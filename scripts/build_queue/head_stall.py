@@ -160,18 +160,18 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
 def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
     inputs = snapshot.inputs
     running = tuple(step for step in inputs.running if step.promise > 0)
-    ordered = inputs.ordered
+    local_rows = (row for _, row in inputs.ordered if gate.can_use_natedev(row))
     disk_hold = inputs.build_space
     if isinstance(disk_hold, records.BuildSpaceHold):
-        local = gate.first_queued_waiter((row for _, row in ordered if gate.can_use_natedev(row)
-            and records.waiter_owner(row) not in inputs.pending_remote_starts), frozenset())
+        local = gate.first_queued_waiter((row for row in local_rows
+            if records.waiter_owner(row) not in inputs.pending_remote_starts), frozenset())
         if not isinstance(local, gate.QueuedWaiter):
             return NoStall()
         head = local.waiter
     else:
-        if not ordered or not running:
+        head = next(local_rows, None)
+        if head is None or not running:
             return NoStall()
-        _, head = ordered[0]
     waited = now - head["since"]
     last_start = max((admitted, *(step.started_at for step in running))) or head["since"]
     quiet = now - last_start

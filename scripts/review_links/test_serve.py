@@ -770,7 +770,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     documents[index] = response.body.replace(b"</body>", probe + b"</body>")
                     fixtures[index] = DialogFixture(self.root)
         self.assertEqual(len(documents), len(pages))
-        capture_dialogs(self.root.parent / "owner-dialogs.png", fixtures, pages=documents)
+        capture_dialogs(self, fixtures, pages=documents)
         for page, fixture in zip(pages, fixtures.values(), strict=True):
             with self.subTest(page=page):
                 self.assertEqual(fixture.results, [])

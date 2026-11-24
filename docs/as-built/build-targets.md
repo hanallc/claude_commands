@@ -114,10 +114,14 @@ The retained remote helpers remain unreachable from these three commands.
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
 `drain` keeps existing runs that work until they finish, also between their steps; a run that only waits waits for the release.
 Both accept `--keep PID` and require `--release-eta HH:MM --zone IANA`.
+Both require Nate's exact words in `--user-words`. The writer refuses missing or blank words.
+`release` needs only the holder identity.
 The dated form `YYYY-MM-DDTHH:MM` permits a later date in that zone.
 The release time must be in the future.
 Both keep the target held until explicit release.
 A holder file uses its holder's fixed staff ID.
+The file stores the exact request in `user_words`. Hold status and the Builds page show it with the purpose.
+For older files, hold status and the Builds page show the purpose.
 Its `release_eta` stores the release instant; old `"unknown"` values remain readable.
 At that instant, status shows `release overdue since HH:MM <zone>`.
 The enforcer sends the holder one overdue message and keeps the hold in force.

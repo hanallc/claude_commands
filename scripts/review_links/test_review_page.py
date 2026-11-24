@@ -9,8 +9,6 @@ import html
 import json
 import re
 import os
-import selectors
-import socket
 import subprocess
 import tempfile
 import time
@@ -40,11 +38,13 @@ from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
+from scripts.review_links.browser_test_support import (
+    assert_status_states, firefox_page, firefox_probe_results, load_firefox,
+)
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_path, question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
@@ -335,7 +335,7 @@ window.fetch=(url,options)=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         markup = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_response_card_hides_validating_and_keeps_the_filters_on_submit(self) -> None:
@@ -1629,7 +1629,7 @@ window.fetch=(url,options)=>{
         for is_validating, source in ((True, markup), (False, open_markup)):
             with self.subTest(validating=is_validating):
                 script = probe.replace('VALIDATING', json.dumps(is_validating))
-                self.assertEqual(firefox_probe_results(source.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, source.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_retries_an_unavailable_body_with_the_same_version(self) -> None:
@@ -1709,7 +1709,7 @@ window.fetch=(url,options)=>{
         for first_load in (False, True):
             with self.subTest(first_load=first_load):
                 script = probe.replace('FIRST_LOAD', json.dumps(first_load))
-                self.assertEqual(firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, markup.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
@@ -1806,7 +1806,7 @@ window.fetch=(url,options)=>{
                     markup = browser_markup(self.root)
                 script = (probe.replace('ACTION', json.dumps(action)).replace('FILTER', json.dumps(filter_id))
                           .replace('COMPLETED', json.dumps(completed)))
-                self.assertEqual(firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, markup.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_closing_action_closes_when_the_saved_detail_is_unavailable(self) -> None:
@@ -1842,7 +1842,7 @@ window.fetch=(url,options)=>{
         for action in ('later', 'works'):
             with self.subTest(action=action):
                 script = probe.replace('ACTION', json.dumps(action))
-                self.assertEqual(firefox_probe_results(markup.replace('</body>', script + '</body>').encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, markup.replace('</body>', script + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_history_opens_a_filtered_review_and_submits_only_its_own_form(self) -> None:
@@ -1922,7 +1922,7 @@ window.fetch=(url,options)=>{
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe + '</body>').encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.replace('</body>', probe + '</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_windowed_rows_keep_open_cards_and_drafts_across_scroll_and_refresh(self) -> None:
@@ -2315,11 +2315,8 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
             thread=threading.Thread(target=server.serve_forever,daemon=True)
             thread.start()
             try:
-                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    result=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
-                        '--window-size','1440,900','--screenshot',str(self.fixture.temporary/'window.png'),
-                        f'http://127.0.0.1:{server.server_port}/#item=page-owner%2FC399'],
-                        capture_output=True,text=True,timeout=45)
+                result = load_firefox(self, f'http://127.0.0.1:{server.server_port}/#item=page-owner%2FC399',
+                                      complete, size=(1440, 900))
                 self.assertEqual(result.returncode,0,result.stderr)
             finally:
                 server.shutdown()
@@ -2410,7 +2407,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    field.selectionStart===2 && field.selectionEnd===5,'The draft, its focus and its selection stay.');
 """
         page_bytes = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(page_bytes), [[]])
+        self.assertEqual(firefox_probe_results(self, page_bytes), [[]])
 
     def long_log_records(self, extra: int = 0) -> list[review_items.ReviewItem]:
         """Return three change rows; change-2 has a log of 40 entries plus extra newer entries."""
@@ -2449,7 +2446,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
     width+' px: The log is 9rem tall from the config. Found '+log.clientHeight+' px.');
   }
 """
-        self.assertEqual(firefox_probe_results(snapshot_probe_page(page, {'initial': initial}, steps)), [[]])
+        self.assertEqual(firefox_probe_results(self, snapshot_probe_page(page, {'initial': initial}, steps)), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_refresh_keeps_the_open_log_position(self) -> None:
@@ -2480,7 +2477,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+found+' px.');
 """.replace('WIDTH', str(width))
                 markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-                self.assertEqual(firefox_probe_results(markup), [[]])
+                self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     def assert_saved_detail_keeps_the_open_log_position(self, reply: str) -> None:
         """Save feedback on the open row with a scrolled log; the new detail has one more log entry."""
@@ -2517,7 +2514,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    'The log keeps its first visible entry at the same place. Expected '+offset+' px, found '+found+' px.');
 """.replace('REPLY', reply)
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_save_keeps_the_open_log_position(self) -> None:
@@ -2587,7 +2584,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(state()==='Waiting','The open row keeps its saved state after the page scrolls away and back. Found '+state()+'.');
 """
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     def assert_own_save_keeps_the_open_row(self, opener: str) -> None:
         """Open change-15 with the opener, save feedback, and check the row stays open at the same pixel."""
@@ -2623,7 +2620,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the save, the open row stays at the same pixel.');
 """.replace('OPENER', opener)
         markup = snapshot_probe_page(page, {'initial': initial, 'fresh': fresh}, steps)
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_own_save_keeps_a_row_opened_by_an_item_link(self) -> None:
@@ -2696,7 +2693,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!row(15),'A new link to the handed change shows no row before the next snapshot.');
 """.replace('LEAVE', leave)
         markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_relink_after_closing_an_own_save_row_hides_the_handed_change(self) -> None:
@@ -2732,7 +2729,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   stays('a chip click');
 """
         markup = self.handed_change_page(stale=True).decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_own_save_row_stays_open_after_a_link_to_the_same_item(self) -> None:
@@ -2749,7 +2746,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(!row(15) || Math.abs(row(15).getBoundingClientRect().top-top)<1,'After the same-item link, the own row stays at the same pixel.');
 """
         markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_deferred_link_after_change_feedback_waits_for_the_snapshot(self) -> None:
@@ -2765,7 +2762,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   check(row(15).dataset.state==='Waiting','The snapshot shows the handed change as Waiting.');
 """
         markup = self.handed_change_page().decode().replace('AFTER_SUBMIT', steps).encode()
-        self.assertEqual(firefox_probe_results(markup), [[]])
+        self.assertEqual(firefox_probe_results(self, markup), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
@@ -2888,59 +2885,9 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     @contextmanager
     def firefox_commands(self, page: Path) -> Generator[Callable[..., object]]:
-        profile = self.fixture.temporary / 'marionette-profile'
-        profile.mkdir()
-        _ = (profile/'user.js').write_text('user_pref("marionette.port", 0);\n')
-        with subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', str(profile), '--marionette',
-                               'about:blank'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as browser:
-            try:
-                with self.marionette_commands(browser) as command:
-                    _ = command('WebDriver:Navigate', url=page.as_uri())
-                    yield command
-            finally:
-                browser.kill()
-
-    @contextmanager
-    def marionette_commands(self, browser: subprocess.Popen[bytes]) -> Generator[Callable[..., object]]:
-        output = browser.stdout
-        assert output is not None
-        log = b''
-        port = 0
-        with selectors.DefaultSelector() as startup:
-            _ = startup.register(output, selectors.EVENT_READ)
-            while startup.select(timeout=15):
-                chunk = os.read(output.fileno(), 4096)
-                if not chunk:
-                    break
-                log += chunk
-                if match := re.search(rb'Listening on port (\d+)\b', log):
-                    port = int(match[1])
-                    break
-        self.assertGreater(port, 0, log.decode(errors='replace'))
-
-        with socket.create_connection(('127.0.0.1', port), timeout=15) as connection, connection.makefile('rb') as reader:
-            def receive() -> object:
-                length = bytearray()
-                while (character := reader.read(1)) != b':':
-                    if not character:
-                        self.fail('Firefox closed the Marionette connection.')
-                    length.extend(character)
-                return cast(object, json.loads(reader.read(int(length))))
-
-            sequence = 0
-
-            def command(name: str, **parameters: object) -> object:
-                nonlocal sequence
-                sequence += 1
-                payload = json.dumps([0, sequence, name, parameters]).encode()
-                connection.sendall(str(len(payload)).encode()+b':'+payload)
-                message = cast(list[object], receive())
-                self.assertEqual(message[:3], [1, sequence, None], message)
-                return message[3]
-
-            _ = receive()
-            _ = command('WebDriver:NewSession', capabilities={})
-            yield command
+        with firefox_page(self, page.as_uri(), 1366, 682) as browser:
+            browser.wait_for_load(page.as_uri())
+            yield browser.command
 
     def test_reader_projects_states_without_copying_the_records(self) -> None:
         key = self.question()
@@ -3209,11 +3156,8 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                with tempfile.TemporaryDirectory() as profile:
-                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
-                        '--window-size', '1440,900', '--screenshot', str(Path(profile)/'page.png'),
-                        f'http://127.0.0.1:{server.server_port}/console/?page=review'],
-                        capture_output=True, text=True, timeout=45)
+                done = load_firefox(self, f'http://127.0.0.1:{server.server_port}/console/?page=review',
+                                    complete, size=(1440, 900))
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 server.shutdown()
@@ -3443,7 +3387,7 @@ const marked=row && !row.hidden && row.querySelector('[data-new-answer]')?.textC
 void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Open Change needs a New answer mark.'])});
 </script>""".replace('KEY', json.dumps(key))
                 markup = snapshot.render().replace(b'</body>', proof.encode() + b'</body>')
-                self.assertEqual(firefox_probe_results(markup), [[]])
+                self.assertEqual(firefox_probe_results(self, markup), [[]])
             body = self.card_body(snapshot, key, 'read')
             _, result = review_page.submit(self.root, body, self.status, snapshot=snapshot)
             self.assertEqual(result, 'marked read')
@@ -4102,10 +4046,8 @@ window.fetch=async(url,options)=>{
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        done = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                            complete, size=(width, 900), timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -4253,10 +4195,8 @@ window.fetch=async(url,options)=>{
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        done = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                            complete, size=(width, 900), timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -4347,7 +4287,7 @@ window.fetch=async(url,options)=>{
 })();</script>'''.replace('ANSWERED', json.dumps(answered)).replace('REMAINING', json.dumps(remaining)).replace(
             'OTHER_OWNER', json.dumps(other_owner.id)).replace('OTHER_QUESTION', json.dumps(other_question))
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_each_review_chip_counts_the_rows_after_its_click(self) -> None:
@@ -4436,7 +4376,7 @@ window.fetch=async(url,options)=>{
  }catch(error){failures.push(String(error));}
  await fetchPage('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''.replace('QUESTION', json.dumps(question))
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>', 1).encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.replace('</body>', probe+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_owner_counts_follow_the_type_and_show_chips(self) -> None:
@@ -4548,7 +4488,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('EXPECTED', json.dumps(expected))
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     def test_server_supplies_the_selected_show_and_complete_index(self) -> None:
         ready = self.investigation()
@@ -5694,7 +5634,7 @@ const marked=row?.querySelector('[data-new-answer]')?.textContent==='New answer'
 void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Open row needs a New answer mark.'])});
 </script>""".replace('KEY', json.dumps(key))
             markup = answered.render().replace(b'</body>', proof.encode() + b'</body>')
-            self.assertEqual(firefox_probe_results(markup), [[]])
+            self.assertEqual(firefox_probe_results(self, markup), [[]])
 
         delivery, result = review_page.submit(self.root, self.card_body(answered, key, 'read'), self.status, snapshot=answered)
         self.assertIsInstance(delivery, change_page.NoMessageDelivery)
@@ -6002,7 +5942,7 @@ window.fetch=async(url,options={})=>{
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>""".replace('KEY', json.dumps(proposal)).replace('ASSIGNEE', json.dumps(self.fixture.unit.id))
-        self.assertEqual(firefox_probe_results((page+probe).encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, (page+probe).encode()), [[]])
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
         _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
@@ -6109,7 +6049,7 @@ window.fetch=async(url,options={})=>{
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind, *, matches_filters: bool = False) -> bytes:
         owner = self.ready_submission_recipient()
@@ -6222,12 +6162,12 @@ window.fetch=async(url,options={})=>{
     def test_new_items_keep_every_review_filter(self) -> None:
         for kind in new_item_dialog.SubmissionKind:
             with self.subTest(kind=kind):
-                self.assertEqual(firefox_probe_results(self.new_item_filter_page(kind)), [[]])
+                self.assertEqual(firefox_probe_results(self, self.new_item_filter_page(kind)), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:
         page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, matches_filters=True)
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
     def test_question_counts_records_the_current_zone_file(self) -> None:
         _ = self.question()
@@ -6467,10 +6407,8 @@ window.fetch=async(url)=>{
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
-                        '--window-size', '390,900', '--screenshot', str(self.fixture.temporary/'review-titles.png'),
-                        f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                done = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                    complete, size=(390, 900), timeout=30)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
                 server.shutdown()
@@ -6512,7 +6450,7 @@ window.fetch=async(url)=>{
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:
@@ -6521,7 +6459,7 @@ window.fetch=async(url)=>{
             change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
             for number in range(4, 9)
         ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
-        self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
+        self.assertEqual(save_notice_failures(self, browser_markup(self.root).encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_card_actions_fade_and_slide(self) -> None:
@@ -6586,7 +6524,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
             with self.subTest(action=action, reduced_motion=reduced):
                 markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
                 markup = markup.replace('REDUCED', json.dumps(reduced)).replace('ACTION', json.dumps(action))
-                self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_departing_card_keeps_its_place_in_the_scrolled_window(self) -> None:
@@ -6857,7 +6795,7 @@ Element.prototype.animate=function(...args){
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_reload_keeps_a_saved_verdict_and_the_selected_show(self) -> None:
@@ -6996,7 +6934,7 @@ window.fetch=(url,options)=>{
                 request_script = '<script>'+review_page.CARD_REQUEST_SCRIPT
                 page = page.replace(request_script, count_requests.replace('CASE', json.dumps(case))+request_script, 1)
                 page = page.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>', 1)
-                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_back_during_a_save_keeps_the_link_for_a_change_and_question(self) -> None:
@@ -7072,7 +7010,7 @@ window.fetch=(url,options={})=>{
 </script>"""
         page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
         page = page.replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_back_and_forward_defer_the_link_to_its_own_pending_save(self) -> None:
@@ -7172,7 +7110,7 @@ window.fetch=(url,options={})=>{
         for refuse_question in (False, True):
             with self.subTest(refuse_question=refuse_question):
                 script = probe.replace('REFUSE_QUESTION', json.dumps(refuse_question))
-                self.assertEqual(firefox_probe_results(page.replace('</body>', script+'</body>', 1).encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, page.replace('</body>', script+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_console_reload_preserves_show_and_an_explicit_link_opens_the_card(self) -> None:
@@ -7223,7 +7161,7 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
         shell = shell.replace('</body>', probe+'</body>', 1)
         review_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, shell))
         router = f'<script>document.write(location.pathname.endsWith("review.html") ? {review_html} : {shell_html});</script>'
-        self.assertEqual(firefox_probe_results(router.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, router.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_links_keep_completed_changes_and_questions_hidden(self) -> None:
@@ -7357,7 +7295,7 @@ window.fetch=(url,options={})=>{
         markup = browser_markup(self.root, show='all')
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         with self.subTest(navigation='same tab'):
-            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+            self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
         fixture = self.fixture
         _ = change_review.record_verdict(fixture.review_list, 'C1', 'works', datetime.now(user_zone()).date(),
@@ -7372,7 +7310,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.datase
 </script>"""
         page = markup.replace('<head>', '<head>'+initial_link, 1).replace('</body>', initial_probe+'</body>', 1)
         with self.subTest(navigation='fresh load'):
-            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+            self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
@@ -7733,10 +7671,8 @@ window.fetch=async(_url,options={})=>{
                     thread=threading.Thread(target=server.serve_forever,daemon=True)
                     thread.start()
                     try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done=subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
-                                '--window-size',f'{width},900','--screenshot',str(self.fixture.temporary/f'review-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'],capture_output=True,text=True,timeout=30)
+                        done = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                            complete, size=(width, 900), timeout=30)
                         self.assertEqual(done.returncode,0,done.stderr)
                     finally:
                         server.shutdown()
@@ -7773,7 +7709,7 @@ Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_time_displays_and_saves_24_hour_time(self) -> None:
@@ -7840,7 +7776,7 @@ window.fetch=async(_url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_retains_drafts_and_resolves_daylight_saving_times(self) -> None:
@@ -7937,10 +7873,8 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', '1440,900', '--screenshot', str(self.fixture.temporary/'later-time.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                        done = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                            complete, size=(1440, 900), timeout=30)
                         self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
@@ -7993,7 +7927,7 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_review_draws_the_same_body_as_the_single_card(self) -> None:
@@ -8019,7 +7953,7 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace("EXPECTED", json.dumps(expected).replace('</', '<\\/'))
         markup = browser_markup(self.root).replace('</body>', probe + '</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_uses_the_shared_status_with_the_real_loader(self) -> None:

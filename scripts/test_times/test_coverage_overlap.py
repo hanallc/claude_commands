@@ -3,24 +3,31 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass
+import fcntl
 import json
+import io
 import os
 from pathlib import Path
-import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 from typing import TYPE_CHECKING, cast
 import unittest
+from unittest.mock import patch
 
 
-from scripts.lib.checkout_test_support import copy_test_runner
+from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
+from scripts.lint.memory_test_support import config_environment
+from scripts.test_times import coverage_overlap
+from scripts.test_times.measurement_gate import MeasurementBlocked
 from scripts.test_times.coverage_overlap import TestCoverage, select_candidates
 
 if TYPE_CHECKING:
@@ -196,32 +203,23 @@ def run_child() -> subprocess.CompletedProcess[str]:
 
 class CoverageOverlapTests(unittest.TestCase):
     @contextmanager
-    def fixture_command(self, sources: dict[str, str]) -> Generator[tuple[subprocess.CompletedProcess[str], Path]]:
+    def fixture_command(self, sources: dict[str, str], *, macos: bool = False
+                        ) -> Generator[tuple[subprocess.CompletedProcess[str], Path]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             folder = root / "scripts" / "fixture"
             folder.mkdir(parents=True)
             tooling = root / "scripts" / "test_times"
-            (tooling / "coverage_child").mkdir(parents=True)
             library = root / "scripts" / "lib"
-            copy_test_runner(root)
-            for source, destination in (
-                (TOOL, tooling / TOOL.name),
-                (TOOL.with_name("line_collector.py"), tooling / "line_collector.py"),
-                (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
-                (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
-                *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
-                    "lib/terminal_cells.py", "buildlog/treekey.py", "production/gate_modules.py",
-                )),
-            ):
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = shutil.copy2(source, destination)
-            _ = (root / "scripts/__init__.py").write_text("")
+            copy_runtime(root, configuration=False)
             sources = {
                 "scripts/fixture/product.py": PRODUCT,
                 "config/test_times.conf": "COVERAGE_LEAF_PROGRAMS=git\n",
                 **sources,
             }
+            if macos:
+                for relative in ("config/build_folders.conf", "config/build_admission.conf"):
+                    sources[relative] = (TOOL.parents[2] / relative).read_text()
             for relative, source in sources.items():
                 destination = root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -241,11 +239,84 @@ class CoverageOverlapTests(unittest.TestCase):
             _ = commit_repository(root, "Create coverage fixtures", env=env)
             patterns = sorted(Path(name).name for name in sources
                               if Path(name).name.startswith("test_") and Path(name).suffix == ".py")
-            result = subprocess.run(
-                [str(library / "py"), str(tooling / TOOL.name), str(folder), *patterns], cwd=root, env=env,
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
-            )
+            command = [str(library / "py"), str(tooling / TOOL.name), str(folder), *patterns]
+            if macos:
+                hooks = root / "macos-startup"
+                hooks.mkdir()
+                # Load the host's proxy and time zone settings before simulating macOS.
+                _ = (hooks / "sitecustomize.py").write_text(
+                    "import urllib.request\nimport zoneinfo\nimport sys\nsys.platform = 'darwin'\n")
+                result = subprocess.run(
+                    command, cwd=root, env={**env, "TMPDIR": str(root),
+                                            "PYTHONPATH": str(hooks), "ADMISSION_SOCKET": str(root / "no-queue"),
+                                            "BUILDLOG_RESERVED_STEP": ""},
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                yield result, output
+                return
+            with AdmissionFixture(root=root / "admission") as admission, admission.serving():
+                admitted_env = {**env, **{key: value for key, value in os.environ.items()
+                                        if not key.startswith(("GIT_", "NATEST_COVERAGE_"))},
+                                **config_environment(root / "config"), "COVERAGE_OUT": str(output),
+                                "PYTHONDONTWRITEBYTECODE": "1"}
+                result = subprocess.run(
+                    command,
+                    cwd=root, env=admitted_env, capture_output=True, text=True,
+                    check=False, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertTrue(admission.callers_released(), result.stdout + result.stderr)
             yield result, output
+
+    def test_admission_refusal_reports_blocked_before_coverage_starts(self) -> None:
+        with (patch.object(coverage_overlap, "measurement_place", side_effect=MeasurementBlocked("queue refused")),
+              redirect_stderr(io.StringIO()) as stderr):
+            status = coverage_overlap.main([str(TOOL.parent), Path(__file__).name])
+        self.assertEqual(status, 2)
+        self.assertEqual(stderr.getvalue(), "coverage overlap: BLOCKED: queue refused\n")
+
+    def test_macos_coverage_runs_multiple_cases_without_a_local_queue(self) -> None:
+        with self.fixture_command({"scripts/fixture/test_macos.py": PRELUDE + '''
+class MacCoverage(unittest.TestCase):
+    def test_first(self) -> None:
+        self.assertEqual(sys.platform, "darwin")
+        self.assertFalse(os.environ.get("BUILDLOG_RESERVED_STEP"))
+        self.assertNotIn("DEVTOOLS_GATE_PARENT_SOURCE_FD", os.environ)
+        self.assertEqual(left(), "left")
+
+    def test_second(self) -> None:
+        self.assertEqual(right(), "right")
+'''}, macos=True) as (result, output):
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = cast("CoverageReport", json.loads(output.read_text(encoding="utf-8")))
+            self.assertEqual([row["id"].rsplit(".", 1)[-1] for row in report["tests"]],
+                             ["test_first", "test_second"])
+
+    def test_macos_coverage_stops_its_child_on_sigterm(self) -> None:
+        with self.fixture_command({"scripts/fixture/test_stop.py": PRELUDE + '''
+import fcntl
+import signal
+
+class StopCoverage(unittest.TestCase):
+    def test_stop(self) -> None:
+        self.assertEqual(os.getsid(0), os.getpid())
+        with Path(__file__).with_name("child-lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            print(os.getpid(), file=lock, flush=True)
+            with open(os.devnull, "w") as quiet:
+                os.dup2(quiet.fileno(), 1)
+                os.dup2(quiet.fileno(), 2)
+            signal.alarm(10)
+            os.kill(os.getppid(), signal.SIGTERM)
+            signal.pause()
+'''}, macos=True) as (result, output):
+            lock_path = output.parent / "scripts/fixture/child-lock"
+            self.assertTrue(lock_path.exists(), result.stdout + result.stderr)
+            with lock_path.open() as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.kill(int(lock.read()), signal.SIGKILL)
+                    self.fail("The coverage child still owns the lock")
+            self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
 
     def run_fixture(self, sources: dict[str, str]) -> FixtureCoverage:
         with self.fixture_command(sources) as (result, output):
@@ -1318,6 +1389,8 @@ class Filter(unittest.TestCase):
             "scripts/fixture/test_first.py": PRELUDE + '''
 class First(unittest.TestCase):
     def test_first(self) -> None:
+        self.assertTrue(os.environ["BUILDLOG_RESERVED_STEP"])
+        self.assertIn("test_gate_pidfd", vars(sys.modules["_devtools_checkout"]))
         self.assertEqual(left(), "left")
 ''',
             "scripts/fixture/test_second.py": PRELUDE + '''

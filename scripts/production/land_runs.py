@@ -57,8 +57,8 @@ def default_state_dir() -> Path:
     old = Path("~/.local/state/merge-gate").expanduser()
     if os.path.lexists(old) and not os.path.lexists(directory):
         raise GateStateMoveRequired(
-            "Gate state move required: set /build:hold drain natedev, then run "
-            + "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh")
+            "Move the gate state. Run /build:hold drain natedev with Nate's exact request. Then run this command.\n"
+            + "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh --user-words '<exact request>'")
     return directory
 
 

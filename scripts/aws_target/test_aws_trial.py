@@ -415,10 +415,11 @@ class PairedTrialTests(CostFixture):
         copy_test_runner(self.repo)
         for relative in ('scripts/aws_target/__init__.py', 'scripts/aws_target/gate_box.py',
                          'scripts/build_queue/admission_jobs.py', 'scripts/build_queue/snapshot_codec.py',
-                         'scripts/buildlog/parse.py', 'scripts/lib/build_steps.py',
+                         'scripts/buildlog/parse.py', 'scripts/buildlog/store.py',
+                         'scripts/lib/atomic_file.py', 'scripts/lib/build_steps.py', 'scripts/lib/file_lock.py',
                          'scripts/lib/proc_text.py', 'scripts/lib/process_group.py',
                          'scripts/production/gate_modules.py', 'scripts/production/gate_routes.py',
-                         'scripts/test_times/gate_record.py'):
+                         'scripts/test_times/gate_record.py', 'scripts/test_times/recent_gate_times.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())

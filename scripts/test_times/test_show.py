@@ -248,6 +248,38 @@ class TestTimesTests(unittest.TestCase):
                 mock.patch.object(socket, "gethostname", return_value=host):
             gate_record.write_gate_run(run, fixture_executions(run))
 
+    def test_seed_gate_times_writes_a_snapshot_per_host(self) -> None:
+        legacy = gate_run()
+        module = {**legacy["modules"][0], "suite": "tools", "module": "test_alpha.py"}
+        for place, host, gate_id, stamp, fields in (
+            ("natedev", "natedev", "linux", "2026-11-01", {"config_reads": ["limits"]}),
+            ("Mac", "Mac", "mac", "2026-11-02", {"config_reads": ["tools"], "folder_scans": []}),
+            (store.CLOUD_GATE_PLACE, "ip-fixture", "cloud", "2026-11-03", {"content_reads": ["docs/guide.md"]}),
+        ):
+            store.append_line(store.host_file(place, EPOCH), {
+                **legacy, "kind": "gate_run", "v": record.RECORD_VERSION, "selection": "full", "aborted": False,
+                "id": gate_id, "host": host, "started_at": stamp, "modules": [{**module, **fields}],
+            })
+
+        with mock.patch.object(store, "host_name", return_value="natedev"):
+            status, output, errors = run("seed-gate-times")
+            self.assertEqual((status, errors), (0, ""))
+            self.assertIn("Recent gate time keys:", output)
+            snapshots = self.log.glob(f"*/{gate_record.LATEST_MODULE_READS_NAME}")
+            self.assertEqual({path.parent.name for path in snapshots}, {"natedev", "Mac"})
+            module_path = "scripts/tools/test_alpha.py"
+            self.assertEqual(gate_record.read_latest_module_reads(), gate_record.ModuleReadHistory(
+                {module_path: gate_record.module_read_record(["limits", "tools"], [], ["docs/guide.md"])},
+                {field: frozenset({module_path}) for field in gate_record.READ_FIELDS},
+            ))
+            local = gate_record.latest_module_reads_path("natedev").read_text()
+            peer = gate_record.latest_module_reads_path("Mac").read_text()
+            self.assertIn('"run_id":"linux"', local)
+            self.assertIn('"run_id":"cloud"', local)
+            self.assertNotIn('"run_id":"mac"', local)
+            self.assertIn('"run_id":"mac"', peer)
+            self.assertNotIn('"run_id":"cloud"', peer)
+
     def report(self, *arguments: str) -> str:
         status, output, errors = run(*arguments)
         self.assertEqual(status, 0, output + errors)

@@ -251,6 +251,11 @@ An unavailable observation cannot substitute for confirmed cleanup or a settled 
 Busy, blocked, and disk refusals retain normal polling.
 A Mac that `free_now` reports busy is a busy exclusion in placement evidence, even though routing keeps it eligible.
 The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
+An explicit `--mac-only` request waits when the Mac is busy.
+When the service refuses that request, it publishes the queue view without the waiter before it replies.
+The refused request cannot hold the Mac or take a place in the probe order.
+The service keeps the start time and host selection for the episode.
+A valid resubmission of the episode reads the Mac again.
 Before this rule, a waiting Mac step made one refused attempt each second.
 A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
@@ -1168,8 +1173,9 @@ These callers always give an owner, also under systemd or with no session:
 Their requests take the owner from the caller variables, the process family, or the worktree owner record.
 `default_owner(reference)` sets `CLAUDE_SESSION_NAME` to the staff name of the reference, or else to the reference.
 When the reference is a staff unit or a worker of a unit, it also sets `BUILDLOG_UNIT` to that unit if `BUILDLOG_UNIT` is empty.
-It never sets `BUILDLOG_OWNER_STAFF_ID`. `hold_enforcer.restart_entry` reads that variable for a run with no session.
-A hold that stops the run sends a restart notice to that staff member when the hold ends.
+It never sets `BUILDLOG_OWNER_STAFF_ID`. `hold_enforcer.restart_entry` reads that variable from the stopped command.
+The command's session takes precedence over the exported staff ID.
+Release sends the notice to the recorded session after it verifies the confirmed stop.
 The default owner did not start the run, so it must not get that notice.
 It does nothing when an owner variable is already set, and it puts back the earlier values at the end.
 `snapshot_codec.wait_line_name` names a waiting step for the client wait line, the service head label, and the Builds page "behind" text.
@@ -1516,7 +1522,8 @@ The hourly task can retry the exchange.
 ### Build hold (`scripts/build_hold/build_hold.py`, `commands/build/hold.md`)
 
 **Holder files.** `BUILD_HOLD_DIR` defaults to `~/.local/state/build-hold/`.
-Each holder has one file with one JSON line: `{holder, since, for, release_eta, keep}`.
+Each holder has one file with one JSON line `{holder, since, for, release_eta, keep, user_words}`.
+`user_words` stores Nate's exact request. Older files can omit it.
 `release_eta` stores the release instant; old `"unknown"` values remain readable.
 `keep` holds PID/start-time pairs and defaults to empty for old files.
 Installed scripts refuse directory overrides or a changed `HOME`.
@@ -1527,14 +1534,14 @@ An unreadable or malformed regular file remains a hold.
 The types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, and `Holder(name, since, purpose, release, key, keep)`.
 `ReleaseEta = KnownReleaseEta | UnknownReleaseEta` describes the release time.
 `ReleaseRequest = NoReleaseEta | ClockReleaseEta | DatedReleaseEta` describes the request.
-`write_hold` and `start_hold` take the resolved identity.
+`write_hold` and `start_hold` take the resolved identity and refuse missing or blank user words.
 Holder files supply state to status and Rust release checks.
 `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle.
 Every present holder file remains in force, including when the cycle has `released_at` or `release_started_at`.
 There is no releasing state.
 Only removal ends the holder's hold.
 
-**Drain.** `build_hold.py drain --for '<why>' --release-eta HH:MM --zone IANA` keeps the natedev runs that work until they finish.
+**Drain.** `build_hold.py drain --for '<why>' --user-words '<exact request>' --release-eta HH:MM --zone IANA` keeps active natedev runs until they finish.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
@@ -1615,7 +1622,7 @@ The Builds page shows the count, limit, repository, and machine for a run-limit 
 The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
-**Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
+**Clear.** `build_hold.py clear --for '<why>' --user-words '<exact request>' --release-eta HH:MM --zone IANA` stops queued gates and running work outside the hold's allow rules.
 It retains explicit keep entries and their children.
 The command leaves the target held until release.
 `clear` and `drain` accept an optional positional target before their options.
@@ -1761,7 +1768,7 @@ Those workers may build.
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
 | `record-recipient --session-id --name` | Written by `top_level.py`. |
-| `release [target] [--holder N]` / `release --resume` | Removes its holder file first, then records released_at and release_started_at; notices follow after the last file is gone. Other holder files keep the hold in force. One notice per recipient; the memory gate orders builds. `--resume` refuses while any holder file exists. Other targets return exit 2 without changes. |
+| `release [target] [--holder N]` / `release --resume` | Removes its holder file before it records `released_at` and `release_started_at`. Release sends notices after it removes the last holder file. The memory gate orders builds. `--resume` refuses while any holder file exists. Other targets return exit 2. |
 | `status` | One line per holder with since, reason and ETA, its keep list, cycle delivery rows, and the audit with `--keep <pid>` for each run that would stop; or `no build hold`. Then `release pending:` lines name unfinished releases and their unsent recipients, using the release drain's reader, and `/build:hold release` to finish them, even with no holder file. A damaged record or cycle is named with its path, error and the command that sets it aside. Status changes no file. Present files stay held despite cycle release fields. |
 | `audit` | Reads running build processes from `/proc`. Prints session-owned builds by class. Records other_session and no_session builds when a hold is in force. |
 
@@ -1828,20 +1835,41 @@ It also names a recipient whose staff row remains after its session is gone.
 `cycle_status_lines` prints delivery outcomes.
 Release waits for no answer, build or memory allocation.
 
-**Stopped run notices.** Each run that a hold stopped has its own entry with a run ID.
-Release sends one notice for all unsent runs that go to the same owner, worker and director folder.
-The notice gives the run count and each run ID. Runs with the same label share the label.
-When the owner is closed or gone, the runs go to the director. Each director gets one notice for the runs of all its closed workers.
-One notice names at most `RELEASE_NOTICE_RUN_LIMIT` (500) runs, so it fits in one argument. A longer list goes in more notices.
-Every entry of a notice gets that notice's outcome. A session that owns runs gets no separate session notice.
-A delivered or queued entry is never sent again. A release that finishes a pending record sends only its unsent entries.
-A run of a gone Claude session with no director has no route. It is recorded as `RecipientGone`, is not retried, and is named under `Not reached`.
+**Stopped run notices.** Each stopped run has an entry with its run ID.
+Before stopping the command, the hold saves its boot ID, PID, start time, and run record.
+The hold saves the command's session marker and the owner staff ID in separate fields.
+If the command has an owner staff ID, its session must match that staff member's current session.
+Release checks the stop confirmation and the saved evidence before it sends a restart notice.
+Release tries the saved session first and checks each run again after address lookup.
+`send.py --exact-thread` sends a Codex restart notice only to its saved thread.
+If the saved session is closed or gone, release uses the worker's parent or the saved director folder.
+Release checks the runs again before a director send.
+The notice gives the run count and each run ID.
+Runs with the same label share the label.
+Each notice lists at most `RELEASE_NOTICE_RUN_LIMIT` (500) runs.
+Each run in a notice gets the same delivery outcome.
+Release skips restart notices that the sender delivered or queued.
+A restart notice stays pending if both routes are unavailable or a send fails.
+If release cannot verify the saved staff session, it keeps the restart pending.
+Release checks the age of each batch before an owner or director send.
+Release removes pending restarts when the release age exceeds `restart_notice.max_age_seconds` in `build_targets.conf`.
+The default limit is 86,400 seconds (24 hours).
+Release can send the ordinary notice while the restart notice stays pending.
+Release skips the ordinary notice when a restart notice for the same session is delivered or queued.
+A newer restart replaces older pending restarts for the same session after it passes all checks.
+A retry before holder removal replaces the pending record for that cycle.
+An unreadable stop confirmation or run record keeps the restart notice pending.
+The enforcer checks that the detached command exits after TERM or KILL.
+A confirmed stop can receive a notice after the command exits.
+Release drops invalid restart notices and keeps waits with an independent or unknown origin.
+Enforcer registration preserves the origin of each existing wait.
+Release notices show a hold's start date if it differs from today's date in the user's time zone.
 
 `release --resume` supports a file left by an old release. It refuses while any hold is in force. With no cycle, the holder broadcasts the release. `open_cycle`, `save_cycle` and `write_hold` write a complete temporary file before `os.replace`; holder temporary files stay outside the holder directory.
 
 **Release intent.** The last holder's release is saved atomically in `BUILD_HOLD_RELEASE_DIR/pending-release.json` before its holder file is removed. A new hold keeps an earlier pending record under `releases/<release-id>/`, so it cannot drop that release's notices. `release` and `release --resume` drain each pending record on its own when no hold is in force: a record whose notice or broadcast fails stays pending, and the drain goes on to the next. Under the release lock, a damaged pending record or referenced cycle is renamed with the same `.damaged-<UTC YYYYMMDDTHHMMSSZ>` suffix used for a damaged current cycle (`-2`, `-3` when taken). One line names its path, error and saved path, and the drain continues. A damaged or missing cycle is rebuilt from its pending intent's holder and recipients before sending; an uncertain delivery can repeat. A stop after the rename leaves the intent available for a rerun. A drained record becomes the one completed receipt for its holder key, at `receipts/<holder-key>/completed-release.json`, replaced in place, so receipts do not grow; older receipt folders are moved there on release lookup. A release without a usable cycle keeps its broadcast pending until the broadcast returns. Live holder files take precedence over receipts. A finished release prints `hold is already released.` even after another cycle opens, followed by the details of any record it drained, `Not reached, tell them yourself` lines included.
 
-`status` reads current and retained pending releases without taking the release lock or changing files, including old receipts. Each `release pending:` line gives the holder, release time in the user's zone, each unsent recipient once and `/build:hold release` to finish it. Each recipient shows its staff name when a staff row matches its session. Otherwise it shows the recorded name, which is often the session ID. A recipient with stopped runs shows the count, for example `phases (160 stopped runs), 341b4683-5b89-4a73-a075-887be3211060 (9 stopped runs)`. Queued notices follow as `; queued: <names>`. Status and the drain call `release_notices` to validate the referenced cycle id and select the same first entry for each recorded recipient. A missing cycle entry, `NotAttempted`, `DeliveryFailed` or `WorkerClosed` means unsent. `RecipientGone` means unsent only for a Codex session, because its thread can open again. `QueuedUnconfirmed` is not unsent: the queued notice arrives when the session returns, so a release does not queue a second copy. A broadcast says `every session (broadcast)`. An unreadable record or cycle, including an id mismatch, is named by path with its error and the command that sets it aside. Completed receipts add no pending line.
+`status` reads current and retained pending releases without taking the release lock or changing files, including old receipts. Each `release pending:` line gives the holder, release time in the user's zone, each unsent recipient once and `/build:hold release` to finish it. Each recipient shows its staff name when a staff row matches its session. Otherwise it shows the recorded name, which is often the session ID. A recipient with stopped runs shows the count, for example `phases (160 stopped runs), 341b4683-5b89-4a73-a075-887be3211060 (9 stopped runs)`. Queued notices follow as `; queued: <names>`. Status and the drain call `release_notices` to validate the referenced cycle id and select the same first entry for each recorded recipient. A missing cycle entry, `NotAttempted`, `DeliveryFailed` or `WorkerClosed` means unsent. `RecipientGone` means unsent for a stopped run or a Codex session. `QueuedUnconfirmed` is not unsent: the queued notice arrives when the session returns, so a release does not queue a second copy. A broadcast says `every session (broadcast)`. An unreadable record or cycle, including an id mismatch, is named by path with its error and the command that sets it aside. Completed receipts add no pending line.
 
 **Damaged record.** `read_cycle` validates the `HoldCycle` shape, session identities, and delivery outcomes.
 Each holder's `since` must have a time offset.
@@ -2799,7 +2827,7 @@ A move gives the moved row a new anchor and keeps its former successor in place.
 Absent and unnamed waits stay in the full order.
 The page omits waits with no name source.
 Placement, memory admission, and continuation claims use the eligible rows in this order.
-The head-stall snapshot uses the order of local waits.
+The head-stall check uses the first waiter that can run on natedev.
 The grant pass shows a newly granted row in Waiting without a move handle.
 The first pass that counts its reservation shows the row in Running and includes the memory charge.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
@@ -2811,6 +2839,15 @@ A local reservation keeps its saved place until the service sees processes in it
 The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
+A request that waits only for the Mac can hold its place for one probe on a busy, blocked, backoff, or unreachable reading.
+This rule applies to the Mac-only route with configured order and to both forms of a Mac pin.
+The explicit `--mac-only` option can hold its place on a busy reading.
+Disk, off, and state readings do not start a hold.
+When a younger request reads the Mac free, the oldest eligible waiter with an overlapping scope can hold it for one probe.
+The hold ends when the probe publishes a result or reaches its time limit.
+A result ends the hold even if the probe started before the hold.
+When the hold ends, a second waiter cannot start a hold against the same free reading.
+If the probe reports free before the hold check, the same pass considers that reading for the older waiter.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.

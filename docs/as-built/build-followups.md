@@ -237,7 +237,19 @@ Folder sizes measured by the buildlog disk job at 03:14 EDT; free and used space
   )
   ```
 - In a worktree, `./scripts/buildlog/buildlog` execs the live `~/.claude` CLI; render the worktree's report with `scripts/lib/py scripts/buildlog/cli.py report <day>`.
-- `test_report.py` has no `sys.path` setup and runs only under `~/.claude/scripts/lib/py -m unittest discover -s scripts/buildlog -p 'test_*.py'`.
+- Run the Buildlog suite through the queue from the repository root.
+
+  ```sh
+  (
+    set --
+    for file in scripts/buildlog/test_*.py; do
+      set -- "$@" --module "${file#scripts/}"
+    done
+    ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+      --repo "$PWD" --commit HEAD --apply-uncommitted "$PWD" -- \
+      scripts/lib/py scripts/production/gate.py --tests-only "$@"
+  )
+  ```
 - `disk.py` imports `scripts.lint.sweep` by package name and changes no `sys.path`.
 - `basedpyright scripts/buildlog` exits 0 when clean. Its summary reads `0 errors, 0 warnings, 0 notes`.
 

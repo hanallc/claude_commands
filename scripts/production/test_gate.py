@@ -7,6 +7,7 @@ from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
 from scripts.build_hold import build_hold
+from scripts.buildlog import index
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
@@ -19,6 +20,7 @@ from pathlib import Path
 import re
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,24 @@ from scripts.production.staff_test_support import (
 )
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 from scripts.production.test_gate_default_placement import placed
+from scripts.test_times import gate_record, recent_gate_times
+from scripts.test_times.gate_record_test_support import gate_run
+
+
+class GateTimeLimitTests(unittest.TestCase):
+    def test_time_limit_reads_the_file_without_an_index_open_or_lock(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root), "BUILDLOG_DIR": str(root)}))
+        _ = write_config_fixture(root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(root / "test_times.conf", "TOP_RUNS=5")
+        run = gate_run()
+        run.update(vcpus=8, selection="full", status=0)
+        recent_gate_times.update_recent_times({**run, "id": "fixture"})
+        with (mock.patch.object(index, "index_path", side_effect=AssertionError("read located the index")),
+              mock.patch.object(index, "update", side_effect=AssertionError("read updated the index")),
+              mock.patch.object(index, "update_lock", side_effect=AssertionError("read locked the index")),
+              mock.patch.object(sqlite3, "connect", side_effect=AssertionError("read opened SQLite"))):
+            self.assertEqual(gate.read_time_limit(8, (), 2, False), gate_record.GateTimeLimit(10))
 
 
 class GateModuleOwnerTests(unittest.TestCase):

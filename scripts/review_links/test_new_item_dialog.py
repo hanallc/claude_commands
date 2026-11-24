@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -17,6 +16,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
+from scripts.review_links.browser_test_support import load_firefox
 from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
@@ -1192,7 +1192,7 @@ class DialogFixture:
                 "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config")}
 
 
-def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
+def capture_dialogs(case: unittest.TestCase, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
     if pages is None:
         pages = {width: fixture_page(width, photo=False) for width in fixtures}
     documents = pages
@@ -1322,13 +1322,8 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         try:
-            profile = output.parent / "profile"
-            profile.mkdir()
-            run = subprocess.run(
-                ["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                 "--window-size", "1440,900", "--screenshot", str(output),
-                 f"http://127.0.0.1:{server.server_port}/"],
-                capture_output=True, text=True, timeout=75, check=False)
+            run = load_firefox(case, f"http://127.0.0.1:{server.server_port}/", finished,
+                               size=(1440, 900), timeout=75)
             if run.returncode:
                 raise AssertionError(run.stderr)
             if not finished.is_set():
@@ -1389,7 +1384,7 @@ class NewItemDialogTests(unittest.TestCase):
         configuration.mkdir()
         _ = (configuration / "console.conf").write_text(f"page.list.owner={owner.id}\n")
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, alternate))):
-            capture_dialogs(temporary / "recipient-draft.png", {1440: fixture}, pages={1440: page})
+            capture_dialogs(self, {1440: fixture}, pages={1440: page})
         self.assertEqual(fixture.results, [])
         return fixture
 
@@ -1414,7 +1409,7 @@ class NewItemDialogTests(unittest.TestCase):
         page = fixture_page(1440, photo=False, script=probe).replace(
             b'data-page-owner="builds"', b'data-page-owner="list"')
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
-            capture_dialogs(temporary / "list-retry.png", {1440: fixture}, pages={1440: page})
+            capture_dialogs(self, {1440: fixture}, pages={1440: page})
         self.assertEqual(fixture.results, [])
         self.assertEqual(len(fixture.posts), 2)
         self.assertEqual(fixture.posts[0].request_id, fixture.posts[1].request_id)
@@ -1429,14 +1424,14 @@ class NewItemDialogTests(unittest.TestCase):
     def test_bug_dialog_reports_the_open_page_even_without_a_screenshot(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         fixture = DialogFixture(temporary)
-        capture_dialogs(temporary / "bug.png", {1440: fixture}, pages={1440: bug_fixture_page()})
+        capture_dialogs(self, {1440: fixture}, pages={1440: bug_fixture_page()})
         self.assertEqual(fixture.results, [])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_owner_button_opens_five_types_and_selects_the_owner_from_all_recipients(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in (1440, 390)}
-        capture_dialogs(temporary / "options.png", fixtures,
+        capture_dialogs(self, fixtures,
                         pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
         self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: []})
 
@@ -1488,7 +1483,7 @@ class NewItemDialogTests(unittest.TestCase):
             configuration.mkdir(parents=True)
             _ = (configuration / "console.conf").write_text(
                 f"page.builds.owner={OWNER}\npage.list.owner={morty.id}\n")
-        capture_dialogs(temporary / "dialog.png", fixtures)
+        capture_dialogs(self, fixtures)
         for width, fixture in fixtures.items():
             with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
                 self.assertEqual(fixture.results, [])

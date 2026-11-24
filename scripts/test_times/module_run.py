@@ -808,10 +808,11 @@ class DirectModuleRun:
     parent: PreparedTestRunsParent
 
 
-RunnerFolderOwner = GateModuleLease | UnleasedGateJob | DirectModuleRun
+StandaloneModuleRun = UnleasedGateJob | DirectModuleRun
+RunnerFolderOwner = GateModuleLease | StandaloneModuleRun
 
 
-def runner_folder_owner(start_dir: Path) -> RunnerFolderOwner:
+def runner_folder_owner(start_dir: Path | None = None) -> RunnerFolderOwner:
     if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
         return GateModuleLease(Path(root))
     if not isinstance(gate_parent(), UnverifiedGateParent):
@@ -819,6 +820,8 @@ def runner_folder_owner(start_dir: Path) -> RunnerFolderOwner:
     from scripts.lib import git_files
     from scripts.lib.testing_folders import prepare_test_runs_parent, use_test_runs_parent
 
+    if start_dir is None:
+        start_dir = Path.cwd()
     try:
         checkout = git_files.locate(start_dir).toplevel
     except git_files.GitFilesError:
@@ -943,13 +946,15 @@ def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
         yield root
 
 
-def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) -> None:
+def run_with_descendant_cleanup(
+        owner: RunnerFolderOwner, cleanup: ExitStack,
+        run: Callable[[RunnerFolderOwner, Path], None] = main) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
-        main(owner, cleanup.enter_context(private_run_roots(owner)))
+        run(owner, cleanup.enter_context(private_run_roots(owner)))
         return
     parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -983,7 +988,7 @@ def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) ->
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main(owner, run_root)
+        run(owner, run_root)
         return
     status = 0
     received = 0

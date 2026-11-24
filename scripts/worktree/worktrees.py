@@ -773,7 +773,7 @@ def create_checkout(path: Path, source: Path,
         exists = os.path.lexists(path)
         if record is not None:
             if (exists and isinstance(record.layout, UnassignedOutput) and isinstance(layout, RecordedWorktreeOutput)
-                    and _unfinished_move_at(path.resolve())):
+                    and any(_unfinished_moves_at(path.resolve()))):
                 raise FileExistsError(f"{path}: editable repository destination is occupied")
             if Path(record.repo).resolve() != repo or (
                     isinstance(record.layout, RecordedWorktreeOutput) and isinstance(layout, RecordedWorktreeOutput)
@@ -1501,12 +1501,11 @@ def moved_launch_folder(folder: Path) -> Path:
     return folder
 
 
-def _unfinished_move_at(path: Path) -> bool:
+def _unfinished_moves_at(path: Path) -> Generator[MoveJournal]:
     for file in move_folder().glob("*.json"):
         journal = read_move(file)
         if journal.stage is not MoveStage.FINISHED and journal.move.new == path:
-            return True
-    return False
+            yield journal
 
 
 def _move_destination(repo: str, unit: str, short_name: str) -> Path:
@@ -1838,7 +1837,8 @@ def _relocate_worktree_records(journal: MoveJournal) -> WorktreeRecord:
     return record
 
 
-def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> MoveJournal:
+def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard,
+                          require_finished: bool = False) -> MoveJournal:
     if journal.stage is MoveStage.FINISHED:
         return journal
     move = journal.move
@@ -1853,6 +1853,8 @@ def _finish_worktree_move(journal: MoveJournal, *, protect: RenameGuard) -> Move
     if retained_copy:
         report_retained_folder(journal.backup, "the worktree moved to a new filesystem")
     if move.output is MoveOutput.LIVE_UNIT and move.repo == "claude" and _legacy_claude_present():
+        if require_finished:
+            raise ValueError(f"{move.new}: archive the old build root before publishing the worktree output")
         print(f"defer output {move.new}: archive the old build root first")
         return journal
 
@@ -1890,7 +1892,8 @@ class MoveRepository(Enum):
     FROM_ORIGIN = "read the checkout's repository word"
 
 
-def move_worktree(old: Path, repo: str | MoveRepository, unit: str, short_name: str) -> Path:
+def move_worktree(old: Path, repo: str | MoveRepository, unit: str, short_name: str, *,
+                  require_finished: bool = False) -> Path:
     """Move a linked checkout and resume any interrupted publication."""
     old = _move_source(old)
     if _is_numbered_build_copy(old, build_folders.build_root().resolve()):
@@ -1919,10 +1922,26 @@ def move_worktree(old: Path, repo: str | MoveRepository, unit: str, short_name: 
             if journal.require_branch and journal.stage is MoveStage.PLANNED and journal.source.matches(old):
                 _ = _required_branch(git_files.at(old))
         try:
-            _ = _finish_worktree_move(journal, protect=_direct_move_guard)
+            _ = _finish_worktree_move(journal, protect=_direct_move_guard, require_finished=require_finished)
         except (MigrationInUse, MigrationPlanChanged) as error:
             raise Refused(1, f"{old}: {error}") from error
     return new
+
+
+def resume_worktree_move_at(path: Path, *, require_idle: Callable[[], None]) -> bool:
+    """Finish publication after staff records the destination."""
+    with move_lock(create=False):
+        journals = tuple(_unfinished_moves_at(path))
+        if not journals:
+            return False
+        if len(journals) != 1:
+            raise ValueError(f"{path}: more than one worktree move needs publication")
+        journal, = journals
+        if not journal.destination.matches(path):
+            raise ValueError(f"{path}: the recorded move destination has changed")
+        require_idle()
+        _ = _finish_worktree_move(journal, protect=_direct_move_guard, require_finished=True)
+        return True
 
 
 @dataclass(frozen=True)

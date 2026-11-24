@@ -32,12 +32,13 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
-    HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
+    HoldEventRecord, SCRIPT, TEST_HOLD_USER_WORDS, invoke_hold, recorded_hold_events, write_holder,
 )
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.lib import conf, test_hang_guard
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.production.cli_fixture import process_boundary
 
@@ -451,7 +452,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                 with self.subTest(action=action, target=target), redirect_stdout(io.StringIO()) as output:
                     arguments = [action, target]
                     if action != "release":
-                        arguments.extend(["--for", "private test"])
+                        arguments.extend(["--for", "private test", "--user-words", TEST_HOLD_USER_WORDS])
                     self.assertEqual(build_hold.main(arguments), 2)
                     self.assertEqual(output.getvalue(), f"{action} {target} is not supported yet\n")
                     self.assertFalse((self.scratch / "holders").exists())
@@ -469,7 +470,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             self.assertEqual(target_config.command_target_name(None), "natedev")
             _ = path.write_text(path.read_text().replace("default_target=natedev", "default_target=all"))
             for action in ("clear", "drain", "release"):
-                arguments = [action] if action == "release" else [action, "--for", "private test"]
+                arguments = [action] if action == "release" else [action, "--for", "private test", "--user-words", TEST_HOLD_USER_WORDS]
                 with self.subTest(action=action), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(build_hold.main(arguments), 2)
                     self.assertEqual(output.getvalue(), f"{action} all is not supported yet\n")
@@ -480,7 +481,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
             for selection in (["--target", "natedev"], ["target", "natedev"]):
                 arguments = [action, *selection]
                 if action != "release":
-                    arguments.extend(["--for", "private test"])
+                    arguments.extend(["--for", "private test", "--user-words", TEST_HOLD_USER_WORDS])
                 with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as result:
                         _ = build_hold.main(arguments)
@@ -488,16 +489,47 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
 
 
 class CommandTests(PrivateReleaseBroadcastTest):
+    def test_clear_and_drain_refuse_missing_or_blank_user_words(self) -> None:
+        folder = self.scratch / "holders"
+        for action in ("clear", "drain"):
+            for words in ([], ["--user-words", ""], ["--user-words", " \t\n"]):
+                with self.subTest(action=action, words=words):
+                    command = [action, "natedev", "--holder", "slot", "--for", "one test",
+                               "--release-eta", "23:59", "--zone", "Etc/GMT+12", *words]
+                    result = invoke_hold(command, {**os.environ, "BUILD_HOLD_DIR": str(folder)})
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("--user-words", result.stderr)
+                    if words:
+                        self.assertIn("a hold requires Nate's explicit request", result.stderr)
+                    self.assertFalse(folder.exists())
+                    self.assertFalse((self.scratch / "release" / "current").exists())
+
+    def test_python_hold_writers_refuse_missing_or_blank_user_words(self) -> None:
+        folder = self.scratch / "holders"
+        identity = build_hold.HolderIdentity("slot", "slot")
+        request = build_hold.NoReleaseEta()
+        now = datetime.now(timezone.utc)
+        for write in (build_hold.write_hold, build_hold.start_hold):
+            with self.subTest(write=write.__name__):
+                with self.assertRaisesRegex(ValueError, "a hold requires Nate's explicit request"):
+                    _ = write(folder, identity, "one test", request, now)
+                with self.assertRaisesRegex(ValueError, "a hold requires Nate's explicit request"):
+                    _ = write(folder, identity, "one test", request, now, user_words=" \t\n")
+                self.assertFalse(folder.exists())
+                self.assertFalse((self.scratch / "release" / "current").exists())
+
     def test_live_holder_precedes_a_former_name_release_receipt(self) -> None:
         folder = self.scratch / "holders"
         for index, by_id in enumerate((False, True)):
             old_name, name, session_id = f"old-{index}", f"new-{index}", f"id-{index}"
             _ = build_hold.start_hold(folder, build_hold.HolderIdentity(old_name, old_name), "old hold",
-                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                      user_words=TEST_HOLD_USER_WORDS)
             self.assertEqual(self.run_cli(folder, "release", "--holder", old_name).returncode, 0)
             self.session(session_id, name, old_name)
             _ = build_hold.start_hold(folder, build_hold.holder_of(name), "new hold",
-                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                      build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                      user_words=TEST_HOLD_USER_WORDS)
             with self.subTest(by_id=by_id):
                 result = self.run_cli(folder, "release", "--holder", session_id if by_id else name)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -509,7 +541,10 @@ class CommandTests(PrivateReleaseBroadcastTest):
         audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"clear", "drain", "status", "audit"} else []
         eta_args = (["--release-eta", "23:59", "--zone", "Etc/GMT+12"]
                     if args[0] in {"clear", "drain"} and "--release-eta" not in args else [])
-        return invoke_hold([*args, *eta_args, *audit_args], {**os.environ, "BUILD_HOLD_DIR": str(folder)})
+        words_args = (["--user-words", TEST_HOLD_USER_WORDS]
+                      if args[0] in {"clear", "drain"} and "--user-words" not in args else [])
+        return invoke_hold([*args, *words_args, *eta_args, *audit_args],
+                           {**os.environ, "BUILD_HOLD_DIR": str(folder)})
 
     def damage_record(self, kind: str, scratch: Path, *, two_holders: bool = False) -> tuple[Path, bytes]:
         folder = scratch / "holders"
@@ -551,13 +586,13 @@ class CommandTests(PrivateReleaseBroadcastTest):
     def hold(self, folder: Path, given: str | None) -> str:
         identity = build_hold.holder_of(given)
         return build_hold.write_hold(folder, identity, "one test", build_hold.release_request(None, None),
-                                     datetime.now().astimezone())
+                                     datetime.now().astimezone(), user_words=TEST_HOLD_USER_WORDS)
 
     def test_session_rename_keeps_begin_and_end_events_under_the_session_id(self) -> None:
         folder = self.scratch / "holders"
         self.session("id-1", "old-name")
         _ = build_hold.start_hold(folder, build_hold.holder_of("old-name"), "render checks",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         self.session("id-1", "new-name", "old-name")
         (self.scratch / "release" / "current").unlink()
         _ = build_hold.release_cycle(folder, build_hold.held_key(folder, "new-name"))
@@ -843,28 +878,33 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
+        words = "  " + TEST_HOLD_USER_WORDS + "  "
         for action in ("clear", "drain"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as scratch, \
                  mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())):
                 folder = Path(scratch)
-                result = self.run_cli(folder, action, "--holder", "slot one", "--for", "the focused test")
+                result = self.run_cli(folder, action, "--holder", "slot one", "--for", "the focused test",
+                                      "--user-words", words)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 path = folder / "slot-one"
                 fields = cast(dict[str, object], json.loads(path.read_text()))
                 self.assertEqual(fields["holder"], "slot one")
                 self.assertEqual(fields["for"], "the focused test")
+                self.assertEqual(fields["user_words"], words)
                 self.assertTrue(cast(str, fields["release_eta"]).endswith("T23:59:00-12:00"))
                 self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
                 if action == "drain":
                     self.assertEqual(result.stdout.splitlines()[-1], "drained; natedev stays held until release")
                 _ = build_hold.start_hold(folder, build_hold.HolderIdentity("slot-one", "slot one"),
-                                          "the focused test", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                          "the focused test", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                          user_words=words)
                 fields = cast(dict[str, object], json.loads(path.read_text()))
                 self.assertEqual(fields["release_eta"], "unknown")
                 status = self.run_cli(folder, "status")
                 self.assertEqual(status.returncode, 0, status.stderr)
                 self.assertIn("slot one", status.stdout)
                 self.assertIn("the focused test", status.stdout)
+                self.assertIn(f'Nate\'s words: "{words}"', status.stdout)
                 self.assertIn("unknown", status.stdout)
                 self.assertIn("release eta unknown", build_hold.holder_text(build_hold.read_holder(path)))
 
@@ -1011,7 +1051,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                     folder = Path(scratch) / "holders"
                     with mock.patch.object(build_hold, "datetime", FixedDatetime), \
                          mock.patch.object(hold_enforcer, "start") as start:
-                        result = invoke_hold([action, "--holder", "slot", "--for", "the test", *eta],
+                        result = invoke_hold([action, "--holder", "slot", "--for", "the test", "--user-words", TEST_HOLD_USER_WORDS, *eta],
                                              {**os.environ, "BUILD_HOLD_DIR": str(folder),
                                               "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
                                               "BUILD_HOLD_ENFORCER_DIR": str(Path(scratch) / "enforcer")})
@@ -1031,7 +1071,8 @@ class CommandTests(PrivateReleaseBroadcastTest):
             folder = Path(scratch)
             now = datetime.fromisoformat("2026-11-01T00:30:00-07:00")
             request = build_hold.release_request("02:30", "America/Los_Angeles")
-            _ = build_hold.write_hold(folder, build_hold.HolderIdentity("slot", "slot"), "clock change", request, now)
+            _ = build_hold.write_hold(folder, build_hold.HolderIdentity("slot", "slot"), "clock change", request, now,
+                                      user_words=TEST_HOLD_USER_WORDS)
             fields = cast(dict[str, object], json.loads((folder / "slot").read_text()))
             self.assertEqual(fields["release_eta"], "2026-11-01T02:30:00-08:00")
 
@@ -1056,6 +1097,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                             with mock.patch.object(build_hold, "datetime", FixedDatetime), \
                                  redirect_stdout(output), redirect_stderr(errors):
                                 result = build_hold.main([action, "--holder", "slot", "--for", "the test",
+                                                          "--user-words", TEST_HOLD_USER_WORDS,
                                                           "--release-eta", eta, "--zone", "America/Los_Angeles"])
                     finally:
                         time.tzset()
@@ -1098,6 +1140,24 @@ HolderFileContent = TypedDict("HolderFileContent", {"holder": str, "since": str,
 
 
 class ReleaseDeliveryTests(IsolatedBuildHoldTest):
+    def test_release_notice_dates_hold_times_by_the_user_day(self) -> None:
+        class FixedDatetime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                return datetime(2026, 11, 23, 8, 1, tzinfo=timezone.utc).astimezone(tz)
+
+        holders = {
+            "old": {"since": "2026-11-23T03:31:19+00:00"},
+            "today": {"since": "2026-11-23T08:00:00+00:00"},
+        }
+        with (mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}),
+              mock.patch.object(build_hold, "datetime", FixedDatetime)):
+            notice = build_hold.release_notice(holders)
+        self.assertTrue(notice.endswith(
+            "Released holds: old hold, from 11-22 19:31:19 PST; today hold, from 00:00:00 PST."
+        ), notice)
+
     def test_a_lookup_is_tried_again_before_it_is_called_unavailable(self) -> None:
         def answers(*codes: int) -> list[subprocess.CompletedProcess[str]]:
             return [subprocess.CompletedProcess([], code, "/tmp/late.sock\n" if code == 0 else "",
@@ -1137,7 +1197,8 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                 }):
                     folder = self.scratch / "holders"
                     _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"),
-                                              "worker tests", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                              "worker tests", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
+                                              user_words=TEST_HOLD_USER_WORDS)
                     self.assertIn("registered", build_hold.register_wait(recipient, "worker"))
                     status = invoke_hold(["status"], dict(os.environ))
                     self.assertEqual(status.returncode, 0, status.stderr)
@@ -1191,7 +1252,7 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                     started = datetime(2026, 11, 11, 12, minute, second, tzinfo=timezone.utc)
                     folder = self.scratch / "holders"
                     _ = build_hold.start_hold(folder, build_hold.HolderIdentity("fps", "fps"), purpose,
-                                              build_hold.NoReleaseEta(), started)
+                                              build_hold.NoReleaseEta(), started, user_words=TEST_HOLD_USER_WORDS)
                     build_hold.record_recipients([("waiting session", "session-a")])
                     cycle = build_hold.read_cycle()
                     assert not isinstance(cycle, build_hold.NoCycle)
@@ -1201,7 +1262,8 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                         build_hold.save_cycle(cycle)
                     if record in ("multiple-holders", "recovered-cycle"):
                         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("resources", "resources"),
-                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1))
+                                                  "render checks", build_hold.NoReleaseEta(), started + timedelta(minutes=1),
+                                                  user_words=TEST_HOLD_USER_WORDS)
                         _ = build_hold.release_cycle(folder, "fps")
                     key = "resources" if record in ("multiple-holders", "recovered-cycle") else "fps"
                     if record == "broadcast":
@@ -1225,11 +1287,11 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
                     notice = arguments[arguments.index("--all" if record == "broadcast" else "--text") + 1]
                     texts.append(notice)
                     if record == "old-cycle":
-                        self.assertIn(f"fps hold, from {shown} EST", notice)
+                        self.assertIn(f"fps hold, from 11-11 {shown} EST", notice)
                     else:
-                        self.assertIn(f"fps hold for {purpose}, from {shown} EST", notice)
+                        self.assertIn(f"fps hold for {purpose}, from 11-11 {shown} EST", notice)
                     if record in ("multiple-holders", "recovered-cycle"):
-                        self.assertIn(f"resources hold for render checks, from 07:{minute + 1}:00 EST", notice)
+                        self.assertIn(f"resources hold for render checks, from 11-11 07:{minute + 1}:00 EST", notice)
                 self.assertNotEqual(texts[0], texts[1])
                 self.assertEqual(len(set(texts)), len(texts))
 
@@ -1396,7 +1458,8 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
             with self.subTest(existing=existing):
                 path = build_hold.holder_path(folder, "holder")
                 if existing:
-                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "old purpose", build_hold.NoReleaseEta(), self.now)
+                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "old purpose", build_hold.NoReleaseEta(), self.now,
+                                              user_words=TEST_HOLD_USER_WORDS)
                 else:
                     path.unlink(missing_ok=True)
                 old = path.read_bytes() if path.exists() else b""
@@ -1410,13 +1473,17 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
                     self.assertEqual(list(folder.iterdir()), old_files)
                     self.assertEqual(source, folder.parent / f"{folder.name}.{path.name}.tmp")
                     content = cast(object, json.loads(source.read_text()))
-                    expected: dict[str, object] = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown", "keep": []}
+                    expected: dict[str, object] = {
+                        "holder": "holder", "since": self.now.isoformat(), "for": "new purpose",
+                        "release_eta": "unknown", "keep": [], "user_words": TEST_HOLD_USER_WORDS,
+                    }
                     self.assertEqual(content, expected)
                     seen.append(source)
                     replace(source, destination)
 
                 with mock.patch.object(os, "replace", side_effect=rename):
-                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new purpose", build_hold.NoReleaseEta(), self.now)
+                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new purpose", build_hold.NoReleaseEta(), self.now,
+                                              user_words=TEST_HOLD_USER_WORDS)
                 self.assertEqual(seen, [folder.parent / f"{folder.name}.{path.name}.tmp"])
                 self.assertEqual(build_hold.read_holder(path).purpose, "new purpose")
 
@@ -1431,7 +1498,8 @@ class AtomicWriteTests(IsolatedBuildHoldTest):
         with mock.patch.object(override_guard, "user_home", return_value=home), \
              self.assertRaises(override_guard.SharedStateWriteRefused) as raised:
             _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"),
-                                      "refused purpose", build_hold.NoReleaseEta(), self.now)
+                                      "refused purpose", build_hold.NoReleaseEta(), self.now,
+                                      user_words=TEST_HOLD_USER_WORDS)
         self.assertIn("build_hold/build_hold.py", str(raised.exception))
         self.assertEqual(shared.read_bytes(), b"shared holder bytes\n")
         self.assertEqual(path.read_bytes(), before)
@@ -1445,7 +1513,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def begin(self, key: str = "session-id", name: str = "old name") -> Path:
         folder = self.scratch / "holders"
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity(key, name), "render checks",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         return folder
 
     def test_locked_log_does_not_delay_hold_or_keep_the_release_lock(self) -> None:
@@ -1456,6 +1524,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
             try:
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "clear", "--holder", "alice", "--for", "render checks",
+                     "--user-words", TEST_HOLD_USER_WORDS,
                      "--release-eta", "23:59", "--zone", "Etc/GMT+12", "--proc-root", str(self.scratch / "proc")],
                     env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1528,7 +1597,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def test_repeated_hold_and_renamed_release_keep_one_begin_and_the_file_key(self) -> None:
         folder = self.begin("unsafe name", "old name")
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("unsafe name", "new name"), "new work",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         self.assertEqual(len(self.events()), 1)
         _ = (self.scratch / "release" / "current").unlink()
         _ = build_hold.release_cycle(folder, "unsafe name")
@@ -1545,7 +1614,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def test_partial_and_final_release_write_end_events_only_after_file_removal(self) -> None:
         folder = self.begin()
         _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other work",
-                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc), user_words=TEST_HOLD_USER_WORDS)
         _ = build_hold.release_cycle(folder, "session-id")
         self.assertFalse((folder / "session-id").exists())
         cycle = build_hold.read_cycle()
@@ -1600,6 +1669,14 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
 class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
     now: datetime = datetime(2026, 10, 28, tzinfo=timezone.utc)
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        _ = (cls.seed / "build_targets.conf").write_text(
+            "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\ndefault_target=natedev\n"
+            + "# whole: 1..604800\nrestart_notice.max_age_seconds=86400\n")
+
     def stop_release_after_unlink(self, name: str) -> subprocess.CompletedProcess[str]:
         release = build_hold.release_hold
 
@@ -1619,16 +1696,24 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertEqual(result.returncode, 1, result.stderr)
 
     def stopped_runs(self, worker: staff.StaffRow, count: int) -> list[build_hold.ReleaseEntry]:
-        return [{"session_id": f"codex:{worker.current_session}", "name": worker.name, "delivery": "NotAttempted",
-                 "run": {"id": f"{worker.name}-{index}", "label": "python3.13 unittest",
-                         "staff_id": str(worker.id), "director_dir": ""}}
+        return self.stopped_runs_for_session(f"codex:{worker.current_session}", worker.name, count, str(worker.id))
+
+    def stopped_runs_for_session(self, session: str, name: str, count: int,
+                                 staff_id: str = "") -> list[build_hold.ReleaseEntry]:
+        boot = self.scratch / "proc/sys/kernel/random/boot_id"
+        boot.parent.mkdir(parents=True, exist_ok=True)
+        _ = boot.write_text("fixture-boot\n")
+        return [{"session_id": session, "name": name, "delivery": "NotAttempted",
+                 "run": {"id": f"{name}-{index}", "label": "python3.13 unittest",
+                         "staff_id": staff_id, "director_dir": "", "pid": index + 1,
+                         "proc_start": "100", "boot_id": "fixture-boot", "owner_session": session}}
                 for index in range(count)]
 
     def release_runs(self, runs: list[build_hold.ReleaseEntry], sent: list[tuple[str, str]],
                      closed: Sequence[str] = ()) -> str:
         cycle = build_hold.open_cycle(datetime.fromisoformat("2026-11-22T10:00:00+00:00"))
         cycle["holders"] = {"holder": {"since": "2026-11-22T10:00:00+00:00", "released_at": "2026-11-22T10:05:00+00:00"}}
-        cycle["release_started_at"] = "2026-11-22T10:05:00+00:00"
+        cycle["release_started_at"] = datetime.now(timezone.utc).isoformat()
         cycle["entries"] = runs
         build_hold.save_cycle(cycle)
         with mock.patch.object(build_hold, "send_release_to", side_effect=self.recorder(sent, closed)):
@@ -1698,6 +1783,23 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             + " For closed-2: python3.13 unittest (Run IDs closed-2-0, closed-2-1).", sent[-1][1])
         self.assertEqual(self.run_deliveries(), ["Delivered"] * 6)
 
+    def test_closed_worker_runs_stay_pending_without_a_director(self) -> None:
+        session = "codex:closed"
+        self.leave_release_pending("holder", [("closed", session)])
+        self.pending_runs(self.stopped_runs_for_session(session, "closed", 2))
+        with (mock.patch.object(build_hold, "send_release_to", side_effect=[
+                  build_hold.ReleaseWorkerClosed(), build_hold.ReleaseDelivered(),
+              ]) as send,
+              mock.patch.object(build_hold, "send_session_release", return_value=build_hold.ReleaseDelivered()) as ordinary):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Release notices still pending for closed.")
+            self.assertEqual(self.run_deliveries(), ["RecipientGone"] * 2)
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume.")
+        self.assertEqual([cast(str, call.args[1]) for call in send.call_args_list], [session, session])
+        ordinary.assert_called_once()
+        self.assertEqual(self.run_deliveries(), ["Delivered"] * 2)
+
     def test_release_splits_a_long_run_list_into_notices_that_fit_one_argument(self) -> None:
         director = fixture_member("showrunner", name="director")
         worker = fixture_member("worker", name="phases", parent=director.id)
@@ -1710,6 +1812,57 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertIn("Restart the 2 stopped runs for phases: python3.13 unittest (Run IDs phases-8, phases-9).",
                       sent[2][1])
         self.assertEqual(self.run_deliveries(), ["Delivered"] * 10)
+
+    def test_director_fallback_splits_a_long_run_list(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        first = fixture_member("worker", name="first", parent=director.id)
+        second = fixture_member("worker", name="second", parent=director.id)
+        closed = [f"codex:{row.current_session}" for row in (first, second)]
+        sent: list[tuple[str, str]] = []
+        with mock.patch.object(build_hold, "RELEASE_NOTICE_RUN_LIMIT", 4):
+            _ = self.release_runs([*self.stopped_runs(first, 3), *self.stopped_runs(second, 3)], sent, closed)
+        self.assertEqual([to for to, _ in sent], [*closed, str(director.id), str(director.id)])
+        self.assertIn("Restart the 4 stopped runs.", sent[2][1])
+        self.assertIn("first-2", sent[2][1])
+        self.assertIn("second-0", sent[2][1])
+        self.assertIn("Restart the 2 stopped runs for second:", sent[3][1])
+        self.assertNotIn("second-0", sent[3][1])
+        self.assertEqual(self.run_deliveries(), ["Delivered"] * 6)
+
+    def test_director_fallback_rechecks_runs_and_retries_a_failed_send(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="closed", parent=director.id)
+        session = f"codex:{worker.current_session}"
+        self.leave_release_pending("holder", [(worker.name, session)])
+        self.pending_runs(self.stopped_runs(worker, 2))
+
+        def send(_entries: Sequence[build_hold.ReleaseEntry], address: str,
+                 notice: str) -> build_hold.ReleaseNoticeResult:
+            if address == session:
+                reused = self.scratch / "proc/2"
+                reused.mkdir(exist_ok=True)
+                _ = (reused / "stat").write_text("2 (python) S " + "0 " * 18 + "200")
+                return build_hold.ReleaseWorkerClosed()
+            self.assertEqual(address, str(director.id))
+            self.assertIn("Run ID closed-0.", notice)
+            self.assertNotIn("closed-1", notice)
+            return build_hold.ReleaseSendFailed("fixture send failure")
+
+        with (mock.patch.object(build_hold, "send_release_to", side_effect=send) as sender,
+              mock.patch.object(build_hold, "send_session_release", return_value=build_hold.ReleaseDelivered()) as ordinary):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices."
+                             + " Release notices still pending for closed.")
+        self.assertEqual([cast(str, call.args[1]) for call in sender.call_args_list], [session, str(director.id)])
+        ordinary.assert_called_once()
+        self.assertEqual(self.run_deliveries(), ["DeliveryFailed"])
+        with mock.patch.object(build_hold, "send_release_to", side_effect=[
+            build_hold.ReleaseWorkerClosed(), build_hold.ReleaseDelivered(),
+        ]) as retry:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume.")
+        self.assertEqual([cast(str, call.args[1]) for call in retry.call_args_list], [session, str(director.id)])
+        self.assertEqual(self.run_deliveries(), ["Delivered"])
 
     def test_release_names_each_session_of_a_notice_once(self) -> None:
         runs = [build_hold.new_entry(session, "worker") for session in ("codex:a", "codex:b", "codex:a")]
@@ -1795,21 +1948,551 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         line, = [line for line in result.stdout.splitlines() if line.startswith("release pending:")]
         self.assertIn(" - unsent: phases (3 stopped runs), twin (1 stopped run), twin (1 stopped run);", line)
 
-    def test_gone_claude_session_run_with_no_route_is_not_reached_and_not_pending(self) -> None:
+    def test_gone_claude_session_run_with_no_route_stays_pending(self) -> None:
         self.leave_release_pending("builds", [("gone session", "gone")])
-        self.pending_runs([{"session_id": "gone", "name": "gone session", "delivery": "NotAttempted",
-                            "run": {"id": f"run-{index}", "label": "python3.13 unittest", "staff_id": "",
-                                    "director_dir": ""}} for index in range(3)])
+        self.pending_runs(self.stopped_runs_for_session("gone", "gone session", 3))
         with (mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientGone()) as lookup,
               mock.patch.object(build_hold, "send_release_to") as send):
             result = invoke_hold(["release", "--holder", "builds"], dict(os.environ))
         self.assertEqual((result.returncode, result.stdout, result.stderr), (
-            0, "released, builds may resume. Not reached, tell them yourself: gone session (session gone)\n", ""))
-        lookup.assert_called_once_with("gone")
+            0, "released, builds may resume. Release notices still pending for gone session.\n", ""))
+        self.assertEqual(lookup.call_args_list, [mock.call("gone"), mock.call("gone")])
         send.assert_not_called()
         self.assertEqual(self.run_deliveries(), ["RecipientGone"] * 3)
         with build_hold.release_lock() as held:
-            self.assertFalse(any(record.state == "pending" for record in build_hold.recorded_releases(held)))
+            self.assertTrue(any(record.state == "pending" for record in build_hold.recorded_releases(held)))
+
+    def pending_restart(self, recipient: str, *, owner: str, legacy: bool = False,
+                        independent: bool = False, unknown_wait: bool = False) -> tuple[Path, Path, build_hold.ReleaseIntent]:
+        proc = self.scratch / "proc"
+        _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
+        boot = proc / "sys/kernel/random/boot_id"
+        boot.parent.mkdir(parents=True)
+        _ = boot.write_text("fixture-boot\n")
+        process = proc / "42"
+        process.mkdir()
+        _ = (process / "stat").write_text("42 (python) S " + "0 " * 18 + "100")
+        _ = (process / "environ").write_bytes(f"CODEX_THREAD_ID={owner}\0".encode())
+        run: build_hold.StoppedRun = {"id": "fixture", "label": "python -m unittest", "staff_id": "",
+                                     "director_dir": ""}
+        if not legacy:
+            run.update(pid=42, proc_start="100", boot_id="fixture-boot", owner_session=f"codex:{owner}")
+        self.begin("holder")
+        if unknown_wait:
+            cycle = self.cycle()
+            cycle["recipients"][recipient] = recipient
+            cycle["entries"].append(build_hold.new_entry(recipient, recipient))
+            build_hold.save_cycle(cycle)
+        _ = build_hold.register_wait(recipient, independent=False)
+        if independent:
+            _ = build_hold.register_wait(recipient)
+        result = self.stop_release_after_unlink("holder")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        path = build_hold.release_directory() / "pending-release.json"
+        intent = build_hold.read_release_intent(path)
+        assert not isinstance(intent, build_hold.NoReleaseIntent)
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        entry: build_hold.ReleaseEntry = {**build_hold.new_entry(recipient, recipient), "run": run}
+        notices["runs"] = [entry]
+        _ = path.write_text(json.dumps(intent))
+        return process, path, intent
+
+    def assert_restart_dropped(self) -> None:
+        with mock.patch.object(build_hold, "send_release_to") as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+            send.assert_not_called()
+        self.assertEqual(self.cycle()["entries"], [])
+        with build_hold.release_lock() as held:
+            receipt, = build_hold.recorded_releases(held)
+        self.assertEqual(receipt.state, "completed")
+        notices = receipt.intent["notices"]
+        assert notices["kind"] == "cycle"
+        self.assertEqual(notices.get("runs"), [])
+        self.assertEqual(notices["recipients"], {})
+
+    def test_release_notifies_when_the_confirmed_process_has_exited(self) -> None:
+        process, _, _ = self.pending_restart("codex:owner", owner="owner")
+        (process / "stat").unlink()
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume.")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), "codex:owner")
+        self.assertIn("Run ID fixture.", cast(str, send.call_args.args[2]))
+
+    def test_release_drops_pending_restart_when_the_pid_was_reused(self) -> None:
+        process, _, _ = self.pending_restart("codex:owner", owner="owner")
+        _ = (process / "stat").write_text("42 (python) S " + "0 " * 18 + "200")
+        self.assert_restart_dropped()
+
+    def test_release_drops_pending_restart_for_another_session(self) -> None:
+        _ = self.pending_restart("codex:other-session", owner="owner")
+        self.assert_restart_dropped()
+
+    def test_release_drops_legacy_restart_without_process_evidence(self) -> None:
+        _ = self.pending_restart("codex:owner", owner="owner", legacy=True)
+        self.assert_restart_dropped()
+
+    def test_pending_codex_restart_does_not_hide_the_ordinary_notice(self) -> None:
+        recipient = "codex:owner"
+        _ = self.pending_restart(recipient, owner="owner")
+        closed = subprocess.CompletedProcess([], SEND_CLOSED_EXIT, "CLOSED: worker unavailable", "")
+        delivered = subprocess.CompletedProcess([], 0, "SENT: delivered", "")
+        with mock.patch.object(subprocess, "run", side_effect=[closed, delivered, delivered]) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Release notices still pending for codex:owner.")
+            with build_hold.release_lock() as held:
+                record, = build_hold.recorded_releases(held)
+            self.assertEqual(record.state, "pending")
+            cycle = self.cycle()
+            entry, = build_hold.stopped_run_entries(cycle["entries"]).values()
+            self.assertEqual(entry["delivery"], "RecipientGone")
+            self.assertEqual(entry["session_id"], recipient)
+            self.assertEqual(build_hold.first_release_entries(cycle)[recipient]["delivery"], "Delivered")
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume.")
+        restart, ordinary, retry = [cast(list[str], call.args[0]) for call in send.call_args_list]
+        self.assertEqual(restart, retry)
+        self.assertIn("--exact-thread", restart)
+        self.assertNotIn("--exact-thread", ordinary)
+        for args in (restart, ordinary):
+            self.assertEqual(args[args.index("--to") + 1], recipient)
+
+    def test_new_release_replaces_only_older_restarts_for_the_same_session(self) -> None:
+        recipient = "codex:owner"
+        process, path, intent = self.pending_restart(recipient, owner="owner")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        older, = notices.get("runs", [])
+        assert "run" in older
+        new_run: build_hold.StoppedRun = {**older["run"], "id": "new-run"}
+        notices["recipients"]["codex:other"] = "other waiter"
+        _ = path.write_text(json.dumps(intent))
+        _ = process.joinpath("stat").write_text("42 (python) Z " + "0 " * 18 + "100")
+        delivered = build_hold.ReleaseDelivered()
+        with mock.patch.object(build_hold, "send_release_to", side_effect=[
+            build_hold.ReleaseWorkerClosed(), delivered, delivered, delivered,
+        ]) as send:
+            self.begin("second")
+            _ = build_hold.register_wait(recipient, independent=False)
+            cycle = self.cycle()
+            cycle["entries"].append({**build_hold.new_entry(recipient, recipient), "run": new_run})
+            build_hold.save_cycle(cycle)
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "second"),
+                             "released, builds may resume. Release notices still pending for codex:owner.")
+            with build_hold.release_lock() as held:
+                records = build_hold.recorded_releases(held)
+            self.assertCountEqual([(item.intent["holder_key"], item.state) for item in records],
+                                  [("holder", "completed"), ("second", "pending")])
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "second", resume=True),
+                             "released, builds may resume.")
+        entries = [entry for call in send.call_args_list
+                   for entry in cast(Sequence[build_hold.ReleaseEntry], call.args[0])]
+        self.assertEqual([entry["run"]["id"] for entry in entries if "run" in entry], ["new-run", "new-run"])
+        self.assertCountEqual([entry["session_id"] for entry in entries if "run" not in entry],
+                              [recipient, "codex:other"])
+        old = next(item.intent["notices"] for item in records if item.intent["holder_key"] == "holder")
+        assert old["kind"] == "cycle"
+        self.assertEqual(old.get("runs"), [])
+
+    def test_invalid_newer_restart_keeps_the_valid_older_restart(self) -> None:
+        recipient = "codex:owner"
+        process, _, intent = self.pending_restart(recipient, owner="owner")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        older, = notices.get("runs", [])
+        assert "run" in older
+        newer: build_hold.StoppedRun = {**older["run"], "id": "new-run", "proc_start": "99"}
+        _ = (process / "stat").write_text("42 (python) S " + "0 " * 18 + "100")
+        self.begin("second")
+        _ = build_hold.register_wait(recipient, independent=False)
+        cycle = self.cycle()
+        cycle["entries"].append({**build_hold.new_entry(recipient, recipient), "run": newer})
+        build_hold.save_cycle(cycle)
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "second"),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+        send.assert_called_once()
+        self.assertIn("Run ID fixture.", cast(str, send.call_args.args[2]))
+
+    def test_unverified_newer_restart_keeps_the_valid_older_restart(self) -> None:
+        recipient = "codex:owner"
+        _, _, intent = self.pending_restart(recipient, owner="owner")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        older, = notices.get("runs", [])
+        assert "run" in older
+        newer: build_hold.StoppedRun = {**older["run"], "id": "new-run", "pid": 43, "staff_id": "missing-staff"}
+        self.begin("second")
+        _ = build_hold.register_wait(recipient, independent=False)
+        cycle = self.cycle()
+        cycle["entries"].append({**build_hold.new_entry(recipient, recipient), "run": newer})
+        build_hold.save_cycle(cycle)
+
+        delivered = build_hold.ReleaseDelivered()
+        with (staff.supplied_snapshot(staff.StaffSnapshot((), production=True)),
+              mock.patch.object(build_hold, "send_release_to", return_value=delivered) as send,
+              mock.patch.object(build_hold, "send_session_release", return_value=delivered)):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "second"),
+                             "released, builds may resume. Release notices still pending for codex:owner.")
+        send.assert_called_once()
+        self.assertIn("Run ID fixture.", cast(str, send.call_args.args[2]))
+        entry, = build_hold.stopped_run_entries(self.cycle()["entries"]).values()
+        self.assertEqual(entry["delivery"], "DeliveryFailed")
+        with build_hold.release_lock() as held:
+            records = build_hold.recorded_releases(held)
+        self.assertCountEqual([(record.intent["holder_key"], record.state) for record in records],
+                              [("holder", "completed"), ("second", "pending")])
+
+    def test_failed_restart_prune_does_not_block_ordinary_notices(self) -> None:
+        recipient = "codex:owner"
+        _, path, intent = self.pending_restart(recipient, owner="owner")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        older, = notices.get("runs", [])
+        assert "run" in older
+        notices["recipients"]["codex:first-waiter"] = "first waiter"
+        _ = path.write_text(json.dumps(intent))
+        newer: build_hold.StoppedRun = {**older["run"], "id": "new-run"}
+        self.begin("second")
+        _ = build_hold.register_wait("codex:second-waiter", "second waiter")
+        cycle = self.cycle()
+        cycle["entries"].append({**build_hold.new_entry(recipient, recipient), "run": newer})
+        build_hold.save_cycle(cycle)
+
+        def reject_old_prune(target: Path, data: str) -> None:
+            if target.name == path.name and target.parent.parent.name == "releases":
+                raise OSError("cannot prune the old release")
+            write_text_atomic(target, data)
+
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            with (mock.patch.object(build_hold, "write_text_atomic", side_effect=reject_old_prune),
+                  self.assertRaisesRegex(OSError, "cannot prune the old release")):
+                _ = build_hold.release_cycle(build_hold.holder_directory(), "second")
+            entries = [entry for call in send.call_args_list
+                       for entry in cast(Sequence[build_hold.ReleaseEntry], call.args[0])]
+            self.assertCountEqual([entry["session_id"] for entry in entries if "run" not in entry],
+                                  ["codex:first-waiter", "codex:second-waiter"])
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "second", resume=True),
+                             "hold is already released.")
+        with build_hold.release_lock() as held:
+            records = build_hold.recorded_releases(held)
+        self.assertCountEqual([(record.intent["holder_key"], record.state) for record in records],
+                              [("holder", "completed"), ("second", "completed")])
+        entries = [entry for call in send.call_args_list
+                   for entry in cast(Sequence[build_hold.ReleaseEntry], call.args[0])]
+        self.assertEqual([entry["run"]["id"] for entry in entries if "run" in entry], ["new-run"])
+        self.assertCountEqual([entry["session_id"] for entry in entries if "run" not in entry],
+                              ["codex:first-waiter", "codex:second-waiter"])
+
+    def test_delivered_receipt_suppresses_older_restart_after_pid_reuse(self) -> None:
+        recipient = "codex:owner"
+        process, _, intent = self.pending_restart(recipient, owner="owner")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        older, = notices.get("runs", [])
+        assert "run" in older
+        reused = process.with_name("43")
+        reused.mkdir()
+        _ = (reused / "stat").write_text("43 (python) S " + "0 " * 18 + "200")
+        newer: build_hold.StoppedRun = {**older["run"], "id": "new-run", "pid": 43}
+        self.begin("second")
+        cycle = self.cycle()
+        cycle["entries"].append({**build_hold.new_entry(recipient, recipient),
+                                 "delivery": "Delivered", "run": newer})
+        build_hold.save_cycle(cycle)
+        self.assertEqual(self.stop_release_after_unlink("second").returncode, 1)
+        with build_hold.release_lock() as held:
+            records = build_hold.recorded_releases(held)
+            receipt = next(record for record in records if record.intent["holder_key"] == "second")
+            build_hold.complete_release_record(held, receipt)
+
+        with (mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send,
+              mock.patch.object(build_hold, "restart_evidence", wraps=build_hold.restart_evidence) as evidence):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "second", resume=True),
+                             "hold is already released.")
+        send.assert_not_called()
+        evidence.assert_not_called()
+        with build_hold.release_lock() as held:
+            records = build_hold.recorded_releases(held)
+        self.assertCountEqual([(record.intent["holder_key"], record.state) for record in records],
+                              [("holder", "completed"), ("second", "completed")])
+
+    def test_release_keeps_failed_restart_for_a_thread_without_staff(self) -> None:
+        recipient = "codex:owner"
+        _ = self.pending_restart(recipient, owner="owner")
+        failed = subprocess.CompletedProcess([], 3, "FAILED: daemon timed out", "")
+        empty = staff.StaffSnapshot((), production=True)
+        with (staff.supplied_snapshot(empty),
+              mock.patch.object(staff, "authority_snapshot", return_value=empty) as authority,
+              mock.patch.object(build_hold, "send_session_release", return_value=build_hold.ReleaseDelivered()),
+              mock.patch.object(subprocess, "run", return_value=failed) as send):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Release notices still pending for codex:owner.")
+        send.assert_called_once()
+        authority.assert_not_called()
+        self.assertIn("--exact-thread", cast(list[str], send.call_args.args[0]))
+        entry, = build_hold.stopped_run_entries(self.cycle()["entries"]).values()
+        self.assertEqual(entry["delivery"], "DeliveryFailed")
+        with build_hold.release_lock() as held:
+            record, = build_hold.recorded_releases(held)
+        self.assertEqual(record.state, "pending")
+
+    def test_release_removes_expired_restart_without_sending(self) -> None:
+        recipient = "codex:owner"
+        _, _, intent = self.pending_restart(recipient, owner="owner")
+        released = datetime.fromisoformat(intent["released_at"])
+        config = self.scratch / "release-config"
+        config.mkdir()
+        _ = (config / "build_targets.conf").write_text("# whole: 1..120\nrestart_notice.max_age_seconds=60\n")
+        holders = build_hold.holder_directory()
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseSendFailed("timeout")) as send,
+              mock.patch.object(build_hold, "send_session_release", return_value=build_hold.ReleaseDelivered()) as ordinary):
+            self.assertEqual(build_hold.release_cycle(holders, "holder", resume=True,
+                                                      clock=lambda: released + timedelta(seconds=60)),
+                             "released, builds may resume. Release notices still pending for codex:owner.")
+            send.assert_called_once()
+            ordinary.assert_called_once()
+            send.reset_mock()
+            ordinary.reset_mock()
+            self.assertEqual(build_hold.release_cycle(holders, "holder", resume=True,
+                                                      clock=lambda: released + timedelta(seconds=61)),
+                             "released, builds may resume. Expired 1 restart notices.")
+            send.assert_not_called()
+            ordinary.assert_not_called()
+        self.assertEqual(self.cycle()["entries"], [])
+        with build_hold.release_lock() as held:
+            record, = build_hold.recorded_releases(held)
+        self.assertEqual(record.state, "completed")
+        notices = record.intent["notices"]
+        assert notices["kind"] == "cycle"
+        self.assertEqual(notices.get("runs"), [])
+        self.assertEqual(notices["recipients"], {})
+
+    def test_release_checks_each_restart_age_before_sending(self) -> None:
+        recipient = "codex:owner"
+        _, path, intent = self.pending_restart(recipient, owner="owner")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        first, = notices.get("runs", [])
+        assert "run" in first
+        notices["runs"] = [first, {**first, "run": {**first["run"], "id": "next-run"}}]
+        _ = path.write_text(json.dumps(intent))
+        config = self.scratch / "release-config"
+        config.mkdir()
+        _ = (config / "build_targets.conf").write_text("# whole: 1..120\nrestart_notice.max_age_seconds=60\n")
+        now = datetime.fromisoformat(intent["released_at"]) + timedelta(seconds=60)
+
+        def send_restart(_entries: Sequence[build_hold.ReleaseEntry], _address: str,
+                         _notice: str) -> build_hold.ReleaseDelivered:
+            nonlocal now
+            now += timedelta(seconds=1)
+            return build_hold.ReleaseDelivered()
+
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
+              mock.patch.object(build_hold, "RELEASE_NOTICE_RUN_LIMIT", 1),
+              mock.patch.object(build_hold, "send_release_to", side_effect=send_restart) as send):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True,
+                                                      clock=lambda: now),
+                             "released, builds may resume. Expired 1 restart notices.")
+        send.assert_called_once()
+        self.assertIn("Run ID fixture.", cast(str, send.call_args.args[2]))
+        self.assertEqual(list(build_hold.stopped_run_entries(self.cycle()["entries"])), ["fixture"])
+        with build_hold.release_lock() as held:
+            record, = build_hold.recorded_releases(held)
+        self.assertEqual(record.state, "completed")
+
+    def test_restart_can_expire_between_the_owner_and_director_sends(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        worker = fixture_member("worker", name="worker", parent=director.id)
+        session = f"codex:{worker.current_session}"
+        self.leave_release_pending("holder", [])
+        self.pending_runs(self.stopped_runs(worker, 2))
+        intent = build_hold.read_release_intent(build_hold.release_directory() / "pending-release.json")
+        assert not isinstance(intent, build_hold.NoReleaseIntent)
+        now = datetime.fromisoformat(intent["released_at"]) + build_hold.restart_notice_max_age()
+
+        def close_owner(entries: Sequence[build_hold.ReleaseEntry], address: str,
+                        _notice: str) -> build_hold.ReleaseWorkerClosed:
+            nonlocal now
+            self.assertEqual(address, session)
+            self.assertEqual(len(entries), 2)
+            now += timedelta(seconds=1)
+            return build_hold.ReleaseWorkerClosed()
+
+        with mock.patch.object(build_hold, "send_release_to", side_effect=close_owner) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True,
+                                                      clock=lambda: now),
+                             "released, builds may resume. Expired 2 restart notices.")
+        send.assert_called_once()
+        self.assertEqual(self.run_deliveries(), [])
+
+    def test_release_retried_before_unlink_keeps_one_pending_record(self) -> None:
+        self.begin("holder")
+        _ = build_hold.register_wait("codex:owner")
+        holders = build_hold.holder_directory()
+        with mock.patch.object(build_hold, "release_hold", side_effect=OSError("interrupted before unlink")):
+            for _ in range(2):
+                with self.assertRaisesRegex(OSError, "interrupted before unlink"):
+                    _ = build_hold.release_cycle(holders, "holder")
+        with build_hold.release_lock() as held:
+            record, = build_hold.recorded_releases(held)
+        self.assertEqual(record.state, "pending")
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(holders, "holder"), "released, builds may resume.")
+        send.assert_called_once()
+
+    def test_enforcer_registration_preserves_an_unknown_wait_after_a_stale_restart(self) -> None:
+        recipient = "codex:owner"
+        _, _, intent = self.pending_restart(recipient, owner="owner", legacy=True, unknown_wait=True)
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        self.assertNotIn(recipient, notices.get("stop_waits", []))
+        self.assertNotIn(recipient, self.cycle().get("independent_waits", {}))
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), recipient)
+        self.assertNotIn("Restart the stopped run", cast(str, send.call_args.args[2]))
+        self.assertEqual(self.cycle()["recipients"], {recipient: recipient})
+
+    def test_old_release_keeps_an_unknown_wait_after_dropping_the_restart(self) -> None:
+        recipient = "codex:owner"
+        _, path, intent = self.pending_restart(recipient, owner="owner", legacy=True)
+        older = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        intent["released_at"] = older
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        _ = notices.pop("stop_waits")
+        _ = path.write_text(json.dumps(intent))
+        build_hold.retain_release_record(path)
+        cycle = self.cycle()
+        _ = cycle.pop("independent_waits")
+        cycle["release_started_at"] = older
+        build_hold.save_cycle(cycle)
+
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), recipient)
+        self.assertNotIn("Restart the stopped run", cast(str, send.call_args.args[2]))
+        self.assertEqual(self.cycle()["recipients"], {recipient: recipient})
+
+    def test_release_keeps_an_independent_wait_when_the_restart_is_stale(self) -> None:
+        _ = self.pending_restart("codex:owner", owner="owner", legacy=True, independent=True)
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), "codex:owner")
+        self.assertNotIn("Restart the stopped run", cast(str, send.call_args.args[2]))
+        self.assertEqual(self.cycle()["recipients"], {"codex:owner": "codex:owner"})
+
+    def test_release_keeps_a_legacy_wait_named_by_its_session_id(self) -> None:
+        recipient = "codex:owner"
+        _, path, intent = self.pending_restart(recipient, owner="owner", legacy=True)
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        _ = notices.pop("stop_waits")
+        _ = path.write_text(json.dumps(intent))
+        cycle = self.cycle()
+        _ = cycle.pop("independent_waits")
+        build_hold.save_cycle(cycle)
+
+        with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), recipient)
+        self.assertNotIn("Restart the stopped run", cast(str, send.call_args.args[2]))
+        self.assertEqual(self.cycle()["recipients"], {recipient: recipient})
+
+    def test_release_refuses_a_detached_restart_for_the_launcher_instead_of_the_owner(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        launcher = fixture_member("worker", name="launcher", parent=director.id)
+        owner = fixture_member("worker", name="owner", parent=director.id)
+        _, path, intent = self.pending_restart(f"codex:{launcher.current_session}", owner=launcher.current_session)
+        runner = self.scratch / "fixture.json"
+        _ = runner.write_text(json.dumps({"run_id": "fixture", "status": "finished", "staff_id": str(owner.id),
+                                          "command_pid": 42, "command_started": "100"}))
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        entry, = notices.get("runs", [])
+        run = entry.get("run")
+        assert run is not None
+        run.update(staff_id=str(owner.id), record_path=str(runner))
+        _ = path.write_text(json.dumps(intent))
+        self.assert_restart_dropped()
+
+    def test_release_rechecks_identity_after_socket_lookup_and_keeps_receipt_readable(self) -> None:
+        process, path, intent = self.pending_restart("codex:owner", owner="owner")
+        second = process.parent / "43"
+        second.mkdir()
+        _ = (second / "stat").write_text("43 (python) S " + "0 " * 18 + "100")
+        _ = (second / "environ").write_bytes(b"CLAUDE_CODE_SESSION_ID=second\0")
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        run: build_hold.StoppedRun = {"id": "second", "label": "python -m unittest", "staff_id": "",
+                                     "director_dir": "", "pid": 43, "proc_start": "100",
+                                     "boot_id": "fixture-boot", "owner_session": "second"}
+        notices.setdefault("runs", []).append({**build_hold.new_entry("second", "second"), "run": run})
+        _ = path.write_text(json.dumps(intent))
+
+        def reused(session: str) -> build_hold.RecipientLive:
+            self.assertEqual(session, "second")
+            _ = (second / "stat").write_text("43 (python) S " + "0 " * 18 + "200")
+            return build_hold.RecipientLive("/fixture/socket")
+
+        with (mock.patch.object(build_hold, "socket_for", side_effect=reused) as lookup,
+              mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices.")
+        lookup.assert_called_once_with("second")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), "codex:owner")
+        with build_hold.release_lock() as held:
+            receipt, = build_hold.recorded_releases(held)
+        self.assertEqual(receipt.state, "completed")
+        saved = receipt.intent["notices"]
+        assert saved["kind"] == "cycle"
+        entry, = saved.get("runs", [])
+        self.assertEqual(entry["delivery"], "NotAttempted")
+
+    def test_release_checks_every_run_in_the_saved_session_batch(self) -> None:
+        session = "claude-owner"
+        self.leave_release_pending("holder", [("owner", session)])
+        runs = self.stopped_runs_for_session(session, "owner", 3)
+        record = self.scratch / "run.json"
+        run = runs[2].get("run")
+        assert run is not None
+        run["record_path"] = str(record)
+        self.pending_runs(runs)
+
+        def lookup(recipient: str) -> build_hold.RecipientLive:
+            self.assertEqual(recipient, session)
+            reused = self.scratch / "proc/2"
+            reused.mkdir()
+            _ = (reused / "stat").write_text("2 (python) S " + "0 " * 18 + "200")
+            _ = record.write_text("{")
+            return build_hold.RecipientLive("/fixture/socket")
+
+        with (mock.patch.object(build_hold, "socket_for", side_effect=lookup),
+              mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send):
+            self.assertEqual(build_hold.release_cycle(build_hold.holder_directory(), "holder", resume=True),
+                             "released, builds may resume. Dropped 1 invalid restart notices."
+                             + " Release notices still pending for owner.")
+        send.assert_called_once()
+        self.assertEqual(cast(str, send.call_args.args[1]), "uds:/fixture/socket")
+        notice = cast(str, send.call_args.args[2])
+        self.assertIn("Run ID owner-0.", notice)
+        self.assertNotIn("owner-1", notice)
+        self.assertNotIn("owner-2", notice)
+        self.assertEqual(self.run_deliveries(), ["Delivered", "DeliveryFailed"])
 
     def test_closed_codex_result_stays_pending_until_the_worker_can_receive_it(self) -> None:
         parent = fixture_member("showrunner", name="runner")
@@ -2407,7 +3090,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
             folder = self.scratch / "holders"
             _ = build_hold.start_hold(folder, build_hold.holder_of(member.name), "rename recovery",
-                                      build_hold.NoReleaseEta(), self.now)
+                                      build_hold.NoReleaseEta(), self.now, user_words=TEST_HOLD_USER_WORDS)
             build_hold.record_recipients([("waiting", "rename-recipient")])
             self.assertEqual(self.stop_release_after_unlink(member.name).returncode, 1)
             intent = build_hold.read_release_intent(build_hold.release_directory() / "pending-release.json")
@@ -2454,7 +3137,8 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.begin()
         build_hold.record_recipients([("waiting", "one")])
         _ = build_hold.write_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"),
-                                  "updated hold", build_hold.NoReleaseEta(), self.now + timedelta(seconds=1))
+                                  "updated hold", build_hold.NoReleaseEta(), self.now + timedelta(seconds=1),
+                                  user_words=TEST_HOLD_USER_WORDS)
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
             result = invoke_hold(["release", "--holder", "holder"], dict(os.environ))
@@ -2576,7 +3260,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         for pid in (10, 20):
             _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"),
                                       "again", build_hold.NoReleaseEta(), self.now,
-                                      (build_hold.ProcessIdentity(pid, str(pid * 10)),))
+                                      (build_hold.ProcessIdentity(pid, str(pid * 10)),), user_words=TEST_HOLD_USER_WORDS)
         self.assertEqual(self.cycle()["release_started_at"], "")
         self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
         self.assertIn("wait for release", build_hold.register_wait("waiter"))
@@ -2593,7 +3277,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
 
     def begin(self, name: str = "holder") -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity(name, name),
-                                  "tests", build_hold.NoReleaseEta(), self.now)
+                                  "tests", build_hold.NoReleaseEta(), self.now, user_words=TEST_HOLD_USER_WORDS)
 
     def cycle(self) -> build_hold.HoldCycle:
         cycle = build_hold.read_cycle()
@@ -2872,6 +3556,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                         self.holders, build_hold.HolderIdentity("holder", "holder"),
                         "app test", build_hold.NoReleaseEta(), datetime.now(timezone.utc),
                         (build_hold.ProcessIdentity(kept_pid, str(kept_pid * 10)),),
+                        user_words=TEST_HOLD_USER_WORDS,
                     )
                     holders = build_hold.natedev_holds(self.holders).in_force
                     kept = hold_enforcer.decide_builds(table, holders, os.getuid(), 999, self.claimed)
@@ -3061,10 +3746,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         output = io.StringIO()
         with redirect_stdout(output):
             for pid in (10, 20):
-                self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
+                self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                                                  "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                                  "--proc-root", str(self.proc), "--keep", str(pid)]), 0)
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                                              "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                              "--proc-root", str(self.proc), "--keep", "999"]), 1)
         holder, = build_hold.natedev_holds(self.holders).in_force
@@ -3080,7 +3765,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                               ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
             if action == "clear":
-                args.extend(["--holder", "holder", "--for", "app test",
+                args.extend(["--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                              "--release-eta", "23:59", "--zone", "Etc/GMT+12"])
             output = io.StringIO()
             if entry == "__main__":
@@ -3114,7 +3799,7 @@ with mock.patch("sys.exit", side_effect=exit_code):
 
     def test_audit_read_failure_does_not_fail_hold_or_status(self) -> None:
         missing_proc = self.scratch / "missing-proc"
-        for args in (["clear", "--holder", "holder", "--for", "app test",
+        for args in (["clear", "--holder", "holder", "--for", "app test", "--user-words", TEST_HOLD_USER_WORDS,
                       "--release-eta", "23:59", "--zone", "Etc/GMT+12"], ["status"]):
             output = io.StringIO()
             with redirect_stdout(output):

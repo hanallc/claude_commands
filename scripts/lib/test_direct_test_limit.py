@@ -24,9 +24,22 @@ MODULE_RUN = REPO / "scripts/test_times/module_run.py"
 CASE_LIMIT = 2
 LIMIT_LINE = f"stopped at the {CASE_LIMIT}-second direct test limit; run longer tests with targeted_test.py --module"
 LIMIT_REQUEST = f"scope requested: {CASE_LIMIT}"
+SELECTION_REFUSAL = "more than one test: run it with copies.py --affected or --module"
 FIXTURE_SCOPE = "claude-direct-test-" + "0" * 32 + ".scope"
-LIMIT_FIXTURE = STANDALONE_TEST_STARTUP + """
+DIRECT_TEST_STARTUP = STANDALONE_TEST_STARTUP + """
+import os
+
 startup = sys.modules["_devtools_python_startup"]
+if sys.platform == "linux":
+    inherited_cgroup = startup._cgroup(os.getpid())
+    direct_test_unit = startup._direct_test_unit
+
+    def fixture_unit(cgroup: str) -> str:
+        return "" if cgroup == inherited_cgroup else direct_test_unit(cgroup)
+
+    startup._direct_test_unit = fixture_unit
+"""
+LIMIT_FIXTURE = DIRECT_TEST_STARTUP + """
 startup._user_test_manager_available = lambda: True
 startup._adopt_direct_test_scope = lambda seconds: print(f"scope requested: {seconds}", flush=True)
 """
@@ -51,6 +64,17 @@ class Example(unittest.TestCase):
         print('fixture started', flush=True)
         time.sleep(60)
         print('fixture finished', flush=True)
+"""
+TWO_CASES = """
+from pathlib import Path
+import unittest
+
+class Example(unittest.TestCase):
+    def test_first(self) -> None:
+        Path(__file__).with_name("first-ran").touch()
+
+    def test_second(self) -> None:
+        Path(__file__).with_name("second-ran").touch()
 """
 GATE_CASE = """
 from direct_case import Example
@@ -114,6 +138,7 @@ class DirectTestLimitTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = (self.root / "direct_case.py").write_text(CASE)
+        _ = (self.root / "two_cases.py").write_text(TWO_CASES)
         self.environment = direct_test_fixture_environment(self.root, seconds=CASE_LIMIT)
         self.environment["HOME"] = str(self.root / "home")
         hooks = self.root / "startup"
@@ -121,8 +146,8 @@ class DirectTestLimitTests(unittest.TestCase):
         _ = (hooks / "sitecustomize.py").write_text(LIMIT_FIXTURE)
         self.environment["PYTHONPATH"] = startup.startup_pythonpath(str(hooks))
 
-    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(arguments, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+    def invoke(self, *arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(arguments, cwd=cwd or self.root, env=self.environment, stdin=subprocess.DEVNULL,
                               capture_output=True, timeout=TEST_HANG_GUARD_SECS, text=True, check=False)
 
     def run_case(self, name: str) -> subprocess.CompletedProcess[str]:
@@ -139,10 +164,192 @@ class DirectTestLimitTests(unittest.TestCase):
     def test_plain_python_requests_the_direct_limit_before_the_test(self) -> None:
         self.assert_limit_before_fixture(self.run_case("test_long"))
 
+    def selection_checkout(self) -> Path:
+        checkout = self.root / "checkout"
+        copy_test_runner(checkout)
+        berth = checkout / "scripts/berth/tests"
+        berth.mkdir(parents=True)
+        _ = (berth / "test_two_cases.py").write_text(TWO_CASES)
+        _ = (berth / "check_installed_hooks.py").write_text(TWO_CASES)
+        return checkout
+
+    def test_a_second_selection_still_checks_its_count(self) -> None:
+        checkout = self.selection_checkout()
+        first = checkout / "scripts/berth/tests/first-ran"
+        second = checkout / "scripts/berth/tests/second-ran"
+        selections = ("unittest.defaultTestLoader.loadTestsFromTestCase(Example)",
+                      "unittest.TestSuite(unittest.FunctionTestCase(getattr(Example(name), name))"
+                      + " for name in ('test_first', 'test_second'))")
+        for selection in selections:
+            with self.subTest(selection=selection):
+                result = self.invoke(sys.executable, "-c", f"""
+import unittest
+from scripts.berth.tests.test_two_cases import Example
+
+runner = unittest.TextTestRunner()
+assert runner.run(Example("test_first")).wasSuccessful()
+runner.run({selection})
+""", cwd=checkout)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertTrue(result.stderr.endswith(SELECTION_REFUSAL + "\n"), result.stderr)
+                self.assertTrue(first.exists())
+                self.assertFalse(second.exists())
+                first.unlink()
+
+    def test_direct_selection_allows_the_installed_hook_check(self) -> None:
+        checkout = self.selection_checkout()
+        result = self.invoke(sys.executable, "-m", "unittest", "scripts.berth.tests.check_installed_hooks", cwd=checkout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((checkout / "scripts/berth/tests/first-ran").exists())
+        self.assertTrue((checkout / "scripts/berth/tests/second-ran").exists())
+
+    def test_one_direct_test_can_start_a_child_with_three_cases(self) -> None:
+        checkout = self.selection_checkout()
+        folder = checkout / "scripts/berth/tests"
+        _ = (folder / "test_two_cases.py").write_text(TWO_CASES + """
+    def test_third(self) -> None:
+        Path(__file__).with_name("third-ran").touch()
+""")
+        startup_hook = self.root / "startup/sitecustomize.py"
+        for platform in dict.fromkeys((sys.platform, "darwin")):
+            with self.subTest(platform=platform):
+                _ = startup_hook.write_text(LIMIT_FIXTURE + f"\nsys.platform = {platform!r}\n")
+                result = self.invoke(sys.executable, "-c", f"""
+import os, subprocess, sys, unittest
+
+def child() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "unittest", "scripts.berth.tests.test_two_cases"],
+        cwd=sys.argv[1], env={{**os.environ, "TMPDIR": sys.argv[2]}},
+        capture_output=True, text=True, timeout={TEST_HANG_GUARD_SECS!r})
+
+class Parent(unittest.TestCase):
+    def test_child(self) -> None:
+        result = child()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Ran 3 tests", result.stderr)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(Parent)
+before = child()
+assert before.returncode == 1 and before.stderr == {SELECTION_REFUSAL + "\n"!r}, before
+raise SystemExit(not unittest.TextTestRunner().run(suite).wasSuccessful())
+""", str(checkout), str(self.root), cwd=REPO)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for name in ("first-ran", "second-ran", "third-ran"):
+                    marker = folder / name
+                    self.assertTrue(marker.exists())
+                    marker.unlink()
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")
+    def test_forked_child_can_use_the_parent_scope_exemption(self) -> None:
+        checkout = self.selection_checkout()
+        properties = f"t {CASE_LIMIT * 1_000_000}\ni {signal.SIGKILL.value}\n"
+        write_stdlib_tool(self.root / "busctl", f"print({properties!r}, end='')\n")
+        self.environment["PATH"] = os.pathsep.join((str(self.root), self.environment["PATH"]))
+        result = self.invoke(sys.executable, "-c", f"""
+import os, sys, unittest
+from unittest.mock import patch
+from scripts.berth.tests.test_two_cases import Example
+
+startup = sys.modules["_devtools_python_startup"]
+runner = unittest.TextTestRunner()
+assert runner.run(Example("test_first")).wasSuccessful()
+startup._cgroup = lambda pid: "/fixture/{FIXTURE_SCOPE}"
+child = os.fork()
+if child == 0:
+    with patch.object(startup, "_begin_direct_test", side_effect=AssertionError("scope restarted")):
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Example)
+        raise SystemExit(not runner.run(suite).wasSuccessful())
+_, status = os.waitpid(child, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+""", cwd=checkout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines().count(LIMIT_REQUEST), 1)
+        self.assertTrue((checkout / "scripts/berth/tests/second-ran").exists())
+
+    def test_direct_module_refuses_two_tests_and_cleans_up_the_limit(self) -> None:
+        checkout = self.selection_checkout()
+        result = self.invoke(sys.executable, "-m", "unittest", "scripts.berth.tests.test_two_cases", cwd=checkout)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, SELECTION_REFUSAL + "\n")
+        if sys.platform == "linux":
+            self.assertIn(LIMIT_REQUEST, result.stdout)
+        self.assertEqual(list((self.root / "test-runs").glob("*")), [])
+        self.assertFalse((checkout / "scripts/berth/tests/first-ran").exists())
+        self.assertFalse((checkout / "scripts/berth/tests/second-ran").exists())
+
+    def test_direct_selection_refuses_two_tests_loaded_through_checkout_alias(self) -> None:
+        checkout = self.selection_checkout()
+        alias = self.root / "alias"
+        alias.symlink_to(checkout, target_is_directory=True)
+        result = self.invoke(sys.executable, "-c", """
+import importlib.util
+import sys
+import unittest
+
+spec = importlib.util.spec_from_file_location("alias_tests", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromModule(module))
+""", str(alias / "scripts/berth/tests/test_two_cases.py"), cwd=checkout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, SELECTION_REFUSAL + "\n")
+        self.assertFalse((checkout / "scripts/berth/tests/first-ran").exists())
+        self.assertFalse((checkout / "scripts/berth/tests/second-ran").exists())
+
+    def test_direct_run_accepts_one_named_test_from_a_module_with_two(self) -> None:
+        checkout = self.selection_checkout()
+        result = self.invoke(sys.executable, "-m", "unittest", "scripts.berth.tests.test_two_cases.Example.test_second",
+                             cwd=checkout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((checkout / "scripts/berth/tests/first-ran").exists())
+        self.assertTrue((checkout / "scripts/berth/tests/second-ran").exists())
+
+    def test_verified_gate_runs_both_tests(self) -> None:
+        case = self.root / "two_cases.py"
+        manager_query = self.root / "manager-query"
+        write_stdlib_tool(self.root / "busctl",
+                          f"from pathlib import Path\nPath({str(manager_query)!r}).touch()\nraise SystemExit(1)\n")
+        self.environment["PATH"] = os.pathsep.join((str(self.root), self.environment["PATH"]))
+        self.environment["PYTHONPATH"] = startup.startup_pythonpath(str(self.root))
+        result = run_gate_test_fixture(
+            case, [str(REPO / "scripts/lib/py"), str(MODULE_RUN), str(self.root), case.name], self.environment)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(manager_query.exists())
+        self.assertTrue((self.root / "first-ran").exists())
+        self.assertTrue((self.root / "second-ran").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test scopes use Linux systemd")
+    def test_direct_scope_child_runs_both_tests(self) -> None:
+        properties = f"t {CASE_LIMIT * 1_000_000}\ni {signal.SIGKILL.value}\n"
+        write_stdlib_tool(self.root / "busctl", f"print({properties!r}, end='')\n")
+        self.environment["PATH"] = os.pathsep.join((str(self.root), self.environment["PATH"]))
+        probe = STANDALONE_TEST_STARTUP + f"""
+import runpy
+sys.modules["_devtools_python_startup"]._cgroup = lambda pid: "/fixture/{FIXTURE_SCOPE}"
+runpy.run_module("unittest", run_name="__main__", alter_sys=True)
+"""
+        fixture = self.root / "parent_case.py"
+        _ = fixture.write_text(f"""
+import os, subprocess, sys, unittest
+
+class Parent(unittest.TestCase):
+    def test_child(self) -> None:
+        environment = {{**os.environ, "PYTHONPATH": {startup.startup_pythonpath("")!r}}}
+        subprocess.run([sys.executable, "-c", {probe!r}, "two_cases"], env=environment,
+                       check=True, timeout={TEST_HANG_GUARD_SECS!r})
+""")
+        result = self.invoke(sys.executable, "-m", "unittest", "parent_case.Parent.test_child")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines().count(LIMIT_REQUEST), 1)
+        self.assertTrue((self.root / "first-ran").exists())
+        self.assertTrue((self.root / "second-ran").exists())
+
     def test_no_user_manager_runs_the_test_in_a_private_folder(self) -> None:
         self.environment = without_user_test_manager(self.root, self.environment)
         self.environment["PYTHONPATH"] = startup.startup_pythonpath("")
-        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+        result = self.invoke(sys.executable, "-c", DIRECT_TEST_STARTUP + """
 import os, unittest
 case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_short")
 assert unittest.TextTestRunner().run(case).wasSuccessful()
@@ -155,10 +362,33 @@ print("folder=" + os.environ["TMPDIR"])
         self.assertFalse(folder.exists())
 
     @unittest.skipUnless(sys.platform == "linux", "Direct test limits use Linux process records")
+    def test_child_with_inherited_scope_starts_its_own_watchdog(self) -> None:
+        from scripts.lib import testing_folders
+
+        checkout = self.selection_checkout()
+        self.environment = without_user_test_manager(self.root, self.environment)
+        _ = (self.root / "startup/sitecustomize.py").write_text(DIRECT_TEST_STARTUP + f"""
+def report_watchdog(event: str, arguments: tuple[object, ...]) -> None:
+    if event != "os.posix_spawn":
+        return
+    command = arguments[1]
+    if isinstance(command, list) and command[-2:] == ["watchdog", {str(CASE_LIMIT)!r}]:
+        print("child watchdog started", flush=True)
+
+sys.addaudithook(report_watchdog)
+""")
+        with mock.patch.dict(os.environ, self.environment), testing_folders.test_run_folder() as folder:
+            self.environment[testing_folders.RUN_FOLDER_ENV] = str(folder)
+            result = self.invoke(sys.executable, "-m", "unittest", "scripts.berth.tests.test_two_cases", cwd=checkout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "child watchdog started\n")
+        self.assertIn("Ran 2 tests", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "linux", "Direct test limits use Linux process records")
     def test_no_user_manager_stops_a_long_test_at_the_direct_limit(self) -> None:
         self.environment = without_user_test_manager(self.root, self.environment)
         self.environment["PYTHONPATH"] = startup.startup_pythonpath("")
-        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+        result = self.invoke(sys.executable, "-c", DIRECT_TEST_STARTUP + """
 import unittest
 case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_hang")
 unittest.TextTestRunner().run(case)
@@ -176,7 +406,7 @@ unittest.TextTestRunner().run(case)
         self.environment.update(DBUS_SESSION_BUS_ADDRESS=f"unix:path={bus}",
                                 PATH=os.pathsep.join((str(self.root), self.environment["PATH"])),
                                 PYTHONPATH=startup.startup_pythonpath(""))
-        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+        result = self.invoke(sys.executable, "-c", DIRECT_TEST_STARTUP + """
 import unittest
 case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_long")
 unittest.TextTestRunner().run(case)
@@ -193,7 +423,7 @@ unittest.TextTestRunner().run(case)
         self.addCleanup(locked.chmod, 0o700)
         self.environment.update(DBUS_SESSION_BUS_ADDRESS=f"unix:path={locked / 'bus'}",
                                 PYTHONPATH=startup.startup_pythonpath(""))
-        result = self.invoke(sys.executable, "-c", STANDALONE_TEST_STARTUP + """
+        result = self.invoke(sys.executable, "-c", DIRECT_TEST_STARTUP + """
 import unittest
 case = unittest.defaultTestLoader.loadTestsFromName("direct_case.Example.test_long")
 unittest.TextTestRunner().run(case)

@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
@@ -33,8 +34,8 @@ from scripts.herdr import pane_launch
 from scripts.herdr import herdr  # noqa: E402
 from scripts.agents import pane_record, detached_run_process  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import build_folders, conf, copy_record, git_files, unit_runs  # noqa: E402
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.lib import build_folders, conf, copy_record, file_lock, git_files, unit_runs, user_zone  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -461,6 +462,8 @@ def prepare_rename(row: staff.StaffRow, destination: Path, branch: str | KeepBra
         raise RenameRefused(f"{row.id}: no unit worktree")
     if (pending := pending_rename(row.id)) is not None:
         raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
+    if (resume := FolderResume.read(folder_resume_path(row.id))) is not None:
+        raise RenameRefused(f"{row.name}: finish the pending folder move to {resume.destination}")
     source = row.worktree.path.expanduser().resolve()
     destination = destination.expanduser().resolve()
     if isinstance(managed := worktree_destination(source, source), ManagedWorktreeDestination):
@@ -739,6 +742,15 @@ def managed_move_api() -> WorktreeMove:
         raise RenameRefused("managed worktree moves require worktrees.py move_worktree") from error
 
 
+def _move_managed_folder(source: Path, repo: str, unit: str, short_name: str) -> Path:
+    from scripts.worktree import worktrees
+
+    try:
+        return worktrees.move_worktree(source, repo, unit, short_name, require_finished=True)
+    except worktrees.Refused as error:
+        raise RenameRefused(str(error)) from error
+
+
 def move_managed_checkout(move_worktree: WorktreeMove, source: Path, checkout: Path,
                           destination: ManagedWorktreeDestination) -> Path:
     """Move the checkout and confirm that Git keeps the same worktree entry."""
@@ -750,12 +762,13 @@ def move_managed_checkout(move_worktree: WorktreeMove, source: Path, checkout: P
 
 
 def prepare_checkout_move(source: Path, checkout: Path, destination: Path,
-                          layout: ManagedWorktreeDestination | LegacyWorktreeDestination) -> Callable[[], Path]:
+                          layout: ManagedWorktreeDestination | LegacyWorktreeDestination, *,
+                          require_finished: bool = False) -> Callable[[], Path]:
     """Prepare the move before changing sessions or worktree locks."""
     if isinstance(layout, ManagedWorktreeDestination):
         if build_folders.repo_word(checkout) != layout.repo:
             raise RenameRefused(f"{destination}: the repository folder differs from the origin")
-        move_worktree = managed_move_api()
+        move_worktree = _move_managed_folder if require_finished else managed_move_api()
         return lambda: move_managed_checkout(move_worktree, source, checkout, layout)
 
     def move_legacy_checkout() -> Path:
@@ -1125,8 +1138,119 @@ def _push_moved_branch(checkout: Path, branch: str) -> None:
         _ = git(checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
 
 
+@dataclass(frozen=True)
+class FolderResume:
+    source: Path
+    destination: Path
+    session: staff.StaffId
+    workers: frozenset[staff.StaffId]
+    branch: str | None
+    pane: tuple[str, str] | None
+
+    @classmethod
+    def read(cls, path: Path) -> FolderResume | None:
+        if not exists(path):
+            return None
+        fields = json_object(read_json(path))
+        source, destination, session = (fields.get(key) for key in ("source", "destination", "session"))
+        workers, branch, pane = (fields.get(key) for key in ("workers", "branch", "pane"))
+        if (not isinstance(source, str) or not Path(source).is_absolute()
+                or not isinstance(destination, str) or not Path(destination).is_absolute()
+                or not isinstance(session, str) or not isinstance(workers, list)
+                or any(not isinstance(worker, str) for worker in cast(list[object], workers))
+                or (branch is not None and not isinstance(branch, str))
+                or (pane is not None and (not isinstance(pane, list) or len(cast(list[object], pane)) != 2
+                        or any(not isinstance(part, str) for part in cast(list[object], pane))))):
+            raise RenameRefused(f"{path}: invalid folder move recovery record")
+        retained = (cast(str, pane[0]), cast(str, pane[1])) if pane is not None else None
+        return cls(Path(source), Path(destination), staff.native_id(session),
+                   frozenset(staff.native_id(worker) for worker in cast(list[str], workers)), branch, retained)
+
+    def write(self, path: Path) -> None:
+        write_json(path, {"source": str(self.source), "destination": str(self.destination),
+                         "session": self.session, "workers": sorted(self.workers),
+                         "branch": self.branch, "pane": self.pane})
+
+
+def folder_resume_path(unit: staff.StaffId) -> Path:
+    return rename_move_path(unit).with_suffix(".resume.json")
+
+
+def _resume_folder_members(
+    row: staff.StaffRow, record: staff.StaffSnapshot, pending: FolderResume, path: Path,
+) -> None:
+    from scripts.agents import restart
+
+    try:
+        start_deadline = time.monotonic() + _move_timeout("RENAME_LIVE_WAIT_SECONDS")
+        with worker_lifecycle.operation_deadline(deadline=start_deadline):
+            if row.current_session != pending.session:
+                raise RenameRefused("the director session changed")
+
+            def observe() -> set[staff.StaffId]:
+                _check_move_deadline()
+                found = {member.id for member in restart.live_members((row,), record)}
+                _check_move_deadline()
+                return found
+
+            if row.id not in observe():
+                client = herdr.Herdr(herdr.shared_session())
+                pane = restart.start_row(row, record, client, worker_scope=restart.WorkerRestartScope.SELECTED_ROWS,
+                                         success_report=restart.RestartSuccessReport.CALLER)
+                if not _wait_folder_rows(observe, {row.id}, running=True):
+                    raise RenameRefused("director restart is incomplete")
+                print(f"{row.name}: director resumed", flush=True)
+                if pane and pending.pane is not None and pane != pending.pane[0]:
+                    try:
+                        _ = client.close_retained_pane(pending.pane[0], terminal=pending.pane[1])
+                    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                        print(f"unit_move: {row.name}: retained pane: {error}", file=sys.stderr)
+            workers = restart.restore_moved_workers(row, record, pending.workers)
+            if workers != pending.workers:
+                replace(pending, workers=workers).write(path)
+            if pending.workers and row.id not in observe():
+                raise RenameRefused("the director stopped during worker restore")
+            _check_move_deadline()
+            if workers:
+                raise RenameRefused("worker restore is incomplete")
+            path.unlink()
+            sync_folder(path.parent)
+    except (worker_lifecycle.OperationDeadlineExpired, subprocess.TimeoutExpired):
+        raise
+    except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        raise RenameRefused(f"{row.name}: session recovery is incomplete. {error}. Retry the folder move") from error
+
+
+@dataclass(frozen=True)
+class MoveAuthority:
+    user_words: str
+    why: str
+    at: datetime
+
+    def fields(self) -> dict[str, str]:
+        return {"user_words": self.user_words, "why": self.why, "at": self.at.isoformat()}
+
+    def record(self, unit: staff.StaffId, destination: Path) -> None:
+        """Save one authority record before the move starts."""
+        path = rename_move_path(unit).with_suffix(".jsonl")
+        row = staff.by_id(unit)
+        source = (str(row.worktree.path.expanduser().resolve())
+                  if row is not None and not isinstance(row.worktree, staff.WorktreeUnfilled) else None)
+        entry = {**self.fields(), "source": source, "destination": str(destination.expanduser().resolve())}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(path.with_suffix(".jsonl.lock")):
+            try:
+                previous = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                previous = ""
+            write_text_atomic(path, previous + json.dumps(entry, ensure_ascii=False) + "\n", new_file_mode=0o600)
+
+
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Defer running work, then move the idle worktree and resume the director."""
+    from scripts.agents import restart
+    from scripts.worktree import worktrees
+
     destination = destination.expanduser().resolve()
     with (worker_lifecycle.operation_deadline(timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS")),
           staff.row_operation(str(unit)), ExitStack() as locks):
@@ -1135,27 +1259,75 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         row = record.by_id(unit)
         if row is None or row.kind != "unit" or isinstance(row.worktree, staff.WorktreeUnfilled):
             raise ValueError(f"{unit}: move-folder requires a unit with a worktree")
-        if (pending := pending_rename(unit)) is not None:
-            raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
+        if (rename := pending_rename(unit)) is not None:
+            raise RenameRefused(f"{row.name}: finish the pending rename to {rename.name}")
         location = row.worktree
         if location.machine != remote.local_machine():
             raise ValueError(f"{unit}: run move-folder on {location.machine}")
         source = location.path.expanduser().absolute()
         old = source.resolve()
+        recovery_path = folder_resume_path(unit)
+        pending = FolderResume.read(recovery_path)
+        requested_branch = branch if isinstance(branch, str) else None
+        if pending is not None and (pending.destination != destination or pending.branch != requested_branch
+                or source not in (pending.source, destination) or pending.session != row.current_session):
+            raise RenameRefused(f"{row.name}: finish the pending folder move to {pending.destination}")
         require_move_destination(record, row, destination)
         managed = worktree_destination(old, destination)
         if isinstance(managed, ManagedWorktreeDestination) and managed.unit != row.name:
             raise RenameRefused(f"{destination}: the unit folder must be {row.name}")
         folder = old if old.exists() else destination
-        runs = folder_move_runs(row, record)
-        require_outside_run_paths(runs, old)
-        if folder != old:
-            require_outside_run_paths(runs, folder)
+        workers = record.find(kind="worker", parent=unit)
+
+        def folder_work(director: DirectorMoveProcesses) -> tuple[str, ...]:
+            runs = folder_move_runs(row, record)
+            require_outside_run_paths(runs, old)
+            if folder != old:
+                require_outside_run_paths(runs, folder)
+            processes = move_processes_inside(row, folder, director=director)
+            return running_work(row, record, folder, runs, processes)
+
+        def require_idle_publication() -> None:
+            _check_move_deadline()
+            director = _director_move_processes(row)
+            # The director stays live during publication. Its child processes can block the retry.
+            session_processes = DirectorMoveProcesses(frozenset(), director.pane_ancestors | director.roots)
+            work = folder_work(session_processes)
+            _check_move_deadline()
+            if not work:
+                work = tuple(member.name for member in restart.live_members(workers, record))
+                _check_move_deadline()
+            if work:
+                raise RenameRefused(f"{row.name}: recovery is pending while {', '.join(work)} runs")
+
+        finished_move = False
+        if isinstance(managed, ManagedWorktreeDestination) and source == destination:
+            try:
+                finished_move = worktrees.resume_worktree_move_at(destination, require_idle=require_idle_publication)
+            except worktrees.Refused as error:
+                raise RenameRefused(str(error)) from error
+            _check_move_deadline()
+        if pending is not None:
+            for member in workers:
+                _ = locks.enter_context(staff.row_operation(str(member.id)))
+            if source == destination and folder.is_dir() and (
+                    requested_branch is None or checked_out_branch(folder) == requested_branch):
+                _resume_folder_members(row, record, pending, recovery_path)
+                if requested_branch is not None:
+                    _sync_and_push_moved_branch(folder, requested_branch)
+                _ = _unlock_move(folder, unit)
+                return True
+
         director = _director_move_processes(row)
-        if work := running_work(row, record, folder, runs, move_processes_inside(row, folder, director=director)):
+        work = folder_work(director)
+        if work:
+            if pending is not None:
+                raise RenameRefused(f"{row.name}: recovery is pending while {', '.join(work)} runs")
             print(f"{row.name}: folder move deferred while {', '.join(work)} runs; rerun when idle")
-            return False
+            return finished_move
         if not folder.exists():
+            if pending is not None:
+                raise RenameRefused(f"{row.name}: recovery needs a checkout at {folder}")
             changed = isinstance(location, staff.RemovedWorktree) and location.path != destination
             if changed:
                 _check_move_deadline()
@@ -1166,99 +1338,83 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             return changed
         current_branch = checked_out_branch(folder)
         move_source = source != destination if isinstance(managed, ManagedWorktreeDestination) else folder != destination
-        move_complete = not move_source and old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
+        move_complete = not move_source and old == destination and (requested_branch is None or current_branch == branch)
         if isinstance(managed, ManagedWorktreeDestination) and not current_branch and not move_complete:
             raise RenameRefused(f"{folder}: the checkout has no branch (detached HEAD)")
-        apply_move = (prepare_checkout_move(source, folder, destination, managed)
-                      if move_source else NoCheckoutMove.STAYS)
-        if move_complete:
-            if not move_locked(unit, folder):
-                if isinstance(branch, str):
-                    _sync_and_push_moved_branch(folder, branch)
-                return False
-        members = [row, *record.find(kind="worker", parent=row.id)]
-        for member in members[1:]:
-            _check_move_deadline()
-            _ = locks.enter_context(staff.row_operation(str(member.id)))
-        # The delayed import avoids the restart module's dependency on unit_move.
-        restart = import_module("scripts.agents.restart")
-        live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
-        stop_row = cast(Callable[[staff.StaffRow, herdr.Herdr], bool], restart.stop_row)
-        start_row = cast(Callable[[staff.StaffRow, staff.StaffSnapshot, herdr.Herdr], str], restart.start_row)
-        client = herdr.Herdr(herdr.shared_session())
-        observed_live = set[staff.StaffId]()
-
-        def observe() -> set[staff.StaffId]:
-            nonlocal observed_live
-            _check_move_deadline()
-            found = {member.id for member in live_members(members, record)}
-            _check_move_deadline()
-            observed_live = found
-            return found
-
-        live = observe().copy()
-        if workers := [member.name for member in members if member.kind == "worker" and member.id in live]:
-            print(f"{row.name}: folder move deferred while {', '.join(workers)} runs; rerun when idle")
-            return False
-        for member in members:
-            if member.id not in live:
-                print(f"info: {member.name}: stopped; agents restart --only {member.id}")
-        if move_complete:
-            if isinstance(branch, str):
-                _sync_and_push_moved_branch(folder, branch)
+        if pending is None and move_complete and not move_locked(unit, folder):
+            if requested_branch is not None:
+                _sync_and_push_moved_branch(folder, requested_branch)
+            return finished_move
+        if pending is None:
+            for member in workers:
+                _check_move_deadline()
+                _ = locks.enter_context(staff.row_operation(str(member.id)))
+        live_members = restart.live_members((row, *workers), record)
+        _check_move_deadline()
+        if live_workers := [member.name for member in live_members if member.kind == "worker"]:
+            if pending is not None:
+                raise RenameRefused(f"{row.name}: recovery is pending while {', '.join(live_workers)} runs")
+            print(f"{row.name}: folder move deferred while {', '.join(live_workers)} runs; rerun when idle")
+            return finished_move
+        if pending is None and move_complete:
+            if requested_branch is not None:
+                _sync_and_push_moved_branch(folder, requested_branch)
             _ = _unlock_move(folder, unit)
             return True
-        changed = False
-        reported = set[staff.StaffId]()
 
-        def restart_notice(member: staff.StaffRow, error: object) -> None:
-            if member.id not in reported:
-                reason = str(error).splitlines()
-                detail = reason[0] if reason else "restart is incomplete"
-                print(f"unit_move: anomaly: {member.name}: {detail}; agents restart --only {member.id}", file=sys.stderr)
-                reported.add(member.id)
-
-        panes = client.panes() if live else []
-        retained = {member.id: (pane["pane_id"], pane.get("terminal_id", ""))
-                    for member in members if member.id in live
-                    for pane in panes if pane["session_id"] == member.current_session}
+        apply_move = (prepare_checkout_move(source, folder, destination, managed, require_finished=True)
+                      if move_source else NoCheckoutMove.STAYS)
+        director_live = row.id in {member.id for member in live_members}
         move_lock_created = False
         moved_source = not move_source
+        changed = finished_move
         try:
             if move_source:
                 move_lock_created = _lock_move(folder, unit)
-            stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
-            with worker_lifecycle.operation_deadline(deadline=stop_deadline):
-                for member in members:
-                    if member.id in live:
-                        _check_move_deadline()
-                        observed_live.discard(member.id)
-                        stopped = stop_row(member, client)
-                        _check_move_deadline()
-                        if not stopped:
-                            print(f"unit_move: anomaly: {member.name}: stop is incomplete", file=sys.stderr)
-                            return False
-                if not _wait_folder_rows(observe, live, running=False):
-                    print(f"unit_move: anomaly: {row.name}: stop is incomplete", file=sys.stderr)
-                    return False
+            if director_live:
+                client = herdr.Herdr(herdr.shared_session())
+                retained = next(((pane["pane_id"], pane.get("terminal_id", ""))
+                                 for pane in client.panes() if pane["session_id"] == row.current_session), None)
+                if pending is None:
+                    intent = FolderResume(source, destination, row.current_session,
+                                          frozenset(member.id for member in workers), requested_branch, retained)
+                    intent.write(recovery_path)
+                    pending = intent
+
+                def observe() -> set[staff.StaffId]:
+                    _check_move_deadline()
+                    found = {member.id for member in restart.live_members((row,), record)}
+                    _check_move_deadline()
+                    return found
+
+                stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
+                with worker_lifecycle.operation_deadline(deadline=stop_deadline):
+                    _check_move_deadline()
+                    stopped = restart.stop_row(row, client)
+                    _check_move_deadline()
+                    if not stopped or not _wait_folder_rows(observe, {row.id}, running=False):
+                        raise RenameRefused(f"{row.name}: stop is incomplete")
+            elif pending is None:
+                for member in (row, *workers):
+                    print(f"info: {member.name}: stopped. To start it, run agents restart --only {member.id}")
             current = staff.snapshot()
             runs = folder_move_runs(row, current)
             require_outside_run_paths(runs, folder)
-            work = list(running_work(row, current, folder, runs, move_processes_inside(row, folder, director=director)))
-            work.extend(member.name for member in live_members(current.find(kind="worker", parent=unit), current))
-            if work:
-                print(f"{row.name}: folder move deferred while {', '.join(work)} runs; rerun when idle")
+            late_work = list(running_work(row, current, folder, runs, move_processes_inside(row, folder, director=director)))
+            late_work.extend(member.name for member in restart.live_members(current.find(kind="worker", parent=unit), current))
+            if late_work:
+                print(f"{row.name}: folder move deferred while {', '.join(late_work)} runs; rerun when idle")
                 return False
             if not isinstance(apply_move, NoCheckoutMove):
                 _check_move_deadline()
                 folder = apply_move()
                 moved_source = True
                 changed = True
-            if isinstance(branch, str) and checked_out_branch(folder) != branch:
-                _ = git(folder, "branch", "-m", branch)
-                changed = True
-            if isinstance(branch, str):
-                _sync_and_push_moved_branch(folder, branch)
+            if requested_branch is not None:
+                if checked_out_branch(folder) != requested_branch:
+                    _ = git(folder, "branch", "-m", requested_branch)
+                    changed = True
+                _sync_and_push_moved_branch(folder, requested_branch)
         finally:
             if isinstance(managed, LegacyWorktreeDestination) and not old.exists() and destination.exists():
                 folder = destination
@@ -1270,16 +1426,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 _check_move_deadline()
                 current = staff.snapshot()
                 _check_move_deadline()
-                latest_unit = current.by_id(unit)
                 updated = replace(location, path=destination)
-                if moved_source and folder == destination and isinstance(updated, staff.RemovedWorktree) and isinstance(branch, str):
+                if moved_source and folder == destination and isinstance(updated, staff.RemovedWorktree) and requested_branch is not None:
                     updated = replace(updated, branch=staff.ParkedBranch(checked_out_branch(folder)))
-                if moved_source and folder == destination and latest_unit is not None and latest_unit.worktree != updated:
-                    latest_unit = replace(latest_unit, worktree=updated)
-                    current = staff.StaffSnapshot(tuple(latest_unit if item.id == unit else item for item in current.rows))
+                latest = current.by_id(unit)
+                if moved_source and folder == destination and latest is not None and latest.worktree != updated:
                     try:
-                        _check_move_deadline()
-                        _ = staff.set_worktree(unit, updated, expected=location)
+                        latest = staff.set_worktree(unit, updated, expected=location)
+                        current = staff.StaffSnapshot(tuple(latest if item.id == unit else item for item in current.rows))
                         changed = True
                         _check_move_deadline()
                     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -1287,55 +1441,48 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 if moved_source and folder == destination:
                     _ = _unlock_move(folder, unit)
             finally:
-                try:
-                    start_deadline = time.monotonic() + _move_timeout("RENAME_LIVE_WAIT_SECONDS")
-                    with worker_lifecycle.operation_deadline(deadline=start_deadline):
-                        still_live = observe()
-                        for member in members:
-                            if member.id not in live or member.id in still_live:
-                                continue
-                            latest = current.by_id(member.id)
-                            if latest is None:
-                                continue
-                            try:
-                                _check_move_deadline()
-                                resumed = start_row(latest, current, client)
-                                _check_move_deadline()
-                                if resumed and member.id in retained:
-                                    pane, terminal = retained[member.id]
-                                    if resumed != pane:
-                                        _ = client.close_retained_pane(pane, terminal=terminal)
-                            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-                                restart_notice(latest, error)
-                        # Worker restore proves active starts and leaves idle workers closed.
-                        expected = {member.id for member in members if member.kind != "worker"} & (live - reported)
-                        if not _wait_folder_rows(observe, expected, running=True):
-                            for member in members:
-                                if member.id in expected - observed_live:
-                                    restart_notice(member, "restart is incomplete")
-                except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-                    for member in members:
-                        if member.id in live - observed_live:
-                            restart_notice(member, error)
+                if pending is not None:
+                    latest = current.by_id(unit)
+                    if latest is None:
+                        raise RenameRefused(f"{row.name}: recovery needs the director's staff row")
+                    _resume_folder_members(latest, current, pending, recovery_path)
         _check_move_deadline()
         return changed
 
 
+class MoveArguments(argparse.Namespace):
+    unit: str = ""
+    to: Path = Path()
+    user_words: str = ""
+    why: str = ""
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    from scripts.lib import main_publish, tune
+
     parser = argparse.ArgumentParser(description="Move a unit folder without a rename.")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("move-folder")
     _ = command.add_argument("--unit", required=True)
     _ = command.add_argument("--to", required=True, type=Path)
-    arguments = parser.parse_args(argv)
+    _ = command.add_argument("--user-words", required=True)
+    _ = command.add_argument("--why", required=True)
+    arguments = parser.parse_args(argv, namespace=MoveArguments())
     try:
-        changed = _move_folder(staff.native_id(cast(str, arguments.unit)), cast(Path, arguments.to))
+        tune.require_one_line("--user-words", arguments.user_words)
+        tune.require_one_line("--why", arguments.why)
+        unit = staff.native_id(arguments.unit)
+        authority = MoveAuthority(arguments.user_words, arguments.why, datetime.now(timezone.utc))
+        authority.record(unit, arguments.to)
+        shown = {**authority.fields(), "at": user_zone.shown_time(authority.at, labeled=True)}
+        print(json.dumps(shown, ensure_ascii=False), flush=True)
+        changed = _move_folder(unit, arguments.to)
         print("done" if changed else "unchanged")
         return 0
     except (subprocess.TimeoutExpired, worker_lifecycle.OperationDeadlineExpired) as error:
         print(f"unit_move: anomaly: {error}", file=sys.stderr)
-        return 0
-    except (RenameRefused, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr_types.HerdrFailure) as error:
+        return 1
+    except (main_publish.Refusal, RenameRefused, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"unit_move: {error}", file=sys.stderr)
         return 1
 

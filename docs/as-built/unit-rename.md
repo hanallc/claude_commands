@@ -93,13 +93,30 @@ A retry reports stopped rows and keeps them stopped.
 Git command limits come from `config/production.conf` at use.
 A finished rerun prints one `unchanged` line.
 
-Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
-An explicit folder move retains its stop, move, and resume behavior, including when a rename remains pending.
+Use `unit_move.py move-folder --unit <staff id> --to <path> --user-words '<exact user words>' --why '<reason>'` to move only the folder.
+Supply one nonempty line for each of `--user-words` and `--why`.
+The first output line shows both values and the time in the user's zone.
+Each command run saves one entry in `folder_moves/<staff id>.jsonl` beside the staff record.
+The command saves the entry before it starts the move.
+The record uses UTC.
+A retry saves a new entry with its own authority.
+Finish any pending rename before an explicit folder move.
+The command defers the move while workers or detached commands run.
 The command refuses an existing destination or a concurrent row operation.
 An open phase does not prevent a folder move.
 Staff remains the folder source for runs, panes, recovery, and resume.
 Claude transcripts and Codex threads retain their native ids and existing transcript locations.
-The shared restart path can resume a previously live unit without an older launch record.
+The shared restart path resumes a previously live director with its current session ID.
+It can resume the director without an older launch record.
+The move confirms and reports the director before it restores workers with resumable dispatches.
+The move reports each worker it restores.
+Before it stops the director, the move records the director's session and the workers that can need recovery.
+A retry uses this record to resume a down director and to retry only unresolved workers.
+The move removes the record after recovery completes.
+A retry finishes any pending worktree publication before it resumes the director.
+If work is running, the retry returns a nonzero status before it publishes the worktree.
+If publication still fails, the command returns a nonzero status.
+An incomplete stop, an incomplete resume, or an expired deadline returns a nonzero status.
 
 ## Tests
 

@@ -164,7 +164,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(filters[-1], "--exclude=*")
         source, destination = self.root / "source", self.root / "destination"
         for name in ("2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json",
-                     "index.sqlite-wal", "launch.lock", "record.tmp", "old.jsonl.bak"):
+                     "latest-module-reads.json", "latest-module-reads.lock", "index.sqlite-wal", "launch.lock", "record.tmp", "old.jsonl.bak"):
             path = source / "Mac" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(name)
@@ -175,7 +175,7 @@ class SyncTests(unittest.TestCase):
         copied = {str(path.relative_to(destination / "Mac")): path.read_text()
                   for path in (destination / "Mac").rglob("*") if path.is_file()}
         self.assertEqual(copied, {name: name for name in (
-            "2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json")})
+            "2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json", "latest-module-reads.json")})
 
     def test_pull_excludes_unknown_folders_and_the_current_host(self) -> None:
         filters = self.assert_host_pull("Mac")

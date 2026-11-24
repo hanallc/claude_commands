@@ -272,7 +272,7 @@ def local_hold_states() -> tuple[TargetState, ...]:
         if not holds.in_force:
             return (Free(),)
         now = utc_now()
-        return tuple(Held(holder.name, holder.purpose,
+        return tuple(Held(holder.name, holder.display_reason(),
             holder.since if holder.start_recorded else StartNotRecorded(),
             (ReleaseOverdue(holder.release.at) if build_hold.release_overdue(holder.release, now)
              else ReleaseEstimated(holder.release.at))

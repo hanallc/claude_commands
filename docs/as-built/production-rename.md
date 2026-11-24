@@ -99,7 +99,7 @@ An unavailable display produces one anomaly line after the staff rename.
 Timers and stores retain their staff IDs during a rename.
 The command edits no document fields, plan headers, prose, marks, or history.
 Membership comes from staff parent relationships.
-Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path>`.
+Folder-only moves use `unit_move.py move-folder --unit <staff id> --to <path> --user-words '<exact user words>' --why '<reason>'`.
 
 The tests use private staff records, temporary repositories, and fake sessions.
 They cover display repair, document moves, retained edits, index recovery, branch collisions, and an interrupted staff publication.

@@ -197,7 +197,7 @@ The command searches all productions only when that scope has no match.
 A unit rename changes matching folder and branch suffixes and resumes its live sessions.
 A worker rename changes its pane title and keeps its shared tab and workspace names.
 The command keeps staff ids and creates no commit.
-Use `unit_move.py move-folder --unit <staff id> --to <path>` to move only the folder.
+Use `unit_move.py move-folder --unit <staff id> --to <path> --user-words '<exact user words>' --why '<reason>'` to move only the folder.
 
 A showrunner rename with a document move preserves staged document bytes separately from working bytes.
 Recovery restores the staged destination entry before removing the source index entry.

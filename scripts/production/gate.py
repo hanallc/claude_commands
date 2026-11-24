@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -67,7 +67,6 @@ import shutil
 import signal
 import stat
 import statistics
-import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -110,7 +109,7 @@ from scripts.lib.testing_folders import test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
-from scripts.test_times import gate_record
+from scripts.test_times import gate_record, recent_gate_times
 from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement  # noqa: E402
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_queue import progress_profile
@@ -651,12 +650,13 @@ def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
                                      stdout: int | TextIO, stderr: int | TextIO,
                                      register: Callable[[subprocess.Popen[str]], Child],
                                      environment: dict[str, str] | None = None, suite: bool = False,
-                                     extra_fds: tuple[int, ...] = ()) -> Child:
+                                     descriptors: tuple[int, ...] | None = None) -> Child:
     """Publish the process group and register the child before it runs."""
     recovery = ACTIVE_GATE_RECOVERY.get()
     with ExitStack() as closer:
         writer: int | None = None
-        descriptors = (*copies.COMMAND_LOCKS.get(), *extra_fds)
+        if descriptors is None:
+            descriptors = copies.COMMAND_LOCKS.get()
         if isinstance(recovery, GateRecovery):
             reader, writer = os.pipe()
             _ = closer.callback(os.close, reader)
@@ -1608,17 +1608,8 @@ def stop_gate_jobs(jobs: Sequence[RunningGateJob], *, deadline: float | None = N
 
 def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
                     targeted: bool) -> gate_record.GateTimeLimit | gate_record.NoGateTimeLimit:
-    """Read the report index and rebuild an index without the vCPU column."""
-    from scripts.buildlog import index
-
-    path = index.index_path()
-    if not path.exists() and not any(store.root().glob("*/*.jsonl")):
-        with closing(sqlite3.connect(":memory:")) as connection:
-            index.create_schema(connection)
-            return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
-    _ = index.update()
-    with closing(sqlite3.connect(index.read_only_path_uri(path), uri=True)) as connection:
-        return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
+    """Read the saved passing walls for this gate."""
+    return recent_gate_times.read_time_limit(vcpus, modules, jobs, targeted)
 
 
 def failure_log_tail(output: str) -> str:
@@ -1669,9 +1660,14 @@ def _gate_program_source() -> BinaryIO:
 _GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE", "BUILDLOG_PLACEMENT_SIDECAR")
 
 
-def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
-    """Remove the gate placement, and filter descriptor variables with names that end in _FD or _FDS, or contain _FD_."""
-    passed_leases = {str(lease) for lease in leases}
+def gate_child_environment(environment: Mapping[str, str], descriptors: tuple[int, ...], *,
+                           kind: GateJobKind = GateJobKind.TEST_MODULE) -> tuple[dict[str, str], tuple[int, ...]]:
+    """Return the child environment and its descriptors.
+
+    Remove the gate placement and filter descriptor variables against the passed descriptors.
+    Add the gate source descriptor for a Linux test module.
+    """
+    passed_leases = {str(descriptor) for descriptor in descriptors}
     job_environment: dict[str, str] = {}
     for name, value in environment.items():
         if name in ("LISTEN_FDS", GATE_PARENT_SOURCE_FD, *_GATE_PLACEMENT_VARIABLES):
@@ -1684,7 +1680,11 @@ def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...
             continue
         job_environment[name] = value
     job_environment["GATE_PARENT_PID"] = str(os.getpid())
-    return job_environment
+    if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
+        source = _gate_program_source().fileno()
+        job_environment[GATE_PARENT_SOURCE_FD] = str(source)
+        descriptors = (*descriptors, source)
+    return job_environment, descriptors
 
 
 def start_gate_job(suite: str, path: Path, argv: Sequence[str] | ScopedGateCommand, repo: Path,
@@ -1709,16 +1709,10 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str] | ScopedGateComma
         return job
 
     try:
-        descriptors = copies.COMMAND_LOCKS.get()
-        job_environment = _gate_job_environment(environment, descriptors)
-        source_fds: tuple[int, ...] = ()
-        if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
-            descriptor = _gate_program_source().fileno()
-            job_environment[GATE_PARENT_SOURCE_FD] = str(descriptor)
-            source_fds = (descriptor,)
+        job_environment, descriptors = gate_child_environment(environment, copies.COMMAND_LOCKS.get(), kind=kind)
         return start_recorded_gate_child(
             [str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *arguments], repo,
-            stdout=output, stderr=subprocess.STDOUT, suite=True, extra_fds=source_fds,
+            stdout=output, stderr=subprocess.STDOUT, suite=True, descriptors=descriptors,
             environment=job_environment, register=register)
     except BaseException:
         output.close()

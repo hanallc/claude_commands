@@ -20,7 +20,7 @@ from unittest import mock
 
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
-from scripts.review_links.browser_test_support import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, load_firefox
 from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names
@@ -817,7 +817,7 @@ async function checkSessionLayout() {
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        with tempfile.TemporaryDirectory() as directory, ThreadingHTTPServer(("127.0.0.1", 0), LayoutProbe) as server:
+        with ThreadingHTTPServer(("127.0.0.1", 0), LayoutProbe) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
             thread.start()
             try:
@@ -825,14 +825,8 @@ async function checkSessionLayout() {
                     with self.subTest(width=width):
                         results.clear()
                         complete.clear()
-                        profile = Path(directory) / f"profile-{width}"
-                        profile.mkdir()
-                        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
-                            ["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                             "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
-                             f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                        done = load_firefox(self, f"http://127.0.0.1:{server.server_port}/",
+                                            complete, size=(width, 900), dark=True)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:

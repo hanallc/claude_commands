@@ -397,7 +397,8 @@ class PaneMoveRecoveryTests(FolderMoveFixture):
         _ = self.enterContext(mock.patch.object(herdr.Herdr, "remember_row_tab"))
 
     def finished_move_rerun(self) -> subprocess.CompletedProcess[str]:
-        arguments = ["move-folder", "--unit", self.owner.id, "--to", str(self.new_folder)]
+        arguments = ["move-folder", "--unit", self.owner.id, "--to", str(self.new_folder),
+                     "--user-words", "Move this unit.", "--why", "Test folder recovery."]
         return invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, dict(os.environ), self.checkout)
 
     def test_missing_pane_recovery_retires_its_source_before_the_next_folder_move(self) -> None:

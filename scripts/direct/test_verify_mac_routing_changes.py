@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import final
 from scripts.build_hold import build_hold
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -18,7 +19,9 @@ class VerifyMacRoutingChangesTests(VerifyMacOffloadFixture):
         process = self.start_routing(step_sleep=True)
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
-            _ = build_hold.start_hold(holders, build_hold.HolderIdentity("julian", "julian"), "restore CI", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            _ = build_hold.start_hold(holders, build_hold.HolderIdentity("julian", "julian"),
+                                      "restore CI", build_hold.NoReleaseEta(), datetime.now().astimezone(),
+                                      user_words=TEST_HOLD_USER_WORDS)
             (holders / "hana").unlink()
         self.resume_routing_sleep(1)
         self.resume_routing_sleep(2)

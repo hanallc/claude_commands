@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import final
 from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
@@ -100,7 +101,8 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         self.wait_for_memory_wait(process)
         with self.hold_environment():
             _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
-                                      "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
+                                      "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone(),
+                                      user_words=TEST_HOLD_USER_WORDS)
             cycle = build_hold.read_cycle()
             assert not isinstance(cycle, build_hold.NoCycle)
         cycle_path = self.root / "release" / cycle["id"] / "cycle.json"

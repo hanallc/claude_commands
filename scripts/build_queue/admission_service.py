@@ -1267,6 +1267,20 @@ class DispatchEvidence:
     observed_monotonic: float
 
 
+@dataclass(frozen=True)
+class NoHostObservation:
+    """The worker has no observation for this key."""
+
+
+@dataclass(frozen=True)
+class HoldReadingNotSupplied:
+    """The hold must read the worker's observation."""
+
+
+HostObservation = placement.HostEvidence | NoHostObservation
+HOLD_READING_NOT_SUPPLIED = HoldReadingNotSupplied()
+
+
 class HostEvidenceWorker:
     """One target reader publishes evidence without blocking the service loop."""
 
@@ -1289,9 +1303,15 @@ class HostEvidenceWorker:
         self.thread: threading.Thread = threading.Thread(target=self._read, name="placement-evidence-" + key.destination.target, daemon=True)
         self.thread.start()
 
-    def evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+    def observation(self, key: placement.HostEvidenceKey) -> HostObservation:
         with self.lock:
-            return self.observations.get(key, placement.HostEvidenceUnavailable(key, self.clock.now(), "not read"))
+            observed = self.observations.get(key)
+        return observed if observed is not None else NoHostObservation()
+
+    def evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        observed = self.observation(key)
+        return (placement.HostEvidenceUnavailable(key, self.clock.now(), "not read")
+                if isinstance(observed, NoHostObservation) else observed)
 
     def publish(self, evidence: placement.HostEvidence) -> None:
         with self.lock:
@@ -1402,6 +1422,8 @@ class HostEvidenceWorker:
                 raise ValueError("provider evidence has a different policy key")
             if isinstance(evidence, placement.FreshHostEvidence):
                 evidence = replace(evidence, observed_at=min(evidence.observed_at, observed_at))
+            else:
+                evidence = replace(evidence)
         except Exception as error:
             evidence = placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
         with self.lock:
@@ -1445,14 +1467,39 @@ def same_remote_resource(first: placement.PlacementDestination, second: placemen
             and scopes_overlap(first.scope, second.scope, mac=first.provider == "mac"))
 
 
+def _hold_exclusion(request: wire.PlacementRequest, destination: placement.PlacementDestination,
+                    eligibility: placement.HostEligibility) -> bool:
+    """Check if an exclusion permits one more remote probe."""
+    if not isinstance(eligibility, placement.TemporaryExclusion):
+        return False
+    if eligibility.reason == "busy":
+        return True
+    if destination.provider != "mac" or destination.target != "mac" or eligibility.reason not in (
+            "blocked", "backoff", "unreachable"):
+        return False
+    selection, route = request.constraints.selection, request.route
+    if isinstance(selection, placement.PinnedHost):
+        return selection.target == "mac"
+    return isinstance(selection, placement.ConfiguredOrder) and (
+        isinstance(route, target_config.MacOnly) or isinstance(route, target_config.PinnedTarget) and route.target == "mac")
+
+
 @dataclass(frozen=True)
 class PlacementHold:
-    """An older waiting request that permits a remote destination but has no current free reading for it."""
+    """A remote wait and the reading that can start or end its hold."""
 
     episode: str
     destination: placement.PlacementDestination
     key: placement.HostEvidenceKey
     observed_at: float
+    reading: HostObservation
+    answered: bool
+
+
+@dataclass(frozen=True)
+class PlacementHoldStart:
+    started_at: float
+    reading: HostObservation
 
 
 @dataclass(frozen=True)
@@ -1979,6 +2026,7 @@ class AdmissionServer:
         self.placement_replacements: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
         self.placement_request_digests: dict[str, bytes] = {}
+        self.refused_mac_only: set[str] = set()
         self.input_event_count: int = 0
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
@@ -2002,9 +2050,9 @@ class AdmissionServer:
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
         self.settlement_host_keys: dict[str, placement.HostEvidenceKey] = {}
         # Start time of each hold that keeps a remote destination for an older waiting request.
-        self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
+        self.placement_holds: dict[tuple[str, placement.PlacementDestination], PlacementHoldStart] = {}
         # The reading that answered each ended hold. That reading never starts another hold.
-        self.placement_hold_answers: dict[tuple[str, placement.PlacementDestination], float] = {}
+        self.placement_hold_answers: dict[tuple[str, placement.PlacementDestination], placement.HostEvidence] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
         self.last_result: gate.PassResult | NoPass = NoPass()
@@ -2747,6 +2795,7 @@ class AdmissionServer:
                 key = self._placement_replacement_key(episode, submitted.owner)
                 self.placement_replacements[key] = ReplayEntry(refused, self.clock.now())
                 _ = self.placement_request_digests.pop(episode, None)
+                self.refused_mac_only.discard(episode)
                 self._end_placement_rank(submitted)
             waiting = self.waiters.get(episode)
             if waiting is not None:
@@ -3367,8 +3416,9 @@ class AdmissionServer:
         parked, self.parked_placements = self.parked_placements, []
         for item in parked:
             if not item.connection.finished and item.connection.socket.fileno() >= 0:
-                self._send(item.connection, self._placement_reply(item.request,
-                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
+                reply = self._placement_reply(item.request,
+                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown()))
+                self._send(item.connection, reply)
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
@@ -3424,8 +3474,8 @@ class AdmissionServer:
         verify_slots = self._verify_slot_requests(inputs, policy.repository_runs)
         inputs = replace(inputs, verify_slot_requests={owner: slot.run_key for owner, slot in verify_slots.items()})
         # The placement pass rebuilds the local order from the queue order, so remove held waiters again.
-        inputs = without_owners(self._placement_pass(inputs, captured.queue_order, policy, remote_start_hold_seconds),
-                                held_owners)
+        inputs = without_owners(self._placement_pass(
+            inputs, captured.queue_order, policy, remote_start_hold_seconds, evidence_keys), held_owners)
         result = gate.admission_pass(inputs, inputs.now, policy)
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
@@ -3881,7 +3931,7 @@ class AdmissionServer:
             if digest is None or not self._placement_waiting(request) or self._needs_mac_linux_state(request):
                 continue
             reply = self._placement_reply(request,
-                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys)
+                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys, record_refusal=False)
             if isinstance(reply, wire.PlacementWait):
                 waits[episode] = PublishedPlacementWait(self.input_event_count, digest, reply)
         return waits
@@ -4640,6 +4690,7 @@ done
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
             _ = self.placement_request_digests.pop(episode, None)
+            self.refused_mac_only.discard(episode)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -4940,6 +4991,7 @@ done
 
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
         if (not self._placement_owner_live(request.owner) or request.episode in self.current_assignments
+                or request.episode in self.refused_mac_only
                 or self._reused_guest_timeout(request) is not None):
             return False
         return not any(saved.assignment.episode == request.episode
@@ -5002,60 +5054,72 @@ done
                 return placement.RetryAt(0)
         return retry
 
+    def _candidate_permission(self, request: wire.PlacementRequest, candidate: placement.PlacementCandidate,
+                              retry: placement.RetryDecision | placement.EvidenceNeeded | RetryAfterAvailability
+                              ) -> placement.HostEligibility:
+        destination = candidate.destination
+        selection = request.constraints.selection
+        if isinstance(selection, placement.PinnedHost) and selection.target != destination.target:
+            return placement.FixedExclusion("another target is pinned")
+        if isinstance(selection, placement.MacOnlyHost) and destination.target != "mac":
+            return placement.FixedExclusion("only the Mac is selected")
+        if isinstance(retry, placement.EvidenceNeeded):
+            return retry
+        if isinstance(retry, placement.DoNotRetry):
+            return placement.FixedExclusion(retry.reason)
+        if isinstance(retry, placement.RetryAt) and retry.deadline > self.clock.now():
+            return placement.TemporaryExclusion("retry deadline has not passed")
+        if (isinstance(candidate.eligibility, placement.AllowedHost) and is_mac_linux_guest(destination)
+                and isinstance(state := self.mac_linux_state, MacLinuxStateUnavailable)):
+            return placement.FixedExclusion(state.reason)
+        return candidate.eligibility
+
+    def _evidence_eligibility(self, destination: placement.PlacementDestination,
+                              evidence: placement.HostEvidence | placement.EvidenceNeeded,
+                              retry: placement.RetryDecision | placement.EvidenceNeeded | RetryAfterAvailability
+                              ) -> placement.HostEligibility:
+        if not isinstance(evidence, placement.FreshHostEvidence):
+            return placement.EvidenceNeeded(evidence.reason)
+        if not isinstance(evidence.eligibility, placement.AllowedHost):
+            return evidence.eligibility
+        if isinstance(retry, RetryAfterAvailability) and evidence.observed_at <= retry.declined_at:
+            if isinstance(self.last_usable_configuration, records.MemoryConfig):
+                _ = self._host_evidence_reader(evidence.key, self.last_usable_configuration.waiting_pass_seconds)
+            return placement.EvidenceNeeded("provider availability predates the decline")
+        if destination.provider == "scaler" and self._cloud_slots_full():
+            return placement.TemporaryExclusion("cloud slots full")
+        from scripts.mac_test.mac_test import scopes_overlap
+
+        retained = tuple((attempt.provider, report.received_at) for attempt in self.assignments.values()
+            for report in (attempt.terminal_report,)
+            if isinstance(attempt.state, placement.ClosedAssignment)
+            and isinstance(report, placement.TerminalAttemptReport)
+            and isinstance(report.outcome, BeforeLaunchRefusal)
+            and isinstance(attempt.provider, placement.ProviderClaimReference)
+            and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
+            and scopes_overlap(attempt.provider.scope, destination.scope, mac=destination.provider == "mac"))
+        if any(scopes_overlap(claim.reference.scope, destination.scope, mac=destination.provider == "mac")
+                and (isinstance(claim, placement.RetainedCleanupClaim)
+                     or any(claim.reference == item[0] for item in retained))
+                for claim in (*evidence.cleanup_claims, *evidence.claims)):
+            return placement.TemporaryExclusion("busy")
+        if evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
+            return placement.EvidenceNeeded("provider evidence predates the retained claim report")
+        return evidence.eligibility
+
     def _candidate_eligibility(self, request: wire.PlacementRequest, keys: PlacementEvidenceKeys
                                ) -> tuple[tuple[placement.CandidateEligibility, ...], placement.ResourceHolder]:
         result: list[placement.CandidateEligibility] = []
         local_holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
         for candidate in request.constraints.candidates:
             destination = candidate.destination
-            permitted: placement.HostEligibility = candidate.eligibility
-            selection = request.constraints.selection
             retry = self._target_retry(request, destination, keys)
-            if isinstance(selection, placement.PinnedHost) and selection.target != destination.target:
-                permitted = placement.FixedExclusion("another target is pinned")
-            elif isinstance(selection, placement.MacOnlyHost) and destination.target != "mac":
-                permitted = placement.FixedExclusion("only the Mac is selected")
-            elif isinstance(retry, placement.EvidenceNeeded):
-                permitted = retry
-            elif isinstance(retry, placement.DoNotRetry):
-                permitted = placement.FixedExclusion(retry.reason)
-            elif isinstance(retry, placement.RetryAt) and retry.deadline > self.clock.now():
-                permitted = placement.TemporaryExclusion("retry deadline has not passed")
-            if (isinstance(permitted, placement.AllowedHost) and is_mac_linux_guest(destination)
-                    and isinstance(state := self.mac_linux_state, MacLinuxStateUnavailable)):
-                permitted = placement.FixedExclusion(state.reason)
+            permitted = self._candidate_permission(request, candidate, retry)
             if isinstance(permitted, placement.AllowedHost):
                 evidence = self._request_host_evidence(request, destination, keys)
                 if destination.provider == "local" and isinstance(evidence, placement.FreshHostEvidence):
                     local_holder = evidence.holder
-                permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
-                             else placement.EvidenceNeeded(evidence.reason))
-                if (isinstance(retry, RetryAfterAvailability) and isinstance(evidence, placement.FreshHostEvidence)
-                        and isinstance(permitted, placement.AllowedHost) and evidence.observed_at <= retry.declined_at):
-                    if isinstance(self.last_usable_configuration, records.MemoryConfig):
-                        _ = self._host_evidence_reader(evidence.key, self.last_usable_configuration.waiting_pass_seconds)
-                    permitted = placement.EvidenceNeeded("provider availability predates the decline")
-                if (destination.provider == "scaler" and isinstance(permitted, placement.AllowedHost)
-                        and self._cloud_slots_full()):
-                    permitted = placement.TemporaryExclusion("cloud slots full")
-                if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
-                    from scripts.mac_test.mac_test import scopes_overlap
-
-                    retained = tuple((attempt.provider, report.received_at) for attempt in self.assignments.values()
-                        for report in (attempt.terminal_report,)
-                        if isinstance(attempt.state, placement.ClosedAssignment)
-                        and isinstance(report, placement.TerminalAttemptReport)
-                        and isinstance(report.outcome, BeforeLaunchRefusal)
-                        and isinstance(attempt.provider, placement.ProviderClaimReference)
-                        and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
-                        and scopes_overlap(attempt.provider.scope, destination.scope, mac=destination.provider == "mac"))
-                    if any(scopes_overlap(claim.reference.scope, destination.scope, mac=destination.provider == "mac")
-                            and (isinstance(claim, placement.RetainedCleanupClaim)
-                                 or any(claim.reference == item[0] for item in retained))
-                            for claim in (*evidence.cleanup_claims, *evidence.claims)):
-                        permitted = placement.TemporaryExclusion("busy")
-                    elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
-                        permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+                permitted = self._evidence_eligibility(destination, evidence, retry)
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -5218,8 +5282,27 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
+    def _end_placement_wait(self, request: wire.PlacementRequest) -> None:
+        episode = request.episode
+        self._end_placement_rank(request)
+        _ = self.local_hold_holders.pop(episode, None)
+        for candidate in request.constraints.candidates:
+            pair = (episode, candidate.destination)
+            _ = self.placement_holds.pop(pair, None)
+            _ = self.placement_hold_answers.pop(pair, None)
+        self._remove_waiter(self.waiters.get(episode), claim_disposition=WaiterClaimDisposition.RETURN)
+
+    def _discard_placement_request(self, request: wire.PlacementRequest) -> None:
+        episode = request.episode
+        self._end_placement_wait(request)
+        self.refused_mac_only.discard(episode)
+        _ = self.placement_requests.pop(episode, None)
+        _ = self.placement_request_digests.pop(episode, None)
+        _ = self.prerequisites.pop(episode, None)
+        _ = self.placement_eligibility.pop(episode, None)
+
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder,
-                         keys: PlacementEvidenceKeys | None = None
+                         keys: PlacementEvidenceKeys | None = None, *, record_refusal: bool = True
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.Refused:
         if (reason := self._reused_guest_timeout(request)) is not None:
             return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
@@ -5338,9 +5421,17 @@ done
                 and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
                 and candidate.eligibility.reason != "busy"), "")
             if refusal:
-                return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
+                refused = wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
                     refusal, placement.DoNotRetry(refusal))
+                if record_refusal and request.episode not in self.refused_mac_only:
+                    self._end_placement_wait(request)
+                    self.refused_mac_only.add(request.episode)
+                    self._prune_host_evidence()
+                    self._schedule_pass()
+                    self.persist()
+                    self._publish_replies(self._project_replies(self._queue_order()))
+                return refused
         if isinstance(selection, placement.PinnedHost):
             selected = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
             if selected and all(isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
@@ -5416,7 +5507,7 @@ done
 
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
                         policy: records.AdmissionPolicy,
-                        remote_start_hold_seconds: int) -> records.QueueInputs:
+                        remote_start_hold_seconds: int, keys: PlacementEvidenceKeys) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
@@ -5451,8 +5542,8 @@ done
         cargo_folders = dict(inputs.cargo_folders)
         held: list[PlacementHold] = []
         taken: list[placement.PlacementDestination] = []
-        holds: dict[tuple[str, placement.PlacementDestination], float] = {}
-        answers: dict[tuple[str, placement.PlacementDestination], float] = {}
+        holds: dict[tuple[str, placement.PlacementDestination], PlacementHoldStart] = {}
+        answers: dict[tuple[str, placement.PlacementDestination], placement.HostEvidence] = {}
         for _, row in ordered:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
@@ -5462,7 +5553,8 @@ done
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
-            for candidate in self.placement_eligibility.get(request.episode, ()):
+            candidates = self.placement_eligibility.get(request.episode, ())
+            for index, candidate in enumerate(candidates):
                 destination = candidate.destination
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
                     continue
@@ -5471,10 +5563,21 @@ done
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
-                    hold = self._placement_hold(request, candidate, answers)
-                    if hold is not None:
-                        waiting_for.append(hold)
-                    continue
+                    reading = self._mac_hold_reading(request, candidate)
+                    if (isinstance(reading, placement.FreshHostEvidence)
+                            and isinstance(reading.eligibility, placement.AllowedHost)
+                            and self.clock.now() - reading.observed_at <= self._evidence_lifetime(reading.key)):
+                        retry = self._target_retry(request, destination, keys)
+                        if isinstance(self._candidate_permission(request, request.constraints.candidates[index], retry),
+                                      placement.AllowedHost):
+                            candidate = replace(candidate, eligibility=self._evidence_eligibility(destination, reading, retry))
+                            candidates = (*candidates[:index], candidate, *candidates[index + 1:])
+                            self.placement_eligibility[request.episode] = candidates
+                    if not isinstance(candidate.eligibility, placement.AllowedHost):
+                        hold = self._placement_hold(request, candidate, answers, reading=reading)
+                        if hold is not None:
+                            waiting_for.append(hold)
+                        continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
                         continue
@@ -5515,10 +5618,9 @@ done
             else:
                 for hold in waiting_for:
                     held.append(hold)
-                    start = self.placement_holds.get((hold.episode, hold.destination))
-                    # A hold lasts until the next probe of the older request; it never starts again on the same reading.
-                    if start is not None and hold.observed_at < start:
-                        holds[(hold.episode, hold.destination)] = start
+                    pair = (hold.episode, hold.destination)
+                    if not hold.answered and (start := self.placement_holds.get(pair)) is not None:
+                        holds[pair] = start
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
@@ -5528,60 +5630,85 @@ done
             if records.waiter_owner(row) in local_order], slots=tuple(self.slots.values()), cargo_folders=cargo_folders,
             pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named)
 
-    def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
-                        answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
-        """Return the hold that keeps a remote destination for a waiting request that can use it now.
+    def _mac_hold_reading(self, request: wire.PlacementRequest,
+                          candidate: placement.CandidateEligibility) -> HostObservation | HoldReadingNotSupplied:
+        """Read the Mac evidence once for eligibility and the hold."""
+        destination = candidate.destination
+        if (destination.provider != "mac" or not isinstance(request.purpose, placement.NormalStep)
+                or not (isinstance(candidate.eligibility, placement.EvidenceNeeded)
+                        or _hold_exclusion(request, destination, candidate.eligibility))):
+            return HOLD_READING_NOT_SUPPLIED
+        key = self.placement_host_keys.get((request.episode, destination))
+        reader = self.host_readers.get(key) if key is not None else None
+        return reader.worker.observation(reader.key) if reader is not None else NoHostObservation()
 
-        The request can use it when its last reading allowed it or said busy, or when it has no reading.
-        A reading that answered an earlier hold starts no new hold: the request cannot use the destination now.
-        """
+    def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
+                        answers: dict[tuple[str, placement.PlacementDestination], placement.HostEvidence], *,
+                        reading: HostObservation | HoldReadingNotSupplied = HOLD_READING_NOT_SUPPLIED
+                        ) -> PlacementHold | None:
+        """Keep a remote destination for one probe of an older request."""
         destination = candidate.destination
         eligibility = candidate.eligibility
-        key = self.placement_host_keys.get((request.episode, destination))
+        pair = (request.episode, destination)
+        key = self.placement_host_keys.get(pair)
         if (key is None or not isinstance(request.purpose, placement.NormalStep)
-                or destination.provider in ("local", "scaler")
-                or not (isinstance(eligibility, placement.EvidenceNeeded)
-                        or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
+                or destination.provider in ("local", "scaler")):
             return None
         reader = self.host_readers.get(key)
         if reader is None:
             return None
-        latest = reader.latest
-        if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
-                and not (isinstance(latest.eligibility, placement.TemporaryExclusion) and latest.eligibility.reason == "busy")):
-            return None
-        pair = (request.episode, destination)
-        observed_at = self.host_evidence(key).observed_at
+        latest = reader.worker.observation(key) if isinstance(reading, HoldReadingNotSupplied) else reading
+        observed_at = self.clock.now() if isinstance(latest, NoHostObservation) else latest.observed_at
         start = self.placement_holds.get(pair)
-        answer = observed_at if start is not None and observed_at >= start else self.placement_hold_answers.get(pair)
+        answer = self.placement_hold_answers.get(pair)
+        mac = destination.provider == "mac"
+        # A Mac probe can publish after the hold starts with an earlier observation time.
+        if (start is not None and not isinstance(latest, NoHostObservation)
+                and (latest is not start.reading if mac else observed_at >= start.started_at)):
+            answer = latest
+        answered = (answer is not None and
+                    (answer is latest if mac else answer.observed_at == observed_at))
+        # Keep a Mac answer in the order even when it cannot start a hold.
+        if not (mac and answered):
+            if not (isinstance(eligibility, placement.EvidenceNeeded)
+                    or _hold_exclusion(request, destination, eligibility)):
+                return None
+            if (isinstance(latest, placement.FreshHostEvidence)
+                    and not isinstance(latest.eligibility, placement.AllowedHost)
+                    and not _hold_exclusion(request, destination, latest.eligibility)):
+                return None
         if answer is not None:
             answers[pair] = answer
-        if answer == observed_at:
+        if answered and not mac:
             return None
-        return PlacementHold(request.episode, destination, key, observed_at)
+        return PlacementHold(request.episode, destination, key, observed_at, latest, answered)
 
     def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                        held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
-        """Keep a destination for an older request whose last reading predates this request's reading.
-
-        The older request's key is probed next. The hold ends when that probe answers, or after one probe time.
-        """
+                        held: list[PlacementHold],
+                        holds: dict[tuple[str, placement.PlacementDestination], PlacementHoldStart]) -> bool:
+        """Hold the destination until the older request's probe answers or reaches its time limit."""
         key = self.placement_host_keys.get((request.episode, destination))
         observed_at = self.host_evidence(key).observed_at if key is not None else self.clock.now()
         now = self.clock.now()
         for hold in held:
-            if not same_remote_resource(hold.destination, destination) or hold.observed_at >= observed_at:
+            if not same_remote_resource(hold.destination, destination):
+                continue
+            if hold.answered or hold.observed_at >= observed_at:
+                if destination.provider == "mac":
+                    return False
                 continue
             reader = self.host_readers.get(hold.key)
             if reader is None:
                 continue
-            start = holds.get((hold.episode, hold.destination))
+            pair = (hold.episode, hold.destination)
+            start = holds.get(pair)
             if start is None:
-                start = now
-                holds[(hold.episode, hold.destination)] = start
+                start = PlacementHoldStart(now, hold.reading)
+                holds[pair] = start
                 reader.worker.expedite(hold.key)
-            if now - start <= self._waiting_pass_interval() + reader.timeout:
-                return True
+            active = now - start.started_at <= self._waiting_pass_interval() + reader.timeout
+            if active or destination.provider == "mac":
+                return active
         return False
 
     def _consume_permission(self, request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
@@ -6044,11 +6171,7 @@ done
                     else:
                         self._close_placement(saved, "cancelled", placement.DoNotRetry(request.reason), persist_change=False)
                 elif saved is None:
-                    self._end_placement_rank(submitted)
-                    _ = self.placement_requests.pop(request.episode, None)
-                    _ = self.placement_request_digests.pop(request.episode, None)
-                    self._remove_waiter(self.waiters.get(request.episode),
-                                        claim_disposition=WaiterClaimDisposition.RETURN)
+                    self._discard_placement_request(submitted)
                 self._prune_host_evidence()
             self._schedule_pass()
             self.persist()
@@ -6091,6 +6214,9 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                if request.episode in self.refused_mac_only:
+                    self.refused_mac_only.remove(request.episode)
+                    _ = self.placement_eligibility.pop(request.episode, None)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:

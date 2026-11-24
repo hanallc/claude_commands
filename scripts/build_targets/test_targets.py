@@ -30,6 +30,7 @@ from scripts.mac_test import claim_state, eligibility, offload
 
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 
 require_checkout(Path(__file__))
 
@@ -406,6 +407,15 @@ class TargetStateTests(IsolatedTargetTest):
         self.write_holder()
         self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
                          targets.Held("hana", "render checks", SINCE, targets.UntilReleased(), targets.HolderSession("hana")))
+
+    def test_local_hold_reason_includes_user_words(self) -> None:
+        _ = build_hold.write_hold(self.holders, build_hold.HolderIdentity("hana", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), SINCE,
+                                  user_words=TEST_HOLD_USER_WORDS)
+        self.assertEqual(targets.local_hold_states(), (
+            targets.Held("hana", f'render checks (Nate\'s words: "{TEST_HOLD_USER_WORDS}")',
+                         SINCE, targets.UntilReleased(), targets.HolderSession("hana")),
+        ))
 
     def test_past_local_eta_does_not_release_hold(self) -> None:
         eta = NOW - timedelta(minutes=1)

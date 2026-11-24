@@ -6378,6 +6378,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(result.outcome, "sent")
         queue.assert_called_once_with(self.daemon_owner(), "thread-one", mock.ANY, timeout=send.delivery_timeout())
 
+    def test_exact_thread_reaches_a_codex_holder(self) -> None:
+        holder = replace(self.daemon_row("thread-one"), role="unit")
+        with (mock.patch.object(roster, "roster", return_value=self.recipient_roster([holder], [])),
+              mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue):
+            result = send.send(local_options(["--exact-thread", "--to", "codex:thread-one", "--text", "Release notice."]))
+        self.assertEqual(result.outcome, "sent")
+        queue.assert_called_once_with(self.daemon_owner(), "thread-one", mock.ANY, timeout=send.delivery_timeout())
+
     def test_codex_thread_address_queues_after_one_local_roster_read(self) -> None:
         output = io.StringIO()
         with (
@@ -7951,6 +7959,48 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertIn("--skip-closed", forwarded)
         self.assertEqual(self.relayed + self.daemon_calls, [])
 
+    def test_exact_thread_preserves_the_peer_address_and_option(self) -> None:
+        peer = self.row("impl", "worker:peer-run/impl")
+        assert isinstance(peer.thread, roster.CodexThread)
+        address = f"codex:{peer.thread.thread_id}"
+        self.peer([peer])
+        status, output, errors = self.run_main(address, "--exact-thread")
+        self.assertEqual((status, errors), (0, ""), output)
+        forwarded, = self.forwarded()
+        self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
+        self.assertIn("--exact-thread", forwarded)
+
+    def test_exact_thread_lost_peer_route_requires_a_new_send(self) -> None:
+        address = "codex:peer-thread"
+        peer = self.row("peer", address)
+        self.peer([peer])
+
+        def move_thread(_command: list[str], _text: str, _timeout: float) -> tuple[int, str, str]:
+            self.local = self.recipient_roster([replace(peer, machine="natedev")], [])
+            self.peer([])
+            return SEND_ABSENT_EXIT, f"ABSENT: no live Codex session has address {address}\n", ""
+
+        with mock.patch.object(send, "run", side_effect=move_thread):
+            status, output, errors = self.run_main(address, "--exact-thread")
+        self.assertEqual(status, 3, output + errors)
+        self.assertTrue(output.startswith("FAILED: "), output)
+        self.assertEqual(self.run_main(address, "--exact-thread")[0], 0)
+        self.assertEqual(self.daemon_calls, ["peer-thread"])
+
+    def test_exact_thread_reports_delivery_failure_when_both_rosters_miss(self) -> None:
+        address = "codex:gone"
+        status, output, errors = self.run_main(address, "--exact-thread", "--here")
+        self.assertEqual(status, 3, output + errors)
+        self.assertEqual(self.ssh_calls(), [])
+        self.peer([], problems=("Codex daemon: socket unreadable",))
+        self.assertEqual(self.run_main(address, "--exact-thread")[0], 3)
+        self.peer([])
+        status, output, errors = self.run_main(address, "--exact-thread")
+        self.assertEqual(status, 3, output + errors)
+        self.assertTrue(output.startswith("FAILED: "), output)
+        self.assertEqual(len(self.ssh_calls()), 2)
+        self.assertEqual(self.forwarded(), [])
+
     def test_skip_closed_accepts_the_peer_closed_result(self) -> None:
         with mock.patch.object(send, "run",
                                return_value=(SEND_CLOSED_EXIT, "CLOSED: closed worker\n", "")):
@@ -8799,6 +8849,27 @@ class PaneWorkerMessageTests(unittest.TestCase):
         prompt, = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
         self.assertEqual(prompt[2], pane)
         self.assertIn("Start the build.", prompt[3])
+
+    def test_exact_thread_does_not_forward_a_blocked_worker_notice(self) -> None:
+        from scripts.herdr import herdr, worker_panes
+
+        worker, pane, observed = self.live_codex_worker()
+        address = f"codex:{worker.current_session}"
+        blocked = worker_panes.OpenWorker(worker, pane, "terminal-" + pane, herdr.AgentStatus.BLOCKED)
+        text = "Restart the stopped run."
+        options = ["--here", "--exact-thread", "--to", address, "--from", "fixture",
+                   "--forwarded-shown-sender", "fixture", "--text", text]
+        with mock.patch.object(roster, "roster", return_value=observed):
+            with mock.patch.object(worker_panes, "observe", return_value=[blocked]):
+                result = send.send(send.parse(options))
+            self.assertEqual((result.outcome, result.detail), ("failed", "worker is blocked"))
+            self.assertNotIn(text, send.pending(f"staff:{self.fixture.parent.id}"))
+            self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.fixture.world.commands))
+            result = send.send(send.parse(options))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        prompt, = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual(prompt[2], pane)
+        self.assertIn(text, prompt[3])
 
     def test_skip_closed_at_pane_recheck_keeps_default_holder_forward(self) -> None:
         from scripts.herdr import worker_panes
