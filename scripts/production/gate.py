@@ -3304,6 +3304,12 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if job.returncode:
                     print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
                           file=sys.stderr, flush=True)
+        else:
+            modules = sum(job.kind is GateJobKind.TEST_MODULE for job in outcome.jobs)
+            minutes, seconds = divmod(round(outcome.seconds), 60)
+            head = checked_git(repo, "rev-parse", "HEAD")[:10]
+            print(f"Mac Linux guest gate passed: {modules} modules in {minutes} min {seconds} s (checkout HEAD {head})",
+                  flush=True)
         return outcome
 
     def run_routed(select: Callable[[RoutedGateTree, set[str]], GateRun]) -> GateRun:
