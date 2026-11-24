@@ -1088,7 +1088,34 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(first["list_number"], item.number)
                 self.assertEqual(first["key"], item.reviews[0])
 
-    def check_new_item_command(self, *, fail_retry: bool = False, change_mapping: bool = False) -> the_list.ListItem:
+    def test_enhancement_command_files_and_prefixes_the_list_title_at_the_word_limit(self) -> None:
+        first_line = "Show the next check in the row."
+        words = first_line + "\n" + "x" * (new_item_dialog.MAX_WORDS_LENGTH - len(first_line) - 1)
+        _ = self.check_new_item_command(
+            kind=new_item.ItemType.ENHANCEMENT, review_type=review_items.ReviewType.INVESTIGATION,
+            words=words, filed_words=f"Enhancement: {words}")
+
+    def test_enhancement_command_reuses_the_draft_after_a_lost_reply(self) -> None:
+        words = "Show the next check in the row."
+        with self.lose_list_send_response() as responses:
+            item = self.check_new_item_command(
+                fail_retry=True, kind=new_item.ItemType.ENHANCEMENT, review_type=review_items.ReviewType.INVESTIGATION,
+                words=words, filed_words=f"Enhancement: {words}")
+        first, = responses
+        self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
+
+    def test_new_item_command_saves_the_link_with_the_row(self) -> None:
+        with patch.object(the_list, "link", side_effect=OSError("No space left on device")) as link:
+            item = self.check_new_item_command()
+        link.assert_not_called()
+        key, = item.reviews
+        self.assertIn(urlencode({"jump": key}), item.evidence)
+
+    def check_new_item_command(
+        self, *, fail_retry: bool = False, change_mapping: bool = False, kind: new_item.ItemType = new_item.ItemType.BUG,
+        review_type: review_items.ReviewType = review_items.ReviewType.BUG,
+        words: str = "The frame time graph has a gap.", filed_words: str = "The frame time graph has a gap.",
+    ) -> the_list.ListItem:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         unit = case.fixture.unit
@@ -1098,7 +1125,6 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = conf.path("producer_map").write_text(f"{owner.id} = {producer.id}\n", encoding="utf-8")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
-        words = "The frame time graph has a gap."
         output, errors = StringIO(), StringIO()
         exchange = new_item.exchange
         posts: list[object] = []
@@ -1158,7 +1184,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(record_store.NumberedRecords, "locked", track_list_lock),
               patch.object(staff, "authority_snapshot", read_staff),
               new_item_notice_log(self.root, morty.id) as log, redirect_stdout(output), redirect_stderr(errors)):
-            arguments = ["bug", unit.name, words, "--session", "another-session"]
+            arguments = [kind, unit.name, words, "--session", "another-session"]
             code = new_item.main(arguments)
             self.assertTrue(self.new_item_posts.wait_until_none_run())
             if fail_retry:
@@ -1184,19 +1210,22 @@ class ReviewLinksServerTests(unittest.TestCase):
                 refused, retried = posts
                 self.assertNotEqual(refused, retried)
         self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
-        key, = [key for key, record in cache.get().records.items() if record.type == review_items.ReviewType.BUG]
-        self.assertEqual(cache.get().records[key].owner, owner.id)
+        key, = [key for key, record in cache.get().records.items() if record.type == review_type]
+        title = filed_words.splitlines()[0]
+        self.assertEqual((cache.get().records[key].title, cache.get().records[key].owner), (title, owner.id))
         item, = the_list.records(morty.id, include_closed=True)
         notice, = read_new_item_notices(log)
         self.assertEqual(notice["rows"], [item.id])
         self.assertEqual(notice["address"], f"session:{owner.current_session}")
-        self.assertIn(words, notice["words"])
+        self.assertIn(title, notice["words"])
         self.assertEqual(in_lock_reads, [(True, False)])
         producer_line = "" if fail_retry else f" Producer: bob (from {owner.name})."
         self.assertEqual(output.getvalue(),
-                         f"Bug → {unit.name}, a unit of {owner.name}.{producer_line} List item {item.number}.\n")
+                         f"{kind.capitalize()} → {unit.name}, a unit of {owner.name}.{producer_line} "
+                         + f"List item {item.number}.\n")
         self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
-                         (words, owner.id, producer.id, unit.name, (key,)))
+                         (title, owner.id, producer.id, unit.name, (key,)))
+        self.assertEqual(item.latest_status, filed_words)
         return item
 
     def test_restart_recovers_a_list_notice_after_the_row_exists(self) -> None:
@@ -3542,9 +3571,6 @@ class ReviewLinksServerTests(unittest.TestCase):
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={showrunner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        # The dialog sends Feedback as an Investigation.
-        kinds = [new_item_dialog.SubmissionKind(kind if kind != "feedback" else "investigation")
-                 for kind, _, _ in new_item_dialog.KINDS]
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message")):
@@ -3558,14 +3584,17 @@ class ReviewLinksServerTests(unittest.TestCase):
                     continue
                 proposal_names = [row["name"] for row in recipients if row["proposal"]]
                 self.assertCountEqual(proposal_names, [showrunner.name, producer.name])
-                for kind in kinds:
+                for chip, _, _ in new_item_dialog.KINDS:
+                    kind = (chip if chip == "enhancement" else
+                            new_item_dialog.SubmissionKind("investigation" if chip == "feedback" else chip))
                     for row in recipients:
                         if kind == new_item_dialog.SubmissionKind.PROPOSAL and row["name"] not in proposal_names:
                             continue
-                        with self.subTest(page=page, kind=kind, name=row["name"]):
-                            request = replace(case.submission_request(kind, staff.StaffId(str(row["id"]))), page=page,
-                                              page_recipient=new_item_dialog.PageRecipient.SELECTED,
-                                              request_id="r6-" + uuid4().hex)
+                        with self.subTest(page=page, kind=chip, name=row["name"]):
+                            request = new_item_dialog.NewItemRequest(
+                                "r6-" + uuid4().hex, kind, staff.StaffId(str(row["id"])),
+                                f"Check the {kind} record.", new_item_dialog.NoEvidence(), page=page,
+                                page_recipient=new_item_dialog.PageRecipient.SELECTED)
                             response = self.new_item_http(self.new_item_body(request), finished=True)
                             self.assertEqual(response.status, 200, response.body)
 
@@ -4294,7 +4323,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
         with (patch.object(self.server, 'review_cache', cache),
               patch.object(self.server, 'delivery_status', case.status),
               capture_sender('send_to_staff') as send):
@@ -4308,7 +4338,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             path = review_items.source_path(waiting)
             initial = review_items.submission_origin(waiting)
             assert isinstance(initial, new_item_dialog.ReviewSubmission)
-            reply_key = new_item_dialog.submission_key(request.kind, owner.id, sent['id'], request.request_id)
+            reply_key = new_item_dialog.submission_key(kind, owner.id, sent['id'], request.request_id)
             self.assertTrue(change_page.answer_item(reply_key, 'Use the wide layout.', initial.reply_token, case.status))
             response, _ = cache.publish_record(cache.get(), key)
             self.assertEqual(response.records[key].type, review_items.ReviewType.RESPONSE)

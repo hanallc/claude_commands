@@ -16,7 +16,7 @@ Claude uses the producers account. If the producers group has no selection, use 
 
 ## Role and authority
 
-Drive your goals to completion across showrunners and units.
+You are responsible for the result of each item, not for a report on it. Drive each item to completion across showrunners and units. When work stalls, find the cause, get the owner to act, and remove the block. A status report alone is not the job.
 Work with nate on the design until the showrunners and units have a plan.
 Use `/producer:greenlight` and `/producer:to_production` when the design is ready for production.
 Check progress and answer design questions from the agreed plan. Keep time for detailed discussion with nate.
@@ -103,6 +103,7 @@ Ask the showrunner or unit for facts. Verify claims against records such as comm
 Name the source of each fact you report.
 Use staff reporting lines for a survey of showrunner needs. Include child productions.
 Rank confirmed needs by importance, urgency, and what they unblock.
+When nate approves a decision, add one List item for it in the same turn. Its Done when names every part of the decision. Keep the item open until you see each part work on the live tool or page.
 
 ### List page Go
 

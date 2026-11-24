@@ -34,16 +34,21 @@ class ItemType(StrEnum):
     PROPOSAL = "proposal"
     EFFICIENCY = "efficiency"
     FEEDBACK = "feedback"
+    ENHANCEMENT = "enhancement"
 
 
-# The console server takes four kinds. Feedback and efficiency file as an investigation.
-FILED_KINDS: dict[ItemType, new_item_dialog.SubmissionKind] = {
+type _NewItemRequestKind = new_item_dialog.SubmissionKind | Literal["enhancement"]
+
+
+# The server files Feedback, Efficiency and Enhancement as investigations.
+FILED_KINDS: dict[ItemType, _NewItemRequestKind] = {
     ItemType.BUG: new_item_dialog.SubmissionKind.BUG,
     ItemType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
     ItemType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL,
     ItemType.EFFICIENCY: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.FEEDBACK: new_item_dialog.SubmissionKind.INVESTIGATION,
+    ItemType.ENHANCEMENT: "enhancement",
 }
 
 
@@ -219,11 +224,11 @@ def recipient_for(member: staff.StaffRow, options: Options, members: staff.Staff
     return found
 
 
-def request_body(options: Options, kind: new_item_dialog.SubmissionKind, recipient: staff.StaffId, words: str,
+def request_body(options: Options, kind: _NewItemRequestKind, recipient: staff.StaffId, words: str,
                  assignee: staff.StaffId, request_id: str) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": request_id, "kind": kind.value,
+        "token": options.token, "request_id": request_id, "kind": kind,
         "recipient_id": recipient, "words": words, "evidence": {"kind": "none"}, "images": [],
         "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value, "list_assignee": assignee,
     }).encode()
@@ -243,7 +248,7 @@ class NoPendingListDraft:
 
 
 def draft_path(address: for_you.ConsoleAddress, session: str, assignee: staff.StaffId,
-               kind: new_item_dialog.SubmissionKind, words: str) -> Path:
+               kind: _NewItemRequestKind, words: str) -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
     scope = json.dumps([address.host, address.port, session, assignee, kind, words])
     return state / hashlib.sha256(scope.encode()).hexdigest()
@@ -266,7 +271,7 @@ def save_pending_draft(path: Path, recipient: staff.StaffId) -> PendingListDraft
     return draft
 
 
-def post_item(address: for_you.ConsoleAddress, options: Options, kind: new_item_dialog.SubmissionKind,
+def post_item(address: for_you.ConsoleAddress, options: Options, kind: _NewItemRequestKind,
               draft: PendingListDraft, words: str, assignee: staff.StaffId) -> ServerReply:
     """Retry an unconfirmed POST with the same draft ID and recipient."""
     def send(current: Options) -> ServerReply:
@@ -286,9 +291,8 @@ def post_item(address: for_you.ConsoleAddress, options: Options, kind: new_item_
 
 
 def words_text(item_type: ItemType, description: str, extra: str) -> str:
-    """A type that files as another server kind names itself first; feedback files as the window files it."""
-    marked = FILED_KINDS[item_type].value != item_type.value and item_type != ItemType.FEEDBACK
-    first = f"{item_type.value.capitalize()}: {description.strip()}" if marked else description.strip()
+    """Add the Efficiency prefix and append any extra words."""
+    first = f"Efficiency: {description.strip()}" if item_type == ItemType.EFFICIENCY else description.strip()
     return first + (f"\n\n{extra.strip()}" if extra.strip() else "")
 
 

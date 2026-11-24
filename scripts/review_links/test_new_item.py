@@ -63,6 +63,7 @@ class FakeServer:
         self.posts: list[dict[str, object]] = []
         self.reads: int = 0
         self.list_number: int | None = 3
+        self.review_key: str | None = "fixture-key"
 
     def exchange(self, _address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
                  body: bytes = b"") -> new_item.ServerReply:
@@ -73,7 +74,9 @@ class FakeServer:
                 {"id": row.id, "name": row.name, "proposal": row.kind != "producer"} for row in TO_ROW]})
         assert target == review_page.NEW_ITEM_PATH
         self.posts.append(cast(dict[str, object], json.loads(body)))
-        fields: dict[str, object] = {"id": "I7", "key": "fixture-key", "version": "1"}
+        fields: dict[str, object] = {"id": "I7", "version": "1"}
+        if self.review_key is not None:
+            fields["key"] = self.review_key
         if self.list_number is not None:
             fields["list_number"] = self.list_number
         return new_item.ServerReply(200, fields)
@@ -120,14 +123,14 @@ class NewItemTests(ServerFixture):
         self.assertEqual(code, new_item.Outcome.USAGE)
         self.assertEqual(output.splitlines(), [
             "/new_item <type> <assignee> <description> [extra, such as a time]",
-            "Types: bug, question, investigation, proposal, efficiency, feedback",
+            "Types: bug, question, investigation, proposal, efficiency, feedback, enhancement",
             "Assignee: a producer, a showrunner or a unit",
         ])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
-    def test_six_types_and_each_files_as_a_server_kind(self) -> None:
+    def test_seven_types_and_each_files_as_a_server_kind(self) -> None:
         self.assertEqual([kind.value for kind in new_item.ItemType],
-                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback"])
+                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback", "enhancement"])
         investigation = new_item_dialog.SubmissionKind.INVESTIGATION
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.FEEDBACK], investigation)
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.EFFICIENCY], investigation)
@@ -138,8 +141,7 @@ class NewItemTests(ServerFixture):
                 code, output, _ = self.run_main(item_type.value.upper(), "bob", "Check the chart.")
                 self.assertEqual(code, 0)
                 self.assertEqual(output, f"{item_type.value.capitalize()} \u2192 bob. List item 3.\n")
-                self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type].value)
-                # Only efficiency files as another kind with a mark; feedback files as the window files it.
+                self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type])
                 words = "Efficiency: Check the chart." if item_type == new_item.ItemType.EFFICIENCY else "Check the chart."
                 self.assertEqual(self.server.posts[-1]["words"], words)
         with self.assertRaises(SystemExit):
@@ -300,6 +302,55 @@ class NewItemTests(ServerFixture):
         code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
         self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
+
+    def test_enhancement_with_no_producer_saves_nothing(self) -> None:
+        code, output, errors = self.run_main("enhancement", "tile", "Show the next check in the row.")
+        self.assertEqual((code, errors), (new_item.Outcome.NO_PRODUCER, ""))
+        self.assertIn("Which producer?", output)
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
+        drafts = (self.folder / "state/new-item").glob("*")
+        self.assertEqual([draft for draft in drafts if draft.suffix != ".lock"], [])
+
+    def test_a_reply_without_a_review_key_reports_the_list_number(self) -> None:
+        self.server.review_key = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
+        self.assertEqual((code, output, errors), (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
+
+    def test_a_reply_without_a_review_key_or_list_number_exits_filed(self) -> None:
+        self.server.review_key = ""
+        self.server.list_number = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
+        self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
+        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
+
+    def test_each_review_item_reports_its_own_list_number(self) -> None:
+        self.server.list_number = 1
+        self.assertEqual(self.run_main("bug", "bob", "A waiting row has no drag grip."),
+                         (new_item.Outcome.FILED, "Bug → bob. List item 1.\n", ""))
+        self.server.review_key = "another-key"
+        self.server.list_number = 2
+        self.assertEqual(self.run_main("bug", "bob", "A waiting row has no drag grip."),
+                         (new_item.Outcome.FILED, "Bug → bob. List item 2.\n", ""))
+        first, second = self.server.posts
+        self.assertNotEqual(first["request_id"], second["request_id"])
+
+    def test_a_list_write_failure_after_filing_keeps_the_draft(self) -> None:
+        def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
+                     body: bytes = b"") -> new_item.ServerReply:
+            reply = self.server.exchange(address, method, target, body)
+            if method == "POST" and len(self.server.posts) <= 2:
+                return new_item.ServerReply(503, {"error": "No space left on device"})
+            return reply
+
+        arguments = ("bug", "bob", "A waiting row has no drag grip.")
+        with mock.patch.object(new_item, "exchange", side_effect=exchange):
+            code, output, errors = self.run_main(*arguments)
+            self.assertEqual((code, output), (new_item.Outcome.FAILED, ""))
+            self.assertIn("No space left on device", errors)
+            self.assertEqual(self.run_main(*arguments),
+                             (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
+        self.assertEqual(len(self.server.posts), 3)
+        self.assertEqual(self.server.posts, [self.server.posts[0]] * 3)
 
 
 if __name__ == "__main__":
