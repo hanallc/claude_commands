@@ -800,22 +800,39 @@ else:
 
     def smoke_fixture(self, root: Path, work: str) -> tuple[dict[str, str], list[str]]:
         environment = queue_fixture(root, """
-import json, os, shlex, subprocess, sys
+import json, os, shlex, signal, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
 command = shlex.split(sys.argv[-1])
 if "mac_smoke_status=" in command[-1]:
     assert (root / "input_closed").exists(), "Status read before the first SSH call ended"
     (root / "status-read").touch()
+    if os.environ.get("FAKE_STATUS_STALL") == "1":
+        signal.alarm(3)
+        with (root / "status-gate").open("rb"):
+            raise AssertionError("The status gate opened")
     subprocess.run(command, check=False)
     raise SystemExit(0)
 (root / "smoke-ssh.json").write_text(json.dumps(sys.argv[1:]))
-if os.environ.get("FAKE_SMOKE_DROP") == "1":
+drop = os.environ.get("FAKE_SMOKE_DROP")
+if drop:
     with subprocess.Popen(command, cwd=root / "checkout", stdin=subprocess.PIPE, stdout=subprocess.PIPE) as worker:
-        assert worker.stdout.readline() == b"work-ready" + bytes([10])
+        if drop == "ready":
+            for line in worker.stdout:
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+                if line.startswith(b"mac_smoke_ready="):
+                    break
+            else:
+                raise AssertionError("The worker did not report readiness")
+        else:
+            assert worker.stdout.readline() == b"work-ready" + bytes([10])
         worker.stdin.close()
         worker.stdin = None
         worker.communicate()
+    if drop == "ready":
+        (root / "input_closed").touch()
+        raise SystemExit(255)
 else:
     subprocess.run(command, cwd=root / "checkout", check=False)
     for status in (root / ".local/state/mac-queue/smoke").glob("*/status"):
@@ -827,6 +844,18 @@ else:
 raise SystemExit(0)
 """)
         (root / "checkout").mkdir()
+        write_stdlib_tool(root / "copies.py", """
+import os, subprocess, sys
+from pathlib import Path
+root = Path(os.environ["FAKE_QUEUE_STATE"])
+status = subprocess.run(sys.argv[1:], check=False).returncode
+(root / "worker-exit").write_text(str(status))
+episode = os.environ["MAC_PLACEMENT"].split("/")[0]
+path = Path.home() / ".local/state/mac-queue/smoke" / episode / "status"
+if path.exists():
+    (root / "early-status").write_text(path.read_text())
+raise SystemExit(int(os.environ.get("FAKE_SMOKE_LEASE_STATUS", status)))
+""")
         environment.update(COPIES_KEEP_FILE=str(root / "copy.keep"),
                            SMOKE_WORKER=str(Path(mac_queue_run.__file__).resolve()), FAKE_SMOKE_WORK=work)
         callback = root / "mac_run.sh"
@@ -837,12 +866,14 @@ root = Path(os.environ["FAKE_QUEUE_STATE"])
 phase, argv_file = sys.argv[1:3]
 if phase == "prepare":
     cleanup = 'touch "$FAKE_QUEUE_STATE/remote_cleanup"; exit "${FAKE_MAC_STATUS:-0}"'
+    runner = [sys.executable, os.environ["SMOKE_WORKER"]]
     Path(argv_file).write_text(json.dumps([
-        sys.executable, os.environ["SMOKE_WORKER"], "smoke-work", os.environ["FAKE_SMOKE_WORK"], cleanup,
+        *runner, "smoke-copy", str(root / "copies.py"),
+        *runner, "smoke-work", os.environ["FAKE_SMOKE_WORK"], cleanup,
     ]))
 else:
     assert (root / "remote_cleanup").exists(), "Local cleanup started before remote cleanup"
-    if os.environ.get("FAKE_SMOKE_DROP") != "1":
+    if not os.environ.get("FAKE_SMOKE_DROP"):
         assert not (root / "input_closed").exists(), "SSH closed before local cleanup"
     (root / "cleanup").touch()
 """)
@@ -874,6 +905,7 @@ else:
             self.assertEqual(ssh_arguments[:-1], ["-o", "BatchMode=yes", "fake-mac"])
             remote_command = shlex.split(ssh_arguments[-1])
             self.assertEqual(remote_command[:-1], ["/bin/zsh", "-f", "-c"])
+            self.assertIn("smoke-copy", shlex.split(remote_command[-1]))
             self.assertIn("smoke-work", shlex.split(remote_command[-1]))
             self.assertTrue(all("MAC_SMOKE_COOKIE" not in argument for argument in ssh_arguments))
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
@@ -906,6 +938,47 @@ else:
             self.assertFalse((root / "status-read").exists())
             self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
             self.assertEqual(len(list((root / mac_queue_run.RUNS).glob("*/run.json"))), 1)
+
+    def test_smoke_disconnect_after_ready_does_not_publish_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment, command = self.smoke_fixture(root, "true")
+            result = subprocess.run(command, env={**environment, "FAKE_SMOKE_DROP": "ready"},
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
+            self.assertTrue((root / "remote_cleanup").exists())
+            self.assertFalse((root / "status-read").exists())
+            self.assertEqual((root / "worker-exit").read_text(), "1")
+            placed, = self.events(root)
+            self.assertEqual(placed[0], "place-step")
+            episode = placed[placed.index("--episode") + 1]
+            status_file = root / mac_queue_run.smoke_status_path(episode)
+            self.assertTrue(not status_file.exists() or status_file.read_text() != "0\n")
+
+    def test_smoke_reports_a_failed_copy_lease_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment, command = self.smoke_fixture(root, "true")
+            result = subprocess.run(command, env={**environment, "FAKE_SMOKE_LEASE_STATUS": "19"},
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+            self.assertEqual((root / "worker-exit").read_text(), "0")
+            self.assertFalse((root / "early-status").exists())
+            self.assertTrue((root / "status-read").exists())
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+
+    def test_smoke_status_read_uses_the_probe_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment, command = self.smoke_fixture(root, "true")
+            _ = write_config_fixture(root / "config/mac_test.conf", "probe_timeout_s=0.5\n")
+            os.mkfifo(root / "status-gate")
+            result = subprocess.run(command, env={**environment, "FAKE_STATUS_STALL": "1"},
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
+            self.assertIn("status read timed out after 0.5 seconds", result.stderr)
+            self.assertTrue((root / "status-read").exists())
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
 
     def test_ended_smoke_retires_the_legacy_scratch_record_after_cleanup(self) -> None:
         self.check_legacy_scratch_cleanup(clear=True)
@@ -988,7 +1061,7 @@ if sys.argv[2] == "stop-checkout":
                 self.assertIn("scratch cleanup unconfirmed", result.stderr)
             self.assertEqual(actions, expected)
 
-    def test_smoke_worker_checks_outside_the_copy_and_waits_for_ssh_eof(self) -> None:
+    def test_smoke_worker_checks_outside_the_copy_and_requires_explicit_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout = root / "checkout"
@@ -1014,8 +1087,9 @@ if sys.argv[2] == "stop-checkout":
                         work += "; cat " + shlex.quote(str(fifo))
                     cleanup = (check_stdin + ' && print -rl -- "$PWD" "$1" > "$CLEANUP_RECORD"'
                                + ' && rm -- "$COPIES_KEEP_FILE" "$MAC_SMOKE_LAUNCH_TOKEN"')
+                    runner = [sys.executable, str(source)]
                     with subprocess.Popen(
-                        [sys.executable, str(source), "smoke-work", work, cleanup],
+                        [*runner, "smoke-copy", *runner, "smoke-work", work, cleanup],
                         cwd=checkout, env={**os.environ, "HOME": str(root), "COPIES_COMMAND_LEASE_FDS": "",
                                            "MAC_PLACEMENT": episode + "/attempt",
                                            "COPIES_KEEP_FILE": str(keep), "CLEANUP_RECORD": str(cleanup_record)},
@@ -1031,21 +1105,20 @@ if sys.argv[2] == "stop-checkout":
                                 self.assertEqual(process.stdout.readline(), f"mac_smoke_ready={episode}\n".encode())
                                 self.assertIsNone(process.poll())
                                 self.assertTrue(cleanup_record.exists())
+                                self.assertFalse(status_file.exists())
+                                _ = process.stdin.write(b"\n")
                             else:
                                 self.assertTrue(keep.exists())
                                 self.assertFalse(cleanup_record.exists())
                             process.stdin.close()
-                            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), int(disconnected))
+                            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
                         finally:
                             if process.poll() is None:
                                 process.kill()
                                 _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(cleanup_record.read_text().splitlines(), [str(root), str(checkout)])
                     self.assertFalse(keep.exists())
-                    if disconnected:
-                        self.assertFalse(status_file.exists())
-                    else:
-                        self.assertEqual(status_file.read_text(), "0\n")
+                    self.assertEqual(status_file.read_text(), f"{int(disconnected)}\n")
 
     def test_ended_custom_callback_uses_its_saved_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

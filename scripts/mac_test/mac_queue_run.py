@@ -286,6 +286,11 @@ class SmokeNotReady:
 
 
 @dataclass(frozen=True)
+class SmokeConnectionLost:
+    pass
+
+
+@dataclass(frozen=True)
 class SmokeFinalStatus:
     status: int
 
@@ -300,7 +305,13 @@ class SmokeInvalidStatus:
     pass
 
 
-SmokeResult = SmokeNotReady | SmokeFinalStatus | SmokeMissingStatus | SmokeInvalidStatus
+@dataclass(frozen=True)
+class SmokeStatusReadTimedOut:
+    seconds: float
+
+
+SmokeResult = (SmokeNotReady | SmokeConnectionLost | SmokeFinalStatus | SmokeMissingStatus
+               | SmokeInvalidStatus | SmokeStatusReadTimedOut)
 
 
 def smoke_status_path(episode: str) -> Path:
@@ -319,10 +330,12 @@ def read_smoke_ready(output: TextIO, episode: str) -> bool:
     return False
 
 
-def read_smoke_result(placement: MacPlacement, *, ready: bool) -> SmokeResult:
+def read_smoke_result(placement: MacPlacement, ssh_status: int, *, ready: bool) -> SmokeResult:
     """Read and remove the status file after the first SSH command ends."""
     if not ready:
         return SmokeNotReady()
+    if ssh_status:
+        return SmokeConnectionLost()
     path = shlex.quote(str(smoke_status_path(placement.episode)))
     command = (
         f'status_file="$HOME"/{path}\n'
@@ -330,9 +343,13 @@ def read_smoke_result(placement: MacPlacement, *, ready: bool) -> SmokeResult:
         'builtin printf "mac_smoke_status="\n'
         'cat -- "$status_file" && rm -f -- "$status_file" && rmdir -- "${status_file:h}"'
     )
-    result = subprocess.run(
-        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(command)],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    timeout = conf.read("mac_test").number("probe_timeout_s")
+    try:
+        result = subprocess.run(
+            ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(command)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return SmokeStatusReadTimedOut(timeout)
     if result.returncode or not result.stdout:
         return SmokeMissingStatus()
     prefix = b"mac_smoke_status="
@@ -343,14 +360,23 @@ def read_smoke_result(placement: MacPlacement, *, ready: bool) -> SmokeResult:
     return SmokeInvalidStatus()
 
 
+def run_smoke_copy(command: list[str]) -> int:
+    """Publish the copy command's exit code after the lease closes."""
+    episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
+    status_file = Path.home() / smoke_status_path(episode)
+    status_file.unlink(missing_ok=True)
+    result = subprocess.run(command)
+    status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+    write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
+    return 0
+
+
 def run_smoke_work(work: str, cleanup: str) -> int:
     """Stop the smoke work on SSH EOF and settle the copy before its lease ends."""
     from scripts.lib.build_folders import COPY_KEEP_ENV
 
     episode = os.environ["MAC_PLACEMENT"].partition("/")[0]
     home = Path.home()
-    status_file = home / smoke_status_path(episode)
-    status_file.unlink(missing_ok=True)
     incoming = sys.stdin.fileno()
     if select.select([incoming], [], [], 0)[0]:
         return 1
@@ -395,9 +421,7 @@ def run_smoke_work(work: str, cleanup: str) -> int:
         status = 128 - status
     status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
     print(f"\nmac_smoke_ready={episode}", flush=True)
-    _ = sys.stdin.buffer.read()
-    write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
-    return status
+    return status if sys.stdin.buffer.read(1) == b"\n" else status or 1
 
 
 def run(args: Arguments) -> int:
@@ -577,19 +601,32 @@ def run_attempt(
             if smoke is not None:
                 assert smoke.stdin is not None and smoke.stdout is not None
                 try:
-                    smoke.stdin.close()
+                    with contextlib.suppress(BrokenPipeError):
+                        if smoke_ready and sys.exception() is None:
+                            # Release the copy after local cleanup. EOF alone means the connection ended.
+                            _ = smoke.stdin.write("\n")
+                            smoke.stdin.flush()
+                    with contextlib.suppress(BrokenPipeError):
+                        smoke.stdin.close()
                     for line in cast(TextIO, smoke.stdout):
                         print(line, end="", flush=True)
-                    _ = smoke.wait()
-                    smoke_result = read_smoke_result(placement, ready=smoke_ready)
+                    smoke_result = read_smoke_result(placement, smoke.wait(), ready=smoke_ready)
                     match smoke_result:
                         case SmokeFinalStatus(remote_status):
                             remote.state = RemoteState.EXITED
                             status = remote_status or status
                             safe = True
-                        case SmokeNotReady() | SmokeMissingStatus() | SmokeInvalidStatus():
-                            detail = " because the ready line is missing" if isinstance(smoke_result, SmokeNotReady) else ""
-                            print(f"mac queue: the Mac returned no valid final status{detail}", file=sys.stderr)
+                        case _:
+                            match smoke_result:
+                                case SmokeNotReady():
+                                    detail = "the Mac returned no valid final status because the ready line is missing"
+                                case SmokeConnectionLost():
+                                    detail = "the SSH connection closed before the Mac run ended"
+                                case SmokeStatusReadTimedOut(seconds):
+                                    detail = f"the Mac status read timed out after {seconds:g} seconds"
+                                case SmokeMissingStatus() | SmokeInvalidStatus():
+                                    detail = "the Mac returned no valid final status"
+                            print(f"mac queue: {detail}", file=sys.stderr)
                             status = 255
                             safe = False
                 except (OSError, ValueError) as error:
@@ -733,6 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         return watch_caller(int(words[1]), int(words[2]))
     if len(words) == 3 and words[0] == "smoke-work":
         return run_smoke_work(words[1], words[2])
+    if len(words) > 1 and words[0] == "smoke-copy":
+        return run_smoke_copy(words[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)
