@@ -40,7 +40,9 @@ from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
+from scripts.lint.memory_test_support import (
+    ADMISSION_CONFIG_FIXTURE, fake_memory_readings, write_config_fixture, write_pressure_reading,
+)
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, staff, waiting
@@ -113,6 +115,7 @@ class StartedStep(TypedDict):
 
 class SlotOrderTests(unittest.TestCase):
     repository_seed: ClassVar[ImmutableGitSeed]
+    child_bytecode: ClassVar[Path]
     root: Path = Path()
     source: Path = Path()
     slot_root: Path = Path()
@@ -130,7 +133,8 @@ class SlotOrderTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="slot-order-seed-")))
-        cls.repository_seed = ImmutableGitSeed.create(seed, "main", "Slot Tests", "slots@example.invalid",
+        cls.child_bytecode = seed / "bytecode"
+        cls.repository_seed = ImmutableGitSeed.create(seed / "git", "main", "Slot Tests", "slots@example.invalid",
             {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "gate.py": GATE_COMMAND,
              ".gitignore": "target/\n"})
 
@@ -138,6 +142,9 @@ class SlotOrderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot-order-"))).resolve()
         environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
+        _ = shutil.copyfile(ADMISSION_CONFIG_FIXTURE, Path(environment["CONF_DIR"]) / "build_admission.conf")
+        # Reuse child imports in a private cache outside the checkout.
+        environment.update(PYTHONPYCACHEPREFIX=str(self.child_bytecode), PYTHONDONTWRITEBYTECODE="")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         server = self.queue.server
@@ -184,8 +191,8 @@ class SlotOrderTests(unittest.TestCase):
                 _ = (self.root / "queue-wait").write_text("")
             return reply
 
-        _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
-        _ = self.enterContext(mock.patch.object(self.queue.server, "reply_filter", side_effect=observe_reply))
+        _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", new=observe_request))
+        _ = self.enterContext(mock.patch.object(self.queue.server, "reply_filter", new=observe_reply))
         _ = self.enterContext(self.queue.serving())
         self.addCleanup(self.stop_processes)
 
@@ -728,7 +735,10 @@ placement_once
         tools.root = self.root / "verify"
         tools.root.mkdir()
         tools.build_fixture()
+        _ = shutil.copyfile(ADMISSION_CONFIG_FIXTURE, tools.root / "build_admission.conf")
+        _ = shutil.copyfile(ADMISSION_CONFIG_FIXTURE, tools.home / ".claude/config/build_admission.conf")
         tools.environment.update(self.build_sessions)
+        tools.environment["PYTHONPYCACHEPREFIX"] = str(self.child_bytecode)
         real_git = shutil.which("git")
         assert real_git is not None
         shutil.rmtree(tools.root / ".git")
@@ -765,14 +775,14 @@ placement_once
             "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
             "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
             "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
-            "LINT_SKIP_SWEEP": "1"}
+            "LINT_SKIP_SWEEP": "1", "BUILD_TARGETS_POLL_S": "5"}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
         _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             if key.destination.provider == "local":
                 return placement.FreshHostEvidence(key, self.queue.clock.now(), "", placement.AllowedHost())
             return placement.HostEvidenceUnavailable(key, self.queue.clock.now(), "The fixture has no remote provider.")
-        _ = self.enterContext(mock.patch.object(self.queue.server, "host_probe", side_effect=provider))
+        _ = self.enterContext(mock.patch.object(self.queue.server, "host_probe", new=provider))
         self.source = tools.root
         return environment
 
@@ -882,7 +892,7 @@ placement_once
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         caller_count = 7
-        self.queue.configure(recovery_start_seconds=1, waiting_pass_seconds=0.05, running_pass_seconds=0.1)
+        self.queue.configure(recovery_start_seconds=1, waiting_pass_seconds=0.2, running_pass_seconds=1)
         memory = fake_memory_readings(self.queue.root, available_kib=256 * 1024**2, total_kib=256 * 1024**2)
         hold = Path(environment["BUILD_HOLD_DIR"])
         hold.mkdir(exist_ok=True)
@@ -985,8 +995,8 @@ placement_once
             return {path for path in self.slot_root.glob("*/*/[0-9]*")
                     if path.name.isdecimal() and path.is_dir() and build_folders.build_folder_state(path) == "held"}
 
-        with (mock.patch.object(self.queue.server, "host_probe", side_effect=read_host),
-              mock.patch.object(self.queue.server, "reply_filter", side_effect=observe_wait),
+        with (mock.patch.object(self.queue.server, "host_probe", new=read_host),
+              mock.patch.object(self.queue.server, "reply_filter", new=observe_wait),
               socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ExitStack() as steps):
             listener.bind(str(endpoint))
             listener.listen()
@@ -1571,7 +1581,7 @@ placement_once
 
                 self.waiting.clear()
                 first_request, first_reply = len(self.requests), len(self.replies)
-                with (mock.patch.object(self.queue.server, "host_probe", side_effect=provider),
+                with (mock.patch.object(self.queue.server, "host_probe", new=provider),
                       mock.patch.dict(os.environ, case_environment)):
                     process = self.start(words, "--apply-uncommitted", str(tools.root), "--merge", revision)
                     if source_record:
@@ -1609,6 +1619,7 @@ placement_once
                     if scenario == "retry":
                         _ = (snapshot / "src/lib.rs").write_text("pub fn retried() {}\n")
                     ready.touch()
+                    self.queue.server.wake_loop()
                     if scenario == "retry":
                         cargo = wait_for_pid(started, processes=(process,))
                         executed = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
@@ -1670,9 +1681,7 @@ placement_once
 
     def test_verify_request_only_keeps_the_first_step_routing_and_creates_no_slot(self) -> None:
         tools = self.verify_source()
-        source_key = subprocess.run([sys.executable, str(CHECKOUT / "scripts/build_targets/build_targets.py"),
-            "source-key", "--repo-root", str(tools.root)], cwd=tools.root, env=tools.environment,
-            capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+        source_key = treekey.committed_tree_key(copies.git(tools.root, "rev-parse", "HEAD^{tree}").strip())
         cases: tuple[tuple[tuple[str, ...], placement.HostSelection, target_config.StepRoute], ...] = (
             (("check", "sample"), placement.ConfiguredOrder(), target_config.ANY_ELIGIBLE_TARGET),
             (("build", "sample", "--target", "mac"), placement.PinnedHost("mac"), target_config.PinnedTarget("mac")),
