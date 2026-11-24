@@ -453,10 +453,11 @@ rustdoc index limit keep their existing rules.
 
 The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
 `unit`/`delegate` run folders without recorded end evidence until they are
-unchanged for 7 days; top-level files and links also wait 7 days. All process,
-ownership and saved-work checks still apply. Its log names removals based on end
-evidence separately from the 7-day fallback and lists paths kept for lack of end
-evidence. Tempfile-named entries, invoke/verify logs and other roots keep their
+unchanged for 7 days. Top-level files and links also wait 7 days.
+The sweep checks processes, ownership and saved work.
+It lists eligible entries for vetted manual removal and gives the reason.
+It reports a count for each reason it keeps entries.
+Tempfile-named entries, invoke/verify logs and other roots keep their
 existing rules; hand cleanup still requires end evidence. Folder audit also uses
 the shared tree change-time check (mtime and ctime) and waits 7 days without a
 change, so a recent copy with preserved mtimes stays.
@@ -470,11 +471,13 @@ different build-log root.
 A cold step has `crates_compiled >= 50`. Its cause is the latest matching
 removal between the same workspace's previous step end and the cold step start.
 The workspace is `worktree` when set, otherwise `cwd`; it also sets the clone
-kind. A tmp sweep can match the workspace or working folder and their ancestors.
+kind.
+A historical tmp sweep removal can match the workspace, the working folder or an ancestor.
 The journal's `the floor took` lines name floor removals. A `lint sweep: removed`
 line for build units uses the budget header from the same journal stream;
-orphan cleanup does not count. `tmp sweep: deleted`
-lines name removed folders. The report groups gate and merge copies, phase
+orphan cleanup does not count.
+Historical `tmp sweep: deleted` lines name removed folders.
+The report groups gate and merge copies, phase
 clones, mktemp folders, scratchpad clones, scratch.py folders, other `/tmp`,
 `~/rust` worktrees, and other folders. Compile-hours use `finished_s`, with
 `duration_s` when that field is absent. The table also gives totals per day.
@@ -532,24 +535,30 @@ the run; the floor sweep discovers the configured gates root and may reclaim
 idle marked caches. See `gate-checkouts.md` for configuration and removal.
 The sweep still reads Cargo's general `build.build-dir` templates.
 
-The copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on natedev and on the Mac) is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
+The copies root is `/tmp/claude/copies` on natedev and the Mac (`roots.copies` in `build_folders.conf`).
+The root holds copies at `<pair>/<copy>`.
+The tmp sweep lists each eligible copy for vetted manual removal.
+The folder audit and scratch guard keep the root.
+`scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
 `targeted_test.py --checkout <copy>` and `merge_gate.py --checkout <copy>` take the shared lock before tests start.
-Scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting.
-They create the mark when absent and retain it through deletion.
+The tmp sweep takes an exclusive lock on existing busy marks without waiting before it lists a copy.
+The floor sweep also checks existing busy marks before it lists build output.
+Scratch end records task completion and keeps the folders.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
-`scratch.removal_lock` and `scratch.judgment_lock` first take its lease lock without waiting and hold it through judgment and deletion.
+Both `scratch.removal_lock` and `scratch.judgment_lock` check its lease before the busy mark.
+`scratch.removal_lock` creates a missing busy mark and holds it through removal.
 A held lease is busy, even when no busy mark is held. The collector then creates no busy mark.
 A collector judges a lock file, a lease record or an unfinished lease record by its folder's lease, so it never removes a live owner's records.
 `scratch.removal_lock` also walks the folder without following links and holds every lease lock below it through deletion.
 A held lease below the folder, or an unreadable folder, is busy. `judgment_lock` does not walk, so status reads stay fast; removal makes the final call.
-Every collector that uses these locks (scratch end, the folder audit, the tmp sweep, the floor sweep and copy removal) gets this guard.
+The folder audit, the tmp sweep, the floor sweep and copy removal use these locks.
  A holder checks the present mark and removal evidence before it starts work. Shared holders can run together; a process exit releases its lock. Hana can set the same mark in a target with `flock`, without importing these scripts. `scratch.py hand-over <path> --to <unit> --task <new-task>` replaces owner and the complete task atomically and keeps the path, so child alternates and recovery records retain valid paths. One task-field function clears the old end evidence, run directory, phase id and land target; a phase hand-over supplies `--run-dir` and derives its phase id from the new task, and a landed task can supply `--land-target`.
 
-Scratch end rechecks the task under the removal lock. A hold on a copy's ancestor judges each copy separately and removes only empty containers. Before deleting a copy, cleanup records removal evidence in its pair folder, outside the tree being removed; a rerun finishes a partial deletion even after its scratch record is gone, and that copy no longer keeps a borrowed parent. The certificate records the copy identity and its directory's device and inode; a new copy at the same path discards a stale certificate instead of inheriting its end evidence.
+Explicit task copy removal rechecks the task under the removal lock. A hold on a copy's ancestor judges each copy separately and removes only empty containers. Before deleting a copy, cleanup records removal evidence in its pair folder, outside the tree being removed; a rerun finishes a partial deletion even after its scratch record is gone, and that copy no longer keeps a borrowed parent. The certificate records the copy identity and its directory's device and inode; a new copy at the same path discards a stale certificate instead of inheriting its end evidence.
 
 ## Calibration / gotchas
 

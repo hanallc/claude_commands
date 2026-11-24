@@ -183,7 +183,7 @@ A successful retry removes the record.
 Removal requires a zero status marker from the remote command before it deletes the local record.
 Authentication failures and remote removal refusals still raise `RemoteMirrorKept` and prevent retirement.
 A kept local tree prints one line, and retirement continues.
-The sweep removes the local tree later.
+The tmp sweep lists eligible local trees for vetted manual removal.
 Another owner's records remain.
 
 Local mirror rows display the machine name while their records retain `localhost`.

@@ -539,11 +539,12 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   After success, the runner sends the full output and deletes the file.
   After failure, it reports the saved path and sends a tail of `nextest_failure_tail_bytes` bytes (65,536 by default).
   It also sends the last nextest Summary line, up to `nextest_failure_summary_bytes` bytes (1,024 by default).
-  The hourly Mac `tmp_sweep.py` job removes closed, owned logs after `nextest_failure_log_days` days (seven by default).
+  The hourly Mac `tmp_sweep.py` job lists closed, owned logs for vetted manual removal after `nextest_failure_log_days` days (seven by default).
   It measures age from the failure time or, for an interrupted run, the last write time.
   On the Mac, read a saved log with `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/nextest_log.py read PATH`.
   The reader holds a shared lock until the copy ends.
-  The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
+  The sweep checks for open files with `lsof`.
+  It takes an exclusive lock before it lists a log.
   If the log writer cannot start nextest, the runner reports a setup failure.
 - `stream_mac_run` holds a `mac_exit=<n>` marker with a status from 0 to 255.
   Later ordinary output invalidates the held marker.
