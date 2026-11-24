@@ -1644,17 +1644,23 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
 
 
 def unread_answer_ids(item: ListItem) -> frozenset[str]:
-    """Find answers since the last action that cleared the item's unread state."""
+    """Find unread answers after the last read, close, or reopen."""
     if not isinstance(item.unread_since, datetime):
         return frozenset()
+    park_times: list[datetime] = []
     unread: set[str] = set()
     for change in reversed(item.log):
-        content = change.what
-        if (isinstance(content, (MarkedRead, Reopened)) or content in ("Marked read", "Reopened")
-                or isinstance(content, FieldChange) and content.action == "Closed"):
-            break
-        if isinstance(content, QuestionAnswered):
-            unread.add(content.question_id)
+        match change.what:
+            case MarkedRead() | "Marked read" | Reopened() | "Reopened" | FieldChange(action="Closed"):
+                break
+            case PageRequest(action="park"):
+                park_times.append(change.time)
+            case FieldChange(action="Parked", fields={"parked_until": until}) if until is not NoTimestamp.UNSET:
+                park_times.append(change.time)
+            case QuestionAnswered(question_id) if question_path.answer_is_unread(change.time, park_times):
+                unread.add(question_id)
+            case _:
+                pass
     return frozenset(unread)
 
 
