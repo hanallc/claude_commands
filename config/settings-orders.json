@@ -30,6 +30,7 @@
     "sweep_build_floor_gib.natedev": 6
   },
   "mac_test": {
+    "free_floor_gib": 27,
     "offload": 21,
     "probe_timeout_s": 26
   },
