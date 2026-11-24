@@ -1060,6 +1060,7 @@ SCRIPT = r'''(() => {
  let pageOwner = '';
  let captureSession, pageContext, savedItem, laterDraft, laterBase;
  let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
+ let separateFromNativeDraft = false, nativeListEdit, separateListEdit;
  let draftDatabase;
 
  function node(tag, text = '', css = '') {
@@ -1090,6 +1091,12 @@ SCRIPT = r'''(() => {
   if (isRecovering()) return submittedDraft.payload;
  }
 
+ function canEditSeparateListDraft() {
+  const canResume = separateListEdit && !words.value && !images.length;
+  return ownerPage === 'list' && token && !savedItem && !submittedDraft &&
+    !separateFromNativeDraft && (awaitingNativeRecovery || canResume);
+ }
+
  function updateSend() {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
@@ -1101,7 +1108,7 @@ SCRIPT = r'''(() => {
   for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
   for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
   send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
-  laterButton.hidden = !submittedDraft || !['retry', 'edit-later'].includes(submittedDraft.mode);
+  laterButton.hidden = !canEditSeparateListDraft() && !['retry', 'edit-later'].includes(submittedDraft?.mode);
   laterButton.disabled = sending;
   laterButton.textContent = isEditingLater() ? 'Return to Retry' : 'Edit a separate draft';
   sentDetails.hidden = scheduled;
@@ -1560,8 +1567,12 @@ SCRIPT = r'''(() => {
   } catch (_) { return null; }
  }
 
+ function isShippedListDraft(draft) {
+  return draft?.id.startsWith('r6-') && draft.awaitingSend === undefined;
+ }
+
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || isEditingLater() || !sendNotice.hidden) return;
+  if (ownerPage !== 'list' || !draftId || isEditingLater() || separateFromNativeDraft || !sendNotice.hidden) return;
   try {
    sessionStorage.setItem(listSendKey, JSON.stringify({
     id: draftId, recipient: selectedRecipient,
@@ -1628,7 +1639,7 @@ SCRIPT = r'''(() => {
   clearSubmittedDraft();
   draftId = undefined;
   awaitingEarlierSend = awaitingNativeRecovery = false;
-  if (ownerPage === 'list') {
+  if (ownerPage === 'list' && !separateFromNativeDraft) {
    try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
  }
@@ -1648,7 +1659,10 @@ SCRIPT = r'''(() => {
  function showLaterDraft() {
   const draft = laterDraft;
   laterDraft = undefined;
-  if (!draft) return;
+  if (draft) showEdit(draft);
+ }
+
+ function showEdit(draft) {
   ownerPage = draft.ownerPage;
   pageContext = draft.pageContext;
   form.elements.kind.value = draft.kind;
@@ -1659,6 +1673,12 @@ SCRIPT = r'''(() => {
   replaceImages(draft.files);
   showRecipients();
   showBugPage();
+ }
+
+ function decodePastedFiles(uploads) {
+  return uploads.map(image => new File([
+   Uint8Array.from(atob(image.base64_data), character => character.charCodeAt(0))
+  ], 'Pasted image', {type: image.media_type}));
  }
 
  function showSubmittedDraft(draft) {
@@ -1675,6 +1695,16 @@ SCRIPT = r'''(() => {
   draft.mode = draft.mode === 'screenshot-expired' ? 'screenshot-expired' : 'retry';
   draftId = original.request_id;
   ownerPage = original.page;
+  if (ownerPage === 'list') {
+   const stored = storedListDraft();
+   separateFromNativeDraft = isShippedListDraft(stored) && stored.id !== draftId;
+   if (separateFromNativeDraft) {
+    awaitingNativeRecovery = false;
+    if (!nativeListEdit && draft.nativeListEdit) {
+     nativeListEdit = {...draft.nativeListEdit, files: decodePastedFiles(draft.nativeListEdit.files)};
+    }
+   }
+  }
   awaitingEarlierSend = true;
   form.elements.kind.value = draft.selectedKind || original.kind;
   selectedRecipient = original.recipient_id;
@@ -1687,9 +1717,7 @@ SCRIPT = r'''(() => {
    viewport: original.defer_capture || original.page_state?.viewport || viewport()
   };
   if (editingLater || images.length !== (original.images?.length || 0)) {
-   replaceImages((original.images || []).map(image => new File([
-    Uint8Array.from(atob(image.base64_data), character => character.charCodeAt(0))
-   ], 'Pasted image', {type: image.media_type})));
+   replaceImages(decodePastedFiles(original.images || []));
   }
   if (!keepDraft || error.hidden || draft.mode === 'screenshot-expired') {
    setError(draft.mode === 'retry' ? 'Retry to confirm the save.' : '');
@@ -1700,6 +1728,22 @@ SCRIPT = r'''(() => {
  }
 
  laterButton.addEventListener('click', () => {
+  if (canEditSeparateListDraft()) {
+   discardCapture();
+   if (awaitingNativeRecovery) {
+    nativeListEdit = editSnapshot();
+    separateFromNativeDraft = true;
+    awaitingEarlierSend = awaitingNativeRecovery = false;
+   }
+   showEdit(separateListEdit || {...nativeListEdit, kind: 'scheduled', id: undefined, words: '', files: []});
+   separateListEdit = undefined;
+   ensureDraftId();
+   setError('');
+   showSentDetails();
+   startCapture();
+   words.focus();
+   return;
+  }
   if (isEditingLater()) {
    showSubmittedDraft(submittedDraft);
    setError('Retry to confirm the save.');
@@ -1782,10 +1826,18 @@ SCRIPT = r'''(() => {
    }
   }
   if (isEditingLater()) showSubmittedDraft(submittedDraft);
+  const returnToNative = separateFromNativeDraft && !submittedDraft;
+  if (returnToNative) {
+   if (!sent && !result) separateListEdit = editSnapshot();
+   separateFromNativeDraft = false;
+   draftId = undefined;
+   awaitingEarlierSend = false;
+  }
   discardCapture();
   opening.abort();
   dialog.close();
-  keepDraft = !sent && !result && Boolean(submittedDraft || awaitingEarlierSend || words.value || images.length);
+  keepDraft = !returnToNative && !sent && !result &&
+    Boolean(submittedDraft || awaitingEarlierSend || words.value || images.length);
   if (!keepDraft) {
    if (ownerPage !== 'list' || !storedListDraft()) finishDraft();
    for (const image of images) URL.revokeObjectURL(image.url);
@@ -1820,7 +1872,7 @@ SCRIPT = r'''(() => {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
     // The shipped List dialog stores no Send state.
-    awaitingNativeRecovery = draftId.startsWith('r6-') && stored.awaitingSend === undefined;
+    awaitingNativeRecovery = isShippedListDraft(stored);
     awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
    }
   }
@@ -1836,6 +1888,10 @@ SCRIPT = r'''(() => {
    form.reset();
    setError('');
    form.elements.kind.value = 'bug';
+   if (nativeListEdit && awaitingNativeRecovery && nativeListEdit.id === draftId) {
+    showEdit(nativeListEdit);
+    nativeListEdit = undefined;
+   }
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
@@ -1911,8 +1967,13 @@ SCRIPT = r'''(() => {
    const item = await submissionPayload();
    if (submittedDraft?.payload !== item) {
     const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
-    await storeSubmittedDraft({payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
-                               includeScreenshot: includePage.checked});
+    const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
+                   includeScreenshot: includePage.checked};
+    if (separateFromNativeDraft && nativeListEdit) {
+     const files = await Promise.all(nativeListEdit.files.map(pastedData));
+     draft.nativeListEdit = {...nativeListEdit, files};
+    }
+    await storeSubmittedDraft(draft);
    }
    awaitingEarlierSend = true;
    storeListDraft();
