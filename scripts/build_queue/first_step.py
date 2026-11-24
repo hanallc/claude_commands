@@ -262,6 +262,14 @@ def run_gate_with_placement(
                                 + 'Received a replacement assignment.')
             else:
                 client.request_settlement(wire.SettlementRequest(previous))
+                if previous.destination.provider == 'ssh' and previous.destination.target == 'mac-linux':
+                    # Guest end proof alone cannot authorize another run.
+                    try:
+                        refusal = read_gate_claim_failure(assignment_file, request)
+                    except FileNotFoundError:
+                        return result
+                    if refusal.reason != placement.MAC_LINUX_NO_ANSWER:
+                        return result
             place_again(request)
             replacement = read_assignment(assignment_file).assignment
             if (not assignment_matches_request(replacement, request)

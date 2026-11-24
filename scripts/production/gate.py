@@ -92,7 +92,7 @@ from scripts.production import (  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules,
-    GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
+    GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun, GuestGateBlocked,
     MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
     MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
@@ -3396,7 +3396,7 @@ class MacLinuxGateRoute(Protocol):
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
               module_time_limit_s: float, selected: AllModules | TreeSelection,
               gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str],
-              assignment: placement.PlacementAssignment) -> GateRun | GuestNotStartedOutcome | str: ...
+              assignment: placement.PlacementAssignment) -> GateRun | GuestNotStartedOutcome | GuestGateBlocked | str: ...
 
     def new_run_settings(self) -> GuestToolSettings | GuestNotStartedOutcome | str: ...
 
@@ -3465,12 +3465,20 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         except guest.GuestEndUnproven as error:
             detail = ' '.join((str(error), *getattr(error, '__notes__', ())))
             raise GateSettlementPending(f'Mac Linux guest gate failed: {detail}') from error
+        if isinstance(outcome, GuestGateBlocked):
+            raise GateSettlementPending(f'Mac Linux guest gate blocked. {outcome.reason}')
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
+            failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
             if outcome.settlement_required:
+                try:
+                    write_gate_claim_failure(failure)
+                except (KeyError, OSError) as error:
+                    raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
+                                                + f'Cannot save the placement refusal. {error}') from error
                 raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
-            write_gate_claim_failure(admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER))
+            write_gate_claim_failure(failure)
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         if not outcome.passed:
             print("Mac Linux guest gate failed", file=sys.stderr, flush=True)

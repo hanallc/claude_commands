@@ -106,6 +106,13 @@ class GateRun:
                 and not self.time_limit_report and all(job.returncode == 0 for job in self.jobs))
 
 
+@dataclass(frozen=True)
+class GuestGateBlocked:
+    """The gate cannot authorize a replacement for this guest attempt."""
+
+    reason: str
+
+
 class WholeGateRoute(Protocol):
     """Run the whole test selection on one remote machine."""
 

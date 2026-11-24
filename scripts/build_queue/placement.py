@@ -35,6 +35,22 @@ class ClaimHolderUnconfirmed:
 
 
 @dataclass(frozen=True)
+class LegacyGuestClaim:
+    """Identify the guest claim and holder that the queue saved."""
+
+    claim_id: str
+    holder: ClaimHolderIdentity
+
+
+@dataclass(frozen=True)
+class RecordedGuestRecoveryOnly:
+    """Recovery lacks an exact legacy claim and holder."""
+
+
+RECORDED_GUEST_RECOVERY_ONLY = RecordedGuestRecoveryOnly()
+
+
+@dataclass(frozen=True)
 class TokenReadinessUnchecked:
     """The caller has not checked whether the local token is ready."""
 
