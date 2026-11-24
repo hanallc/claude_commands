@@ -306,7 +306,7 @@ The Builds page shows both attempts in Running with the recorded job, unit, and 
 The Machine cell shows one bright Apple icon with a 🐧 badge.
 The Apple icon has a white fill and a black outline in light and dark modes.
 The cell shows `not confirmed` until confirmation, then `running`.
-The tooltip shows `Runs on` and `Named targets`. It shows the attempt ID after confirmation.
+The tooltip shows `Runs on` and `Named targets`.
 The shared tooltip wraps long fields within its box. The tooltip adjusts its position to fit the viewport when it opens or its content changes.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
