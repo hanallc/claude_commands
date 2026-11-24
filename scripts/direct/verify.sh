@@ -884,8 +884,7 @@ finish_verify_verb_list() {
 }
 
 run_verify_verbs() {
-    local verb length offset=0 status list_run=""
-    if (( ${#VERIFY_STEP_LENGTHS[@]} )); then list_run=${BUILDLOG_RUN:-}; fi
+    local verb length offset=0 status list_run
     for verb in ${VERIFY_VERBS[@]+"${VERIFY_VERBS[@]}"}; do
         VERIFY_STEP_LENGTHS+=("$(( $# + 1 ))")
         VERIFY_STEP_WORDS+=("$verb" "$@")
@@ -897,6 +896,9 @@ run_verify_verbs() {
     VERIFY_VERB_PREVIOUS_JOB=${!:-}
     trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
     for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        # Doc can leave its grant without a memory handoff when it takes its own slot.
+        list_run=""
+        if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
         env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
             "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
         status=0
@@ -3127,8 +3129,7 @@ placement_once() {
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
     local parent_run=${BUILDLOG_RUN:-}
-    # Plus-list steps keep their queue place even when they need a checkout.
-    # Other steps with a checkout can leave a grant without a memory handoff.
+    # The parent marker lets a list step keep its queue place during checkout.
     local BUILDLOG_RUN=$parent_run
     if [[ -n "${VERIFY_SLOT_SOURCE:-}" && "${VERIFY_STEP_LIST_RUN:-}" != "$parent_run" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN

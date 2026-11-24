@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from typing import cast
 import unittest
 from unittest import mock
@@ -11,6 +12,7 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import target_config
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyStepListTests(VerifyStepRoutesFixture):
@@ -63,7 +65,7 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.assertIsInstance(run, wire.RunIdentity)
         assert isinstance(run, wire.RunIdentity)
         self.assertEqual([row["run_id"] for row in rows], [f"{run.pid}:{run.start_time}"] * 5)
-        self.assertTrue(all(request.run == run for request in placements))
+        self.assertEqual([request.run for request in placements], [run] * 5 + [wire.NO_RUN])
         routes = list(dict.fromkeys((request.identity.step, request.route) for request in placements))
         self.assertEqual(routes, [
             ("check", target_config.LocalRequired("requires Linux kernel")),
@@ -85,6 +87,39 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.assertEqual(doc[doc.index("--verb") + 1], "doc")
         self.assertIn("extra", doc)
         self.assertIn("Mac only (Mac-only docs + Swift)", result.stderr)
+        self.assert_removed()
+
+    def test_comma_steps_keep_one_run_identity_in_a_slot_copy(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        _ = subprocess.run(["git", "remote", "add", "origin", str(root)], cwd=root,
+                           env=self.fixture.environment, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.fixture.environment.update({"BUILDLOG_OFF": "0", "COPIES_STEP_SOURCE": str(root),
+                                         "COPIES_STEP_OWNER": "fixture", "COPIES_STEP_POOL": str(root)})
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        previous = admission.server.handle_request
+        requests: dict[str, wire.PlacementRequest] = {}
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                _ = requests.setdefault(request.episode, request)
+            return previous(request, connection)
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("lint,test,doc", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual([row["verb"] for row in rows], ["lint", "test", "doc"])
+        self.assertEqual(len({row["id"] for row in rows}), 3)
+        placements = list(requests.values())
+        self.assertEqual([request.identity.step for request in placements], ["mend", "clippy", "nextest", "doc"])
+        run = placements[0].run
+        self.assertIsInstance(run, wire.RunIdentity)
+        assert isinstance(run, wire.RunIdentity)
+        self.assertEqual([row["run_id"] for row in rows], [f"{run.pid}:{run.start_time}"] * 3)
+        self.assertEqual([request.run for request in placements], [run, run, run, wire.NO_RUN])
         self.assert_removed()
 
     def test_quoted_plus_is_a_routing_reason(self) -> None:
