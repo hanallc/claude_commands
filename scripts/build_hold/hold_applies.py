@@ -36,7 +36,7 @@ def hold_applies() -> str:
         names = "; ".join(build_hold.holder_text(holder) for holder in holds.in_force)
         return (f"natedev builds are held by {names}. Keep working, writes included. "
                 "Use verify.sh: eligible steps go to the Mac; other steps wait. "
-                "Raw cargo and merge gates must wait for the hold to end.")
+                "Raw cargo and gate jobs must wait for the hold to end.")
     except (OSError, UnicodeError, ValueError) as error:
         raise HoldStateReadError(str(error)) from error
 
