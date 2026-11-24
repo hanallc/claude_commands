@@ -487,6 +487,29 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
+    def test_mac_linux_prints_a_summary_only_when_the_guest_passes(self) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        target = gate.MacLinuxAssignment(self.gate_assignment("mac-linux"))
+        commit = self.git(self.checkout, "rev-parse", "HEAD")[:10]
+        types = gate.GateJobResult("types", "basedpyright", 0, 1, "", kind=gate.GateJobKind.TYPE_CHECK)
+        first = gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
+        second = gate.GateJobResult("lib", "test_first.py", 0, 1, "")
+        for status, dirty in ((0, False), (1, False), (0, True)):
+            if dirty:
+                self.write(self.checkout / "uncommitted.txt", "Guest snapshot fixture.\n")
+            result = gate.GateRun((replace(first, returncode=status), second, types), 1673, 0)
+            with (self.subTest(status=status, dirty=dirty), mock.patch.object(mac_linux, "route", return_value=result),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED, full=True, target=target)
+                self.assertIs(run, result)
+                if status == 0:
+                    self.assertEqual(output.getvalue(),
+                                     f"Mac Linux guest gate passed: 2 modules in 27 min 53 s (checkout HEAD {commit})\n")
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("Mac Linux guest gate failed\n", errors.getvalue())
+
     @gate_suites("lib")
     def test_mac_linux_checks_types_in_the_guest_when_the_tests_are_reused(self) -> None:
         self.assertTrue(gate.run_suites(self.checkout).passed, self.output.getvalue())
