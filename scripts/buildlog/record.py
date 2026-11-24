@@ -1257,6 +1257,68 @@ def write_call(started: float, fields: dict[str, object], record_id: str | None 
     store.append_line(store.host_file(host, started), record)
 
 
+def wait_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text().splitlines()
+    except OSError:
+        return []
+
+
+def call_waits(directory: Path, verb: str, token_wait: int, skipped_hold_can_be_zero: bool) -> dict[str, object]:
+    """Read the wait totals before Verify removes its wait directory."""
+    token_file = os.environ.get("BUILDLOG_TOKEN_WAIT_FILE", "")
+    token_directory = Path(os.environ.get("BUILDLOG_TOKEN_WAIT_DIR") or directory)
+    step_waits: dict[str, int | None] = {}
+    wait_total = 0.0
+    hold_total: float | None = None
+    invalid_hold_sample = False
+    token_total = 0
+    for folder in (directory, *sorted(directory.glob("wait-*"))):
+        label = verb if folder == directory else folder.name.removeprefix("wait-")
+        hold_path = folder / "seconds"
+        hold_samples = [seconds for line in wait_lines(hold_path)
+                        if (seconds := optional_nonnegative_number(line)) is not None]
+        hold = sum(hold_samples)
+        if hold_samples:
+            hold_total = (hold_total or 0.0) + hold
+        elif hold_path.exists():
+            invalid_hold_sample = True
+        token_path = Path(token_file) if folder == directory and token_file else folder / "token-seconds"
+        token = sum(optional_int(line) or 0 for line in wait_lines(token_path))
+        if folder == token_directory:
+            token += token_wait
+        memory = sum(optional_int(line) or 0 for line in wait_lines(folder / "memory-seconds"))
+        measured = True
+        for path in folder.glob("placement-call-*"):
+            if path.suffix == ".pending":
+                measured = False
+                continue
+            samples = path.glob("sample-*") if path.is_dir() else (path,)
+            for sample in samples:
+                if sample.suffix == ".tmp":
+                    continue
+                lines = wait_lines(sample)
+                elapsed = optional_int(lines[0]) if lines else None
+                if elapsed is None:
+                    measured = False
+                else:
+                    memory += elapsed
+        total = memory + token + hold
+        if total or label != verb or not measured:
+            step_waits[label] = int(total) if measured else None
+        wait_total += total
+        token_total += token
+    if not step_waits:
+        step_waits[verb] = 0
+    admission_measured = None not in step_waits.values()
+    # Verify skips the sample file when the hold check is unnecessary.
+    if (hold_total is None and skipped_hold_can_be_zero and admission_measured
+            and not invalid_hold_sample and directory.is_dir()):
+        hold_total = 0.0
+    return {"admission_wait_s": int(wait_total) if admission_measured else None,
+            "hold_wait_s": hold_total, "token_wait_s": token_total, "step_wait_s": step_waits}
+
+
 def call(args: list[str]) -> None:
     from scripts.direct.step_record import NamedPackage, WorkspacePackages
 
@@ -1264,6 +1326,7 @@ def call(args: list[str]) -> None:
     words = args[9:]
     package_name = os.environ.get("BUILDLOG_PACKAGE", words[0] if words and not words[0].startswith("-") else "")
     selection = NamedPackage(package_name) if package_name else WorkspacePackages()
+    hold_wait = optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", ""))
     fields: dict[str, object] = {
         "tool": "verify.sh",
         "caller": os.environ.get("BUILDLOG_CALLER") or "verify",
@@ -1283,7 +1346,7 @@ def call(args: list[str]) -> None:
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "target": os.environ.get("BUILDLOG_TARGET", ""),
         "pinned": bool(os.environ.get("BUILDLOG_PINNED_TARGET")),
-        "hold_wait_s": optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", "")),
+        "hold_wait_s": hold_wait,
         "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
         "copy_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_COPY_S", "")),
         "copy_count": optional_int(os.environ.get("BUILDLOG_MAC_COPY_COUNT", "")),
@@ -1294,6 +1357,10 @@ def call(args: list[str]) -> None:
         "mem_kills": int(os.environ.get("BUILDLOG_MEM_KILLS", "0")),
         "mem_kill_stopped": os.environ.get("BUILDLOG_MEM_KILL_STOPPED") == "1",
     }
+    if wait_directory := os.environ.get("BUILDLOG_WAIT_DIR"):
+        token_wait = optional_int(os.environ.get("BUILDLOG_TOKEN_WAIT_S", "")) or 0
+        fields.update(call_waits(Path(wait_directory), verb, token_wait,
+                                 skipped_hold_can_be_zero=hold_wait == 0 and outcome != "interrupted"))
     write_call(time.time() - float(elapsed or 0), fields, os.environ.get("BUILDLOG_CALL_ID"))
 
 
