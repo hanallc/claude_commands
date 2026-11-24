@@ -86,9 +86,9 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(len(table.findall(".//tbody//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']")), 1)
         self.assertIsNone(table.find(".//thead//{http://www.w3.org/2000/svg}svg[@class='lucide lucide-microchip']"))
         self.assertIsNotNone(table.find(".//th[@data-tip='limit:machine:mac']"))
-        columns = [ElementTree.fromstring(value).find("dl") for value in (tooltip, heading, metric, mac_wait_tip)]
-        for column in columns:
-            assert column is not None
+        for value in (tooltip, heading, metric, mac_wait_tip):
+            column = ElementTree.fromstring(value)
+            self.assertEqual(column.tag, "dl")
             self.assertIn("Waiting", [row.text for row in column.findall("dt")])
             self.assertIn("Because", [row.text for row in column.findall("dt")])
             self.assertIn("Test <one>, Test two", [row.text for row in column.findall("dd")])
