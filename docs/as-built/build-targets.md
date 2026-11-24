@@ -645,6 +645,7 @@ The Cargo token report uses the existing `wait_s` field to locate the end of the
 The `admission_wait_s` field totals the waits for memory, routing, holds, and the Cargo token.
 The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
 Verify counts the placement samples after it receives a grant, a refusal, or a confirmed cancellation.
+A confirmed cancellation includes the cancellation that Verify requests before lint formatting.
 A canceled episode stops accruing wait before formatting starts.
 If Verify stops before it reads a final reply or a sample is missing, it records null for the step and admission totals.
 The `hold_wait_s` field is null when the call has no valid hold sample.

@@ -210,6 +210,62 @@ else:
         self.assertEqual((lint_waits["mend"], lint_waits["clippy"]), (4200, 720))
         self.assertEqual([row["step_wait_s"] for row in rows[1:]], [{"test": 1290}, {"doc": 420}])
 
+    def test_mend_cancellation_records_the_wait_when_taplo_fails(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        startup = root / "verify-clock.sh"
+        _ = startup.write_text('''if [[ ${0##*/} == verify.sh ]]; then
+    unset EPOCHREALTIME
+    EPOCHREALTIME="$(date +%s).000000"
+fi
+''')
+        self.fixture.environment.update({"BUILDLOG_OFF": "0", "BASH_ENV": str(startup)})
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        canceled = root / "mend-canceled"
+        self.fixture.write_executable(self.fixture.bin_directory / "taplo", f"""from pathlib import Path
+import sys
+if sys.argv[1:] == ["--version"]:
+    print("taplo fixture 1.0")
+elif Path({str(canceled)!r}).is_file():
+    sys.exit(9)
+""")
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        previous = admission.server.handle_request
+        episode = ""
+        wait = wait_reply(records.NeedsMemory())
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            nonlocal episode
+            if isinstance(request, wire.PlacementRequest) and request.identity.step == "mend":
+                candidates = tuple(placement.CandidateEligibility(candidate.destination, candidate.eligibility)
+                                   for candidate in request.constraints.candidates)
+                if not episode:
+                    episode = request.episode
+                    folder, = tool_folders(root / "tmp", "verify", pid=request.owner.pid)
+                    path = folder / f"placement-{episode}.json.wait"
+                    notice = admission_client.PlacementWaitNotice(0, (), 1,
+                        wire.PlacementResourceWait("mac", "busy"), 4)
+                    _ = path.write_text(wire.encode_record(notice))
+                    return [wire.PlacementWait(episode, request.since, 0, candidates)]
+                return [wire.PlacementWait(request.episode, request.since, 1, candidates, wait)]
+            if isinstance(request, wire.PrerequisiteReport) and request.episode == episode:
+                return [wire.Ok()]
+            if (isinstance(request, wire.CancelPlacement) and request.episode == episode
+                    and request.reason == "judge lint before local repair"):
+                canceled.touch()
+                return [wire.Ok()]
+            return previous(request, connection)
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("lint", "sample")
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertTrue(canceled.is_file())
+        row, = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual(row["step_wait_s"], {"fmt": 0, "mend": 4})
+        self.assertEqual(row["admission_wait_s"], 4)
+        self.assert_removed()
+
     def test_confirmed_placement_cancellation_records_the_memory_wait(self) -> None:
         self.prepare_repository()
         root = self.fixture.root

@@ -2917,6 +2917,7 @@ initialize_step_record() {
 # Reuse the call's decision. A hold check supplies the only local allow.
 route_compiling_step() {
     local command=$1
+    local pending_placement_wait="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}.pending"
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
     if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
         local token_status=0 reason
@@ -3142,6 +3143,12 @@ placement_failed() {
     PLACEMENT_FAILED=1
 }
 
+publish_placement_wait() {
+    if [[ -s "$pending_placement_wait/sample-$PLACEMENT_CALL_NUMBER" ]]; then
+        mv -- "$pending_placement_wait" "${pending_placement_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
+    fi
+}
+
 placement_once() {
     local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
@@ -3219,9 +3226,8 @@ placement_once() {
     fi
     [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
     PLACEMENT_CALL_NUMBER=$((${PLACEMENT_CALL_NUMBER:-0} + 1))
-    local pending_wait="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}.pending"
-    local wait_result="$pending_wait/sample-$PLACEMENT_CALL_NUMBER"
-    [[ -d "$pending_wait" ]] || mkdir -- "$pending_wait" || return $?
+    local wait_result="$pending_placement_wait/sample-$PLACEMENT_CALL_NUMBER"
+    [[ -d "$pending_placement_wait" ]] || mkdir -- "$pending_placement_wait" || return $?
     # An empty file means the client did not return a measurement.
     : > "$wait_result" || return $?
     # A builtin wait lets the parent handle signals during a service outage.
@@ -3239,10 +3245,7 @@ placement_once() {
     reply=$(< "$HOLD_WAIT_DIR/placement-reply") || return $?
     # A grant, refusal, or confirmed cancellation ends the admission wait.
     case "$status" in
-        0|2|"$LINT_LEFT_QUEUE_STATUS")
-            if [[ -s "$wait_result" ]]; then
-                mv -- "$pending_wait" "${pending_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
-            fi ;;
+        0|2|"$LINT_LEFT_QUEUE_STATUS") publish_placement_wait ;;
     esac
     while IFS= read -r line; do
         case "$line" in
@@ -3399,6 +3402,7 @@ route_test() {
                     && STEP_WRITES_TREE=0 step_can_retry; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                     --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "judge lint before local repair" >/dev/null || return $?
+                publish_placement_wait
                 LINT_MEMORY_WAIT_FILE="$PLACEMENT_ASSIGNMENT_FILE.wait"
                 LINT_MEMORY_JUDGMENT=1
                 BUILDLOG_PLACEMENT_PREPARED=0
