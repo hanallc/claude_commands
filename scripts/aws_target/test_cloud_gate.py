@@ -390,12 +390,12 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
             claim = binding.claim
             self.assertEqual(binding.account_settings, self.settings)
 
-            def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
+            def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
                 self.assertEqual(message.claim, claim)
                 saved = ledger.GateDispatchJournal(binding.journal).read()
                 self.assertEqual((saved.binding, saved.holder), (binding, message.holder))
                 reply, = fixture.server.handle_request(message)
-                assert isinstance(reply, wire.FirstAuthorization), reply
+                assert isinstance(reply, (wire.FirstAuthorization, wire.DispatchStatus)), reply
                 return reply
 
             def launch(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
@@ -413,14 +413,17 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
                   mock.patch.object(admission_client, 'report_execution') as report,
                   mock.patch.object(cloud_gate, 'run_cloud', side_effect=launch) as start_launch,
                   mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake AWS transport'))):
+                route = partial(cloud_gate.route, self.root, mode=gate.SuiteMode.GATE, full=False,
+                                module_time_limit_s=30, assignment=assignment)
                 with self.assertRaisesRegex(gate.AwsGateLaunchPending, 'remains open'):
-                    _ = cloud_gate.route(self.root, mode=gate.SuiteMode.GATE, full=False,
-                                        module_time_limit_s=30, assignment=assignment)
-                authorize.assert_called_once()
+                    _ = route()
                 consume_request = cast(wire.ConsumePermission, authorize.call_args.args[0])
                 replay, = fixture.server.handle_request(replace(consume_request, request_id='replay'))
                 assert isinstance(replay, wire.DispatchStatus), replay
                 self.assertIsInstance(replay.permission, placement.PermissionConsumed)
+                with self.assertRaisesRegex(gate.AwsGateLaunchPending, 'permission was consumed'):
+                    _ = route()
+                self.assertEqual(authorize.call_count, 2)
 
             start_launch.assert_called_once()
             report.assert_called_once()
@@ -4031,7 +4034,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
 
                     api = AwsCli('fixture', 'us-east-2', 1, execute=fake)
                     with (fixture.serving(),
-                          mock.patch.object(copies, 'take_prepared_gate_handoff', return_value=True),
                           mock.patch.dict(os.environ, {'BUILDLOG_PREPARED_COPY': str(repo),
                               'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar),
                               'BUILDLOG_PLACEMENT_FILE': str(assignment_file), 'BUILDLOG_PLACEMENT_EPISODE': assignment.episode}),
@@ -4055,7 +4057,15 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                             side_effect=AssertionError('AWS dispatch status must not create a nightly red result')))
                         local = isolated.enter_context(mock.patch.object(gate, 'run_suites'))
                         notice = isolated.enter_context(mock.patch.object(gate, 'push_nightly_result'))
-                        actual = gate.main(command)
+                        reader, writer = os.pipe()
+                        os.environ[copies.PREPARED_GATE_FD] = str(reader)
+                        try:
+                            with os.fdopen(writer, 'wb') as token:
+                                _ = token.write(f'{os.getpid()}\n'.encode('ascii'))
+                            actual = gate.main(command)
+                        finally:
+                            if os.environ.pop(copies.PREPARED_GATE_FD, None) is not None:
+                                os.close(reader)
                     self.assertEqual(actual, status, output.getvalue() + errors.getvalue())
                     self.assertTrue(fake.launches)
                     local.assert_not_called()
@@ -5727,14 +5737,32 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         return binding, sidecar
 
     def test_cloud_refusal_uses_the_assigned_slot_and_closes_the_booking(self) -> None:
-        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image',
+            'template': 'fixture-template', 'bucket': 'fixture-bucket', 'security_group': 'fixture-group',
+            'deployment_id': 'fixture', 'revision': 'fixture', 'version': '1',
+            'subnets': [{'id': 'fixture-subnet', 'zone': 'fixture-zone'}]})
         target = aws_gate_assignment()
         assignment = target.assignment
+        _ = write_config_fixture(conf.path('build_targets'),
+            'targets=aws\nkind.aws=scaler\nenabled.aws=on\nsettings.aws=cloud_gate.conf\n')
         binding, sidecar = self.route_binding(assignment)
         claim = binding.claim
         journal = ledger.GateDispatchJournal(binding.journal)
         book = ledger.CostLedger(binding.directory)
         book.record_inventory(ledger.ResourceInventory(int(time.time()), (), 'fixture', builder_removed=True))
+        fake = FakeGateAws()
+        fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation'] * 20
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if 'run-instances' in arguments and not fake.launches:
+                folder, = journal.read().folders
+                bookings = book.gate_claim_reservations(claim.claim_id)
+                self.assertEqual(len(bookings), 1, 'The assigned claim needs one booking before launch')
+                booked, = bookings
+                self.assertEqual(booked.attempt, folder.name)
+                self.assertEqual(booked.placement_claim, claim.claim_id)
+                self.assertIsInstance(booked.state, ledger.GateLaunchPending)
+            return fake(arguments, **options)
 
         def service(command: Sequence[str]) -> int:
             self.assertTrue(self.admission.callers_released())
@@ -5743,27 +5771,21 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             self.assertEqual(journal.read().folders, (folder,))
             request = cloud_gate.read(folder / 'request.json')
             self.assertEqual(request['placement_claim'], claim.claim_id)
-            offered = ledger.gate_booking(cloud_gate.settings(), folder.name, int(time.time()),
-                                          ledger.instant(request, 'expires'))
-            self.assertIsInstance(book.reserve_gate(binding.account_settings,
-                                                    replace(offered, placement_claim=claim.claim_id)), ledger.GateReserved)
-            booked, = book.gate_claim_reservations(claim.claim_id)
-            self.assertEqual(booked.attempt, folder.name)
-            self.assertIsInstance(booked.state, ledger.GateLaunchPending)
-            book.resolve_gate(folder.name, ledger.GateAbsent(int(time.time())))
-            cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
-            return 0
+            with mock.patch.object(sys, 'argv', ['cloud_gate', *command[command.index('--worker'):]]):
+                return cloud_gate.main()
 
+        api = AwsCli('fixture', 'us-east-2', 1, execute=transport)
         with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar),
                                           'BUILDLOG_PLACEMENT_FILE': str(self.root / 'assignment.json')}),
               mock.patch.object(admission_client, 'consume_permission', return_value=wire.FirstAuthorization(assignment, claim)),
               mock.patch.object(admission_client, 'report_execution') as report,
               mock.patch.object(cloud_gate, 'run', side_effect=partial(cloud_gate.run, service=service)),
               mock.patch.object(cloud_gate, 'cloud_reservation') as legacy,
-              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('No AWS call may start')),
+              mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
               mock.patch.object(gate, 'run_suites') as local,
               self.assertRaisesRegex(gate.AwsGateTookNoRun, 'capacity')):
             _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=target)
+        self.assertTrue(fake.launches)
         legacy.assert_not_called()
         local.assert_not_called()
         report.assert_called_once()
@@ -5771,7 +5793,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertEqual((sent.assignment, sent.claim), (assignment, claim))
         self.assertIsInstance(sent.path, placement.DispatchPathSettled)
         self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
-        self.assertEqual(sent.outcome, placement.PrelaunchRefused('AWS gate took no run. capacity'))
+        self.assertEqual(sent.outcome, placement.PrelaunchRefused(
+            'AWS gate took no run. Spot capacity is unavailable in every configured region'))
         self.assertEqual(journal.read().state, 'no launch')
         booked, = book.gate_claim_reservations(claim.claim_id)
         self.assertIsInstance(booked.state, ledger.GateAbsent)

@@ -25,7 +25,7 @@ from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
-from scripts.aws_target import hana_placement as hana, ledger as aws_ledger
+from scripts.aws_target import cloud_gate, hana_placement as hana, ledger as aws_ledger
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
@@ -990,6 +990,9 @@ class PlacementTests(unittest.TestCase):
                 assert isinstance(worker, ManualEvidenceWorker)
                 self.assertIn(attempt, worker.dispatch_probes)
                 self.assertEqual(worker.dispatch_probes[attempt].saved.assignment, assignment)
+                _ = worker.probe_next()
+                self.assertIsInstance(worker.dispatch_observations[attempt].result, placement.DispatchPathPending)
+                reconcile.assert_not_called()
                 confirm_scaler_absent(binding, folder, fixture.clock.now())
                 _ = worker.probe_next()
                 self.assertIsInstance(worker.dispatch_observations[attempt].result, placement.DispatchPathSettled)
@@ -1137,13 +1140,15 @@ class PlacementTests(unittest.TestCase):
                 reading.set()
 
         pending = placement.Pending("launch unknown")
-        for result, supports_reconcile, report_during_read, expected_calls in (
-                (pending, True, False, 1),
-                (placement.Settled(), True, False, 0),
-                (pending, False, False, 0),
-                (pending, True, True, int(guest))):
+        cases = [(pending, True, False, True, 1),
+                 (placement.Settled(), True, False, True, 0),
+                 (pending, False, False, True, 0),
+                 (pending, True, True, True, int(guest))]
+        if not guest:
+            cases.append((pending, True, False, False, 1))
+        for result, supports_reconcile, report_during_read, expired, expected_calls in cases:
             with (self.subTest(result=result, supports_reconcile=supports_reconcile,
-                               report_during_read=report_during_read),
+                               report_during_read=report_during_read, expired=expired),
                   PlacementFixture(private_child_starts=True) as fixture):
                 request = mac_linux_and_natedev_request(fixture) if guest else scaler_gate_request(fixture)
                 key = publish_candidate(fixture, request).key
@@ -1153,6 +1158,14 @@ class PlacementTests(unittest.TestCase):
                     authorization, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
                 else:
                     scaler = scaler_launch(fixture, request, assignment)
+                    if not expired:
+                        binding, _folder = scaler
+                        with aws_ledger.CostLedger(binding.directory).transaction() as state:
+                            booked, = state.gate_reservations
+                            cleanup = aws_ledger.GateCleanupPending(
+                                aws_ledger.GateCleanupTargets("us-east-2", ("i-fixture",)))
+                            state.gate_reservations[:] = [replace(booked, expires=int(fixture.clock.now()) + 60,
+                                                                 cleanup=cleanup)]
                     consume = consume_permission("launch", assignment, scaler[0].claim)
                     authorization, = fixture.server.handle_request(consume)
                 assert isinstance(authorization, wire.FirstAuthorization), authorization
@@ -1163,6 +1176,10 @@ class PlacementTests(unittest.TestCase):
                 def record_reconcile(*_arguments: object) -> None:
                     reconcile_threads.append(threading.current_thread())
 
+                def reconcile_scaler(binding: aws_ledger.GateDispatchBinding) -> None:
+                    record_reconcile(binding)
+                    cloud_gate.reconcile_dispatch(binding)
+
                 def read_settlement(_episode: str, _attempt: int, *,
                                     legacy_holder_ended: bool = False) -> placement.Pending | placement.Settled:
                     self.assertFalse(legacy_holder_ended)
@@ -1172,22 +1189,24 @@ class PlacementTests(unittest.TestCase):
                     return result
 
                 settle_journal = aws_ledger.GateDispatchJournal.settle
-                journal_reads: list[Path] = []
+                journal_reads: list[tuple[Path, aws_ledger.GateDispatchSettlement | placement.DispatchPathPending]] = []
 
                 def settle_scaler(journal: aws_ledger.GateDispatchJournal, claim: placement.ProviderClaimReference,
                                   holder: placement.ClaimHolderIdentity
                                   ) -> aws_ledger.GateDispatchSettlement | placement.DispatchPathPending:
                     if scaler is not None and threading.current_thread() is not threading.main_thread():
                         binding, folder = scaler
-                        journal_reads.append(journal.path)
                         if isinstance(result, placement.Settled):
                             confirm_scaler_absent(binding, folder, fixture.clock.now())
+                        observed = settle_journal(journal, claim, holder)
+                        journal_reads.append((journal.path, observed))
                         if report_during_read:
                             reading.set()
                             guard.event(released)
+                        return observed
                     return settle_journal(journal, claim, holder)
 
-                reconcile = mock.Mock(side_effect=record_reconcile)
+                reconcile = mock.Mock(side_effect=record_reconcile if guest else reconcile_scaler)
                 settle = mock.Mock(side_effect=read_settlement)
                 reconcile_name = "reconcile_unproven" if guest else "reconcile_dispatch"
                 hooks = {reconcile_name: reconcile} if supports_reconcile else {}
@@ -1195,6 +1214,8 @@ class PlacementTests(unittest.TestCase):
                 provider_name = "mac_linux_provider" if guest else "scaler_provider"
                 with (mock.patch.object(service, provider_name, return_value=provider),
                       mock.patch.object(aws_ledger.GateDispatchJournal, "settle", settle_scaler),
+                      mock.patch.object(cloud_gate, "time", mock.Mock(wraps=time, time=fixture.clock.now)),
+                      mock.patch.object(cloud_gate, "start_reconcile_service") as start_reconcile,
                       mock.patch.object(service, "HostEvidenceWorker", SingleReadWorker)):
                     self.assertIsInstance(fixture.server.handle_request(wire.SettlementRequest(assignment))[0], wire.Ok)
                     if guest:
@@ -1220,7 +1241,10 @@ class PlacementTests(unittest.TestCase):
                     settle.assert_called_once_with(*exact_attempt, legacy_holder_ended=False)
                 else:
                     assert scaler is not None
-                    self.assertEqual(journal_reads, [scaler[0].journal])
+                    (journal_path, observation), = journal_reads
+                    self.assertEqual(journal_path, scaler[0].journal)
+                    if not isinstance(result, placement.Settled):
+                        self.assertIsInstance(observation, placement.DispatchPathPending)
                     settle.assert_not_called()
                 self.assertEqual(reconcile.call_count, expected_calls)
                 if expected_calls:
@@ -1229,6 +1253,13 @@ class PlacementTests(unittest.TestCase):
                     else:
                         reconcile.assert_called_once_with(scaler[0])
                     self.assertEqual(reconcile_threads, [worker.thread])
+                if scaler is not None and expired and expected_calls:
+                    binding, _folder = scaler
+                    start_reconcile.assert_called_once_with(
+                        cloud_gate.reconcile_command(binding.directory, start_only=True, account=binding.account_settings),
+                        cloud_gate.settings().number("api_timeout_s"), existing_unit="cloud-gate-reconcile")
+                else:
+                    start_reconcile.assert_not_called()
 
     def test_guest_settlement_refuses_unused_permission(self) -> None:
         for owner_exits in (False, True):
