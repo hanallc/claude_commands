@@ -2050,23 +2050,15 @@ The crossing record keeps the first above-line time under the record lock.
 A reading at or below that boundary restarts the interval.
 `config/lint.conf` sets the margin to 5 GiB and the interval to 60 minutes.
 With the 150 GiB alert line, free space must stay above 155 GiB for 60 minutes.
-Rearm sends one `sweep.disk_floor_recovered` phone push after an accepted fall push.
-The return receipt and its stable key prevent accepted return delivery from repeating.
-A failed return delivery retries above the rearm line.
-A later fall starts a new episode even when the previous return receipt stays pending.
-At recovery, `disk_floor` retires every open crossing's `phone:<identity>` fall key on natedev, which owns the silence queue.
-This includes a crossing whose fall phone receipt stays pending.
-The Mac reaches this retirement through ssh natedev.
-If retirement drops a kept fall push, the fall never reached the user and no return push sends.
-The reported dropped count determines this result even when the retire command exits with an error.
-A retire attempt without a dropped count suppresses the return push in the saved crossing state.
-The next pass retries retirement; a completed retry closes that crossing without a return push.
-Only an accepted fall and a first retire result of zero dropped pushes permit a return push.
-An episode with a pending fall phone receipt gets no return push.
-The same rule applies to natedev and the Mac.
+Recovery rearms the next fall without sending a phone push.
+At recovery, `disk_floor` retires the crossing's `phone:<identity>` fall key in the silence queue on natedev.
+This includes a crossing with a pending phone receipt.
+The Mac uses SSH to retire the key on natedev.
+A reported dropped count confirms retirement even when the command exits with an error.
+If the command gives no dropped count, the crossing stays in retirement and retries on a subsequent pass above the rearm line.
+A later fall starts a new episode if retirement is still pending.
 While text approval is stale, the natedev message still sends and the phone receipt stays pending.
 The phone channel can send that pending episode after the showrunner records the new approval.
-The return text needs its own approval before delivery.
 
 Natedev also records cache sizes, growth and removal accounting. These reports stay outside the Mac path:
 
