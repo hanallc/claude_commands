@@ -23,7 +23,7 @@ from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
-from scripts.aws_target import hana_placement as hana
+from scripts.aws_target import hana_placement as hana, ledger as aws_ledger
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
@@ -41,6 +41,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
+from scripts.build_targets.gate_targets import aws_gate_candidate
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
 
@@ -616,6 +617,71 @@ class CargoFolderTests(unittest.TestCase):
                     self.assertEqual(snapshot.get("cargo_folder"), tagged)
                     self.assertEqual(codec.parse_snapshot_value(snapshot, placement.PlacementConstraints), decoded.constraints)
                     self.assertEqual(wire.parse_request(wire.encode_request(decoded)), decoded)
+
+
+class AwsGatePlacementTests(unittest.TestCase):
+    def assigned_gate(self, fixture: PlacementFixture) -> tuple[wire.PlacementRequest, placement.PlacementAssignment,
+                                                                aws_ledger.GateDispatchBinding]:
+        _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
+        request = placement_request(fixture)
+        local = request.local
+        assert isinstance(local, wire.LocalAdmissionContext)
+        sidecar = fixture.root / "progress"
+        request = replace(request, local=replace(local, sidecar=str(sidecar)), route=PinnedTarget("aws"),
+            constraints=replace(request.constraints, candidates=(aws_gate_candidate(),),
+                                command=("scripts/production/gate.py", "--tests-only"), command_kind="final"))
+        key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+        evidence = fixture.read_host_evidence(key)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+        fixture.provider_evidence[key] = evidence
+        fixture.server.publish_host_evidence(evidence)
+        assignment = assignment_for(fixture, request)
+        binding = aws_ledger.GateDispatchBinding.read(aws_ledger.gate_dispatch_binding_path(sidecar))
+        self.assertEqual(binding.claim, placement.assigned_claim_reference(assignment))
+        self.assertEqual(binding.journal.parent, fixture.server.state_dir)
+        self.assertEqual(binding.directory, fixture.root / "queue-target-state" / "aws")
+        return request, assignment, binding
+
+    def test_dead_caller_after_prelaunch_closes_without_a_launch(self) -> None:
+        for consumed in (True, False):
+            with self.subTest(consumed=consumed), PlacementFixture() as fixture:
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
+                    request, assignment, binding = self.assigned_gate(fixture)
+                    owner = request.owner
+                    holder = placement.ClaimHolderIdentity(owner.host, owner.pid, owner.start_time)
+                    journal = aws_ledger.GateDispatchJournal(binding.journal)
+                    journal.begin(binding, holder)
+                    if consumed:
+                        reply, = fixture.server.handle_request(
+                            wire.ConsumePermission("consume", assignment, binding.claim, holder))
+                        self.assertEqual(reply, wire.FirstAuthorization(assignment, binding.claim))
+                    fixture.proc.kill(wire.Owner(owner.pid, owner.start_time))
+                    fixture.restart()
+                    _ = fixture.server.run_pass()
+                    self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                    report = fixture.server.assignments[key].terminal_report
+                    assert isinstance(report, placement.TerminalAttemptReport)
+                    self.assertEqual(report.outcome, placement.AttemptCancelled("no launch"))
+                    self.assertEqual(report.path, placement.DispatchPathSettled())
+                    self.assertEqual(journal.read().state, "no launch")
+                    self.assertFalse((binding.directory / "cost-ledger.json").exists())
+
+    def test_caller_uses_the_queue_journal_with_a_different_aws_state_root(self) -> None:
+        from scripts.aws_target import cloud_gate
+
+        with PlacementFixture() as fixture:
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
+                request, assignment, binding = self.assigned_gate(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            caller_root = fixture.root / "caller-target-state"
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(caller_root),
+                                             "BUILDLOG_PLACEMENT_SIDECAR": request.local.sidecar}):
+                dispatch = cloud_gate.begin_assigned_gate(assignment)
+            self.assertEqual(dispatch.binding, binding)
+            self.assertEqual(dispatch.journal.read().directory, binding.directory)
+            self.assertFalse(caller_root.exists())
 
 
 class PlacementTests(unittest.TestCase):

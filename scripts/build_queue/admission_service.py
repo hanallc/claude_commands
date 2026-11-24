@@ -70,6 +70,7 @@ from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
+    from scripts.aws_target import ledger as aws_ledger
     from scripts.mac_test.claim_state import RemoteJobClaim
 
 
@@ -3100,6 +3101,12 @@ class AdmissionServer:
             self._prune_watches()
         return groups
 
+    def _cloud_slots_used(self) -> int:
+        """Count legacy cloud reservations and current AWS placements."""
+        return (sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+                + sum(self.assignments[key].assignment.destination.provider == "scaler"
+                      for key in self.current_assignments.values()))
+
     def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
         waiting_cloud = self._cloud_waiters()
         if not waiting_cloud and not self.pending_cloud_groups:
@@ -3110,7 +3117,7 @@ class AdmissionServer:
         disconnected = min(((pending.group.started_at, 0, key)
             for key, pending in self.pending_cloud_groups.items() if key not in groups),
             default=(float("inf"), 0, ""))
-        used = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+        used = self._cloud_slots_used()
         started = False
         blocked = False
         position = 0
@@ -3145,7 +3152,7 @@ class AdmissionServer:
                        ) -> records.QueueRead | wire.CloudQueueRead:
         rows: list[wire.CloudRow] = []
         reservations = [record for record in self.reservations.values() if isinstance(record.place, wire.CloudPlace)]
-        used, slots = len(reservations), configuration.cloud_gate_slots
+        used, slots = self._cloud_slots_used(), configuration.cloud_gate_slots
         recorded_launch = False
         for record in reservations:
             place = record.place
@@ -3662,6 +3669,8 @@ class AdmissionServer:
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
+        if key.destination.provider == "scaler":
+            return 0.0
         if key.destination.provider == "ssh" and key.destination.target == "mac-linux":
             from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
 
@@ -3879,6 +3888,15 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
+        if destination.provider == "scaler" and destination.target == "aws":
+            from scripts.build_targets.gate_targets import aws_gate_candidate
+
+            candidate = aws_gate_candidate()
+            if (destination, key.settings) != (candidate.destination, candidate.settings):
+                eligibility = placement.FixedExclusion("AWS placement differs from the configured target")
+            else:
+                eligibility = candidate.eligibility
+            return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
@@ -4116,7 +4134,8 @@ done
                                  evidence: placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest) -> bool:
         """Confirm claim release under the same rules for status, replay, and settlement."""
         assignment = saved.assignment
-        if (not isinstance(saved.state, placement.CurrentAssignment)
+        if (assignment.destination.provider == "scaler"
+                or not isinstance(saved.state, placement.CurrentAssignment)
                 or self.current_assignments.get(assignment.episode) != execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 or assignment.episode not in self.placement_requests):
             return False
@@ -4196,7 +4215,7 @@ done
 
         destination = saved.assignment.destination
         if destination.provider != "ssh":
-            return destination.provider != "local"
+            return destination.provider not in ("local", "scaler")
         transport = self._ssh_transport(saved)
         return transport is not None and not isinstance(
             transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
@@ -4519,7 +4538,8 @@ done
             if not self._placement_owner_live(request.owner):
                 self._end_placement_rank(request)
                 if saved is not None:
-                    if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
+                    if (saved.assignment.destination.provider != "scaler"
+                            and isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved)):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
                     else:
                         self.assignments[key] = self._end_remote_start_hold(request, saved)
@@ -4563,6 +4583,26 @@ done
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
         self.current_assignments[request.episode] = key
         return assignment
+
+    def _aws_gate_binding(self, assignment: placement.PlacementAssignment) -> aws_ledger.GateDispatchBinding:
+        from scripts.aws_target import ledger as aws_ledger
+
+        claim = placement.assigned_claim_reference(assignment)
+        journal = self.state_dir / f"aws-gate-{claim.claim_id}.json"
+        directory = target_config.ssh_target_state_directory("aws").resolve()
+        return aws_ledger.GateDispatchBinding(claim, journal, directory)
+
+    def _publish_aws_gate_binding(self, request: wire.PlacementRequest,
+                                  assignment: placement.PlacementAssignment) -> None:
+        from scripts.aws_target import ledger as aws_ledger
+
+        local = request.local
+        if not isinstance(local, wire.LocalAdmissionContext) or not local.sidecar:
+            raise ValueError("The AWS gate placement has no sidecar")
+        binding = self._aws_gate_binding(assignment)
+        path = aws_ledger.gate_dispatch_binding_path(Path(local.sidecar))
+        self.writes.require(path)
+        binding.publish(path)
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
@@ -4637,6 +4677,13 @@ done
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
+            if saved.assignment.destination.provider == "scaler":
+                try:
+                    self._publish_aws_gate_binding(request, saved.assignment)
+                except (OSError, ValueError) as error:
+                    reason = f"The AWS placement binding is unavailable. {error}"
+                    self._close_placement(saved, "cancelled", placement.DoNotRetry(reason))
+                    return self._placement_status(saved.assignment, reason, check_lifetime=False)
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
         terminal = [saved for saved in self.assignments.values() if saved.assignment.episode == request.episode
                     and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]
@@ -4802,8 +4849,10 @@ done
                         break
                     continue
                 if destination.provider == "scaler":
-                    continue
-                if (any(same_remote_resource(other, destination) for other in taken)
+                    if (destination.target != "aws" or not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
+                            or self._cloud_slots_used() >= self.configuration.cloud_gate_slots):
+                        continue
+                elif (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
@@ -4943,7 +4992,19 @@ done
                                 return self._placement_status(assignment, f'Hana admission refused: {memory.reason}')
                 except (OSError, ValueError) as error:
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
-        if isinstance(transport, hana_placement.HanaControlTransport):
+        if destination.provider == "scaler" and destination.target == "aws":
+            from scripts.aws_target import ledger as aws_ledger
+
+            binding = self._aws_gate_binding(assignment)
+            if reference != binding.claim:
+                return self._placement_status(assignment, "the exact AWS claim does not match")
+            try:
+                record = aws_ledger.GateDispatchJournal(binding.journal).require_open(reference, request.holder)
+                if record.directory != binding.directory:
+                    raise ValueError("The AWS journal names a different accounting directory")
+            except (OSError, ValueError) as error:
+                return self._placement_status(assignment, f"AWS prelaunch evidence is unavailable. {error}")
+        elif isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.aws_target.hana_placement_adapter import read_assigned_adoption
 
             adopted = read_assigned_adoption(assignment, request.holder, transport)
@@ -5067,6 +5128,9 @@ done
             assignment = saved.assignment
             if self.current_assignments.get(assignment.episode) != key:
                 continue
+            if assignment.destination.provider == "scaler":
+                self._settle_aws_dispatch(saved)
+                continue
             report = saved.terminal_report
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
@@ -5113,6 +5177,51 @@ done
                 report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
+
+    def _settle_aws_dispatch(self, saved: records.SavedPlacementAssignment) -> None:
+        """Close an AWS assignment with local evidence and fence a late worker."""
+        from scripts.aws_target import ledger as aws_ledger
+
+        assignment = saved.assignment
+        binding = self._aws_gate_binding(assignment)
+        journal = aws_ledger.GateDispatchJournal(binding.journal)
+        report = saved.terminal_report
+        holder = saved.holder
+        if isinstance(saved.permission, placement.PermissionAvailable):
+            owner = assignment.owner
+            if (owner.host != self.host
+                    or owner_may_be_live(self.proc.owner_start(owner.pid), owner.start_time)):
+                return
+            try:
+                record = journal.read()
+            except FileNotFoundError:
+                holder = placement.ClaimHolderIdentity(owner.host, owner.pid, owner.start_time)
+                try:
+                    journal.begin(binding, holder)
+                except (OSError, ValueError):
+                    return
+            except (OSError, ValueError):
+                return
+            else:
+                holder = record.holder
+        elif saved.provider != binding.claim:
+            return
+        if not isinstance(holder, placement.ClaimHolderIdentity) or holder.host != self.host:
+            return
+        if (isinstance(report, placement.NoTerminalReport)
+                and owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time)):
+            return
+        settlement = journal.settle(binding.claim, holder)
+        if isinstance(settlement, placement.DispatchPathPending):
+            return
+        path = placement.DispatchPathSettled()
+        if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.outcome, placement.AttemptCompleted):
+            terminal = replace(report, path=path)
+        else:
+            terminal = placement.TerminalAttemptReport(placement.AttemptCancelled(
+                "The AWS gate ended without a verdict" if settlement == "launch ended" else "no launch"),
+                path, self.clock.now())
+        self._close_for_report(replace(saved, terminal_report=terminal), terminal)
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
@@ -5296,7 +5405,12 @@ done
                     self.assignments[key] = replace(saved, provider=request.claim, terminal_report=terminal)
             saved = self.assignments[key]
             report = saved.terminal_report
-            if (self.current_assignments.get(assignment.episode) == key
+            if assignment.destination.provider == "scaler":
+                self.persist()
+                if self.current_assignments.get(assignment.episode) == key:
+                    self._settle_aws_dispatch(saved)
+                self.next_pass = self.clock.monotonic()
+            elif (self.current_assignments.get(assignment.episode) == key
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
                     and not isinstance(report.outcome, placement.AttemptDeclined)):

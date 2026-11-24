@@ -257,13 +257,27 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
+def _gate_targets_for_command(command: Sequence[str], source: Path, targets: tuple[str, ...]) -> tuple[str, ...]:
+    if "aws" not in targets:
+        return targets
+    from scripts.build_targets.gate_targets import aws_gate_command
+
+    if aws_gate_command(source, tuple(command)):
+        return targets
+    remaining = tuple(target for target in targets if target != "aws")
+    if not remaining:
+        raise FirstStepRefused("AWS requires scripts/production/gate.py without --nightly, --module, or --promote-only")
+    return remaining
+
+
 def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
         return ()
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
     if names:
-        return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+        targets = tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
+        return _gate_targets_for_command(command, source, targets)
     from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets
 
     selected = eligible_gate_targets(source, tuple(command))
@@ -276,6 +290,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
                   owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
     arguments = tuple(command)
+    targets = _gate_targets_for_command(command, source, targets)
     flag = gate_natedev_only_flag(arguments)
     if flag is not None and "natedev" not in targets:
         raise FirstStepRefused(f"gate.py {flag} runs only on natedev")

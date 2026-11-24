@@ -33,7 +33,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, 
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
     gate_regions, money, read_settings)
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, placement, progress_profile, queue_place, snapshot_codec
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib import cancellation, git_index
 from scripts.build_targets import target_config
@@ -45,6 +45,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, is_test_module
+from scripts.production.gate_routes import GateResultUnknown, GateTookNoRun
 from scripts.production import gate
 from scripts.style.git_process import parse_tree_listing
 from scripts.test_times import gate_record
@@ -60,12 +61,18 @@ class UnassignedCloudGate:
     """The cloud gate obtains a slot through legacy admission."""
 
 
+UNASSIGNED_CLOUD_GATE = UnassignedCloudGate()
+
+
 @dataclass(frozen=True)
 class AssignedCloudGate:
     """The queue has granted this gate a cloud slot."""
-    journal: ledger.GateDispatchJournal
-    claim: placement.ProviderClaimReference
+    binding: ledger.GateDispatchBinding
     holder: placement.ClaimHolderIdentity
+
+    @property
+    def journal(self) -> ledger.GateDispatchJournal:
+        return ledger.GateDispatchJournal(self.binding.journal)
 
 
 @dataclass
@@ -75,7 +82,7 @@ class CloudAttempt:
     identifier: str = ''
     interruptions: int = 0
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
-    dispatch: AssignedCloudGate | UnassignedCloudGate = UnassignedCloudGate()
+    dispatch: AssignedCloudGate | UnassignedCloudGate = UNASSIGNED_CLOUD_GATE
 
 
 @dataclass(frozen=True)
@@ -1353,7 +1360,7 @@ def read_saved_request(repo: Path, path: Path, tree: str,
 
 def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Path,
                          directory: Path, sidecar: Path, *,
-                         dispatch: AssignedCloudGate | UnassignedCloudGate = UnassignedCloudGate()) -> list[str]:
+                         dispatch: AssignedCloudGate | UnassignedCloudGate = UNASSIGNED_CLOUD_GATE) -> list[str]:
     arguments = [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
                  '--settings', str(account_settings_path())]
     if isinstance(dispatch, AssignedCloudGate):
@@ -1439,9 +1446,12 @@ def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
         gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
-        service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
-    # Record the final fallback here so worker replies and service errors produce one row.
-    attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode, gate_job=gate_job)
+        service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command),
+        dispatch: AssignedCloudGate | UnassignedCloudGate = UNASSIGNED_CLOUD_GATE) -> LocalFallback | CloudCompleted:
+    # Record the final failure here so worker replies and service errors produce one row.
+    directory = (dispatch.binding.directory if isinstance(dispatch, AssignedCloudGate)
+                 else target_config.ssh_target_state_directory('aws'))
+    attempt = CloudAttempt(directory, mode, gate_job=gate_job, dispatch=dispatch)
     try:
         outcome = run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                             selected=selected, service=service, attempt=attempt)
@@ -1486,7 +1496,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
         dispatch = attempt.dispatch
-        current = (root / f'{dispatch.claim.claim_id}.json' if isinstance(dispatch, AssignedCloudGate)
+        current = (root / f'{dispatch.binding.claim.claim_id}.json' if isinstance(dispatch, AssignedCloudGate)
                    else root / 'current.json')
         if not current.exists() and not deployment_path.exists():
             return LocalFallback('image or stack is absent')
@@ -1615,7 +1625,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     save(folder / 'request.json', request)
                     save(folder / 'deployment.json', deployment)
                     if isinstance(dispatch, AssignedCloudGate):
-                        dispatch.journal.register(dispatch.claim, dispatch.holder, folder)
+                        dispatch.journal.register(dispatch.binding.claim, dispatch.holder, folder)
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
                     failure = retryable_cloud_failure(result)
@@ -1752,7 +1762,8 @@ def main() -> int:
         journal = ledger.GateDispatchJournal(journal_path)
         with journal.lock():
             dispatch = journal.read()
-            if dispatch.state != "prelaunch" or folder not in dispatch.folders:
+            if (dispatch.state != "prelaunch" or folder not in dispatch.folders
+                    or dispatch.directory != directory):
                 return 0
             return execute_gate_worker(folder, gate_worker)
 
@@ -1772,6 +1783,64 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
     outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                   selected=selected, gate_job=gate_job)
     return outcome.reason if isinstance(outcome, LocalFallback) else outcome.run
+
+
+def begin_assigned_gate(assignment: placement.PlacementAssignment) -> AssignedCloudGate:
+    """Record the caller in the journal that the queue supplied."""
+    start = process_start(os.getpid())
+    if not isinstance(start, Started):
+        raise GateTookNoRun('The AWS gate caller has no readable process identity')
+    holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+    sidecar = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR')
+    if not sidecar:
+        raise GateTookNoRun('The AWS gate placement has no sidecar')
+    try:
+        binding = ledger.GateDispatchBinding.read(ledger.gate_dispatch_binding_path(Path(sidecar)))
+        if binding.claim != placement.assigned_claim_reference(assignment):
+            raise ValueError('The AWS binding names a different claim')
+        dispatch = AssignedCloudGate(binding, holder)
+        dispatch.journal.begin(binding, holder)
+        return dispatch
+    except (OSError, ValueError) as error:
+        raise GateTookNoRun(f'The AWS prelaunch record is unavailable. {error}') from error
+
+
+def route_assigned(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
+                   assignment: placement.PlacementAssignment, selected: gate.AllModules | gate.TreeSelection,
+                   gate_job: StepJob | GateJobNotRecorded) -> gate.GateRun:
+    """Use the assignment once and report its verdict or its lack of a verdict."""
+    dispatch = begin_assigned_gate(assignment)
+    claim = dispatch.binding.claim
+    try:
+        authorization = admission_client.consume_permission(
+            wire.ConsumePermission(admission_client.request_id(), assignment, claim, dispatch.holder))
+    except (OSError, wire.AdmissionUnavailable) as error:
+        raise GateTookNoRun(f'The AWS launch permission is unavailable. {error}') from error
+    if isinstance(authorization, wire.DispatchStatus):
+        if isinstance(authorization.permission, placement.PermissionConsumed):
+            raise GateResultUnknown(f'The AWS launch permission was consumed. {authorization.reason}')
+        raise GateTookNoRun(f'The queue refused AWS launch permission. {authorization.reason}')
+    if (authorization.assignment, authorization.claim) != (assignment, claim):
+        raise GateTookNoRun('The AWS launch permission differs from the request')
+
+    outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                  selected=selected, gate_job=gate_job, dispatch=dispatch)
+    settled = dispatch.journal.settle(claim, dispatch.holder)
+    path = settled if isinstance(settled, placement.DispatchPathPending) else placement.DispatchPathSettled()
+    evidence = (execution_identity.ExecutionNotStarted() if settled == 'no launch'
+                else execution_identity.ExecutionEvidenceUnavailable('AWS gate dispatch', time.time()))
+    disposition = (placement.AttemptCompleted(int(not outcome.run.passed)) if isinstance(outcome, CloudCompleted)
+                   else placement.AttemptCancelled(outcome.reason))
+    try:
+        _ = admission_client.report_execution(wire.ExecutionReport(
+            admission_client.request_id(), assignment, claim, evidence, disposition, path))
+    except (OSError, wire.AdmissionUnavailable) as error:
+        print(f'Cannot report the AWS gate result to the queue. {error}', file=sys.stderr, flush=True)
+    if isinstance(outcome, CloudCompleted):
+        return outcome.run
+    if settled == 'no launch':
+        raise GateTookNoRun(f'AWS gate took no run. {outcome.reason}')
+    raise GateResultUnknown(f'The AWS gate result is unknown. {outcome.reason}')
 
 
 if __name__ == '__main__':

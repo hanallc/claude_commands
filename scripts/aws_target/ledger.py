@@ -177,6 +177,34 @@ def gate_is_open(reservation: GateReservation) -> bool:
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
 
 
+def gate_dispatch_binding_path(sidecar: Path) -> Path:
+    """Locate the queue's AWS binding beside the placement progress file."""
+    return sidecar.with_name(sidecar.name + '.aws-dispatch.json')
+
+
+@dataclass(frozen=True)
+class GateDispatchBinding:
+    """Identify the queue journal and AWS accounting directory for one claim."""
+    claim: placement.ProviderClaimReference
+    journal: Path
+    directory: Path
+
+    def publish(self, path: Path) -> None:
+        try:
+            saved = self.read(path)
+        except FileNotFoundError:
+            if create_text_atomic(path, json.dumps(snapshot_codec.snapshot_value(self)) + '\n'):
+                return
+            saved = self.read(path)
+        if saved != self:
+            raise LedgerUnavailable('The AWS placement binding differs from the queue assignment')
+
+    @staticmethod
+    def read(path: Path) -> GateDispatchBinding:
+        return cast(GateDispatchBinding, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(path.read_text())), GateDispatchBinding))
+
+
 GateDispatchSettlement = Literal["no launch", "launch ended"]
 
 
@@ -185,6 +213,7 @@ class GateDispatchRecord:
     """Bind the service folders to the exact queue claim and caller."""
     claim: placement.ProviderClaimReference
     holder: placement.ClaimHolderIdentity
+    directory: Path
     state: Literal["prelaunch"] | GateDispatchSettlement = "prelaunch"
     folders: tuple[Path, ...] = ()
 
@@ -202,10 +231,13 @@ class GateDispatchJournal:
         return cast(GateDispatchRecord, snapshot_codec.parse_snapshot_value(
             cast(object, json.loads(self.path.read_text())), GateDispatchRecord))
 
-    def begin(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> None:
+    def begin(self, binding: GateDispatchBinding, holder: placement.ClaimHolderIdentity) -> None:
         """Persist the caller before it requests launch permission."""
-        if not create_text_atomic(self.path, _gate_dispatch_text(GateDispatchRecord(claim, holder))):
-            self.require_open(claim, holder)
+        fresh = GateDispatchRecord(binding.claim, holder, binding.directory)
+        if not create_text_atomic(self.path, _gate_dispatch_text(fresh)):
+            saved = self.require_open(binding.claim, holder)
+            if saved.directory != binding.directory:
+                raise LedgerUnavailable('The AWS journal names a different accounting directory')
 
     def require_open(self, claim: placement.ProviderClaimReference,
                      holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
@@ -227,8 +259,7 @@ class GateDispatchJournal:
             if folder not in record.folders:
                 write_text_atomic(self.path, _gate_dispatch_text(replace(record, folders=(*record.folders, folder))))
 
-    def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity,
-               book: CostLedger) -> GateDispatchSettlement | placement.DispatchPathPending:
+    def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> GateDispatchSettlement | placement.DispatchPathPending:
         """Use only local evidence to close a dispatch and fence its workers."""
         try:
             with self.lock(wait=False) as access:
@@ -241,6 +272,7 @@ class GateDispatchJournal:
                     return record.state
                 state: GateDispatchSettlement = "no launch"
                 if record.folders:
+                    book = CostLedger(record.directory)
                     reservations = ({row.attempt: row for row in book.read_snapshot().gate_reservations}
                                     if book.path.exists() else {})
                     for folder in record.folders:

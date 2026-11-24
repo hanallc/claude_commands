@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.aws_target.config import AwsOn, aws_switch, cloud_gate_off_reason
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import execution_identity, placement
 from scripts.build_queue.admission_client import placement_constraint_builder
@@ -19,16 +20,22 @@ class NoEnabledTarget:
     reason: str = "No enabled build target can run this Claude gate. Check enabled.* in build_targets.conf."
 
 
+def aws_gate_command(repo: Path, command: tuple[str, ...]) -> bool:
+    """Allow AWS for the canonical gate script in the checkout."""
+    program = parse_command_program(command, keep_path=True)
+    return (not isinstance(program, OtherCommand) and Path(command[0]).name not in {"bash", "sh"}
+            and (repo / program[0]).resolve() == repo.resolve() / "scripts/production/gate.py"
+            and "--nightly" not in program[1] and gate_natedev_only_flag(program[1]) is None)
+
+
 def aws_gate_candidate() -> placement.PlacementCandidate:
     """Read the cloud gate switch for the AWS scaler."""
     path = conf.path("cloud_gate")
     destination = placement.PlacementDestination("scaler", "aws", "aws", WHOLE_MAC)
     settings = placement.ExplicitProviderSettings(path)
-    try:
-        enabled = conf.read(path).value("enabled", conf.on_off, default=False, recover_invalid=False)
-    except conf.Unusable as error:
-        return placement.PlacementCandidate(destination, placement.FixedExclusion(str(error)), settings)
-    eligibility = placement.AllowedHost() if enabled else placement.FixedExclusion("off")
+    switch = aws_switch(conf.read_or_repository("cloud_gate"))
+    eligibility = (placement.AllowedHost() if isinstance(switch, AwsOn)
+                   else placement.FixedExclusion(cloud_gate_off_reason(switch)))
     return placement.PlacementCandidate(destination, eligibility, settings)
 
 
@@ -59,6 +66,6 @@ def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[st
         if any(candidate.destination.target == target.name and isinstance(candidate.eligibility, placement.AllowedHost)
                for candidate in fixed.candidates):
             names.append(target.name)
-    if isinstance(aws_gate_candidate().eligibility, placement.AllowedHost):
+    if aws_gate_command(repo_root, command) and isinstance(aws_gate_candidate().eligibility, placement.AllowedHost):
         names.append("aws")
     return tuple(names) if names else NoEnabledTarget()

@@ -38,7 +38,7 @@ from scripts.aws_target.ledger_test_support import (
     CostFixture, account_reply, install_aws_fixture_settings, instant, numeric_settings,
     override_fixture_settings, text_setting,
 )
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, placement, progress_profile, queue_place
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -47,6 +47,7 @@ from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_routes import GatePlacementIncomplete
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
 from scripts.mac_test.claim_state import WHOLE_MAC
@@ -56,7 +57,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
-from scripts.build_hold.owning_session import OwningSession, owning_session
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
 from scripts.message.unit_labels import OwnerRole, UnitLabels
 
@@ -2949,6 +2950,50 @@ wait_for_watchdog()
 
 
 class GateDispatchJournalTests(unittest.TestCase):
+    def test_assigned_route_reports_no_launch_or_an_unknown_result(self) -> None:
+        for launch_pending in (False, True):
+            with self.subTest(launch_pending=launch_pending), TemporaryDirectory() as directory:
+                root = Path(directory)
+                sidecar = root / 'progress'
+                assignment = placement.PlacementAssignment('episode', 'attempt',
+                    placement.PlacementDestination('scaler', 'aws', 'aws', WHOLE_MAC),
+                    execution_identity.SourceKeyKnown('tree'), placement.SubmittingOwner('host', 1, '1'),
+                    NoOwningSession(), 1)
+                claim = placement.assigned_claim_reference(assignment)
+                binding = ledger.GateDispatchBinding(claim, root / 'journal.json', root / 'aws')
+                binding.publish(ledger.gate_dispatch_binding_path(sidecar))
+                reports: list[wire.ExecutionReport] = []
+
+                def no_result(_repo: Path, *, dispatch: cloud_gate.AssignedCloudGate, **_options: object
+                              ) -> cloud_gate.LocalFallback:
+                    if launch_pending:
+                        folder = root / 'worker'
+                        dispatch.journal.register(claim, dispatch.holder, folder)
+                        cloud_gate.save(folder / 'launch.json', {'arguments': {'ClientToken': 'fixture'}})
+                    return cloud_gate.LocalFallback('No result from the worker')
+
+                def report(request: wire.ExecutionReport) -> wire.DispatchStatus:
+                    reports.append(request)
+                    return wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionConsumed(0))
+
+                with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
+                      mock.patch.object(admission_client, 'consume_permission',
+                                        return_value=wire.FirstAuthorization(assignment, claim)) as consume,
+                      mock.patch.object(cloud_gate, 'run', side_effect=no_result) as run,
+                      mock.patch.object(admission_client, 'report_execution', side_effect=report),
+                      self.assertRaises(GatePlacementIncomplete) as failed):
+                    _ = cloud_gate.route_assigned(root, mode=gate.SuiteMode.GATE, full=True,
+                        module_time_limit_s=10, assignment=assignment, selected=gate.ALL_MODULES,
+                        gate_job=GateJobNotRecorded())
+                self.assertEqual(failed.exception.status, 80 if launch_pending else 79)
+                consume.assert_called_once()
+                run.assert_called_once()
+                sent, = reports
+                self.assertEqual(sent.claim, claim)
+                self.assertIsInstance(sent.path, placement.DispatchPathPending if launch_pending
+                                      else placement.DispatchPathSettled)
+
+
     def test_a_late_worker_cannot_start_after_local_closure(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2956,11 +3001,11 @@ class GateDispatchJournalTests(unittest.TestCase):
             journal = ledger.GateDispatchJournal(root / 'queue' / 'claim.json')
             claim = placement.ProviderClaimReference('scaler', 'aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
             holder = placement.ClaimHolderIdentity('host', 1, '1')
-            journal.begin(claim, holder)
+            journal.begin(ledger.GateDispatchBinding(claim, journal.path, book.directory), holder)
             folder = root / 'worker'
             journal.register(claim, holder, folder)
             self.assertEqual(journal.read().state, 'prelaunch')
-            self.assertEqual(journal.settle(claim, holder, book), 'no launch')
+            self.assertEqual(journal.settle(claim, holder), 'no launch')
             self.assertEqual(journal.read().state, 'no launch')
 
             command = ['cloud_gate.py', '--worker', str(folder), '--directory', str(book.directory),
