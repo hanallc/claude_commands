@@ -1854,6 +1854,7 @@ class AdmissionServer:
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
         self.placement_request_digests: dict[str, bytes] = {}
+        self.refused_mac_only: set[str] = set()
         self.input_event_count: int = 0
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
@@ -2584,6 +2585,7 @@ class AdmissionServer:
             submitted = self.placement_requests.pop(episode, None)
             if submitted is not None:
                 _ = self.placement_request_digests.pop(episode, None)
+                self.refused_mac_only.discard(episode)
                 self._end_placement_rank(submitted)
             waiting = self.waiters.get(episode)
             if waiting is not None:
@@ -3198,17 +3200,10 @@ class AdmissionServer:
 
     def _answer_parked_placements(self) -> None:
         parked, self.parked_placements = self.parked_placements, []
-        # Duplicate submissions in this pass receive the same refusal.
-        refused: dict[str, wire.DispatchStatus] = {}
         for item in parked:
             if not item.connection.finished and item.connection.socket.fileno() >= 0:
-                episode = item.request.episode
-                reply = refused.get(episode)
-                if reply is None:
-                    reply = self._placement_reply(item.request,
-                        self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
-                    if isinstance(reply, wire.DispatchStatus) and episode not in self.placement_requests:
-                        refused[episode] = reply
+                reply = self._placement_reply(item.request,
+                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown()))
                 self._send(item.connection, reply)
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
@@ -3710,7 +3705,7 @@ class AdmissionServer:
             if digest is None or not self._placement_waiting(request):
                 continue
             reply = self._placement_reply(request,
-                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys, discard_on_refusal=False)
+                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys, record_refusal=False)
             if isinstance(reply, wire.PlacementWait):
                 waits[episode] = PublishedPlacementWait(self.input_event_count, digest, reply)
         return waits
@@ -4442,6 +4437,7 @@ done
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
             _ = self.placement_request_digests.pop(episode, None)
+            self.refused_mac_only.discard(episode)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -4683,7 +4679,8 @@ done
         return wire.DispatchStatus(saved.assignment, state, saved.permission, reason, saved.retry)
 
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
-        if request.episode in self.current_assignments or not self._placement_owner_live(request.owner):
+        if (request.episode in self.refused_mac_only or request.episode in self.current_assignments
+                or not self._placement_owner_live(request.owner)):
             return False
         return not any(saved.assignment.episode == request.episode
             and isinstance(saved.state, placement.ClosedAssignment)
@@ -4949,13 +4946,9 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
-    def _discard_placement_request(self, request: wire.PlacementRequest) -> None:
+    def _end_placement_wait(self, request: wire.PlacementRequest) -> None:
         episode = request.episode
         self._end_placement_rank(request)
-        _ = self.placement_requests.pop(episode, None)
-        _ = self.placement_request_digests.pop(episode, None)
-        _ = self.prerequisites.pop(episode, None)
-        _ = self.placement_eligibility.pop(episode, None)
         _ = self.local_hold_holders.pop(episode, None)
         for candidate in request.constraints.candidates:
             pair = (episode, candidate.destination)
@@ -4963,8 +4956,17 @@ done
             _ = self.placement_hold_answers.pop(pair, None)
         self._remove_waiter(self.waiters.get(episode), claim_disposition=WaiterClaimDisposition.RETURN)
 
+    def _discard_placement_request(self, request: wire.PlacementRequest) -> None:
+        episode = request.episode
+        self._end_placement_wait(request)
+        self.refused_mac_only.discard(episode)
+        _ = self.placement_requests.pop(episode, None)
+        _ = self.placement_request_digests.pop(episode, None)
+        _ = self.prerequisites.pop(episode, None)
+        _ = self.placement_eligibility.pop(episode, None)
+
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder,
-                         keys: PlacementEvidenceKeys | None = None, *, discard_on_refusal: bool = True
+                         keys: PlacementEvidenceKeys | None = None, *, record_refusal: bool = True
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
@@ -5053,8 +5055,9 @@ done
                 refused = wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
                     refusal, placement.DoNotRetry(refusal))
-                if discard_on_refusal:
-                    self._discard_placement_request(request)
+                if record_refusal and request.episode not in self.refused_mac_only:
+                    self._end_placement_wait(request)
+                    self.refused_mac_only.add(request.episode)
                     self._prune_host_evidence()
                     self._schedule_pass()
                     self.persist()
@@ -5670,6 +5673,9 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                if request.episode in self.refused_mac_only:
+                    self.refused_mac_only.remove(request.episode)
+                    _ = self.placement_eligibility.pop(request.episode, None)
                 self._close_abandoned_attempt(request.episode)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):

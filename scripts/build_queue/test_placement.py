@@ -3236,7 +3236,8 @@ class MacOrderTests(unittest.TestCase):
             self.assertEqual(self.assigned(fixture, older, younger), [younger.episode])
             self.assertEqual(fixture.server.placement_holds, {})
             self.assertNotIn(older_key, fixture.server.host_readers)
-            self.assertNotIn(older.episode, service.read_state(fixture.state_dir).placement_requests)
+            saved = service.read_state(fixture.state_dir).placement_requests[older.episode]
+            self.assertEqual(saved.constraints, older.constraints)
 
             cancelled, = fixture.server.handle_request(wire.CancelPlacement(
                 "cancel-younger", younger.episode, younger.owner, "the step ended"))
@@ -3288,6 +3289,57 @@ class MacOrderTests(unittest.TestCase):
         snapshot = queue_snapshot.read_view_snapshot(fixture.state_dir)
         assert isinstance(snapshot, queue_snapshot.PublishedView), snapshot
         self.assertEqual(snapshot.reading.view.waiting, ())
+
+    def test_duplicate_mac_only_submission_that_starts_the_pass_gets_the_same_refusal(self) -> None:
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            fixture.configure(min_pass_gap_seconds=0.25)
+            request = placement_request(fixture)
+            request = replace(request, route=MAC_ONLY,
+                              constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
+            key = self.provide(fixture, request, placement.TemporaryExclusion("blocked"))
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            worker = fixture.server.host_targets[("mac", "mac")]
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            parked = fixture.connect(request)
+            self.assertEqual(parked.replies(), [])
+            self.assertEqual(len(fixture.server.parked_placements), 1)
+
+            fixture.clock.advance(0.25)
+            duplicate = fixture.connect(request)
+            refusal, = parked.replies()
+            self.assertIsInstance(refusal, wire.DispatchStatus)
+            self.assertEqual(duplicate.replies(), [refusal])
+
+    def test_a_refused_mac_only_episode_keeps_its_start_and_host_selection(self) -> None:
+        for changed in ("since", "selection"):
+            with (self.subTest(changed=changed), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                first = placement_request(fixture)
+                first = replace(first, route=MAC_ONLY,
+                                constraints=replace(first.constraints, selection=placement.MacOnlyHost()))
+                key = self.provide(fixture, first, placement.TemporaryExclusion("blocked"))
+                self.assertIsInstance(fixture.server.handle_request(first)[0], wire.PlacementWait)
+                worker = fixture.server.host_targets[("mac", "mac")]
+                assert isinstance(worker, ManualEvidenceWorker)
+                self.assertEqual(worker.probe_next(), key)
+                _ = fixture.run_pass()
+                refusal, = fixture.server.handle_request(first)
+                self.assertIsInstance(refusal, wire.DispatchStatus)
+
+                if changed == "since":
+                    reply, = fixture.server.handle_request(replace(first, since=first.since + 1))
+                    self.assertEqual(reply, wire.Refused("placement episode changed its owner, start, run or purpose"))
+                else:
+                    later = replace(first, constraints=replace(first.constraints, selection=placement.ConfiguredOrder()))
+                    pending, = fixture.server.handle_request(later)
+                    self.assertIsInstance(pending, wire.PlacementWait)
+                    retained = fixture.server.placement_requests[first.episode]
+                    self.assertEqual(retained.constraints.selection, placement.MacOnlyHost())
+                    self.assertEqual(worker.probe_next(), key)
+                    _ = fixture.run_pass()
+                    reply, = fixture.server.handle_request(later)
+                    self.assertEqual(reply, refusal)
 
     def test_the_older_request_is_probed_next_and_takes_the_mac(self) -> None:
         for mac_only in (False, True):

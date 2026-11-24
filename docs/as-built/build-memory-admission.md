@@ -252,8 +252,10 @@ Busy, blocked, and disk refusals retain normal polling.
 A Mac that `free_now` reports busy is a busy exclusion in placement evidence, even though routing keeps it eligible.
 The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
 An explicit `--mac-only` request waits when the Mac is busy.
-When the service refuses that request, it removes the request and publishes the queue view before it replies.
-A new submission of the same episode reads the Mac again.
+When the service refuses that request, it publishes the queue view without the waiter before it replies.
+The refused request cannot hold the Mac or take a place in the probe order.
+The service keeps the start time and host selection for the episode.
+A valid resubmission of the episode reads the Mac again.
 Before this rule, a waiting Mac step made one refused attempt each second.
 When a younger request reads the Mac free, the oldest eligible waiter can hold it for one probe.
 A probe that publishes during the hold answers it, even if the probe started before the hold.
