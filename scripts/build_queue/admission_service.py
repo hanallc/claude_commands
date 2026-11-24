@@ -3172,8 +3172,9 @@ class AdmissionServer:
 
     def _cloud_slots_used(self) -> int:
         legacy = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
-        placed = sum(self.assignments[key].assignment.destination.provider == "scaler"
-                     for key in self.current_assignments.values())
+        placed = sum(saved.assignment.destination.provider == "scaler"
+                     for key in self.current_assignments.values()
+                     if (saved := self.assignments.get(key)) is not None)
         return legacy + placed
 
     def _cloud_slots_full(self) -> bool:
