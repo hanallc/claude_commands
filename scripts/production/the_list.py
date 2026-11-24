@@ -293,7 +293,7 @@ class UseCurrentSchedule(StrEnum):
 @dataclass(frozen=True)
 class ScheduleExpectation:
     revision: str
-    run_number: int
+    run_number: int | repeat_rule.NoNextRun
 
 
 class ScheduleChanges(TypedDict, total=False):
@@ -1668,7 +1668,7 @@ def _scoped_series_run(series: ScheduledSeries, scope: ScheduleScope, moment: da
 
 
 def _require_expected_run(selected: SeriesRun | repeat_rule.NoNextRun, expected: ScheduleExpectation) -> None:
-    number = selected.number if isinstance(selected, SeriesRun) else 0
+    number = selected.number if isinstance(selected, SeriesRun) else selected
     if number != expected.run_number:
         raise ScheduleSelectionChanged("The next run changed. Open the item again.")
 
@@ -1724,7 +1724,10 @@ def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleSc
         if run.start.astimezone(UTC) < moment.astimezone(UTC):
             raise ListError("choose a time on or after now for this run")
         return _replace_series_run(schedule, selected.number, run)
-    run = ScheduledRun(edits.get("start", selected.original), edits.get("words", schedule.first.words))
+    start = edits.get("start", selected.original)
+    if "repeat" in edits and "start" not in edits:
+        start = selected.run.start.astimezone(user_zone())
+    run = ScheduledRun(start, edits.get("words", schedule.first.words))
     rule = edits.get("repeat", schedule.rule)
     if not isinstance(rule, repeat_rule.RepeatRule):
         return run

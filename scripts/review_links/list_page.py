@@ -477,8 +477,7 @@ def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
         attributes += f' data-rule="{html.escape(series.rule.rrule, quote=True)}" data-repeat-start="{origin}"'
         words = series.first.words
     if isinstance(schedule, UpcomingSeriesRun):
-        original = schedule.selected.original.strftime("%Y-%m-%dT%H:%M")
-        attributes += f' data-run="{schedule.selected.number}" data-run-start="{original}"'
+        attributes += f' data-run="{schedule.selected.number}"'
         schedule = schedule.selected.run
     if isinstance(schedule, the_list.ScheduledRun):
         start = schedule.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
@@ -1076,7 +1075,8 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
 def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: str,
                    prefix: ListFormRequestPrefix, action: str, words: str, until: str,
                    status: change_page.DeliveryStatus | None, submitted: SchedulePageAction) -> ListActionSubmission:
-    expected = the_list.ScheduleExpectation(submitted.revision, submitted.run_number)
+    run_number = submitted.run_number or repeat_rule.NoNextRun.REMAINING
+    expected = the_list.ScheduleExpectation(submitted.revision, run_number)
     if action in the_list.ScheduleOperation:
         save_schedule(keeper, identity, request, the_list.ScheduleOperation(action), until, submitted, expected)
         return change_page.NoMessageDelivery()
@@ -1943,7 +1943,7 @@ function bindScheduleFields(form,until,zone,draft,edit){
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[for="'+select.id+'"]');
- const {start='',rule='',repeatStart,runStart,revision}=panel.dataset,number=Number(panel.dataset.run || 0);
+ const {start='',rule='',repeatStart,revision}=panel.dataset,number=Number(panel.dataset.run || 0);
  const savedWords=words.value;
  const currentDraft=draft?.revision===revision && draft.number===number ? draft : undefined;
  until.value=currentDraft?.until ?? start;
@@ -2015,8 +2015,7 @@ function bindScheduleFields(form,until,zone,draft,edit){
   },
   applySeriesRepeat:data=>{
    if(data.scope==='this' || (!data.startChanged && data.repeat===undefined)) return true;
-   const scopedStart=data.startChanged ? until.value : data.scope==='following' ? runStart : start || repeatStart;
-   const at=scheduleDate(scopedStart);
+   const at=scheduleDate(data.startChanged ? until.value : start);
    if(!at) return true;
    if(!repeatEdited && data.startChanged && choice!=='custom'){
     const repeat=preset(at,choice);

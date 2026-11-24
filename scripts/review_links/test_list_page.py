@@ -4028,7 +4028,7 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date,instruction,repeat,advanceRun=false}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,advanceRun=false}={})=>{
   let posted;
   let readback;
   const send=window.fetch;
@@ -4051,7 +4051,11 @@ window.fetch=async(_path,options={})=>{
    const selected=dialog.querySelector('[value='+scope+']');
    check(!selected.disabled,'The requested scope is available.');
    selected.click();
+   const status=form.querySelector('[data-schedule-status]');
+   const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
    dialog.querySelector('[data-done]').click();
+   await closed;
+   if(rule) check(!status.textContent,status.textContent);
   }
   const result=await response;
   if(!advanceRun) check(!result.reason,result.reason);
@@ -4059,7 +4063,7 @@ window.fetch=async(_path,options={})=>{
   if(date) check(posted.get('until')===date && !posted.has('repeat'),'The move keeps the saved repeat rule.');
   if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
    'The edit sends only the instruction for the selected scope.');
-  if(repeat) check(posted.get('repeat')==='FREQ=DAILY' && !posted.get('until'),
+  if(rule) check(posted.get('repeat')===rule && !posted.get('until'),
    'The rule change uses the start of the displayed run.');
   await new Promise(resolve=>{
    const sent=()=>!form.dataset.sending;
@@ -4116,9 +4120,10 @@ window.fetch=async(_path,options={})=>{
   [1,'park','this',{date:'2026-12-01T14:00:00.000Z'}],
   [1,'park','all',{instruction:'Compare the revised predictions.'}],
   [1,'park','following',{instruction:'Compare the remaining predictions.'}],
+  [1,'park','following',{repeat:'custom',rule:'FREQ=WEEKLY;BYDAY=TU',note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
-  [1,'park','all',{repeat:'daily',advanceRun:true}],
+  [1,'park','all',{repeat:'daily',rule:'FREQ=DAILY',advanceRun:true}],
   [1,'park','following',{advanceRun:true}],
   [1,'remove','this',{advanceRun:true}],
   [3,'remove','all',{}],
@@ -4132,6 +4137,12 @@ window.fetch=async(_path,options={})=>{
    if(options.repeat){
     const select=form.querySelector('[data-repeat]');
     select.value=options.repeat;select.dispatchEvent(new Event('change'));
+    if(options.repeat==='custom'){
+     const dialog=document.querySelector('.list-schedule-dialog[open]');
+     const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+     dialog.querySelector('[data-done]').click();
+     await closed;
+    }
    }else if(options.advanceRun){
     words(form).value='';edit(words(form));
     form.elements.until.value='2026-12-23T09:00';edit(form.elements.until);
@@ -4141,6 +4152,9 @@ window.fetch=async(_path,options={})=>{
   if(options.instruction && scope==='following')
    check(row(number).querySelector('[data-scheduled-note]').textContent.endsWith('Dec 1 09:00 EST'),
     'The instruction edit keeps the moved start.');
+  if(options.note)
+   check(row(number).querySelector('[data-scheduled-note]').textContent===options.note,
+    'The changed rule starts on the moved date.');
   if(action==='unpark'){
    const current=openItem(number);
    current.querySelector('[data-later-toggle]').click();
