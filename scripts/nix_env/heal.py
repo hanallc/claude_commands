@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Generator, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -71,6 +72,13 @@ class HealSession:
     cwd: Path
     status: str
     config_dir: Path
+
+
+@dataclass(frozen=True)
+class PendingSession:
+    session_id: str
+    name: str
+    cwd: Path
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,7 @@ class HealHistory(TypedDict):
     action: str
     reason: str
     alert_reason: str
+    showrunner_alert_key: str
     pending: NoPendingRestart | PendingRestart
 
 
@@ -292,7 +301,8 @@ def hold_reason() -> str:
 
 def new_history() -> HealHistory:
     return HealHistory(restart_at=0.0, restart_pid=0, restart_proc_start="", healthy_since_restart=False,
-                       notified=False, action="", reason="", alert_reason="", pending=NoPendingRestart(kind="none"))
+                       notified=False, action="", reason="", alert_reason="", showrunner_alert_key="",
+                       pending=NoPendingRestart(kind="none"))
 
 
 def read_pending(value: object) -> NoPendingRestart | PendingRestart:
@@ -335,15 +345,18 @@ def read_history(directory: Path) -> dict[str, HealHistory]:
         start, notified = fields.get("restart_proc_start"), fields.get("notified")
         healthy = fields.get("healthy_since_restart")
         action, reason = fields.get("action"), fields.get("reason")
-        alert_reason = fields.get("alert_reason", reason)
+        alert_reason = fields.get("alert_reason", "")
+        showrunner_alert_key = fields.get("showrunner_alert_key", "")
         if (not isinstance(restarted, (int, float)) or isinstance(restarted, bool) or not math.isfinite(restarted)
                 or not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(start, str)
                 or not isinstance(healthy, bool) or not isinstance(notified, bool)
-                or not isinstance(action, str) or not isinstance(reason, str) or not isinstance(alert_reason, str)):
+                or not isinstance(action, str) or not isinstance(reason, str) or not isinstance(alert_reason, str)
+                or not isinstance(showrunner_alert_key, str)):
             raise ValueError("invalid nix-heal session state; refusing to lose the restart guard")
         histories[key] = HealHistory(restart_at=float(restarted), restart_pid=pid,
             restart_proc_start=start, healthy_since_restart=healthy, notified=notified, action=action, reason=reason,
-            alert_reason=alert_reason, pending=read_pending(fields.get("pending", {"kind": "none"})))
+            alert_reason=alert_reason, showrunner_alert_key=showrunner_alert_key,
+            pending=read_pending(fields.get("pending", {"kind": "none"})))
     return histories
 
 
@@ -363,7 +376,7 @@ def state_lock(directory: Path) -> Generator[bool]:
         yield True
 
 
-def log(directory: Path, session: HealSession, history: HealHistory, action: str, reason: str) -> None:
+def log(directory: Path, session: HealSession | PendingSession, history: HealHistory, action: str, reason: str) -> None:
     """Retain every restart and refusal; suppress unchanged skip reasons."""
     if action in {"skip", "pending"} and history["action"] == action and history["reason"] == reason:
         return
@@ -397,7 +410,7 @@ def send_alert(command: list[str], limits: HealLimits) -> tuple[send_result.Outc
     return (outcome.header.outcome if isinstance(outcome, send_result.ConfirmedSendOutcome) else None), detail
 
 
-def send_push(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory,
+def send_push(directory: Path, limits: HealLimits, session: HealSession | PendingSession, history: HealHistory,
               reason: str) -> tuple[bool, str]:
     push = push_texts.render("nix_heal.failed", session=session.name,
                              machine=socket.gethostname(), cwd=str(session.cwd), cause=alert_cause(reason))
@@ -438,21 +451,32 @@ def alert(directory: Path, limits: HealLimits, session: HealSession, history: He
         fallback = "The session has no owning showrunner."
         if owner is not None:
             machine = socket.gethostname()
+            escalate = heal_command("escalate", session.session_id)
+            if history["pending"]["kind"] == "none":
+                instructions = (
+                    "1. Repair the nix setup for this worktree. Get Nate's approval before you change /etc/nixos.\n"
+                    f"2. Run this command on {machine} after the repair.\n"
+                    f"   {heal_command('retry', session.session_id)}\n"
+                    f"3. Run this command on {machine} to send Nate a push if you cannot repair the setup.\n"
+                    f"   {escalate}"
+                )
+            else:
+                instructions = (
+                    "Retry refuses while a restart is pending.\n"
+                    f"Run this command on {machine} to send Nate a push.\n{escalate}"
+                )
             text = (
                 f"The nix shell for {session.name} did not load on {machine}.\n"
                 f"The worktree is {session.cwd}.\n"
                 f"{alert_cause(reason)}\n"
                 f"The healer recorded this reason.\n{reason}\n\n"
-                "1. Repair the nix setup for this worktree. Get Nate's approval before you change /etc/nixos.\n"
-                f"2. Run this command on {machine} after the repair.\n"
-                f"   {heal_command('retry', session.session_id)}\n"
-                f"3. Run this command on {machine} to send Nate a push if you cannot repair the setup.\n"
-                f"   {heal_command('escalate', session.session_id)}"
+                f"{instructions}"
             )
+            key = history["showrunner_alert_key"] or f"nix-heal-{session.session_id}"
             command = session_send.send_argv("--to", str(owner.id), "--from", "nix-heal",
-                                             "--key", f"nix-heal-{session.session_id}", "--text", text)
+                                             "--key", key, "--text", text)
             outcome, detail = send_alert(command, limits)
-            if outcome in {"sent", "queued", "kept"}:
+            if outcome in {"sent", "queued", "kept", "skipped"}:
                 history["notified"] = True
                 log(directory, session, history, "showrunner_alerted", owner.name)
                 return
@@ -723,17 +747,18 @@ def update_recovery(command: str, session_id: str) -> int:
         directory = state_directory()
         with state_lock(directory) as locked:
             if not locked:
-                print("The nix-heal state is busy.")
+                print(f"The nix-heal state is busy. Run {command} again after the sweep ends.")
                 return 1
             histories = read_history(directory)
             history = histories.get(session_id)
             if command == "retry":
                 if history is not None:
                     if history["pending"]["kind"] != "none":
-                        print(f"A restart is pending for {session_id}.")
+                        print(f"A restart is pending for {session_id}. Run {heal_command('escalate', session_id)} to send Nate a push.")
                         return 1
                     history.update(restart_at=0.0, restart_pid=0, restart_proc_start="",
-                                   healthy_since_restart=False, notified=False)
+                                   healthy_since_restart=False, notified=False,
+                                   showrunner_alert_key=f"nix-heal-{session_id}-{uuid.uuid4().hex}")
                     save_history(directory, histories)
                 print(f"The next sweep can retry {session_id}.")
                 return 0
@@ -741,13 +766,18 @@ def update_recovery(command: str, session_id: str) -> int:
             if isinstance(session, Unavailable):
                 print(f"Could not read the live session. {' '.join(session.reason.split())}")
                 return 1
+            pending = history["pending"] if history is not None else NoPendingRestart(kind="none")
             if isinstance(session, Gone):
-                print(f"No live session matches {session_id}.")
-                return 1
+                if pending["kind"] == "none":
+                    print(f"No live session matches {session_id}.")
+                    return 1
+                target = PendingSession(session_id, pending["name"], Path(pending["cwd"]))
+            else:
+                target = session
             if history is None or not history["alert_reason"]:
                 print(f"No failure reason is saved for {session_id}.")
                 return 1
-            confirmed, outcome = send_push(directory, HealLimits.read(), session, history, history["alert_reason"])
+            confirmed, outcome = send_push(directory, HealLimits.read(), target, history, history["alert_reason"])
             save_history(directory, histories)
             print(f"{outcome} push for {session_id}." if confirmed else f"Push failed. {outcome}")
             return 0 if confirmed else 1

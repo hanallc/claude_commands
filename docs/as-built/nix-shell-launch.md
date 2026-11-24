@@ -207,7 +207,8 @@ Every restart, refusal, and change in a skip reason appends one object to
 unchanged skip reasons do not add lines.
 
 A refused environment or failed recovery alerts the nearest showrunner above the session's staff row.
-The message gives the cause, the raw reason, and the retry and escalation commands.
+The message gives the cause, the raw reason, and the recovery commands.
+The healer accepts `SKIPPED` as confirmation when the sender already holds or accepted the alert.
 The journal records `showrunner_alerted` with the name of the showrunner after a confirmed send.
 If the staff record is unreadable, no showrunner owns the session, or the send lacks confirmation, the healer sends Nate the push.
 The healer writes the fallback reason to stderr. The timer saves it in its run log.
@@ -216,9 +217,11 @@ The healer writes the fallback reason to stderr. The timer saves it in its run l
 2. Run `heal.py retry --only <id>` after the repair. It clears the restart guard and notification flag for the next sweep.
 3. Run `heal.py escalate --only <id>` if you cannot repair the setup. It uses the saved failure reason to send Nate the push.
 
-Both commands take the same state lock as the sweep.
-Retry refuses while a restart is pending. Escalation requires a live session and a saved reason.
-A failed retry can send a new showrunner alert.
+Both commands take the same state lock as the sweep. If the lock is busy, run the command again after the sweep ends.
+Retry refuses while a restart is pending. The refusal and the showrunner alert give the escalation command.
+Escalation requires a saved failure reason and a live session or a pending restart.
+If the session is gone, escalation uses the name and worktree from the pending restart.
+A successful retry command gives the next showrunner alert a new message key.
 
 The push catalog owns the title, action and text of `nix_heal.failed`.
 The push keeps the key `nix-heal-<id>` and the clear command `heal.py sweep --only <id> --check`.
