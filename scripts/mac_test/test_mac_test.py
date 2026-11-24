@@ -14,6 +14,7 @@ import socket
 import os
 import runpy
 import select
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, final, override
 
 from scripts.build_queue import execution_identity
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -3385,7 +3386,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             self.assertEqual(transport_calls, 2)
             send.assert_called_once()
 
-    def test_idle_watcher_keeps_the_claim_and_fence_when_the_saved_host_lease_is_busy(self) -> None:
+    def test_watcher_keeps_the_claim_and_fence_when_the_saved_host_lease_is_busy(self) -> None:
         from scripts.copies import copies
         from scripts.mac_test import offload
 
@@ -3406,7 +3407,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(offload, "read_leftovers") as check, mock.patch.object(mac_test, "send_message") as send:
             _ = self.watch_once()
-        activity.assert_called_once_with(mac_test.read_config(), "claim-mac")
+        activity.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(pending.read_text(), "pending")
         check.assert_not_called()
@@ -3654,6 +3655,87 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def read_repository_claim(self, name: str) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
+
+    def check_kept_mirror(self, outcome: Literal["empty", "busy", "ssh failure", "timeout", "probe failure",
+                                                "boot changed", "fence held"]) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import offload
+
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "hana", "hana.json", "hana").for_remote_claim()
+        records = self.write_repository_claims(mac_repository=saved.record(), repo_name=saved.mirror_name,
+                                               repo_key=saved.key, proc_start="ended-owner", cleanup_pending=True)
+        path = self.paths.claims / saved.claim_file
+        claim = claim_state.read_run(path)
+        assert isinstance(claim, dict)
+        pending = claim_state.claim_pending_start(self.paths, path, claim)
+        pending.parent.mkdir(parents=True)
+        _ = pending.write_text("pending")
+        identity = claim_state.claim_identity(claim)
+        scope_key = claim_state.claim_fence_scope_key(path, claim)
+        prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac", scope_key=scope_key),
+                                          self.root)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        fence = self.root / offload.start_fence_relative(identity, "mac", scope_key=scope_key).with_suffix(".lock")
+
+        def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+            self.assertIn("StrictHostKeyChecking=yes", arguments)
+            if outcome == "ssh failure":
+                return subprocess.CompletedProcess(arguments, 255, "", "private SSH failure")
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(arguments, cast(float, options["timeout"]))
+            mirror = "hana" if outcome == "busy" else "cargo-liner"
+            cwd = f"n{self.root}/{offload.mac_mirror_root().relative}/{mirror}"
+            setup = ("id() { echo 501; }\npgrep() { return 1; }\n"
+                     + "sysctl() { echo 31C2CDF0-B7BB-4996-A850-E5FE36B08363; }\n"
+                     + f"lsof() {{ printf 'p42\\n%s\\n' {shlex.quote(cwd)}; }}\n")
+            if outcome == "probe failure":
+                setup += "lsof() { return 1; }\n"
+            if outcome == "boot changed":
+                setup += ('sysctl() { if [ -f "$HOME/boot-read" ]; then echo changed; '
+                          'else touch "$HOME/boot-read"; echo original; fi; }\n')
+            if outcome == "fence held":
+                with fence.open("r") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self.run_private_shell(setup + arguments[-1], self.root)
+            return self.run_private_shell(setup + arguments[-1], self.root)
+
+        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 1)), \
+             mock.patch.object(subprocess, "run", side_effect=remote) as ssh, \
+             mock.patch.object(mac_test, "send_message") as send:
+            _ = self.watch_once()
+        self.assertEqual(self.read_repository_claim("cargo-liner"), records["cargo-liner"])
+        if outcome == "empty":
+            self.assertFalse(path.exists())
+            self.assertFalse(pending.exists())
+            self.assertFalse(fence.exists())
+            send.assert_called_once()
+        else:
+            self.assertEqual(self.read_repository_claim("hana"), records["hana"])
+            self.assertEqual(pending.read_text(), "pending")
+            send.assert_not_called()
+        ssh.assert_called_once()
+
+    def test_kept_mirror_releases_while_another_repository_runs(self) -> None:
+        self.check_kept_mirror("empty")
+
+    def test_kept_mirror_stays_when_its_process_runs(self) -> None:
+        self.check_kept_mirror("busy")
+
+    def test_kept_mirror_stays_when_ssh_fails_or_times_out(self) -> None:
+        for outcome in ("ssh failure", "timeout"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                self.paths = mac_test.StatePaths(Path(directory))
+                with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+                    self.check_kept_mirror(outcome)
+
+    def test_kept_mirror_stays_without_probe_boot_or_fence_proof(self) -> None:
+        for outcome in ("probe failure", "boot changed", "fence held"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                self.paths = mac_test.StatePaths(Path(directory))
+                with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+                    self.check_kept_mirror(outcome)
 
     def test_one_activity_check_per_host_serves_every_repository_claim(self) -> None:
         records = self.write_repository_claims()

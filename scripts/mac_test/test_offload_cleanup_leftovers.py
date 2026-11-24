@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Generator, Sequence
 import json
 import os
 import subprocess
-from typing import cast
+from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
@@ -18,6 +18,50 @@ from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
+    def doc_with_cleanup_timeout(self, *, live_work: bool) -> subprocess.CompletedProcess[str]:
+        self.write_portable_workspace()
+        self.fixture.update(selector_shell="sh", run_cleanup_line="")
+        self.sync_fixture()
+        selectors = self.stub_directory / "selectors"
+        selectors.mkdir()
+        write_shell(selectors / "pgrep", "printf '42\\n'" if live_work else "exit 1")
+        write_shell(selectors / "lsof", "printf 'p41\\nn/home/fixture\\n'")
+        write_shell(selectors / "sleep", "exit 99")
+        write_shell(selectors / "sysctl", "printf 'fixture-boot\\n'")
+        read_lines = offload.bounded_output_lines
+
+        def timeout_after_verdict(output: BinaryIO | TextIO,
+                                  remaining: Callable[[], float | None]) -> Generator[bytes]:
+            for line in read_lines(output, remaining):
+                yield line
+                if line == b"mac_exit=0\n":
+                    raise TimeoutError
+
+        with mock.patch.object(offload, "bounded_output_lines", side_effect=timeout_after_verdict):
+            result = self.command("--workspace", verb="doc", package="", runner_options=("--target", "mac"),
+                                  separate_stderr=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_wire("passed", "")
+        self.assertIn("cleanup timed out", result.stdout)
+        return result
+
+    def test_passed_doc_releases_claim_after_cleanup_stream_timeout(self) -> None:
+        _ = self.doc_with_cleanup_timeout(live_work=False)
+        self.assertFalse(self.claim_file.exists())
+        self.assertEqual(list((self.state_directory / "pending-starts").iterdir()), [])
+        proof, = self.leftover_events()
+        self.assertTrue(proof["claimed"])
+        self.assertNotIn("kill ", proof["args"][-1])
+
+    def test_passed_doc_keeps_claim_while_remote_work_remains(self) -> None:
+        result = self.doc_with_cleanup_timeout(live_work=True)
+        self.assertTrue(self.claim_file.exists())
+        self.assertEqual(len(list((self.state_directory / "pending-starts").iterdir())), 1)
+        proof, = self.leftover_events()
+        self.assertTrue(proof["claimed"])
+        self.assertNotIn("kill ", proof["args"][-1])
+        self.assertIn("stays busy", result.stderr)
+
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
         self.sync_config()

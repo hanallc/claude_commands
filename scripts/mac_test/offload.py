@@ -2648,6 +2648,26 @@ printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
 
 
+def mirror_departure_script(saved: claim_state.MacMirrorIdentity, target: str, fence: str) -> str:
+    """Count work in the saved mirror within one Mac boot session."""
+    command = mirror_selector_script(KnownRepository(saved.mirror_name, saved.key), target)
+    command += r'''
+boot=$(sysctl -n kern.bootsessionuuid) || exit 1
+[ -n "$boot" ] || exit 1
+leftover_pids=$(select_leftovers) || exit 1
+'''
+    if fence:
+        command += ('if [ -z "$leftover_pids" ]; then\n'
+                    + fence + ' || exit 1\n'
+                    + 'leftover_pids=$(select_leftovers) || exit 1\nfi\n')
+    return command + r'''
+current_boot=$(sysctl -n kern.bootsessionuuid) || exit 1
+[ "$boot" = "$current_boot" ] || exit 1
+leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+printf 'leftovers=%s\nrc=0\n' "$leftover_count"
+'''
+
+
 def parse_leftover_check(output: str) -> LeftoverCheckResult:
     values: dict[str, str] = {}
     for line in output.splitlines():
@@ -2671,14 +2691,16 @@ class LeftoverObservation:
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
                    target: str, *,
                    release_deadline: ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                   require_host_key: bool = False,
                    ) -> LeftoverObservation:
-    """End and count one mirror's work without exposing the check to a second signal."""
+    """Read the remote result of a mirror check."""
     timeout = (release_deadline.remaining() if isinstance(release_deadline, ClaimReleaseDeadline)
                else config.leftover_timeout_s)
     if timeout <= 0:
         return LeftoverObservation(LeftoverCheckFailed("the claim release deadline expired before SSH"), "")
     try:
-        arguments = ["ssh", *ssh_options(config), host, script]
+        host_options = ["-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none"] if require_host_key else []
+        arguments = ["ssh", *host_options, *ssh_options(config), host, script]
         result = subprocess.run(
             arguments,
             stdin=subprocess.DEVNULL,
@@ -2692,6 +2714,8 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
     except OSError:
         return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
+    except UnicodeError:
+        return LeftoverObservation(LeftoverCheckFailed("the leftover check answer could not be read"), "")
     ledger = transfer_bytes.active_transfers.get()
     if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
@@ -2716,7 +2740,8 @@ def check_leftovers(config: SshConnectionSettings, host: str, repository: Mirror
 
 
 def settle_pending_start(controller: ProcessController, config: OffloadConfig, host: str,
-                         repository: MirrorScope, target: str = "mac", slot: int = 1
+                         repository: MirrorScope, target: str = "mac", slot: int = 1, *,
+                         observe_only: bool = False,
                          ) -> StartSettled | StartUnsettled:
     """Keep the claim until the remote fence prevents a delayed start."""
     identity = controller.claim_identity
@@ -2726,13 +2751,27 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
         connection = eligibility.read_connection_settings(config.source)
     except (OSError, ValueError) as error:
         return StartUnsettled(str(error), LeftoverCheckFailed(f"cleanup settings unavailable: {error}"))
-    command = (start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key) + " || exit 1\n"
-               + leftover_check_script(repository, target, slot))
-    observed = read_leftovers(connection, host, command, target)
+    fence = start_fence_command(identity, target, settle=True, scope_key=controller.claim_scope_key)
+    if observe_only:
+        saved = controller.mac_repository
+        if not isinstance(saved, claim_state.MacMirrorIdentity):
+            reason = "the claim has no saved Mac mirror"
+            return StartUnsettled(reason, LeftoverCheckFailed(reason))
+        try:
+            command = mirror_departure_script(saved, target, fence)
+            observed = read_leftovers(connection, host, command, target, require_host_key=True)
+        except (OSError, ValueError) as error:
+            return StartUnsettled(str(error), LeftoverCheckFailed(str(error)))
+    else:
+        command = fence + " || exit 1\n" + leftover_check_script(repository, target, slot)
+        observed = read_leftovers(connection, host, command, target)
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
+        try:
+            pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
+        except OSError as error:
+            return StartUnsettled(str(error), LeftoverCheckFailed(str(error)))
         controller.pending = SettledDispatchOperations()
-        pending_start_path(target, identity, scope_key=controller.claim_scope_key).unlink(missing_ok=True)
         return StartSettled(observed.result)
     return StartUnsettled("the original remote start has not settled", observed.result)
 
@@ -3056,7 +3095,15 @@ def claimed_run(
         report_cleanup(remote_status.cleanup, request.target,
                        path=f"~/{mirror_target(repository, request.target, request.slot)}",
                        free_floor_gib=config.free_floor_gib)
-        if isinstance(remote_status.cleanup, CleanupUnconfirmed):
+        if (routed_mac_command and isinstance(remote_status, ReportedMacStatus)
+                and isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
+            controller.pending = PendingStartOperation()
+            settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot,
+                                              observe_only=True)
+            release_allowed = isinstance(settlement, StartSettled)
+            observe_cleanup(evidence, settlement.leftovers)
+            report_leftover_check(settlement.leftovers, request)
+        elif isinstance(remote_status.cleanup, CleanupUnconfirmed):
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)

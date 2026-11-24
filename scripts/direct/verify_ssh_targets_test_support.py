@@ -280,8 +280,12 @@ real_popen = subprocess.Popen
 real_fetch = offload.fetch_folder
 def commands(arguments, **options):
     if arguments[0] == "ssh":
+        if mode in ("cleanup-stream-timeout", "post-fetch-cleanup-timeout"):
+            actions.append("release-probe")
+            assert "kern.bootsessionuuid" in arguments[-1] and "kill " not in arguments[-1], arguments
+            return subprocess.CompletedProcess(arguments, 0, "leftovers=1\nrc=0\n", "")
         actions.append("cleanup")
-        if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout", "post-fetch-cleanup-timeout"):
+        if mode == "setup-failure-cleanup-timeout":
             raise AssertionError("A timed-out stream must not start another cleanup")
         if mode in ("lost-cleanup-timeout", "lost-authorization-reply"):
             (root / "mac-loss-ready").touch()
