@@ -51,7 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 import fcntl
-from functools import cache
+from functools import cache, partial
 import hashlib
 import inspect
 from importlib import import_module
@@ -3289,8 +3289,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return run_local(type_dirs)
         return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
 
-    def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection, *,
-                  checkout_commit: str, dirty: bool) -> GateRun:
+    def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
         outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                               selected=selection, gate_job=gate_job, type_dirs=type_dirs, assignment=assignment)
@@ -3308,12 +3307,10 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                           file=sys.stderr, flush=True)
         else:
             modules = sum(job.kind is GateJobKind.TEST_MODULE for job in outcome.jobs)
-            unit = "module" if modules == 1 else "modules"
             minutes, seconds = divmod(round(outcome.seconds), 60)
-            duration = f"{minutes} min {seconds} s" if minutes else f"{seconds} s"
-            commit = (checkout_commit or checked_git(repo, "rev-parse", "HEAD"))[:10]
-            revision = f"snapshot of commit {commit}" if dirty else f"commit {commit}"
-            print(f"Mac Linux guest gate passed: {modules} {unit} in {duration} ({revision})", flush=True)
+            head = checked_git(repo, "rev-parse", "HEAD")[:10]
+            print(f"Mac Linux guest gate passed: {modules} modules in {minutes} min {seconds} s (checkout HEAD {head})",
+                  flush=True)
         return outcome
 
     def run_routed(select: Callable[[RoutedGateTree, set[str]], GateRun]) -> GateRun:
@@ -3335,7 +3332,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         case "natedev":
             # A gate assigned to natedev checks its checkout at the end, like every other gate.
             return run_routed(lambda _routed, _dirty: run_local(type_dirs))
-        case MacLinuxAssignment():
+        case MacLinuxAssignment(assignment=guest_assignment):
             key = "enabled.mac-linux"
             try:
                 enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
@@ -3343,22 +3340,17 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
             if not enabled:
                 raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
+            run_selected = partial(run_guest, guest_assignment)
         case "aws":
             if type_dirs:
                 raise GateRefused("The AWS gate route does not support type checks")
+            run_selected = run_cloud
         case NoGateAssignment():
-            pass
+            run_selected = run_cloud
         case _:
             raise GateRefused(f"The gate does not support the assigned target {target}")
 
     def select_and_run(routed: RoutedGateTree, dirty: set[str]) -> GateRun:
-        checkout_commit = ""
-
-        def run_selected(selection: AllModules | TreeSelection) -> GateRun:
-            if isinstance(target, MacLinuxAssignment):
-                return run_guest(target.assignment, selection, checkout_commit=checkout_commit, dirty=bool(dirty))
-            return run_cloud(selection)
-
         if mode is SuiteMode.GATE:
             return run_selected(ALL_MODULES)
 
@@ -3367,10 +3359,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if not full:
             tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
                            else head_test_tree(repo))
-            if isinstance(tested_tree, CleanTestTree):
-                if tested_tree.tree != routed.tree:
-                    raise GateRefused("The checkout changed before test selection")
-                checkout_commit = tested_tree.commit
+            if isinstance(tested_tree, CleanTestTree) and tested_tree.tree != routed.tree:
+                raise GateRefused("The checkout changed before test selection")
             modules = discover_test_modules(repo)
             selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
             unassigned = isinstance(target, NoGateAssignment)

@@ -492,18 +492,19 @@ class MacGateSuitesTests(GateSuitesFixture):
         target = gate.MacLinuxAssignment(self.gate_assignment("mac-linux"))
         commit = self.git(self.checkout, "rev-parse", "HEAD")[:10]
         types = gate.GateJobResult("types", "basedpyright", 0, 1, "", kind=gate.GateJobKind.TYPE_CHECK)
-        test = gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
+        first = gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
+        second = gate.GateJobResult("lib", "test_first.py", 0, 1, "")
         for status, dirty in ((0, False), (1, False), (0, True)):
             if dirty:
                 self.write(self.checkout / "uncommitted.txt", "Guest snapshot fixture.\n")
-            result = gate.GateRun((replace(test, returncode=status), types), 1673, 0)
+            result = gate.GateRun((replace(first, returncode=status), second, types), 1673, 0)
             with (self.subTest(status=status, dirty=dirty), mock.patch.object(mac_linux, "route", return_value=result),
                   redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
                 run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED, full=True, target=target)
                 self.assertIs(run, result)
                 if status == 0:
-                    revision = f"snapshot of commit {commit}" if dirty else f"commit {commit}"
-                    self.assertEqual(output.getvalue(), f"Mac Linux guest gate passed: 1 module in 27 min 53 s ({revision})\n")
+                    self.assertEqual(output.getvalue(),
+                                     f"Mac Linux guest gate passed: 2 modules in 27 min 53 s (checkout HEAD {commit})\n")
                     self.assertEqual(errors.getvalue(), "")
                 else:
                     self.assertEqual(output.getvalue(), "")
