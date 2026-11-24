@@ -10,12 +10,12 @@ import secrets
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
+from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, quote, unquote, urlencode
 from zoneinfo import ZoneInfo
 
@@ -464,16 +464,12 @@ REPEAT_CHOICES = (
 )
 
 
-def schedule_revision(schedule: the_list.Schedule) -> str:
-    return hashlib.sha256(repr(schedule).encode()).hexdigest()
-
-
 def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
                     members: staff.StaffSnapshot, key: str, zone: ZoneInfo) -> str:
     owner = html.escape(owner_name(members, entry.item.owner))
     producer = html.escape(owner_name(members, entry.item.producer))
     options = ''.join(f'<option value="{value}">{label}</option>' for value, label in REPEAT_CHOICES)
-    attributes = f' data-revision="{schedule_revision(entry.item.schedule)}"'
+    attributes = f' data-revision="{the_list.schedule_revision(entry.item.schedule)}"'
     words = ""
     if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
         series = schedule.series
@@ -976,25 +972,6 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     return save_action(root, body, status)[0]
 
 
-class ScheduleWrite(Protocol):
-    """The List write that saves an edit and a page receipt together."""
-
-    def __call__(self, keeper: staff.StaffId, identity: str,
-                 edit: Callable[[the_list.ListItem, datetime], the_list.ListItem],
-                 what: the_list.FieldChange, source: str, *,
-                 page_action: the_list.PageRequest) -> the_list.ListEdit: ...
-
-
-# Share the storage operations that the command line uses.
-write_schedule = cast(ScheduleWrite, getattr(the_list, "_change"))
-edit_schedule = cast(
-    Callable[[the_list.Schedule, the_list.ScheduleChanges, the_list.ScheduleScope, datetime], the_list.Schedule],
-    getattr(the_list, "_schedule_edit"))
-remove_schedule = cast(Callable[[the_list.Schedule, the_list.ScheduleScope, datetime], the_list.Schedule],
-                       getattr(the_list, "_remove_schedule"))
-check_series_limit = cast(Callable[[the_list.Schedule], None], getattr(the_list, "_check_series_limit"))
-
-
 class KeepRepeat(Enum):
     UNCHANGED = "keep the saved repeat rule"
 
@@ -1029,75 +1006,24 @@ class SchedulePageAction:
         fields = (action, self.scope, self.run_number, self.words, rule, until)
         return json.dumps((*fields, self.revision) if self.revision else fields)
 
-    def require_revision(self, schedule: the_list.Schedule) -> None:
-        if self.revision and self.revision != schedule_revision(schedule):
-            raise the_list.ListError("The schedule changed. Open the item again.")
 
-    def require_selected_run(self, schedule: the_list.Schedule, moment: datetime) -> None:
-        if self.scope not in (the_list.ScheduleScope.THIS, the_list.ScheduleScope.FOLLOWING):
-            return
-        if not isinstance(schedule, the_list.ScheduledSeries):
-            raise the_list.ListError("The series changed. Open the item again.")
-        selected = schedule.next_run(moment, the_list.series_run_limit())
-        if not isinstance(selected, the_list.SeriesRun) or selected.number != self.run_number:
-            raise the_list.ListError("The next run changed. Open the item again.")
-
-
-def save_schedule(keeper: staff.StaffId, identity: str, request: str, action: str,
-                  until: str, submitted: SchedulePageAction) -> None:
-    """Save the schedule and its retry receipt in one List write."""
-    start = the_list.NoTimestamp.UNSET
+def save_schedule(keeper: staff.StaffId, identity: str, request: str, operation: the_list.ScheduleOperation,
+                  until: str, submitted: SchedulePageAction, expected: the_list.ScheduleExpectation) -> None:
+    edits: the_list.ScheduleChanges = {}
     if until:
         if the_list.ISO_TIME.fullmatch(until) is None or "T" not in until:
             raise question_record.AnswerRefused("Choose a start time with a UTC offset.")
         moment = datetime.fromisoformat(until)
         if moment.utcoffset() is None:
             raise question_record.AnswerRefused("Choose a start time with a UTC offset.")
-        start = moment.astimezone(user_zone())
-    edits: the_list.ScheduleChanges = {}
+        edits["start"] = moment.astimezone(user_zone())
     if submitted.words:
         edits["words"] = submitted.words
     if isinstance(submitted.repeat, str):
         edits["repeat"] = repeat_rule.parse(submitted.repeat) if submitted.repeat else the_list.NoSchedule.UNSET
-    if isinstance(start, datetime):
-        edits["start"] = start
-    receipt = the_list.PageRequest(request, "park", submitted.receipt_words(action, until))
-
-    def edit(item: the_list.ListItem, moment: datetime) -> the_list.ListItem:
-        if item.state is the_list.ItemState.CLOSED:
-            raise the_list.ListError("Reopen the item before changing its schedule.")
-        existing = item.schedule
-        submitted.require_revision(existing)
-        submitted.require_selected_run(existing, moment)
-        if action == "unschedule":
-            if item.state is not the_list.ItemState.SCHEDULED:
-                raise the_list.ListError("This item has no active schedule.")
-            remaining = remove_schedule(existing, submitted.scope, moment)
-            return replace(item, schedule=remaining,
-                           state=the_list.ItemState.SCHEDULED if isinstance(remaining, the_list.ScheduledSeries)
-                           else the_list.ItemState.WORKING)
-        if action == "start-now":
-            if item.state is not the_list.ItemState.SCHEDULED:
-                raise the_list.ListError("This item has no active schedule.")
-            immediate: the_list.ScheduleChanges = {"start": moment}
-            schedule = edit_schedule(existing, immediate, submitted.scope, moment)
-        else:
-            if not submitted.words:
-                raise question_record.AnswerRefused("Enter an instruction for the start time.")
-            if isinstance(start, datetime) and start <= moment:
-                raise question_record.AnswerRefused("Choose a future start time.")
-            if (submitted.scope is the_list.ScheduleScope.ALL and
-                    "repeat" in edits and "start" not in edits and isinstance(existing, the_list.ScheduledSeries)):
-                selected = existing.next_run(moment, the_list.series_run_limit())
-                if isinstance(selected, the_list.SeriesRun):
-                    edits["start"] = selected.run.start.astimezone(user_zone())
-            schedule = edit_schedule(existing, edits, submitted.scope, moment)
-            check_series_limit(schedule)
-        return replace(item, state=the_list.ItemState.SCHEDULED, schedule=schedule,
-                       parked_until=the_list.NoTimestamp.UNSET)
-
-    _ = write_schedule(keeper, identity, edit, the_list.FieldChange("Updated", {}), the_list.PAGE_SOURCE,
-                       page_action=receipt)
+    receipt = the_list.PageRequest(request, "park", submitted.receipt_words(operation, until))
+    _ = the_list.save_page_schedule(keeper, identity, operation, edits, scope=submitted.scope, expected=expected,
+                                    receipt=receipt)
 
 
 def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
@@ -1150,8 +1076,9 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
 def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: str,
                    prefix: ListFormRequestPrefix, action: str, words: str, until: str,
                    status: change_page.DeliveryStatus | None, submitted: SchedulePageAction) -> ListActionSubmission:
-    if action in {"schedule", "unschedule", "start-now"}:
-        save_schedule(keeper, identity, request, action, until, submitted)
+    expected = the_list.ScheduleExpectation(submitted.revision, submitted.run_number)
+    if action in the_list.ScheduleOperation:
+        save_schedule(keeper, identity, request, the_list.ScheduleOperation(action), until, submitted, expected)
         return change_page.NoMessageDelivery()
     item = the_list.load(keeper, identity)
     if action == "question":
@@ -1163,11 +1090,6 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             _mark_seen_update_read(keeper, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
         return question
-    if action in {"remove", "park"} and request not in the_list.feedback_requests(item):
-        if action == "park" and submitted.scope is the_list.ScheduleScope.THIS:
-            raise question_record.AnswerRefused("Choose This and following runs or All runs to park a repeated item.")
-        submitted.require_revision(item.schedule)
-        submitted.require_selected_run(item.schedule, the_list.now())
     if action == "remove":
         one_run = submitted.scope is the_list.ScheduleScope.THIS
         target = f"run {submitted.run_number} of item {item.number}" if one_run else f"item {item.number}"
@@ -1175,7 +1097,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         notice = the_list.PageItemNotice(request, f"List page: nate removed {target}.", "remove", saved_words,
                                         recipient=prefix.recipient)
         changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE,
-                                 notice=notice, schedule_scope=submitted.scope)
+                                 notice=notice, schedule_scope=submitted.scope, expected_schedule=expected)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
@@ -1186,7 +1108,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", saved_words,
                                         recipient=prefix.recipient)
         changed = the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice,
-                                schedule_scope=submitted.scope)
+                                schedule_scope=submitted.scope, expected_schedule=expected)
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words,
                                         recipient=prefix.recipient)

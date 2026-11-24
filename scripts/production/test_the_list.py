@@ -349,7 +349,8 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(event.fields.get("schedule"), item.schedule)
 
     def test_repeated_item_refuses_an_invalid_scope_without_writing(self) -> None:
-        code, output, errors = self.add_scheduled("2026-11-30T17:00:00Z", "--repeat", "FREQ=DAILY")
+        start = datetime(2026, 11, 30, 17, tzinfo=UTC)
+        code, output, errors = self.add_scheduled(start.isoformat(), "--repeat", "FREQ=DAILY")
         self.assertEqual((code, errors), (0, ""))
         identity = output.splitlines()[-1]
         path = the_list.folder(MORTY.id) / f"{identity}.md"
@@ -366,6 +367,18 @@ class TheListTests(unittest.TestCase):
                 code, output, errors = self.command(verb, "--id", identity, "--source", "nate", *flags)
                 self.assertEqual((code, output), (1, ""))
                 self.assertIn(reason, errors)
+                self.assertEqual(path.read_bytes(), before)
+
+        saved = the_list.load(MORTY.id, identity)
+        expected = the_list.ScheduleExpectation(the_list.schedule_revision(saved.schedule), run_number=2)
+        for scope, moment in (
+            (the_list.ScheduleScope.THIS, start + timedelta(days=2)),
+            (the_list.ScheduleScope.FOLLOWING, start + timedelta(days=the_list.series_run_limit())),
+        ):
+            with self.subTest(scope=scope, moment=moment), patch.object(the_list, "now", return_value=moment):
+                with self.assertRaisesRegex(the_list.ScheduleSelectionChanged, "The next run changed"):
+                    _ = the_list.close(MORTY.id, identity, "Stop", source="nate", schedule_scope=scope,
+                                       expected_schedule=expected)
                 self.assertEqual(path.read_bytes(), before)
 
     def test_text_limits_on_add_and_update(self) -> None:

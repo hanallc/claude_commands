@@ -37,6 +37,10 @@ class ListError(ValueError):
     """The item cannot accept the requested operation."""
 
 
+class ScheduleSelectionChanged(ListError):
+    """The saved schedule or selected run changed before the write."""
+
+
 class ItemState(StrEnum):
     NEW = "New"
     WORKING = "Working"
@@ -282,10 +286,26 @@ class ScheduleScope(StrEnum):
     ALL = "all"
 
 
+class UseCurrentSchedule(StrEnum):
+    AT_WRITE = "use the schedule at the time of the write"
+
+
+@dataclass(frozen=True)
+class ScheduleExpectation:
+    revision: str
+    run_number: int
+
+
 class ScheduleChanges(TypedDict, total=False):
     start: datetime
     words: str
     repeat: repeat_rule.RepeatRule | NoSchedule
+
+
+class ScheduleOperation(StrEnum):
+    EDIT = "schedule"
+    REMOVE = "unschedule"
+    START_NOW = "start-now"
 
 
 @dataclass(frozen=True)
@@ -1616,7 +1636,18 @@ def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
     return changed, unchanged
 
 
-def _require_schedule_scope(schedule: Schedule, scope: ScheduleScope) -> None:
+def schedule_revision(schedule: Schedule) -> str:
+    return hashlib.sha256(repr(schedule).encode()).hexdigest()
+
+
+def _require_schedule_selection(
+        schedule: Schedule, scope: ScheduleScope,
+        expected: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> None:
+    if isinstance(expected, ScheduleExpectation):
+        if expected.revision and expected.revision != schedule_revision(schedule):
+            raise ScheduleSelectionChanged("The schedule changed. Open the item again.")
+        if scope in (ScheduleScope.THIS, ScheduleScope.FOLLOWING) and not isinstance(schedule, ScheduledSeries):
+            raise ScheduleSelectionChanged("The series changed. Open the item again.")
     if isinstance(schedule, ScheduledSeries):
         if scope is ScheduleScope.UNSPECIFIED:
             raise ListError("use --scope this, following, or all for a repeated item")
@@ -1624,8 +1655,12 @@ def _require_schedule_scope(schedule: Schedule, scope: ScheduleScope) -> None:
         raise ListError("--scope needs a repeated item")
 
 
-def _scoped_series_run(series: ScheduledSeries, scope: ScheduleScope, moment: datetime, limit: int) -> SeriesRun:
+def _scoped_series_run(series: ScheduledSeries, scope: ScheduleScope, moment: datetime, limit: int,
+                       expected: ScheduleExpectation | UseCurrentSchedule) -> SeriesRun:
     selected = series.next_run(moment, limit)
+    if isinstance(expected, ScheduleExpectation) and (
+            not isinstance(selected, SeriesRun) or selected.number != expected.run_number):
+        raise ScheduleSelectionChanged("The next run changed. Open the item again.")
     if isinstance(selected, repeat_rule.NoNextRun):
         raise ListError("the series has no next run. Use --scope all")
     if scope is ScheduleScope.FOLLOWING and selected.number == 1:
@@ -1638,8 +1673,9 @@ def _replace_series_run(series: ScheduledSeries, number: int, run: ScheduledRun 
     return replace(series, exceptions=(*exceptions, RunException(number, run)))
 
 
-def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleScope, moment: datetime) -> Schedule:
-    _require_schedule_scope(schedule, scope)
+def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleScope, moment: datetime,
+                   expected: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> Schedule:
+    _require_schedule_selection(schedule, scope, expected)
     if isinstance(schedule, NoSchedule):
         if "start" not in edits or "words" not in edits:
             raise ListError("use --start and --do for a new schedule")
@@ -1662,7 +1698,7 @@ def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleSc
             exceptions = tuple(replace(entry, run=replace(entry.run, words=run.words))
                                if isinstance(entry.run, ScheduledRun) else entry for entry in exceptions)
         return ScheduledSeries(run, rule, schedule.runs_before, exceptions)
-    selected = _scoped_series_run(schedule, scope, moment, series_run_limit())
+    selected = _scoped_series_run(schedule, scope, moment, series_run_limit(), expected)
     if scope is ScheduleScope.THIS:
         if "repeat" in edits:
             raise ListError("change a repeat rule with --scope following or all")
@@ -1681,17 +1717,53 @@ def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleSc
     return ScheduledSeries(run, rule, runs_before=selected.number - 1)
 
 
-def _remove_schedule(schedule: Schedule, scope: ScheduleScope, moment: datetime) -> Schedule:
-    _require_schedule_scope(schedule, scope)
+def _remove_schedule(schedule: Schedule, scope: ScheduleScope, moment: datetime,
+                     expected: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> Schedule:
+    _require_schedule_selection(schedule, scope, expected)
     if not isinstance(schedule, ScheduledSeries) or scope is ScheduleScope.ALL:
         return NoSchedule.UNSET
     limit = series_run_limit()
-    selected = _scoped_series_run(schedule, scope, moment, limit)
+    selected = _scoped_series_run(schedule, scope, moment, limit, expected)
     if scope is ScheduleScope.THIS:
         series = _replace_series_run(schedule, selected.number, RemovedRun.SKIPPED)
         if isinstance(series.next_run(moment, limit), SeriesRun):
             return series
     return NoSchedule.UNSET
+
+
+def save_page_schedule(keeper: staff.StaffId, identity: str, operation: ScheduleOperation,
+                       edits: ScheduleChanges, *, scope: ScheduleScope, expected: ScheduleExpectation,
+                       receipt: PageRequest) -> ListEdit:
+    """Save the schedule and the page receipt in one write."""
+    def edit(item: ListItem, moment: datetime) -> ListItem:
+        if item.state is ItemState.CLOSED:
+            raise ListError("Reopen the item before changing its schedule.")
+        existing = item.schedule
+        if operation is not ScheduleOperation.EDIT and item.state is not ItemState.SCHEDULED:
+            raise ListError("This item has no active schedule.")
+        if operation is ScheduleOperation.REMOVE:
+            remaining = _remove_schedule(existing, scope, moment, expected)
+            state = ItemState.SCHEDULED if isinstance(remaining, ScheduledSeries) else ItemState.WORKING
+            return replace(item, schedule=remaining, state=state)
+        if operation is ScheduleOperation.START_NOW:
+            schedule = _schedule_edit(existing, {"start": moment}, scope, moment, expected)
+        else:
+            if not edits.get("words", "").strip():
+                raise question_record.AnswerRefused("Enter an instruction for the start time.")
+            if "start" in edits and edits["start"] <= moment:
+                raise question_record.AnswerRefused("Choose a future start time.")
+            changes = edits
+            if (scope is ScheduleScope.ALL and "repeat" in edits
+                    and "start" not in edits and isinstance(existing, ScheduledSeries)):
+                selected = existing.next_run(moment, series_run_limit())
+                if isinstance(selected, SeriesRun):
+                    changes = edits.copy()
+                    changes["start"] = selected.run.start.astimezone(user_zone())
+            schedule = _schedule_edit(existing, changes, scope, moment, expected)
+            _check_series_limit(schedule)
+        return replace(item, state=ItemState.SCHEDULED, schedule=schedule, parked_until=NoTimestamp.UNSET)
+
+    return _change(keeper, identity, edit, FieldChange("Updated", {}), PAGE_SOURCE, page_action=receipt)
 
 
 def _say_schedule(schedule: Schedule) -> None:
@@ -1789,7 +1861,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         elif schedule_scope is not ScheduleScope.UNSPECIFIED:
             raise ListError("--scope needs a schedule change or removal")
         elif "schedule" in changes:
-            _require_schedule_scope(item.schedule, schedule_scope)
+            _require_schedule_selection(item.schedule, schedule_scope)
         if changed.state is ItemState.SCHEDULED:
             changed = replace(changed, parked_until=NoTimestamp.UNSET)
         if add_evidence:
@@ -1860,7 +1932,8 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
-         schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED) -> ListItem:
+         schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
+         expected_schedule: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
     if isinstance(until, datetime):
@@ -1870,12 +1943,15 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
         event = PageParkingChange("Parked", fields, notice.request)
 
     def edit(item: ListItem, moment: datetime) -> ListItem:
-        if isinstance(notice, PageItemNotice) and not parking_active(until, moment):
-            raise ListError("Choose a future parking date.")
+        if isinstance(notice, PageItemNotice):
+            if schedule_scope is ScheduleScope.THIS:
+                raise question_record.AnswerRefused("Choose This and following runs or All runs to park a repeated item.")
+            if not parking_active(until, moment):
+                raise ListError("Choose a future parking date.")
         _open(item)
         if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
             raise ListError("This item is already delivered.")
-        schedule = _remove_schedule(item.schedule, schedule_scope, moment)
+        schedule = _remove_schedule(item.schedule, schedule_scope, moment, expected_schedule)
         if isinstance(schedule, ScheduledSeries):
             return replace(item, schedule=schedule)
         state = ItemState.WORKING if item.state is ItemState.SCHEDULED else item.state
@@ -1913,10 +1989,11 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
           assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
-          schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED) -> ListItem:
+          schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
+          expected_schedule: ScheduleExpectation | UseCurrentSchedule = UseCurrentSchedule.AT_WRITE) -> ListItem:
     _validate_closing_words(words)
     def edit(item: ListItem, moment: datetime) -> ListItem:
-        schedule = _remove_schedule(item.schedule, schedule_scope, moment)
+        schedule = _remove_schedule(item.schedule, schedule_scope, moment, expected_schedule)
         if isinstance(schedule, ScheduledSeries):
             return replace(item, schedule=schedule)
         if item.state == ItemState.CLOSED:

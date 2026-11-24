@@ -19,7 +19,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,7 +41,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result, sessions
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import (change_review, change_routing, delivery_state, investigation, repeat_rule,
+from scripts.production import (change_review, change_routing, delivery_state, investigation, record_store, repeat_rule,
                                 session_pane, session_staff, showrunners, staff, the_list, unrouted_alert)
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
@@ -3566,17 +3566,21 @@ window.fetch=(url,options)=>{
         root = self.root / "reviews"
         fields = self.fields(item, "park", until="2026-12-03")
         midnight = datetime(2026, 12, 3, 5, tzinfo=UTC)
-        park = the_list.park
-
-        def at_midnight(keeper: staff.StaffId, identity: str, until: the_list.Timestamp, *,
-                        source: str, notice: the_list.PageItemNotice) -> the_list.ListItem:
-            with patch.object(the_list, "now", return_value=midnight):
-                return park(keeper, identity, until, source=source, notice=notice)
-
-        with patch.object(the_list, "park", side_effect=at_midnight):
+        with self.list_clock_after_lock(midnight):
             with self.assertRaisesRegex(ValueError, "Choose a future parking date"):
                 _ = list_page.submit(root, urlencode(fields))
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    @staticmethod
+    @contextmanager
+    def list_clock_after_lock(moment: datetime) -> Generator[None]:
+        @contextmanager
+        def lock_at_time(path: Path) -> Generator[file_lock.LockResult]:
+            with file_lock.exclusive(path) as lock, patch.object(the_list, "now", return_value=moment):
+                yield lock
+
+        with patch.object(record_store, "exclusive", lock_at_time):
+            yield
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_item_actions_unread_sync_and_words_fields(self) -> None:
@@ -3680,7 +3684,7 @@ window.fetch=async(_path,options={})=>{
 
         second = first + timedelta(days=7)
         with patch.object(the_list, "now", return_value=first + timedelta(days=1)):
-            revision = list_page.schedule_revision(saved.schedule)
+            revision = the_list.schedule_revision(saved.schedule)
             for action, scope, run, reason in (
                 ("park", "this", "2", "to park a repeated item"),
                 ("schedule", "this", "1", "The next run changed"),
@@ -3700,9 +3704,10 @@ window.fetch=async(_path,options={})=>{
             current = the_list.load(MORTY.id, item.id)
             for action, scope in (("schedule", "all"), ("unschedule", "all"), ("remove", "this"), ("park", "following")):
                 with self.subTest(action=action, scope=scope):
+                    until = second.isoformat() if action == "park" else ""
                     fields = self.fields(saved, action, scope=scope, run="2", schedule_words="Use the old schedule.",
-                                         schedule_revision=revision)
-                    with self.assertRaisesRegex(the_list.ListError, "The schedule changed"):
+                                         schedule_revision=revision, until=until)
+                    with self.assertRaisesRegex(the_list.ScheduleSelectionChanged, "The schedule changed"):
                         _ = list_page.submit(root, urlencode(fields))
                     self.assertEqual(the_list.load(MORTY.id, item.id), current)
             change = self.fields(saved, "schedule", scope="following", run="2",
@@ -3712,7 +3717,8 @@ window.fetch=async(_path,options={})=>{
             assert isinstance(remaining, the_list.ScheduledSeries)
             self.assertEqual((remaining.first.start, remaining.first.words, remaining.rule.rrule),
                              (second, change["schedule_words"], "FREQ=WEEKLY;BYDAY=MO;COUNT=4"))
-            remove = self.fields(saved, "remove", scope="this", run="2")
+            remove = self.fields(saved, "remove", scope="this", run="2",
+                                 schedule_revision=the_list.schedule_revision(remaining))
             _ = list_page.submit(root, urlencode(remove))
             _ = list_page.submit(root, urlencode(remove))
             skipped = the_list.load(MORTY.id, item.id).schedule
@@ -3759,6 +3765,8 @@ window.fetch=async(_path,options={})=>{
                       "Repeat on Thursday"):
             _ = self.add(title)
 
+        advance_run = self.list_clock_after_lock
+
         class FixtureList(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 url = urlsplit(self.path)
@@ -3779,8 +3787,10 @@ window.fetch=async(_path,options={})=>{
 
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                clock = advance_run(start.start + timedelta(days=15)) if self.headers.get("X-Test-Advance-Run") else nullcontext()
                 try:
-                    _, state = list_page.save_action(root, body, include_detail=True)
+                    with clock:
+                        _, state = list_page.save_action(root, body, include_detail=True)
                     code, result = 200, state
                 except ValueError as error:
                     code, result = 400, {"reason": str(error)}
@@ -3980,12 +3990,13 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date,instruction}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,advanceRun=false}={})=>{
   let posted;
   let readback;
   const send=window.fetch;
   const response=new Promise(resolve=>{
    window.fetch=async(...args)=>{
+    if(advanceRun && args[1]?.method==='POST') args[1].headers={'X-Test-Advance-Run':'1'};
     const reply=await send(...args);
     if(args[1]?.method==='POST'){
      posted=new URLSearchParams(args[1].body);
@@ -4005,7 +4016,7 @@ window.fetch=async(_path,options={})=>{
    dialog.querySelector('[data-done]').click();
   }
   const result=await response;
-  check(!result.reason,result.reason);
+  if(!advanceRun) check(!result.reason,result.reason);
   if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
   if(date) check(posted.get('until')===date && !posted.has('repeat'),'The move keeps the saved repeat rule.');
   if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
@@ -4017,6 +4028,11 @@ window.fetch=async(_path,options={})=>{
    if(sent()){observer.disconnect();resolve();}
   });
   window.fetch=send;
+  if(advanceRun){
+   const reason='The next run changed. Open the item again.';
+   check(result.reason===reason && recordIsOpen(row(1)) &&
+    form.querySelector('[data-send-status]').textContent.includes(reason),'The page shows why the stale action was refused.');
+  }
   if(lost) check(readback?.remove_request_saved && readback.item_state==='Scheduled' &&
    !recordIsOpen(row(1)),'The removal receipt confirms the save and closes the detail.');
  };
@@ -4061,14 +4077,20 @@ window.fetch=async(_path,options={})=>{
   [1,'park','all',{instruction:'Compare the revised predictions.'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
+  [1,'park','following',{advanceRun:true}],
+  [1,'remove','this',{advanceRun:true}],
   [3,'remove','all',{}],
   [1,'remove','following',{}],
  ]){
-  const form=openItem(number);
-  if(options.date || options.instruction){
+  const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+  if(options.date || options.instruction || (action==='park' && options.advanceRun)){
    form.querySelector('[data-later-toggle]').click();
    if(options.date) pickDate(form,'2026-12-01');
    if(options.instruction){words(form).value=options.instruction;edit(words(form));}
+   if(options.advanceRun){
+    words(form).value='';edit(words(form));
+    form.elements.until.value='2026-12-23T09:00';edit(form.elements.until);
+   }
   }
   await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);
   if(action==='unpark'){
