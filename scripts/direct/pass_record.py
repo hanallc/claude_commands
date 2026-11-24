@@ -22,6 +22,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
@@ -414,8 +415,19 @@ def append_event(state: dict[str, object], event: dict[str, object]) -> None:
     history_file = Path(history_file_value)
     history_file.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(_stored_fields(event), separators=(",", ":"), sort_keys=True) + "\n"
-    with history_file.open("a", encoding="utf-8") as handle:
+    cancellation = (event.get("event_type") == "pass_finished" and event.get("status") == "canceled"
+                    and bool(event.get("pass_instance_id")))
+    with history_file.open("a+" if cancellation else "a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if cancellation:
+            # The history can contain the cancellation if the state write fails.
+            _ = handle.seek(0)
+            for previous_line in handle:
+                previous = json_object(previous_line)
+                if previous is not None and all(previous.get(key) == event.get(key)
+                        for key in ("event_type", "run_id", "pass_instance_id", "status")):
+                    event["timestamp_epoch"] = previous.get("timestamp_epoch")
+                    return
         _ = handle.write(line)
         handle.flush()
         # Disposable fixtures may omit disk durability; production syncs by default.
@@ -765,7 +777,7 @@ def close_slot_pass(
     )
     append_event(state, event)
     current_pass["status"] = status
-    current_pass["finished_at"] = now
+    current_pass["finished_at"] = number(event.get("timestamp_epoch"), now)
     write_state(session_dir, state)
     return True
 
@@ -916,7 +928,7 @@ class DispatchPromptRefused(RuntimeError):
 
 def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool,
+                    dispatch_owned: bool, prompt_source: Path | bytes,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
         return NoMatchedDispatch()
@@ -941,7 +953,8 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
             return NoMatchedDispatch()
     if dispatch_owned and not stage_two:
         try:
-            digest = hashlib.sha256(Path(string(fields.get("prompt_file"))).read_bytes()).hexdigest()
+            content = prompt_source.read_bytes() if isinstance(prompt_source, Path) else prompt_source
+            digest = hashlib.sha256(content).hexdigest()
         except OSError:
             return NoMatchedDispatch()
         if active.get("prompt_digest") != digest:
@@ -1058,7 +1071,8 @@ def start_pass(args: argparse.Namespace,
     }
     active = pass_slots(state).get(team_slot)
     match = dispatch_match(active, phase, dispatch_fields, launcher_command,
-                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)))
+                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
+                           prompt_source=Path(optional_arg(args, "prompt_file")))
     if isinstance(match, ActiveDispatchPromptConflict):
         raise DispatchPromptRefused(match)
     if isinstance(selection, DispatchSelection):
@@ -1243,7 +1257,20 @@ def hook_completion(passed: dict[str, object]) -> HookCompletion | NoHookComplet
         string(fields.get("sender_native_id")), tuple(string_list(fields.get("pending_diagnostics"))))
 
 
-def _finish_pass(args: argparse.Namespace) -> None:
+@dataclass(frozen=True)
+class CanceledWorkerPass:
+    """Identify the exact canceled pass when the recorder releases its lock."""
+
+    run: Path
+    worker_id: staff.StaffId
+    instance: str
+
+
+class NoCanceledPane(Enum):
+    NONE = "the command has no canceled worker pane to close"
+
+
+def _finish_pass(args: argparse.Namespace) -> CanceledWorkerPass | NoCanceledPane:
     session_dir = argument_session_dir(args)
     status = arg_string(args, "status")
     orphaned = bool(getattr(args, "orphaned_launcher", False))
@@ -1261,15 +1288,30 @@ def _finish_pass(args: argparse.Namespace) -> None:
     # still running.
     slot = _team_slot()
     state = read_state(session_dir)
+    current = open_passes(state).get(slot, {})
+    if not current and status == "canceled":
+        previous = pass_slots(state).get(slot, {})
+        identity = string(previous.get("worker_id"))
+        instance = string(previous.get("instance_id"))
+        requested = optional_arg(args, "pass_instance_id")
+        if (previous.get("status") == "canceled" and identity and instance
+                and (not requested or requested == instance)):
+            return CanceledWorkerPass(session_dir, staff.StaffId(identity), instance)
     if instance_id := optional_arg(args, "pass_instance_id"):
-        if open_passes(state).get(slot, {}).get("instance_id") != instance_id:
-            return
+        if current.get("instance_id") != instance_id:
+            return NoCanceledPane.NONE
     closed = close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(
             "No pass is open in this slot, so no launcher was orphaned and "
             + "nothing was recorded"
         )
+
+    identity = string(current.get("worker_id"))
+    instance = string(current.get("instance_id"))
+    if closed and status == "canceled" and identity and instance:
+        return CanceledWorkerPass(session_dir, staff.StaffId(identity), instance)
+    return NoCanceledPane.NONE
 
 
 def clear_armed_review(
@@ -1372,15 +1414,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
-    handler = cast(Callable[[argparse.Namespace], None], args.handler)
+    handler = cast(Callable[[argparse.Namespace], object], args.handler)
     session_dir = argument_session_dir(args)
     session_dir.mkdir(parents=True, exist_ok=True)
     try:
         with recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            handler(args)
+            result = handler(args)
     except recorder_state.OldRecorderState as error:
         raise SystemExit(str(error)) from error
+
+    if isinstance(result, CanceledWorkerPass):
+        close = cast(Callable[[Path, staff.StaffId, str], None],
+                     import_module("scripts.herdr.worker_panes").close_canceled_worker)
+        close(result.run, result.worker_id, result.instance)
 
 
 if __name__ == "__main__":
