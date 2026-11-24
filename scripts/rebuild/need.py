@@ -14,9 +14,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 Machine = Literal["natedev", "mac"]
+
+
+class SourceWatch(Protocol):
+    """Record file observations that determine whether a result can be saved."""
+
+    def watch(self, path: Path) -> None: ...
+    def verified_absence(self, path: Path) -> bool: ...
+    def mark_incomplete(self) -> None: ...
 
 
 class NeedRecord(TypedDict):
@@ -55,12 +63,25 @@ def needs_folder() -> Path:
     return Path(os.environ.get("REBUILD_NEEDS_DIR", "~/.local/state/rebuild/needs")).expanduser()
 
 
-def _open_needs() -> list[NeedRecord]:
+def _open_needs(watch: SourceWatch | None = None) -> list[NeedRecord]:
+    folder = needs_folder()
+    if watch is not None:
+        watch.watch(folder)
+    try:
+        paths = sorted(path for path in folder.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
+        if watch is not None and (folder.exists() or folder.is_symlink()):
+            raise
+        return []
     records: list[NeedRecord] = []
-    for path in sorted(needs_folder().glob("*.json")):
+    for path in paths:
+        if watch is not None:
+            watch.watch(path)
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            if watch is not None:
+                watch.mark_incomplete()
             continue
         records.append(cast(NeedRecord, json.loads(text)))
     return records
@@ -115,10 +136,10 @@ def add_need(machine: Machine, commit: str, reason: str, concerns: str,
         _write_record(folder / filename, record, create_only=True)
 
 
-def read_needs() -> list[MachineNeeds]:
+def read_needs(*, watch: SourceWatch | None = None) -> list[MachineNeeds]:
     """Read the needs folder and return one summary per machine without subprocesses."""
     groups: dict[Machine, list[NeedRecord]] = {}
-    for record in _open_needs():
+    for record in _open_needs(watch):
         groups.setdefault(record["machine"], []).append(record)
     summaries: list[MachineNeeds] = []
     for machine in sorted(groups):
