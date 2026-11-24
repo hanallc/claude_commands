@@ -170,7 +170,7 @@ buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
     buildlog_check_nested_step || return $?
-    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION="" BUILDLOG_MEM_REPLACED=""
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
         return 0
@@ -203,7 +203,7 @@ buildlog_wait_for_memory() {
         if [[ "$BUILDLOG_MEM_OUTCOME" != Refused ]]; then
             buildlog_memory_refuse "admission client failed (exit $status)" || true
         else
-            build_check_record_failure 'memory admission client refused the step'
+            build_check_record_failure "${BUILDLOG_MEM_REPLACED:-memory admission client refused the step}"
         fi
         BUILDLOG_MEM_OUTCOME=Refused
     fi

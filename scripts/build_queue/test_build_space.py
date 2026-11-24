@@ -14,13 +14,14 @@ from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request, publish_candidate
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class BuildSpaceTests(unittest.TestCase):
     def configure_floor(self, fixture: AdmissionFixture, *, estimate_lifetime: str = "3600") -> Path:
         output = fixture.root / "build-output"
         output.mkdir()
-        _ = (fixture.root / "build_folders.conf").write_text(f"roots.build={output}\n")
+        _ = write_config_fixture(fixture.root / "build_folders.conf", f"roots.build={output}\nroots.build.natedev={output}\n")
         write_memory_config(fixture.root / "build_admission.conf",
                             free_floor_gib="150", estimate_refresh_seconds=estimate_lifetime)
         _ = fixture.enter_context(mock.patch.object(fixture.readings, "build_space",

@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, cast
@@ -247,13 +247,14 @@ class RebuildAnswer:
         return self.failure.commit if isinstance(self.failure, EvaluationFailure) else ""
 
 
-def config_values(path: Path) -> dict[str, str]:
+def config_values(path: Path) -> Mapping[str, str]:
     values: dict[str, str] = {}
-    for line in conf_reads.read_text(path).splitlines():
+    contents = conf_reads.read_text(path)
+    for line in contents.splitlines():
         key, sep, value = line.partition("#")[0].partition("=")
         if sep:
             values[key.strip()] = value.strip()
-    return values
+    return conf_reads.trace_values(path, contents, values)
 
 
 def cache_path(config: Path) -> Path:

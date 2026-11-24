@@ -25,6 +25,7 @@ import time
 from scripts.build_queue import admission_client as client
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
+from scripts.build_queue.ci_job_start import job_start, queue_job_start
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
@@ -103,34 +104,6 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
     if os.getppid() != front_pid:
         os._exit(1)
-
-
-def job_start(pid: int, proc_root: Path) -> float | None:
-    """Return the CLOCK_BOOTTIME seconds when the GitHub job of pid started, or None without a readable Runner.Worker ancestor.
-
-    A self-hosted runner starts one Runner.Worker process for each job, so its start is the job start.
-    """
-    seen: set[int] = set()
-    while pid > 0 and pid not in seen:
-        seen.add(pid)
-        try:
-            name, fields = process_stat.name_and_fields(pid, proc_root)
-            if name == "Runner.Worker":
-                return int(fields[19]) / os.sysconf("SC_CLK_TCK")
-            pid = int(fields[1])
-        except (OSError, IndexError, ValueError):
-            return None
-    return None
-
-
-def queue_job_start(boot_start: float | None, *, now: float, boot_now: float) -> records.CiJobStart:
-    """Convert a CLOCK_BOOTTIME job start to the queue clock.
-
-    now and boot_now are readings of the queue clock and of CLOCK_BOOTTIME at the same moment.
-    """
-    if boot_start is None:
-        return records.NO_JOB_START
-    return records.JobStart(now - (boot_now - boot_start))
 
 
 def remove_abandoned_folders(shared_folder: Path) -> None:

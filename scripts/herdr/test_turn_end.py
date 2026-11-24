@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
-
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.checkout_test_support import python_tool_source
 
 import hashlib
@@ -304,8 +304,8 @@ class TurnEndTests(unittest.TestCase):
         for shared_sessions in (False, True):
             with self.subTest(shared_sessions=shared_sessions):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
-                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf",
-                                    self.case.fixture.root / "conf/accounts.conf")
+                _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                             self.case.fixture.root / "conf/accounts.conf")
                 self.case.agent.finish_after = 1
                 self.assertIs(self.case.dispatch("impl-shared" if shared_sessions else "impl"), worker.DispatchSubmission.SUBMITTED)
                 row = self.case.agent.row(self.case.agent.submitted[-1][0])

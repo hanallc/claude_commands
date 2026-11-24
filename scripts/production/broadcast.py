@@ -29,7 +29,7 @@ from typing import Literal, NamedTuple, cast
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
-from scripts.message import send_result, session_send
+from scripts.message import send_result, session_send, sessions
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
 USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT"
@@ -192,7 +192,6 @@ def _unreachable(entry: roster.RosterEntry, reach: roster.CannotReceiveMessages)
 
 def _broadcast(
     sender: str, texts: Mapping[BroadcastGroup, str], entries: Sequence[roster.RosterEntry],
-    identity: roster.SenderIdentity,
     scope: roster.RosterScope = roster.ALL_MACHINES,
 ) -> list[Delivery]:
     if not texts:
@@ -200,8 +199,6 @@ def _broadcast(
     last = ending(texts, scope)
     chosen: list[tuple[roster.RosterEntry, str]] = []
     for entry in entries:
-        if roster.is_sender(entry, identity):
-            continue
         versions = [text for group, text in texts.items() if selects(group, entry)]
         if versions:
             chosen.append((entry, versions[-1]))
@@ -375,12 +372,14 @@ def _orchestrate(
         return []
     here_texts = _machine_texts(texts, here=True)
     peer_texts = _machine_texts(texts, here=False)
+    candidates = [entry for entry in entries
+                  if not roster.is_closed_worker(entry) and not roster.is_sender(entry, identity)]
     with ThreadPoolExecutor(max_workers=2) as pool:
         peer = (pool.submit(_remote_broadcast, sender, peer_texts)
                 if isinstance(scope, roster.AllMachines) and peer_texts else None)
-        deliveries = _broadcast(sender, here_texts, entries, identity, scope)
+        deliveries = _broadcast(sender, here_texts, candidates, scope)
         for group in here_texts:
-            if not any(selects(group, entry) and not roster.is_sender(entry, identity) for entry in entries):
+            if not any(selects(group, entry) for entry in candidates):
                 deliveries.append(Delivery(GroupWithoutMembers(group), "no live session", ""))
         if peer is not None:
             deliveries.extend(peer.result())
@@ -420,6 +419,11 @@ def main(arguments: list[str]) -> int:
     production_scope = any(flag in ("--production", "--resolved-production") for flag, _ in pairs)
     if production_scope or any(flag == "--of" for flag, _ in pairs):
         result = roster.roster(os.environ, scope)
+        if production_scope and result.problems and all(
+            isinstance(problem, roster.UnreadableSessionRecordProblem) for problem in result.problems
+        ):
+            time.sleep(sessions.retry_policy().registry_delay_seconds)
+            result = roster.roster(os.environ, scope)
         for problem in result.diagnostics:
             print(f"broadcast: roster: {problem}", file=sys.stderr)
         host = roster.remote.other_machine()

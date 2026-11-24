@@ -14,6 +14,13 @@ from scripts.issue_score.test_config import ConfiguredTestCase, patch_thresholds
 from scripts.issue_score import client, decide, questions
 
 FIXTURES = Path(__file__).with_name("fixtures")
+DISTINCT_ERROR_TARGETS = {
+    "error_target.category": ".10",
+    "error_target.backlog_goal": ".15",
+    "error_target.area": ".20",
+    "error_target.backlog_alignment": ".25",
+    "error_target.backlog_impact": ".30",
+}
 
 
 def score_answer(probabilities: dict[str, float]) -> client.ScoreAnswer:
@@ -182,15 +189,19 @@ class DecideTests(ConfiguredTestCase):
                 self.assertFalse(decide.is_sure("backlog_alignment", decision, thresholds))
 
     def test_threshold_selection_chooses_lowest_qualifying_positive_coverage(self) -> None:
-        points = [decide.RiskPoint(.85, .1, .0), decide.RiskPoint(.4, .9, .11),
-                  decide.RiskPoint(.55, .7, .1), decide.RiskPoint(.45, 0., .0)]
+        settings = conf.read(self.configuration(**DISTINCT_ERROR_TARGETS))
         for field in ("backlog_goal", "category", "area", "backlog_alignment", "backlog_impact"):
             with self.subTest(field=field):
+                target = settings.number(f"error_target.{field}")
+                points = [decide.RiskPoint(.85, .1, .0), decide.RiskPoint(.4, .9, target + .01),
+                          decide.RiskPoint(.55, .7, target), decide.RiskPoint(.45, 0., .0)]
                 result = decide.select_threshold(field, points)
                 self.assertEqual(result, decide.MinimumGap(.55) if field == "area" else decide.Supported(.55))
 
     def test_threshold_selection_names_failure_and_report_only_outcomes(self) -> None:
-        for points in ([decide.RiskPoint(.4, 1., .1001), decide.RiskPoint(.95, .1, .2)],
+        settings = conf.read(self.configuration(**DISTINCT_ERROR_TARGETS))
+        target = settings.number("error_target.category")
+        for points in ([decide.RiskPoint(.4, 1., target + .0001), decide.RiskPoint(.95, .1, target + .1)],
                        [decide.RiskPoint(.4, 0., .0)], []):
             with self.subTest(points=points):
                 result = decide.select_threshold("category", points)

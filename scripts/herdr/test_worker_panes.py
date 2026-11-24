@@ -26,6 +26,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import ANY, patch
 from weakref import finalize
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import fake_unit_host, staff, worker_admission
 from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
@@ -139,12 +140,11 @@ class PaneWorld(herdr.Herdr):
                           + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
                           + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
-        write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
+        _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
-        write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
-        source = Path(__file__).resolve().parents[2] / "config"
+        _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
         for name in ("detached_runs.conf", "postmaster.conf"):
-            write_text_atomic(config / name, (source / name).read_text())
+            _ = write_config_fixture(config / name)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),

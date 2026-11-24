@@ -71,7 +71,7 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
         self.assertEqual((self.noted[0].title, self.noted[0].body), ("claude2 runs out Sun 11-22 03:00 EST", ""))
         self.assertIsInstance(self.noted[0].action, ActionRequired)
         assert isinstance(self.noted[0].action, ActionRequired)
-        self.assertEqual(self.noted[0].action.text, "Type /agents move <role> <account>")
+        self.assertEqual(self.noted[0].action.text, "In the natedev session, type /agents move <role> <account>")
         self.assertEqual((self.sent, self.pushed), ([], []))
 
     def test_expiry_push_does_not_repeat_before_two_hours(self) -> None:
