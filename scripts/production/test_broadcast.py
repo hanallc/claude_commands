@@ -198,12 +198,23 @@ class BroadcastTests(unittest.TestCase):
         return {command[1]: command[6] for command in commands}
 
     def test_all_reaches_every_role_at_once_and_never_the_sender(self) -> None:
+        worker = self.rows[4]
+        self.rows.extend([
+            replace(worker, name="closed worker", status="closed",
+                    reach=roster.CannotReceiveMessages("closed"), thread=roster.CodexThread("thread-closed"),
+                    worker_closure=roster.WorkerClosure.CONFIRMED),
+            replace(worker, name="stopped worker", status="stopped; pane w1:p2",
+                    reach=roster.CannotReceiveMessages("stopped; pane w1:p2"),
+                    thread=roster.CodexThread("thread-stopped")),
+        ])
         result, output, errors = self.run_main("--all", "From the user: stop builds.", TOGETHER="5")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {
             "session:id-hana", "session:id-trunk", "session:id-ups",
             "worker:run-a/fps-impl", "codex:thread-window",
         })
+        self.assertNotIn("closed worker", output)
+        self.assertIn("stopped worker cannot take messages (stopped; pane w1:p2)", output)
         self.assertRegex(output.splitlines()[-2], r"^5 sent in \d+ s$")
         for text in self.sent_texts().values():
             self.assertTrue(text.startswith("From the user: stop builds.\n\n"))
@@ -322,12 +333,18 @@ class BroadcastTests(unittest.TestCase):
         self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_a_unit_with_no_workers_says_none_for_its_scoped_group(self) -> None:
-        self.rows = [row for row in self.rows if row.role != "worker"]
-        result, output, errors = self.run_main("--of", "trunk", "--workers", "finish")
-        self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(self.sends(), [])
-        self.assertEqual(output.splitlines()[:-2], ["workers of trunk - none on this machine"])
-        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
+        worker = self.rows[4]
+        nonworkers = [row for row in self.rows if row.role != "worker"]
+        closed = replace(worker, status="closed", reach=roster.CannotReceiveMessages("closed"),
+                         worker_closure=roster.WorkerClosure.CONFIRMED)
+        for case, workers in (("no workers", ()), ("only closed workers", (closed,))):
+            with self.subTest(case=case):
+                self.rows = [*nonworkers, *workers]
+                result, output, errors = self.run_main("--of", "trunk", "--workers", "finish")
+                self.assertEqual((result, errors), (0, ""), output)
+                self.assertEqual(self.sends(), [])
+                self.assertEqual(output.splitlines()[:-2], ["workers of trunk - none on this machine"])
+                self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_empty_groups_are_named_once_in_command_line_order(self) -> None:
         self.rows = []

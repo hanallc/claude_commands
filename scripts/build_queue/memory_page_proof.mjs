@@ -648,7 +648,7 @@ try {
           reading.queued_priority_units = [];
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          // At 800 px the walk is tight: a waiting step wraps, but no word is cut. No icon row wraps at any width.
+          // At 800 px the walk uses compact gaps. At 900 px the font metrics determine the gaps.
           let rows;
           for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
@@ -662,8 +662,12 @@ try {
               const keys = [...latest.walk.map(row => 'row:' + row.key), 'wait:' + latest.waiters[0].key];
               const lines = element => Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight));
               const box = walk.closest('.card').getBoundingClientRect();
+              const scroll = walk.closest('.walk-scroll');
+              const waitingName = chart(keys[4]).querySelector('.name');
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
+                walkOverflow:scroll.scrollWidth - scroll.clientWidth,
+                trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
                   table(key).querySelector('.step').textContent]),
                 icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
@@ -676,7 +680,8 @@ try {
                 colors:[chart(keys[0]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
-                waitingNameLines:lines(chart(keys[4]).querySelector('.name')),
+                waitingNameLines:lines(waitingName),
+                waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                   return label.scrollWidth > label.clientWidth;
@@ -698,7 +703,13 @@ try {
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, ['natedev','mac','mac-linux','aws','hana-aws','hana-gpu'].map(name => [name, name]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
-              assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
+              if (width === 900) {
+                assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
+                assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);
+                assert.equal(rows.waitingNameCut, false, 'The waiting unit name is cut at 900 px.');
+              } else {
+                assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
+              }
               assert.equal(rows.waitingNameLines, 1, `The waiting unit name breaks at ${width} px.`);
               assert.deepEqual(rows.cutSteps, [], `A Step cell is cut at ${width} px.`);
               assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
@@ -883,7 +894,7 @@ try {
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
         queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
-          name:'remote startup', machine:'mac', reason:'remote startup',
+          name:'remote startup', machine:'mac', targets:['mac'], reason:'remote startup',
           move:{row_id:'remote-start', movable:false}});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
@@ -921,8 +932,9 @@ try {
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
 
         queueFixture.move_revision += 'mac-only';
+        // The waiting row uses its eligible targets to select the dim icons.
         queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
-          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', targets:['mac'], reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
           move:{row_id:'mac-only', movable:false}});
         await evaluate('pageRefresh.refresh(true)');
@@ -934,7 +946,8 @@ try {
         await waitForLine('typesafe · test affected moved from 2 to 1');
         assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
-        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] td.machine .machine').dataset.machine`), 'mac');
+        assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr[data-tip="wait:mac-only"] td.machine .machine')]
+          .map(icon => [icon.dataset.machine, icon.classList.contains('dim')])`), [['mac', true]]);
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
         assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
         assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');

@@ -46,8 +46,8 @@ A held target admits only work that its hold rules permit.
 A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
 The caller checks the targets in `targets` in the order the file lists them.
 It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-The current rules permit natedev and mac-linux for a full gate.
-Named module tests, nightly gates, and promotion without tests use natedev.
+The current rules permit natedev and `mac-linux` for a full gate and for nightly suites.
+Named module tests and promotion without tests use natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 Hana gates have no repository default.
 The Builds page shows both candidates while a gate with both targets waits or runs.
@@ -150,8 +150,8 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   The release intent keeps each cycle holder's name, purpose, and start time for broadcasts and cycle recovery.
   An old release intent without cycle holders still names its one holder.
   Release does not wait for an answer or an allocation.
-  The result names failed or unconfirmed deliveries:
-  `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
+  The result names each gone session once: `Not reached, tell them yourself: <name> (session gone)`.
+  It names each session with unsent notices once: `Release notices still pending for <name>, ...`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
 
 ### Where a job runs: `scripts/direct/verify.sh`
@@ -202,7 +202,15 @@ It saves no pass because a saved pass describes this machine.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
 - `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
-- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the live local block, claim and backoff files. A saved line that the live state does not agree with shows no Mac condition until the next sample. The watch message uses the reading that the watch just wrote, so it does not read the live state again. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes an unreachable Mac sends one phone push per outage, cleared when the saved outage ends. A block, an idle claim and a free Mac send no push. An unreachable Mac that the user turned off (a Mac block, `offload=off` or `enabled.<machine>=off`) sends no push either. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
+- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the live local block, claim and backoff files. A saved line that the live state does not agree with shows no Mac condition until the next sample. The watch message uses the reading that the watch just wrote, so it does not read the live state again. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`. The machine watch below sends the phone push. The idle interval and its send keys reset after an active job. No waiting steps means no idle line.
+- The machine watch, `scripts/buildlog/machine_watch.py`, is the one watch for every registered and pinned target: natedev, mac, mac-linux, hana-aws and hana-gpu. `buildlog sample` runs it each pass on natedev. It runs the Mac idle watch first, then one rule for each machine. A machine that is not off on purpose sends one notice when, for longer than its notice time, it is unusable or steps wait for it and it runs none.
+- The notice time is `excluded_notice_seconds.<machine>` in `config/build_targets.conf`, else `excluded_notice_seconds`. The Mac uses 600 seconds; every other machine uses 3600 seconds.
+- `mac_test.machine_off_on_purpose` decides off on purpose for every target. Each target reads `enabled.<target>=off`. The local target also reads the `/build:hold` holds in force through `build_hold.natedev_holds`; an unreadable hold state counts as in use. An SSH target also reads the block in its own state folder (the Mac in `MAC_TEST_STATE_DIR`, another target under `BUILD_TARGETS_STATE_DIR/<target>`), except when the block holder asks. A macOS target reads `offload=off` in its settings file; another SSH target reads `enabled=off` there (`hana_aws.conf`, and `cloud_gate.conf` for hana-gpu). A Hana GPU target also reads `hana_gpu_route_enabled=off` in its settings file. An unreadable record or a bad value counts as in use.
+- The unusable test follows the target kind. The Mac uses the saved Mac idle reading: unreachable while steps wait. A Hana control target is unusable when its image is stale. A Hana GPU target is unusable when GPU setup is refused, or when the AWS page shows a credential refusal. The watch uses `aws_page.launch_evidence`, the same read as the AWS page. That read takes the refusals after the newest good launch as the current run, and a capacity or price refusal stays in the run. The outage starts at the first refusal of the run, with no time window. Only a credential code or `BLOCKED` as the newest refusal makes the target unusable. A plain SSH target is unusable when its target state is `Unreachable` (failed probe or retry backoff). A busy, starting or unprovisioned Hana box does not count. The work test counts live step records that wait for the target while no step runs on it. A `waiting_hold` step waits for the local target, a `waiting_mac` step for an eligible macOS target, and a `waiting_ssh` step for the target that its state names; `verify.sh` writes that target with each `waiting_ssh` state. The Mac takes this count from its saved reading: a free Mac, an idle claim or a disk exclusion while steps wait.
+- A phone push goes to nate only when natedev, the Mac or mac-linux is unusable: only nate can repair a machine that does not answer. The Mac push keeps `mac_idle.unreachable` and its `mac-idle-<since>` key. Another machine uses `machine_watch.unreachable`, with the key `machine-watch-<machine>-<since>` and the clear check `machine_watch.py cleared --machine <machine> --since <since>`.
+- Every other notice is a session message to bob and to the builds showrunner, with the key `machine-watch-<machine>-<since>`: a machine that steps wait for and that runs none, and an unusable Hana target. A machine that takes no work is ours to repair, so it sends no phone push. The notice counts as sent only when both messages are confirmed; a retry sends both again, and the key stops a second delivery.
+- One outage sends one notice. The saved file `~/.local/state/machine-watch/<machine>.json` records `since`, `sent` and the notice kind, `push` or `message`. The `sent` mark clears only when the outage ends, the notice kind changes, or the machine is off on purpose. A change of kind starts a new outage, so its receivers get their own notice. The clear check `machine_watch.py cleared` exits 0 when the saved kind is no longer `push`. A lost or unreadable state file can send one more notice.
+- A unit block that holds the Mac with no Mac work for longer than the Mac notice time sends one session message to bob and one to the holder's showrunner (the block's showrunner, else the holder's unit labels). A block whose reason names nate, or a Mac with `offload=off` or `enabled.mac=off`, sends none.
 - Repairs still run only when no block or live claim exists. Buildlog schema 21 includes `mac_idle`, one row per cause per call; `message_showrunner` names its message action and failed sends stay pending without more rows. State lives under `~/.local/state/mac-idle/`. See the idle Mac watch in [mac-test-offload.md](mac-test-offload.md).
 - Exports for the build log: `BUILDLOG_TARGET` is `mac` from the start of a Mac attempt and for a call that ends there, empty after a decline or a lost run, `natedev` once tests start locally (a Mac pass confirmed on natedev is `natedev` with `BUILDLOG_MAC=passed`). `BUILDLOG_HOLD_WAIT_S` sums every wait a hold caused: routing sleeps, each declined Mac retry's seconds, and `wait-local`'s; memory waits are not counted. `BUILDLOG_MAC_HOLDER` carries a `busy` decline's `holder=` value and is passed on the `record.py call` line, never exported.
 
@@ -322,6 +330,11 @@ A shortfall selects logical units by their bytes on that filesystem, in target l
 Each selected unit includes its intermediate files and copied artifacts on both filesystems.
 Only bytes freed on the selected filesystem reduce its shortfall.
 A held checkout protects both output roots.
+A process use or build hold on one output root counts as a use of the other roots of that root's own saved mappings (`pair_roots_for`).
+A target is held (`PairHeld`) when a root of its own mappings is in use. A held target makes no other root held.
+A lock or a live use that the take finds on a held target replaces the hold, and the target is then in use.
+Example: the mappings are (one, shared), (two, shared) and (two, three), and a process uses one. One and shared are in use, two is held, and three is free.
+The closure of the mappings (`connected_roots_for`) has five uses: scan clusters, batch order, group last use, the CI exclusion and the filesystem floor's target list.
 The take checks both roots' processes, Cargo locks, use stamps, and observed output before deletion.
 The take records both roots in `target-deletes.json` before it removes any output.
 A saved trim intent retains the paired paths after an interruption.
@@ -600,6 +613,11 @@ No package selects the whole workspace.
 | `doc [<package>]` | Workspace rustdoc against staged content. |
 | `example [<package>] [--name <name>]` | Workspace or named example selection. |
 | `final [<package>] [--saved] [--tree <tree>]` | Workspace check and selected tests, or a saved-pass query. |
+| `test,lint,doc [<package>]` | Run a comma list of `test`, `lint`, and `doc` in the given order. |
+
+A verb list accepts one optional package and no verb flags. The first failure ends the list with its status.
+On Linux, the parent initializes `BUILDLOG_RUN` once. Each verb inherits it and uses its own call record.
+Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.
@@ -611,8 +629,18 @@ No alias accepts them.
 Call records use the package name or `workspace`.
 
 After help and saved-pass query exits, verify reads the Git top level.
-A missing root `Cargo.toml` prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` and exits 2.
+If the root has no `Cargo.toml`, Verify prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` on stderr and exits 2.
+If the root has `scripts/copies/copies.py`, Verify also prints `claude_commands: run tests with copies.py --affected or --module` on stderr.
 This refusal precedes environment setup and Cargo calls.
+
+From a `claude_commands` checkout, run the affected tests through the queue with:
+
+```sh
+./scripts/lib/py scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+```
+
+Add `--module <module>` after `--affected` to select a module.
+
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
 For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
 No configuration maps repositories to unit gates.
