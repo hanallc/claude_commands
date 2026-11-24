@@ -1,7 +1,7 @@
 """Check remote copy removal, admission and recovery through their entry points."""
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
@@ -18,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 from threading import Event
-from types import SimpleNamespace
 from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
@@ -35,6 +34,7 @@ from scripts.lint import sweep
 from scripts.lib import conf, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
@@ -42,7 +42,7 @@ from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
-from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.production.cli_fixture import ImmutableGitSeed
 
 
 @final
@@ -222,7 +222,7 @@ class RemoteEntryTests(unittest.TestCase):
                 path = paths.claims / name
                 _ = path.write_text(json.dumps(fields))
                 with self.assertRaisesRegex(copies.CopyError, "busy"):
-                    copies.remove_trees("alpha")
+                    self.remove_trees_through_cli("alpha")
                 self.assertTrue(self.mirror.exists())
                 path.unlink()
 
@@ -250,7 +250,7 @@ class RemoteEntryTests(unittest.TestCase):
             self.assertEqual(request.owner, "gate-owner")
             mirror = self.mirror_record(request.owner)
             self.assertEqual(publish_mirror(mirror), 0)
-        copies.remove_trees("gate-owner")
+        self.remove_trees_through_cli("gate-owner")
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors("gate-owner"), [])
 
@@ -302,7 +302,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(publish_mirror(other), 0)
         with copies.standing(owner, self.source, copies.CommittedSource("HEAD")) as tree:
             pass
-        copies.remove_trees(owner)
+        self.remove_trees_through_cli(owner)
         self.assertTrue(tree.exists())
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors(owner), [])
@@ -310,15 +310,29 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
 
     def remove_trees_through_cli(self, owner: str) -> None:
-        """Run the real remote CLI without another SSH interpreter."""
+        """Run the remote removal in a child with warm imports."""
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
         def remote_cli(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
-            command = shlex.split(arguments[-1].partition("; copies_status=")[0])[2:]
-            answer = invoke_cli(copies, lambda: copies.main(command), command, os.environ, self.root,
-                                combined_output=not bool(options.get("capture_output")))
+            if arguments[0] != "ssh" or "; copies_status=" not in arguments[-1]:
+                return run(arguments, **options)
+            command_text = arguments[-1].partition("; copies_status=")[0]
+            command = shlex.split(command_text)[2:]
+            timeout = cast(float, options["timeout"])
+
+            def remove() -> int:
+                os.chdir(self.root)
+                return copies.main(command)
+
+            with ForkChildren() as children:
+                try:
+                    answer = children.start(remove).result(timeout=timeout)
+                except TimeoutError as error:
+                    raise subprocess.TimeoutExpired(arguments, timeout) from error
             return subprocess.CompletedProcess(arguments, answer.returncode,
                                                answer.stdout + f"\nrc={answer.returncode}\n", answer.stderr)
 
-        with mock.patch.object(copies, "subprocess", SimpleNamespace(run=remote_cli)):
+        with mock.patch.object(subprocess, "run", side_effect=remote_cli):
             copies.remove_trees(owner)
 
     def save_interrupted_mirror(self, mirror: copies.RemoteMirror, key: tuple[str, str]) -> None:
@@ -578,7 +592,7 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 self.assertIsInstance(result, offload.DeclinedMacRun)
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [original])
                 self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
-                copies.remove_trees("alpha")
+                self.remove_trees_through_cli("alpha")
                 self.assertFalse(Path(original.path).exists())
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [])
 

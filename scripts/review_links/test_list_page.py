@@ -46,9 +46,9 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page, search_fold
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
+from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
-from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -83,8 +83,11 @@ async function reviewCardPosition(card){
  const height=frame?.getBoundingClientRect().height ?? win.innerHeight;
  const requested=frame && Number.parseFloat(frame.style.getPropertyValue('--review-card-height'));
  const fullscreen=frame?.closest('dialog').hasAttribute('data-fullscreen');
- return {top,left,main,height,requested,
-  resized:!frame || Math.abs(height-(fullscreen ? win.parent.innerHeight : Math.min(requested,win.parent.innerHeight-98)))<1,
+ // The cap is the view height under the top of the List box, less 82 px for the box parts around the frame.
+ const start=frame ? frame.closest('dialog').getBoundingClientRect().top : 0;
+ const cap=win.parent.innerHeight-start-(fullscreen ? 0 : 82);
+ return {top,left,main,height,requested,cap,
+  resized:!frame || Math.abs(height-(fullscreen ? cap : Math.min(requested,cap)))<1,
   row:card.querySelector('[data-review-card-updates]').getBoundingClientRect().height,
   dark:win.matchMedia('(prefers-color-scheme:dark)').matches};
 }
@@ -125,8 +128,8 @@ async function checkReviewCardConflict(card,layout,check,advance){
   check(before.row===52 && after.row===52,'The status row keeps the same 52 pixel height.');
   check(Math.abs(after.top-before.top)<0.5 && Math.abs(after.left-before.left)<0.5 &&
    before.main===after.main && before.height===after.height && before.requested===after.requested,'A 409 keeps the text and card in place. '+JSON.stringify({before,after}));
-  if(layout==='short') check(before.requested<win.parent.innerHeight-98,'The short card fits below the iframe height cap.');
-  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-(win.parent.innerHeight-98))<1,
+  if(layout==='short') check(before.requested<before.cap,'The short card fits below the iframe height cap.');
+  if(layout==='cap') check(before.requested>before.height && Math.abs(before.height-before.cap)<1,
    'The tall card reaches the iframe height cap.');
   if(layout==='phone') check(win.top.innerWidth===390 && win.frameElement.closest('dialog').hasAttribute('data-fullscreen'),
    'The phone card fills the List dialog at 390 pixels.');
@@ -452,7 +455,7 @@ class ListPageTests(unittest.TestCase):
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
             + "# whole: 1..1440\nlater_soon_minutes=60\n"
-            + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
+            + "later_morning=09:00\n"
             + "later_week_day=Monday\nlater_week_time=09:00\n"
             + "# whole: 1..60\npark_time_step_minutes=15\n"
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
@@ -933,7 +936,8 @@ window.fetch=async (path,options={})=>{
   }) || bounds.height>heading.height || heading.height>button.offsetHeight+1){
    failures.push('The List controls fit beside the title at 320 px.');
   }
-  if(title.parentElement.querySelectorAll('button').length!==1 ||
+  if(title.parentElement.querySelector('button') ||
+     document.querySelector('[data-page-actions]').querySelectorAll('button').length!==1 ||
      button.getAttribute('aria-label')!=='New item for cargo-liner'){
    failures.push('The page owner button is the only action beside the title.');
   }
@@ -1083,6 +1087,56 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 })();
 </script>'''
         self.browser_actions(markup, "", probe)
+
+    def test_new_item_opens_above_the_review_box_and_its_screenshot_shows_the_box(self) -> None:
+        from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest("Chrome or Firefox is required for the window rule.")
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        change = review_items.ReviewItem("sdlc/C1", "C1", review_items.ReviewType.CHANGE, OWNER.id, OWNER.id,
+            "Check C1", review_items.ReviewState.OPEN, review_items.ReviewTimes(NOW, NOW), (), (), source)
+        item = self.add("Check the linked change", number=7)
+        _ = the_list.link(MORTY.id, item.id, (change.key,), source="morty")
+        with (patch.object(list_page, "read_linked_reviews", return_value=[change]),
+              patch.object(list_page, "counts_strip", return_value="")):
+            markup = list_page.render(self.root / "reviews")
+        page = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const dialog=document.querySelector('[data-list-review-dialog]');
+  const link=document.querySelector('a[data-list-review-card]');
+  link.click();
+  await until(()=>dialog.open && dialog.querySelector('iframe'),'the review box');
+  await painted();
+  check(onTop(dialog.querySelector('.list-review-close')),'The action area does not cover the review box Close button.');
+  check(dialog.getBoundingClientRect().top>=actionsBottom(),'The review box starts below the action area.');
+  check(pressNewItem('over the review box')!==null,'The press reaches New item.');
+  const capture=await newItemOver(dialog,'the review box');
+  const address=location.pathname+location.search+location.hash;
+  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(link.getAttribute('href')),
+   'The screenshot address names the open review box: '+capture.place);
+  await closeNewItem(dialog,'the review box');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-list-review-dialog]')?.open===true
+   && doc.querySelector('[data-list-review-dialog] iframe')!==null,'the review box');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = page.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
+        card = b'<!doctype html><html data-theme="dark"><body><p>Review card fixture</p></body></html>'
+        # The probe starts a private browser. Close the idle shared browsers first.
+        for cached in (self._chrome, self._firefox):
+            if cached is not None:
+                cached.close()
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({list_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
+                                                      list_page.PAGE_PATH, browser), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
@@ -1253,16 +1307,23 @@ async function inspect(){
  check(columns===(ready.defaultView.innerWidth<800 ? 1 : 2),'The card changes columns at 800 pixels.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
+ // A top window starts at the bottom of the action area, or at the top of the view on a page without one.
+ const area=doc.querySelector('[data-page-actions]:not([data-page-window-actions])');
+ const clear=area ? Math.max(area.getBoundingClientRect().top,
+  ...[...area.children].map(control=>control.getBoundingClientRect().bottom)) : 0;
  if(phone){
   const box=dialog.getBoundingClientRect();
-  const top=listFrame?.getBoundingClientRect().top ?? box.top;
-  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.height-innerHeight)<=1 && top===0,
-   'The phone dialog fills the screen. '+JSON.stringify({width:innerWidth,height:innerHeight,box,top}));
+  const top=listFrame?.getBoundingClientRect().top ?? 0;
+  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.top-clear)<1 && Math.abs(box.bottom-innerHeight)<=1
+   && top===0,
+   'The phone dialog fills the screen below the action area. '
+   +JSON.stringify({width:innerWidth,height:innerHeight,box,top,clear}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the phone width.');
  }else{
   const box=dialog.getBoundingClientRect();
-  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && box.top===16,
-   'The desktop dialog is centered horizontally and starts 16 pixels from the top.');
+  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20 && Math.abs(box.top-clear-16)<1,
+   'The desktop dialog is centered horizontally and starts 16 pixels below the action area. '
+   +JSON.stringify({box,clear}));
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
  if(short && !direct){
@@ -1546,10 +1607,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                 class Probe(serve.ReviewLinksHandler):
                     @override
                     def html_response(self, status: int, content: bytes, *,
-                                      delivery_pending: bool | None = None) -> None:
+                                      delivery_pending: bool | None = None, builds_version: str = "") -> None:
                         if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
-                        super().html_response(status, content, delivery_pending=delivery_pending)
+                        super().html_response(status, content, delivery_pending=delivery_pending,
+                                              builds_version=builds_version)
 
                     @override
                     def review_response(self, content: bytes, content_type: str, prepared: bytes = b"", *,
@@ -1596,7 +1658,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                       patch.object(change_review, "lists_directory", return_value=self.root),
                       patch.object(staff, "snapshot", return_value=members),
                       patch.object(list_page, "counts_strip", return_value=""),
-                      serve.ReviewLinksServer(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
+                      started_review_server(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
@@ -3010,6 +3072,7 @@ document.body.append(result);
         check_counts(initial, 0, 2)
         answered = list_page.render(root, include_counts=False).decode()
         check_counts(answered, 2, 0)
+        self.assertEqual(answered.partition('<script>')[0].count('<small data-new-answer>New answer</small>'), 2)
         news = list_page.waiting_updates(console.NewsRequest(root))
         self.assertEqual({key.rsplit('/', 1)[0] for key in news}, {f'{MORTY.id}/{item.id}' for item in items})
         read_responses: list[list_page.SavedActionState] = []
@@ -3042,12 +3105,14 @@ document.body.append(result);
   if(!recordIsOpen(item(number))) item(number).querySelector('.list-toggle').click();
   const detail=recordDetails(item(number));
   check(detail.querySelector('.question-unread')?.textContent==='Unread','The answer is unread.');
+  check(item(number).querySelector('[data-new-answer]')?.textContent==='New answer','The row marks the new answer.');
   submit('read',detail.querySelector('form'));
   finishPost(receipts[number-1]);
   await flush();
   check(item(number).hidden && count('needs-me')===String(2-number) && count('parked')===String(number),
    'Mark read returns the item to the Parked count.');
   check(parkNote(number)===parks[number-1],'Mark read keeps the original parking condition.');
+  check(!item(number).querySelector('[data-new-answer]'),'Mark read removes the mark from the row.');
  }
  show('parked');
  check(!item(1).hidden && !item(2).hidden,'Both items appear in Parked after Mark read.');
@@ -3571,7 +3636,9 @@ window.fetch=(url,options)=>{
         parked = the_list.load(MORTY.id, item.id)
         self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "delivered")
-        self.assertEqual(the_list.feedback_requests(parked)[fields["request"]].parked_until, parked.parked_until)
+        notice = the_list.feedback_requests(parked)[fields["request"]]
+        self.assertEqual(notice.parked_until, parked.parked_until)
+        self.assertEqual(notice.words, f"List page: nate parked item {item.number} until delivered.")
         with self.assertRaisesRegex(the_list.ListError, "different parking"):
             _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-03"}))
         delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
@@ -5211,7 +5278,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, 1366, 768)
 
-        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=load)):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -5413,6 +5480,12 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
                 self.assertEqual(answered["waiting_for_answer"], "false")
                 self.assertEqual(answered["unread"], "true")
                 self.assertEqual(answered["parked"], "false" if unpark else "true")
+                if not unpark:
+                    current = the_list.load(MORTY.id, item.id)
+                    _, read = list_page.save_action(root, urlencode(self.fields(current, "read")), include_detail=True)
+                    assert read is not None
+                    self.assertEqual((read.get("unread_answer"), read["parked"]), ("false", "true"))
+                    self.assertEqual(the_list.load(MORTY.id, item.id).parked_until, until)
 
     def test_another_question_keeps_the_first_failure_visible(self) -> None:
         root = self.root / "reviews"
@@ -7200,7 +7273,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              serve.ReviewLinksServer(("127.0.0.1", 0), self.root / "reviews") as server):
+              started_review_server(("127.0.0.1", 0), self.root / "reviews") as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
@@ -7409,7 +7482,7 @@ const change=async path=>{
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session),
               patch.object(change_page, "send_question", return_value=question_outcome()),
-              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+              started_review_server(("127.0.0.1", 0), root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
@@ -7622,6 +7695,8 @@ window.fetch=async(path,options={})=>{
                     item = the_list.load(MORTY.id, item.id)
                     feedback = the_list.feedback_requests(item)[fields["request"]]
                     self.assertEqual(feedback.words, words)
+                    if action == "park":
+                        self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
                     if action == "tell":
                         self.assertEqual(item.log[-1].what, the_list.MarkedRead())
                     self.assertEqual(item.log[-2 if action == "tell" else -1].what, feedback)
@@ -7652,7 +7727,7 @@ window.fetch=async(path,options={})=>{
                     list_page.deliver(list_page.submit(root, urlencode(fields)))
                     self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
             self.assertEqual(item.state, the_list.ItemState.CLOSED)
-            self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
+            self.assertIs(item.parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual((item.title, item.owner, item.next_step), (initial.title, initial.owner, initial.next_step))
             _ = the_list.reopen(MORTY.id, item.id, source="morty")
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")
@@ -7676,6 +7751,33 @@ window.fetch=async(path,options={})=>{
         self.assertEqual([(entry.what, entry.source) for entry in saved.log if isinstance(entry.what, the_list.MarkedRead)],
                          [(the_list.MarkedRead(), the_list.PAGE_SOURCE)])
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
+
+        root = self.root / "reviews"
+        for keeper, before, after in (
+            (MORTY.id, the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.WORKING),
+            (DWIGHT.id, the_list.ItemState.DELIVERED, the_list.ItemState.WORKING),
+            (MORTY.id, the_list.ItemState.BLOCKED, the_list.ItemState.BLOCKED),
+        ):
+            with self.subTest(keeper=keeper, state=before):
+                item = self.add("Check the Tell state", before)
+                if keeper != MORTY.id:
+                    legacy = the_list.folder(keeper)
+                    legacy.mkdir(parents=True)
+                    _ = (the_list.folder(MORTY.id) / f"{item.id}.md").rename(legacy / f"{item.id}.md")
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(root))
+                body = urlencode(dict(keeper=keeper, id=item.id, request=request, token=token,
+                                      action="tell", words="Keep this state change.", until=""))
+                delivery, state = list_page.save_action(root, body, include_detail=True)
+                assert state is not None
+                saved = the_list.load(keeper, item.id)
+                self.assertIs(saved.state, after)
+                self.assertEqual((state["item_state"], state["unread"]), (after.value, "false"))
+                self.assertEqual(saved.questions, ())
+                self.assertEqual(delivery, list_page.ListFeedbackDelivery(keeper, item.id, request))
+                self.assertEqual(the_list.feedback_requests(saved)[request].words, "Keep this state change.")
+                _ = list_page.submit(root, body)
+                self.assertEqual(the_list.load(keeper, item.id), saved)
 
     def test_tell_on_a_read_item_adds_no_read_log_entry(self) -> None:
         item = self.add("An update already read")
@@ -7819,6 +7921,51 @@ window.fetch=async(_path,options={})=>{
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
 
+        with self.subTest(action="tell", view="needs-me"):
+            item = self.add("Check the waiting result", the_list.ItemState.WAITING_FOR_NATE)
+            browser = self.chrome()
+            root = self.root / "reviews"
+            with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                  patch.object(change_page, "send_to_staff", return_value=None),
+                  serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                try:
+                    browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}#show=needs-me")
+                    result = browser.command("Runtime.evaluate", {
+                        "expression": r"""(async () => {
+ const row=document.querySelector('[data-number="ITEM_NUMBER"]');
+ const chip=document.getElementById('filter-show-needs-me');
+ const before=[row.hidden,Number(chip.dataset.filterCount)];
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('form');
+ const words=form.elements.words;
+ words.value='Use the waiting result.';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ const finished=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(form.dataset.sending) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+ });
+ form.querySelector('[value="tell"]').click();
+ if(!form.dataset.sending) throw new Error('Tell did not submit.');
+ await finished;
+ return {before,after:[row.hidden,Number(chip.dataset.filterCount),row.dataset.state],
+  sameRow:row===document.querySelector('[data-number="ITEM_NUMBER"]')};
+})()""".replace("ITEM_NUMBER", str(item.number)),
+                        "awaitPromise": True, "returnByValue": True}, browser.session)
+                    self.assertNotIn("exceptionDetails", result)
+                    value = cast(dict[str, object], result["result"])
+                    self.assertEqual(value.get("value"), {
+                        "before": [False, 1], "after": [True, 0, "Working"], "sameRow": True})
+                    self.assertIs(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
+                finally:
+                    server.shutdown()
+                    thread.join()
+
     def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
         root = self.root / "reviews"
         item = self.add("Recover the message")
@@ -7953,7 +8100,7 @@ window.fetch=async(_path,options={})=>{
             width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
-        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=screenshot)):
             assert_status_states(self, list_page.render(self.root / "reviews", include_counts=False).decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")

@@ -18,7 +18,7 @@ from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, the_list, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
-from scripts.review_links import question_record, reply_tokens
+from scripts.review_links import question_path, question_record, reply_tokens
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
 PY = '~/.claude/scripts/lib/py ~/.claude/scripts/'
@@ -211,11 +211,14 @@ def save_timed_park[Result](value: str, zone: tzinfo,
                            save: Callable[[datetime, Callable[[datetime], None]], Result], *,
                            require_offset: bool = False) -> Result:
     """Pass the selected deadline and its check to the item's writer."""
-    until = datetime.fromisoformat(value)
-    if until.tzinfo is None:
+    def local_time(time: datetime) -> datetime:
         if require_offset:
             raise ValueError('a time must have a time zone')
-        until = until.replace(tzinfo=zone)
+        return time.replace(tzinfo=zone)
+
+    until = question_path.read_later(value, local_time)
+    if isinstance(until, question_path.UntilDelivered):
+        raise question_record.AnswerRefused('Review Later requires a time.')
 
     def check_deadline(moment: datetime) -> None:
         the_list.require_active_parking(until, moment)
@@ -226,7 +229,7 @@ def save_timed_park[Result](value: str, zone: tzinfo,
 def _save_review_park(item: review_items.ReviewItem, until: datetime, words: str, *,
                       check_deadline: Callable[[datetime], None],
                       verify_revision: Callable[[], object] | None, root: Path | None) -> str:
-    event = 'Later until '+until.isoformat()+(': '+words if words else '')
+    event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
 
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:

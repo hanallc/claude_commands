@@ -307,6 +307,25 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_later_rows_name_the_held_row_and_say_they_did_not_run(self) -> None:
+        first = self.checkpoint("src/alpha.txt", "Code in a shrink\n", subject="shrink")
+        second = self.beta_checkpoint("src/beta.txt", "Beta checkpoint\n")
+        third = self.checkpoint("src/third.txt", "Third checkpoint\n")
+        start = self.git("rev-parse", "HEAD")
+
+        result = self.land_batch([self.batch_line("alpha", "2", first, "--shrink"),
+                                  self.batch_line("beta", "5", second), self.batch_line("alpha", "3", third)])
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+        self.assertEqual(len(notices), 3, result.stdout)
+        self.assertIn(f"send alpha: phase 2 ({first[:12]}): shrink paths must be", notices[0])
+        detail = f"Not run because alpha phase 2 ({first[:12]}) was held."
+        self.assertEqual(notices[1:], [f"send beta: phase 5 ({second[:12]}): {detail}",
+                                       f"send alpha: phase 3 ({third[:12]}): {detail}"])
+        self.assertEqual(self.events("checkpoint-test"), [])
+        self.assert_rolled_back(start)
+
     def test_batch_preserves_an_open_merge_and_its_staged_resolution(self) -> None:
         start = self.git("rev-parse", "HEAD")
         first = self.checkpoint(content="alpha batch side\n")
@@ -1023,6 +1042,8 @@ if not trigger.is_file():
     raise SystemExit(0)
 trigger.write_text("formatted\n")
 subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)
+trigger.write_text("formatted again\n")
+subprocess.run(["git", "commit", "--amend", "-a", "--no-edit"], check=True, timeout=TEST_HANG_GUARD_SECS)
 formatter = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=TEST_HANG_GUARD_SECS)
 (state / "formatter-tip").write_text(formatter.strip())
 print("=== STEP: taplo ===", flush=True)
@@ -1035,6 +1056,7 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         formatter = (self.state / "formatter-tip").read_text()
         self.assertEqual(self.git("show", "-s", "--format=%s", formatter), "Format alpha")
+        self.assertEqual(self.git("show", f"{formatter}:src/formatter-trigger.txt"), "formatted again")
         self.assertIn("error: invalid TOML", result.stdout)
         notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
         self.assertEqual([line.split(":", 1)[0] for line in notices], ["send alpha", "send beta"])
@@ -1043,6 +1065,64 @@ raise SystemExit(1)
         next_item = self.land_batch([self.batch_line("beta", "2", beta)])
         self.assertEqual(next_item.returncode, 0, next_item.stdout + next_item.stderr)
         _ = self.assert_landed(start, [beta])
+
+    def test_formatter_rollback_keeps_an_intervening_operator_commit(self) -> None:
+        self.push = "validate_and_push"
+        self.production_doc()
+        start = self.git("rev-parse", "HEAD")
+        alpha = self.checkpoint("src/formatter-trigger.txt", "format this\n")
+        beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+        self.executable(self.bin / "validate_and_push.sh", STUB + r'''
+import os
+import subprocess
+trigger = Path("src/formatter-trigger.txt")
+trigger.write_text("formatted\n")
+subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)
+operator_env = dict(os.environ)
+operator_env.pop("GIT_REFLOG_ACTION", None)
+subprocess.run(["git", "commit", "--allow-empty", "-m", "Operator commit"], env=operator_env,
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+trigger.write_text("formatted again\n")
+subprocess.run(["git", "commit", "-am", "Format again"], check=True, timeout=TEST_HANG_GUARD_SECS)
+print("=== STEP: taplo ===", flush=True)
+print("error: invalid TOML", file=sys.stderr, flush=True)
+raise SystemExit(1)
+''')
+
+        result = self.land_batch([self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)])
+
+        self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+        self.assertEqual(self.git("log", "-3", "--format=%s").splitlines(),
+                         ["Format again", "Operator commit", "Format alpha"])
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+
+    def test_formatter_rollback_requires_the_merge_branch(self) -> None:
+        for switch in ("-c operator", "--detach"):
+            with self.subTest(switch=switch):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                self.push = "validate_and_push"
+                self.production_doc()
+                start = self.git("rev-parse", "HEAD")
+                alpha = self.checkpoint("src/formatter-trigger.txt", "format this\n")
+                beta = self.beta_checkpoint("src/beta.txt", "clean beta change\n")
+                self.executable(self.bin / "validate_and_push.sh", STUB + r'''
+import subprocess
+Path("src/formatter-trigger.txt").write_text("formatted\n")
+subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)
+''' + f'''
+subprocess.run(["git", "switch", *{switch.split()!r}], check=True, timeout=TEST_HANG_GUARD_SECS)
+raise SystemExit(1)
+''')
+
+                result = self.land_batch([self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)])
+
+                self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production"))
+                self.assertEqual(self.git("show", "-s", "--format=%s", "HEAD"), "Format alpha")
+                self.assertEqual(self.git("branch", "--show-current"), "operator" if switch == "-c operator" else "")
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+                self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
 
     def test_batch_stop_keeps_the_gate_failure_and_notifies_pending_rows(self) -> None:
         for case in ("invalid result log", "unrelated later row", "completed later row",
@@ -1258,8 +1338,8 @@ raise SystemExit(1)
         _ = self.interrupt_batch_before_row(rows, beta)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
         self.write(self.checkout, "crates/damaged/Cargo.toml", "[package]\n")
-        self.executable(self.bin / "verify.sh", STUB + '''
-Path("Cargo.toml").write_text("[package]\\n")
+        self.executable(self.bin / "verify.sh", STUB + f'''
+Path({str(self.checkout / manifest)!r}).write_text("[package]\\n")
 raise SystemExit(1)
 ''')
 

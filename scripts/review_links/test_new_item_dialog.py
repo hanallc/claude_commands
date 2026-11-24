@@ -150,7 +150,7 @@ async function sendSaved() {
    check(dialog.open && dialog.matches(':modal'), 'The dialog opens as a native modal.');
    check(document.activeElement.id === 'new-item-title' &&
          dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug is selected when the dialog opens.');
-   check([...dialog.querySelectorAll('[name="kind"]')].length === 5, 'Five keyboard-selectable types are present.');
+   check([...dialog.querySelectorAll('[name="kind"]')].length === 6, 'Six keyboard-selectable types are present.');
    check(!!recipient() && recipient().tabIndex === 0, 'To uses native keyboard-selectable radios.');
    check(send.disabled, 'Send needs words and a recipient.');
    dialog.querySelector('[name="include_page"]').click();
@@ -330,7 +330,8 @@ async function sendSaved() {
     check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
-    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation', 'The owner dialog has all five types.');
+    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement',
+          'The owner dialog has all six types.');
    }
    async function sendOwner() {
     selectType('feedback');
@@ -659,7 +660,7 @@ OWNER_OPTIONS_PROBE = r"""
  const failures = [];
  const check = (value, description) => { if (!value) failures.push(description); };
  try {
-  const buttons = document.querySelectorAll('.page-heading button');
+  const buttons = document.querySelectorAll('.page-heading-actions button');
   const dialog = document.querySelector('#review-new-item');
   const recipients = dialog.querySelector('[data-recipients]');
   const loaded = new Promise(resolve => {
@@ -673,7 +674,7 @@ OWNER_OPTIONS_PROBE = r"""
   if (!dialog.open) throw new Error('The owner button must open the dialog.');
   await loaded;
   const types = [...dialog.querySelectorAll('[data-kind-label]')].map(label => label.textContent);
-  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation', 'All five types appear in order.');
+  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement', 'All six types appear in order.');
   check(dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug starts selected.');
   const inputs = () => [...recipients.querySelectorAll('input')];
   check(inputs().map(input => input.value).join() === __RECIPIENTS__.map(row => row.id).join(),
@@ -722,6 +723,13 @@ OWNER_OPTIONS_PROBE = r"""
   inputs().find(input => input.value === alternate.value).click();
   check(selected() === alternate.value && !send.disabled && status.hidden,
         'An explicit selection enables Send and hides the notice.');
+  dialog.querySelector('[data-kind="enhancement"] input').click();
+  words.value = 'Show the next check in the row.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  const saved = new Promise(resolve => document.addEventListener('review-item-saved', resolve, {once:true}));
+  send.click();
+  check((await saved).detail.id === 'I1', 'Send reports the saved Enhancement.');
+  check(!dialog.open && document.activeElement === buttons[0], 'Send closes the dialog and restores focus.');
  } catch (error) { failures.push(String(error)); }
  await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
  parent.postMessage('finished', location.origin);
@@ -1446,20 +1454,38 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertEqual(fixture.results, [])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
-    def test_owner_button_opens_five_types_and_selects_the_owner_from_all_recipients(self) -> None:
+    def test_owner_button_selects_the_owner_and_sends_an_enhancement(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in (1440, 390)}
-        capture_dialogs(temporary / "options.png", fixtures,
-                        pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
-        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: []})
+        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        alternate = staff.StaffRow(OTHER_RECIPIENT, "producer", "cargo-liner", staff.StaffRoot(),
+                                   current_session=OTHER_RECIPIENT)
+        fixtures = {width: DialogFixture(temporary / str(width), reject_first_send=False, owner_reason=OWNER_REASON)
+                    for width in (1440, 390)}
+        for fixture in fixtures.values():
+            configuration = fixture.root / "config"
+            configuration.mkdir(parents=True)
+            _ = (configuration / "console.conf").write_text(f"page.builds.owner={OWNER}\n")
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, alternate))):
+            capture_dialogs(temporary / "options.png", fixtures,
+                            pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
+        for width, fixture in fixtures.items():
+            with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
+                self.assertEqual(fixture.results, [])
+                post, = fixture.wire_posts
+                self.assertEqual((post["kind"], post["recipient_id"], post["words"]),
+                                 ("enhancement", OTHER_RECIPIENT, "Show the next check in the row."))
+                record, = investigation.records(OTHER_RECIPIENT)
+                self.assertEqual(record.title, "Enhancement: Show the next check in the row.")
 
-    def test_render_mounts_one_dialog_with_five_types(self) -> None:
+    def test_render_mounts_one_dialog_with_six_types(self) -> None:
         markup = new_item_dialog.render()
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
-        self.assertEqual(markup.count('type="radio" name="kind"'), 5)
-        self.assertEqual(markup.count('<span data-button-face>'), 5)
+        self.assertEqual(markup.count('type="radio" name="kind"'), 6)
+        self.assertEqual(markup.count('<span data-button-face>'), 6)
         self.assertIn('data-kind="bug"', markup)
+        self.assertIn('data-kind="enhancement"', markup)
+        self.assertIn('class="lucide lucide-sparkles"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-sent-details aria-labelledby="sent-details-title"', markup)

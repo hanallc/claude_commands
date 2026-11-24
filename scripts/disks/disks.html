@@ -29,7 +29,7 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 __STEP_TIP_STYLE__
-#tip > .tip[data-held-count] { max-width: min(60rem, calc(100vw - 16px)); grid-template-columns: minmax(0, auto) minmax(0, auto); }
+#tip > .tip[data-held-count] { max-width: min(60rem, var(--tip-width, 60rem)); grid-template-columns: minmax(0, auto) minmax(0, auto); }
 .tip dd.held-folder { text-align: left; opacity: 0.7; }
 @media (width >= 900px) {
   .tip .held-folder { overflow: hidden; text-overflow: ellipsis; }
@@ -165,16 +165,6 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  const placeSharedTip = placeTipAt;
-  placeTipAt = (tip, x, y) => {
-    const list = tip.querySelector(".tip[data-held-count]");
-    if (list) fitSessionTip(tip, list);
-    placeSharedTip(tip, x, y);
-    if (list) {
-      const bottomLimit = innerHeight - tip.offsetHeight - 8;
-      tip.style.top = `${Math.max(8, Math.min(parseFloat(tip.style.top), bottomLimit))}px`;
-    }
-  };
   return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
 })();
 
@@ -776,9 +766,9 @@ function sessionTip(row, keepBytes) {
   return rows;
 }
 
-function fitSessionTip(tip, list) {
-  const maxHeight = innerHeight - 16;
-  if (tip.offsetHeight <= maxHeight) return;
+function fitSessionTip(tip, maxHeight) {
+  const list = tip.querySelector(".tip[data-held-count]");
+  if (!list || tip.offsetHeight <= maxHeight) return;
   const folders = [...list.querySelectorAll("dt.held-folder")];
   let summary = list.querySelector("dd.long");
   if (!summary) {
@@ -875,7 +865,7 @@ async function loadDisks(supersede=false,current=()=>true){
    busy:measuring ? 'Measuring…' : ''};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
-stepTip.hoverTips(document.getElementById("tip"), tipFor);
+stepTip.hoverTips(document.getElementById("tip"), tipFor, fitSessionTip);
 onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   toggleOpen(opened.groups, row.dataset.group);
   renderSlots();

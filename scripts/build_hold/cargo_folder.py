@@ -19,7 +19,7 @@ import sys
 
 from scripts.lib import build_folder_lock, build_folders, cargo_target_config, git_files
 from scripts.lib.atomic_file import write_bytes_atomic
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 # The build-hold cargo wrapper. It holds the cargo word lists, each on one line, and this module reads them there.
@@ -67,10 +67,24 @@ def wrapper_words(name: str) -> frozenset[str]:
     return frozenset(found.group(1).split())
 
 
+def in_named_step_scope(environment: Mapping[str, str]) -> bool:
+    """The cgroup folder of this process equals BUILDLOG_STEP_SCOPE, the scope that a queued step or a reserved
+    program names. The wrapper starts cargo there at once, with no folder step. A value from another scope is
+    stale and changes nothing."""
+    step_scope = environment.get("BUILDLOG_STEP_SCOPE")
+    if not step_scope:
+        return False
+    try:
+        lines = Path(environment.get("CARGO_WRAPPER_CGROUP_FILE") or "/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return False
+    return any(line.startswith("0::") and "/sys/fs/cgroup" + line[3:] == step_scope for line in lines)
+
+
 def folder_step_due(argv: Sequence[str], environment: Mapping[str, str]) -> bool:
     """The wrapper does its folder steps for the cargo words argv in the environment: a build subcommand other
-    than install, no help or version word after it, and no outer step that did the steps."""
-    if environment.get("CARGO_FOLDER_CHECKED") == "1" or environment.get("BUILDLOG_STEP_SCOPE"):
+    than install, no help or version word after it, no outer step that did the steps, and no named step scope."""
+    if environment.get("CARGO_FOLDER_CHECKED") == "1" or in_named_step_scope(environment):
         return False
     value_options, skip = wrapper_words("value_options"), False
     for index, word in enumerate(argv):
@@ -105,7 +119,7 @@ def _workspace(argv: list[str], cwd: Path, environment: Mapping[str, str]) -> Ca
 def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
     """The build output folder that the build folder model gives for the checkout."""
     layout = worktrees.worktree_output(checkout)
-    if isinstance(layout, worktrees.RecordedWorktreeOutput):
+    if isinstance(layout, worktree_records.RecordedWorktreeOutput):
         return LinkedOutput(worktrees.checked_output(layout))
     form = build_folders.parse_form(checkout)
     if isinstance(form, build_folders.UnverifiedFolderPath):
@@ -116,7 +130,7 @@ def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWo
         return LocalOutput(checkout)
     try:
         word = build_folders.repo_word(checkout)
-        if worktrees.main_checkout_for_word(word) == checkout:
+        if worktree_records.main_checkout_for_word(word) == checkout:
             return LinkedOutput(build_folders.main_output_path(word))
     except ValueError:
         pass
@@ -222,7 +236,7 @@ def check_step(argv: list[str], cwd: Path, locks: ExitStack, environment: Mappin
 
 
 # The errors that end a checked step with no Cargo run.
-STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused)
+STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktree_records.Refused)
 
 
 def checked_step(argv: list[str], cwd: Path, locks: ExitStack,

@@ -8,9 +8,13 @@ except FileNotFoundError:
 
 import sys
 
+SET_MODEL_EXAMPLE = "agents {command} producers fable high"
+
+
 def _usage() -> str:
     from scripts.agents import set_model
 
+    example = SET_MODEL_EXAMPLE.format(command=set_model.COMMAND)
     return f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
@@ -29,7 +33,7 @@ def _usage() -> str:
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
   agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: {example})
 """
 
 if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
@@ -46,6 +50,7 @@ import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from functools import partial
 from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -60,7 +65,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, git_files, unit_runs, build_folders
+from scripts.lib import process_group, process_start, conf, berth_board, git_files, git_merge_tree, unit_runs, build_folders
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
@@ -77,7 +82,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.agents import (
     producer_lifecycle,
     producer_transfer,
@@ -156,6 +161,23 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         if not waiting:
             return
         time.sleep(1)
+
+
+def _row_at_path(path: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Select one row by its full staff path, or by a path under a showrunner, such as assembly/fix2.
+
+    Return None when no row has the path, so that the caller can try a native session name.
+    """
+    found: dict[staff.StaffId, str] = {}
+    for full in (path, *(f"{root.name}/{path}" for root in record.rows if root.kind in ("showrunner", "producer"))):
+        if (row := record.by_path(full)) is not None:
+            _ = found.setdefault(row.id, full)
+    if len(found) == 1:
+        return record.rows_by_id[next(iter(found))]
+    if found:
+        paths = ", ".join(sorted(found.values()))
+        raise staff.StaffRefused(f"{path}: several staff rows match: {paths}; use the full path or the staff id")
+    return None
 
 
 def _result_code(result: StopResult | ResumeResult) -> int:
@@ -579,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments == ["_unit-local"]:
         return unit_local_command()
     parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
-    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    commands = parser.add_subparsers(prog=parser.prog, dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")
     selection = command.add_mutually_exclusive_group(required=True)
     _ = selection.add_argument("session", nargs="?")
@@ -599,7 +621,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
     _ = command.add_argument("--job", default="")
-    command = commands.add_parser(set_model.COMMAND)
+    example = SET_MODEL_EXAMPLE.format(command=set_model.COMMAND)
+    command = commands.add_parser(set_model.COMMAND, description=f"Example: {example}")
     _ = command.add_argument("role", metavar="ROLE")
     _ = command.add_argument("model", metavar="MODEL")
     _ = command.add_argument("effort", metavar="EFFORT", nargs="?", default="")
@@ -758,24 +781,28 @@ def main(argv: list[str] | None = None) -> int:
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
-        member = record.by_member_reference(options.session)
-        matches = [member for member in record.rows if member.name == options.session]
-        named = matches[0] if len(matches) == 1 else None
-        row = member or record.by_path(options.session) or named
+        session = options.session
+        row = _row_at_path(session, record) if "/" in session else None
+        if row is not None:
+            target = row
+            session = str(row.id)
+        else:
+            matches = [member for member in record.rows if member.name == session]
+            target = record.by_member_reference(session) or (matches[0] if len(matches) == 1 else None)
+            row = target or record.by_path(session)
         if options.dry_run:
-            target = stop_resume.stop_target(options.session)
-            if isinstance(target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
-                return _result_code(target)
+            stop_target = stop_resume.stop_target(session)
+            if isinstance(stop_target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
+                return _result_code(stop_target)
             if row is not None and row.kind in ("unit", "showrunner"):
                 for child in record.find(kind="worker", parent=row.id):
                     print(f"{child.name}: would stop")
-            print(f"{row.name if row is not None else options.session}: would stop")
+            print(f"{row.name if row is not None else session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
         deadline = worker_lifecycle.effective_deadline()
-        target = member or named
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
-                  if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
+                  if target is not None and target.kind == "producer" else stop_resume.stop(session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
     except herdr.RebootLockBusy as error:
         print(error, file=sys.stderr)
@@ -1199,37 +1226,6 @@ def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path 
     return None
 
 
-def _merge_leaves_target_tree_unchanged(unit: RetiringUnit, ref: str, merge_ref: str,
-                                        *, settings: conf.ConfigRead) -> bool:
-    """Check that a merge of the branch leaves the merge tree unchanged."""
-    branch = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", settings=settings)
-    if branch.returncode:
-        raise OSError(f"cannot resolve commit {ref}: {retirement_failure(branch)}")
-    target = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{merge_ref}^{{commit}}", settings=settings)
-    if target.returncode:
-        raise OSError(f"cannot resolve commit {merge_ref}: {retirement_failure(target)}")
-    drivers = retirement_git(unit, "config", "--get-regexp", r"^merge\..+\.driver$", settings=settings)
-    if drivers.returncode == 0:
-        return False
-    if drivers.returncode != 1:
-        raise OSError(retirement_failure(drivers))
-
-    target_commit = target.stdout.strip()
-    merged = retirement_git(unit, "merge-tree", "--write-tree", target_commit, branch.stdout.strip(), settings=settings)
-    merged_tree = merged.stdout.partition("\n")[0]
-    if merged.returncode:
-        if merged.returncode == 1 and merged_tree:
-            conflict_tree = retirement_git(unit, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                                           f"{merged_tree}^{{tree}}", settings=settings)
-            if conflict_tree.returncode == 0 and conflict_tree.stdout.strip() == merged_tree:
-                return False
-        raise OSError(retirement_failure(merged))
-    current = retirement_git(unit, "rev-parse", f"{target_commit}^{{tree}}", settings=settings)
-    if current.returncode:
-        raise OSError(retirement_failure(current))
-    return bool(merged_tree) and merged_tree == current.stdout.strip()
-
-
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and branch content missing from the merge branch."""
     present = unit.worktree.is_dir()
@@ -1253,11 +1249,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     # The fetched origin commit comes last when origin has the branch.
     merge_target = merge_refs[-1]
+    run_git = partial(retirement_git, unit, settings=settings)
     for ref in refs:
-        commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
+        commits = run_git("rev-list", "--no-merges", ref, "--not", *merge_refs)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
-        if commits.stdout.strip() and not _merge_leaves_target_tree_unchanged(unit, ref, merge_target, settings=settings):
+        if commits.stdout.strip() and not git_merge_tree.leaves_target_unchanged(
+                run_git, ref, merge_target, failure=retirement_failure):
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
     return found
@@ -1272,9 +1270,9 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
     try:
         layout = worktrees.worktree_output(unit.worktree)
         worktrees.remove_git_checkout(unit.worktree, unit.production.checkout, force=True, retain_record=True)
-        if isinstance(layout, worktrees.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
+        if isinstance(layout, worktree_records.RecordedWorktreeOutput) or worktrees.enforce_build_folders():
             worktrees.retire(unit.name)
-    except (OSError, ValueError, worktrees.Refused) as error:
+    except (OSError, ValueError, worktree_records.Refused) as error:
         return [str(error)]
     if os.path.lexists(unit.worktree):
         return failed
@@ -1827,14 +1825,14 @@ def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
               if recovery_git(unit, "branch", "--list", unit.branch)
               else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
     try:
-        record = worktrees.checkout_record(unit.worktree)
-        layout = (record.layout if record is not None and record.stage is worktrees.MakeStage.MAKING
+        record = worktree_records.checkout_record(unit.worktree)
+        layout = (record.layout if record is not None and record.stage is worktree_records.MakeStage.MAKING
                   else worktrees.unit_checkout_output(
                       unit.worktree, build_folders.repo_word(unit.production.checkout), unit.name))
         _ = worktrees.create_checkout(unit.worktree, unit.production.checkout, branch,
                                       layout, owner=unit.name, merge_branch=unit.production.merge_branch,
                                       allow_existing=True)
-    except (OSError, ValueError, worktrees.Refused) as error:
+    except (OSError, ValueError, worktree_records.Refused) as error:
         raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
     if not had_checkout:
         print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
@@ -2471,7 +2469,7 @@ def rename_named_member(old: str, new: str, *, to_doc: str = "", to_branch: str 
         except subprocess.TimeoutExpired as error:
             print(f"rename: error: {str(error).splitlines()[0]}", file=sys.stderr)
             return 1
-        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktrees.Refused) as error:
+        except (ValueError, OSError, UnicodeError, RenameRefused, herdr_types.HerdrFailure, worktree_records.Refused) as error:
             print(f"rename: {error}", file=sys.stderr)
             return 1
         return 0

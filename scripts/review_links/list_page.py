@@ -25,7 +25,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, delivery_state, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
+from scripts.review_links import change_browser, change_page, console, page_frame, page_question, question_path, record_table, review_link
 from scripts.review_links import review_actions, review_items, review_legacy, review_page
 from scripts.review_links import search_fold, staff_names
 from scripts.review_links import question_record
@@ -56,14 +56,25 @@ class ListChip(StrEnum):
     PARKED = "parked"
 
 
-CHIP_BY_STATE = {
-    the_list.ItemState.NEW: ListChip.WORKING,
-    the_list.ItemState.WORKING: ListChip.WORKING,
-    the_list.ItemState.BLOCKED: ListChip.BLOCKED,
-    the_list.ItemState.WAITING_FOR_NATE: ListChip.NEEDS_ME,
-    the_list.ItemState.DELIVERED: ListChip.NEEDS_ME,
-    the_list.ItemState.DONE: ListChip.ALL,
-    the_list.ItemState.PAUSED: ListChip.BLOCKED,
+QUEUE_BY_STATE = {
+    the_list.ItemState.NEW: question_path.Queue.WORKING,
+    the_list.ItemState.WORKING: question_path.Queue.WORKING,
+    the_list.ItemState.BLOCKED: question_path.Queue.BLOCKED,
+    the_list.ItemState.WAITING_FOR_NATE: question_path.Queue.NEEDS_ME,
+    the_list.ItemState.DELIVERED: question_path.Queue.NEEDS_ME,
+    the_list.ItemState.DONE: question_path.Queue.DONE,
+    the_list.ItemState.PAUSED: question_path.Queue.BLOCKED,
+    the_list.ItemState.CLOSED: question_path.Queue.CLOSED,
+}
+
+CHIP_BY_QUEUE = {
+    question_path.Queue.NEEDS_ME: ListChip.NEEDS_ME,
+    question_path.Queue.WAITING_FOR_ANSWER: ListChip.MORTY_ANSWERING,
+    question_path.Queue.LATER: ListChip.PARKED,
+    question_path.Queue.WORKING: ListChip.WORKING,
+    question_path.Queue.BLOCKED: ListChip.BLOCKED,
+    question_path.Queue.DONE: ListChip.ALL,
+    question_path.Queue.CLOSED: ListChip.ALL,
 }
 
 
@@ -75,8 +86,6 @@ PARKED_SEARCH_LABEL = search_fold.fold("Parked")
 STATE_SEARCH_TEXT = {state: search_fold.fold(state.value) for state in the_list.ItemState}
 UNREAD_FILTER = ("unread", "1", "true")
 UNREAD_FIELD, UNREAD_VALUE, UNREAD_MATCH = UNREAD_FILTER
-# Each unread update kind as (unread delivery, unread answer).
-UNREAD_UPDATES = {"none": (False, False), "delivery": (True, False), "answer": (False, True)}
 LINK_REVEAL_FIELDS = (("openQuestion", "true", ""), (UNREAD_FIELD, "false", UNREAD_FIELD))
 # Match the whitespace that String.trim removes.
 QUERY_WHITESPACE = ("\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
@@ -102,7 +111,7 @@ def show_aliases() -> dict[str, dict[str, ListChip]]:
     for show in ("", "*", "open", "done", "closed", UNREAD_FIELD, *ListChip):
         states = {"Closed": ListChip.ALL}
         if show in ("", "open", ListChip.ALL, UNREAD_FIELD):
-            states.update({state.value: chip for state, chip in CHIP_BY_STATE.items()})
+            states.update({state.value: CHIP_BY_QUEUE[queue] for state, queue in QUEUE_BY_STATE.items()})
         if show in ("done", "closed", UNREAD_FIELD):
             states[""] = ListChip.ALL
         aliases[show] = states
@@ -115,14 +124,9 @@ SHOW_ALIASES = show_aliases()
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
     """Find the one status chip for this item."""
-    chip = CHIP_BY_STATE[state]
-    if unread_answer:
-        return ListChip.NEEDS_ME
-    if parked:
-        return ListChip.PARKED
-    if unread_delivery:
-        return ListChip.NEEDS_ME
-    return ListChip.MORTY_ANSWERING if open_question else chip
+    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer, later=parked,
+                                unread_delivery=unread_delivery, waiting_for_answer=open_question)
+    return CHIP_BY_QUEUE[queue]
 
 
 class ListRecord(NamedTuple):
@@ -206,16 +210,19 @@ def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
 
 
 def parked_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
-    return moment.value if moment is the_list.ParkUntilDelivered.DELIVERED else short_list_time(moment, zone)
+    # Keep the delivery value in the save response for existing List tabs.
+    return short_list_time(moment, zone) if isinstance(moment, datetime) else question_path.write_later(moment)
 
 
 def parking_notice_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
-    if moment is the_list.ParkUntilDelivered.DELIVERED:
-        return moment.value
-    local = moment.astimezone(zone)
-    if local.hour or local.minute:
-        return local.strftime("%Y-%m-%d %H:%M %Z")
-    return local.date().isoformat()
+    def time_label(time: datetime) -> str:
+        local = time.astimezone(zone)
+        if local.hour or local.minute:
+            return local.strftime("%Y-%m-%d %H:%M %Z")
+        return local.date().isoformat()
+
+    label = question_path.later_label(moment, time_label)
+    return f"until {label}" if isinstance(moment, datetime) else label.lower()
 
 
 def field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames) -> str:
@@ -666,6 +673,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         else:
             state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
+    if unread_answers:
+        update += question_path.NEW_ANSWER_HTML
     notice_time = the_list.sent_notice_time(item)
     if isinstance(notice_time, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
@@ -929,7 +938,7 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         def save_park(parked_until: datetime | the_list.ParkUntilDelivered,
                       check_deadline: Callable[[datetime], None] | None = None) -> the_list.ListItem:
             label = parking_notice_label(parked_until, zone)
-            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
+            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park", words)
             return the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE,
                                  notice=notice, check_deadline=check_deadline)
 
@@ -1277,18 +1286,20 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
-[data-list-review-dialog]{position:fixed;inset:0;margin:16px auto auto;width:min(1060px,calc(100% - 48px));
+[data-list-review-dialog]{position:fixed;inset:0;margin:calc(var(--page-window-top,0px) + 16px) auto auto;
+width:min(1060px,calc(100% - 48px));
 max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:12px;
 background:var(--card);color:var(--ink);overflow:hidden;box-sizing:border-box}
 [data-list-review-dialog]::backdrop{background:rgb(0 0 0 / 90%);backdrop-filter:blur(3px)}
 .list-review-close{position:absolute;top:24px;right:24px;z-index:1;margin:0;min-height:32px;padding:4px 12px;
 font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
-max-height:calc(100dvh - 98px);border:0}
+max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
 :root:has([data-list-review-dialog][open]){overflow:hidden}
 :root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
 :root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
-[data-list-review-dialog][data-fullscreen]{width:100vw;height:100dvh;border:0;border-radius:0;margin:0}
+[data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;
+border-radius:0;margin:var(--page-window-top,0px) 0 0}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
@@ -1351,6 +1362,7 @@ background:var(--ink-2);border-radius:50%}
 .list-log .log-evidence div{white-space:pre-wrap}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .page-question time{color:var(--ink-3);font-size:13px}
+.list-table small[data-new-answer]{color:var(--accent)}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
 .list-panel [data-waiting-note]{margin-top:16px}
@@ -1379,17 +1391,10 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + review_legacy.SHOW_ALIAS_SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
-const chipsByQuestion=''' + json.dumps({
-    str(open_question).lower(): {
-        str(parked).lower(): {
-            update: {
-                state.value: list_chip(state, parked=parked, open_question=open_question,
-                                       unread_delivery=delivery, unread_answer=answer)
-                for state in CHIP_BY_STATE
-            } for update, (delivery, answer) in UNREAD_UPDATES.items()
-        } for parked in (False, True)
-    } for open_question in (False, True)
-}) + ''';
+''' + question_path.queue_script() + '''
+const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
+const chipsByQueue=''' + json.dumps(CHIP_BY_QUEUE) + ''';
+const newAnswerMarkup=''' + json.dumps(question_path.NEW_ANSWER_HTML) + ''';
 const shows=''' + json.dumps(list(ListChip)) + r''';
 const showAliases=''' + json.dumps(SHOW_ALIASES) + r''';
 const [unreadField,unreadValue,unreadMatch]=''' + json.dumps(UNREAD_FILTER) + r''';
@@ -1411,9 +1416,8 @@ const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
  const parked=isParked(data);
- const unreadUpdate=data.unread==='true' && data.unreadAnswer==='true' ? 'answer'
-  : data.unreadDelivery==='true' ? 'delivery' : 'none';
- return chipsByQuestion[data.openQuestion][String(parked)][unreadUpdate][data.state];
+ return chipsByQueue[questionQueue(queuesByState[data.state],data.unread==='true' && data.unreadAnswer==='true',
+  parked,data.unreadDelivery==='true',data.openQuestion==='true')];
 };
 let content=document.querySelector('[data-list]');
 function decodeListKeys(list){
@@ -1505,6 +1509,10 @@ function syncUnread(item,form,unread,unreadSort){
  item.dataset.sortValues=JSON.stringify(sortValues);
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
  const read=form?.querySelector('[value="read"]');
+ const answerMark=update.querySelector('[data-new-answer]');
+ if(unread && item.dataset.unreadAnswer==='true'){
+  if(!answerMark) update.insertAdjacentHTML('beforeend',newAnswerMarkup);
+ }else answerMark?.remove();
  if(unread){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
@@ -1993,10 +2001,11 @@ function bindFeedbackForm(form){
      if(target?.getClientRects().length){
       target.focus({preventScroll:true});
       if(saved && item.hidden){
-       const {top,bottom}=target.getBoundingClientRect();
-       const inset=(typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom()
+       const status=content.querySelector('[data-hidden-action-status]');
+       const top=target.getBoundingClientRect().top;
+       const inset=(typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom()
         : document.querySelector('[data-page-status]').offsetHeight)+12;
-       if(top<inset || bottom>innerHeight)
+       if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }
      }

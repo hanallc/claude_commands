@@ -30,7 +30,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_unit_location, isolated_staff_file
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
@@ -74,7 +74,7 @@ def model_worktree_environment(root: Path, configuration: Path) -> dict[str, str
 
 def make_fixture_worktree(source: Path, unit: str, short_name: str) -> Path:
     """Create a linked checkout and save its record through the model."""
-    main = worktrees.main_checkout(source)
+    main = worktree_records.main_checkout(source)
     _ = subprocess.run(["git", "-C", str(main), "config", "remote.origin.url", str(main.with_suffix(".git"))],
                        check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
     return worktrees.make(main.name, unit, short_name,
@@ -185,8 +185,10 @@ class WorktreeAttributionTests(unittest.TestCase):
         self.record_clone("2", clone)
         directory = phase_reservation.phase_directory(self.session, "2")
         foreign = make_fixture_worktree(self.first, "other-unit", "p3")
-        for requested, reason in ((clone, f"{str(clone)!r} is not in the subpath of"),
-                                  (self.main, f"{str(self.main)!r} is not in the subpath of"),
+        model = self.session.parent / "worktrees" / "<repo>" / "<unit>" / "<short name>"
+        outside = f"the checkout is not at {model}"
+        for requested, reason in ((clone, outside),
+                                  (self.main, outside),
                                   (foreign, "the checkout is for unit 'other-unit'")):
             with self.subTest(requested=requested):
                 code, errors = self.claim("2", requested)
@@ -300,12 +302,12 @@ class WorktreeAttributionTests(unittest.TestCase):
                             str(main.parent / "claude_commands.git")], check=True, capture_output=True,
                            timeout=TEST_HANG_GUARD_SECS)
         source = worktrees.FrozenWorktreeSource(main, phase_reservation.commit_id(main, "HEAD"))
-        _ = (worktrees.state_folder() / "invalid.json").write_text("{")
+        _ = (worktree_records.state_folder() / "invalid.json").write_text("{")
         owned = worktrees.make("claude", "natedev-board", "owned", source)
         ownerless = worktrees.make("claude", "natedev-board", "ownerless", source)
         foreign = worktrees.make("claude", "natedev-other", "foreign", source)
         for checkout, owner in ((owned, "board"), (ownerless, ""), (foreign, "other")):
-            record = worktrees.read_record(worktrees.record_file(checkout))
+            record = worktree_records.read_record(worktree_records.record_file(checkout))
             worktrees.write_record(replace(record, owner=owner))
         record_unit(self, self.session, owned, "1", name="board")
 
@@ -364,18 +366,27 @@ class WorktreeAttributionTests(unittest.TestCase):
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.assert_model_worktree_refused("2", self.second, "recorded branch 'reservation-p2'")
 
+    def assert_home_path_refused(self, home: Path, requested: Path) -> None:
+        errors = self.assert_claim_refused("1", requested)
+        model = self.session.parent / "worktrees" / "<repo>" / "<unit>" / "<short name>"
+        self.assertIn(f"{home}: the checkout is not at {model}. {phase_reservation.MOVE_UNIT_HOME}", errors)
+        self.assertNotIn("unpack", errors)
+        self.assertNotIn("subpath", errors)
+
     def test_claim_refuses_an_off_model_home(self) -> None:
-        row = next(row for row in staff.snapshot().rows if row.kind == "unit")
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.main), expected=row.worktree)
-        self.assert_model_worktree_refused(
-            "1", self.main, "Move the unit home into the worktree model by the showrunner's order.")
+        shallow_home = self.session.parent / "worktrees" / "claude-natedev-accounts"
+        _ = subprocess.run(["git", "clone", "-q", str(self.main), str(shallow_home)], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        for home in (self.main, shallow_home):
+            with self.subTest(home=home):
+                row = next(row for row in staff.snapshot().rows if row.kind == "unit")
+                _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", home), expected=row.worktree)
+                self.assert_home_path_refused(home, home)
 
     def test_claim_refuses_an_off_model_home_with_a_valid_separate_checkout(self) -> None:
         row = next(row for row in staff.snapshot().rows if row.kind == "unit")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.main), expected=row.worktree)
-        errors = self.assert_claim_refused("1", self.second)
-        self.assertIn(str(self.main), errors)
-        self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
+        self.assert_home_path_refused(self.main, self.second)
 
     def test_claim_refuses_a_home_without_a_git_checkout(self) -> None:
         home = self.session.parent / "non-git-home"
@@ -385,12 +396,10 @@ class WorktreeAttributionTests(unittest.TestCase):
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", home), expected=row.worktree)
         for requested in (home, subdirectory):
             with self.subTest(requested=requested):
-                errors = self.assert_claim_refused("1", requested)
-                self.assertIn(str(home), errors)
-                self.assertIn(phase_reservation.MOVE_UNIT_HOME, errors)
+                self.assert_home_path_refused(home, requested)
 
     def test_claim_refuses_a_model_home_without_a_worktree_record(self) -> None:
-        worktrees.record_file(self.first).unlink()
+        worktree_records.record_file(self.first).unlink()
 
         errors = self.assert_claim_refused("1", self.second)
 

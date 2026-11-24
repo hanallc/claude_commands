@@ -1,5 +1,6 @@
 """Check complete configuration fixtures and successive value changes."""
 
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -7,25 +8,73 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
+from scripts.lib import conf
+from scripts.lint.memory_test_support import (
+    ConfigFixtureRefused, commit_config_fixture, config_environment, shifted_number, write_config_fixture,
+)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "direct.conf"
+            root = Path(directory)
+            template = root / "template.conf"
+            _ = template.write_text(
+                "# whole: 1..\nMAX_FIX_ATTEMPTS=3\n"
+                + "# whole: 1..\nMAX_REOPENS=3\n"
+                + "# whole: 1..4\ncount=4\n"
+                + "# whole: 2..2\nfixed=2\n"
+                + "# range: 0..10\ntimeout=9\n"
+                + "# range: 0..0.5\nretry=0\n"
+                + "# one of: 1, 2\nmode=1\n"
+                + "unbounded=7\n")
+            path = root / "direct.conf"
             _ = path.write_text("MAX_FIX_ATTEMPTS=17\nfixture_only=kept\n")
-            _ = write_config_fixture(path, "MAX_REOPENS=19\n")
+            with mock.patch("scripts.lint.memory_test_support._template", return_value=template):
+                _ = write_config_fixture(path, "MAX_REOPENS=19\n")
+                _ = write_config_fixture(path)
             text = path.read_text()
-        committed = Path(__file__).resolve().parents[2] / "config" / "direct.conf"
-        expected = dict(line.split("=", 1) for line in committed.read_text().splitlines()
-                        if "=" in line and not line.startswith("#"))
-        expected.update(MAX_FIX_ATTEMPTS="17", MAX_REOPENS="19", fixture_only="kept")
+        expected = {
+            "MAX_FIX_ATTEMPTS": "17", "MAX_REOPENS": "19", "fixture_only": "kept",
+            "count": "3", "fixed": "2", "timeout": "4.5", "retry": "0.25", "mode": "1", "unbounded": "7",
+        }
         actual = dict(line.split("=", 1) for line in text.splitlines()
                       if "=" in line and not line.startswith("#"))
         self.assertEqual(actual, expected)
         self.assertIn("# whole: 1..\nMAX_FIX_ATTEMPTS=17\n", text)
+        self.assertIn("# test config shift: 4 3\n# whole: 1..4\ncount=3\n", text)
+
+    def test_config_environment_shifts_unpinned_values_and_uses_short_deadlines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            committed = root / "committed"
+            committed.mkdir()
+            _ = (committed / "copies.conf").write_text(
+                "# range: 1..\ngit_timeout_seconds=600\n# whole: 1..\nfixture_count=4\n")
+            _ = (committed / "build_admission.conf").write_text("# range: 0..\nmin_pass_gap_seconds=0.25\n")
+            private = root / "private"
+            def template(name: str) -> Path:
+                return committed / name
+
+            with mock.patch("scripts.lint.memory_test_support._template", side_effect=template):
+                _ = config_environment(private)
+            settings = conf.read(private / "copies.conf")
+            self.assertEqual(settings.whole("fixture_count"), 5)
+            self.assertEqual(settings.number("git_timeout_seconds"), 30)
+            self.assertEqual(conf.read(private / "build_admission.conf").number("min_pass_gap_seconds"), 0)
+            self.assertIn("# test config shift: 4 5", (private / "copies.conf").read_text())
+            self.assertNotIn("# test config shift: 600", (private / "copies.conf").read_text())
+
+    def test_decimal_shift_uses_high_midpoint_when_only_high_side_has_room(self) -> None:
+        setting = conf.Setting("4", "# range: 4..4.5", 0)
+        self.assertEqual(shifted_number(setting), "4.25")
+
+    def test_narrow_decimal_range_uses_an_endpoint_or_an_adjacent_float(self) -> None:
+        narrow = conf.Setting("1", "# range: 1..1.0000000000000002", 0)
+        smallest = conf.Setting("5e-324", "# range: 5e-324..", 0)
+        self.assertEqual(shifted_number(narrow), "1.0000000000000002")
+        self.assertEqual(float(shifted_number(smallest)), math.nextafter(float(smallest.value), math.inf))
 
     def test_successive_overrides_keep_prior_values_and_allow_an_explicit_empty_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -34,7 +34,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, scratch, urgency
@@ -47,6 +47,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
 from scripts.review_links import new_item_dialog, question_record, reply_tokens, review_actions, review_items, review_submissions
+from scripts.review_links.server_test_support import started_review_server
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -151,6 +152,7 @@ class BrowserForms(HTMLParser):
 
 
 SEND_MESSAGE = change_page.send_message
+
 
 # The Memory bar record predates structured question parts.
 MEMORY_BAR_ASK = "Memory bar on the Builds page: what name should the new block have?"
@@ -836,12 +838,11 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         if not legacy_links:
             return
-        # Restart tests start recovery after they create the pending records.
+        # Restart tests enable legacy recovery after they create the records.
         with (patch.object(change_page, "recover_pending"),
               patch.object(serve, "loaded_module_stamps", return_value={})):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
@@ -1391,8 +1392,8 @@ class ChangePageTests(unittest.TestCase):
             "attempt": "legacy", "state": "pending", "kind": "verdict"}))
         self.messages.clear()
         self.delivery_done.clear()
-        with serve.ReviewLinksServer(("127.0.0.1", 0), self.root):
-            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        with started_review_server(("127.0.0.1", 0), self.root):
+            self.assertTrue(self.delivery_done.is_set())
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
         self.assertIn("C1: works", self.messages[0][2])
         self.assert_record_cleared()
@@ -1978,7 +1979,7 @@ class ChangePageTests(unittest.TestCase):
         with self.subTest(rebuilds="missing folder"):
             with patch.object(need, "read_needs", wraps=need.read_needs) as reads:
                 body = change_browser.render_rebuilds().decode()
-            reads.assert_called_once_with()
+            reads.assert_called_once_with([])
             self.assertIn('<title>Rebuilds needed</title>', body)
             self.assertIn('<div data-rebuilds data-count="0" data-label=""><p>No rebuilds needed.</p></div>', body)
             self.assertFalse(Path(os.environ["REBUILD_NEEDS_DIR"]).exists())
@@ -2003,7 +2004,7 @@ class ChangePageTests(unittest.TestCase):
                 _ = path.write_text(json.dumps(record))
             with patch.object(need, "read_needs", wraps=need.read_needs) as reads:
                 body = change_browser.render_rebuilds().decode()
-            reads.assert_called_once_with()
+            reads.assert_called_once_with([])
             answer = rebuild_row.read(Path(os.environ["CONF_DIR"]) / "statusline.conf")
             self.assertIn(change_browser.rebuild_list(answer, {}, staff.snapshot()), self.request(rebuilds, {}).body)
             block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1].rsplit('</div>', 1)[0]
@@ -2055,18 +2056,21 @@ class ChangePageTests(unittest.TestCase):
                 mac = block.split('</article>', 1)[1]
                 # The filed need covers its commit, so that commit shows once, with the need's requester.
                 self.assertEqual(mac.count("Apply the Mac settings."), 1)
-                self.assertIn('<h2>Rebuild the Mac</h2><div data-owner><h3>page-owner (showrunner)</h3>'
+                self.assertIn('<section class="rebuild-commits"><h3>Commits</h3>'
+                              + '<div data-owner><h4>page-owner (showrunner)</h4>'
                               + '<dl><dt><time datetime="2026-11-12T14:30:00+00:00">Nov 12, 2026, 09:30</time></dt>'
-                              + '<dd>memory: &lt;defer&gt; defrag</dd></dl></div><div data-owner>', mac)
+                              + '<dd>memory: &lt;defer&gt; defrag</dd></dl></div></section>', mac)
+                self.assertLess(mac.index("Apply the Mac settings."), mac.index("<h3>Commits</h3>"))
                 only = change_browser.rebuild_list(rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
                                                    {"mac": (rebuild_row.Change("f" * 40, "2026-11-12T15:00:00+00:00",
                                                                                "Turn on swap", ""),)},
                                                    staff.snapshot())
                 self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac">'
                                  + '<article data-machine="mac"><h2>Rebuild the Mac</h2>'
-                                 + '<div data-owner><h3>Unknown session</h3>'
+                                 + '<section class="rebuild-commits"><h3>Commits</h3>'
+                                 + '<div data-owner><h4>Unknown session</h4>'
                                  + '<dl><dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
-                                 + '<dd>Turn on swap</dd></dl></div></article></div>')
+                                 + '<dd>Turn on swap</dd></dl></div></section></article></div>')
 
             with self.subTest(rebuilds="one owner and one time each"):
                 grouped = change_browser.rebuild_list(
@@ -2076,12 +2080,12 @@ class ChangePageTests(unittest.TestCase):
                              rebuild_row.Change("3" * 40, "2026-11-12T14:00:00+00:00", "Between", ""),
                              rebuild_row.Change("4" * 40, "2026-11-12T15:00:00+00:00", "Second", owner.id))},
                     staff.snapshot())
-                self.assertEqual(grouped.count('<h3>page-owner (showrunner)</h3>'), 1)
-                self.assertIn('<div data-owner><h3>page-owner (showrunner)</h3><dl>'
+                self.assertEqual(grouped.count('<h4>page-owner (showrunner)</h4>'), 1)
+                self.assertIn('<div data-owner><h4>page-owner (showrunner)</h4><dl>'
                               + '<dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
                               + '<dd>First</dd><dd>Second</dd>'
                               + '<dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
-                              + '<dd>Older</dd></dl></div><div data-owner><h3>Unknown session</h3>', grouped)
+                              + '<dd>Older</dd></dl></div><div data-owner><h4>Unknown session</h4>', grouped)
                 self.assertIn('<p>The change list is not available yet.</p>', change_browser.rebuild_list(
                     rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)), {}, staff.snapshot()))
 
@@ -3645,8 +3649,8 @@ class ChangePageTests(unittest.TestCase):
         question = status.ask(self.page, "C1", "Which groups?")
         assert isinstance(question, change_page.QuestionDelivery)
         self.delivery_done.clear()
-        with serve.ReviewLinksServer(("127.0.0.1", 0), self.root):
-            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        with started_review_server(("127.0.0.1", 0), self.root):
+            self.assertTrue(self.delivery_done.is_set())
         saved = status.slots(self.page, "C1").question
         self.assertEqual(saved, change_page.OpenQuestion(question.question_id, "Which groups?", change_page.NoDelivery()))
         self.assertIn("Question id: " + question.question_id, self.messages[0][2])
@@ -3658,8 +3662,8 @@ class ChangePageTests(unittest.TestCase):
             assert isinstance(feedback, change_page.QuestionDelivery)
             count = len(self.messages)
             self.delivery_done.clear()
-            with serve.ReviewLinksServer(("127.0.0.1", 0), self.root):
-                self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+            with started_review_server(("127.0.0.1", 0), self.root):
+                self.assertTrue(self.delivery_done.is_set())
             recovered = change_page.DeliveryStatus(self.root).slots(self.page, "C3").question
             self.assertIsInstance(recovered, change_page.OpenFeedback)
             self.assertEqual(len(self.messages), count + 1)
@@ -4964,46 +4968,55 @@ class ChangePageTests(unittest.TestCase):
 
 class FixtureStartupRecoveryTests(unittest.TestCase):
     @contextmanager
-    def delayed_startup(self) -> Generator[tuple[ChangePageTests, threading.Thread], None, None]:
+    def startup_with_record(self, prepare: Callable[[ChangePageTests], None]) -> Generator[ChangePageTests]:
         fixture = ChangePageTests()
-        deferred: list[threading.Thread] = []
+        prepared = False
         start = threading.Thread.start
 
-        def defer_recovery(thread: threading.Thread) -> None:
-            if not deferred:
-                deferred.append(thread)
-            else:
-                start(thread)
+        def prepare_before_start(thread: threading.Thread) -> None:
+            nonlocal prepared
+            if not prepared:
+                prepare(fixture)
+                prepared = True
+            start(thread)
 
         try:
-            with patch.object(threading.Thread, "start", new=defer_recovery):
+            with patch.object(threading.Thread, "start", new=prepare_before_start):
                 fixture.setUp()
-            self.assertEqual(len(deferred), 1)
-            yield fixture, deferred[0]
+            self.assertTrue(prepared)
+            yield fixture
         finally:
             fixture.doCleanups()
 
     def test_fixture_startup_cannot_clear_a_later_legacy_verdict(self) -> None:
-        with self.delayed_startup() as (fixture, recovery):
+        def prepare(fixture: ChangePageTests) -> None:
             status = change_page.DeliveryStatus(fixture.root)
             _ = status.path(fixture.page, "C1").write_text(json.dumps({
                 "attempt": "old-attempt", "state": "pending", "kind": "verdict",
             }), encoding="utf-8")
-            recovery.run()
+
+        with self.startup_with_record(prepare) as fixture:
+            status = change_page.DeliveryStatus(fixture.root)
             _ = status.begin(fixture.page, "C1", "validation", "New words")
             self.assertEqual(status.slots(fixture.page, "C1").verdict,
                              change_page.DeliveryIntent("old-attempt", "verdict"))
             self.assertEqual(fixture.messages, [])
 
     def test_fixture_startup_cannot_send_during_a_legacy_context_rewrite(self) -> None:
-        with self.delayed_startup() as (fixture, recovery):
+        before = b""
+
+        def prepare(fixture: ChangePageTests) -> None:
+            nonlocal before
+            before = fixture.review_list.read_bytes()
             status = change_page.DeliveryStatus(fixture.root)
             _ = status.begin(fixture.page, "C1", "validation", "Keep these words", recipients=(fixture.showrunner_id,))
+
+        with self.startup_with_record(prepare) as fixture:
+            self.assertEqual(fixture.messages, [])
+            status = change_page.DeliveryStatus(fixture.root)
             path = status.path(fixture.page, "C1")
             fields = cast(dict[str, object], json.loads(path.read_text()))
             fields["page"] = {"review_list": "/missing-list", "production": "/wrong-production", "row": "C999"}
-            before = fixture.review_list.read_bytes()
-            recovery.run()
             _ = path.write_text(json.dumps(fields), encoding="utf-8")
             restarted = change_page.DeliveryStatus(fixture.root)
             change_page.recover_pending(restarted)

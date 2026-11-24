@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from typing import Literal, cast
+from urllib.parse import urlencode
 
 from scripts.lib import conf, main_publish
 from scripts.production import investigation, producer_map, staff, the_list
-from scripts.review_links import for_you, new_item_dialog, review_page
+from scripts.review_links import for_you, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
@@ -31,16 +32,21 @@ class ItemType(StrEnum):
     PROPOSAL = "proposal"
     EFFICIENCY = "efficiency"
     FEEDBACK = "feedback"
+    ENHANCEMENT = "enhancement"
 
 
-# The console server takes four kinds. Feedback and efficiency file as an investigation.
-FILED_KINDS: dict[ItemType, new_item_dialog.SubmissionKind] = {
+type _WireKind = new_item_dialog.SubmissionKind | Literal["enhancement"]
+
+
+# The server files Feedback, Efficiency and Enhancement as investigations.
+FILED_KINDS: dict[ItemType, _WireKind] = {
     ItemType.BUG: new_item_dialog.SubmissionKind.BUG,
     ItemType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
     ItemType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL,
     ItemType.EFFICIENCY: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.FEEDBACK: new_item_dialog.SubmissionKind.INVESTIGATION,
+    ItemType.ENHANCEMENT: "enhancement",
 }
 
 
@@ -82,6 +88,14 @@ class Options:
 @dataclass(frozen=True)
 class Refusal:
     reason: str
+
+
+class UnlinkedListItem(Exception):
+    """The List item exists, but its link to the Review item failed."""
+
+    def __init__(self, number: int, cause: Exception) -> None:
+        super().__init__(f"List item {number} exists without its Review link: {cause}")
+        self.number: int = number
 
 
 def usage() -> str:
@@ -131,15 +145,14 @@ def producer_question(member: staff.StaffRow, missing: producer_map.NoProducer, 
 
 
 def result_line(item_type: ItemType, member: staff.StaffRow, mapped: producer_map.MappedProducer,
-                members: staff.StaffSnapshot, *, this_session: bool, list_key: str) -> str:
-    """Say who does the work, who tracks it and why, and the List item number."""
+                members: staff.StaffSnapshot, *, this_session: bool, filed: str) -> str:
+    """Say who does the work, who tracks it and why, and where the item is filed."""
     to = unit_of(member, members) + (", this session" if this_session else "")
     producer = ""
     if member.kind != "producer":
         why = "set for" if mapped.set_by == member else "from"
         producer = f" Producer: {mapped.producer.name} ({why} {mapped.set_by.name})."
-    number = list_key.partition("/")[2].removeprefix("L")
-    return f"{item_type.value.capitalize()} → {to}.{producer} List item {number}."
+    return f"{item_type.value.capitalize()} → {to}.{producer} {filed}"
 
 
 def console_address() -> for_you.ConsoleAddress:
@@ -220,31 +233,39 @@ def recipient_for(member: staff.StaffRow, options: Options, members: staff.Staff
     return found
 
 
-def request_body(options: Options, kind: new_item_dialog.SubmissionKind, recipient: Recipient, words: str) -> bytes:
+def request_body(options: Options, kind: _WireKind, recipient: Recipient, words: str) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": kind.value,
+        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": kind,
         "recipient_id": recipient.id, "words": words, "evidence": {"kind": "none"}, "images": [],
         "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value,
     }).encode()
 
 
 def words_text(item_type: ItemType, description: str, extra: str) -> str:
-    """A type that files as another server kind names itself first; feedback files as the window files it."""
-    marked = FILED_KINDS[item_type].value != item_type.value and item_type != ItemType.FEEDBACK
-    first = f"{item_type.value.capitalize()}: {description.strip()}" if marked else description.strip()
+    """Add the Efficiency prefix and append any extra words."""
+    first = f"Efficiency: {description.strip()}" if item_type == ItemType.EFFICIENCY else description.strip()
     return first + (f"\n\n{extra.strip()}" if extra.strip() else "")
 
 
-def set_assignee(list_key: str, member: staff.StaffRow, mapped: producer_map.MappedProducer) -> None:
-    """The List item names a unit assignee and takes the assignee's producer, not the recipient's."""
-    keeper, _, identity = list_key.partition("/")
-    item = the_list.load(staff.StaffId(keeper), identity)
-    changes: the_list.ItemChanges = {"unit": member.name} if member.kind == "unit" else {}
-    if mapped.producer.id != item.producer:
-        changes["producer"] = mapped.producer.id
-    if changes:
-        _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
+def add_list_item(review_key: str, words: str, recipient: Recipient, member: staff.StaffRow,
+                  mapped: producer_map.MappedProducer, members: staff.StaffSnapshot) -> the_list.ListItem:
+    """Make the List item of a filed Review item in morty's folder, which alone allocates List numbers.
+
+    Each run sends a new request ID, so the server never gives one Review key to two runs.
+    """
+    keeper = the_list.producer_id(members, "morty")
+    evidence = review_page.PAGE_PATH + "?show=all#" + urlencode({"show": "open", "jump": review_key})
+    # The item names a unit assignee and takes the assignee's producer, not the recipient's.
+    changes: the_list.ItemChanges = {"latest_status": words, "evidence": evidence, "producer": mapped.producer.id}
+    if member.kind == "unit":
+        changes["unit"] = member.name
+    item = the_list.add(keeper, review_submissions.submission_title(words), owner=recipient.id, source=SOURCE,
+                        changes=changes)
+    try:
+        return the_list.link(keeper, item.id, (review_key,), source=SOURCE)
+    except Exception as error:
+        raise UnlinkedListItem(item.number, error) from error
 
 
 class Arguments(argparse.Namespace):
@@ -290,26 +311,36 @@ def main(arguments: list[str] | None = None) -> int:
         if isinstance(recipient, Refusal):
             print(f"new_item: {recipient.reason}", file=sys.stderr)
             return Outcome.REFUSED
-        reply = exchange(address, "POST", review_page.NEW_ITEM_PATH, request_body(
-            options, FILED_KINDS[item_type], recipient, words_text(item_type, args.description, args.extra)))
-        list_key = reply.fields.get("list_key")
-        if reply.status != 200 or not isinstance(list_key, str):
+        caller = members.by_current_session(args.session) if args.session else None
+        this_session = caller is not None and caller.id == member.id
+        words = words_text(item_type, args.description, args.extra)
+        kind = FILED_KINDS[item_type]
+        reply = exchange(address, "POST", review_page.NEW_ITEM_PATH,
+                         request_body(options, kind, recipient, words))
+        if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
-    caller = members.by_current_session(args.session) if args.session else None
-    filed = result_line(item_type, member, mapped, members,
-                        this_session=caller is not None and caller.id == member.id, list_key=list_key)
-    if member.id != recipient.id:
-        try:
-            set_assignee(list_key, member, mapped)
-        except (OSError, ValueError, staff.StaffRefused) as error:
-            print(f"new_item: filed, but the List item does not name the assignee and its producer: {filed} {error}",
-                  file=sys.stderr)
-            return Outcome.FAILED
-    print(filed)
+    # The server filed the item, so each path from here exits FILED: a second run would file it again.
+    review_id, review_key = reply.fields.get("id"), reply.fields.get("key")
+    try:
+        if not isinstance(review_key, str) or not review_key:
+            raise ValueError("the console server sent no Review item key")
+        if kind == "enhancement":
+            words = new_item_dialog.read_words(words, "Your words", kind=kind)
+        item = add_list_item(review_key, words, recipient, member, mapped, members)
+    except UnlinkedListItem as error:
+        print(result_line(item_type, member, mapped, members, this_session=this_session, filed=str(error)))
+        return Outcome.FILED
+    except Exception as error:
+        shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
+        print(result_line(item_type, member, mapped, members, this_session=this_session,
+                          filed=f"Filed as {shown}, but no List item exists: {error}"))
+        return Outcome.FILED
+    print(result_line(item_type, member, mapped, members, this_session=this_session,
+                      filed=f"List item {item.number}."))
     return Outcome.FILED
 
 

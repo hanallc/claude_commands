@@ -1,6 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.agents import remote
 
 import contextlib
@@ -141,12 +142,12 @@ class FooterCountsTests(unittest.TestCase):
         _ = listing.write_text(LIST, encoding="utf-8")
         doc = self.doc(f"- **Change review:** `{listing}`")
         record = staff.snapshot()
-        with (mock.patch.object(change_review, "routed_review_entries", wraps=change_review.routed_review_entries) as routed,
+        with (mock.patch.object(change_review, "review_snapshot", wraps=change_review.review_snapshot) as snapshot,
               mock.patch.object(staff, "snapshot", side_effect=AssertionError("use the supplied snapshot"))):
             counts = footer_counts.read_counts(doc, record=record)
         self.assertEqual(counts.changes, 2)
         self.assertEqual(counts.unrouted, 0)
-        routed.assert_called_once_with(listing, doc, record=record)
+        snapshot.assert_called_once_with(listing, include_reviewed=False, collect_owners=False)
 
     def test_footer_counts_and_watches_questions_without_a_proposals_line(self) -> None:
         doc = self.root / "example-production.md"
@@ -415,7 +416,7 @@ class FooterCountsTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         source = Path(__file__).resolve().parents[2] / "config/change_review.conf"
-        _ = (config / "change_review.conf").write_text(source.read_text())
+        _ = copy_config_file_fixture(source, config / "change_review.conf")
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         listing = self.root / "change-review - top.md"
