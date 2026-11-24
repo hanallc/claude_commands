@@ -270,47 +270,80 @@ def shell_session() -> OwningSession | NoOwningSession:
     return OwningSession(session) if session else NoOwningSession()
 
 
-def smoke_session(placement: MacPlacement, command: list[str], cookie: str,
-                  ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
+def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
     """Run the numbered copy with the SSH input open."""
     work = (
-        f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} MAC_SMOKE_COOKIE={cookie} {shlex.join(command)}\n"
-        f"printf '\\nmac_smoke_complete={cookie}:%s\\n' \"$?\""
+        'typeset +x smoke_cookie; IFS= read -r smoke_cookie || exit 1\n'
+        f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}\n"
+        'builtin printf "\\nmac_smoke_complete=%s:%s\\n" "$smoke_cookie" "$?"'
     )
     process = ssh.enter_context(subprocess.Popen(
-        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -c " + shlex.quote(work)],
+        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(work)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
     _ = ssh.callback(stop_command, process)
     return process
 
 
-def read_smoke_output(output: TextIO, cookie: str, *, until_ready: bool) -> tuple[bool, int | None]:
-    """Stream the log and accept the status only on the last line."""
-    ready = f"mac_smoke_complete={cookie}\n"
+@dataclass(frozen=True)
+class SmokeNotReady:
+    pass
+
+
+@dataclass(frozen=True)
+class SmokeFinalStatus:
+    status: int
+
+
+@dataclass(frozen=True)
+class SmokeMissingStatus:
+    pass
+
+
+SmokeResult = SmokeNotReady | SmokeFinalStatus | SmokeMissingStatus
+
+
+def read_smoke_ready(output: TextIO, cookie: str) -> bool:
+    ready = f"mac_smoke_complete={cookie}"
+    for line in output:
+        if line == ready + "\n":
+            return True
+        if not line.startswith(ready + ":"):
+            print(line, end="", flush=True)
+    return False
+
+
+def read_smoke_result(output: TextIO, cookie: str, *, ready: bool) -> SmokeResult:
+    """Accept a final status only after readiness and at the end of the log."""
+    if not ready:
+        return SmokeNotReady()
     prefix = f"mac_smoke_complete={cookie}:"
     last = ""
     for line in output:
-        if until_ready and line == ready:
-            return True, None
         if not line.startswith(prefix):
             print(line, end="", flush=True)
         last = line
     if last.startswith(prefix) and last.endswith("\n"):
         status = last[len(prefix):-1]
         if 1 <= len(status) <= 3 and status.isascii() and status.isdecimal() and int(status) <= 255:
-            return False, int(status)
-    return False, None
+            return SmokeFinalStatus(int(status))
+    return SmokeMissingStatus()
 
 
 def run_smoke_work(work: str, cleanup: str) -> int:
     """Stop the smoke work on SSH EOF and settle the copy before its lease ends."""
     from scripts.lib.build_folders import COPY_KEEP_ENV
 
+    token_length = 32
+    cookie_line = sys.stdin.buffer.readline(token_length + 1)
+    cookie = cookie_line[:-1]
+    if len(cookie) != token_length or not cookie_line.endswith(b"\n"):
+        return 1
+    if not all(byte in b"0123456789abcdef" for byte in cookie):
+        return 1
     incoming = sys.stdin.fileno()
     if select.select([incoming], [], [], 0)[0]:
         return 1
     environment = dict(os.environ)
-    cookie = environment.pop("MAC_SMOKE_COOKIE")
     checkout = Path.cwd()
     keep_file = Path(os.environ[COPY_KEEP_ENV])
     _ = keep_file.write_text("Mac smoke checkout clearance is unconfirmed.\n")
@@ -351,8 +384,8 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     if status < 0:
         status = 128 - status
     status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
-    print(f"\nmac_smoke_complete={cookie}", flush=True)
-    _ = sys.stdin.read()
+    print(f"\nmac_smoke_complete={cookie.decode('ascii')}", flush=True)
+    _ = sys.stdin.buffer.read()
     return status
 
 
@@ -428,7 +461,6 @@ def run_attempt(
         cookie = uuid.uuid4().hex if mac_run else ""
         smoke: subprocess.Popen[str] | None = None
         smoke_ready = False
-        smoke_status: int | None = None
         cleaned = False
         try:
             while True:
@@ -495,15 +527,15 @@ def run_attempt(
                         if args.owned_close and not on_close:
                             raise ValueError("the run needs a close hook")
                         if mac_run:
-                            smoke = smoke_session(placement, command, cookie, ssh)
+                            smoke = smoke_session(placement, command, ssh)
                             remote.state = RemoteState.LIVE
-                            assert smoke.stdout is not None
-                            smoke_ready, smoke_status = read_smoke_output(cast(TextIO, smoke.stdout), cookie, until_ready=True)
+                            assert smoke.stdin is not None and smoke.stdout is not None
+                            # The shell and the worker each read one line from SSH input.
+                            _ = smoke.stdin.write(f"{cookie}\n{cookie}\n")
+                            smoke.stdin.flush()
+                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), cookie)
                             if smoke_ready:
                                 status = 0
-                            elif smoke_status is not None:
-                                status = smoke_status
-                                remote.state = RemoteState.EXITED
                         else:
                             status = stream_remote(remote_command(placement, args.cwd, command, on_close,
                                                                   owned_close=args.owned_close), remote, ssh)
@@ -539,17 +571,18 @@ def run_attempt(
                 assert smoke.stdin is not None and smoke.stdout is not None
                 try:
                     smoke.stdin.close()
-                    if smoke_ready:
-                        _, smoke_status = read_smoke_output(cast(TextIO, smoke.stdout), cookie, until_ready=False)
+                    smoke_result = read_smoke_result(cast(TextIO, smoke.stdout), cookie, ready=smoke_ready)
                     _ = smoke.wait()
-                    if smoke_status is None:
-                        print("mac queue: the Mac returned no valid final status", file=sys.stderr)
-                        status = 255
-                        safe = False
-                    else:
-                        remote.state = RemoteState.EXITED
-                        status = smoke_status or status
-                        safe = True
+                    match smoke_result:
+                        case SmokeFinalStatus(remote_status):
+                            remote.state = RemoteState.EXITED
+                            status = remote_status or status
+                            safe = True
+                        case SmokeNotReady() | SmokeMissingStatus():
+                            detail = " because the ready line is missing" if isinstance(smoke_result, SmokeNotReady) else ""
+                            print(f"mac queue: the Mac returned no valid final status{detail}", file=sys.stderr)
+                            status = 255
+                            safe = False
                 except (OSError, ValueError) as error:
                     print(f"mac queue: the Mac smoke session did not finish: {error}", file=sys.stderr)
                     status = status or 2

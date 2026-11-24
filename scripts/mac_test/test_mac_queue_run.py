@@ -32,6 +32,8 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 
 
+FIXTURE_SMOKE_TOKEN = "73b79143c2c846a18d3bdb66b5dd15a0"
+
 QUEUE = r'''
 import json, os, sys, time
 from pathlib import Path
@@ -848,16 +850,23 @@ else:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = queue_fixture(root, """
-import shlex, subprocess, sys
-subprocess.run(shlex.split(sys.argv[-1]), check=False)
+import os, shlex, subprocess, sys
+from pathlib import Path
+root = Path(os.environ["FAKE_QUEUE_STATE"])
+subprocess.run(shlex.split(sys.argv[-1]), cwd=root / "checkout", check=False)
 raise SystemExit(0)
 """)
+            (root / "checkout").mkdir()
+            environment["COPIES_KEEP_FILE"] = str(root / "copy.keep")
+            environment["SMOKE_WORKER"] = str(Path(mac_queue_run.__file__).resolve())
             callback = root / "mac_run.sh"
             write_stdlib_tool(callback, """
-import json, sys
+import json, os, sys
 from pathlib import Path
 if sys.argv[1] == "prepare":
-    Path(sys.argv[2]).write_text(json.dumps(["/bin/zsh", "-c", "print mac_exit=0; exit 7"]))
+    Path(sys.argv[2]).write_text(json.dumps([
+        sys.executable, os.environ["SMOKE_WORKER"], "smoke-work", "print mac_exit=0; exit 7", "true",
+    ]))
 """)
             command = self.command(root, "run")
             command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
@@ -867,35 +876,72 @@ if sys.argv[1] == "prepare":
             self.assertIn("mac_exit=0", result.stdout.splitlines())
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
 
-    def test_smoke_rejects_missing_or_invalid_final_status_when_ssh_exits_zero(self) -> None:
-        for frame in ("missing", "ready-without-status", "wrong-token", "malformed", "out-of-range", "followed-by-output"):
-            with self.subTest(frame=frame), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                environment = queue_fixture(root, """
-import os, shlex, sys
-frame = os.environ["FAKE_SMOKE_FRAME"]
-work = shlex.split(sys.argv[-1])[2]
-cookie = shlex.split(work.splitlines()[0])[1].removeprefix("MAC_SMOKE_COOKIE=")
-print("Mac output")
-if frame == "ready-without-status":
-    print(f"mac_smoke_complete={cookie}")
-elif frame != "missing":
-    token = "another-run" if frame == "wrong-token" else cookie
-    status = {"malformed": "void", "out-of-range": "256"}.get(frame, "0")
-    print(f"mac_smoke_complete={token}:{status}")
-if frame == "followed-by-output":
-    print("more output")
-""")
-                callback = root / "mac_run.sh"
-                write_stdlib_tool(callback, """
+    def smoke_protocol_command(self, root: Path) -> list[str]:
+        callback = root / "mac_run.sh"
+        write_stdlib_tool(callback, """
 import sys
 from pathlib import Path
 if sys.argv[1] == "prepare":
     Path(sys.argv[2]).write_text('["true"]')
 """)
-                command = self.command(root, "run")
-                command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
-                result = subprocess.run(command, env={**environment, "FAKE_SMOKE_FRAME": frame},
+        command = self.command(root, "run")
+        command[1:3] = ["-c", """
+import os, uuid
+from types import SimpleNamespace
+from scripts.mac_test import mac_queue_run
+
+ids = iter((uuid.uuid4(), uuid.UUID(hex=os.environ["FIXTURE_SMOKE_TOKEN"])))
+mac_queue_run.uuid = SimpleNamespace(uuid4=lambda: next(ids))
+raise SystemExit(mac_queue_run.main())
+"""]
+        command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
+        return command
+
+    def test_smoke_sends_the_token_on_ssh_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root, """
+import os, sys
+token = os.environ["FIXTURE_SMOKE_TOKEN"]
+assert all(token not in argument for argument in sys.argv), "Token found in SSH arguments"
+assert sys.stdin.readline() == token + chr(10), "Token missing from SSH input"
+assert sys.stdin.readline() == token + chr(10), "Token missing from worker input"
+print(f"mac_smoke_complete={token}", flush=True)
+assert sys.stdin.read() == ""
+print(f"mac_smoke_complete={token}:0", flush=True)
+""")
+            environment["FIXTURE_SMOKE_TOKEN"] = FIXTURE_SMOKE_TOKEN
+            result = subprocess.run(self.smoke_protocol_command(root), env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+
+    def test_smoke_rejects_missing_or_invalid_final_status_when_ssh_exits_zero(self) -> None:
+        for frame in ("missing", "valid-without-ready", "valid-before-ready", "ready-without-status",
+                      "wrong-token", "malformed", "out-of-range", "followed-by-output"):
+            with self.subTest(frame=frame), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root, """
+import os, sys
+frame = os.environ["FAKE_SMOKE_FRAME"]
+token = os.environ["FIXTURE_SMOKE_TOKEN"]
+ready = f"mac_smoke_complete={token}"
+print("Mac output")
+if frame in ("valid-without-ready", "valid-before-ready"):
+    print(f"{ready}:0")
+    if frame == "valid-before-ready":
+        print(ready)
+elif frame != "missing":
+    print(ready)
+    if frame != "ready-without-status":
+        token = "another-run" if frame == "wrong-token" else token
+        status = {"malformed": "void", "out-of-range": "256"}.get(frame, "0")
+        print(f"mac_smoke_complete={token}:{status}")
+if frame == "followed-by-output":
+    print("more output")
+""")
+                environment.update(FAKE_SMOKE_FRAME=frame, FIXTURE_SMOKE_TOKEN=FIXTURE_SMOKE_TOKEN)
+                result = subprocess.run(self.smoke_protocol_command(root), env=environment,
                                         capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
                 self.assertIn("no valid final status", result.stderr)
@@ -908,7 +954,10 @@ if sys.argv[1] == "prepare":
     def test_ended_smoke_keeps_the_legacy_scratch_record_when_cleanup_fails(self) -> None:
         self.check_legacy_scratch_cleanup(clear=False)
 
-    def check_legacy_scratch_cleanup(self, *, clear: bool) -> None:
+    def test_ended_smoke_lists_the_legacy_task_without_a_checkout(self) -> None:
+        self.check_legacy_scratch_cleanup(clear=False, checkout_known=False)
+
+    def check_legacy_scratch_cleanup(self, *, clear: bool, checkout_known: bool = True) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = queue_fixture(root, SSH.replace(
@@ -926,7 +975,7 @@ if "stop-checkout" in sys.argv[-1]:
             state = directory / "argv.json.state"
             bundle = root / "legacy bundle"
             bundle.touch()
-            checkout = root / "old checkout"
+            checkout = str(root / "old checkout") if checkout_known else ""
             task = "gate:mac-run-fixture"
             old_state = f"clone={shlex.quote(str(checkout))}\nclone_task={task}\nbundle={shlex.quote(str(bundle))}\n"
             _ = state.write_text(old_state)
@@ -958,6 +1007,13 @@ if sys.argv[2] == "stop-checkout":
             self.assertEqual(record.exists(), not clear, result.stdout + result.stderr)
             self.assertEqual(receipt.exists(), not clear)
             self.assertEqual(bundle.exists(), not clear)
+            if not checkout_known:
+                self.assertEqual(state.read_text(), old_state)
+                self.assertIn(f"kept for a manual removal list: {state} (scratch, task {task} has no checkout path)",
+                              result.stderr)
+                self.assertFalse((root / "legacy-host").exists())
+                self.assertFalse((root / "legacy-actions").exists())
+                return
             self.assertTrue((root / "legacy-host").exists(), result.stdout + result.stderr)
             self.assertEqual((root / "legacy-host").read_text(), "saved-mac")
             actions = [cast(list[str], json.loads(line)) for line in (root / "legacy-actions").read_text().splitlines()]
@@ -981,6 +1037,7 @@ if sys.argv[2] == "stop-checkout":
             keep = root / "1.keep"
             cleanup_record = root / "cleanup"
             source = Path(mac_queue_run.__file__).resolve()
+            token = FIXTURE_SMOKE_TOKEN.encode("ascii")
             for disconnected in (False, True):
                 with self.subTest(disconnected=disconnected):
                     cleanup_record.unlink(missing_ok=True)
@@ -996,17 +1053,18 @@ if sys.argv[2] == "stop-checkout":
                     with subprocess.Popen(
                         [sys.executable, str(source), "smoke-work", work, cleanup],
                         cwd=checkout, env={**os.environ, "HOME": str(root), "COPIES_COMMAND_LEASE_FDS": "",
-                                           "COPIES_KEEP_FILE": str(keep), "CLEANUP_RECORD": str(cleanup_record),
-                                           "MAC_SMOKE_COOKIE": "fixture-cookie"},
+                                           "COPIES_KEEP_FILE": str(keep), "CLEANUP_RECORD": str(cleanup_record)},
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     ) as process:
                         assert process.stdin is not None and process.stdout is not None
                         try:
+                            _ = process.stdin.write(token + b"\n")
+                            process.stdin.flush()
                             self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                             self.assertEqual(process.stdout.readline(), b"work-ready\n")
                             if not disconnected:
                                 self.assertEqual(process.stdout.readline(), b"\n")
-                                self.assertEqual(process.stdout.readline(), b"mac_smoke_complete=fixture-cookie\n")
+                                self.assertEqual(process.stdout.readline(), b"mac_smoke_complete=" + token + b"\n")
                                 self.assertIsNone(process.poll())
                                 self.assertTrue(cleanup_record.exists())
                             else:
