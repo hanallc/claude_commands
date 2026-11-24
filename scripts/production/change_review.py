@@ -577,9 +577,9 @@ class _ReadinessCommits:
     pending: dict[Path, tuple[str, int]] = field(default_factory=dict)
     failures: dict[Path, str] = field(default_factory=dict)
 
-    def add(self, path: Path, subject: str, wrote: bool) -> None:
-        previous, writes = self.pending.get(path, (subject, 0))
-        self.pending[path] = (subject if wrote else previous, writes + wrote)
+    def add(self, path: Path, subject: str, rows: list[str]) -> None:
+        previous, count = self.pending.get(path, (subject, 0))
+        self.pending[path] = (subject if rows else previous, count + len(rows))
 
     def commit(self) -> None:
         for path, (subject, _) in self.pending.items():
@@ -590,19 +590,17 @@ class _ReadinessCommits:
                 self.failures[path] = next(iter(str(error).splitlines()), type(error).__name__)
 
     def report(self) -> None:
-        if self.failures:
-            writes = sum(self.pending[path][1] for path in self.failures)
-            details = [f"{path.name}: {reason}" for path, reason in self.failures.items()]
-            summary = (f"change review: {writes} new list write(s) not committed. "
-                       + f"{len(self.failures)} unresolved commit attempt(s).")
-            separator = " " if len(details) == 1 else "\n  "
-            _print_warning(summary + separator + separator.join(details))
+        for path, reason in self.failures.items():
+            count = self.pending[path][1]
+            label = "row" if count == 1 else "rows"
+            _print_warning(f"change review: {path}: {count} new {label} saved. The commit attempt failed ({reason})."
+                           + " The next successful write commits the list.")
 
 
 def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
           what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning,
           publish: Callable[[Path, str], None] | None = None,
-          readiness: _ReadinessCommits | None = None) -> Result:
+          defer_commit: Callable[[Path, str, Result], None] | None = None) -> Result:
     """Change the list's lines under the lock, then write and commit them.
 
     A change that raises an error writes nothing. The lock is the list's directory.
@@ -616,16 +614,15 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
             text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
             lines = text.splitlines(keepends=True)
             result = write(lines)
-            wrote = lines != text.splitlines(keepends=True)
-            if wrote:
+            if lines != text.splitlines(keepends=True):
                 _sort(path, lines)
                 _stamp(path, lines, production, day)
                 (publish or write_text_atomic)(path, "".join(lines))
         subject = f"{_owner(path)} {what(result)}"
-        if readiness is None:
+        if defer_commit is None:
             _commit([path], subject, report_warning=report_warning)
         else:
-            readiness.add(path, subject, wrote)
+            defer_commit(path, subject, result)
         return result
 
 
@@ -900,7 +897,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             visible = [WrittenReviewRow(path, row) for row in pending_rows]
             raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
 
-    rows = _edit(path, production, day, write, what, publish=publish, readiness=readiness)
+    rows = _edit(path, production, day, write, what, publish=publish,
+                 defer_commit=readiness.add if readiness is not None else None)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -2536,7 +2534,7 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
                     known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge.
 
-    Try the vault lock once per list after the scan. Report any uncommitted lists together.
+    Try the vault lock once per list after the scan. Report each list that could not be committed.
     """
     commits = _ReadinessCommits()
     try:

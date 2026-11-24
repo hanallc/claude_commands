@@ -3986,7 +3986,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
 
-    def ready_arguments(self, *, names: tuple[str, ...] = ("First", "Second")) -> tuple[str, ...]:
+    def ready_arguments(self, *, names: tuple[str, ...] = ("First", "Second"), rows_per_merge: int = 1) -> tuple[str, ...]:
         self.path = self.path.with_name("change-review - commit-scan.md")
         _ = self.enterContext(isolated_staff_file(self.repo.parent / "staff.json", {}))
         self.enterContext(mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(self.path.parent)}))
@@ -3996,7 +3996,9 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
                                   + f"- **Change review:** `{self.path}`\n")
         _ = fixture_member("showrunner", name="commit-scan", doc=staff.LiveDoc(remote.local_machine(), production))
         for name in names:
-            message = pictured_review_lines(f"{name} change\n\nChange-Review: {name} | Read | Result")
+            titles = [name] if rows_per_merge == 1 else [f"{name} {number}" for number in range(1, rows_per_merge + 1)]
+            trailers = "\n".join(f"Change-Review: {title} | Read | Result" for title in titles)
+            message = pictured_review_lines(f"{name} change\n\n{trailers}")
             for arguments in (("checkout", "-qb", name), ("commit", "-qm", message, "--allow-empty"),
                               ("checkout", "-q", "main"), ("merge", "--no-ff", "-qm", f"Merge {name}", name)):
                 _ = subprocess.run(["git", "-C", str(source), *arguments], check=True,
@@ -4034,15 +4036,41 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
             self.assertEqual(code, 0)
             self.assertEqual(output.count("| C"), 2)
             self.assertEqual(len(error.splitlines()), 1, error)
-            self.assertIn("2 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
+            self.assertIn("2 new rows saved. The commit attempt failed", error)
             self.assertIn(self.path.name, error)
             self.assertIn(os.strerror(errno.EAGAIN), error)
             self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
             code, output, error = run(*arguments)
             self.assertEqual((code, output), (0, ""))
             self.assertEqual(len(error.splitlines()), 1, error)
-            self.assertIn("0 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
+            self.assertIn("0 new rows saved. The commit attempt failed", error)
             release()
+
+    def test_merge_publication_warns_once_and_the_next_add_commits_all_rows(self) -> None:
+        arguments = self.ready_arguments(rows_per_merge=3)
+        production = production_doc.ProductionDocument(self.repo.parent / "production.md", "commit-scan", "main",
+                                                        Path(arguments[2]), self.repo.parent / "log", ZoneInfo("UTC"))
+        before = self.git("rev-parse", "HEAD")
+        output, warnings = io.StringIO(), io.StringIO()
+        with self.hold_vault_lock() as release:
+            with (mock.patch.object(main_push_lock, "main_push_lock", wraps=main_push_lock.main_push_lock) as lock,
+                  redirect_stdout(output), redirect_stderr(warnings)):
+                merge_checkpoint.record_publication_changes(production)
+            lock.assert_called_once_with(self.repo, "change-review", wait=False)
+            self.assertEqual(self.git("rev-parse", "HEAD"), before)
+            release()
+        self.assertIn(f"6 row(s) added to {self.path}", output.getvalue())
+        self.assertEqual(len(warnings.getvalue().splitlines()), 1, warnings.getvalue())
+        self.assertIn(f"{self.path}: 6 new rows saved.", warnings.getvalue())
+        self.assertIn(os.strerror(errno.EAGAIN), warnings.getvalue())
+        names = {f"{name} {number}" for name in ("First", "Second") for number in range(1, 4)}
+        self.assertEqual({row["Change"] for row in change_review.pending(self.path)}, names)
+        self.assertEqual(run_with_image("add", "--production", "commit-scan", "--list", str(self.path),
+                                        "--change", "Next", "--check", "Read", "--see", "Result"), (0, "C7\n", ""))
+        self.assertEqual(self.git("rev-list", "--count", f"{before}..HEAD"), "1")
+        committed = self.git("show", f"HEAD:{self.path.relative_to(self.repo)}")
+        self.assertEqual(committed, self.path.read_text(encoding="utf-8").strip())
+        self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_list_ready_commits_after_agent_notes_releases_the_vault_lock(self) -> None:
         arguments = self.ready_arguments()
@@ -4080,9 +4108,10 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertEqual(code, 0, error)
         self.assertEqual(output.count("| C"), 3)
         self.assertEqual(len(error.splitlines()), 1, error)
-        self.assertIn("2 new list write(s) not committed. 1 unresolved commit attempt(s)", error)
+        self.assertIn("2 new rows saved. The commit attempt failed", error)
         reason = BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
-        self.assertIn(f"{self.path.name}: {reason}", error)
+        self.assertIn(f"({reason})", error)
+        self.assertIn(str(self.path), error)
         self.assertNotIn(other.name, error)
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
         self.assertEqual(self.git("status", "--porcelain", "-z"), f"?? {self.path.relative_to(self.repo)}\0")

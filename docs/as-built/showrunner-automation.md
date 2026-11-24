@@ -460,10 +460,9 @@ Each local Promote checkout must exist before the command pushes.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
   Commits share the vault's main push lock with the other Git writers.
-  At the end of a readiness scan, the scan tries the vault lock once per list without waiting.
+  The readiness scan also runs after a merge. It tries the vault lock once per list without waiting.
   If the lock is busy, the list stays uncommitted. The next scan tries again.
-  The scan reports each unresolved list and its commit errors in one warning at the end.
-  The warning counts new writes separately from attempts to commit existing content.
+  Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
   Other list writes report a commit failure immediately.
   The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
