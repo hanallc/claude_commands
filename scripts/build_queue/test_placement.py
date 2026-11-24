@@ -1529,28 +1529,56 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
     def test_guest_owner_and_branch_reports_keep_the_first_completion(self) -> None:
-        cases = ((True, 0), (False, 0), (True, 7))
-        for owner_first, status in cases:
-            with self.subTest(owner_first=owner_first, status=status), PlacementFixture() as fixture:
+        cases = ((True, 0, False), (False, 0, False), (True, 7, False), (True, 0, True), (False, 0, True))
+        for owner_first, status, proof_required in cases:
+            with (self.subTest(owner_first=owner_first, status=status, proof_required=proof_required),
+                  PlacementFixture() as fixture):
                 request = mac_linux_and_natedev_request(fixture)
                 owner = fixture.fixture_owner(os.getpid(), "owner-start")
                 request = replace(request, owner=replace(request.owner, pid=owner.pid, start_time=owner.start_time),
                                   run=wire.RunIdentity(owner.pid, owner.start_time))
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
-                granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment),
+                                                    proof_required=proof_required)
                 assert isinstance(granted, wire.FirstAuthorization), granted
+                _ = fixture.run_pass()
                 key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 owner_end = wire.encode_owner_end(wire.OwnerEnd("owner-end", assignment, assignment.owner, status))
-                branch_status = 0 if owner_first else 3
+                branch_status = 3 if proof_required or not owner_first else 0
+                branch_evidence = (execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                    "mac-linux", "fixture-boot", "fixture-machine", assignment.attempt)) if proof_required
+                    else execution_identity.ExecutionEvidenceUnavailable("guest ended", fixture.clock.now()))
                 branch_end = wire.ExecutionReport("branch-end", assignment, granted.claim,
-                    execution_identity.ExecutionEvidenceUnavailable("guest ended", fixture.clock.now()),
-                    placement.AttemptCompleted(branch_status), placement.DispatchPathSettled(), code_version="branch")
+                    branch_evidence, placement.AttemptCompleted(branch_status), placement.DispatchPathSettled(),
+                    code_version="branch")
                 first, second = (owner_end, branch_end) if owner_first else (branch_end, owner_end)
 
                 first_reply, = fixture.connect(first).replies()
                 assert isinstance(first_reply, wire.DispatchStatus), first_reply
                 received_at = fixture.clock.now()
+                if proof_required:
+                    self.assertEqual(first_reply.state, placement.CurrentAssignment())
+                    saved = fixture.server.assignments[key]
+                    report = saved.terminal_report
+                    assert isinstance(report, placement.TerminalAttemptReport), report
+                    self.assertEqual(report.outcome, placement.AttemptCompleted(status if owner_first else branch_status))
+                    self.assertIsInstance(report.path, placement.DispatchPathPending)
+                    self.assertEqual(report.received_at, received_at)
+                    self.assertIsInstance(saved.confirmed_guest_start,
+                        records.GuestStartNotRecorded if owner_first else records.ConfirmedGuestStart)
+                    evidence = fixture.server.execution_evidence.copy()
+                    versions = fixture.server.caller_versions.copy()
+                    event_count = fixture.server.input_event_count
+                    fixture.clock.epoch += 1
+
+                    self.assertEqual(fixture.connect(second).replies(), [first_reply])
+                    self.assertEqual(fixture.server.execution_evidence, evidence)
+                    self.assertEqual(fixture.server.assignments[key], saved)
+                    self.assertEqual(service.read_state(fixture.state_dir).assignments[key], saved)
+                    self.assertEqual(fixture.server.caller_versions, versions)
+                    self.assertEqual(fixture.server.input_event_count, event_count)
+                    continue
                 if owner_first:
                     closed = first_reply
                 else:

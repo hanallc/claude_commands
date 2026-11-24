@@ -6270,10 +6270,11 @@ done
                 placement.DispatchPathPending("Mac Linux settlement is pending"), received_at)
         elif not isinstance(report.outcome, placement.AttemptCompleted):
             return wire.Refused("the attempt already has a terminal report")
+        elif saved.guest_proof_required:
+            return self._placement_status(assignment, check_lifetime=False)
         if saved.guest_proof_required:
-            if report != saved.terminal_report:
-                self.assignments[key] = replace(saved, terminal_report=report)
-                self.persist()
+            self.assignments[key] = replace(saved, terminal_report=report)
+            self.persist()
             self._schedule_pass()
         else:
             terminal = replace(report, path=placement.DispatchPathSettled())
@@ -6401,10 +6402,13 @@ done
             return [self._handle_owner_end(request, connection)]
         if isinstance(request, wire.ExecutionReport) and isinstance(request.outcome, placement.AttemptCompleted):
             assignment = request.assignment
-            if assignment.destination.provider == "ssh" and assignment.destination.target == "mac-linux":
+            if is_mac_linux_guest(assignment.destination):
                 saved = self._saved_assignment(assignment.episode, assignment.attempt)
                 if (isinstance(saved, records.SavedPlacementAssignment) and saved.assignment == assignment
-                        and saved.state == placement.ClosedAssignment("completed")):
+                        and (saved.state == placement.ClosedAssignment("completed")
+                             or isinstance(saved.state, placement.CurrentAssignment)
+                             and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+                             and isinstance(saved.terminal_report.outcome, placement.AttemptCompleted))):
                     return [self._placement_status(assignment, check_lifetime=False)]
         if isinstance(request, status_wire.PlacementStatusRequest):
             saved = self._saved_assignment(request.episode, request.attempt)
