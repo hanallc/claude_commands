@@ -248,14 +248,15 @@ def run_gate_with_placement(
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
                 refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
+                destination = previous.destination
+                waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
+                    destination.provider == 'scaler' or (destination.provider == 'ssh' and destination.target == 'mac-linux'
+                        and isinstance(settled.permission, placement.PermissionConsumed)))
                 if (settled.assignment != refusal.assignment
                         or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                         or not isinstance(settled.retry, placement.RetryAt)
-                        or settled.state != placement.ClosedAssignment(refusal.reason)
-                        and not (previous.destination.provider == 'scaler'
-                                 and isinstance(settled.state, placement.CurrentAssignment))):
+                        or (settled.state != placement.ClosedAssignment(refusal.reason) and not waiting_for_settlement)):
                     raise wire.AdmissionUnavailable('the queue did not permit a retry for the gate attempt')
-                destination = previous.destination
                 reason = 'did not answer' if refusal.reason == placement.MAC_LINUX_NO_ANSWER else refusal.reason
                 retry_notice = (f'placement: retry — {destination.host} ({destination.target}) {reason}. '
                                 + 'Received a replacement assignment.')

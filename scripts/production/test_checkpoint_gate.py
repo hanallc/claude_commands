@@ -224,7 +224,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         # The guest gate consumed its launch permission, then took no run.
         fixture = GatePlacementFixture(self)
         fixture.report_failure.return_value = admission_wire.DispatchStatus(fixture.guest,
-            placement.ClosedAssignment(REASON), placement.PermissionConsumed(12.0), retry=placement.RetryAt(13.0))
+            placement.CurrentAssignment(), placement.PermissionConsumed(12.0), retry=placement.RetryAt(13.0))
         run = mock.Mock(side_effect=[fixture.refuse_guest(), subprocess.CompletedProcess(COMMAND, 0, "", "")])
         with redirect_stdout(io.StringIO()):
             detail = fixture.run_step(run)
