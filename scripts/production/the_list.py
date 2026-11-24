@@ -1658,9 +1658,8 @@ def _require_schedule_selection(
 def _scoped_series_run(series: ScheduledSeries, scope: ScheduleScope, moment: datetime, limit: int,
                        expected: ScheduleExpectation | UseCurrentSchedule) -> SeriesRun:
     selected = series.next_run(moment, limit)
-    if isinstance(expected, ScheduleExpectation) and (
-            not isinstance(selected, SeriesRun) or selected.number != expected.run_number):
-        raise ScheduleSelectionChanged("The next run changed. Open the item again.")
+    if isinstance(expected, ScheduleExpectation):
+        _require_expected_run(selected, expected)
     if isinstance(selected, repeat_rule.NoNextRun):
         raise ListError("the series has no next run. Use --scope all")
     if scope is ScheduleScope.FOLLOWING and selected.number == 1:
@@ -1668,9 +1667,21 @@ def _scoped_series_run(series: ScheduledSeries, scope: ScheduleScope, moment: da
     return selected
 
 
+def _require_expected_run(selected: SeriesRun | repeat_rule.NoNextRun, expected: ScheduleExpectation) -> None:
+    number = selected.number if isinstance(selected, SeriesRun) else 0
+    if number != expected.run_number:
+        raise ScheduleSelectionChanged("The next run changed. Open the item again.")
+
+
 def _replace_series_run(series: ScheduledSeries, number: int, run: ScheduledRun | RemovedRun) -> ScheduledSeries:
     exceptions = tuple(entry for entry in series.exceptions if entry.number != number)
     return replace(series, exceptions=(*exceptions, RunException(number, run)))
+
+
+def _series_exceptions_with_words(series: ScheduledSeries, words: str, first_number: int) -> tuple[RunException, ...]:
+    return tuple(replace(entry, run=replace(entry.run, words=words))
+                 if entry.number >= first_number and isinstance(entry.run, ScheduledRun) else entry
+                 for entry in series.exceptions)
 
 
 def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleScope, moment: datetime,
@@ -1688,15 +1699,20 @@ def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleSc
         return ScheduledSeries(run, rule) if isinstance(rule, repeat_rule.RepeatRule) else run
     if scope is ScheduleScope.ALL:
         rule = edits.get("repeat", schedule.rule)
-        run = ScheduledRun(edits.get("start", schedule.first.start), edits.get("words", schedule.first.words))
+        start = edits.get("start", schedule.first.start)
+        if "repeat" in edits and "start" not in edits and isinstance(expected, ScheduleExpectation):
+            selected = schedule.next_run(moment, series_run_limit())
+            _require_expected_run(selected, expected)
+            if isinstance(selected, SeriesRun):
+                start = selected.run.start.astimezone(user_zone())
+        run = ScheduledRun(start, edits.get("words", schedule.first.words))
         if not isinstance(rule, repeat_rule.RepeatRule):
             return run
         exceptions = schedule.exceptions
         if _schedule_time_text(run.start) != _schedule_time_text(schedule.first.start) or rule != schedule.rule:
             exceptions = ()
         elif "words" in edits:
-            exceptions = tuple(replace(entry, run=replace(entry.run, words=run.words))
-                               if isinstance(entry.run, ScheduledRun) else entry for entry in exceptions)
+            exceptions = _series_exceptions_with_words(schedule, run.words, schedule.runs_before + 1)
         return ScheduledSeries(run, rule, schedule.runs_before, exceptions)
     selected = _scoped_series_run(schedule, scope, moment, series_run_limit(), expected)
     if scope is ScheduleScope.THIS:
@@ -1712,9 +1728,26 @@ def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleSc
     rule = edits.get("repeat", schedule.rule)
     if not isinstance(rule, repeat_rule.RepeatRule):
         return run
+    exceptions: tuple[RunException, ...] = ()
+    if edits.keys() == {"words"}:
+        exceptions = _series_exceptions_with_words(schedule, run.words, selected.number)
+        # Keep earlier exceptions and any earlier run that has a later start.
+        if (selected.run.start.astimezone(UTC) < selected.original.astimezone(UTC)
+                or any(entry.number < selected.number for entry in exceptions)):
+            if run.words != schedule.first.words:
+                saved_numbers = {entry.number for entry in exceptions}
+                earlier_count = selected.number - schedule.runs_before - 1
+                earlier = schedule.rule.runs(schedule.first.start, earlier_count)
+                exceptions += tuple(
+                    RunException(number, ScheduledRun(start, schedule.first.words))
+                    for number, start in enumerate(earlier, schedule.runs_before + 1) if number not in saved_numbers
+                )
+            return replace(schedule, first=replace(schedule.first, words=run.words), exceptions=exceptions)
+        if _schedule_time_text(selected.run.start) == _schedule_time_text(selected.original):
+            exceptions = tuple(entry for entry in exceptions if entry.number != selected.number)
     if "repeat" not in edits and isinstance(rule.end, repeat_rule.RunCount):
         rule = replace(rule, end=repeat_rule.RunCount(rule.end.count - (selected.number - schedule.runs_before - 1)))
-    return ScheduledSeries(run, rule, runs_before=selected.number - 1)
+    return ScheduledSeries(run, rule, runs_before=selected.number - 1, exceptions=exceptions)
 
 
 def _remove_schedule(schedule: Schedule, scope: ScheduleScope, moment: datetime,
@@ -1752,14 +1785,7 @@ def save_page_schedule(keeper: staff.StaffId, identity: str, operation: Schedule
                 raise question_record.AnswerRefused("Enter an instruction for the start time.")
             if "start" in edits and edits["start"] <= moment:
                 raise question_record.AnswerRefused("Choose a future start time.")
-            changes = edits
-            if (scope is ScheduleScope.ALL and "repeat" in edits
-                    and "start" not in edits and isinstance(existing, ScheduledSeries)):
-                selected = existing.next_run(moment, series_run_limit())
-                if isinstance(selected, SeriesRun):
-                    changes = edits.copy()
-                    changes["start"] = selected.run.start.astimezone(user_zone())
-            schedule = _schedule_edit(existing, changes, scope, moment, expected)
+            schedule = _schedule_edit(existing, edits, scope, moment, expected)
             _check_series_limit(schedule)
         return replace(item, state=ItemState.SCHEDULED, schedule=schedule, parked_until=NoTimestamp.UNSET)
 

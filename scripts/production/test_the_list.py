@@ -313,6 +313,35 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(item.log[:-1], before.log)
                 self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {"schedule": series}))
 
+        old_words, new_words = "Read the figures.", "Read new figures."
+        fourth = start + timedelta(days=3, hours=2)
+        early = second - timedelta(hours=1)
+        for exceptions, now_at, expected_runs in (
+            ((the_list.RunException(2, the_list.ScheduledRun(moved, old_words)),
+              the_list.RunException(3, the_list.RemovedRun.SKIPPED),
+              the_list.RunException(4, the_list.ScheduledRun(fourth, old_words))),
+             second, ((2, moved, new_words), (4, fourth, new_words), (5, start + timedelta(days=4), new_words))),
+            ((the_list.RunException(3, the_list.ScheduledRun(early, old_words)),),
+             early, ((3, early, new_words), (2, second, old_words), (4, start + timedelta(days=3), new_words))),
+        ):
+            with self.subTest(scope="following", exceptions=exceptions):
+                schedule = the_list.ScheduledSeries(the_list.ScheduledRun(start, old_words),
+                                                   repeat_rule.parse("FREQ=DAILY;COUNT=5"), exceptions=exceptions)
+                item = self.add(changes={"state": the_list.ItemState.SCHEDULED, "schedule": schedule})
+                with patch.object(the_list, "now", return_value=now_at):
+                    code, output, errors = self.command("update", "--id", item.id, "--source", "nate",
+                                                        "--scope", "following", "--do", new_words)
+                self.assertEqual((code, errors), (0, ""))
+                self.assertIn("Repeats: Daily", output)
+                series = the_list.load(MORTY.id, item.id).schedule
+                assert isinstance(series, the_list.ScheduledSeries)
+                moment = now_at
+                for number, date, words in expected_runs:
+                    next_run = series.next_run(moment, the_list.series_run_limit())
+                    assert isinstance(next_run, the_list.SeriesRun)
+                    self.assertEqual((next_run.number, next_run.run), (number, the_list.ScheduledRun(date, words)))
+                    moment = date + timedelta(microseconds=1)
+
     def test_repeated_item_removals_use_the_selected_scope(self) -> None:
         start = datetime(2026, 11, 30, 17, tzinfo=UTC)
         second = start + timedelta(days=1)
@@ -374,11 +403,19 @@ class TheListTests(unittest.TestCase):
         for scope, moment in (
             (the_list.ScheduleScope.THIS, start + timedelta(days=2)),
             (the_list.ScheduleScope.FOLLOWING, start + timedelta(days=the_list.series_run_limit())),
+            (the_list.ScheduleScope.ALL, start + timedelta(days=2)),
         ):
             with self.subTest(scope=scope, moment=moment), patch.object(the_list, "now", return_value=moment):
                 with self.assertRaisesRegex(the_list.ScheduleSelectionChanged, "The next run changed"):
-                    _ = the_list.close(MORTY.id, identity, "Stop", source="nate", schedule_scope=scope,
-                                       expected_schedule=expected)
+                    if scope is the_list.ScheduleScope.ALL:
+                        _ = the_list.save_page_schedule(
+                            MORTY.id, identity, the_list.ScheduleOperation.EDIT,
+                            {"words": "Read new figures.", "repeat": repeat_rule.parse("FREQ=DAILY;INTERVAL=2")},
+                            scope=scope, expected=expected, receipt=the_list.PageRequest("repeat", "park", "Repeat"),
+                        )
+                    else:
+                        _ = the_list.close(MORTY.id, identity, "Stop", source="nate", schedule_scope=scope,
+                                           expected_schedule=expected)
                 self.assertEqual(path.read_bytes(), before)
 
     def test_text_limits_on_add_and_update(self) -> None:

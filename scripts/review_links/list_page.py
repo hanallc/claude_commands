@@ -1412,6 +1412,7 @@ SCHEDULE_TEMPLATES = """
 <label><input type="radio" name="scope-choice" value="all"> All runs</label>
 </fieldset>
 <p data-scope-rule hidden>To change the repeat rule, select future runs or all runs.</p>
+<p id="list-scope-park" data-scope-park hidden>Parking applies to the item.</p>
 <div class="list-repeat-buttons"><button type="button" data-cancel>Cancel</button>
 <button type="button" class="primary" data-done>OK</button></div>
 </dialog></template>
@@ -1502,6 +1503,7 @@ background:var(--ink-2);border-radius:50%}
 .list-schedule-dialog [hidden]{display:none!important}
 .list-schedule-dialog h3{margin:0 0 12px;font-size:1rem}
 .list-schedule-dialog fieldset{display:grid;gap:8px;margin:12px 0;padding:0;border:0}
+.list-schedule-dialog [data-scope-this]:has(input:disabled){opacity:.6}
 .list-schedule-dialog legend{padding:0 0 6px;color:var(--ink-2)}
 .list-repeat-line,.list-repeat-buttons{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
 .list-repeat-buttons{justify-content:flex-end;margin-top:12px}
@@ -1892,16 +1894,18 @@ function customRepeat(parent,start,rule,zone){
   }
  });
 }
-function chooseScheduleScope(parent,{number,removing,changingRule}){
+function chooseScheduleScope(parent,{number,removing,parking,changingRule}){
  const dialog=listScheduleDialog('list-repeat-scope',parent);
  if(removing) dialog.querySelector('h3').textContent='Remove the repeated item';
  const thisRun=dialog.querySelector('[data-scope-this] input');
  const following=dialog.querySelector('[data-scope-following] input');
  const all=dialog.querySelector('[value=all]');
- thisRun.disabled=!number || changingRule;
- following.closest('label').hidden=number<2;
+ thisRun.disabled=!number || parking || changingRule;
+ following.disabled=following.closest('label').hidden=number<2;
  dialog.querySelector('[data-scope-rule]').hidden=!changingRule;
- (thisRun.disabled ? number>=2 ? following : all : thisRun).checked=true;
+ dialog.querySelector('[data-scope-park]').hidden=!parking;
+ if(parking) dialog.querySelector('fieldset').setAttribute('aria-describedby','list-scope-park');
+ [thisRun,following,all].find(choice=>!choice.disabled).checked=true;
  return new Promise(resolve=>{
   dialog.addEventListener('close',()=>resolve(dialog.returnValue || null),{once:true});
   dialog.querySelector('[data-done]').onclick=()=>dialog.close(dialog.querySelector('[name=scope-choice]:checked').value);
@@ -2029,7 +2033,8 @@ function bindScheduleFields(form,until,zone,draft,edit){
   repeating:!!rule,
   words:()=>words.value.trim(),
   scope:(action,data)=>chooseScheduleScope(menu.hidden ? form : menu,
-   {number,removing:action==='remove',changingRule:action==='schedule' && data.repeat!==undefined}),
+   {number,removing:action==='remove',parking:action==='park' || action==='park-until-delivered',
+    changingRule:action==='schedule' && data.repeat!==undefined}),
   showError:message=>{status.textContent=message;},
  };
 }

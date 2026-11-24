@@ -3823,6 +3823,18 @@ window.fetch=async(_path,options={})=>{
                                              "returnByValue": True}, session)
                     self.assertNotIn("exceptionDetails", answer, answer)
 
+                def capture_proof(selector: str, path: Path) -> None:
+                    clip = browser.command("Runtime.evaluate", {"returnByValue": True, "expression": """
+(() => {
+ const box=document.querySelector(""" + json.dumps(selector) + """).getBoundingClientRect();
+ return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
+})()
+"""}, session)
+                    rect = cast(dict[str, object], clip["result"])["value"]
+                    result = cast(dict[str, str], browser.command(
+                        "Page.captureScreenshot", {"format": "png", "clip": rect}, session))
+                    _ = path.write_bytes(base64.b64decode(result["data"]))
+
                 evaluate(r"""
 (() => {
  Date.now=()=>Date.parse('2026-11-16T18:00:00Z');
@@ -3832,6 +3844,23 @@ window.fetch=async(_path,options={})=>{
  window.openItem=number=>{
   row(number).querySelector('.list-toggle').click();
   return recordDetails(row(number)).querySelector('form');
+ };
+ window.showParkScope=number=>{
+  const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+  const picker=form.querySelector('[data-later-menu]');
+  if(picker.hidden) form.querySelector('[data-later-toggle]').click();
+  const words=picker.querySelector('[data-schedule-words]');
+  words.value='';
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  picker.querySelector('[value=park]').click();
+  const dialog=document.querySelector('.list-schedule-dialog[open]');
+  return {dialog,closePicker:()=>form.querySelector('[data-later-toggle]').click(),cancel:async()=>{
+   const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+   dialog.querySelector('[data-cancel]').click();
+   await closed;
+   words.value=words.defaultValue;
+   words.dispatchEvent(new Event('input',{bubbles:true}));
+  }};
  };
  show('needs-me');
  check(row(1).hidden && row(2).hidden && row(3).hidden && !row(4).hidden,'Needs me hides scheduled items.');
@@ -3884,16 +3913,12 @@ window.fetch=async(_path,options={})=>{
 })();
 """)
                 if proof:
-                    clip = browser.command("Runtime.evaluate", {"returnByValue": True, "expression": """
-(() => {
- const box=document.querySelector('[data-later-menu]:not([hidden])').getBoundingClientRect();
- return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
-})()
-"""}, session)
-                    rect = cast(dict[str, object], clip["result"])["value"]
-                    result = cast(dict[str, str], browser.command(
-                        "Page.captureScreenshot", {"format": "png", "clip": rect}, session))
-                    _ = (Path(proof) / "scheduled-picker-dark.png").write_bytes(base64.b64decode(result["data"]))
+                    capture_proof("[data-later-menu]:not([hidden])", Path(proof) / "scheduled-picker-dark.png")
+                scope_proof = os.environ.get("LIST_PARK_SCOPE_PROOF")
+                if scope_proof:
+                    evaluate("window.parkScopeProof=showParkScope(1);")
+                    capture_proof(".list-schedule-dialog[open]", Path(scope_proof))
+                    evaluate("parkScopeProof.cancel();")
                 evaluate(r"""
 (() => {
  const select=recordDetails(row(1)).querySelector('[data-repeat]');
@@ -3931,7 +3956,19 @@ window.fetch=async(_path,options={})=>{
  openItem(3).querySelector('[value=remove]').click();
  dialog=document.querySelector('.list-schedule-dialog[open]');
  check(dialog.querySelector('[data-scope-following]').hidden,'The first run omits the following scope.');
+ const firstRunClosed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
  dialog.querySelector('[data-cancel]').click();
+ await firstRunClosed;
+ for(const [number,scope] of [[1,'following'],[3,'all']]){
+  const park=showParkScope(number);
+  const reason=park.dialog.querySelector('[data-scope-park]');
+  check(park.dialog.querySelector('[value=this]').disabled &&
+   park.dialog.querySelector('[name=scope-choice]:checked').value===scope &&
+   !reason.hidden && reason.textContent==='Parking applies to the item.',
+   'Park explains why This run is unavailable and selects the first allowed scope.');
+  await park.cancel();
+  park.closePicker();
+ }
 })();
 """)
                 for control, expected in (("data-schedule-words", "Read the result.\n"), ("data-repeat", None)):
@@ -3947,6 +3984,7 @@ window.fetch=async(_path,options={})=>{
  if(field.matches('textarea')){
   field.value='Read the result.';
   field.focus();
+  check(document.activeElement===field,'The instruction field has focus.');
   field.setSelectionRange(field.value.length,field.value.length);
  }else{
   field.focus();
@@ -3990,7 +4028,7 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date,instruction,advanceRun=false}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,repeat,advanceRun=false}={})=>{
   let posted;
   let readback;
   const send=window.fetch;
@@ -4020,7 +4058,9 @@ window.fetch=async(_path,options={})=>{
   if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
   if(date) check(posted.get('until')===date && !posted.has('repeat'),'The move keeps the saved repeat rule.');
   if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
-   'The edit sends only the instruction for all runs.');
+   'The edit sends only the instruction for the selected scope.');
+  if(repeat) check(posted.get('repeat')==='FREQ=DAILY' && !posted.get('until'),
+   'The rule change uses the start of the displayed run.');
   await new Promise(resolve=>{
    const sent=()=>!form.dataset.sending;
    const observer=new MutationObserver(()=>{if(sent()){observer.disconnect();resolve();}});
@@ -4075,24 +4115,32 @@ window.fetch=async(_path,options={})=>{
  for(const [number,action,scope,options] of [
   [1,'park','this',{date:'2026-12-01T14:00:00.000Z'}],
   [1,'park','all',{instruction:'Compare the revised predictions.'}],
+  [1,'park','following',{instruction:'Compare the remaining predictions.'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
+  [1,'park','all',{repeat:'daily',advanceRun:true}],
   [1,'park','following',{advanceRun:true}],
   [1,'remove','this',{advanceRun:true}],
   [3,'remove','all',{}],
   [1,'remove','following',{}],
  ]){
   const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
-  if(options.date || options.instruction || (action==='park' && options.advanceRun)){
+  if(options.date || options.instruction || options.repeat || (action==='park' && options.advanceRun)){
    form.querySelector('[data-later-toggle]').click();
    if(options.date) pickDate(form,'2026-12-01');
    if(options.instruction){words(form).value=options.instruction;edit(words(form));}
-   if(options.advanceRun){
+   if(options.repeat){
+    const select=form.querySelector('[data-repeat]');
+    select.value=options.repeat;select.dispatchEvent(new Event('change'));
+   }else if(options.advanceRun){
     words(form).value='';edit(words(form));
     form.elements.until.value='2026-12-23T09:00';edit(form.elements.until);
    }
   }
   await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);
+  if(options.instruction && scope==='following')
+   check(row(number).querySelector('[data-scheduled-note]').textContent.endsWith('Dec 1 09:00 EST'),
+    'The instruction edit keeps the moved start.');
   if(action==='unpark'){
    const current=openItem(number);
    current.querySelector('[data-later-toggle]').click();
