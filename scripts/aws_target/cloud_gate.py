@@ -23,6 +23,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from threading import Lock
 import time
 from typing import BinaryIO, Literal, cast, final
 from uuid import uuid4
@@ -189,27 +190,21 @@ def availability() -> Available | Unavailable:
         return Unavailable('The local AWS gate evidence is unavailable')
 
 
-def settlement(episode: str, attempt: int) -> placement.Settled | placement.Pending:
-    """Read the exact claim and request cleanup if its booking has expired."""
+def _claim_bookings(episode: str, attempt: int) -> tuple[Path, tuple[ledger.GateReservation, ...]]:
     claim_id = execution_identity.assigned_claim_id(episode, f'{attempt:032x}')
+    directory = target_config.ssh_target_state_directory('aws')
+    return directory, ledger.CostLedger(directory).gate_claim_reservations(claim_id)
+
+
+def settlement(episode: str, attempt: int) -> placement.Settled | placement.Pending:
+    """Read settlement for the exact claim from the ledger."""
     try:
-        book = ledger.CostLedger(target_config.ssh_target_state_directory('aws'))
-        rows = book.gate_claim_reservations(claim_id)
+        _, rows = _claim_bookings(episode, attempt)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return placement.Pending('The AWS gate ledger is unavailable')
-    if not any(ledger.gate_is_open(row) for row in rows):
-        return placement.Settled()
-    now = int(time.time())
-    if any(row.expires <= now and cleanup_due(row, now) for row in rows):
-        try:
-            command = reconcile_command(book.directory, start_only=True)
-            # Admission can run without a user session environment.
-            runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
-            _ = subprocess.run(command, env={**os.environ, 'XDG_RUNTIME_DIR': runtime}, check=False, capture_output=True,
-                               timeout=settings().number('api_timeout_s'))
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f'The cloud gate reconcile did not start: {error}', file=sys.stderr, flush=True)
-    return placement.Pending('AWS launch settlement remains pending')
+    if any(ledger.gate_is_open(row) for row in rows):
+        return placement.Pending('AWS launch settlement remains pending')
+    return placement.Settled()
 
 
 def cleanup_due(reservation: ledger.GateReservation, now: int) -> bool:
@@ -1470,15 +1465,50 @@ def reconcile_command(directory: Path, *, start_only: bool = False) -> list[str]
         'cloud-gate-reconcile', start_only=start_only)
 
 
-def end_open_gates(directory: Path, service: Callable[[Sequence[str]], int]) -> None:
-    """Start the reconcile step while the switch is off when a gate is due for cleanup; the step launches no box.
+def _start_reconcile_if_due(directory: Path, rows: Sequence[ledger.GateReservation],
+                            service: Callable[[Sequence[str]], int | None], *, start_only: bool = False) -> None:
+    now = int(time.time())
+    if any((not start_only or row.expires <= now) and cleanup_due(row, now) for row in rows):
+        _ = service(reconcile_command(directory, start_only=start_only))
 
-    An error here prints its own line and never changes the off reason of the caller."""
+
+def _start_reconcile_service(command: Sequence[str]) -> None:
+    # The admission service can run without a user session environment.
+    runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+    result = subprocess.run(command, env={**os.environ, 'XDG_RUNTIME_DIR': runtime}, check=False,
+                            capture_output=True, text=True, timeout=settings().number('api_timeout_s'))
+    if result.returncode:
+        raise OSError(result.stderr.strip() or f'systemd-run exited with status {result.returncode}')
+
+
+_reconcile_start_warnings: set[tuple[str, int]] = set()
+_reconcile_start_warnings_lock = Lock()
+
+
+def reconcile_expired(episode: str, attempt: int) -> None:
+    """Request reconciliation for an expired claim when cleanup is due."""
+    try:
+        directory, rows = _claim_bookings(episode, attempt)
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+        return
+    try:
+        _start_reconcile_if_due(directory, rows, _start_reconcile_service, start_only=True)
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
+        key = (episode, attempt)
+        with _reconcile_start_warnings_lock:
+            if key in _reconcile_start_warnings:
+                return
+            _reconcile_start_warnings.add(key)
+        detail = ' '.join(str(error).split())
+        print(f'The cloud gate reconcile did not start: {detail}', file=sys.stderr, flush=True)
+
+
+def end_open_gates(directory: Path, service: Callable[[Sequence[str]], int]) -> None:
+    """Start reconciliation for gates due for cleanup when the switch is off."""
     try:
         book = ledger.CostLedger(directory)
-        now = int(time.time())
-        if book.path.exists() and any(cleanup_due(row, now) for row in book.read_snapshot().gate_reservations):
-            _ = service(reconcile_command(directory))
+        if book.path.exists():
+            _start_reconcile_if_due(directory, book.read_snapshot().gate_reservations, service)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(f'The cloud gate reconcile did not start: {error}', file=sys.stderr, flush=True)
 

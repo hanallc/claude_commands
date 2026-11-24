@@ -907,7 +907,11 @@ A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The route reports pending settlement to the queue while the launch remains uncertain.
 The stop cleanup looks up an unknown instance by client token.
-After expiry, the queue retries reconciliation for an open booking.
+The queue reads settlement for the exact claim through `settlement()`.
+The queue calls `reconcile_expired()` when it checks pending settlement.
+This call requests the reconcile service when a booking for that claim has expired and is due for cleanup.
+The call returns before reconciliation completes.
+If the service cannot start, the call prints one warning per attempt in the queue process.
 The reconciler records the confirmed end in the local ledger.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.

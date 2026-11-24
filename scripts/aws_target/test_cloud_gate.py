@@ -517,7 +517,7 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         booking, = self.book.gate_claim_reservations(attempt)
         self.assertIsInstance(booking.state, ledger.GateTerminated)
 
-    def test_queue_settlement_retries_expired_cleanup_from_the_saved_booking(self) -> None:
+    def test_queue_reconciles_only_a_due_expired_booking(self) -> None:
         episode = 'episode'
         claim = execution_identity.assigned_claim_id(episode, f'{10:032x}')
         expires = int(self.now) + 1200
@@ -537,14 +537,14 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         def start_reconcile(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             self.assertIn('--no-block', command)
             self.assertNotIn('--wait', command)
-            self.assertFalse(any(option.startswith('--on-calendar') for option in command))
+            self.assertIn('--unit=cloud-gate-reconcile', command)
             environment = cast(dict[str, str], _options['env'])
             self.assertEqual(environment['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
             with mock.patch.object(sys, 'argv', ['cloud_gate', *command[command.index('--reconcile'):]]):
                 status = cloud_gate.main()
             return subprocess.CompletedProcess(list(command), status, '', '')
 
-        with (mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': ''}),
+        with (mock.patch.dict(os.environ),
               mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
               mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
               mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
@@ -552,20 +552,62 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
               mock.patch.object(time, 'time', side_effect=lambda: self.now),
               mock.patch.object(sys, 'argv', ['cloud_gate', *cleanup]),
               mock.patch.object(subprocess, 'run', side_effect=start_reconcile) as start):
+            _ = os.environ.pop('XDG_RUNTIME_DIR', None)
             self.assertEqual(cloud_gate.main(), 1)
-            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            saved, = self.book.gate_claim_reservations(claim)
+            assert isinstance(saved.owner, ledger.GateWorkerOwner)
+            with mock.patch.object(cloud_gate, 'process_start', return_value=Gone()):
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
             start.assert_not_called()
             self.advance(1201)
+            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            self.assertIsNone(cloud_gate.reconcile_expired(episode, 11))
+            with mock.patch.object(cloud_gate, 'process_start', return_value=Started(saved.owner.start)):
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            start.assert_not_called()
             self.fake.describe_errors = [subprocess.TimeoutExpired('describe-instances', 1)]
             with mock.patch.object(cloud_gate, 'process_start', return_value=Gone()):
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+                start.assert_called_once()
                 self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
                 start.assert_called_once()
                 self.assertIsInstance(self.book.gate_claim_reservations(claim)[0].state, ledger.GateLaunchPending)
-                self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
                 self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
                 self.assertEqual(start.call_count, 2)
         self.assertEqual(len(self.fake.commands), 3)
         self.assertTrue(all('describe-instances' in row for row in self.fake.commands))
+
+    def test_reconcile_expired_warns_once_per_attempt_and_retries_the_start(self) -> None:
+        episode = 'reconcile-failure'
+        now = int(self.now)
+        claims = [execution_identity.assigned_claim_id(episode, f'{attempt:032x}') for attempt in (10, 11)]
+        with self.book.transaction() as state:
+            for claim in claims:
+                state.gate_reservations.append(ledger.GateReservation(
+                    claim, now - 120, now - 1, Decimal('.8'), Decimal(0), placement_claim=claim))
+        failed = subprocess.CompletedProcess(['systemd-run'], 1, '', 'Failed to connect to bus\nNo user session')
+        warnings: set[tuple[str, int]] = set()
+        with (mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': '/fixture/user'}),
+              mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(cloud_gate, '_reconcile_start_warnings', warnings),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(subprocess, 'run', side_effect=[failed, OSError('start refused'), failed]) as start):
+            with redirect_stderr(StringIO()) as first:
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            self.assertEqual(first.getvalue(),
+                             'The cloud gate reconcile did not start: Failed to connect to bus No user session\n')
+            with redirect_stderr(StringIO()) as repeat:
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
+            self.assertEqual(repeat.getvalue(), '')
+            with redirect_stderr(StringIO()) as next_attempt:
+                self.assertIsNone(cloud_gate.reconcile_expired(episode, 11))
+            self.assertEqual(next_attempt.getvalue(), first.getvalue())
+        self.assertEqual(start.call_count, 3)
+        self.assertEqual(start.call_args.kwargs['env']['XDG_RUNTIME_DIR'], '/fixture/user')
+        self.assertTrue(all(ledger.gate_is_open(row) for row in self.book.read_snapshot().gate_reservations))
 
     def test_settlement_uses_only_the_exact_claim_and_its_retries(self) -> None:
         episode = 'episode'
@@ -593,6 +635,7 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
             self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
             _ = self.book.path.write_text('unreadable')
             self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            self.assertIsNone(cloud_gate.reconcile_expired(episode, 10))
 
         start.assert_not_called()
 
