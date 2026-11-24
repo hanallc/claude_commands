@@ -18,7 +18,6 @@ from typing import cast
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import limits_view, memory_feed, program_memory_feed, progress_profile as progress, snapshot_codec
 from scripts.build_queue import test_memory_feed
-from scripts.disks import disks_page
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
@@ -83,7 +82,7 @@ def program_memory_fixture(*, started: bool, with_past: bool = True) -> program_
 
 def program_memory_row(memory: program_memory_feed.ProgramMemoryView) -> dict[str, object]:
     return {"key": "hana", "name": "Hana · nextest", "used": 4, "reserved": 1, "queued": True,
-            "started_at": 390, "slot_folder": "hana-slot1", "slot_machine": "natedev", "program_memory": memory}
+            "started_at": 390, "program_memory": memory}
 
 
 def aws_cost_fixture() -> dict[str, object]:
@@ -1024,36 +1023,6 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.assertGreaterEqual(top, 8)
                 self.assertLessEqual(bottom, 712)
-
-    def test_disks_slot_tooltip_reads_traced_steps_without_showing_charts(self) -> None:
-        row = program_memory_row(program_memory_fixture(started=True))
-        builds_source = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        disks_source = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
-        shared = disks_page.shared_step_tip(builds_source)
-        slot_tooltip = disks_source[disks_source.index("function slotStep("):disks_source.index("function slotsAbout(")]
-        probe = """
-          const data = null;
-          const settings = {builds_max_age_seconds: 30};
-          const slotReport = {machine:'natedev', groups:[{slots:[{name:'hana-slot1', used_by:{}}]}]};
-          Date.now = () => builds.read_at * 1000;
-          const stepTip = (() => {
-        """ + shared.script + """
-            return {tooltipHtml, shownReading};
-          })();
-        """ + slot_tooltip + """
-          const amounts = stepTip.shownReading(builds).programReadings.get(builds.walk[0].program_memory);
-          return [tipFor('slot:hana-slot1'), amounts.compile.peak.text, amounts.test.current.text];
-        """
-        expression = ("[...new Function('builds', 'esc', " + json.dumps(probe)
-                      + ")(data, esc), tooltipHtml('row:hana', data)]")
-        disks, compile_peak, test_sample, shared_builds = cast(
-            list[str], self.page_expression(expression, {"read_at": 400, "walk": [row]}, walk=True))
-        self.assertEqual((compile_peak, test_sample), ("7.0 GiB", "2.0 GiB"))
-        self.assertEqual(disks, shared_builds)
-        self.assertIn('<dt>Runs on</dt><dd><span class="machine" data-machine="natedev">natedev</span></dd>', disks)
-        self.assertNotIn("program-memory", disks)
-        self.assertNotIn(".program-memory", shared.style)
-        self.assertIn(".tip :is(dt, dd) { overflow-wrap: anywhere; }", shared.style)
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("gate", need=4 * GIB)
@@ -2803,6 +2772,8 @@ const document = {activeElement:null};
 let painted;
 renderWalk = reading => { painted = reading; };
 """
+        else:
+            constants += "let displayedQueue = null;\n"
         if swap:
             start = html.index("const swapView =")
             functions += html[start:html.index('document.addEventListener("click", (e) => {', start)]
@@ -2961,7 +2932,7 @@ renderWalk = reading => { painted = reading; };
         self.assertIn('<dt>Because</dt><dd></dd><dd class="long">edits the merged checkout with mend and fmt</dd>',
                       grids["wait:fixture-wait-0"])
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        self.assertIn("grid-template-columns: max-content 1fr", page)
+        self.assertIn(".tip { display: grid; grid-template-columns: fit-content(44%) minmax(0, 1fr);", page)
         self.assertRegex(page, r"\.tip dt \{[^}]*text-align: left")
         self.assertRegex(page, r"\.tip dd \{[^}]*text-align: right")
 

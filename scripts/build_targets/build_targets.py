@@ -462,7 +462,7 @@ def fixed_remote_candidates(
         configuration = conf.read(target.settings)
         transport = target_config.read_execution_transport(target, configuration=configuration)
         if isinstance(transport, HanaGpuNextestTransport):
-            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+            scope = (claim_state.RepositoryScope(repository.name, repository.key)
                      if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
             if isinstance(rule, NatedevOnly):
                 policy = placement.FixedExclusion(rule.reason)
@@ -475,7 +475,7 @@ def fixed_remote_candidates(
             destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
             return (placement.PlacementCandidate(destination, policy, settings),)
         if isinstance(transport, hana_placement.HanaControlTransport):
-            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+            scope = (claim_state.RepositoryScope(repository.name, repository.key)
                      if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
             route = hana_placement_adapter.configured_route(configuration, str(repo_root), kind)
             if isinstance(rule, NatedevOnly):
@@ -512,17 +512,13 @@ def fixed_remote_candidates(
             answer = eligibility.configured_step_policy(configuration, target.platform, repository, repo_root, package, kind)
             if isinstance(answer, eligibility.IneligibleMacStep):
                 policy = placement.FixedExclusion(answer.reason)
-        slots = (target_config.slot_capacity(configuration, repository.name,
-                 missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
-                 if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
     except conf.Unusable:
         destination = placement.PlacementDestination(provider, target.name, target.name, claim_state.WHOLE_MAC)
         return (placement.PlacementCandidate(destination, placement.FixedExclusion("state unreadable"), settings),)
 
-    return tuple(placement.PlacementCandidate(placement.PlacementDestination(provider, target.name, host,
-        claim_state.RepositoryScope(scope.name, scope.key, slot)
-            if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope,
-        slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
+    destination = placement.PlacementDestination(provider, target.name, host, scope,
+                                                 1 if target.platform == "linux" else 0)
+    return (placement.PlacementCandidate(destination, policy, settings),)
 
 
 def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, repo_root: Path, kind: CommandKind,
@@ -554,7 +550,7 @@ def fixed_mac_linux_candidate(target: SshTarget, settings: ProviderSettings, rep
             policy = placement.FixedExclusion("repo")
         except (conf.Unusable, mac_linux.GuestUnavailable):
             policy = placement.FixedExclusion("mac_linux_settings_unreadable")
-    destination = placement.PlacementDestination("ssh", target.name, host, claim_state.RepositoryScope("claude", slot=1), 1)
+    destination = placement.PlacementDestination("ssh", target.name, host, claim_state.RepositoryScope("claude"), 1)
     return placement.PlacementCandidate(destination, policy, settings)
 
 
@@ -713,19 +709,11 @@ def command_recover_probe(args: CliArguments) -> int:
         try:
             with offload.interrupt_handlers(controller):
                 with ExitStack() as leases:
-                    slots: list[int] = []
-                    capacity = (1 if target.platform == "macos" else target_config.slot_capacity(
-                        config.values, repository.name, missing=target_config.MissingSlotCapacity.SINGLE_SLOT))
-                    for slot in range(1, capacity + 1):
-                        try:
-                            leases.enter_context(copies.remote_lease(offload.request_mirror(
-                                config, replace(request, slot=slot), repository)))
-                        except copies.BusyRemoteMirror:
-                            continue
-                        slots.append(slot)
-                    if not slots:
+                    try:
+                        leases.enter_context(copies.remote_lease(offload.request_mirror(config, request, repository)))
+                    except copies.BusyRemoteMirror:
                         return 0
-                    claim = offload.claim_for_run(controller, config, request, repository, tuple(slots),
+                    claim = offload.claim_for_run(controller, config, request, repository,
                         mac_repository=(mac_repository if isinstance(mac_repository, claim_state.MacRepositoryIdentity)
                                         else claim_state.NO_SAVED_MAC_REPOSITORY))
                     if not isinstance(claim, offload.FreshMacClaim):
@@ -1065,6 +1053,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
         if "remote_host" not in record:
             continue
         if paths.platform == "macos":
+            mirror_number = 1
             saved = claim_state.saved_mac_repository(record)
             lease = offload.mac_cleanup_lease(saved, record["remote_host"], target.name)
             mirror = offload.mac_cleanup_scope(saved)
@@ -1072,8 +1061,10 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
             cleanup_scope = claim.scope if isinstance(claim.scope, claim_state.RepositoryScope) else scope
             if not isinstance(cleanup_scope, claim_state.RepositoryScope):
                 continue
-            lease = nullcontext()
+            _, mirror_number = claim_state.legacy_linux_claim_name(claim.path)
             mirror = eligibility.KnownRepository(cleanup_scope.name, cleanup_scope.key)
+            lease = copies.remote_lease(copies.RemoteMirror("", copies.SelectedRepository(mirror.name),
+                record["remote_host"], offload.remote_mirror(mirror, target.name, mirror_number), ""))
         with ExitStack() as cleanup:
             try:
                 cleanup.enter_context(lease)
@@ -1090,7 +1081,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
                     if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                         continue
                 checked = offload.check_leftovers(config, record["remote_host"], mirror, target.name,
-                                                  record.get("slot", 1))
+                                                  mirror_number)
                 if isinstance(checked, offload.LeftoversEnded):
                     release = mac_test.CliArguments()
                     release.pid = args.pid
@@ -1118,7 +1109,7 @@ def publish_wait_reservation(args: CliArguments, target: SshTarget,
 
 
 def reserve_assigned(args: CliArguments) -> int:
-    """Claim only the target, scope and slot in the saved assignment."""
+    """Claim the target and repository in the saved assignment."""
     from scripts.build_queue import admission_protocol as wire, placement
     from scripts.mac_test import mac_test
     from scripts.build_targets import target_config

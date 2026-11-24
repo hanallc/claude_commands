@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
-from scripts.disks import disks_page, sessions, slots
+from scripts.disks import disks_page, sessions
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
 from scripts.lib import atomic_file, conf, scratch
@@ -2309,7 +2309,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return False
 
     def disks_measure_post(self) -> None:
-        """Start a Disks page measure in the background and answer at once with the slots and sessions in use now."""
+        """Start a Disks page measure and return its state and the current sessions."""
         now = time.time()
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -2319,16 +2319,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(503, "The measure could not start.", error)
             return
         try:
-            report = slots.slot_report(now)
-        except (OSError, ValueError) as error:
-            print(f"review-links disks slots: {error}", file=sys.stderr)
-            report = None
-        try:
             folders = sessions.session_report()
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
-        self.json_response(200, {"state": started.state.value, "target": started.target, "slots": report, "sessions": folders})
+        self.json_response(200, {"state": started.state.value, "target": started.target, "sessions": folders})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)

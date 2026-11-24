@@ -22,7 +22,6 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
-from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
@@ -211,7 +210,7 @@ class RemoteEntryTests(unittest.TestCase):
             "since": "2026-11-05T12:00:00+00:00", "repo_name": "repository", "repo_key": "",
         }
         key = "https://fixture.invalid/team/repository"
-        stem = claim_state.mac_claim_stem(key, 0)
+        stem = claim_state.mac_claim_stem(key)
         identity = claim_state.CleanupOnlyMacRepository(key, "repository", f"{stem}.json", stem)
         for name, fields in (
             ("repository.json", record),
@@ -682,10 +681,10 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
     def admission(self, *, free_gib: float = 200) -> Generator[tuple[offload.ProcessController,
             eligibility.OffloadConfig, offload.OffloadRequest]]:
         settings = self.root / "target.conf"
-        _ = write_config_fixture(settings, "slots=2\n", template="mac_test")
+        _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
-                                      1, 1, 1, "1", {"slots": "2"})
+                                      1, 1, 1, "1", {})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
         controller = offload.ProcessController()
@@ -757,35 +756,6 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
         self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "new-owner")
 
-    def test_empty_slot_values_raise_config_error_while_absent_values_use_the_missing_policy(self) -> None:
-        single = target_config.MissingSlotCapacity.SINGLE_SLOT
-        required = target_config.MissingSlotCapacity.REQUIRE_CONFIGURED
-        self.assertEqual(target_config.slot_capacity({}, "repository", missing=single), 1)
-        with self.assertRaises(target_config.ConfigError):
-            _ = target_config.slot_capacity({}, "repository", missing=required)
-        for values in ({"slots.repository": "", "slots": "2"}, {"slots": ""}):
-            with self.subTest(values=values, behavior="capacity reader"):
-                with self.assertRaises(target_config.ConfigError):
-                    _ = target_config.slot_capacity(values, "repository", missing=single)
-            with self.subTest(values=values, behavior="admission"):
-                with self.admission() as (controller, config, request):
-                    settings = self.root / "target.conf"
-                    _ = write_config_fixture(settings, "".join(f"{key}={value}\n" for key, value in values.items()),
-                                             template="mac_test")
-                    empty_config = replace(config, values=values, source=settings)
-                    with self.assertRaises(target_config.ConfigError):
-                        _ = offload.run_offload(controller, empty_config, request, 0)
-
-    def test_bad_slot_capacity_raises_config_error_in_claims_and_admission(self) -> None:
-        with self.admission() as (controller, config, request):
-            settings = self.root / "target.conf"
-            _ = write_config_fixture(settings, "slots=bad\n", template="mac_test")
-            bad_config = replace(config, values={**config.values, "slots": "bad"}, source=settings)
-            with self.assertRaises(target_config.ConfigError):
-                _ = mac_test.slot_capacity(mac_test.state_paths("linux"), mac_test.RepositoryScope("repository", "key"))
-            with self.assertRaises(target_config.ConfigError):
-                _ = offload.run_offload(controller, bad_config, request, 0)
-
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
         run = self.root / "unit-run"
         owner = fixture_member("showrunner", name="director-session")
@@ -841,25 +811,6 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         self.assertEqual(copies.mirror_run(args), 0)
         self.assertEqual(json.loads((self.mirror / ".copy-record.json").read_text())["owner"], "alpha")
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [mirror])
-
-    def test_adoption_keeps_a_reservation_outside_the_leased_slots(self) -> None:
-        with self.admission() as (controller, config, request):
-            args = mac_test.CliArguments()
-            args.pid, args.worktree, args.what, args.target = os.getpid(), str(self.source), "reserved", "linux"
-            paths = mac_test.state_paths("linux")
-            scope = mac_test.RepositoryScope("repository", "key")
-            with mac_test.locked(paths.lock):
-                first = mac_test.claim_once(args, paths, scope, session=NoOwningSession(), reserve_wait=True)
-            self.assertEqual(first, mac_test.ClaimFinished(0, ("claimed", "slot: 1")))
-            reservation, = mac_test.read_claims(paths)
-            request = replace(request, admission=offload.MacClaimFromWait(
-                os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
-            result = offload.claim_for_run(controller, config, request, eligibility.KnownRepository("repository"), (2,))
-            self.assertIsInstance(result, offload.MacClaimNotConfirmed)
-            claims = mac_test.read_claims(paths)
-            self.assertEqual(len(claims), 1)
-            self.assertEqual(claims[0].record["pid"], os.getpid())
-            self.assertNotIn("remote_host", claims[0].record)
 
     def test_cancelled_sweep_releases_real_locks_for_admission_and_owner_removal(self) -> None:
         from scripts.mac_test.mirror_root import MacMirrorRoot

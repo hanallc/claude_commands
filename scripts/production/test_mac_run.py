@@ -732,7 +732,7 @@ class MacRunTests(unittest.TestCase):
         claims = self.state_directory / "claims"
         # A Mac claim file takes its name from the repository key.
         other_key = "git-dir:" + str(other.resolve() / ".git")
-        other_claim = claims / f"{claim_state.mac_claim_stem(other_key, 0)}.json"
+        other_claim = claims / f"{claim_state.mac_claim_stem(other_key)}.json"
         before = other_claim.read_bytes()
         self.clear_events()
 

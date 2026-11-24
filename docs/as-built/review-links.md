@@ -289,6 +289,7 @@ Accounts preferences, News polls, and Disks polls keep the snapshot.
 Builds revalidates `memory.json` at its feed interval.
 The server uses only `If-None-Match` to decide whether to return HTTP 304 for a static file.
 The server sends static JSON with gzip when the client accepts gzip.
+Disks shows the drive cards and the session list.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
-import io
 import json
 import os
 from pathlib import Path
@@ -20,11 +18,8 @@ from scripts.build_queue.admission_test_support import caller_provider_controls
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state
-
-from scripts.lib import process_start as process_identity
 
 
 mac_test = eligibility_support.mac_test
@@ -168,59 +163,51 @@ if output_size:
         result = self.verify_with_memory_hook({"left": True, "clock": "", "attempts": 0})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def retain_slots(self, old_capacity: int = 2) -> list[Path]:
-        _ = write_config_fixture(self.root / "linux_target.conf",
-                                 (self.root / "linux_target.conf").read_text()
-                                 + f"slots={old_capacity}\nslots.hana={old_capacity}\n",
-                                 template="mac_test")
-        paths: list[Path] = []
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(Path, "home", return_value=self.home), \
-             mock.patch.object(process_identity, "process_start", side_effect=process_reader(eligibility_support.SshEligibilityTests().process_start)), \
-             mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope(
-                 "hana", "https://example.com/team/hana")):
+    def retain_slots(self) -> list[Path]:
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(Path, "home", return_value=self.home):
             state = mac_test.state_paths("linux")
-            for pid in range(2147483000, 2147483000 + old_capacity):
-                args = mac_test.CliArguments()
-                args.target, args.worktree, args.pid = "linux", str(self.root), pid
-                args.what, args.remote = "test hana", "fake-linux"
-                with redirect_stdout(io.StringIO()):
-                    self.assertEqual(mac_test.command_claim(args, state, watch_claim=False), 0)
-            paths = [claim.path for claim in mac_test.read_claims(state)]
-        self.assertEqual(len(paths), old_capacity)
-        # The current step has one slot. The other old claim remains outside current capacity.
-        settings = self.root / "linux_target.conf"
-        _ = write_config_fixture(settings, settings.read_text() + "slots=1\nslots.hana=1\n", template="mac_test")
+            scope = mac_test.RepositoryScope("hana", "https://example.com/team/hana")
+            claim_path = mac_test.claim_path(state, scope)
+            claim_path.parent.mkdir(parents=True, exist_ok=True)
+            paths = [claim_path.with_name(f"{claim_path.stem}.slot-{number}.json") for number in (1, 2)]
+            for number, path in enumerate(paths, start=1):
+                pid = 2147482999 + number
+                mac_test.write_json(path, {
+                    "claim_id": f"saved-claim-{number}", "episode": f"saved-episode-{number}",
+                    "attempt": f"saved-attempt-{number}", "submitting_session": "", "pid": pid,
+                    "proc_start": f"start-{pid}", "worktree": str(self.root), "what": "test hana",
+                    "since": f"2026-11-01T00:00:0{number}+00:00", "remote_host": "fake-linux",
+                    "repo_name": scope.name, "repo_key": scope.key, "slot": number,
+                })
         return paths
 
     def test_queue_retry_cleans_retained_slots_after_their_owners_exit(self) -> None:
         self.configure("natedev,linux")
         claims = self.retain_slots()
         controls = caller_provider_controls(self, self.admission)
-        old_claims = {held.record["claim_id"]: (held.record["episode"], held.record["attempt"])
-                      for held in controls.claims("linux")}
+        old_claims = {held.record["claim_id"] for held in controls.claims("linux")}
         _ = self.hold_memory()
         result = self.verify("test", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        cleanup, run = self.ssh_events()
-        self.assertEqual(cleanup["actions"], ["claim:13", "cleanup", "release"])
-        self.assertEqual(cleanup["result_type"], "BusyMacDecline")
-        selected, = cleanup["adopted_claim_ids"]
-        self.assertIn(selected, old_claims)
-        self.assertNotIn(selected, cleanup["remaining_claim_ids"])
+        first_cleanup, second_cleanup, run = self.ssh_events()
+        released: set[str] = set()
+        for cleanup in (first_cleanup, second_cleanup):
+            self.assertEqual(cleanup["actions"], ["claim:13", "cleanup", "release"])
+            self.assertEqual(cleanup["result_type"], "BusyMacDecline")
+            selected, = cleanup["adopted_claim_ids"]
+            released.add(selected)
+            self.assertNotIn(selected, cleanup["remaining_claim_ids"])
+            self.assertEqual(cleanup["queued_at"], run["queued_at"])
+        self.assertEqual(released, old_claims)
         self.assertEqual(run["actions"][0], "claim:0")
         self.assertIn("run", run["actions"])
         self.assertEqual(run["result_type"], "PassedOnTarget")
         replacement, = run["adopted_claim_ids"]
         self.assertNotIn(replacement, old_claims)
         self.assertIn(replacement, run["entry_claim_ids"])
-        self.assertEqual(cleanup["queued_at"], run["queued_at"])
         self.assertEqual(self.local_runs(), [])
-        self.assertLess(sum(path.exists() for path in claims), len(claims))
-        remaining, = controls.claims("linux")
-        self.assertNotEqual(remaining.record["claim_id"], selected)
-        self.assertEqual((remaining.record["episode"], remaining.record["attempt"]),
-                         old_claims[remaining.record["claim_id"]])
+        self.assertFalse(any(path.exists() for path in claims))
+        self.assertEqual(controls.claims("linux"), ())
 
     def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
         self.configure("natedev,linux,spare")
@@ -296,9 +283,7 @@ steps_path.write_text(json.dumps(steps))
         # Keep os.environ stable while the admission reader uses the private memory paths.
         claim = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", """
 import os
-from unittest import mock
-from scripts.lib import process_start as process_identity
-from scripts.mac_test import mac_test
+from unittest import mockfrom scripts.mac_test import mac_test
 args = mac_test.CliArguments()
 args.target, args.worktree, args.pid = "mac", os.getcwd(), 2147483000
 args.what, args.remote = "test sample", "test-mac"

@@ -160,7 +160,7 @@ def mac_linux_fixture(fixture: AdmissionFixture, *, enabled: str = "on", registe
 
 def mac_linux_candidate() -> placement.PlacementCandidate:
     return placement.PlacementCandidate(placement.PlacementDestination(
-        "ssh", "mac-linux", "fixture-guest", RepositoryScope("claude", slot=1), 1))
+        "ssh", "mac-linux", "fixture-guest", RepositoryScope("claude"), 1))
 
 
 def publish_candidate(fixture: PlacementFixture, request: wire.PlacementRequest,
@@ -293,7 +293,7 @@ def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementReques
     _ = write_config_fixture(settings, f"enabled=on\nrepository_identity={HANA_REPOSITORY}\n")
     _ = (fixture.root / "build_targets.conf").write_text(
         "targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\nsettings.hana-aws=hana_aws.conf\n")
-    scope = RepositoryScope("hana", HANA_REPOSITORY, 1)
+    scope = RepositoryScope("hana", HANA_REPOSITORY)
     destination = placement.PlacementDestination("ssh", "hana-aws", "aws-hana", scope, 1)
     request = placement_request(fixture)
     assert isinstance(request.profile, records.StepProfile)
@@ -4148,7 +4148,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\n", template="mac_test")
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
                 destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
@@ -4182,7 +4182,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             + "kind.healthy=ssh\nplatform.healthy=linux\nsettings.healthy=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
         settings = fixture.root / "target.conf"
         _ = write_config_fixture(settings, "host=fixture\nexecution_transport=ssh\n"
-                                 + "probe_timeout_s=10\nslots=1\nkinds=check\n", template="mac_test")
+                                 + "probe_timeout_s=10\nkinds=check\n", template="mac_test")
         repository = fixture.root / "hana"
         (repository / ".git").mkdir(parents=True)
         request = placement_request(fixture)
@@ -4542,22 +4542,19 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             with self.subTest(neighbor="invalid registry entry"):
                 check_healthy()
 
-    def test_client_and_service_recover_the_same_linux_policy_and_capacity(self) -> None:
+    def test_client_and_service_recover_the_same_linux_policy(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
             settings, request, _destination = self.target_settings_fixture(fixture)
-            _ = settings.write_text(settings.read_text() + "\nslots.hana=2\n")
             self.commit_settings(settings)
-            _ = settings.write_text(settings.read_text().replace("slots.hana=2", "slots.hana=broken")
-                                    .replace("kinds=check", "kinds=broken"))
+            _ = settings.write_text(settings.read_text().replace("kinds=check", "kinds=broken"))
             candidates = [candidate for candidate in self.client_constraints(request).candidates
                           if candidate.destination.target == "fixture"]
-            self.assertEqual([candidate.destination.slot for candidate in candidates], [1, 2])
+            self.assertEqual([candidate.destination.slot for candidate in candidates], [1])
             self.assertTrue(all(candidate.eligibility == ALLOWED_HOST for candidate in candidates))
             with mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                 evidence = self.read_target(fixture, request)
             assert isinstance(evidence, placement.FreshHostEvidence), evidence
             self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-            self.assertEqual(warnings.getvalue().count("slots.hana='broken'"), 1)
             self.assertEqual(warnings.getvalue().count("kinds='broken'"), 1)
 
     def test_hana_preview_recovers_budget_and_ignores_guest_guard(self) -> None:
@@ -4663,30 +4660,15 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertIsInstance(reply, wire.PlacementWait)
             self.assertNotIn(key, fixture.server.host_requests)
 
-    def test_capacity_ignores_bad_leftover_timeout(self) -> None:
+    def test_free_now_ignores_bad_leftover_timeout(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
             settings, request, destination = self.target_settings_fixture(fixture)
             good = settings.read_text()
             timeout = conf.read(settings).text("leftover_timeout_s")
             _ = settings.write_text(good.replace(f"leftover_timeout_s={timeout}", "leftover_timeout_s=broken"))
             paths = mac_test.state_paths(destination.target)
-            with self.subTest(reader="free_now"):
-                self.assertEqual(mac_test.free_now(paths, settings, Path(request.constraints.repository)), "free")
-            with self.subTest(reader="slot_capacity"):
-                self.assertEqual(mac_test.slot_capacity(paths, RepositoryScope("hana")), 1)
+            self.assertEqual(mac_test.free_now(paths, settings, Path(request.constraints.repository)), "free")
             self.assertEqual(warnings.getvalue(), "")
-
-    def test_capacity_recovers_bad_repository_slot_count(self) -> None:
-        with PlacementFixture() as fixture:
-            settings, _request, destination = self.target_settings_fixture(fixture)
-            good = settings.read_text() + "\nslots.hana=2\n"
-            _ = settings.write_text(good)
-            self.commit_settings(settings)
-            _ = settings.write_text(good.replace("slots.hana=2", "slots.hana=broken"))
-            paths = mac_test.state_paths(destination.target)
-            with redirect_stderr(io.StringIO()) as warnings:
-                self.assertEqual(mac_test.slot_capacity(paths, RepositoryScope("hana")), 2)
-            self.assertEqual(warnings.getvalue().count("slots.hana='broken'"), 1)
 
     def test_unreadable_mac_settings_allow_local_placement(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()):
@@ -4794,7 +4776,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 _ = (fixture.root / "build_targets.conf").write_text(
                     f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\n", template="mac_test")
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
                 destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
@@ -4853,7 +4835,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=box\nkind.box=ssh\nplatform.box=macos\nsettings.box=box.conf\n")
             _ = write_config_fixture(fixture.root / "box.conf",
-                "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\n", template="mac_test")
             request = placement_request(fixture)
             destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
             request = replace(request, constraints=replace(request.constraints, repository=str(repository),

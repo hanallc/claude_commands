@@ -4728,7 +4728,7 @@ class AdmissionServer:
             adopted.append(placement.AdoptedProviderClaim(reference,
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))
-            executions.append((reference, self._observe_provider_execution(request, destination, reference,
+            executions.append((reference, self._observe_provider_execution(request, destination, claim.path,
                 record, paths.platform, configuration)))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
@@ -4750,7 +4750,7 @@ class AdmissionServer:
         return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                                    reference: placement.ProviderClaimReference, record: RemoteJobClaim,
+                                    claim_path: Path, record: RemoteJobClaim,
                                     platform: Literal["linux", "macos"],
                                     config: conf.ConfigRead) -> execution_identity.ExecutionEvidence:
         """Read existing mirror process evidence without invoking provider cleanup."""
@@ -4767,8 +4767,7 @@ class AdmissionServer:
             repository = eligibility.repository_identity(Path(request.constraints.repository))
             if not isinstance(repository, eligibility.KnownRepository):
                 return execution_identity.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
-        scope = reference.scope
-        slot = scope.slot if isinstance(scope, claim_state.RepositoryScope) and scope.slot else destination.slot or 1
+        slot = claim_state.legacy_linux_claim_name(claim_path)[1] if platform == "linux" else 1
         script = offload.mirror_selector_script(repository, destination.target, slot) + r'''
 placement_pids=$(select_leftovers) || exit 1
 for placement_pid in $placement_pids; do
@@ -5886,9 +5885,6 @@ done
         from scripts.aws_target import hana_placement
         from scripts.build_queue import mac_run
         from scripts.build_targets import mac_linux
-        from scripts.mac_test.claim_state import RepositoryScope
-        if isinstance(destination.scope, RepositoryScope) and destination.scope.slot != destination.slot and destination.provider == "ssh":
-            return self._placement_status(assignment, "assigned scope and slot disagree")
         transport: ExecutionTransport | None = None
         if destination.provider == "ssh":
             with conf.report_key_changes():
