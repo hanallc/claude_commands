@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import time
 from typing import cast, final, override
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, tzinfo
@@ -32,7 +32,7 @@ from scripts.buildlog import treekey
 from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
-from scripts.lib import conf, scratch
+from scripts.lib import build_folders, conf, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
@@ -1179,14 +1179,15 @@ class GateRecoveryTests(MergeGateFixture):
 class LiveConfigTripwireTests(unittest.TestCase):
     def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        job_root = root / "job"
-        job_root.mkdir()
+        folders = self.enterContext(ExitStack())
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=root, purpose="job", suffix_length=0)
+        job_root = folders.enter_context(build_folders.temporary_build_folder(spec))
         marker = job_root / "live-config-writes"
         _ = marker.write_text("/fixture/config/console.conf\n")
         log = job_root / "output.log"
         process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
         job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
-                                  time.time(), log.open("w+"), log, "test_fixture.py")
+                                  time.time(), log.open("w+"), log, "test_fixture.py", folder_cleanup=folders)
         self.addCleanup(job.output.close)
         with mock.patch.object(gate, "kill_job_group"):
             result = gate.finish_gate_job(job, 0)

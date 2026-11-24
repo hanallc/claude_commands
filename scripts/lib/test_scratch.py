@@ -17,9 +17,8 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from contextlib import AbstractContextManager, ExitStack, redirect_stdout, redirect_stderr
 from pathlib import Path
 from threading import Event, current_thread
 from typing import cast, override
@@ -1379,6 +1378,20 @@ for descriptor in descriptors:
                 self.assert_retry_keeps_metadata(path, index)
                 self.assertTrue(index.is_dir())
 
+    def patch_metadata_scan(self, *patches: AbstractContextManager[object]) -> None:
+        inspect = git_files.check_internal_removal_entries
+
+        def inspect_with_patches(checkouts: tuple[git_files.Checkout, ...],
+                                 previous: git_files.RecordedRemovalFiles | git_files.LegacyRemovalFiles, *,
+                                 removal_root: Path) -> None:
+            with ExitStack() as stack:
+                for patch in patches:
+                    _ = stack.enter_context(patch)
+                inspect(checkouts, previous, removal_root=removal_root)
+
+        _ = self.enterContext(mock.patch.object(git_files, "check_internal_removal_entries",
+                                                side_effect=inspect_with_patches))
+
     def test_retry_keeps_a_ref_directory_replaced_by_a_symlink_during_scan(self) -> None:
         path = self.checkout_with_removal_intent("current", "ref-directory-swap")
         namespace = path / ".git/refs/heads"
@@ -1407,9 +1420,9 @@ for descriptor in descriptors:
                 replace_namespace()
             return scan(folder)
 
-        with (mock.patch.object(os, "open", side_effect=open_during_swap),
-              mock.patch.object(os, "scandir", side_effect=scan_during_swap)):
-            self.assert_retry_keeps_metadata(path, namespace)
+        self.patch_metadata_scan(mock.patch.object(os, "open", side_effect=open_during_swap),
+                                 mock.patch.object(os, "scandir", side_effect=scan_during_swap))
+        self.assert_retry_keeps_metadata(path, namespace)
         self.assertTrue(namespace.is_symlink())
         self.assertTrue((moved / "loose").is_file())
 
@@ -1454,8 +1467,8 @@ for descriptor in descriptors:
                 metadata.symlink_to(replacement, target_is_directory=True)
             return open_entry(name, flags, mode, dir_fd=dir_fd)
 
-        with (mock.patch.object(os, "open", side_effect=open_during_swap),
-              mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete):
+        self.patch_metadata_scan(mock.patch.object(os, "open", side_effect=open_during_swap))
+        with mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
             result = scratch.remove_folder(path)
             delete.assert_not_called()
         self.assertEqual(result, scratch.KeptFolder(path, f"{metadata}: directory changed during inspection"))
@@ -3133,31 +3146,17 @@ print(scratch.target('gate:proof', 'tree'))
         record = (path / copy_record.RECORD).read_bytes()
         other = scratch.new(RUN, "kept")
         real_unlink = os.unlink
-        real_scandir = os.scandir
+        real_listdir = os.listdir
 
-        class RecordFirstEntries:
-            def __init__(self, entries: list[os.DirEntry[str]]) -> None:
-                self.entries: list[os.DirEntry[str]] = entries
-
-            def __iter__(self) -> Iterator[os.DirEntry[str]]:
-                return iter(self.entries)
-
-            def __enter__(self) -> Iterator[os.DirEntry[str]]:
-                return iter(self.entries)
-
-            def __exit__(self, *error: object) -> None:
-                pass
-
-        def record_first(directory: int | str | os.PathLike[str]) -> RecordFirstEntries:
-            with real_scandir(directory) as entries:
-                return RecordFirstEntries(sorted(entries, key=lambda entry: (entry.name != copy_record.RECORD, entry.name)))
+        def record_first(directory: int | str | os.PathLike[str] | None = None) -> list[str]:
+            return sorted(real_listdir(directory), key=lambda name: (name != copy_record.RECORD, name))
 
         def stop_after_child(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
             real_unlink(child, dir_fd=dir_fd)
             if Path(child).name == first.name:
                 raise KeyboardInterrupt
 
-        with (mock.patch.object(os, "scandir", side_effect=record_first),
+        with (mock.patch.object(os, "listdir", side_effect=record_first),
               mock.patch.object(os, "unlink", side_effect=stop_after_child),
               self.assertRaises(KeyboardInterrupt)):
             _ = self.removal_attempt(path, ROW)
