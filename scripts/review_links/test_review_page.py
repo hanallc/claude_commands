@@ -44,8 +44,7 @@ from scripts.review_links import change_browser, change_page, console, for_you, 
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
@@ -5901,6 +5900,7 @@ window.fetch=async(url)=>{
  const failures=[];
  try{
   const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
+  const actions=document.querySelector('[data-page-actions]');
   const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
   const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
   await document.fonts.ready;
@@ -5910,10 +5910,11 @@ window.fetch=async(url)=>{
    const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
    const beside=Math.abs(center(t)-center(o))<=1;
    const atRight=Math.abs(o.right-r.right)<=1;
-   if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
+   if(innerWidth!==width || row.querySelector('button') || actions.querySelectorAll('button').length!==1 ||
+      !actions.contains(owner) ||
       Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
       n.left<r.left-1 || !atRight ||
-      (beside ? n.left<t.right+4 : width===1280 || o.top<t.bottom+4)){
+      (beside ? n.left<t.right+4 : width===1280 || o.bottom+4>t.top)){
     failures.push('The owner button is the only title action and fits at '+width+' px.');
    }
    if(width===320 && Math.abs(t.height-parseFloat(getComputedStyle(title).lineHeight))>1){

@@ -18,7 +18,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target import plan_identity, quota_requests
