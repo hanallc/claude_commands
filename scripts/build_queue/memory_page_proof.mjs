@@ -57,7 +57,7 @@ const [callerFolder, ...comparisonArgs] = args;
 const awsCostShots = !gateMode && comparisonArgs[0] === '--aws-cost-shots';
 const liveAwsCostSource = awsCostShots ? comparisonArgs[1] : undefined;
 const approvedAwsCostShot = awsCostShots && !liveAwsCostSource;
-const [previousPage, comparison] = gateMode || awsCostShots ? [] : comparisonArgs;
+const [previousPage, comparison] = awsCostShots ? [] : comparisonArgs;
 const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
