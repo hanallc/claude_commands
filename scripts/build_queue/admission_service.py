@@ -5003,7 +5003,7 @@ done
                 and (candidate.eligibility.reason == "disk"
                      or isinstance(selection, placement.MacOnlyHost)
                      and (isinstance(candidate.eligibility, placement.FixedExclusion)
-                          or candidate.eligibility.reason not in ("busy", "blocked")))), "")
+                          or candidate.eligibility.reason != "busy"))), "")
             if refusal:
                 return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),

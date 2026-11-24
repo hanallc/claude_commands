@@ -914,7 +914,7 @@ class ClientTests(unittest.TestCase):
 
         cases = (
             (("--mac-only",), placement.TemporaryExclusion("busy"), 78),
-            (("--mac-only",), placement.TemporaryExclusion("blocked"), 78),
+            (("--mac-only",), placement.TemporaryExclusion("blocked"), 2),
             (("--mac-only",), placement.TemporaryExclusion("disk"), 2),
             (("--mac-only",), placement.TemporaryExclusion("unreachable"), 2),
             (("--mac-only",), placement.TemporaryExclusion("backoff"), 2),
@@ -969,7 +969,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(client.main(arguments), expected, errors.getvalue())
                     if expected == 2:
                         self.assertEqual(output.getvalue(), f"refused\t{exclusion.reason}\n")
-                    if exclusion.reason in ("busy", "blocked"):
+                    if selection == ("--target", "mac") and exclusion.reason in ("busy", "blocked"):
                         reply = client.request_placement(submitted)
                         self.assertIsInstance(reply, wire.PlacementWait)
                         assert isinstance(reply, wire.PlacementWait)

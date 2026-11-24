@@ -3195,12 +3195,9 @@ class MacOrderTests(unittest.TestCase):
         self.assertEqual(self.assigned(fixture, order.older, order.younger), [order.older.episode])
 
     def test_a_blocked_mac_only_request_starts_before_a_younger_request(self) -> None:
-        for selection, route in ((placement.MacOnlyHost(), ANY_ELIGIBLE_TARGET),
-                                 (placement.ConfiguredOrder(), MAC_ONLY)):
-            with (self.subTest(selection=selection, route=route), PlacementFixture() as fixture,
-                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
-                order = self.mac_order(fixture, reason="blocked", selection=selection, route=route)
-                self.assert_older_takes_mac(fixture, order)
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            order = self.mac_order(fixture, reason="blocked", selection=placement.ConfiguredOrder(), route=MAC_ONLY)
+            self.assert_older_takes_mac(fixture, order)
 
     def test_a_blocked_mac_pin_starts_before_a_younger_request(self) -> None:
         for selection, route in ((placement.PinnedHost("mac"), PinnedTarget("mac")),
@@ -3228,7 +3225,8 @@ class MacOrderTests(unittest.TestCase):
 
     def test_a_mac_only_hold_ends_after_one_blocked_probe(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
-            order = self.mac_order(fixture, reason="blocked", selection=placement.MacOnlyHost())
+            order = self.mac_order(fixture, reason="blocked", selection=placement.ConfiguredOrder(), route=MAC_ONLY)
+            self.assertIsInstance(fixture.server.handle_request(order.older)[0], wire.PlacementWait)
             fixture.clock.advance(1)
             _ = self.provide(fixture, order.older, placement.TemporaryExclusion("blocked"))
             self.assertEqual(order.worker.probe_next(), order.older_key)
@@ -3240,7 +3238,8 @@ class MacOrderTests(unittest.TestCase):
         for reason in ("disk", "off", "state"):
             with (self.subTest(reason=reason), PlacementFixture() as fixture,
                   mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
-                _ = self.mac_order(fixture, reason=reason, selection=placement.MacOnlyHost(), expect_hold=False)
+                _ = self.mac_order(fixture, reason=reason, selection=placement.ConfiguredOrder(), route=MAC_ONLY,
+                                   expect_hold=False)
                 self.assertEqual(fixture.server.placement_holds, {})
 
     def test_disk_refuses_each_mac_only_route(self) -> None:

@@ -2812,12 +2812,12 @@ A local reservation keeps its saved place until the service sees processes in it
 The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
-A Mac-only request includes a request pinned to the Mac.
-An older Mac-only request with a temporary exclusion can hold its destination.
+An older request with a temporary exclusion can hold the Mac if it uses `route=MacOnly` with `ConfiguredOrder`.
+An older Mac pin can also hold the Mac.
 The hold applies when a later request has a newer free reading for an overlapping scope.
 Disk, off, and state exclusions prevent this hold.
 The next probe or its time limit ends the hold.
-A blocked Mac returns a wait for `--mac-only`.
+A blocked Mac probe immediately refuses `--mac-only`.
 A disk exclusion immediately refuses all Mac-only requests.
 Other requests can hold a remote destination for one probe when a reading is missing or the destination is busy.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
