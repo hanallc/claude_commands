@@ -43,12 +43,18 @@ class HandedOff:
     """The command now owns the next admission of this run."""
 
 
+def _owner_end_timing() -> client.OwnerEndTiming:
+    config = records.read_memory_config(report=False)
+    return client.OwnerEndTiming(config.query_timeout_seconds, config.reconnect_seconds, config.unreachable_limit_seconds)
+
+
 @dataclass(frozen=True)
 class GatePlacement:
     """The gate uses this assignment until its caller ends."""
 
     grant: wire.LocalPlacementGranted | wire.Assignment
     request: wire.PlacementRequest
+    owner_end_timing: client.OwnerEndTiming = field(default_factory=_owner_end_timing)
 
 
 @dataclass
@@ -95,7 +101,7 @@ class FirstStepAdmission:
         grant = self.grant
         if not isinstance(grant, GatePlacement) or grant.request != request:
             raise wire.AdmissionUnavailable('only the original gate request can be placed again')
-        self.grant = GatePlacement(_placement_grant(request), request)
+        self.grant = replace(grant, grant=_placement_grant(request))
         client.write_assignment(self.assignment_file, self.grant.grant)
         self._hand_gate(self.grant)
 
@@ -120,7 +126,8 @@ class FirstStepAdmission:
                 return
             if not assignment_matches_request(assignment, grant.request):
                 raise wire.AdmissionUnavailable('the saved assignment does not match the gate request')
-            client.report_owner_end(wire.OwnerEnd(uuid4().hex, assignment, grant.request.owner, status))
+            client.report_owner_end(wire.OwnerEnd(uuid4().hex, assignment, grant.request.owner, status),
+                                    grant.owner_end_timing)
         except (OSError, ValueError, wire.AdmissionUnavailable) as error:
             if isinstance(error, TimeoutError):
                 # The queue checks the assignment when the owner exits.
@@ -376,7 +383,8 @@ def admitted_run(command: Sequence[str], source: Path, *,
                 grant = _placement_grant(request)
             elif targets:
                 gate_request = _gate_request(command, source, targets, owner, position, run, folder / 'placement.cgroup')
-                grant = GatePlacement(_placement_grant(gate_request), gate_request)
+                timing = _owner_end_timing()
+                grant = GatePlacement(_placement_grant(gate_request), gate_request, timing)
             else:
                 grant = _program_grant(command, source, owner, position, run)
             admitted = FirstStepAdmission(position, grant, assignment_file)

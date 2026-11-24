@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+from threading import get_ident
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -82,8 +83,17 @@ class FirstStepTests(unittest.TestCase):
             assignment = client.read_assignment(admitted.assignment_file).assignment
             args = copies.CopyArguments(repo=str(fixture.root), targets="mac-linux")
             child = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, 0))
+            owner_thread = get_ident()
+            read_config = records.read_memory_config
+
+            def read_service_config(*, report: bool = True) -> records.MemoryConfig:
+                if get_ident() == owner_thread:
+                    raise AssertionError("late configuration read")
+                return read_config(report=report)
+
             with (fixture.serving(), mock.patch.dict(os.environ),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
+                  mock.patch.object(records, "read_memory_config", read_service_config),
                   mock.patch.object(copies, "subprocess", SimpleNamespace(run=child))):
                 self.assertEqual(copies.run_gate_step(args, GATE_COMMAND), 0)
             child.assert_called_once()

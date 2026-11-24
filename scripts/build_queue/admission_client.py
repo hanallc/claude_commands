@@ -605,15 +605,23 @@ def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
     raise wire.AdmissionUnavailable("invalid execution report answer")
 
 
-def report_owner_end(request: wire.OwnerEnd) -> None:
-    """Retry transport failures within the queue outage limit."""
-    from scripts.build_queue import admission_protocol as wire, admission_records as records
+@dataclass(frozen=True)
+class OwnerEndTiming:
+    """Set the query and retry limits for a guest gate completion report."""
 
-    config = records.read_memory_config(report=False)
-    deadline = CLOCK.monotonic() + config.unreachable_limit_seconds
+    query_timeout_seconds: float
+    reconnect_seconds: float
+    unreachable_limit_seconds: float
+
+
+def report_owner_end(request: wire.OwnerEnd, timing: OwnerEndTiming) -> None:
+    """Retry transport failures within the queue outage limit."""
+    from scripts.build_queue import admission_protocol as wire
+
+    deadline = CLOCK.monotonic() + timing.unreachable_limit_seconds
     outgoing = wire.encode_owner_end(request).encode()
     while True:
-        query_deadline = min(deadline, CLOCK.monotonic() + config.query_timeout_seconds)
+        query_deadline = min(deadline, CLOCK.monotonic() + timing.query_timeout_seconds)
         try:
             with _connect(_remaining_seconds(query_deadline)) as connection:
                 connection.settimeout(_remaining_seconds(query_deadline))
@@ -622,8 +630,8 @@ def report_owner_end(request: wire.OwnerEnd) -> None:
         except OSError as error:
             remaining = deadline - CLOCK.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"no answer in {config.unreachable_limit_seconds:g} s") from error
-            CLOCK.sleep(min(config.reconnect_seconds, remaining))
+                raise TimeoutError(f"no answer in {timing.unreachable_limit_seconds:g} s") from error
+            CLOCK.sleep(min(timing.reconnect_seconds, remaining))
         else:
             break
 
