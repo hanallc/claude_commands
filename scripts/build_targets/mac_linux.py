@@ -53,9 +53,10 @@ if TYPE_CHECKING:
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
-# The guest route holds a repository claim on this Mac target while its run lasts.
-GUEST_CLAIM_TARGET = 'mac'
+GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
+RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
+BOOTSTRAP_DIR = '.git/mac-linux'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
        '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}')
@@ -255,6 +256,7 @@ class GuestRunRequest(TypedDict):
     commit: str
     tree: str
     origin_main: str
+    runner_commit: str
     unit: str
 
 
@@ -309,6 +311,10 @@ class CheckoutSource:
     tree: str
     origin_main: str
     origin_url: str
+    runner_commit: str
+
+    def bundle_tips(self) -> dict[str, str]:
+        return {'candidate': self.commit, 'main': self.origin_main, 'runner': self.runner_commit}
 
 
 @dataclass(frozen=True)
@@ -324,11 +330,35 @@ def check_repository(repo: Path) -> None:
         raise GuestRepositoryRefused(repository)
 
 
+def runner_commit(repo: Path) -> str:
+    """Find the clean runner commit and make its objects available to the bundle."""
+    from scripts.production.gate import checked_git, git
+
+    runner_folder = Path(__file__).resolve().parent
+    try:
+        top, _, commit = checked_git(runner_folder, 'rev-parse', '--show-toplevel', 'HEAD').rpartition('\n')
+        root = Path(top)
+        entries = checked_git(root, 'ls-files', '-v', '-z', '--cached', '--others', '--exclude-standard', '--', 'scripts/')
+        tags = {entry[0] for entry in entries.split('\0') if entry}
+        if any(tag == 'S' or tag.islower() for tag in tags):
+            raise GuestTookNoRun(f'the guest runner scripts have assume-unchanged or skip-worktree flags in {root}')
+        if ('?' in tags
+                or checked_git(root, 'diff', '--cached', '--name-only', commit, '--', 'scripts/')
+                or checked_git(root, 'diff', '--name-only', '--', 'scripts/')):
+            raise GuestTookNoRun(f'the guest runner scripts have uncommitted changes in {root}')
+        if git(repo, 'cat-file', '-e', f'{commit}^{{commit}}').returncode:
+            _ = checked_git(repo, 'fetch', '--no-tags', '--no-write-fetch-head', str(root), commit)
+    except (GateRefused, OSError, subprocess.SubprocessError) as error:
+        raise GuestTookNoRun(f'cannot prepare the guest runner commit: {error}') from error
+    return commit
+
+
 def checkout_source(repo: Path) -> CheckoutSource:
     from scripts.aws_target import cloud_gate
     from scripts.production.gate import checked_git
 
     check_repository(repo)
+    runner = runner_commit(repo)
     head = checked_git(repo, 'rev-parse', 'HEAD')
     origin_main = checked_git(repo, 'rev-parse', '--verify', f'{ORIGIN_MAIN}^{{commit}}')
     tree, dirty = cloud_gate.working_tree(repo)
@@ -337,7 +367,7 @@ def checkout_source(repo: Path) -> CheckoutSource:
     if origin.password or origin.query or ('://' in origin_url and origin.username):
         raise GuestUnavailable('the origin URL must contain no credential')
     commit = checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Mac Linux gate snapshot') if dirty else head
-    return CheckoutSource(head, commit, tree, origin_main, origin_url)
+    return CheckoutSource(head, commit, tree, origin_main, origin_url, runner)
 
 
 def blob_id(data: bytes, object_id_length: int) -> str:
@@ -388,7 +418,7 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
             raise GuestUnavailable('selected modules are absent from the checkout')
     coverage = ModuleCoverage.COMPLETE if modules == paths else ModuleCoverage.SUBSET
     return CandidateSource(source.head, source.commit, source.tree, source.origin_main, source.origin_url,
-                           modules, coverage)
+                           source.runner_commit, modules, coverage)
 
 
 def runner_bootstrap(request: GuestRequest | GuestCommandRequest) -> bytes:
@@ -398,7 +428,6 @@ def runner_bootstrap(request: GuestRequest | GuestCommandRequest) -> bytes:
     with BytesIO() as bootstrap:
         with tarfile.open(fileobj=bootstrap, mode='w') as archive:
             archive.addfile(record, BytesIO(manifest))
-            archive.add(Path(__file__).resolve(), arcname='runner.py')
         return bootstrap.getvalue()
 
 
@@ -830,7 +859,7 @@ unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
 if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
-bootstrap="$PWD/.git/mac-linux"
+bootstrap="$PWD/{BOOTSTRAP_DIR}"
 rm -rf -- "$bootstrap"
 mkdir -p -- "$bootstrap/tmp"
 trap 'rm -rf -- "$bootstrap"' EXIT
@@ -864,8 +893,9 @@ git symbolic-ref HEAD refs/heads/main
 git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
+git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$bootstrap"
 umask 022
-./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+"$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
     locked_run = f'''set -euo pipefail
@@ -882,7 +912,7 @@ def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
 lock="/proc/$$/fd/8"
 prove_end() {{
     flock -x -n 8 || return 1
-    if ! {cancel}; then
+    if ! {cancel} || ! rm -rf -- {BOOTSTRAP_DIR}; then
         exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
@@ -1031,7 +1061,7 @@ class BundleReason(StrEnum):
 
 @dataclass(frozen=True)
 class FullBundle:
-    """Send the complete Git history for the candidate and origin/main."""
+    """Send the complete Git history for the candidate, origin/main, and runner."""
 
     reason: BundleReason
 
@@ -1069,17 +1099,18 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
     from scripts.production.gate import checked_git
 
     prefix = f'refs/mac-linux/{attempt}'
+    tips = source.bundle_tips()
     active_error: BaseException | None = None
     try:
-        _ = checked_git(repo, 'update-ref', f'{prefix}/candidate', source.commit)
-        _ = checked_git(repo, 'update-ref', f'{prefix}/main', source.origin_main)
+        for name, commit in tips.items():
+            _ = checked_git(repo, 'update-ref', f'{prefix}/{name}', commit)
         yield prefix
     except BaseException as error:
         active_error = error
         raise
     finally:
         failure = active_error
-        for tip in ('candidate', 'main'):
+        for tip in tips:
             ref = f'{prefix}/{tip}'
             try:
                 _ = checked_git(repo, 'update-ref', '-d', ref)
@@ -1100,12 +1131,13 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
 def empty_delta_header(repo: Path, source: CheckoutSource, basis: DeltaBundle, prefix: str) -> str:
     from scripts.production.gate import checked_git
 
-    if checked_git(repo, 'rev-list', '--max-count=1', source.commit, source.origin_main, f'^{basis.base}'):
+    tips = source.bundle_tips()
+    if checked_git(repo, 'rev-list', '--max-count=1', *tips.values(), f'^{basis.base}'):
         return ''
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
-    # Git refuses to create a bundle when both tips are already in the prerequisite.
-    return (f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n'
-            + f'{source.commit} {prefix}/candidate\n{source.origin_main} {prefix}/main\n\n')
+    # Git refuses to create a bundle when the prerequisite already has all the tips.
+    refs = ''.join(f'{commit} {prefix}/{name}\n' for name, commit in tips.items())
+    return f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n{refs}\n'
 
 
 # Without a count argument, the SSH output is the stream output. With one, send the SSH result to
@@ -1123,7 +1155,7 @@ bundle() {
     if [ -n "$header" ]; then
         printf '%s' "$header" && git pack-objects --stdout </dev/null
     else
-        local refs=("$prefix/candidate" "$prefix/main")
+        local refs=("--glob=$prefix/*")
         if [ -n "$base" ]; then
             refs+=("^$base")
         fi
@@ -1882,7 +1914,7 @@ class GuestCommand:
 
     def start(self, repo: Path, argv: Sequence[str], *, work: str, unit: str, bootstrap: Path,
               checked: Mapping[Path, bytes]) -> subprocess.Popen[bytes]:
-        """Start one run; the bootstrap file holds the request and the runner while the stream reads them.
+        """Start one run; the bootstrap file holds the request while the stream reads it.
 
         checked holds the bytes of each file of the checkout that the run must find in the commit. A
         failure before the guest starts the argv raises GuestUnavailable with the guest output, and closes
@@ -1898,7 +1930,8 @@ class GuestCommand:
             raise GuestUnavailable(f'the commit for the guest does not hold the checked text of {", ".join(mismatches)}: '
                                    + 'the file changed after the check, or git does not keep it')
         request = GuestCommandRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
-                                      origin_main=source.origin_main, unit=unit, work=work, argv=list(argv),
+                                      origin_main=source.origin_main, runner_commit=source.runner_commit, unit=unit,
+                                      work=work, argv=list(argv),
                                       checked=sorted(files))
         data = runner_bootstrap(request)
         _ = bootstrap.write_bytes(data)
@@ -2112,7 +2145,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         guest_attempt = _placed_guest_attempt(attempt_key(assignment.episode, assignment.attempt))
         request = GuestRequest(attempt=guest_attempt, commit=source.commit, tree=source.tree,
-                               origin_main=source.origin_main, mode=mode.wire, full=full,
+                               origin_main=source.origin_main, runner_commit=source.runner_commit,
+                               mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
@@ -2507,7 +2541,6 @@ def run_guest(request_path: Path) -> int:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             reply = os.dup(1)
             try:
-                # The -c entry selects the numbered copy as the Python checkout.
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
                                                                   request_path, reply),
                                           copy.path, environment, reply)
@@ -2534,12 +2567,8 @@ def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
 
 
 def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
-    """Run the runner in the numbered copy with the argv [runner, request, --run-copy, reply descriptor].
-
-    Python gives a -c entry the argv ['-c', *arguments], so the entry removes '-c' before it runs the runner.
-    """
-    return ['./scripts/lib/py', '-X', f'cpu_count={jobs}',
-            '-c', 'import runpy, sys; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")',
+    """Start the archived runner with the numbered copy as the working directory."""
+    return [str(runner.parents[1] / 'lib/py'), '-X', f'cpu_count={jobs}',
             str(runner), str(request_path), RUN_COPY, str(reply)]
 
 
@@ -2589,7 +2618,7 @@ def run_copy(request_path: Path, reply: int) -> None:
             def send_progress(line: str) -> None:
                 print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
 
-            # Older gate code in a candidate checkout has no progress callback.
+            # Older gate code can omit the progress callback.
             machine = (gate.WholeMachine(module_progress=send_progress)
                        if hasattr(gate.WholeMachine, 'module_progress') else gate.WholeMachine())
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
