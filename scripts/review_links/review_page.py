@@ -25,6 +25,7 @@ from scripts.for_you.action import ActionStore, ActionStoreError, REVIEW_PATH
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
 from scripts.production.record_store import FileStamp, state_root
+from scripts.rebuild import need
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, reply_tokens, review_submissions
@@ -996,17 +997,34 @@ def log_html(item: ReviewItem, inputs: ReviewBodyInputs, owner: str) -> str:
 def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBodyInputs) -> str:
     """Render the action in the shared Review card."""
     requester = row.requested_by or 'Not recorded'
+    rebuild = row.kind == 'rebuild'
+    asker = inputs.names.html(row.requester_reference, requester) if rebuild else inputs.names.html(item.owner, requester)
     fields = (
         ('Machine', html.escape(row.machine)),
         ('Working directory', html.escape(row.cwd or 'Not recorded')),
-        ('Requester', inputs.names.html(item.owner, requester)),
-        ('Waiting work', html.escape(row.waits)),
+        ('Asked by' if rebuild else 'Requester', asker),
+        *(() if rebuild else (('Waiting work', html.escape(row.waits)),)),
         ('Completion', 'Automatic after rebuild' if row.completion == 'automatic' else 'Manual'),
     )
     metadata = '<dl class="page-state">'+''.join(f'<dt>{label}</dt><dd>{text}</dd>' for label, text in fields)+'</dl>'
     reason = section('Reason', row.reason) if row.reason else ''
     evidence = section('Withdrawal reason' if row.status == 'withdrawn' else 'Evidence', row.evidence) if row.evidence else ''
-    link = '<p><a href="/console/?page=rebuilds" target="_top">Rebuild details</a></p>' if row.kind == 'rebuild' else ''
+    link = '<p><a href="/console/?page=rebuilds" target="_top">Rebuild details</a></p>' if rebuild else ''
+    if rebuild:
+        why: list[str] = []
+        for request in row.requests:
+            shown = datetime.fromisoformat(request.created_at).astimezone(inputs.zone)
+            name = inputs.names.html(request.requester_reference, request.requested_by or 'Not recorded')
+            label = f'{shown:%b} {shown.day}, {shown:%H:%M %Z}'
+            text = ('<span>' + html.escape(request.reason) + '</span>' if request.reason
+                    else f'<span class="rebuild-secondary">{need.NO_REASON}</span>')
+            why.append(f'<li>{text}<small>{name} · <time datetime="{shown.isoformat()}">{label}</time></small></li>')
+        reason = ('<section><h3>Why</h3>'
+                  + ('<ul class="rebuild-why">' + ''.join(why) + '</ul>' if why
+                     else f'<p class="rebuild-secondary">{need.NO_REASON}</p>')
+                  + '</section>')
+        if not row.running_revision:
+            reason += '<p class="rebuild-secondary">The running revision is unknown.</p>'
     return ('<div class="list-panel review-panel for-you"><div data-review-body>'
             +page_frame.copy_code_block(row.command)+reason+evidence+link+'</div><div>'+metadata+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets))+'</div>')
@@ -1419,6 +1437,11 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 .change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response,.for-you{--type-color:#edc46d}
 .review-panel.for-you dd{overflow-wrap:anywhere}
+.rebuild-why{padding:0;margin:0;list-style:none}
+.rebuild-why li+li{margin-top:12px}
+.rebuild-why li>span{white-space:pre-wrap;overflow-wrap:anywhere}
+.rebuild-why small{display:block;margin-top:4px;font-size:12px;overflow-wrap:anywhere}
+.rebuild-why small,.rebuild-secondary{color:var(--ink-3)}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .response-answer time{display:block;margin-bottom:8px;color:var(--ink-3);font-size:12px}
 .review-log-column{display:flex;flex-direction:column;min-width:0}.review-log-column>.list-log-panel{flex:1 0 0}

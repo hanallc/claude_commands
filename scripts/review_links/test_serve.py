@@ -4910,7 +4910,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["cache-control"], "no-store")
         self.assertEqual(json.loads(body), {"available": True, "count": 2, "other_count": 1, "rebuild_machines": ["mac"]})
-        read.assert_called_once_with(include_comparison_reason=False)
+        read.assert_called_once_with(include_running_revision=False)
+        partial = replace(snapshot, unavailable=(for_you.UnavailableSource("rebuild needs", "Bad record.", partial=True),))
+        with patch.object(for_you, "read", return_value=partial):
+            status, _, body = self.head("/console/for-you.json?view=count")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"available": False, "partial": True, "other_count": 1,
+                                           "rebuild_machines": ["mac"]})
 
     def test_for_you_count_view_keeps_rebuilds_when_the_read_exceeds_the_recursion_limit(self) -> None:
         rebuild = rebuild_row.RebuildAnswer(("natedev", "mac"), False)
