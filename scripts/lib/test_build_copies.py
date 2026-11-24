@@ -1,9 +1,9 @@
 """Numbered copies retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 import fcntl
 import io
 import json
@@ -21,12 +21,13 @@ import unittest
 from unittest import mock
 
 from scripts.copies import copies
-from scripts.lib import build_folders, build_copies, copy_record, file_lock, git_rescue
+from scripts.lib import build_copies, build_folder_lock, build_folders, copy_record, file_lock, git_files, git_rescue, scratch, session_folder
 from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
 
 
 class BuildCopiesTests(unittest.TestCase):
@@ -159,25 +160,706 @@ class BuildCopiesTests(unittest.TestCase):
         self.assertEqual(self.rescue_refs(), refs)
         self.assertNotIn("untracked folders", notices.getvalue())
 
+    def test_free_copy_with_only_ignored_folders_is_taken_again(self) -> None:
+        _ = (self.source / ".gitignore").write_text("target/\noutput/\n")
+        self.base = commit_repository(self.source, "ignore output")
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            draft = path / "output/draft.txt"
+            draft.parent.mkdir()
+            _ = draft.write_text("ignored file\n")
+            self.assertEqual(self.git(path, "check-ignore", str(draft)), str(draft))
+
+        with self.take_queue_copy() as copy:
+            self.assertEqual(copy.path, path)
+
+    def test_rescue_saves_an_ignored_file_that_the_next_commit_tracks(self) -> None:
+        _ = (self.source / ".gitignore").write_text("target/\noutput/\n")
+        self.base = commit_repository(self.source, "ignore output")
+        with self.take_queue_copy() as copy:
+            draft = copy.path / "output/draft.txt"
+            draft.parent.mkdir()
+            _ = draft.write_text("local draft\n")
+
+        upstream = self.source / "output/draft.txt"
+        upstream.parent.mkdir()
+        _ = upstream.write_text("tracked draft\n")
+        _ = self.git(self.source, "add", "--force", "--", str(upstream))
+        next_commit = commit_repository(self.source, "track the draft")
+        before = set(self.rescue_refs().splitlines())
+        with self.take_queue_copy(commit=next_commit) as reused:
+            self.assertEqual(reused.path, copy.path)
+            self.assertEqual(draft.read_text(), "tracked draft\n")
+        saved, = set(self.rescue_refs().splitlines()) - before
+        self.assertEqual(self.git(self.source, "show", f"{saved}:output/draft.txt"), "local draft")
+
     def test_free_copy_with_an_untracked_folder_is_kept(self) -> None:
-        self.commit_allow_list_ignore()
-        exclude = self.source / ".git/info/exclude"
-        exclude.parent.mkdir(exist_ok=True)
-        with exclude.open("a") as output:
-            _ = output.write("saved/\n")
+        with self.take_queue_copy() as copy:
+            draft = copy.path / "notes/draft.txt"
+            draft.parent.mkdir()
+            _ = draft.write_text("unsaved work\n")
+
         notices = io.StringIO()
-        _ = self.enterContext(redirect_stderr(notices))
-        for folder in ("notes", "saved", "src/target"):
-            with self.subTest(folder=folder):
-                with self.take_queue_copy() as copy:
-                    path = copy.path
-                    (path / folder).mkdir()
-                    _ = (path / folder / "draft.txt").write_text("unsaved work\n")
+        with redirect_stderr(notices), self.take_queue_copy() as other:
+            self.assertEqual(other.number, 2)
+        self.assertIn(f"kept for a manual removal list: {copy.path} (build_copies, untracked folders)",
+                      notices.getvalue())
+        self.assertEqual(draft.read_text(), "unsaved work\n")
+
+    def make_temporary(self, parent: Path | None = None) -> Path:
+        path = (build_folders.build_root() if parent is None else parent) / "p-fixture1"
+        path.mkdir(parents=True)
+        _ = build_folders.lease_path(path).write_text(json.dumps({"pid": os.getpid()}))
+        with build_folders.folder_removal_lease(path, create=True):
+            pass
+        return path
+
+    def unused_build_folders(self) -> list[build_copies.UnusedBuildFolder]:
+        return build_copies.unused_build_folders(build_folders.build_root())
+
+    def test_inventory_lists_only_free_copies_and_measures_them_once(self) -> None:
+        with self.take_queue_copy() as held:
+            with self.take_queue_copy() as free:
+                artifact = free.cargo_dir / "artifact"
+                _ = artifact.write_text("build output\n")
+            lease = build_folders.lease_path(free.path)
+            before = lease.read_bytes()
+            with (mock.patch.object(scratch, "borrower_index", wraps=scratch.borrower_index) as index,
+                  mock.patch.object(build_copies, "_disk_bytes", return_value=4096) as size):
+                candidates = self.unused_build_folders()
+            index.assert_called_once()
+            size.assert_called_once_with(free.path)
+            self.assertEqual(candidates, [build_copies.UnusedBuildFolder(free.path, 4096, "free numbered copy")])
+            self.assertTrue(held.path.is_dir())
+            self.assertEqual(lease.read_bytes(), before)
+            self.assertFalse((git_files.at(free.path).git_dir / build_folders.BUSY).exists())
+            self.assertEqual(artifact.read_text(), "build output\n")
+
+    def test_claim_refuses_a_numbered_copy_held_by_take(self) -> None:
+        with self.take_queue_copy() as copy:
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                    build_copies.claim_unused_build_folder(copy.path)):
+                self.fail("The claim admitted a held copy")
+
+    def test_claim_keeps_a_copy_and_blocks_another_take(self) -> None:
+        with self.take_queue_copy() as copy:
+            artifact = copy.cargo_dir / "artifact"
+            _ = artifact.write_text("build output\n")
+
+        with build_copies.claim_unused_build_folder(copy.path):
+            self.assertEqual(artifact.read_text(), "build output\n")
+            with self.take_queue_copy() as other:
+                self.assertEqual(other.number, 2)
+        self.assertEqual(artifact.read_text(), "build output\n")
+        with self.take_queue_copy() as reused:
+            self.assertEqual(reused.path, copy.path)
+
+    def test_take_refuses_an_ancestor_claim_before_trying_another_number(self) -> None:
+        parent = self.make_temporary()
+        _ = self.git(self.source, "remote", "set-url", "origin", f"git@example.invalid:group/{parent.name}.git")
+
+        def first_number() -> Iterator[int]:
+            yield 1
+            self.fail("The take tried a second number")
+
+        with (mock.patch.object(os, "kill", side_effect=ProcessLookupError),
+              mock.patch.object(build_copies, "_copy_order", return_value=first_number()),
+              build_copies.claim_unused_build_folder(parent)):
+            with self.assertRaises(build_folders.BuildFolderClaimHeld) as held, self.take_queue_copy():
+                self.fail("The take entered a claimed ancestor")
+            self.assertEqual(str(held.exception), f"{parent}: the build folder claim lock is held")
+
+    def test_take_ignores_a_missing_alternate_object_store(self) -> None:
+        temporary = self.make_temporary()
+        alternates = self.source / ".git/objects/info/alternates"
+        store = temporary / "objects"
+        _ = alternates.write_text(f"{store}\n")
+        root = build_folders.build_root()
+        with build_folders.build_folder_claim_lock(temporary, root, exclusive=True):
+            with self.take_queue_copy() as copy:
+                self.assertEqual(self.git(copy.path, "rev-parse", "HEAD"), self.base)
+        _ = shutil.copytree(self.source / ".git/objects", store, ignore=shutil.ignore_patterns("alternates"))
+        with build_folders.build_folder_claim_lock(temporary, root, exclusive=True):
+            with self.assertRaisesRegex(build_folders.CopySourceBusy, "claim lock is held"), self.take_queue_copy():
+                self.fail("The take used an object store in a claimed folder")
+
+    def test_take_ignores_a_regular_file_named_as_an_alternate_object_store(self) -> None:
+        temporary = self.make_temporary()
+        file = temporary / "objects"
+        _ = file.write_text("regular file\n")
+        alternates = self.source / ".git/objects/info/alternates"
+        _ = alternates.write_text(f"{file}\n")
+
+        with build_folders.build_folder_claim_lock(temporary, build_folders.build_root(), exclusive=True):
+            with self.take_queue_copy() as copy:
+                self.assertEqual(self.git(copy.path, "rev-parse", "HEAD"), self.base)
+
+            store = self.root / "alternate-objects"
+            (store / "info").mkdir(parents=True)
+            (store / "info/alternates").symlink_to(file)
+            _ = file.write_text(f"{self.source / '.git/objects'}\n")
+            _ = alternates.write_text(f"{store}\n")
+            with self.assertRaisesRegex(build_folders.CopySourceBusy, "claim lock is held"), self.take_queue_copy():
+                self.fail("The take read an alternates file in a claimed folder")
+
+    def test_claim_blocks_a_new_shared_scratch_clone(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+
+        session = self.root / "session-clones"
+        session.mkdir()
+        for caller in (None, session):
+            with self.subTest(caller=caller), mock.patch.object(session_folder, "caller_folder", return_value=caller):
+                with build_copies.claim_unused_build_folder(path):
+                    with self.assertRaisesRegex(copies.CopyError, "claim lock"):
+                        _ = copies.clone(path, task="gate:blocked")
+                clone = copies.clone(path, task="gate:free")
+                self.assertTrue((clone / ".git/objects/info/alternates").is_file())
+
+    def test_ssh_source_holds_the_numbered_copy_through_fetch(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+        tree = self.git(path, "rev-parse", "HEAD^{tree}")
+        real_git = copies.git
+        fetches: list[Path] = []
+
+        def check_fetch(folder: Path, *arguments: str, data: bytes | None = None) -> bytes:
+            if arguments[:4] == ("fetch", "-q", "--", str(path)):
+                with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                        build_copies.claim_unused_build_folder(path)):
+                    self.fail("The claim admitted the SSH source during fetch")
+                fetches.append(folder)
+            return real_git(folder, *arguments, data=data)
+
+        trust = copies.SshSourceTrust(lambda _: False, lambda _: False, lambda _: False)
+        with mock.patch.object(copies, "git", side_effect=check_fetch):
+            with copies.remote_step_source(path, tree, self.source, trust) as checkout:
+                self.assertEqual((checkout / "same.txt").read_text(), "unchanged\n")
+        self.assertEqual(fetches, [checkout])
+
+    def test_standing_holds_numbered_sources_before_reading_them(self) -> None:
+        with self.take_queue_copy() as source, self.take_queue_copy() as edited:
+            _ = (edited.path / "same.txt").write_text("working changes\n")
+        policy = copies.WorktreeSource(self.base, edited.path)
+        read_commit = copies.source_commit
+        apply_changes = copies.apply_changes
+
+        def check_read(folder: Path, requested: copies.SourcePolicy) -> str:
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                    build_copies.claim_unused_build_folder(folder)):
+                self.fail("The claim admitted the source during the commit read")
+            return read_commit(folder, requested)
+
+        def check_worktree(tree: Path, worktree: Path, base: str) -> copies.EnvrcReference:
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                    build_copies.claim_unused_build_folder(worktree)):
+                self.fail("The claim admitted the worktree while its changes were read")
+            return apply_changes(tree, worktree, base)
+
+        with (mock.patch.object(copies, "source_commit", side_effect=check_read) as read,
+              mock.patch.object(copies, "apply_changes", side_effect=check_worktree) as apply,
+              copies.standing("another-unit", source.path, policy) as prepared):
+            self.assertEqual((prepared / "same.txt").read_text(), "working changes\n")
+        read.assert_called_once_with(source.path, policy)
+        apply.assert_called_once_with(prepared, edited.path, self.base)
+
+    def test_inventory_and_claim_accept_ownerless_temporary_folders(self) -> None:
+        root = build_folders.build_root()
+        top = self.make_temporary()
+        nested = self.make_temporary(root / "widget")
+        artifact = top / "artifact"
+        _ = artifact.write_text("build output\n")
+        nested_artifact = nested / "output"
+        _ = nested_artifact.write_text("build output\n")
+        (nested / "artifact").symlink_to(nested_artifact.name)
+        (nested / "objects").mkdir()
+        stray = root / "widget/stray/1"
+        stray.mkdir(parents=True)
+        unrecorded = nested.with_name("p-freetmp1")
+        unrecorded.mkdir()
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            rows = self.unused_build_folders()
+            self.assertEqual([entry.path for entry in rows], [top, nested])
+            self.assertTrue(all(entry.reason == "ownerless temporary build folder" for entry in rows))
+            self.assertFalse(any(entry.review_only for entry in rows))
+            self.assertFalse((root / ".build-claim-locks").exists())
+            for path in (top, nested):
+                with build_copies.claim_unused_build_folder(path):
+                    self.assertTrue(path.is_dir())
+
+    def test_inventory_marks_ownerless_temporary_git_storage_for_review(self) -> None:
+        root = build_folders.build_root()
+        checkout = self.make_temporary()
+        objects = self.make_temporary(root / "objects-fixture")
+        repository = checkout / "nested" / "source"
+        repository.mkdir(parents=True)
+        _ = self.git(repository, "init", "-q")
+        _ = shutil.copytree(self.source / ".git/objects", objects / "object-store")
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            rows = self.unused_build_folders()
+            self.assertEqual({row.path for row in rows}, {checkout, objects})
+            for row in rows:
+                with self.subTest(path=row.path):
+                    self.assertTrue(row.review_only)
+                    self.assertEqual(row.reason, git_files.GIT_STORAGE_REASON)
+                    self.assertGreater(row.bytes, 0)
+                    with self.assertRaisesRegex(build_copies.BuildFolderReviewOnly, row.reason), (
+                            build_copies.claim_unused_build_folder(row.path)):
+                        self.fail("The claim admitted a temporary folder with Git storage")
+                    cleanup = mock.Mock()
+                    self.assertFalse(build_folders.remove_build_folder(row.path, cleanup))
+                    cleanup.assert_not_called()
+
+    def test_inventory_and_claim_refuse_an_external_symbolic_link(self) -> None:
+        temporary = self.make_temporary()
+        nested = temporary / "nested"
+        nested.mkdir()
+        (nested / "outside").symlink_to(os.path.relpath(self.source.parent, nested), target_is_directory=True)
+        self.assertTrue((nested / "outside" / self.source.name / ".git").is_dir())
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            row, = self.unused_build_folders()
+            self.assertEqual(row.path, temporary)
+            self.assertTrue(row.review_only)
+            self.assertEqual(row.reason, build_folders.EXTERNAL_LINK_REASON)
+            with self.assertRaisesRegex(build_copies.BuildFolderReviewOnly, row.reason), (
+                    build_copies.claim_unused_build_folder(temporary)):
+                self.fail("The claim admitted a link outside the temporary folder")
+            cleanup = mock.Mock()
+            self.assertFalse(build_folders.remove_build_folder(temporary, cleanup))
+            cleanup.assert_not_called()
+
+    def test_temporary_review_scans_each_directory_once_without_path_status_calls(self) -> None:
+        temporary = self.make_temporary()
+        nested = temporary / "nested"
+        nested.mkdir()
+        artifact = nested / "artifact"
+        _ = artifact.write_text("build output\n")
+        (temporary / "link").symlink_to("nested/artifact")
+        (nested / "link").symlink_to("../nested/artifact")
+        with (
+            ExitStack() as leases,
+            mock.patch.object(os, "scandir", wraps=os.scandir) as scan,
+            mock.patch.object(os, "stat", wraps=os.stat) as status,
+            mock.patch.object(os, "lstat", wraps=os.lstat) as link_status,
+        ):
+            self.assertIsNone(build_folders.hold_child_leases(temporary, leases, review_temporary=True))
+            self.assertEqual(scan.call_count, 2)
+            status.assert_not_called()
+            link_status.assert_not_called()
+
+    def test_inventory_and_claim_keep_a_temporary_folder_with_a_live_owner(self) -> None:
+        path = self.make_temporary()
+        _ = build_folders.lease_path(path).write_text(json.dumps({"pid": os.getpid(), "released": True}))
+        self.assertEqual(self.unused_build_folders(), [])
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "the lease owner is active$"), (
+                build_copies.claim_unused_build_folder(path)):
+            self.fail("The claim admitted a temporary folder with a live owner")
+
+    def test_inventory_and_claim_keep_a_temporary_folder_with_a_held_lease(self) -> None:
+        path = self.make_temporary()
+        with (mock.patch.object(os, "kill", side_effect=ProcessLookupError),
+              build_folders.folder_removal_lease(path)):
+            self.assertEqual(self.unused_build_folders(), [])
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "a lease lock is active"), (
+                    build_copies.claim_unused_build_folder(path)):
+                self.fail("The claim admitted a held temporary folder")
+
+    def test_temporary_owner_cleanup_keeps_a_source_during_clone(self) -> None:
+        root = build_folders.build_root()
+        root.mkdir()
+        owner_code = """import sys
+from scripts.lib import build_folders as folders
+request = folders.UniqueBuildFolder('p-', folders.ExplicitBuildParent(folders.build_root()))
+with folders.temporary_build_folder(request) as path:
+    print(path, flush=True)
+    sys.stdin.read()
+"""
+        with subprocess.Popen([sys.executable, "-c", owner_code], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as owner:
+            assert owner.stdout is not None
+            name = cast(str, owner.stdout.readline()).strip()
+            self.assertTrue(name, "The owner did not report its folder")
+            temporary = Path(name)
+            source = temporary / "repository"
+            _ = self.git(self.source, "clone", "--", str(self.source), str(source))
+            initialize_git = copies.initialize_git
+
+            def finish_owner(tree: Path, checkout: Path) -> None:
+                _, errors = owner.communicate(input="", timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(owner.returncode, 0, errors)
+                self.assertTrue(source.is_dir())
+                self.assertTrue(build_folders.lease_path(temporary).is_file())
+                self.assertTrue(temporary.with_name(temporary.name + ".lock").is_file())
+                with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                        build_copies.claim_unused_build_folder(temporary)):
+                    self.fail("The claim admitted the temporary source during clone")
+                initialize_git(tree, checkout)
+
+            with mock.patch.object(copies, "initialize_git", side_effect=finish_owner):
+                clone = copies.clone(source, task="gate:temporary-owner")
+
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), self.base)
+        shutil.rmtree(clone)
+        self.assertEqual([entry.path for entry in self.unused_build_folders() if entry.review_only], [temporary])
+        with self.assertRaisesRegex(build_copies.BuildFolderReviewOnly, git_files.GIT_STORAGE_REASON), (
+                build_copies.claim_unused_build_folder(temporary)):
+            self.fail("The claim admitted a source after the clone ended")
+
+    def test_temporary_owner_cleanup_keeps_the_source_of_a_finished_clone(self) -> None:
+        root = build_folders.build_root()
+        root.mkdir()
+        request = build_folders.UniqueBuildFolder("p-", build_folders.ExplicitBuildParent(root))
+        with build_folders.temporary_build_folder(request) as temporary:
+            source = temporary / "repository"
+            _ = self.git(self.source, "clone", "--", str(self.source), str(source))
+            clone = copies.clone(source, task="gate:finished-clone")
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(clone, "show", "HEAD:same.txt"), "unchanged")
+        self.assertTrue(source.is_dir())
+        self.assertTrue(build_folders.lease_path(temporary).is_file())
+
+    def test_temporary_claim_blocks_a_clone_and_refuses_an_existing_borrower(self) -> None:
+        temporary = self.make_temporary()
+        source = temporary / "repository"
+        _ = self.git(self.source, "clone", "--", str(self.source), str(source))
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            with build_folders.build_folder_claim_lock(temporary, build_folders.build_root(), exclusive=True):
+                with self.assertRaisesRegex(copies.CopyError, "claim lock"):
+                    _ = copies.clone(source, task="gate:blocked")
+                with self.assertRaisesRegex(scratch.ScratchError, "claim lock"), scratch.copy_lock(source):
+                    self.fail("Scratch admitted a claimed temporary source")
+            clone = copies.clone(source, task="gate:borrowed")
+            self.assertEqual(self.git(clone, "rev-parse", "HEAD"), self.base)
+            with self.assertRaisesRegex(build_copies.BuildFolderReviewOnly, git_files.GIT_STORAGE_REASON), (
+                    build_copies.claim_unused_build_folder(temporary)):
+                self.fail("The claim admitted the source of a scratch clone")
+            self.assertEqual([entry.path for entry in self.unused_build_folders() if entry.review_only], [temporary])
+
+    def test_temporary_claim_refuses_the_source_of_a_numbered_copy(self) -> None:
+        temporary = self.make_temporary()
+        source = temporary / "repository"
+        _ = self.git(self.source, "clone", "--", str(self.source), str(source))
+        _ = self.git(source, "remote", "set-url", "origin", "git@example.invalid:group/widget.git")
+        with self.take_queue_copy(source, self.base) as copy:
+            pass
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            with self.assertRaisesRegex(build_copies.BuildFolderReviewOnly, git_files.GIT_STORAGE_REASON), (
+                    build_copies.claim_unused_build_folder(temporary)):
+                self.fail("The claim admitted the source of a numbered copy")
+            rows = self.unused_build_folders()
+        self.assertIn(copy.path, [entry.path for entry in rows if not entry.review_only])
+        self.assertEqual([entry.path for entry in rows if entry.review_only], [temporary])
+
+    def test_numbered_claim_refuses_direct_and_transitive_numbered_borrowers(self) -> None:
+        with self.take_queue_copy() as candidate:
+            source = candidate.path / "repository"
+            _ = self.git(self.source, "clone", "--", str(self.source), str(source))
+        middle = self.root / "middle"
+        outside = self.root / "outside"
+        _ = self.git(source, "clone", "--shared", "--", str(source), str(middle))
+        _ = self.git(middle, "clone", "--shared", "--", str(middle), str(outside))
+        middle_alternates = middle / ".git/objects/info/alternates"
+        for unit, repository in (("alternate-borrower", outside), ("direct-borrower", source)):
+            with self.subTest(unit=unit):
+                if repository == source:
+                    _ = middle_alternates.write_text(f"{self.source / '.git/objects'}\n")
+                _ = self.git(repository, "remote", "set-url", "origin", "git@example.invalid:group/widget.git")
+                with build_copies.take_copy(repository, self.base, showrunner="builds", unit=unit,
+                                            work="proof", purpose="test") as borrower:
+                    pass
+                with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses its Git source") as refusal:
+                    with build_copies.claim_unused_build_folder(candidate.path):
+                        self.fail("The claim admitted a source that a numbered copy uses")
+                self.assertIn(str(borrower.path), str(refusal.exception))
+                self.assertNotIn(candidate.path, [entry.path for entry in self.unused_build_folders()])
+                self.assertEqual(self.git(borrower.path, "show", "HEAD:same.txt"), "unchanged")
+
+    def test_claim_protects_a_git_directory_link_used_by_an_outside_checkout(self) -> None:
+        with self.take_queue_copy() as copy:
+            pass
+        link = copy.path / "git-directory"
+        link.symlink_to(self.source / ".git", target_is_directory=True)
+        hop = self.root / "git-hop"
+        hop.symlink_to(link, target_is_directory=True)
+        outside = copy_record.copies_root() / "widget-legacy" / "borrower"
+        with build_copies.claim_unused_build_folder(copy.path):
+            outside.mkdir(parents=True)
+            _ = (outside / ".git").write_text(f"gitdir: {hop}\n")
+            with self.assertRaisesRegex(copies.CopyError, "claim lock"):
+                _ = copies.clone(outside, task="gate:git-directory-link")
+        self.assertEqual(self.git(outside, "rev-parse", "HEAD"), self.base)
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses a Git directory link"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted a Git directory link that an outside checkout uses")
+        self.assertEqual(self.unused_build_folders(), [])
+
+    def test_claim_protects_a_git_directory_with_an_external_common_directory(self) -> None:
+        with self.take_queue_copy() as copy:
+            pass
+        outside = copy_record.copies_root() / "widget-legacy" / "borrower"
+        outside.parent.mkdir(parents=True)
+        _ = self.git(self.source, "worktree", "add", "--detach", str(outside))
+        checkout = git_files.at(outside)
+        admin = copy.path / "admin"
+        _ = checkout.git_dir.rename(admin)
+        _ = (admin / "commondir").write_text(f"{checkout.common_dir}\n")
+        _ = (outside / ".git").write_text(f"gitdir: {admin}\n")
+        self.assertEqual(self.git(outside, "show", "HEAD:same.txt"), "unchanged")
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses a Git directory in"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted the Git directory of an outside checkout")
+        self.assertEqual(self.unused_build_folders(), [])
+
+    def test_temporary_claim_checks_transitive_alternates_and_intermediate_links(self) -> None:
+        temporary = self.make_temporary()
+        repository = temporary / "repository"
+        _ = self.git(self.source, "clone", "--", str(self.source), str(repository))
+        outside = self.root / "unregistered"
+        _ = self.git(self.source, "clone", "--shared", "--", str(self.source), str(outside))
+        _ = (outside / ".git/objects/info/alternates").write_text(str(repository / ".git/objects") + "\n")
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            with build_folders.build_folder_claim_lock(temporary, build_folders.build_root(), exclusive=True):
+                with self.assertRaisesRegex(copies.CopyError, "claim lock"):
+                    _ = copies.clone(outside, task="gate:alternate")
+            shutil.rmtree(repository)
+
+            alternate = temporary / "objects-list"
+            _ = alternate.write_text(str(self.source / ".git/objects") + "\n")
+            intermediate = temporary / "objects-link"
+            intermediate.symlink_to(alternate)
+            borrower = copy_record.copies_root() / "widget-legacy" / "borrower"
+            borrower.mkdir(parents=True)
+            _ = self.git(borrower, "init", "-q")
+            (borrower / ".git/objects/info/alternates").symlink_to(intermediate)
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "uses an alternates file"), (
+                    build_copies.claim_unused_build_folder(temporary)):
+                self.fail("The claim admitted an intermediate alternates link")
+            self.assertEqual(self.unused_build_folders(), [])
+
+    def test_worktree_paths_outside_a_claimable_folder_do_not_take_claim_locks(self) -> None:
+        worktree = build_folders.build_root() / "widget/queue/worktree"
+        with build_folders.build_folder_use(worktree) as descriptors:
+            self.assertEqual(descriptors, ())
+        self.assertFalse((build_folders.build_root() / ".build-claim-locks").exists())
+
+    def test_inventory_lists_a_gone_unit_after_all_its_copies(self) -> None:
+        with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
+            with self.take_queue_copy() as held:
                 with self.take_queue_copy() as other:
-                    self.assertNotEqual(other.path, path)
-                self.assertIn(f"kept for a manual removal list: {path} (build_copies, untracked folders)",
-                              notices.getvalue())
-                self.assertEqual((path / folder / "draft.txt").read_text(), "unsaved work\n")
+                    path = other.path
+                unit = held.path.parent
+                self.assertEqual([entry.path for entry in self.unused_build_folders()], [path])
+            self.assertEqual([entry.path for entry in self.unused_build_folders()], [held.path, path, unit])
+            self.assertTrue(unit.is_dir())
+            _ = (unit / "unrelated").write_text("keep this file")
+            self.assertEqual([entry.path for entry in self.unused_build_folders()], [held.path, path])
+            empty = unit.with_name("former-unit")
+            with build_folders.unit_allocation_lock(empty, exclusive=False):
+                empty.mkdir()
+                self.assertNotIn(empty, [entry.path for entry in self.unused_build_folders()])
+            self.assertIn(empty, [entry.path for entry in self.unused_build_folders()])
+
+    def test_claim_refuses_a_source_used_by_a_sessionless_clone(self) -> None:
+        with self.take_queue_copy() as copy:
+            source = copy.path / "repository"
+            _ = self.git(self.source, "clone", "--", str(self.source), str(source))
+        with mock.patch.object(session_folder, "caller_folder", return_value=None):
+            clone = copies.clone(source, task="gate:borrowed")
+        self.assertEqual(clone.parent, copy_record.root())
+        self.assertNotIn(str(clone), scratch.holds())
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses its git objects"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted a source with a scratch clone")
+        self.assertNotIn(copy.path, [entry.path for entry in self.unused_build_folders()])
+
+    def test_claim_blocks_a_new_child_maker(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+        with build_copies.claim_unused_build_folder(path):
+            with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
+                    build_folders.tool_folder("tool", parent=path)):
+                self.fail("A tool started inside the claimed copy")
+        self.assertFalse((path / "tool").exists())
+        with build_folders.tool_folder("tool", parent=path) as child:
+            self.assertTrue(child.is_dir())
+
+    def test_claim_blocks_tool_folder_after_removal_of_its_temporary_parent(self) -> None:
+        path = self.make_temporary()
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            with build_copies.claim_unused_build_folder(path):
+                self.assertTrue(build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                self.assertFalse(build_folders.lease_path(path).exists())
+                with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
+                        build_folders.tool_folder("tool", parent=path)):
+                    self.fail("A tool created its parent during the claim")
+                self.assertFalse(path.exists())
+        with build_folders.tool_folder("tool", parent=path) as child:
+            self.assertTrue(child.is_dir())
+
+    def test_claim_blocks_stable_folder_after_removal_of_its_temporary_parent(self) -> None:
+        path = self.make_temporary()
+        child = path / "stable"
+        command = [sys.executable, "-m", "scripts.lib.build_folders", "stable", "--path", str(child)]
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            with build_copies.claim_unused_build_folder(path):
+                self.assertTrue(build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                self.assertFalse(build_folders.lease_path(path).exists())
+                result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("claim lock is held", result.stderr)
+                with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
+                        build_folder_lock.folder_parent(child, build_folders.build_root(), create=True)):
+                    self.fail("The parent opener created a folder during the claim")
+                self.assertFalse(path.exists())
+        result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(child.is_dir())
+
+    def test_nested_temporary_claim_blocks_a_parent_lease_and_a_tool(self) -> None:
+        parent = build_folders.build_root() / "p-testroot"
+        path = self.make_temporary(parent)
+        command = [sys.executable, "-m", "scripts.lib.build_folders", "stable", "--path", str(parent)]
+        self.assertFalse(build_folders.lease_path(parent).exists())
+        with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
+            with build_copies.claim_unused_build_folder(path):
+                result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("nested build folder claim lock is held", result.stderr)
+                self.assertFalse(build_folders.lease_path(parent).exists())
+                with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
+                        build_folders.tool_folder("tool", parent=path)):
+                    self.fail("A tool started inside the claimed folder")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(build_folders.lease_path(parent).is_file())
+        with build_folders.tool_folder("tool", parent=path) as tool:
+            self.assertTrue(tool.is_dir())
+
+    def test_claim_blocks_a_workspace_in_a_plain_descendant(self) -> None:
+        with self.take_queue_copy() as copy:
+            tree = copy.path / "plain"
+            tree.mkdir()
+        with build_copies.claim_unused_build_folder(copy.path):
+            with self.assertRaisesRegex(copies.CopyError, "claim lock"), copies.workspace(
+                    "queue", self.source, self.base, name="plain", branch="work", path=tree):
+                self.fail("A workspace started inside the claimed copy")
+        self.assertEqual(list(tree.iterdir()), [])
+
+    def test_claim_blocks_an_alternate_from_a_worktree_source(self) -> None:
+        with self.take_queue_copy() as copy:
+            source = copy.path
+        tree = self.root / "private-copy"
+        tree.mkdir()
+        _ = self.git(tree, "init", "-q")
+        alternate = tree / ".git/objects/info/alternates"
+        policy = copies.WorktreeSource(self.base, source)
+        with build_copies.claim_unused_build_folder(source):
+            with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
+                    copies.requested_source(self.source, policy, copies.NO_MERGE)):
+                self.fail("The snapshot read a worktree during the claim")
+            with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
+                    copies.worktree_objects(tree, source)):
+                self.fail("The copy added a borrower during the claim")
+            self.assertFalse(alternate.exists())
+        with copies.worktree_objects(tree, source):
+            self.assertEqual(alternate.read_text().strip(), str(self.source / ".git/objects"))
+        with mock.patch.object(build_folders, "inherited_temporary_parent", return_value=self.root):
+            with copies.requested_source(self.source, policy, copies.NO_MERGE) as snapshot:
+                self.assertTrue((snapshot / "same.txt").is_file())
+                with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                        build_copies.claim_unused_build_folder(source)):
+                    self.fail("The claim admitted a worktree source still in use")
+
+    def test_claim_refuses_an_intermediate_alternates_link(self) -> None:
+        with self.take_queue_copy() as copy:
+            intermediate = copy.path / "objects-link"
+            alternate = self.root / "objects-list"
+            _ = alternate.write_text(str(self.source / ".git/objects") + "\n")
+            intermediate.symlink_to(alternate)
+        borrower = copy_record.copies_root() / "widget-legacy" / "borrower"
+        borrower.mkdir(parents=True)
+        _ = self.git(borrower, "init", "-q")
+        (borrower / ".git/objects/info/alternates").symlink_to(intermediate)
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "uses an alternates file"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted an intermediate alternates link")
+        self.assertNotIn(copy.path, [entry.path for entry in self.unused_build_folders()])
+
+    def test_claim_blocks_a_clone_that_needs_an_alternate_in_a_copy(self) -> None:
+        alternate_source = self.root / "unregistered"
+        _ = self.git(self.source, "clone", "--shared", "--", str(self.source), str(alternate_source))
+        with self.take_queue_copy() as copy:
+            nested = copy.path / "repository"
+            _ = self.git(self.source, "clone", "--", str(self.source), str(nested))
+        alternate = alternate_source / ".git/objects/info/alternates"
+        _ = alternate.write_text(str(nested / ".git/objects") + "\n")
+        with build_copies.claim_unused_build_folder(copy.path):
+            with self.assertRaisesRegex(copies.CopyError, "claim lock"):
+                _ = copies.clone(alternate_source, task="gate:alternate")
+        clone = copies.clone(alternate_source, task="gate:alternate")
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), self.base)
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses its git objects"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted a numbered copy with a transitive borrower")
+
+    def test_claim_refuses_a_child_lease_and_live_owner(self) -> None:
+        with self.take_queue_copy() as copy:
+            pass
+        specification = build_folders.BuildFolderSpec(
+            kind="tool", parent=copy.path, purpose="tool", suffix_length=0)
+        with build_folders.leased_build_folder(specification) as child:
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, r"tool\.lock"), (
+                    build_copies.claim_unused_build_folder(copy.path)):
+                self.fail("The claim admitted a held child lease")
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, r"tool\.lease\.json"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail(f"The claim admitted the live owner of {child}")
+
+    def test_claim_refuses_nested_and_external_busy_marks(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            checkout = path / "worktree"
+            _ = self.git(self.source, "worktree", "add", "--detach", str(checkout))
+            nested = path / "plain/nested"
+            nested.mkdir(parents=True)
+        git_directory = git_files.at(checkout).git_dir
+        self.assertFalse(git_directory.is_relative_to(path))
+        for folder in (nested, git_directory):
+            with self.subTest(folder=folder), (folder / build_folders.BUSY).open("w") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                with self.assertRaisesRegex(build_copies.BuildFolderInUse, "busy mark is held"), (
+                        build_copies.claim_unused_build_folder(path)):
+                    self.fail(f"The claim ignored the busy mark in {folder}")
+                self.assertNotIn(path, [entry.path for entry in self.unused_build_folders()])
+        with build_copies.claim_unused_build_folder(path):
+            self.assertTrue(checkout.is_dir())
+
+    def test_repository_with_p_prefix_still_lists_numbered_copies(self) -> None:
+        _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:group/p-abcd1234.git")
+        with self.take_queue_copy() as copy:
+            path = copy.path
+        self.assertEqual(path.parent.parent.name, "p-abcd1234")
+        self.assertIn(path, [entry.path for entry in self.unused_build_folders()])
+
+    def test_claim_refuses_a_copy_with_a_borrower(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+        record = build_folders.numbered_copy_record(path)
+        assert isinstance(record, build_folders.NumberedCopySource)
+        borrower = copy_record.copies_root() / "widget-legacy" / "borrower"
+        borrower.mkdir(parents=True)
+        with mock.patch.object(scratch, "borrower_index", wraps=scratch.borrower_index) as index:
+            first = self.unused_build_folders()
+            self.assertEqual([entry.path for entry in first], [path])
+            _ = (borrower / copy_record.RECORD).write_text(json.dumps({
+                "task": "gate:borrower", "borrows_from": str(record.git_directory / "objects"),
+            }))
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses its git objects"), (
+                    build_copies.claim_unused_build_folder(path)):
+                self.fail("The claim admitted the source of a borrower")
+            self.assertEqual(index.call_count, 2)
+        self.assertEqual(self.unused_build_folders(), [])
+        self.assertTrue(path.is_dir())
 
     def test_copy_from_a_clone_removes_its_private_ref_on_release_and_failure(self) -> None:
         source, commit = self.clone_source()
@@ -305,13 +987,14 @@ class BuildCopiesTests(unittest.TestCase):
 
         def observe_contention(descriptor: int, mode: int) -> None:
             # Resume the first caller when the real lock makes the second caller wait.
-            if mode == fcntl.LOCK_EX and lock_path.exists() and os.path.samestat(os.fstat(descriptor), lock_path.stat()):
+            if mode == fcntl.LOCK_EX | fcntl.LOCK_NB and lock_path.exists() and os.path.samestat(os.fstat(descriptor), lock_path.stat()):
                 try:
-                    flock(descriptor, mode | fcntl.LOCK_NB)
-                    return
+                    flock(descriptor, mode)
                 except BlockingIOError:
                     resume_first.set()
-            flock(descriptor, mode)
+                    raise
+            else:
+                flock(descriptor, mode)
 
         def take(number: int) -> Path:
             with build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
@@ -334,6 +1017,43 @@ class BuildCopiesTests(unittest.TestCase):
         self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
         self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
                                   "--get-all", "core.bare"), "false")
+
+    def test_config_migration_times_out_when_the_repository_lock_is_held(self) -> None:
+        common = self.source / ".git"
+        lock_path = common / "build-copy-config.lock"
+        enable_worktree_config = cast(Callable[[Path, Path, int], None], getattr(build_copies, "_enable_worktree_config"))
+        with lock_path.open("w") as held, mock.patch.object(build_folders, "repository_git_timeout", return_value=0.3):
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            with self.assertRaisesRegex(build_copies.CopyGitFailure,
+                    r"build-copy-config\.lock: timed out after 0\.3 seconds waiting for the repository config lock"):
+                enable_worktree_config(self.source, common, held.fileno())
+        self.assertNotIn("extensions.worktreeconfig=", self.git(self.source, "config", "--local", "--list"))
+
+    def test_numbered_take_opens_the_claim_once(self) -> None:
+        root = build_folders.build_root()
+        with mock.patch.object(build_folder_lock, "hold_named_lock", wraps=build_folder_lock.hold_named_lock) as lock:
+            with self.take_queue_copy() as copy:
+                relative = copy.path.relative_to(root)
+                claim = root / ".build-claim-locks" / relative
+                unit = root / ".unit-locks" / relative.parent
+                self.assertEqual([call.args for call in lock.call_args_list],
+                                 [(unit, root), (claim.parent.parent, root), (claim.parent, root), (claim, root)])
+                inode = claim.with_suffix(".lock").stat()
+                matches = [fd for fd in copy.pass_fds if os.path.samestat(os.fstat(fd), inode)]
+                self.assertEqual(len(matches), 1)
+
+    def test_claim_and_unit_locks_refuse_a_changed_inode(self) -> None:
+        with self.take_queue_copy() as copy:
+            pass
+        with mock.patch.object(build_folder_lock, "lock_current", return_value=False):
+            with self.assertRaisesRegex(ValueError, "unit lock changed"), (
+                    build_folders.unit_allocation_lock(copy.path.parent, exclusive=True)):
+                self.fail("The unit allocation accepted a changed lock")
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock changed"), (
+                    build_copies.claim_unused_build_folder(copy.path)):
+                self.fail("The claim accepted a changed lock")
+        with build_copies.claim_unused_build_folder(copy.path):
+            self.assertTrue(copy.path.is_dir())
 
     def test_git_inherits_the_shared_lock_during_copy_config_migration(self) -> None:
         lock_path = self.source / ".git/build-copy-config.lock"

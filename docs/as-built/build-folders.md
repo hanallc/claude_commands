@@ -186,7 +186,15 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source
 The director creates a model worktree for a trial project.
 Workers use `scratch.py new --worker` only for downloads and other files unrelated to builds, tests, gates, or source copies.
 
-`build_copies.take_copy` takes the lowest free existing number for the repo and unit. If none is free, it takes the smallest unused number. A worker has no fixed number. The maker checks out the requested commit and keeps the real `target` folder. Nightly tests of main use the merge unit's numbered copies.
+`build_copies.take_copy` takes the lowest free existing number for the repo and unit.
+If none is free, it takes the smallest unused number.
+A worker has no fixed number.
+The scan uses the standard Git ignore rules.
+The maker skips a copy with untracked directories outside those rules.
+The maker saves work in `refs/rescue/` before it checks out the requested commit.
+The rescue includes ignored files outside the tool output folders.
+The maker keeps the copy's real `target` folder.
+Nightly tests of main use the merge unit's numbered copies.
 
 Copy `1` has sibling files `1.lock` and `1.lease.json`.
 The lease records the checkout path, holder, source, commit, and directory identities.
@@ -203,7 +211,48 @@ The guest keeps the shell cache under `~/build/hana/main/shells` and holds the m
 
 `lint/sweep.py --unused-folders` uses each folder's `.lint-sweep-used` stamp. The cutoff is two days. The sweep checks the stamp again under the folder lock. It keeps unstamped folders, folders in use, and CI folders. It lists eligible folders and keeps unit and repository parents. The nightly gate invokes the sweep.
 
-The copy review checks the folder identity, mounts, locks, and borrowers. It keeps the checkout, its Git directory, and any saved removal record.
+Use `build_copies.unused_build_folders` to list free numbered copies.
+The inventory also lists gone unit folders when all their numbered copies are free and the unit folder holds no other file.
+It lists each unit folder after its copies.
+It lists temporary `p-*` folders with a free lease lock when the process with the recorded owner PID has ended.
+It marks temporary folders with Git storage or symbolic links that can point outside the folder as review-only.
+Git storage includes a `pack` directory or a loose object file anywhere in the temporary folder.
+The check recognizes full object hashes and the shorter names that Git uses in two-digit hexadecimal directories.
+The inventory reads each symbolic link path without opening its target.
+Each entry gives the path, disk usage in bytes, and reason.
+The bytes for a unit include its directory and copy sidecars. Each copy has its own entry.
+The inventory is a read-only snapshot.
+
+`build_copies.claim_unused_build_folder(path)` takes one exclusive lock without waiting.
+It accepts free numbered copies and ownerless temporary folders that pass the removal checks.
+The lock file is `<build root>/.build-claim-locks/<relative folder path>.lock`.
+The lock file stays outside the folder during removal.
+Code that starts work inside a claimable folder takes the lock in shared mode.
+Folder creation takes shared claim locks from the first folder under the build root to the target folder.
+A nested temporary claim prevents lease creation on a parent with a temporary folder name.
+Git source setup takes the shared lock for the folders that hold the source's object directory, its alternates, or a link to a Git directory.
+The SSH source holds the shared lock through its fetch.
+The claim checks lease locks, lease owners, busy marks, mounts, and current borrowers under the exclusive lock.
+The borrower scan checks Git directories, Git directory links, and alternates for scratch and numbered copies.
+One walk checks child leases and busy marks, including marks in external Git directories.
+The claim releases these checks' locks before it yields.
+The claim raises `BuildFolderInUse` with a reason when it cannot verify a folder.
+In the resources cleanup script, remove each claimed folder inside the `with` block.
+The claim refuses review-only folders.
+Check the unit again under its allocation lock before removing the empty unit folder.
+Keep the claim lock file in place.
+Only Nate runs the removal.
+
+Known limit: the claim cannot see a checkout outside the build root and the scratch root that has no copy record.
+If that checkout's `objects/info/alternates` or `commondir` file is a symbolic link to a plain file in an ownerless temporary folder, the claim can admit that folder.
+If that checkout's `objects/pack` folder is a symbolic link into a numbered copy, the claim can admit that copy.
+Removal then breaks the outside checkout.
+Only a hand-made link of a Git metadata file or folder makes these cases. No Git command makes them.
+
+Automatic owner cleanup for these temporary folders takes the exclusive claim lock without waiting.
+Cleanup keeps the folder and lease record if a reader holds the lock or the borrower check cannot confirm that the folder is unused.
+Cleanup also keeps review-only temporary folders.
+The inventory can list the folder after the owner ends and all borrowers release it.
 
 Run `scripts/lib/py scripts/lint/sweep.py --switch-removal-list` to list the former build folders at the switch.
 The list uses the `removal_guard.py` format. Legacy paths require manual review because they do not match the templates in `removal.path_templates.<machine>`.

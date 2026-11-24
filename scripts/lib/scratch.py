@@ -173,11 +173,12 @@ def mark_cargo_cache(target: Path) -> None:
     """Tag a lasting Cargo cache and refresh its one use stamp."""
     from scripts.lib.atomic_file import write_text_atomic
 
-    target.mkdir(parents=True, exist_ok=True)
-    tag = target / CACHE_TAG
-    if not tag.exists():
-        write_text_atomic(tag, CACHE_TAG_SIGNATURE + "\n" + CARGO_TAG_LINE + "\n")
-    (target / USE_STAMP).touch()
+    with build_folders.build_folder_creation(target):
+        target.mkdir(parents=True, exist_ok=True)
+        tag = target / CACHE_TAG
+        if not tag.exists():
+            write_text_atomic(tag, CACHE_TAG_SIGNATURE + "\n" + CARGO_TAG_LINE + "\n")
+        (target / USE_STAMP).touch()
 
 
 def atomic_record(path: Path, fields: object) -> None:
@@ -310,39 +311,46 @@ def copy_lock(path: Path, *,
                 raise ScratchError(lease.reason)
             yield
         return
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
-    folder = copy_record.copy_folder(path)
-    if folder is None:
-        record = task_of(path)
-        if not isinstance(record, copy_record.Registered) or "owner_unit" not in record.fields:
+    with ExitStack() as claim:
+        try:
+            descriptors = claim.enter_context(build_folders.build_folder_use(path))
+        except build_folders.BuildFolderClaimHeld as error:
+            raise ScratchError(str(error)) from error
+        for descriptor in descriptors:
+            _ = claim.enter_context(build_folders.inherit_build_lock(descriptor))
+        if isinstance(scratch_settings, UseConfiguredValue):
+            scratch_settings = conf.read("scratch")
+        folder = copy_record.copy_folder(path)
+        if folder is None:
+            record = task_of(path)
+            if not isinstance(record, copy_record.Registered) or "owner_unit" not in record.fields:
+                yield
+                return
+            folder = path
+        mark = busy_path(folder)
+        lock = open_busy_mark(mark, create=True)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            with copy_record_lock(folder, scratch_settings=scratch_settings):
+                # A remover can unlink the mark while this holder waits on its old inode.
+                # Recheck after the record lock too: deletion can finish while it waits.
+                held = os.fstat(lock)
+                try:
+                    present = mark.stat(follow_symlinks=False)
+                except FileNotFoundError as error:
+                    raise ScratchError(f"{folder}: copy was removed before its busy lock was acquired") from error
+                if (held.st_dev, held.st_ino) != (present.st_dev, present.st_ino):
+                    raise ScratchError(f"{folder}: copy changed before its busy lock was acquired")
+                pending = pending_removal(folder, scratch_settings=scratch_settings)
+                if isinstance(pending, copy_record.UnreadableRecord):
+                    raise ScratchError(pending.reason)
+                if isinstance(pending, copy_record.Registered):
+                    raise ScratchError(f"{folder}: removal has already started; finish cleanup first")
+                require_no_removal_mark(folder.resolve().parent)
+                exclude_copy_metadata(folder)
             yield
-            return
-        folder = path
-    mark = busy_path(folder)
-    lock = open_busy_mark(mark, create=True)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_SH)
-        with copy_record_lock(folder, scratch_settings=scratch_settings):
-            # A remover can unlink the mark while this holder waits on its old inode.
-            # Recheck after the record lock too: deletion can finish while it waits.
-            held = os.fstat(lock)
-            try:
-                present = mark.stat(follow_symlinks=False)
-            except FileNotFoundError as error:
-                raise ScratchError(f"{folder}: copy was removed before its busy lock was acquired") from error
-            if (held.st_dev, held.st_ino) != (present.st_dev, present.st_ino):
-                raise ScratchError(f"{folder}: copy changed before its busy lock was acquired")
-            pending = pending_removal(folder, scratch_settings=scratch_settings)
-            if isinstance(pending, copy_record.UnreadableRecord):
-                raise ScratchError(pending.reason)
-            if isinstance(pending, copy_record.Registered):
-                raise ScratchError(f"{folder}: removal has already started; finish cleanup first")
-            require_no_removal_mark(folder.resolve().parent)
-            exclude_copy_metadata(folder)
-        yield
-    finally:
-        os.close(lock)
+        finally:
+            os.close(lock)
 
 
 @contextmanager
@@ -802,21 +810,21 @@ def new(task: str = "", word: str = "", now: float | None = None, *,
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     while True:
         path = target(task, word, scratch_settings=scratch_settings)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            path.mkdir()
-            break
-        except FileExistsError:
-            # Another call took the free name in the session folder first; take the next one.
-            if not in_session_folder(path):
+        with build_folders.build_folder_creation(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                path.mkdir()
+            except FileExistsError:
+                if in_session_folder(path):
+                    continue
                 raise
-    try:
-        write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
-        index_in_session(path, task, scratch_settings=scratch_settings)
-    except BaseException:
-        shutil.rmtree(path, ignore_errors=True)
-        raise
-    return path
+            try:
+                write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+                index_in_session(path, task, scratch_settings=scratch_settings)
+            except BaseException:
+                shutil.rmtree(path, ignore_errors=True)
+                raise
+            return path
 
 
 def worker_task(staff_id: str) -> str:
@@ -846,16 +854,17 @@ def new_worker(word: str = "", *,
     if any(not WORD.fullmatch(part) for part in (*parts, *([word] if word else []))):
         raise ScratchError("--worker names must contain letters, digits, - and _")
     parent = inherited_temporary_parent().resolve()
-    parent.mkdir(parents=True, exist_ok=True)
     path = parent / "-".join((*parts, random_suffix(scratch_settings), *([word] if word else [])))
-    path.mkdir()
-    try:
-        task = worker_task(worker.id)
-        write_record(path, task, time.time(), throwaway=True, scratch_settings=scratch_settings)
-        _ = hold(path, task, "worker assignment folder", scratch_settings=scratch_settings)
-    except BaseException:
-        shutil.rmtree(path)
-        raise
+    with build_folders.build_folder_creation(path):
+        parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir()
+        try:
+            task = worker_task(worker.id)
+            write_record(path, task, time.time(), throwaway=True, scratch_settings=scratch_settings)
+            _ = hold(path, task, "worker assignment folder", scratch_settings=scratch_settings)
+        except BaseException:
+            shutil.rmtree(path)
+            raise
     return path
 
 
@@ -872,10 +881,11 @@ def adopt(source: Path, task: str, word: str = "", now: float | None = None, *,
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     path = target(task, word, scratch_settings=scratch_settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _ = shutil.move(str(source), str(path))
-    write_record(path, task, moment, scratch_settings=scratch_settings)
-    index_in_session(path, task, scratch_settings=scratch_settings)
+    with build_folders.build_folder_creation(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.move(str(source), str(path))
+        write_record(path, task, moment, scratch_settings=scratch_settings)
+        index_in_session(path, task, scratch_settings=scratch_settings)
     return path
 
 
@@ -1111,83 +1121,218 @@ def registered_copy_paths() -> Iterator[Path]:
 
 def numbered_source_lifetime(path: Path) -> Live | Ended | Unknown:
     """Check whether removing this folder would remove a numbered copy's Git source."""
-    try:
-        root = path.resolve()
-        for record in build_folders.numbered_copy_records():
-            if isinstance(record, build_folders.UnreadableNumberedCopySource):
-                return Unknown(f"{record.path}: cannot check numbered copy source: {record.reason}")
-            copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
-            if any(folder.is_relative_to(root)
-                   for folder in (copy.source, copy.git_directory, copy.common_directory)):
-                return Live(f"borrowed: {copy.path} still uses its Git source")
-    except (OSError, ValueError, RuntimeError) as error:
-        return Unknown(f"cannot read numbered copy sources: {error}")
-    return Ended("no numbered copy uses its Git source")
+    deadline = time.monotonic() + build_folders.repository_git_timeout()
+    index = BorrowerIndex(tuple(_numbered_borrowers({}, deadline)), "")
+    return index.lifetime(path, object_roots=(path,))
 
 
-class UnregisteredBorrowCandidate(Enum):
-    POSSIBLE_BORROWER = "possible borrower"
-    WORKTREE_SUBFOLDER = "worktree subfolder"
-
-
-def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
-    """Check the pair and candidate for Git entries without reading their targets."""
-    pair = path.parent
-    if pair.parent != copy_record.copies_root():
-        return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+def _borrower_git_paths(path: Path, registry: Path, on_link: Callable[[Path], None]) -> tuple[Path, Path] | None:
+    """Locate the Git directory and its common object store."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     with ExitStack() as descriptors:
-        pair_fd = os.open(pair, flags)
-        _ = descriptors.callback(os.close, pair_fd)
-        candidate_fd = os.open(path.name, flags, dir_fd=pair_fd)
-        _ = descriptors.callback(os.close, candidate_fd)
-        try:
-            _ = os.stat(".git", dir_fd=pair_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+        if path.parent.parent == registry:
+            parent = os.open(path.parent, flags)
+            _ = descriptors.callback(os.close, parent)
+            candidate = os.open(path.name, flags, dir_fd=parent)
+        else:
+            candidate = os.open(path, flags)
+        _ = descriptors.callback(os.close, candidate)
         for name in GIT_BORROWER_ENTRIES:
             try:
-                _ = os.stat(name, dir_fd=candidate_fd, follow_symlinks=False)
+                _ = os.stat(name, dir_fd=candidate, follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
-    return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
+            if name == ".git":
+                checkout = git_files.at(path, on_link=on_link)
+                return checkout.git_dir, checkout.common_dir / "objects"
+            return path.resolve(), git_files.objects_in_git_directory(path, on_link=on_link)
+    return None
 
 
-def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead,
-                    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER) -> Live | Ended | Unknown:
-    """Check the copy registry for borrowers of this folder's Git objects."""
-    protection: Live | Ended | Unknown = Ended("no copy borrows from it")
-    try:
-        for child in registered_copy_paths():
+def _borrowable_objects(roots: tuple[Path, ...], *, check_descendants: bool) -> bool:
+    """Check whether an unreadable borrower could name objects in these folders."""
+    def unreadable(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for root in roots:
+        if ((root / ".git/objects").is_dir() or (root / "objects").is_dir()
+                or root.name == "objects" and root.is_dir()):
+            return True
+        if check_descendants:
+            for _, folders, _ in os.walk(root, onerror=unreadable, followlinks=False):
+                if "objects" in folders:
+                    return True
+    return False
+
+
+@dataclass(frozen=True)
+class _Borrower:
+    path: Path
+    stores: frozenset[Path]
+    files: frozenset[Path]
+    unreadable: str
+    git_links: frozenset[Path] = frozenset()
+    numbered: bool = False
+    git_directory: Path | None = None
+
+
+def _numbered_borrowers(cache: dict[Path, git_files.AlternateEvidence], deadline: float) -> Iterator[_Borrower]:
+    """Read the Git paths and object stores that numbered copies use."""
+    graphs: dict[Path, tuple[set[Path], set[Path], str]] = {}
+    for record in build_folders.numbered_copy_records():
+        if isinstance(record, build_folders.UnreadableNumberedCopySource):
+            reason = f"{record.path}: cannot check numbered copy source: {record.reason}"
+            yield _Borrower(record.path, frozenset(), frozenset(), reason, numbered=True)
+            continue
+        copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
+        stores = {copy.source, copy.git_directory, copy.common_directory}
+        objects = copy.common_directory / "objects"
+        graph = graphs.get(objects)
+        if graph is None:
+            graph = graphs[objects] = git_files.object_stores(objects, cache, deadline)
+        alternates, files, unreadable = graph
+        links: set[Path] = set()
+        try:
+            _ = git_files.at(copy.source, on_link=links.add)
+            if isinstance(record, build_folders.NumberedCopySource):
+                _ = git_files.at(copy.path, on_link=links.add)
+        except (OSError, ValueError, RuntimeError) as error:
+            unreadable = unreadable or str(error)
+        reason = f"{copy.path}: cannot check numbered copy source: {unreadable}" if unreadable else ""
+        yield _Borrower(copy.path, frozenset(stores | alternates), frozenset(files), reason,
+                        git_links=frozenset(links), numbered=True)
+
+
+@dataclass(frozen=True)
+class BorrowerIndex:
+    """The object stores and unreadable evidence from one borrower scan."""
+
+    borrowers: tuple[_Borrower, ...]
+    unreadable: str
+
+    def lifetime(self, path: Path, *, object_roots: tuple[Path, ...] = ()) -> Live | Ended | Unknown:
+        """Check whether the scan found a reference to the folder's Git objects."""
+        root = path.resolve()
+        roots = tuple(folder.resolve() for folder in object_roots) or (root,)
+        exact = (root / ".git/objects", root / "objects")
+        unreadable = self.unreadable
+        unreadable_numbered = ""
+        for borrower in self.borrowers:
+            if any(borrower.path.is_relative_to(folder) for folder in roots):
+                continue
+            if any(link.is_relative_to(folder) for link in borrower.git_links for folder in roots):
+                return Live(f"borrowed: {borrower.path} still uses a Git directory link in {path}")
+            matches = (any(store.is_relative_to(folder) for store in borrower.stores for folder in roots)
+                       if object_roots else any(store in borrower.stores for store in exact))
+            if matches:
+                reason = "its Git source" if borrower.numbered else "its git objects"
+                return Live(f"borrowed: {borrower.path} still uses {reason}")
+            if borrower.git_directory is not None and any(borrower.git_directory.is_relative_to(folder) for folder in roots):
+                return Live(f"borrowed: {borrower.path} still uses a Git directory in {path}")
+            if any(file.is_relative_to(folder) for file in borrower.files for folder in roots):
+                return Live(f"borrowed: {borrower.path} still uses an alternates file in {path}")
+            if borrower.numbered:
+                unreadable_numbered = unreadable_numbered or borrower.unreadable
+            else:
+                unreadable = unreadable or borrower.unreadable
+        if unreadable_numbered:
+            return Unknown(unreadable_numbered)
+        if unreadable:
+            try:
+                if not _borrowable_objects(roots, check_descendants=bool(object_roots)):
+                    return Ended("the folder has no Git objects")
+            except OSError:
+                pass
+            return Unknown(f"cannot rule out a borrower of Git objects in {path}: {unreadable}")
+        return Ended("no copy borrows from it")
+
+
+def borrower_index(*, scratch_settings: conf.ConfigRead,
+                   intent: RemovalIntentAccess = RemovalIntentAccess.READ_ONLY,
+                   exclude: tuple[Path, ...] = (), include_numbered: bool = False) -> BorrowerIndex:
+    """Read borrower records and their object stores."""
+    registry = copy_record.copies_root()
+    borrowers: list[_Borrower] = []
+    cache: dict[Path, git_files.AlternateEvidence] = {}
+    deadline = time.monotonic() + build_folders.repository_git_timeout()
+
+    def inspect(child: Path) -> _Borrower:
+        unreadable = ""
+        stores: set[Path] = set()
+        files: set[Path] = set()
+        links: set[Path] = set()
+        git_directory: Path | None = None
+        try:
             try:
                 mode = child.lstat().st_mode
             except FileNotFoundError:
-                continue
+                return _Borrower(child, frozenset(), frozenset(), "")
             if stat.S_ISLNK(mode):
-                protection = Unknown(f"{child}: cannot check borrowed objects through a link")
-                break
-            if child.resolve() == path.resolve():
+                return _Borrower(child, frozenset(), frozenset(), f"{child}: cannot check borrowed objects through a link")
+            if not stat.S_ISDIR(mode):
+                return _Borrower(child, frozenset(), frozenset(), "")
+            record = task_of(child, scratch_settings=scratch_settings, intent=intent)
+            if isinstance(record, copy_record.UnreadableRecord):
+                unreadable = record.reason
+            if isinstance(record, copy_record.Registered):
+                borrowed = record.fields.get("borrows_from", "")
+                if not isinstance(borrowed, str) or borrowed and not Path(borrowed).is_absolute():
+                    unreadable = f"repair record {child / copy_record.RECORD}: invalid borrows_from"
+                elif borrowed:
+                    store = Path(borrowed)
+                    if store.name != "objects":
+                        store /= "objects"
+                    stores.add(Path(os.path.normpath(store)))
+                    stores.add(store.resolve())
+            git_paths = _borrower_git_paths(child, registry, links.add)
+            if git_paths is not None:
+                git_directory, objects = git_paths
+                alternates, files, reason = git_files.object_stores(objects, cache, deadline)
+                stores.update(alternates)
+                if reason:
+                    unreadable = unreadable or f"{child}: {reason}"
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            unreadable = unreadable or f"{child}: {error}"
+        return _Borrower(child, frozenset(stores), frozenset(files), unreadable,
+                         git_links=frozenset(links), git_directory=git_directory)
+
+    unreadable = ""
+    try:
+        paths = set(copy_paths(scan=LegacyPairScan.BORROWERS))
+        paths.update(path for path in _legacy_copy_entries(copy_record.root().resolve())
+                     if _legacy_pair_entry(path, LegacyPairScan.BORROWERS))
+        paths.update(Path(held) for held in holds(scratch_settings=scratch_settings))
+        for path in sorted(paths):
+            if any(path.is_relative_to(folder) for folder in exclude):
                 continue
-            other = task_of(child, scratch_settings=scratch_settings, intent=intent)
-            if isinstance(other, copy_record.NotRegistered):
-                if _unregistered_borrow_candidate(child) is UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER:
-                    continue
-                protection = Unknown(f"repair record {child / copy_record.RECORD}: cannot rule out borrowed objects")
-                break
-            if isinstance(other, copy_record.UnreadableRecord):
-                protection = Unknown(other.reason + "; cannot rule out borrowed objects")
-                break
-            borrowed = other.fields.get("borrows_from", "")
-            if not isinstance(borrowed, str):
-                protection = Unknown(f"repair record {child / copy_record.RECORD}: invalid borrows_from")
-                break
-            if borrowed and Path(borrowed).resolve() == (path / ".git").resolve():
-                protection = Live(f"borrowed: {child} still uses its git objects")
-                break
-    except OSError as error:
-        protection = Unknown(f"repair copies registry {copy_record.copies_root()}: {error}")
-    return protection
+            evidence = inspect(path)
+            if evidence.stores or evidence.git_links or evidence.git_directory is not None or evidence.unreadable:
+                borrowers.append(evidence)
+    except (OSError, ValueError, RuntimeError) as error:
+        unreadable = f"repair copies registry {registry}: {error}"
+    if include_numbered:
+        borrowers.extend(_numbered_borrowers(cache, deadline))
+    return BorrowerIndex(tuple(borrowers), unreadable)
+
+
+def build_folder_borrowers() -> BorrowerIndex:
+    """Read the scratch and numbered copies that can borrow from build folders."""
+    return borrower_index(scratch_settings=conf.read("scratch"), include_numbered=True)
+
+
+def build_folder_has_borrowers(path: Path) -> bool:
+    """Keep the folder when the scan finds a borrower or cannot rule one out."""
+    return not isinstance(build_folder_borrowers().lifetime(path, object_roots=(path,)), Ended)
+
+
+def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead,
+                    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
+                    object_roots: tuple[Path, ...] = ()) -> Live | Ended | Unknown:
+    """Check for references to the Git objects that the removal would delete."""
+    roots = tuple(folder.resolve() for folder in object_roots or (path,))
+    index = borrower_index(scratch_settings=scratch_settings, intent=intent, exclude=roots)
+    return index.lifetime(path, object_roots=object_roots)
 
 
 @dataclass(frozen=True)
@@ -2357,42 +2502,13 @@ def _remote_storage_path(path: Path, root: Path) -> Path:
     return resolved
 
 
-def _read_alternate_paths(objects: Path, root: Path, deadline: float) -> Iterator[Path]:
-    alternates = objects / "info/alternates"
-    try:
-        path = _remote_storage_path(alternates, root)
-    except FileNotFoundError:
-        try:
-            _ = alternates.lstat()
-        except FileNotFoundError:
-            return
-        raise
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    with os.fdopen(descriptor, "rb") as source:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"{path} is not a regular file")
-        while line := source.readline(65536):
-            if time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired("inspect local object storage", 0)
-            if len(line) == 65536 or b"\0" in line:
-                raise ValueError(f"{path} has an invalid alternate")
-            if line != b"\n" and not line.startswith(b"#"):
-                yield objects / os.fsdecode(line.removesuffix(b"\n"))
-
-
 def _check_remote_objects(objects: Path, root: Path, deadline: float) -> None:
-    pending = [objects]
-    visited: set[Path] = set()
-    while pending:
-        if time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired("inspect local object storage", 0)
-        folder = _remote_storage_path(pending.pop(), root)
-        if folder in visited:
-            continue
-        if not folder.is_dir():
-            raise ValueError(f"{folder} is not an object directory")
-        visited.add(folder)
-        pending.extend(_read_alternate_paths(folder, root, deadline))
+    stores, files, unreadable = git_files.object_stores(objects, {}, deadline)
+    for dependency in sorted(stores | files):
+        if dependency.is_relative_to(root):
+            raise _RemovalTreeDependency(str(dependency))
+    if unreadable:
+        raise ValueError(unreadable)
 
 
 def _check_local_remote(repo: Path, locations: tuple[Path, ...], root: Path, deadline: float) -> RemoteStorage:

@@ -342,7 +342,9 @@ class FolderFormTests(unittest.TestCase):
                 assert isinstance(reader, folders.NumberedCopyUseLease)
                 self.assertEqual(reader.source, record)
                 self.assertTrue(reader.pass_fds)
-            self.assertFalse(build_copies.remove_copy(record))
+            with self.assertRaisesRegex(build_copies.BuildFolderInUse, "claim lock"), (
+                    build_copies.claim_unused_build_folder(copy.path)):
+                self.fail("The claim admitted an active copy")
             envrc = copy.path / ".envrc"
             self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
                              folders.NumberedCopyEnvrc.TRUSTED)
@@ -358,7 +360,9 @@ class FolderFormTests(unittest.TestCase):
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
-        self.assertFalse(build_copies.remove_copy(record))
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "identity changed"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted a replacement folder")
 
     def test_copy_removal_keeps_borrowers_and_resumes_after_git_deletes_the_checkout(self) -> None:
         from scripts.lib import build_copies
@@ -378,7 +382,9 @@ class FolderFormTests(unittest.TestCase):
         _ = (borrower / copy_record.RECORD).write_text(json.dumps({
             "task": "gate:borrower", "borrows_from": str(copy.path / ".git"),
         }))
-        self.assertFalse(build_copies.remove_copy(record))
+        with self.assertRaisesRegex(build_copies.BuildFolderInUse, "still uses its git objects"), (
+                build_copies.claim_unused_build_folder(copy.path)):
+            self.fail("The claim admitted a copy with a borrower")
         self.assertTrue((copy.cargo_dir / "warm").exists())
         shutil.rmtree(borrower)
 
@@ -399,6 +405,40 @@ class FolderFormTests(unittest.TestCase):
         self.assertTrue(record.git_directory.exists())
         self.assertTrue(folders.lease_path(copy.path).exists())
         self.assertTrue(other.path.is_dir())
+
+    def test_unused_temporary_object_layouts_require_review(self) -> None:
+        from scripts.lib import build_copies
+        from scripts.production import staff
+
+        root = folders.build_root()
+        layouts = {
+            root / "p-packtest": Path("nested/pack"),
+            root / "p-hashtest": Path("nested/ab") / ("c" * 38),
+            root / "p-loosetst": Path("nested") / ("d" * 62),
+            root / "p-fullhash": Path("nested") / ("E" * 64),
+        }
+        for path, layout in layouts.items():
+            entry = path / layout
+            if entry.name == "pack":
+                entry.mkdir(parents=True)
+            else:
+                entry.parent.mkdir(parents=True)
+                _ = entry.write_bytes(b"object data")
+            _ = folders.lease_path(path).write_text(json.dumps({"pid": os.getpid()}))
+            with folders.folder_removal_lease(path, create=True):
+                pass
+
+        with (mock.patch.object(os, "kill", side_effect=ProcessLookupError),
+              mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            rows = build_copies.unused_build_folders(root)
+            self.assertEqual({row.path for row in rows}, set(layouts))
+            for row in rows:
+                with self.subTest(layout=layouts[row.path]):
+                    self.assertTrue(row.review_only)
+                    self.assertEqual(row.reason, git_files.GIT_STORAGE_REASON)
+                    with self.assertRaisesRegex(build_copies.BuildFolderReviewOnly, row.reason), (
+                            build_copies.claim_unused_build_folder(row.path)):
+                        self.fail("The claim admitted a temporary folder with an object layout")
 
     def test_unused_pass_keeps_live_copies_ci_and_other_top_entries(self) -> None:
         from scripts.lint import sweep
@@ -1472,7 +1512,7 @@ print('signals')
         parent.mkdir()
         moved = self.root / "moved"
         opens: list[Path] = []
-        original = build_folder_lock.folder_parent
+        original = build_folder_lock.open_folder_parent
 
         @contextmanager
         def replace_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
@@ -1484,7 +1524,7 @@ print('signals')
                     _ = (parent / "keep").write_text("replacement")
                 yield descriptor
 
-        with mock.patch("scripts.lib.build_folder_lock.folder_parent", side_effect=replace_parent):
+        with mock.patch("scripts.lib.build_folder_lock.open_folder_parent", side_effect=replace_parent):
             with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-", folders.ExplicitBuildParent(parent))) as path:
                 self.assertTrue((moved / path.name).is_dir())
                 self.assertFalse(path.exists())

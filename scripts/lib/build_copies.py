@@ -6,7 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,11 +19,16 @@ import subprocess
 import sys
 import tempfile
 from types import MappingProxyType
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
+from scripts.lib import build_folder_lock, build_folders, copy_record, git_files, git_rescue
+
+
+if TYPE_CHECKING:
+    from scripts.lib import scratch
+    from scripts.lib.scratch import BorrowerIndex
 
 
 # Python writes these folders beside each imported module; they hold no work.
@@ -98,7 +103,7 @@ def source_checkout(source: Path) -> Path:
     return (Path(common) / configured).resolve()
 
 
-def _persistent_source(source: Path) -> Path:
+def _persistent_source(source: Path, hold: Callable[[Path], None]) -> Path:
     seen: set[Path] = set()
     while True:
         record_path = copy_record.record_path(source)
@@ -112,7 +117,9 @@ def _persistent_source(source: Path) -> Path:
         original = record.fields.get("source_path") if isinstance(record, copy_record.Registered) else None
         if not isinstance(original, str) or not original or not Path(original).is_dir():
             raise CopyGitFailure(f"copies: {source} has no available persistent source; create its pool from the original repository")
-        source = source_checkout(Path(original))
+        original_path = Path(original)
+        hold(original_path)
+        source = source_checkout(original_path)
 
 
 @contextmanager
@@ -163,9 +170,12 @@ def _enable_worktree_config(path: Path, common_dir: Path, descriptor: int) -> No
     read_extension = ("config", "--local", "--type=bool", "--get", "extensions.worktreeConfig")
     if _git(path, *read_extension, accepted=(0, 1), pass_fds=(descriptor,)) == "true":
         return
-    with (common_dir / "build-copy-config.lock").open("a") as lock:
+    lock_path = common_dir / "build-copy-config.lock"
+    timeout = build_folders.repository_git_timeout()
+    with lock_path.open("a") as lock:
         # Git retains the lock if the copy process exits during a write.
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not build_folder_lock.take_lock(lock.fileno(), fcntl.LOCK_EX, build_folder_lock.ProbeTiming(timeout, 0.05)):
+            raise CopyGitFailure(f"{lock_path}: timed out after {timeout:g} seconds waiting for the repository config lock")
         descriptors = (descriptor, lock.fileno())
         if _git(path, *read_extension, accepted=(0, 1), pass_fds=descriptors) == "true":
             return
@@ -227,25 +237,44 @@ def _copy_order(parent: Path) -> Generator[int]:
 def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: str,
               purpose: str, selection: CopySelection = LOWEST_FREE_COPY) -> Generator[LeasedCopy]:
     """Take the assigned number or the first free copy."""
-    repository = _persistent_source(source_checkout(source))
-    name = build_folders.repo_word(repository)
-    revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
-    if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
-        raise CopyGitFailure(f"{revision}: the commit tracks a reserved copy path")
-    parent = build_folders.unit_folder(name, unit)
-    checkout = build_folders.CopyCheckout(repository, revision)
-    numbers = (selection.number,) if isinstance(selection, ExactCopyRequest) else _copy_order(parent)
-    with _copy_commit(repository, source, revision), ExitStack() as unit_claim:
+    with ExitStack() as sources, ExitStack() as unit_claim:
+        def hold_source(path: Path) -> None:
+            for descriptor in sources.enter_context(build_folders.git_source_claims(path)):
+                _ = sources.enter_context(build_folders.inherit_build_lock(descriptor))
+
+        try:
+            hold_source(source)
+            repository = _persistent_source(source_checkout(source), hold_source)
+            if repository != source:
+                hold_source(repository)
+        except build_folders.BuildFolderClaimHeld as error:
+            raise build_folders.CopySourceBusy(str(error)) from error
+        name = build_folders.repo_word(repository)
+        revision = _git(source, "rev-parse", "--verify", "--end-of-options", f"{commit}^{{commit}}")
+        if _git(source, "ls-tree", revision, "--", "target", build_folders.COPY_USE_STAMP):
+            raise CopyGitFailure(f"{revision}: the commit tracks a reserved copy path")
+        parent = build_folders.unit_folder(name, unit)
+        checkout = build_folders.CopyCheckout(repository, revision)
+        numbers = (selection.number,) if isinstance(selection, ExactCopyRequest) else _copy_order(parent)
+        _ = sources.enter_context(_copy_commit(repository, source, revision))
         _ = unit_claim.enter_context(build_folders.unit_allocation_lock(parent, exclusive=False))
         for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="copy", parent=build_folders.build_root(),
                 suffix_length=0, repository=name, number=number, showrunner=showrunner, unit=unit,
                 work=work, purpose=purpose, copy_checkout=checkout, machine=host_name())
+            candidate = build_folders.build_folder_path(spec)
             with ExitStack() as held:
                 try:
+                    claims = held.enter_context(build_folders.build_folder_creation(candidate))
+                    for claim in claims:
+                        _ = held.enter_context(build_folders.inherit_build_lock(claim))
                     path = held.enter_context(build_folders.copy_build_folder(spec))
                 except build_folders.CopySourceBusy:
                     raise
+                except build_folders.BuildFolderClaimHeld as error:
+                    if error.path != candidate and error.path != candidate.resolve():
+                        raise
+                    continue
                 except (BlockingIOError, FileExistsError):
                     continue
                 descriptor = build_folders.build_folder_lock_fd(path)
@@ -261,13 +290,13 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                         *(f"--exclude={folder}/" for folder in _TOOL_OUTPUT_FOLDERS))
                 rescued = False
                 try:
-                    untracked = _git(path, *scan, pass_fds=(descriptor,))
+                    untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
                 except CopyGitFailure as error:
                     if isinstance(error.__cause__, subprocess.TimeoutExpired):
                         raise
                     _rescue(path)
                     rescued = True
-                    untracked = _git(path, *scan, pass_fds=(descriptor,))
+                    untracked = _git(path, *scan, "--exclude-standard", pass_fds=(descriptor,))
                 if any(name.endswith("/") for name in untracked.split("\0")):
                     print(f"kept for a manual removal list: {path} (build_copies, untracked folders)", file=sys.stderr)
                     continue
@@ -288,7 +317,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield LeasedCopy(path, name, number, MappingProxyType({
                     "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
-                }), (descriptor,))
+                }), (descriptor, *claims))
                 return
         if isinstance(selection, ExactCopyRequest):
             raise BlockingIOError(f"{parent}: assigned copy {selection.number} is unavailable")
@@ -304,89 +333,266 @@ def limit_copy_size(copy: LeasedCopy, limit: int) -> None:
               + "The maker deleted its Cargo output.")
 
 
-def _check_directory_identity(path: Path, expected: build_folders.CopyDirectoryIdentity) -> bool:
-    try:
-        identity = build_folders.CopyDirectoryIdentity.from_stat(path.lstat())
-    except FileNotFoundError:
+class BuildFolderInUse(RuntimeError):
+    """The folder is busy or the claim cannot verify that it is free."""
+
+
+class BuildFolderReviewOnly(BuildFolderInUse):
+    """The inventory can list this folder, but the claim cannot admit it."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{path}: review only: {reason}")
+        self.reason: str = reason
+
+
+@dataclass(frozen=True)
+class UnusedBuildFolder:
+    path: Path
+    bytes: int
+    reason: str
+    review_only: bool = False
+
+
+def _borrower_index() -> BorrowerIndex:
+    from scripts.lib import scratch
+
+    return scratch.build_folder_borrowers()
+
+
+def _disk_bytes(path: Path) -> int:
+    reading = subprocess.run(["du", "-skx", str(path)], capture_output=True, text=True, check=True,
+                             timeout=build_folders.repository_git_timeout())
+    return int(reading.stdout.split(maxsplit=1)[0]) * 1024
+
+
+def _excluded_build_root_child(name: str) -> bool:
+    return (name in build_folders.BUILD_ROOT_EXCEPTIONS or name.startswith("old-")
+            or name in ("cargo", "paths", "hana-ci"))
+
+
+def _numbered_candidate(path: Path, root: Path) -> bool:
+    """Verify the path. Return True for a numbered copy and False for a temporary folder."""
+    parts = path.relative_to(root).parts
+    if (not parts or _excluded_build_root_child(parts[0]) or not stat.S_ISDIR(path.lstat().st_mode)
+            or path.resolve(strict=True) != root.resolve() / Path(*parts)):
+        raise BuildFolderInUse(f"{path}: the folder path is not verified")
+    temporary = build_folders.is_temporary_build_folder
+    if len(parts) <= 2 and temporary(path) and (len(parts) == 1 or not temporary(path.parent)):
         return False
-    if identity != expected:
-        raise CopyGitFailure(f"{path}: directory identity changed during copy removal")
-    return True
+    if (isinstance(build_folders.parse_resolved_form(path, root), build_folders.BuildCopy)
+            and not temporary(path.parent) and not temporary(path.parent.parent)):
+        return True
+    raise BuildFolderInUse(f"{path}: expected a numbered copy or temporary build folder")
+
+
+def _copy_source(path: Path) -> build_folders.NumberedCopySource:
+    record = build_folders.numbered_copy_record(path)
+    if isinstance(record, build_folders.UnreadableNumberedCopySource):
+        raise BuildFolderInUse(record.reason)
+    if isinstance(record, build_folders.NoNumberedCopySource):
+        raise BuildFolderInUse(f"{path}: no numbered copy source record")
+    copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
+    for folder, identity in ((copy.path, copy.checkout_identity), (copy.git_directory, copy.git_identity),
+                             (copy.common_directory, copy.common_identity)):
+        if build_folders.CopyDirectoryIdentity.from_stat(folder.lstat()) != identity:
+            raise BuildFolderInUse(f"{folder}: the directory identity changed")
+    return copy
+
+
+def _busy_mark_check(path: Path, copy: build_folders.NumberedCopySource | None, locks: ExitStack
+                     ) -> Callable[[Path, set[str], set[str]], None]:
+    held: set[Path] = set()
+
+    def hold(folder: Path, *, shared: bool = False) -> None:
+        mark = folder / build_folders.BUSY
+        if mark in held:
+            return
+        try:
+            descriptor = build_folders.open_busy_mark(mark, create=False)
+        except FileNotFoundError:
+            return
+        _ = locks.callback(os.close, descriptor)
+        try:
+            fcntl.flock(descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise BuildFolderInUse(f"{mark}: the busy mark is held") from error
+        if not os.path.samestat(os.fstat(descriptor), mark.lstat()):
+            raise BuildFolderInUse(f"{mark}: the busy mark changed")
+        held.add(mark)
+
+    if copy is not None:
+        hold(copy.common_directory, shared=True)
+        hold(copy.git_directory)
+    hold(path.parent)
+
+    def inspect(folder: Path, folders: set[str], files: set[str]) -> None:
+        if copy is not None and (".git" in folders or ".git" in files):
+            checkout = git_files.at(folder)
+            if checkout.common_dir != checkout.git_dir:
+                hold(checkout.common_dir, shared=not checkout.common_dir.is_relative_to(path))
+            hold(checkout.git_dir)
+        elif copy is not None and git_files.is_git_directory(folders, files):
+            common = git_files.objects_in_git_directory(folder).parent
+            if common != folder:
+                hold(common, shared=not common.is_relative_to(path))
+            hold(folder)
+        if build_folders.BUSY in folders or build_folders.BUSY in files:
+            hold(folder)
+
+    return inspect
+
+
+def _require_ended(state: scratch.Live | scratch.Ended | scratch.Unknown) -> None:
+    from scripts.lib import scratch
+
+    if isinstance(state, scratch.Live):
+        raise BuildFolderInUse(state.why)
+    if isinstance(state, scratch.Unknown):
+        raise BuildFolderInUse(state.reason)
+
+
+def _check_unused_folder(path: Path, root: Path, *, numbered: bool, snapshot: BorrowerIndex | None) -> None:
+    if not numbered and path.parent != root and build_folders.is_temporary_build_folder(path.parent):
+        raise BuildFolderInUse(f"{path.parent}: the parent has a temporary folder lease")
+    with ExitStack() as probes:
+        lease = probes.enter_context(build_folders.folder_removal_lease(path, root=root, wait=False))
+        if isinstance(lease, build_folders.RemovalLockHeld):
+            raise BuildFolderInUse(f"{lease.lock}: a lease lock is active")
+        if (not isinstance(lease, build_folders.HeldFolderRemovalLease)
+                or build_folders.lease_path(path).name not in lease.sidecar_identities()):
+            raise BuildFolderInUse(f"{path}: the lease cannot be verified")
+        owner = lease.owner_state(allow_released=numbered)
+        if owner is not build_folders.LeaseOwnerState.ENDED:
+            raise BuildFolderInUse(f"{path}: the lease owner is {owner.value}")
+
+        copy = _copy_source(path) if numbered else None
+        roots = (path, copy.git_directory) if copy is not None else (path,)
+        if not build_folders.may_remove_build_path(path) or not build_folders.may_remove_folder_tree(*roots):
+            raise BuildFolderInUse(f"{path}: the folder or a mount is protected")
+        inspect = _busy_mark_check(path, copy, probes)
+        child = build_folders.hold_child_leases(path, probes, wait=False, check_owners=True,
+                                               review_temporary=not numbered, inspect=inspect)
+        if isinstance(child, build_folders.RemovalLockHeld):
+            raise BuildFolderInUse(f"{child.lock}: a lease lock or owner is active")
+        if child is not None:
+            raise BuildFolderInUse(f"{path}: a child lease cannot be verified")
+        borrowers = _borrower_index() if snapshot is None else snapshot
+        _require_ended(borrowers.lifetime(path, object_roots=roots))
 
 
 @contextmanager
-def _numbered_copy_busy_marks(copy: build_folders.NumberedCopySource, *, dry_run: bool) -> Generator[bool]:
-    """Hold the old busy marks even when the checkout is partly removed."""
-    with ExitStack() as stack:
+def _claim_unused_folder(path: Path, root: Path, *, snapshot: BorrowerIndex | None = None) -> Generator[str]:
+    with ExitStack() as claim:
         try:
-            parents = [copy.common_directory, copy.path, copy.path.parent]
-            with suppress(FileNotFoundError):
-                info = copy.git_directory.lstat()
-                if stat.S_ISDIR(info.st_mode) and build_folders.CopyDirectoryIdentity.from_stat(info) == copy.git_identity:
-                    parents.insert(1, copy.git_directory)
-            for parent in parents:
-                mark = parent / build_folders.BUSY
-                create = not dry_run and parent in (copy.common_directory, copy.git_directory)
-                with suppress(FileNotFoundError):
-                    descriptor = build_folders.open_busy_mark(mark, create=create)
-                    _ = stack.callback(os.close, descriptor)
-                    mode = fcntl.LOCK_SH if parent == copy.common_directory else fcntl.LOCK_EX
-                    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-                    if not os.path.samestat(os.fstat(descriptor), mark.lstat()):
-                        raise BlockingIOError(f"{mark}: the busy mark changed")
+            numbered = _numbered_candidate(path, root)
+            _ = claim.enter_context(build_folders.build_folder_claim_lock(
+                path, root, exclusive=True, create=snapshot is None))
+            _check_unused_folder(path, root, numbered=numbered, snapshot=snapshot)
+        except BuildFolderInUse:
+            raise
+        except build_folders.TemporaryFolderReview as error:
+            raise BuildFolderReviewOnly(path, str(error)) from error
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            raise BuildFolderInUse(f"{path}: {error}") from error
+        yield "free numbered copy" if numbered else "ownerless temporary build folder"
+
+
+@contextmanager
+def claim_unused_build_folder(path: Path) -> Generator[None]:
+    """Hold the claim while the caller removes a verified unused build folder."""
+    with _claim_unused_folder(path, build_folders.build_root()):
+        yield
+
+
+def _inventory_entry(path: Path, root: Path, borrowers: BorrowerIndex) -> UnusedBuildFolder | None:
+    try:
+        review_only = False
+        try:
+            with _claim_unused_folder(path, root, snapshot=borrowers) as reason:
+                pass
+        except BuildFolderReviewOnly as review:
+            reason = review.reason
+            review_only = True
+        return UnusedBuildFolder(path, _disk_bytes(path), reason, review_only=review_only)
+    except (BuildFolderInUse, OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _current_unit_names() -> set[str] | None:
+    from scripts.production import staff
+
+    try:
+        return {row.name for row in staff.local_snapshot().rows
+                if not isinstance(row.worktree, staff.RemovedWorktree)}
+    except staff.StaffUnreadable:
+        return None
+
+
+def _unused_unit_entry(unit: Path, root: Path, copies: set[Path]) -> UnusedBuildFolder | None:
+    try:
+        with build_folders.unit_allocation_lock(unit, root=root, exclusive=True, create=False,
+                                                require_existing=not copies):
+            if not build_folders.may_remove_build_path(unit) or not build_folders.may_remove_folder_tree(unit):
+                return None
+            directory = unit.lstat()
+            if not stat.S_ISDIR(directory.st_mode) or unit.resolve(strict=True) != root.resolve() / unit.relative_to(root):
+                return None
+            size = directory.st_blocks * 512
+            for entry in unit.iterdir():
+                inode = entry.lstat()
+                if entry in copies and stat.S_ISDIR(inode.st_mode):
+                    continue
+                name = build_folders.metadata_folder_name(entry.name)
+                if not stat.S_ISREG(inode.st_mode) or name == entry.name or entry.with_name(name) not in copies:
+                    return None
+                size += inode.st_blocks * 512
+            return UnusedBuildFolder(unit, size, "gone unit with free numbered copies")
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _temporary_folders(root: Path) -> Iterator[Path]:
+    with suppress(OSError), os.scandir(root) as repositories:
+        for repo in repositories:
+            if _excluded_build_root_child(repo.name) or not repo.is_dir(follow_symlinks=False):
+                continue
+            path = Path(repo.path)
+            if build_folders.is_temporary_build_folder(path):
+                yield path
+                continue
+            with suppress(OSError), os.scandir(path) as children:
+                for child in children:
+                    folder = Path(child.path)
+                    if child.is_dir(follow_symlinks=False) and build_folders.is_temporary_build_folder(folder):
+                        yield folder
+
+
+def unused_build_folders(root: Path) -> list[UnusedBuildFolder]:
+    """List unused numbered copies, gone units, and ownerless temporary folders."""
+    borrowers = _borrower_index()
+    current = _current_unit_names()
+    found: list[UnusedBuildFolder] = []
+    units = sorted(path for path in build_folders.copy_unit_folders(root) if isinstance(path, Path))
+    for unit in units:
+        if (_excluded_build_root_child(unit.parent.name)
+                or not isinstance(build_folders.parse_resolved_form(unit / "1", root), build_folders.BuildCopy)):
+            continue
+        try:
+            numbers = build_folders.copy_numbers(unit)
         except OSError:
-            yield False
-        else:
-            yield True
-
-
-def remove_copy_locked(path: Path, *, dry_run: bool = False) -> bool:
-    """Check a numbered copy for manual review."""
-    from scripts.lib import scratch
-
-    record = build_folders.numbered_copy_record(path)
-    if isinstance(record, build_folders.NoNumberedCopySource):
-        return False
-    if isinstance(record, build_folders.UnreadableNumberedCopySource):
-        raise CopyGitFailure(record.reason)
-    copy = record.copy if isinstance(record, build_folders.NumberedCopyRemovalPending) else record
-    if not build_folders.may_remove_folder_tree(path, copy.git_directory):
-        return False
-    if not _check_directory_identity(copy.common_directory, copy.common_identity):
-        return False
-    _ = _check_directory_identity(path, copy.checkout_identity)
-    with _numbered_copy_busy_marks(copy, dry_run=True) as idle:
-        if not idle or not isinstance(scratch.borrow_lifetime(path, scratch_settings=conf.read("scratch")), scratch.Ended):
-            return False
-        for borrower in scratch.registered_copy_paths():
-            evidence = scratch.task_of(borrower)
-            if isinstance(evidence, copy_record.Registered):
-                borrowed = evidence.fields.get("borrows_from")
-                if isinstance(borrowed, str) and borrowed:
-                    store = Path(borrowed).resolve()
-                    if store.is_relative_to(copy.git_directory) or store.is_relative_to(path.resolve()):
-                        return False
-        if not dry_run:
-            print(f"kept for a manual removal list: {path} (build_copies, numbered copy)", file=sys.stderr)
-        return dry_run
-
-
-def remove_copy(copy: build_folders.NumberedCopySource | build_folders.NumberedCopyRemovalPending, *,
-                dry_run: bool = False) -> bool:
-    """Check a free numbered copy for manual review."""
-    path = copy.copy.path if isinstance(copy, build_folders.NumberedCopyRemovalPending) else copy.path
-    form = build_folders.parse_form(path)
-    if isinstance(form, build_folders.UnverifiedFolderPath):
-        return False
-    if not isinstance(form, build_folders.BuildCopy):
-        raise ValueError(f"{path}: expected a numbered copy")
-    with build_folders.folder_removal_lease(path, wait=False, create=False,
-                                           root=build_folders.build_root()) as lease:
-        if not isinstance(lease, build_folders.HeldFolderRemovalLease):
-            return False
-        if build_folders.numbered_copy_record(path) != copy or not remove_copy_locked(path, dry_run=dry_run):
-            return False
-        return True
+            continue
+        free = [entry for number, exists in sorted(numbers.items())
+                if exists and (entry := _inventory_entry(unit / str(number), root, borrowers)) is not None]
+        found.extend(free)
+        if current is not None and unit.name not in current and len(free) == len(numbers):
+            entry = _unused_unit_entry(unit, root, {copy.path for copy in free})
+            if entry is not None:
+                found.append(entry)
+    for path in sorted(_temporary_folders(root)):
+        entry = _inventory_entry(path, root, borrowers)
+        if entry is not None:
+            found.append(entry)
+    return found
 
 
 def _size(path: Path) -> int:
