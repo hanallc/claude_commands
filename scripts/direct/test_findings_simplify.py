@@ -126,12 +126,21 @@ class SimplifyFindingTests(FindingsLedgerFixture):
             before = {path: path.read_bytes() for path in self.session_dir.glob("*.json")}
             phase_options = (("--phase", "simplify"),) if parked else ((), ("--phase", "simplify"))
             for command in commands:
-                for options in phase_options:
+                # A named closed phase takes a late finding, so only an unnamed open with no later phase is refused.
+                late_options: tuple[tuple[str, ...], ...] = () if parked else ((),)
+                for options in late_options if command[0] == "open" else phase_options:
                     with self.subTest(parked=parked, command=command[0], options=options):
                         result = self.run_failing_command(*command, *options)
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("Phase simplify is not open", result.stderr)
                         self.assertEqual({path: path.read_bytes() for path in before}, before)
+            with self.history_file.open("a", encoding="utf-8") as history:
+                _ = history.write(json.dumps({"event_type": "phase_started", "phase_id": "simplify",
+                                              "phase_instance_id": "simplify-instance"}) + "\n")
+            late = self.run_command("open", "--phase", "simplify", "--severity", "nit",
+                                    "--title", f"Late change, parked={parked}", "--caught-by", "main")
+            titles = [entry["title"] for entry in cast(list[dict[str, object]], self.phase_status("simplify")["findings"])]
+            self.assertIn(f"Late change, parked={parked}", titles, late)
 
     def test_status_keeps_the_last_decision_without_a_later_phase(self) -> None:
         held_id = self.complete_held_phase()

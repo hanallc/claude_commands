@@ -293,11 +293,15 @@ Each local Promote checkout must exist before the command pushes.
 - **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
+     For a shrink or as-built checkpoint, the test merge uses the pending commit's first parent as its base.
+     Ancestry skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
      `_unit_paths` excludes unchanged paths that an origin merge base contains.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
-     A shrink allows only the plan doc and `<plan stem>-next.md`.
+     A shrink changes the plan doc and can also change `<plan stem>-next.md`.
+     A shrink with no paths in scope passes if a clean test merge leaves the fetched `origin/main` tree unchanged.
+     The test merge uses the shrink's first parent as its base.
      An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
      The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
      It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.
@@ -320,10 +324,10 @@ Each local Promote checkout must exist before the command pushes.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
      Otherwise, restore the tip before the checkpoint merge while origin still has its old tip.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
-     A red names its failed nextest tests, or the red modules of a merge gate command (`--- <suite>/<module> exit=<rc> ---`).
+     A failure names the failed nextest tests or the failed gate modules (`--- <suite>/<module> exit=<rc> ---`).
      A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
   8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
-     The run is limited to its red names, with `--filter`, `-E test(=<name>)` or the merge gate's `--module <suite>/<module>`.
+     Limit the run to failed names with `--filter`, `-E test(=<name>)`, or the gate's `--module <suite>/<module>`.
      The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
      A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
      The unit gets a repair line only for its own red names.
@@ -366,12 +370,12 @@ Each local Promote checkout must exist before the command pushes.
   An invisible change uses `Change-Review: none — <why>`.
   `problem` reads both visible forms through the shared parser.
   A merge message can carry only invisible lines.
-  The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
+  The hook and the integrate job reject visible lines and `Change-Review-Covers` lines on merge commits.
   A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
   A malformed line holds any unit commit, whatever its subject, unless a later plain commit covers it.
   Other commits need no line.
   `Change-Review-Covers: <hash>` names each covered commit.
-  The merge gates retain their staff reads before publication.
+  The integrate job retains its staff reads before publication.
 
   Merge callers use `list_ready` after promotion succeeds or the Mac pull enters the shared pending queue.
   A failed required step adds no rows.
@@ -606,9 +610,12 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
+They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
 Their updates use the caller's staff name as the log source.
+They can also run `park`, `close`, and `reopen` on those items.
+These commands use the `--source` words as the log source.
+The command refuses each item of another producer.
+Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
 Morty's new items default to morty.

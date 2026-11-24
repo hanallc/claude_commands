@@ -39,8 +39,8 @@ STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/p
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
-                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
-                     "config/test_times.conf")
+                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "scripts/lib/testing_folders.py",
+                     "scripts/lib/session_folder.py", "config/build_folders.conf", "config/test_times.conf")
 _DIRECT_TEST_UNIT_PREFIX = "claude-direct-test-"
 _GATE_ANCESTOR_LIMIT = 32
 _GATE_ENVIRONMENT_LIMIT = 64 * 1024
@@ -530,6 +530,8 @@ def within_test_limit() -> bool:
 
 
 def _begin_direct_test() -> None:
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if within_test_limit():
         return
     from contextlib import AbstractContextManager, nullcontext
@@ -656,6 +658,8 @@ def _watch_direct_test(seconds: int) -> None:
     import signal
     from contextlib import suppress
 
+    # Close the descriptors that the watchdog inherits from the test, so it holds no build folder lock of the test.
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
     _ = os.write(1, _WATCHDOG_READY)
     os.close(1)
     readable, _, _ = select.select([0], [], [], seconds)

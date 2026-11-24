@@ -26,16 +26,16 @@ class TargetedTestTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # The fixture's main branch has no merge gate pass.
+        # The fixture's main branch has no full gate pass.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
                                  "landing_branches=fixture-landing\nscan_roots=\n")
 
     def test_targeted_runner_holds_and_removes_its_test_folder(self) -> None:
         allocated: list[Path] = []
 
-        def run(args: gate.GateArguments, mode: gate.SuiteMode, target: str | gate.NoGateAssignment) -> int:
+        def run(args: gate.GateArguments, mode: gate.SuiteMode, target: gate.GateTarget) -> int:
             self.assertIs(mode, gate.SuiteMode.TARGETED)
-            self.assertIsInstance(target, gate.NoGateAssignment)
+            self.assertEqual(target, "natedev")
             self.assertEqual(args.gate_job, StepJob("test-affected"))
             path = Path(os.environ["TMPDIR"])
             allocated.append(path)
@@ -85,7 +85,11 @@ argparse.ArgumentParser.exit = checked_exit
             return gate.GateRun((), 0, 0, tests_reused=True)
 
         self.environment.update(dict.fromkeys(admission_records.OWNER_VARIABLES, ""))
+        # The test fixes the process family to one that names no owner. A terminal or login session family, such
+        # as a guest test runner, names the user, and then the worktree owner would not apply.
+        unnamed = admission_records.OwnerNotGiven("script · test")
         with mock.patch.dict(os.environ, dict.fromkeys(admission_records.OWNER_VARIABLES, "")), \
+             mock.patch.object(admission_records, "family_owner", return_value=unnamed), \
              mock.patch.object(gate, "run_suites", side_effect=suites):
             result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

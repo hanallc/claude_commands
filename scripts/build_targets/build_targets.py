@@ -34,6 +34,7 @@ from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
 from scripts.build_targets.execution_transport import HanaGpuNextestTransport
 from scripts.lib import conf
+from scripts.lib.display_text import display_field
 from scripts.build_queue.placement import (
     MAC_RUN_KINDS, CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings,
 )
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
     from scripts.mac_test import eligibility, mac_test
     from scripts.message import roster
     from scripts.build_targets.targets import (
-        Held, RunningJob, TargetState,
+        Held, KeptClaim, RunningJob, TargetState,
     )
 
 
@@ -141,6 +142,7 @@ def parser() -> argparse.ArgumentParser:
     _ = backoff.add_argument("--no-probe", action="store_true")
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
+    _ = commands.add_parser("setup-mac-linux", help="Repair the state root for the Mac Linux gate on natedev")
     eligible = commands.add_parser("eligible", aliases=["constraints"])
     _ = eligible.add_argument("--repo-root", required=True)
     _ = eligible.add_argument("--package", default="")
@@ -229,24 +231,29 @@ def local_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def display_field(value: str) -> str:
-    from scripts.buildlog.mac_idle_alert import display_field as clean_field
-
-    return clean_field(value)
-
-
-def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held, roster.UnitLabels]) -> str:
+def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels]) -> str:
     identity = labels.get(state)
     if identity is None:
         return ""
     return f" (showrunner {display_field(identity.showrunner)}, unit {display_field(identity.unit)})"
 
 
-_NO_UNIT_LABELS: Mapping[RunningJob | Held, roster.UnitLabels] = {}
+_NO_UNIT_LABELS: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels] = {}
+
+
+def kept_claims_suffix(kept: tuple[KeptClaim, ...],
+                       labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels]) -> str:
+    """Name each kept claim with its owner: the holder session name when known, else the repository."""
+    from scripts.build_targets.targets import kept_claim_text
+    from scripts.lib.user_zone import user_zone
+
+    zone = user_zone()
+    return "".join(" · " + display_field(kept_claim_text(claim, labels[claim].session if claim in labels else "", zone))
+                   for claim in kept)
 
 
 def running_job_text(job: RunningJob,
-                     labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
+                     labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     from scripts.lib.user_zone import user_zone
     from scripts.build_targets.targets import IdleSince
 
@@ -258,19 +265,17 @@ def running_job_text(job: RunningJob,
 
 
 def format_state(name: str, state: TargetState,
-                 labels: Mapping[RunningJob | Held, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
+                 labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels] = _NO_UNIT_LABELS) -> str:
     from scripts.build_targets.targets import (
         ExpiresAt, Free, ReleaseEstimated, ReleaseOverdue, Running, StateUnreadable, Unreachable,
     )
 
     name = display_field(name)
     if isinstance(state, Free):
-        from scripts.buildlog.mac_idle_alert import kept_claims_text
-
-        suffix = f" · {kept_claims_text(state.kept_claims)}" if state.kept_claims else ""
-        return f"{name}: free{suffix}"
+        return f"{name}: free" + kept_claims_suffix(state.kept_claims, labels)
     if isinstance(state, Running):
-        return f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
+        return (f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
+                + kept_claims_suffix(state.kept_claims, labels))
     if isinstance(state, Unreachable):
         return f"{name}: unreachable — {display_field(state.reason)}"
     if isinstance(state, StateUnreadable):
@@ -285,7 +290,7 @@ def format_state(name: str, state: TargetState,
     elif isinstance(state.end, ReleaseOverdue):
         line += f" release overdue since {local_time(state.end.when)}"
     reason = display_field(state.reason)
-    return f"{line} — {reason}" if reason else line
+    return (f"{line} — {reason}" if reason else line) + kept_claims_suffix(state.kept_claims, labels)
 
 
 def probe_target(target: SshTarget) -> TargetState:
@@ -307,7 +312,7 @@ def command_status(probe: bool = False) -> int:
     from scripts.buildlog import mac_idle
     from scripts.lib.user_zone import user_zone
     from scripts.message import roster
-    from scripts.build_targets.targets import Held, HolderSession, Running
+    from scripts.build_targets.targets import Free, Held, HolderSession, Running
 
     try:
         targets = read_targets()
@@ -315,7 +320,7 @@ def command_status(probe: bool = False) -> int:
         print(f"build targets: {error}", file=sys.stderr)
         return 2
     states: list[tuple[str, TargetState]] = []
-    holders: dict[RunningJob | Held, str] = {}
+    holders: dict[RunningJob | Held | KeptClaim, str] = {}
     for target in targets:
         state = (
             probe_target(target)
@@ -323,7 +328,8 @@ def command_status(probe: bool = False) -> int:
             else target_state(target)
         )
         states.append((target.name, state))
-        jobs = state.jobs if isinstance(state, Running) else (state,) if isinstance(state, Held) else ()
+        jobs = ((*state.jobs, *state.kept_claims) if isinstance(state, Running) else state.kept_claims
+                if isinstance(state, Free) else (state, *state.kept_claims) if isinstance(state, Held) else ())
         for job in jobs:
             if isinstance(job.holder_session, HolderSession):
                 holders[job] = job.holder_session.session_id
@@ -1802,6 +1808,14 @@ def main() -> int:
         from scripts.build_targets import target_config
 
         args = parser().parse_args(namespace=CliArguments())
+        if args.command == "setup-mac-linux":
+            root = target_config.build_targets_state_root()
+            try:
+                target_config.provision_mac_linux_state_root(root)
+            except OSError as error:
+                print(f"setup-mac-linux: Cannot prepare {root}: {error}", file=sys.stderr)
+                return 1
+            return 0
         if args.command == "recover-probe":
             return command_recover_probe(args)
         if args.command == "probe-backoff":

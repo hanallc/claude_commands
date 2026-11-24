@@ -24,7 +24,7 @@ from unittest import mock
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, FixtureConfigValues, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
@@ -2150,8 +2150,8 @@ assert not loaded, loaded
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
         settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
+            path = scratch.new("gate:folder-test", "checkout", scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)
@@ -2254,20 +2254,20 @@ assert not loaded, loaded
         self.assertEqual(first.name, "unit-proof-aa")
         self.assertEqual(second.name, "unit-proof-bb")
 
-    def test_nonvisible_scratch_target_uses_the_shared_name_rule(self) -> None:
+    def test_scratch_target_uses_the_shared_name_rule(self) -> None:
         with (mock.patch.object(scratch, "validate_phase_task"),
               mock.patch.object(scratch, "build_folder_path", wraps=folders.build_folder_path) as naming):
-            path = scratch.target("gate:proof", "tree", False)
+            path = scratch.target("gate:proof", "tree")
         naming.assert_called_once()
         self.assertEqual(path.parent, copy_record.root())
         self.assertRegex(path.name, r"^gate-proof-tree-[a-z0-9]{6}$")
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
         copied = self.root / "copied-config"
-        _ = config_environment(copied)
+        _ = config_environment(copied, values=FixtureConfigValues.EXACT)
         config = copied / "build_folders.conf"
         config.unlink()
-        environment = config_environment(config.parent)
+        environment = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
@@ -2285,7 +2285,7 @@ assert not loaded, loaded
             self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
-        _ = config_environment(config.parent)
+        _ = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
 
     def test_repository_key_keeps_the_fixed_path_name(self) -> None:

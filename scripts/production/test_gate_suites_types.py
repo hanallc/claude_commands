@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Test the gate suite runner."""
 
 from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
@@ -22,10 +22,12 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from scripts.agents import remote
 from scripts.copies import copies
 from scripts.direct import progress_history
-from scripts.lib import build_folders
+from scripts.lib import build_folders, scratch
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.production import change_review, gate, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_routes import GateResultUnknown
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.gate_test_support import gate_suites, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -91,7 +93,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual(arguments.args[:2], ("fixture-showrunner", f"merge-gate-nightly:{tree}"))
         message = cast(str, arguments.args[2])
         self.assertIn(failing_file, message)
-        self.assertNotIn("requires the full suite", message)
+        self.assertNotIn("full-required marker exists", message)
         self.assertFalse((self.state / "runner/full-required").exists())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
@@ -255,18 +257,24 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertIn("1980 other diagnostic lines omitted.", message)
         self.assertIn(summary, message)
 
-    def test_nightly_notice_without_a_failed_job_says_the_full_suite_is_required(self) -> None:
+    def test_nightly_runner_failure_names_the_jobs_that_run_the_full_suite_again(self) -> None:
         from scripts.production import showrunners
 
-        with (mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner"),
+        self.write(Path(self.environment["CONF_DIR"]) / "build_steps.conf",
+                   "names.integrate=fixture integrate\nnames.test-all=fixture test all\n"
+                   + "names.test-nightly=fixture test nightly\n")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner"),
               mock.patch.object(showrunners, "tell", return_value="sent to fixture-showrunner") as notice):
             _ = gate.tell_nightly_red(gate.GateArguments(merge_branch="integration"), "fixture-tree", [])
 
         arguments = notice.call_args
         assert arguments is not None
         message = cast(str, arguments.args[2])
+        self.assertIn("The fixture test nightly job failed", message)
         self.assertIn("(runner failure)", message)
-        self.assertIn("requires the full suite", message)
+        self.assertIn("The fixture integrate and fixture test all jobs run the full suite again"
+                      + " while the full-required marker exists.", message)
         self.assertNotIn("Tests passed", message)
 
     def test_type_check_requires_exit_zero_and_a_clean_summary(self) -> None:
@@ -410,7 +418,7 @@ class NightlyPushTests(unittest.TestCase):
               mock.patch.object(gate, "checked_git", return_value="fixture-tree"),
               mock.patch.object(gate, "nightly_owner", return_value="sdlc"),
               mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
-              mock.patch.object(gate, "run_suites", return_value=run,
+              mock.patch.object(gate, "run_gate_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
               mock.patch.object(showrunners, "tell", return_value="told sdlc"),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
@@ -771,9 +779,28 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertIn("action=None. The next nightly run tries again.", command)
                 self.assertNotIn("--priority", command)
 
+    def test_nightly_without_a_guest_verdict_publishes_the_reason_and_keeps_the_status(self) -> None:
+        for failure, status in (
+                (gate.MacLinuxTookNoRun("fixture guest did not start"), MAC_LINUX_PRELAUNCH_REFUSED_STATUS),
+                (GateResultUnknown("fixture guest gave no verdict"), GATE_RESULT_UNKNOWN_STATUS)):
+            with (self.subTest(status=status), self.execution(failure) as sent,
+                  mock.patch.object(gate, "_sweep_nightly_build_folders"),
+                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                  redirect_stdout(io.StringIO()),
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(["--nightly", "--merge-branch", "main",
+                                            "--unit", "fixture-merge", "--repo", str(self.root)]), status)
+                self.assertEqual(errors.getvalue(), f"{failure}\n")
+                notices = [command for call in sent.call_args_list
+                           if "--text-id" in (command := cast(list[str], call.args[0]))]
+                self.assertEqual(len(notices), 1, sent.call_args_list)
+                command, = notices
+                self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+                self.assertIn(f"reason={failure}", command)
+
     def test_interrupt_push_preserves_the_exception(self) -> None:
         run = gate.GateRun((), 0, 0)
-        for stage in ("nightly_git", "run_suites"):
+        for stage in ("nightly_git", "run_gate_suites"):
             failure = KeyboardInterrupt()
             with self.subTest(stage=stage), self.execution(run) as sent:
                 with mock.patch.object(gate, stage, side_effect=failure):

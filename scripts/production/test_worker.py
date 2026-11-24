@@ -363,14 +363,14 @@ class WorkerCommandTests(unittest.TestCase):
         config = self.fixture.root / "conf/direct.conf"
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
-        atomic_file.write_text_atomic(config.with_name("send.conf"),
+        _ = write_config_fixture(config.with_name("send.conf"),
             "# range: 0.001..\nwaits_review_seconds=1\n"
             + "# range: 0.001..\ndelivery_timeout=5\n"
             + "# range: 0.001..\nkill_grace=1\n"
             + "# range: 0.001..\ncaller_margin_seconds=2\n"
             + "# range: 0.001..\nremote_transport_seconds=2\n"
             + "# one of: on, off\nreview_hold=off\n")
-        atomic_file.write_text_atomic(config.with_name("scratch.conf"),
+        _ = write_config_fixture(config.with_name("scratch.conf"),
             "# whole: 1..\nsuffix_length=6\n"
             + "# whole: 1..\nrecord_lock_attempts=3\n"
             + "# whole: 1..\nrepo_depth=3\n"
@@ -381,7 +381,6 @@ class WorkerCommandTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "TMPDIR": str(root / "worker-tmp"),
             "SCRATCH_ROOT": str(root / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(root / "visible-scratch"),
             "SCRATCH_COPIES_ROOT": str(root / "copies"),
             "SCRATCH_HOLDS": str(root / "scratch-holds.json"),
         })))

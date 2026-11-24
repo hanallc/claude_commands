@@ -5,13 +5,16 @@ description: Show suite, module and test times.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines unchanged.
 
 - `top [--limit N] [--repo PATH] [--host NAME]`: rank the slowest tests of the working repository, or of PATH. This is the default command.
-- `trend [--days N]`: show daily CPU, wall time and cost for targeted tests and merge gates. The default is `TREND_DAYS`.
+- `trend [--days N]`: show daily CPU, wall time and cost for targeted tests and full suite runs. The default is `TREND_DAYS`.
 - `suites [--days N]`: show recent gate runs.
 - `suite <folder> [--days N]`: show one folder suite's history.
 - `module <folder>/<file> [--runs N]`: show each module execution and its slowest kept tests.
 - `test <text> [--runs N]`: show kept test names that contain the text and later missing measurements.
 
 In the ~/.claude repository, `top` ranks live gate modules by median CPU time.
+Each module uses up to `TOP_RUNS` runs, ordered by the commit time of their merge base with `origin/main`.
+The start time breaks ties. Runs with unknown commit times sort last.
+`code date` shows the merge-base date of the latest counted run, or `unknown`.
 The nightly type check has a footnote with its latest passed CPU and wall time. It does not count toward the limit.
 In another repository, `top` ranks recorded nextest tests on the current host within `TOP_MAX_AGE_DAYS`.
 The repository key follows its origin, so worktrees share the same test history.
@@ -57,7 +60,7 @@ The number keeps its sign.
 These command measures come from a separate run, so they can differ from the time run.
 
 `trend` groups passing, non-aborted runs by place, selection and day in the user's zone.
-For each place, it prints merge gates before targeted tests.
+For each place, it prints full suite runs before targeted tests.
 Columns: day, runs, CPU mean, CPU p95, wall mean, wall p95, cost mean, cost p95, cost total.
 Targeted tests (`affected`) tables add median modules run.
 CPU includes all module attempts. Wall time comes from the gate run.

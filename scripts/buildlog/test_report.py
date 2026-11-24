@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from zipfile import ZipFile, Path as ZipPath
+
+from scripts.aws_target.ledger_test_support import install_cost_settings
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
@@ -70,7 +72,12 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
+        configuration = temporary / "config"
+        account_settings = configuration / "aws_target.conf"
+        install_cost_settings(account_settings)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **mac_natedev_environment(configuration), "AWS_TARGET_CONFIG": str(account_settings),
+        })))
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:

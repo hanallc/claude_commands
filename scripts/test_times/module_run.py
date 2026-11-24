@@ -16,17 +16,18 @@ import ctypes
 import json
 import os
 import fcntl
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from inspect import currentframe, getsource
+from inspect import currentframe, getsource, signature
 from pathlib import Path
 import resource
 import select
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 from types import FrameType, MethodType, TracebackType
@@ -34,9 +35,10 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
-from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, gate_parent
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, checkout_root, gate_parent
 
 if TYPE_CHECKING:
+    from scripts.lib.testing_folders import PreparedTestRunsParent
     from scripts.test_times.gate_record import TestStatus, TestTime
 
 
@@ -356,6 +358,9 @@ else:
 
 
 class TimedResult(TimedResultBase):
+    shift_directory: ClassVar[Path | None] = None
+    select_shift_log: ClassVar[Callable[[str], str] | None] = None
+
     def __init__(self, stream: TestOutput, descriptions: bool, verbosity: int,
                  *, durations: int | None = None) -> None:
         super().__init__(stream, descriptions, verbosity, durations=durations)
@@ -365,6 +370,8 @@ class TimedResult(TimedResultBase):
         self.test_labels: dict[str, str] = {}
         self.cpu_times: dict[str, float] = {}
         self.test_cpu_started: float = 0.0
+        self.shift_log: Path | None = None
+        self.previous_shift_log: str = ""
 
     @override
     def startTest(self, test: unittest.TestCase) -> None:
@@ -372,12 +379,24 @@ class TimedResult(TimedResultBase):
         self.open_test = OpenTest(test.id())
         self.test_labels[test.id()] = test.id().removeprefix(type(test).__module__ + ".")
         super().startTest(test)
+        select_log = TimedResult.select_shift_log
+        if self.shift_directory is not None and select_log is not None:
+            self.shift_log = self.shift_directory / f"shift-{self.testsRun}"
+            self.previous_shift_log = select_log(str(self.shift_log))
 
     @override
     def stopTest(self, test: unittest.TestCase) -> None:
         self.cpu_times[test.id()] = cpu_seconds() - self.test_cpu_started
-        super().stopTest(test)
-        self.open_test = NoOpenTest()
+        try:
+            super().stopTest(test)
+        finally:
+            self.open_test = NoOpenTest()
+            select_log = TimedResult.select_shift_log
+            if self.shift_log is not None and select_log is not None:
+                _ = select_log(self.previous_shift_log)
+                failed = self.outcomes.get(test.id()) in ("fail", "error", "unexpected_success")
+                finish_shift_log(self.shift_log, test.id(), self.stream.writeln, failed=failed)
+                self.shift_log = None
 
     def record_outcome(self, test: unittest.TestCase, status: TestStatus) -> None:
         if isinstance(self.open_test, OpenTest):
@@ -479,6 +498,78 @@ def test_times(result: TimedResult) -> list[TestTime]:
     return rows
 
 
+def finish_shift_log(log: Path, label: str, write: Callable[[str], None], *, failed: bool) -> None:
+    """Print the distinct shifted reads only when the call fails."""
+    try:
+        if failed and log.is_file():
+            reads = sorted(set(log.read_text(encoding="utf-8").splitlines()))
+            if reads:
+                write(f"Shifted configuration reads for {label}")
+                for read in reads:
+                    write(f"  {read}")
+    except (OSError, UnicodeError):
+        pass
+    finally:
+        try:
+            log.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@contextmanager
+def trace_fixture_shifts(name: str, index: int) -> Generator[None]:
+    """Give each unittest setup call its own shift read log."""
+    directory, select_log = TimedResult.shift_directory, TimedResult.select_shift_log
+    if directory is None or select_log is None or not name.startswith(("setUpModule (", "setUpClass (")):
+        yield
+        return
+    log = directory / f"shift-fixture-{index}"
+    previous = select_log(str(log))
+    failed = False
+    try:
+        yield
+    except unittest.SkipTest:
+        raise
+    except Exception:
+        failed = True
+        raise
+    finally:
+        _ = select_log(previous)
+        finish_shift_log(log, name, lambda line: print(line, file=sys.stderr), failed=failed)
+
+
+@contextmanager
+def preserve_child_shift_log(shift_environment: Callable[[], dict[str, str]]) -> Generator[None]:
+    """Pass the active read log through subprocess environment replacements."""
+    popen = subprocess.Popen
+    initialize = cast(Callable[..., None], popen.__init__)
+    parameters = tuple(signature(initialize).parameters)
+    env_index = parameters.index("env") - 1
+
+    @wraps(initialize)
+    def launch(process: object, *arguments: object, **options: object) -> None:
+        if additions := shift_environment():
+            positional = len(arguments) > env_index
+            supplied = arguments[env_index] if positional else options.get("env")
+            if supplied is not None or any(os.environ.get(key) != value for key, value in additions.items()):
+                inherited = os.environ if supplied is None else supplied
+                environment = dict(cast(Mapping[str | bytes, str | bytes], inherited))
+                for key, value in additions.items():
+                    _ = environment.pop(os.fsencode(key), None)
+                    environment[key] = value
+                if positional:
+                    arguments = (*arguments[:env_index], environment, *arguments[env_index + 1:])
+                else:
+                    options["env"] = environment
+        initialize(process, *arguments, **options)
+
+    setattr(popen, "__init__", launch)
+    try:
+        yield
+    finally:
+        setattr(popen, "__init__", initialize)
+
+
 @contextmanager
 def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
                      ) -> Generator[list[FixtureMeasure], None, None]:
@@ -500,7 +591,8 @@ def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
             cpu = cpu_seconds()
             started = time.perf_counter()
             try:
-                return function()
+                with trace_fixture_shifts(name, len(rows)):
+                    return function()
             finally:
                 depth -= 1
                 rows.append({"kind": "fixture", "test": name,
@@ -643,18 +735,41 @@ class GateModuleLease:
 
 
 @dataclass(frozen=True)
-class StandaloneModuleRun:
-    """The runner owns its folder leases."""
+class UnleasedGateJob:
+    """A gate job without a module lease. The runner keeps its folder leases in the gate's TMPDIR."""
 
 
-def runner_folder_owner() -> GateModuleLease | StandaloneModuleRun:
+@dataclass(frozen=True)
+class DirectModuleRun:
+    """A direct run. The runner keeps its folder leases in the test-runs folder of the start_dir checkout.
+
+    A checkout without a modeled output uses `$TMPDIR/test-runs` instead.
+    """
+    parent: PreparedTestRunsParent
+
+
+RunnerFolderOwner = GateModuleLease | UnleasedGateJob | DirectModuleRun
+
+
+def runner_folder_owner(start_dir: Path) -> RunnerFolderOwner:
     if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
         return GateModuleLease(Path(root))
-    return StandaloneModuleRun()
+    if not isinstance(gate_parent(), UnverifiedGateParent):
+        return UnleasedGateJob()
+    from scripts.lib import git_files
+    from scripts.lib.testing_folders import prepare_test_runs_parent, use_test_runs_parent
+
+    try:
+        checkout = git_files.locate(start_dir).toplevel
+    except git_files.GitFilesError:
+        checkout = Path(checkout_root(str(start_dir)) or start_dir)
+    parent = prepare_test_runs_parent(checkout)
+    use_test_runs_parent(parent)
+    return DirectModuleRun(parent)
 
 
 @contextmanager
-def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Generator[Path]:
+def runner_folder(owner: RunnerFolderOwner, name: str) -> Generator[Path]:
     if isinstance(owner, GateModuleLease):
         folder = owner.root / name
         creator = os.getpid()
@@ -672,6 +787,12 @@ def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Ge
                     from scripts.lib import build_folders
 
                     build_folders.remove_folder(folder)
+    elif isinstance(owner, DirectModuleRun):
+        from scripts.lib import build_folders
+
+        request = build_folders.UniqueBuildFolder(f"{name}-", build_folders.ExplicitBuildParent(owner.parent))
+        with build_folders.temporary_build_folder(request) as folder:
+            yield folder
     else:
         from scripts.lib import build_folders
 
@@ -679,7 +800,7 @@ def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Ge
             yield folder
 
 
-def main(owner: GateModuleLease | StandaloneModuleRun, run_root: Path) -> None:
+def main(owner: RunnerFolderOwner, run_root: Path) -> None:
     violation_log = (owner.root if isinstance(owner, GateModuleLease) else run_root) / "live-config-writes"
     try:
         from scripts.lib import conf_reads
@@ -696,14 +817,13 @@ def main(owner: GateModuleLease | StandaloneModuleRun, run_root: Path) -> None:
                      else cleanup.enter_context(runner_folder(owner, "config-reads")))
         log = temporary / "reads"
         log.touch()
-        with conf_reads.record_reads(log):
+        TimedResult.shift_directory = log.parent
+        TimedResult.select_shift_log = conf_reads.set_shift_read_log
+        with conf_reads.record_reads(log), preserve_child_shift_log(conf_reads.shift_child_environment):
             run_module(log, run_root, violation_log)
 
 
 def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log: Path) -> None:
-    if len(sys.argv) != 3:
-        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
-        sys.exit(2)
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
@@ -739,7 +859,7 @@ def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log
 
 
 @contextmanager
-def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator[Path]:
+def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
     """Keep imported run roots and child processes under one private folder."""
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
@@ -756,7 +876,7 @@ def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cleanup: ExitStack) -> None:
+def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
@@ -852,6 +972,9 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
 
 
 if __name__ == "__main__":
-    folder_owner = runner_folder_owner()
+    if len(sys.argv) != 3:
+        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
+        sys.exit(2)
+    folder_owner = runner_folder_owner(Path(sys.argv[1]).resolve())
     with ExitStack() as runner_cleanup:
         run_with_descendant_cleanup(folder_owner, runner_cleanup)
