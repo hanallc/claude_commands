@@ -3332,6 +3332,9 @@ class GuestNotStartedOutcome(Protocol):
     @property
     def reason(self) -> str: ...
 
+    @property
+    def settlement_required(self) -> bool: ...
+
 
 class GuestToolSettings(Protocol):
     def command(self, shell: str) -> tuple[str, ...]: ...
@@ -3428,6 +3431,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
+            if outcome.settlement_required:
+                raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
             write_gate_claim_failure(admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER))
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         if not outcome.passed:

@@ -537,6 +537,7 @@ class GuestNotStarted:
     """
 
     reason: str
+    settlement_required: bool = False
 
 
 class GuestEndUnproven(GuestUnavailable):
@@ -1232,17 +1233,10 @@ def _append_guest_end(dispatch: GuestGateDispatch, evidence: GuestEndProven | Gu
     _write_guest_end(attempt_key(assignment.episode, assignment.attempt), dispatch.claim.claim_id, evidence, detail)
 
 
-@dataclass(frozen=True)
-class GuestClaimUnrecorded:
-    """The journal has no Mac claim ID for the attempt."""
-
-
-def _write_guest_end(key: str, claim: str | GuestClaimUnrecorded,
+def _write_guest_end(key: str, claim: str,
                      evidence: GuestEndProven | GuestNotStartedProven | ArmedGuestAttempt,
                      detail: str) -> None:
-    row: dict[str, object] = {'attempt': key, 'detail': detail, 'written_at': time()}
-    if isinstance(claim, str):
-        row['claim'] = claim
+    row: dict[str, object] = {'attempt': key, 'claim': claim, 'detail': detail, 'written_at': time()}
     if isinstance(evidence, ArmedGuestAttempt):
         row['result'] = 'unproven'
         row['armed'] = evidence.to_record()
@@ -1278,12 +1272,12 @@ class GuestEndRecovery:
 
 @dataclass(frozen=True)
 class GuestLaunchHolder:
-    """The gate process can still ask the guest to arm."""
+    """The gate process holds the guest attempt."""
 
     pid: int
     start: str
 
-    def can_arm(self) -> bool:
+    def may_be_live(self) -> bool:
         current = process_start.process_start(self.pid)
         return (isinstance(current, process_start.Started) and current.start == self.start
                 or isinstance(current, process_start.Unreadable))
@@ -1297,15 +1291,13 @@ class GuestLaunchRecovery:
     claim: str
     ssh_hops: tuple[str, str]
     guest_user: str
-    checkout: GuestCheckoutIdentity | GuestCheckoutUnrecorded
+    checkout: GuestCheckoutIdentity
     holders: tuple[GuestLaunchHolder, ...] = ()
 
 
 @dataclass(frozen=True)
 class GuestLaunchUnrecorded:
     """Recovery has no journal entry for the attempt."""
-
-    key: str
 
 
 def _placed_guest_attempt(key: str) -> str:
@@ -1345,11 +1337,12 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
     from scripts.build_queue.placement import Pending, Settled
 
     key = attempt_key(episode, f'{attempt:032x}')
-    result: GuestEndRecovery | GuestLaunchUnrecorded = GuestLaunchUnrecorded(key)
+    result: GuestEndRecovery | GuestLaunchUnrecorded = GuestLaunchUnrecorded()
     launch: GuestLaunchRecovery | None = None
     holders: dict[tuple[str, GuestLaunchHolder], None] = {}
     conflicting_address = False
     recorded = False
+    proven = False
     try:
         with _end_proofs_path().open('rb') as journal:
             for line in journal:
@@ -1365,17 +1358,17 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
                     kind = row.get('result')
                     if kind in ('proven', 'not started', 'unproven', 'awaiting arm', 'arm abandoned'):
                         recorded = True
-                    if kind in ('proven', 'not started'):
-                        claim = row.get('claim')
-                        if 'claim' not in row or isinstance(claim, str) and claim:
-                            return Settled()
                     claim = ledger.text(row, 'claim')
+                    if kind in ('proven', 'not started'):
+                        proven = True
                     if kind == 'unproven' and 'armed' in row:
                         saved = ledger.mapping(row['armed'])
                         armed = ArmedGuestAttempt(ledger.text(saved, 'attempt'), ledger.text(saved, 'machine_id'),
                             ledger.text(saved, 'boot_id'), ledger.instant(saved, 'deadline_ns'),
                             ledger.text(saved, 'guest_user'), ledger.text(saved, 'checkout'))
                         result = GuestEndRecovery(key, claim, armed)
+                        # The gate gives up the attempt when it saves the armed identity for recovery.
+                        holders = {entry: None for entry in holders if entry[0] != claim}
                     if kind in ('awaiting arm', 'arm abandoned') and 'holder' in row:
                         saved_holder = ledger.mapping(row['holder'])
                         holder = GuestLaunchHolder(ledger.instant(saved_holder, 'pid'), ledger.text(saved_holder, 'start'))
@@ -1384,11 +1377,9 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
                         else:
                             _ = holders.pop((claim, holder), None)
                     if kind == 'awaiting arm':
-                        identity: GuestCheckoutIdentity | GuestCheckoutUnrecorded = GuestCheckoutUnrecorded()
-                        if 'guest_checkout' in row:
-                            saved_guest = ledger.mapping(row['guest_checkout'])
-                            identity = GuestCheckoutIdentity(
-                                ledger.text(saved_guest, 'machine_id'), ledger.text(saved_guest, 'path'))
+                        saved_guest = ledger.mapping(row.get('guest_checkout'))
+                        identity = GuestCheckoutIdentity(
+                            ledger.text(saved_guest, 'machine_id'), ledger.text(saved_guest, 'path'))
                         recovery = GuestLaunchRecovery(key, claim,
                             (ledger.text(row, 'mac_host'), ledger.text(row, 'guest_host')),
                             ledger.text(row, 'guest_user'), identity)
@@ -1402,21 +1393,27 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
         pass
     except OSError as error:
         return Pending(f'The Mac Linux end proof journal is unavailable: {error}')
-    if isinstance(result, GuestEndRecovery) or not recorded:
-        return result
     if conflicting_address:
         return Pending('The Mac Linux guest address changed for this attempt.')
-    if launch is None or isinstance(launch.checkout, GuestCheckoutUnrecorded):
-        return Pending('The Mac Linux recovery record has no saved guest checkout identity.')
+    if proven:
+        if any(holder.may_be_live() for _, holder in holders):
+            return Pending('The Mac Linux launch holder can still report the result.')
+        return Settled()
+    if isinstance(result, GuestEndRecovery) or not recorded:
+        return result
+    if launch is None:
+        return Pending('The Mac Linux recovery record is incomplete.')
     return replace(launch, holders=tuple(holder for _, holder in holders))
 
 
-def settlement(episode: str, attempt: int) -> Settled | Pending:
-    """Read the proof for the exact queue attempt."""
-    from scripts.build_queue.placement import Pending
+def settlement(episode: str, attempt: int, *, legacy_holder_ended: bool = False) -> Settled | Pending:
+    """Read the proof or use the queue's holder check for a legacy attempt."""
+    from scripts.build_queue.placement import Pending, Settled
 
     result = _read_guest_end(episode, attempt)
-    if isinstance(result, (GuestEndRecovery, GuestLaunchRecovery, GuestLaunchUnrecorded)):
+    if isinstance(result, GuestLaunchUnrecorded):
+        return Settled() if legacy_holder_ended else Pending('The legacy Mac Linux launch holder can still be live.')
+    if isinstance(result, (GuestEndRecovery, GuestLaunchRecovery)):
         return Pending('The Mac Linux guest end remains unproven')
     return result
 
@@ -1461,8 +1458,8 @@ def reconcile_unproven(episode: str, attempt: int) -> None:
 
 def _guest_recovery_ready(recovery: Settled | Pending | GuestEndRecovery | GuestLaunchRecovery | GuestLaunchUnrecorded) -> bool:
     if isinstance(recovery, GuestLaunchRecovery):
-        return not any(holder.can_arm() for holder in recovery.holders)
-    return isinstance(recovery, (GuestEndRecovery, GuestLaunchUnrecorded))
+        return not any(holder.may_be_live() for holder in recovery.holders)
+    return isinstance(recovery, GuestEndRecovery)
 
 
 def reconcile_guest_end(episode: str, attempt: int) -> None:
@@ -1473,18 +1470,14 @@ def reconcile_guest_end(episode: str, attempt: int) -> None:
         if isinstance(recovery, GuestEndRecovery):
             proof = prove_kept_guest_end(recovery.armed)
             detail = 'The guest confirmed the run ended'
-            claim: str | GuestClaimUnrecorded = recovery.claim
-        elif isinstance(recovery, (GuestLaunchRecovery, GuestLaunchUnrecorded)):
+        elif isinstance(recovery, GuestLaunchRecovery):
             if not _guest_recovery_ready(recovery):
                 return
             settings = read_settings(conf.read('build_targets'))
-            claim = GuestClaimUnrecorded()
-            if isinstance(recovery, GuestLaunchRecovery):
-                if (settings.ssh_hops, settings.guest_user) != (recovery.ssh_hops, recovery.guest_user):
-                    _warn_guest_reconcile(unit, 'The Mac Linux guest address changed for this attempt.')
-                    return
-                claim = recovery.claim
-                settings = replace(settings, checkout_identity=recovery.checkout)
+            if (settings.ssh_hops, settings.guest_user) != (recovery.ssh_hops, recovery.guest_user):
+                _warn_guest_reconcile(unit, 'The Mac Linux guest address changed for this attempt.')
+                return
+            settings = replace(settings, checkout_identity=recovery.checkout)
             proof = recover_guest_launch(settings, _placed_guest_attempt(recovery.key))
             detail = ('The guest refused the attempt before it armed' if isinstance(proof, GuestNotStartedProven)
                       else 'The guest ended the armed attempt')
@@ -1493,7 +1486,7 @@ def reconcile_guest_end(episode: str, attempt: int) -> None:
         if isinstance(proof, GuestEndPending):
             _warn_guest_reconcile(unit, proof.detail)
             return
-        _write_guest_end(recovery.key, claim, proof, detail)
+        _write_guest_end(recovery.key, recovery.claim, proof, detail)
     except Exception as error:
         _warn_guest_reconcile(unit, str(error) or type(error).__name__)
 
@@ -1512,14 +1505,35 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, status: int) -> None:
         request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
             execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
             placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
-        with conf.diagnostics(report=False):
-            timeout = conf.read('build_admission').number('query_timeout_seconds')
-        reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
-        settlement_pending = (isinstance(reply.state, placement.CurrentAssignment)
-                              and isinstance(reply.permission, placement.PermissionConsumed))
-        if (reply.assignment != assignment or reply.reason
-                or not (settlement_pending or isinstance(reply.state, placement.ClosedAssignment))):
-            raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
+        send_guest_end_report(request)
+    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
+        print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
+
+
+def send_guest_end_report(request: ExecutionReport) -> None:
+    from scripts.build_queue import admission_protocol as wire, placement
+
+    with conf.diagnostics(report=False):
+        timeout = conf.read('build_admission').number('query_timeout_seconds')
+    reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
+    settlement_pending = (isinstance(reply.state, placement.CurrentAssignment)
+                          and isinstance(reply.permission, placement.PermissionConsumed))
+    if (reply.assignment != request.assignment or reply.reason
+            or not (settlement_pending or isinstance(reply.state, placement.ClosedAssignment))):
+        raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
+
+
+def settle_guest_no_run(dispatch: GuestGateDispatch) -> None:
+    """Save proof and report a refusal for the consumed permission."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+    try:
+        detail = 'The guest confirmed the run ended' if dispatch.settled else 'The gate sent no arm request'
+        _append_guest_end(dispatch, GuestNotStartedProven(), detail)
+        request = wire.ExecutionReport(admission_client.request_id(), dispatch.assignment, dispatch.claim,
+            execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER),
+            placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+        send_guest_end_report(request)
     except (wire.AdmissionUnavailable, OSError, ValueError) as error:
         print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
 
@@ -2048,7 +2062,15 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
 
     dispatch: GuestGateDispatch | None = None
     launch: GuestLaunchRecovery | None = None
+    no_run_proven = False
     status = 1
+
+    def refused(reason: str) -> GuestNotStarted:
+        nonlocal no_run_proven
+        no_run_proven = (dispatch is not None and dispatch.started is None
+                         and (dispatch.settled or not dispatch.arm_requested))
+        return GuestNotStarted(reason, settlement_required=no_run_proven)
+
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
         # run_gate_suites always sends a list for a targeted run without --full, so this guard protects only a future caller.
@@ -2100,10 +2122,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         status = int(not run.passed)
         return run
     except mac_run.MacRunRefused as error:
-        return GuestNotStarted(str(error))
+        return refused(str(error))
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return GuestNotStarted(' '.join((str(error), *notes)))
+        return refused(' '.join((str(error), *notes)))
     except GuestEndUnproven as error:
         if dispatch is not None:
             try:
@@ -2116,17 +2138,17 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         notes = cast(list[str], getattr(error, '__notes__', []))
         detail = ' '.join((str(error), *notes))
         if dispatch is not None and not dispatch.arm_requested:
-            return GuestNotStarted(detail)
+            return refused(detail)
         return f'{TARGET}: {detail}'
     finally:
-        if dispatch is not None and dispatch.settled:
+        if no_run_proven:
+            assert dispatch is not None
+            settle_guest_no_run(dispatch)
+        elif dispatch is not None and dispatch.settled:
             settle_guest_dispatch(dispatch, status)
-        elif launch is not None:
+        if launch is not None and (no_run_proven or dispatch is None or not dispatch.settled):
             try:
-                if dispatch is not None and not dispatch.arm_requested:
-                    _append_guest_end(dispatch, GuestNotStartedProven(), 'The gate sent no arm request')
-                else:
-                    _release_guest_launch(launch)
+                _release_guest_launch(launch)
             except OSError as error:
                 print(f'Cannot save the Mac Linux guest end: {error}', file=sys.stderr, flush=True)
 
