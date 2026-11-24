@@ -181,11 +181,13 @@ OUTSIDE_UNIT_RULES = OutsideUnitRules()
 
 @dataclass(frozen=True)
 class RunPlace:
-    """The run placement holds its identity, first owner, start time, and unit."""
+    """Keep the first place of a live run."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    move_id: str = ""
+    repository: str = ""
     unit_place: UnitPlace | OutsideUnitRules = field(default=OUTSIDE_UNIT_RULES, kw_only=True)
 
 
