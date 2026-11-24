@@ -12,6 +12,7 @@ import unittest
 from typing import NamedTuple, final
 from unittest.mock import patch
 
+from scripts.buildlog import record as build_record
 from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
@@ -1131,6 +1132,7 @@ raise SystemExit(1)
         with patch.dict("os.environ", self.env):
             results = land_runs.last_results()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"batch: dropped — alpha phase 2 ({alpha[:12]})", result.stdout.splitlines())
         self.assertFalse(results[alpha]["landed"])
         self.assertEqual(results[alpha]["state"], "dropped")
         self.assertIn(RED_MODULE, results[alpha]["detail"])
@@ -1140,6 +1142,40 @@ raise SystemExit(1)
         notice, = (line for line in result.stdout.splitlines() if line.startswith("send alpha:"))
         self.assertIn(str(log), notice)
         self.assertIn(str(log), results[alpha]["detail"])
+
+    def test_failed_probe_log_save_rolls_back_the_batch(self) -> None:
+        start, _, _, rows = self.prepare_row_drop()
+        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])),
+              patch.object(build_record, "keep_log", side_effect=OSError("log write refused"))):
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("could not save the batch drop: log write refused", result.stdout)
+        self.assert_rolled_back(start)
+
+    def test_drop_stays_saved_until_the_result_is_written(self) -> None:
+        start, alpha, beta, rows = self.prepare_row_drop()
+        runs: list[RowDropRun] = []
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+            with patch.object(land_runs, "record_result", side_effect=OSError("result write refused")):
+                first = self.land_batch(rows)
+                self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+                self.assertIn("could not record the drop of alpha phase 2", first.stdout)
+                saved = self.batch_record().read_text()
+                self.assertIn(RED_MODULE, saved)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+                _ = self.git("reset", "--keep", start)
+                runs.clear()
+                held = self.land_batch(rows)
+                self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
+                self.assertEqual(self.batch_record().read_text(), saved)
+                self.assertEqual(runs, [])
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.batch_record().exists())
+        self.assertEqual(runs, [RowDropRun(False, False, True, False)])
+        _ = self.assert_landed(start, [beta])
+        with patch.dict("os.environ", self.env):
+            self.assertEqual(land_runs.last_results()[alpha]["state"], "dropped")
 
     def test_main_move_requires_survivor_retest(self) -> None:
         _, _, beta, rows = self.prepare_row_drop()

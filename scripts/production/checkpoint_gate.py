@@ -172,12 +172,31 @@ def red_names(command: Sequence[str], output: str) -> frozenset[str]:
     return frozenset(match[1] for match in GATE_RED.finditer(output) if match[2] != "0") - green
 
 
+def gate_command_words(command: Sequence[str]) -> Sequence[str]:
+    """Read the gate command after a leading env with assignments."""
+    if not command or Path(command[0]).name != "env":
+        return command
+    index = 1
+    while index < len(command) and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", command[index]):
+        index += 1
+    return command[index:]
+
+
 def batch_module_command(red: RedStep, checkout: Path, probe: Path) -> list[str] | None:
-    """Select the red modules without carrying options that can change the checkout or publish."""
+    """Select the red modules. Keep the environment and a checkout of dot."""
     command = red.step.command
-    program = parse_command_program(command, keep_path=True)
-    if (isinstance(program, OtherCommand) or Path(program[0]).name not in {"gate.py", "merge_gate.py"}
-            or not red.names or any(word not in {"--tests-only", "--affected", "--full"} for word in program[1])):
+    program = parse_command_program(gate_command_words(command), keep_path=True)
+    if isinstance(program, OtherCommand) or Path(program[0]).name not in {"gate.py", "merge_gate.py"} or not red.names:
+        return None
+    options = list(program[1])
+    checkout_option: list[str] = []
+    if "--checkout" in options:
+        index = options.index("--checkout")
+        checkout_option = options[index:index + 2]
+        if checkout_option != ["--checkout", "."]:
+            return None
+        del options[index:index + 2]
+    if any(word not in {"--tests-only", "--affected", "--full"} for word in options):
         return None
     for name in red.names:
         path = Path(name)
@@ -188,7 +207,8 @@ def batch_module_command(red: RedStep, checkout: Path, probe: Path) -> list[str]
     script = Path(program[0])
     if script.is_absolute() and script.is_relative_to(checkout):
         prefix[-1] = str(probe / script.relative_to(checkout))
-    return [*prefix, "--tests-only", *(word for name in sorted(red.names) for word in ("--module", name))]
+    return [*prefix, *checkout_option, "--tests-only",
+            *(word for name in sorted(red.names) for word in ("--module", name))]
 
 
 def batch_probe_reproduced(command: Sequence[str], output: str, modules: frozenset[str]) -> bool:
@@ -267,7 +287,7 @@ def stop_test_without_result(step: CheckpointTestStep, result: subprocess.Comple
         raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
     if (result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
-            and command_program(step.command) in GATE_SCRIPTS):
+            and command_program(gate_command_words(step.command)) in GATE_SCRIPTS):
         raise Stop("test", "blocked", f"{step.label} ended with gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
 

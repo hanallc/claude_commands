@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import admission_client, admission_records, first_step
+from scripts.build_queue import admission_client, admission_protocol, admission_records, first_step
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import write_process
@@ -21,7 +21,8 @@ from scripts.copies import copies
 from scripts.lib import build_folders, process_stat
 from scripts.lib.build_steps import gate_job_from_process
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import checkpoint_gate
+from scripts.production import checkpoint_gate, merge_checkpoint
+from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.production.production_doc import ProductionDocument
 
 
@@ -133,6 +134,46 @@ class CheckpointGateTests(unittest.TestCase):
 
 COMMAND = ["python3", "gate.py", "--tests-only"]
 RED_OUTPUT = "  FAIL [  0.1s] (1/1) check known_flake\n--- lib/test_infrastructure.py exit=1 ---\n"
+
+
+class BatchProbeAdmissionTests(GateSuitesFixture):
+    def test_configured_merge_commands_admit_the_named_probe(self) -> None:
+        # These are the forms in the builds, natedev, and sdlc production docs.
+        configured = (
+            "env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py",
+            "env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/gate.py",
+        )
+        install = Path(self.environment["HOME"]) / ".claude"
+        install.mkdir()
+        (install / "scripts").symlink_to(Path(__file__).resolve().parents[1], target_is_directory=True)
+        module = "hooks/test_first.py"
+        admission = self.admission.server
+        previous = admission.reply_filter
+        grants: list[admission_protocol.Admitted | admission_protocol.LocalPlacementGranted] = []
+
+        def observe(reply: admission_protocol.Reply) -> admission_protocol.Reply:
+            if isinstance(reply, (admission_protocol.Admitted, admission_protocol.LocalPlacementGranted)):
+                grants.append(reply)
+            return previous(reply)
+
+        with (mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(admission, "reply_filter", side_effect=observe)):
+            for prefix in configured:
+                with self.subTest(prefix=prefix):
+                    field = f"- **Merge tests:** `{prefix} --checkout . --tests-only`"
+                    command, = merge_checkpoint.parse_merge_tests([field], self.checkout)
+                    step = checkpoint_gate.CheckpointTestStep("merge test 1", list(command), self.checkout)
+                    red = checkpoint_gate.RedStep(step, frozenset({module}))
+                    probe = checkpoint_gate.batch_module_command(red, self.checkout, self.main)
+                    self.assertEqual(probe, [*command, "--module", module])
+                    assert probe is not None
+                    grants.clear()
+                    result = checkpoint_gate.run_test_command(probe, self.main)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(grants), 1)
+                    self.assert_gate_released()
+        self.assertEqual([event["module"] for event in self.module_events() if event["event"] == "start"],
+                         ["test_first.py", "test_first.py"])
 
 
 @final

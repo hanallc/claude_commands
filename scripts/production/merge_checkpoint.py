@@ -1963,6 +1963,7 @@ class BatchResumeRecord:
     merge_state: LegacyBatchMerge | NoBatchMerge | InFlightBatchMerge = NO_BATCH_MERGE
     retirement_attempted: bool = False
     drop: BatchDrop | None = None
+    drop_result_written: bool = False
 
     def checkpoint_rows(self) -> str:
         return "".join(f"{item.commit}\t{item.batch_argument_line}\n" for item in self.checkpoints)
@@ -2485,7 +2486,7 @@ def batch_resume_record(requests: tuple[MergeRequest, ...], upstream: str) -> Ge
         yield record
         returned = True
     finally:
-        if ((record.drop is None or returned) and not record.retirement_attempted
+        if ((record.drop is None or (returned and record.drop_result_written)) and not record.retirement_attempted
                 and not unpushed_checkpoint_sources(production, upstream)):
             if isinstance(record.merge_state, NoBatchMerge) or isinstance(
                     read_open_merge(merge_head_path(checkout)), NoOpenMerge):
@@ -2533,16 +2534,20 @@ def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
             owner = None
         if owner is None:
             return finish_batch_stop(red, red.notices, red.rollback)
+        save_failure_rollback: ResetBatchCheckout | KeepBatchCheckout = red.rollback
         try:
             kept = build_record.keep_log(red.log, build_store.host_name(), time.time(),
                                          f"batch-drop-{red.tested_tip}-{owner.commit}")
             drop = BatchDrop(owner.commit, tuple(sorted(red.modules)), red.tested_tip, red.main_tip,
                              red.rollback.start_tip, red.rollback.published_tip, str((build_store.root() / kept).resolve()))
+            # A failed write can leave the drop visible. Keep the batch for inspection.
+            save_failure_rollback = KEEP_BATCH_CHECKOUT
             resume_record.store(resume_record.merge_state, drop)
         except (OSError, ValueError) as error:
             stop = checkpoint_gate.Stop("batch", "held", f"could not save the batch drop: {error}",
                                         "the showrunner will inspect the batch record")
-            return finish_batch_stop(stop, batch_stop_notices(tuple(row.request for row in red.notices), stop))
+            return finish_batch_stop(stop, batch_stop_notices(tuple(row.request for row in red.notices), stop),
+                                     save_failure_rollback)
         if (stopped := apply_batch_drop(resume_record)) is not None:
             return stopped
         survivors = tuple(row.request for row in red.notices if row.request.commit != owner.commit)
@@ -2556,7 +2561,11 @@ def apply_batch_drop(record: BatchResumeRecord) -> int | None:
     owner = next(request for request in record.checkpoints if request.commit == drop.commit)
     production = owner.production
     detail = f"red modules {', '.join(drop.modules)} on {drop.tested_tip}. Test log: {drop.log}"
-    record_land(owner, landed=False, step="red", state="dropped", detail=detail)
+    if error := land_result_error(owner, landed=False, step="red", state="dropped", detail=detail):
+        checkpoint_gate.report("batch", "held", f"could not record the drop of {owner.unit.name} phase {owner.phase}: {error}")
+        return 1
+    record.drop_result_written = True
+    checkpoint_gate.report("batch", "dropped", f"{owner.unit.name} phase {owner.phase} ({owner.commit[:12]})")
     print(f"send {owner.unit.name}: phase {owner.phase} ({owner.commit[:12]}): {detail}. "
           + "Repair the red modules and send a new checkpoint", flush=True)
     active = record.active_checkpoints()
