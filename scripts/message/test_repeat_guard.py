@@ -34,6 +34,13 @@ def setUpModule() -> None:
     install_guard_test_budget()
 
 
+FIXTURE_LIMITS = guard.Limits(
+    window_seconds=1800, repeat_count=3, receiver_rate_count=100,
+    max_senders=4096, max_keys=256, preview_characters=240,
+    notice_timeout_seconds=15, drain_timeout_seconds=30, notice_max_age_seconds=86400,
+)
+
+
 # A time bound is this many times its limit, so gate load cannot fail it.
 DEADLINE_CEILING_FACTOR = 10
 
@@ -107,7 +114,8 @@ class RepeatGuardTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}))
         config = install_notice_test_config(self.home)
-        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        limits_path = self.limits_file(FIXTURE_LIMITS, name="default-limits.conf")
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config), "SEND_REPEAT_CONFIG": str(limits_path)}))
         limits = guard.configuration()
         if isinstance(limits, guard.GuardUnavailable):
             raise AssertionError(limits.reason)
@@ -175,7 +183,8 @@ class RepeatGuardTests(unittest.TestCase):
             return child
 
         errors = io.StringIO()
-        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}, clear=True),
+        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state"),
+                                      "SEND_REPEAT_CONFIG": os.environ["SEND_REPEAT_CONFIG"]}, clear=True),
               patch.object(guard, "Popen", slow_start), redirect_stderr(errors)):
             held = [guard.check(self.root, self.attempt(at=index)).held for index in range(3)]
         self.assertEqual(held, [False, False, True])
@@ -552,8 +561,8 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertFalse(self.root.exists())
 
-    def limits_file(self, limits: guard.Limits) -> Path:
-        path = self.home / "limits.conf"
+    def limits_file(self, limits: guard.Limits, *, name: str = "limits.conf") -> Path:
+        path = self.home / name
         values = cast(dict[str, int], asdict(limits))
         _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
         return path
@@ -950,6 +959,8 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
             _ = self.persist(self.attempt("other flood", at=at))
         clock = [0.0]
         completed: list[str] = []
+        limits = replace(self.limits, drain_timeout_seconds=90, notice_timeout_seconds=60)
+
         def deliver(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
             self.assert_notice(state, notice, limits)
             clock[0] += 60 if notice.text == "Morty: worker stopped" else 45
@@ -957,7 +968,9 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
                 completed.append(notice.text)
                 return "delivered"
             return "unknown"
-        with patch.object(time, "monotonic", side_effect=lambda: clock[0]):
+        with (patch.object(guard, "configuration", return_value=limits),
+              patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              patch.dict(os.environ, {"SEND_REPEAT_NOTICE_DEADLINE": "inf"})):
             guard.drain(self.root, deliver, 3, cleanup_seconds=20)
             self.assertEqual(completed, [])
             state = guard.decode(next(self.root.glob("*.json")).read_text())

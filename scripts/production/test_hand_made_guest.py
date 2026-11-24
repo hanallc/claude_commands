@@ -22,7 +22,7 @@ from scripts.lib import models_registry, nix_env
 from scripts.mac_test import eligibility
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
-from scripts.production import hand_made, hand_made_guest, hand_made_limit
+from scripts.production import gate, hand_made, hand_made_guest, hand_made_limit
 from scripts.production.hand_made_route import Machine
 from scripts.production.test_hand_made import (REGISTRY_TEXT, SCRIPT, YES, FakeLine, envelope, local_grant, no_envrc,
                                                remote, same_model)
@@ -92,8 +92,7 @@ class InjectedGuest:
         self.events.append("arm")
         return mac_linux.ArmedGuestAttempt(attempt, "0" * 32, "boot", 1, "fixture", "/fixture/checkout")
 
-    def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
-               _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
+    def stream(self, _settings: mac_linux.GuestSettings, _shell: str, _prefix: str, _send: mac_linux.BundleSend, *,
                count: bool, link: int) -> list[str]:
         del link
         self.events.append(f"run count={count}")
@@ -118,7 +117,11 @@ class InjectedGuest:
             self.events.append(f"attempt {attempt}")
             return arm(settings, attempt)
 
+        def fixture_runner_commit(repo: Path) -> str:
+            return gate.checked_git(repo, "rev-parse", "HEAD")
+
         with (mock.patch.object(mac_linux, "checkout_source", self.source),
+              mock.patch.object(mac_linux, "runner_commit", fixture_runner_commit),
               mock.patch.object(mac_linux, "guest_bundle", self.bundle),
               mock.patch.object(mac_linux, "bundle_refs", self.refs),
               mock.patch.object(mac_linux, "arm_guest", record_arm),

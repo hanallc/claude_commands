@@ -62,6 +62,8 @@ SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # Retry a failed session lookup before reporting an undelivered release notice.
 LOOKUP_TRIES = 3
 LOOKUP_RETRY_S = 1.0
+# One notice names at most this many stopped runs. Linux limits one argv string to 128 KiB.
+RELEASE_NOTICE_RUN_LIMIT = 500
 RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
                   "their memory gate orders them. No answer is needed.")
 
@@ -110,6 +112,11 @@ class ReleaseRecordReadError(ValueError):
 @dataclass(frozen=True)
 class NoCycle:
     pass
+
+
+@dataclass(frozen=True)
+class NoStaffRead:
+    """Status has not read the staff snapshot yet."""
 
 
 class CycleReleaseNotices(TypedDict):
@@ -163,6 +170,8 @@ class CycleNoticesToSend:
     cycle: HoldCycle
     entries: list[ReleaseEntry]
     unresolved_stops: int
+    # Queued notices arrive when their session returns. A release does not send them again.
+    queued: list[ReleaseEntry]
 
 
 class ReleaseNoticeReadError(ReleaseRecordReadError):
@@ -1435,10 +1444,10 @@ def release_entries(cycle: HoldCycle, recipients: Mapping[str, str],
 
 
 def release_notice_pending(entry: ReleaseEntry) -> bool:
+    """A queued notice arrives later. A gone Claude session has no route later; a Codex thread can open again."""
     delivery = entry["delivery"]
-    # An absent Claude session can skip a generic notice before the sender runs.
-    return (delivery in ("NotAttempted", "DeliveryFailed", "QueuedUnconfirmed", "WorkerClosed")
-            or (delivery == "RecipientGone" and ("run" in entry or entry["session_id"].startswith("codex:"))))
+    return (delivery in ("NotAttempted", "DeliveryFailed", "WorkerClosed")
+            or delivery == "RecipientGone" and entry["session_id"].startswith("codex:"))
 
 
 def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
@@ -1463,14 +1472,39 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
                 unresolved += 1
             case "not_stopped":
                 pass
-    entries = [entry for entry in release_entries(cycle, notices["recipients"], runs)
-               if release_notice_pending(entry)]
-    return CycleNoticesToSend(cycle, entries, unresolved)
+    entries = release_entries(cycle, notices["recipients"], runs)
+    return CycleNoticesToSend(cycle, [entry for entry in entries if release_notice_pending(entry)], unresolved,
+                              [entry for entry in entries if entry["delivery"] == "QueuedUnconfirmed"])
+
+
+def entry_name(entry: ReleaseEntry, recipients: Mapping[str, str], membership: staff.StaffSnapshot | None) -> str:
+    """Use the staff name when a staff row matches. Otherwise use the recorded name."""
+    run = entry.get("run")
+    if membership is not None:
+        row = (run_worker(entry, run, membership) if run is not None
+               else membership.by_member_reference(entry["session_id"].removeprefix("codex:")))
+        if row is not None:
+            return row.name
+    return entry["name"] if run is not None else recipients.get(entry["session_id"], entry["name"])
+
+
+def recipients_text(entries: Sequence[ReleaseEntry], recipients: Mapping[str, str],
+                    membership: staff.StaffSnapshot | None) -> str:
+    """Name each recipient session once, with the count of its stopped runs."""
+    sessions: dict[str, tuple[str, int]] = {}
+    for entry in entries:
+        name, runs = sessions.get(entry["session_id"]) or (entry_name(entry, recipients, membership), 0)
+        sessions[entry["session_id"]] = (name, runs + int("run" in entry))
+    return ", ".join(f"{name} ({runs} stopped run{'s' if runs > 1 else ''})" if runs else name
+                     for name, runs in sessions.values()) or "none"
 
 
 def pending_release_status_lines() -> list[str]:
     """Name unfinished notices without locking, migrating or changing release state."""
+    from scripts.production import staff
+
     lines: list[str] = []
+    membership: staff.StaffSnapshot | None | NoStaffRead = NoStaffRead()
     for path in pending_release_paths():
         try:
             intent = read_release_intent(path)
@@ -1478,10 +1512,17 @@ def pending_release_status_lines() -> list[str]:
                 continue
             pending = release_notices(intent)
             notices = intent["notices"]
-            unsent = (", ".join(entry["run"]["label"] if "run" in entry else notices["recipients"][entry["session_id"]]
-                               for entry in pending.entries) or "none"
-                      if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle"
-                      else "every session (broadcast)")
+            if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle":
+                if isinstance(membership, NoStaffRead):
+                    try:
+                        membership = staff.initial_snapshot()
+                    except staff.StaffUnreadable:
+                        membership = None
+                unsent = recipients_text(pending.entries, notices["recipients"], membership)
+                if pending.queued:
+                    unsent += "; queued: " + recipients_text(pending.queued, notices["recipients"], membership)
+            else:
+                unsent = "every session (broadcast)"
             if isinstance(pending, CycleNoticesToSend) and pending.unresolved_stops:
                 unsent += f". Pending stop confirmations: {pending.unresolved_stops}"
         except (OSError, ValueError) as error:
@@ -1826,12 +1867,13 @@ ReleaseNoticeResult = ReleaseDelivered | ReleaseQueued | ReleaseWorkerClosed | R
 
 def send_release(entry: ReleaseEntry, socket: str, notice: str) -> ReleaseNoticeResult:
     """Tell a recipient to start its builds; the memory gate orders them."""
-    return send_release_to(entry, f"uds:{socket}", notice)
+    return send_release_to([entry], f"uds:{socket}", notice)
 
 
-def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNoticeResult:
-    """Send the same release text to a session socket or a Codex thread."""
-    notice = f"{notice} Session {entry['session_id']}."
+def send_release_to(entries: Sequence[ReleaseEntry], address: str, notice: str) -> ReleaseNoticeResult:
+    """Send the same release text to a session socket or a Codex thread. Name each session of the entries once."""
+    sessions = list(dict.fromkeys(entry["session_id"] for entry in entries))
+    notice += f" Session {sessions[0]}." if len(sessions) == 1 else f" Sessions {', '.join(sessions)}."
     try:
         options = ("--skip-closed",) if address.startswith("codex:") else ()
         result = subprocess.run(session_send.send_argv("--to", address, "--text", notice, *options),
@@ -1852,42 +1894,114 @@ def send_release_to(entry: ReleaseEntry, address: str, notice: str) -> ReleaseNo
 def send_session_release(entry: ReleaseEntry, notice: str) -> ReleaseNoticeResult:
     session_id = entry["session_id"]
     if session_id.startswith("codex:"):
-        return send_release_to(entry, session_id, notice)
+        return send_release_to([entry], session_id, notice)
     recipient = socket_for(session_id)
     if isinstance(recipient, RecipientLive):
         return send_release(entry, recipient.socket, notice)
     return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
 
 
-def send_stopped_run_release(entry: ReleaseEntry, run: StoppedRun, notice: str,
-                             membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
-    from scripts.production import staff, worker_admission
+def run_worker(entry: ReleaseEntry, run: StoppedRun, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None:
+    if membership is None:
+        return None
+    return membership.by_member_reference(run["staff_id"] or entry["session_id"].removeprefix("codex:"))
 
-    worker = (membership.by_member_reference(run["staff_id"] or entry["session_id"].removeprefix("codex:"))
-              if membership is not None else None)
-    name = worker.name if worker is not None else entry["name"]
-    notice += f" Restart the stopped run {run['label']} for {name}."
-    notice += f" Run ID {run['id']}."
+
+def run_address(entry: ReleaseEntry, worker: staff.StaffRow | None, membership: staff.StaffSnapshot | None) -> str:
+    """Name the first address of a stopped run notice. A run without a staff row goes to its session."""
+    from scripts.production import staff
+
     if worker is None:
-        result = send_session_release(entry, notice)
-    elif worker.kind == "worker" and (
+        return entry["session_id"]
+    if worker.kind == "worker" and (
         entry["session_id"].startswith("codex:")
         or membership is not None and isinstance(membership.backends.get(worker.id), staff.CodexBackend)
     ):
-        result = send_release_to(entry, f"codex:{worker.current_session}", notice)
-    else:
-        result = send_release_to(entry, str(worker.id), notice)
-    if not isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
-        return result
+        return f"codex:{worker.current_session}"
+    return str(worker.id)
+
+
+def run_ids_text(runs: Sequence[StoppedRun]) -> str:
+    """Name each run ID once. Runs with the same label share it."""
+    ids: dict[str, list[str]] = {}
+    for run in runs:
+        ids.setdefault(run["label"], []).append(run["id"])
+    return "; ".join(f"{label} (Run ID{'s' if len(group) > 1 else ''} {', '.join(group)})"
+                     for label, group in ids.items())
+
+
+def stopped_runs_text(entries: Sequence[ReleaseEntry], membership: staff.StaffSnapshot | None) -> str:
+    """Name the stopped runs of the entries, grouped by the worker that owns them."""
+    owners: dict[str, list[StoppedRun]] = {}
+    for entry in entries:
+        run = entry.get("run")
+        assert run is not None
+        owners.setdefault(entry_name(entry, {}, membership), []).append(run)
+    if len(entries) == 1:
+        (name, (run,)), = owners.items()
+        return f" Restart the stopped run {run['label']} for {name}. Run ID {run['id']}."
+    if len(owners) == 1:
+        (name, runs), = owners.items()
+        return f" Restart the {len(entries)} stopped runs for {name}: {run_ids_text(runs)}."
+    return f" Restart the {len(entries)} stopped runs." + "".join(
+        f" For {name}: {run_ids_text(runs)}." for name, runs in owners.items())
+
+
+def notice_chunks(entries: Sequence[ReleaseEntry]) -> list[list[ReleaseEntry]]:
+    """Split the entries of one recipient so that each notice fits in one argv string."""
+    return [list(entries[start:start + RELEASE_NOTICE_RUN_LIMIT])
+            for start in range(0, len(entries), RELEASE_NOTICE_RUN_LIMIT)]
+
+
+def notice_batches(entries: Sequence[ReleaseEntry], membership: staff.StaffSnapshot | None) -> list[list[ReleaseEntry]]:
+    """Put the stopped runs with one route into one batch. Each session notice is a batch of its own."""
+    batches: list[list[ReleaseEntry]] = []
+    routes: dict[tuple[str, str, str], list[ReleaseEntry]] = {}
+    for entry in entries:
+        run = entry.get("run")
+        if run is None:
+            batches.append([entry])
+            continue
+        worker = run_worker(entry, run, membership)
+        # The director fallback reads the worker parent or the run director folder.
+        route = (str(worker.id) if worker is not None else "", run_address(entry, worker, membership),
+                 run["director_dir"])
+        if route not in routes:
+            routes[route] = []
+            batches.append(routes[route])
+        routes[route].append(entry)
+    return [chunk for batch in batches for chunk in notice_chunks(batch)]
+
+
+def send_stopped_runs_release(entries: Sequence[ReleaseEntry], notice: str,
+                              membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
+    """Send one notice for stopped runs with one route to the run owner. The first entry sets the route."""
+    entry = entries[0]
+    run = entry.get("run")
+    assert run is not None
+    worker = run_worker(entry, run, membership)
+    notice += stopped_runs_text(entries, membership)
+    if worker is None:
+        return send_session_release(entry, notice)
+    return send_release_to(entries, run_address(entry, worker, membership), notice)
+
+
+def run_director(entry: ReleaseEntry, membership: staff.StaffSnapshot | None) -> staff.StaffRow | None | ReleaseSendFailed:
+    """Find the director that takes a stopped run notice when the run owner is closed or gone."""
+    from scripts.production import staff, worker_admission
+
     if membership is None:
         return ReleaseSendFailed("staff membership is unavailable")
+    run = entry.get("run")
+    assert run is not None
+    worker = run_worker(entry, run, membership)
     director = membership.parent_of(worker) if worker is not None else None
     if director is None and run["director_dir"]:
         try:
             director = worker_admission.parent(membership, run=Path(run["director_dir"]))
         except (worker_admission.RunOwnerUnavailable, staff.StaffUnreadable) as error:
             return ReleaseSendFailed(str(error))
-    return result if director is None else send_release_to(entry, str(director.id), notice)
+    return director
 
 
 def send_release_broadcast(notice: str) -> None:
@@ -1908,9 +2022,10 @@ def cycle_status_lines(cycle: HoldCycle) -> list[str]:
 
 def not_reached_detail(cycle: HoldCycle) -> str:
     entries = release_entries(cycle, cycle["recipients"])
-    missing = [f"{entry['name']} (session gone)" for entry in entries
-               if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)]
-    pending = [entry["name"] for entry in entries if release_notice_pending(entry)]
+    # Name each session once, however many of its runs are listed.
+    missing = list({entry["session_id"]: f"{entry['name']} (session gone)" for entry in entries
+                    if entry["delivery"] == "RecipientGone" and not release_notice_pending(entry)}.values())
+    pending = list({entry["session_id"]: entry["name"] for entry in entries if release_notice_pending(entry)}.values())
     failed = " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
     if not pending:
         return failed
@@ -1950,37 +2065,72 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
     else:
         without_staff = {entry["session_id"] for entry in entries
                          if membership.by_member_reference(entry["session_id"].removeprefix("codex:")) is None}
-    for entry in entries:
+    notice = release_notice(cycle["holders"])
+    # A director takes one notice for the runs of all its closed or gone workers.
+    fallbacks: dict[str, list[ReleaseEntry]] = {}
+    for batch in notice_batches(entries, membership):
         if has_holder_file(holder_directory()):
-            break
+            return not_reached_detail(cycle)
+        save_attempt(cycle, batch)
+        run = "run" in batch[0]
+        result = (send_stopped_runs_release(batch, notice, membership) if run
+                  else send_session_release(batch[0], notice))
+        if run and isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
+            director = run_director(batch[0], membership)
+            if isinstance(director, ReleaseSendFailed):
+                result = director
+            elif director is not None:
+                # The entries stay NotAttempted until the director notice returns.
+                fallbacks.setdefault(str(director.id), []).extend(batch)
+                continue
+        save_outcome(cycle, batch, result, without_staff)
+    for address, group in fallbacks.items():
+        for chunk in notice_chunks(group):
+            if has_holder_file(holder_directory()):
+                return not_reached_detail(cycle)
+            save_attempt(cycle, chunk)
+            result = send_release_to(chunk, address, notice + stopped_runs_text(chunk, membership))
+            save_outcome(cycle, chunk, result, without_staff)
+    return not_reached_detail(cycle)
+
+
+def save_attempt(cycle: HoldCycle, batch: Sequence[ReleaseEntry]) -> None:
+    """Save the pending entries before a send. A stop before the outcome is saved may cause a harmless second notice."""
+    for entry in batch:
         if entry not in cycle["entries"]:
             cycle["entries"].append(entry)
         entry["delivery"] = "NotAttempted"
-        # Save the pending entry before sending, and the outcome only after return.
-        # A stop at any point between these saves may cause a harmless second notice.
-        save_cycle(cycle)
-        session_id = entry["session_id"]
-        codex = session_id.startswith("codex:")
-        notice = release_notice(cycle["holders"])
-        run = entry.get("run")
-        result = (send_session_release(entry, notice) if run is None
-                  else send_stopped_run_release(entry, run, notice, membership))
-        if isinstance(result, ReleaseDelivered):
-            entry["delivery"] = "Delivered"
-        elif isinstance(result, ReleaseQueued):
-            entry["delivery"] = "QueuedUnconfirmed"
-        elif isinstance(result, ReleaseWorkerClosed):
-            entry["delivery"] = "WorkerClosed" if run is None else "RecipientGone"
-        elif isinstance(result, RecipientGone):
-            entry["delivery"] = "RecipientGone"
-            if not release_notice_pending(entry) and session_id in without_staff:
-                _ = cycle["recipients"].pop(session_id, None)
-        else:
-            entry["delivery"] = "DeliveryFailed"
-            if run is not None or codex:
-                print(f"build_hold: release notice for {entry['session_id']}: {result.reason}", file=sys.stderr)
-        save_cycle(cycle)
-    return not_reached_detail(cycle)
+    save_cycle(cycle)
+
+
+def save_outcome(cycle: HoldCycle, batch: Sequence[ReleaseEntry], result: ReleaseNoticeResult,
+                 without_staff: set[str]) -> None:
+    """Save one send outcome on every entry of the batch, only after the send returns."""
+    session_id = batch[0]["session_id"]
+    run = "run" in batch[0]
+    delivery = release_delivery(result, run=run)
+    for entry in batch:
+        entry["delivery"] = delivery
+        if (isinstance(result, RecipientGone) and not release_notice_pending(entry)
+                and entry["session_id"] in without_staff):
+            _ = cycle["recipients"].pop(entry["session_id"], None)
+    if isinstance(result, ReleaseSendFailed) and (run or session_id.startswith("codex:")):
+        print(f"build_hold: release notice for {session_id}: {result.reason}", file=sys.stderr)
+    save_cycle(cycle)
+
+
+def release_delivery(result: ReleaseNoticeResult, *, run: bool) -> DeliveryOutcome:
+    match result:
+        case ReleaseDelivered():
+            return "Delivered"
+        case ReleaseQueued():
+            return "QueuedUnconfirmed"
+        case ReleaseWorkerClosed():
+            return "RecipientGone" if run else "WorkerClosed"
+        case RecipientGone():
+            return "RecipientGone"
+        case ReleaseSendFailed():
+            return "DeliveryFailed"
 
 
 def release_cycle(directory: Path, name: str, *, resume: bool = False,
