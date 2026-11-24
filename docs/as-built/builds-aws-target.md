@@ -1845,8 +1845,7 @@ Systemd removes the per-run runtime filesystem when the unit ends.
 
 ## Hana placement adapter
 
-Linux SSH placement submits one candidate.
-A recovery probe uses claim 1 without reading a capacity setting.
+Linux SSH targets read slot capacity for placement and recovery.
 
 Hana retains the configured SSH target family and uses signed control instead of an SSH connection.
 `target_config.read_execution_transport()` selects the transport before any connection settings or provider probes.

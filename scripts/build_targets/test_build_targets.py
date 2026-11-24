@@ -105,7 +105,7 @@ class FolderInvocationTests(NotificationGuardedTestCase):
             with self.assertRaises(ChildProcessError):
                 _ = real_waitpid(children[0], os.WNOHANG)
 
-    def test_linux_recovery_probes_only_claim_one(self) -> None:
+    def test_linux_recovery_passes_the_free_mirror_to_the_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory, open(os.devnull) as descriptor:
             root = Path(directory)
             args = build_targets.CliArguments()
@@ -117,7 +117,7 @@ class FolderInvocationTests(NotificationGuardedTestCase):
             repository = eligibility.KnownRepository("hana", "fixture/hana")
             config = eligibility.OffloadConfig(True,
                 eligibility.SshConnectionSettings("fixture-linux", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
-                1, 1, 1, "1", {"slots.hana": "3"})
+                1, 1, 1, "1", {"slots.hana": "2"})
             paths = claim_state.StatePaths(root, args.target, platform="linux")
             with (mock.patch.object(target_config, "configured_ssh_target", return_value=target),
                   mock.patch.object(build_targets, "ssh_target_config", return_value=config),
@@ -126,14 +126,14 @@ class FolderInvocationTests(NotificationGuardedTestCase):
                   mock.patch.object(mac_test, "free_now", return_value="bad"),
                   mock.patch.object(offload, "holder_session", return_value="fixture"),
                   mock.patch.object(offload, "request_mirror") as request_mirror,
-                  mock.patch.object(copies, "remote_lease", return_value=nullcontext()) as lease,
+                  mock.patch.object(copies, "remote_lease", side_effect=(
+                      copies.BusyRemoteMirror("mirror 1 is held"), nullcontext())) as lease,
                   mock.patch.object(offload, "claim_for_run", return_value=None) as claim):
                 self.assertEqual(build_targets.command_recover_probe(args), 0)
-            request_mirror.assert_called_once()
-            request = cast(offload.OffloadRequest, request_mirror.call_args.args[1])
-            self.assertEqual(request.slot, 1)
-            lease.assert_called_once()
-            claim.assert_called_once_with(mock.ANY, config, request, repository, (1,),
+            requests = [cast(offload.OffloadRequest, call.args[1]) for call in request_mirror.call_args_list]
+            self.assertEqual([request.slot for request in requests], [1, 2])
+            self.assertEqual(lease.call_count, 2)
+            claim.assert_called_once_with(mock.ANY, config, requests[0], repository, (2,),
                                           mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY)
 
     def test_verify_commands_open_each_config_once(self) -> None:
@@ -938,23 +938,25 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(sweep.call_count, 1)
         return output.getvalue(), errors.getvalue()
 
-    def test_linux_candidate_uses_one_claim_without_reading_capacity(self) -> None:
+    def test_linux_candidates_use_the_repository_slot_capacity(self) -> None:
         settings = self.root / "linux.conf"
         _ = settings.write_text("host=fixture-linux\nkinds=check\nslots=4\nslots.hana=3\n")
         target = target_config.SshTarget("linux", "linux", settings)
         scope = claim_state.RepositoryScope("hana", "fixture/hana")
         paths = claim_state.StatePaths(self.root, "linux", platform="linux")
         with (mock.patch.object(claim_state, "state_paths", return_value=paths),
-              mock.patch.object(claim_state, "target_claim_scope", return_value=scope),
-              mock.patch.object(target_config, "slot_capacity",
-                                side_effect=AssertionError("Linux placement read capacity"))):
-            candidate, = build_targets.fixed_remote_candidates(
+              mock.patch.object(claim_state, "target_claim_scope", return_value=scope)):
+            candidates = build_targets.fixed_remote_candidates(
                 target, build_targets.CONFIGURED_PROVIDER_SETTINGS, eligibility.KnownRepository("hana", scope.key),
                 self.root, "portable", "check", ("cargo", "check"), build_targets.AnyTarget(),
                 selection=Pinned(target.name))
-        self.assertEqual(candidate.destination, placement.PlacementDestination(
-            "ssh", "linux", "fixture-linux", claim_state.RepositoryScope(scope.name, scope.key, 1), 1))
-        self.assertIsInstance(candidate.eligibility, placement.AllowedHost)
+        self.assertEqual([candidate.destination for candidate in candidates], [
+            placement.PlacementDestination(
+                "ssh", "linux", "fixture-linux", claim_state.RepositoryScope(scope.name, scope.key, slot), slot)
+            for slot in (1, 2, 3)
+        ])
+        for candidate in candidates:
+            self.assertIsInstance(candidate.eligibility, placement.AllowedHost)
 
     def test_floor_sweep_admits_the_mac_after_a_disk_exclusion(self) -> None:
         for background in (False, True):
