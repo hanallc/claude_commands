@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 from scripts.lib import conf
 from scripts.lib.checkout_test_support import runtime_files
+from scripts.lib.fixture_test_support import FIXTURE_OWNER as FIXTURE_OWNER
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -25,8 +26,6 @@ VERIFY_TEST_ENVIRONMENT = frozenset({
     # Keep the test runner's Python process settings in fixture subprocesses.
     "PYTHON_CPU_COUNT", "PYTHONDONTWRITEBYTECODE",
 })
-# Every fixture says who started its queue requests, so the queue never refuses a test run.
-FIXTURE_OWNER = "test fixture"
 
 
 def verify_test_environment() -> dict[str, str]:
