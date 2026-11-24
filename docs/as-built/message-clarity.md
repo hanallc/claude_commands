@@ -377,7 +377,7 @@ New escalate holds retain their registered template and values.
   Silence keeps only the newest push and delivers it when silence ends.
   The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
-  A run that never reaches merge_gate.py sends no push unless the timer script sends one.
+  A run that never reaches gate.py sends no push unless the timer script sends one.
 - `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.
   Title: `{sender}: {session} {noun} refused`. The first body line is `Session: {session}`.
   Action: `On {machine}, in the {session} pane, type: Go: run the refused {noun}`.

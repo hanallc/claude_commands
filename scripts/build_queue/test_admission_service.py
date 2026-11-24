@@ -10257,7 +10257,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
         for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
             with self.subTest(name=name):
                 self.assertEqual(name in service.ADMISSION_CALLERS, expected)
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "production/gate.py", "build_queue/admission_client.py",
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/gate.py", "build_queue/admission_client.py",
                          "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()

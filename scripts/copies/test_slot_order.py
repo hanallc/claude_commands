@@ -437,7 +437,7 @@ class SlotOrderTests(unittest.TestCase):
         gate = str(self.source / "gate.py")
         for command, expected in (
             ((sys.executable, gate, "--affected", "--full"), "test-affected"),
-            ((sys.executable, str(self.source / "targeted_test.py")), "test-affected"),
+            ((sys.executable, gate, "--affected"), "test-affected"),
             ((sys.executable, "-X", "--affected", gate, "--tests-only"), "gate"),
         ):
             with self.subTest(command=command):

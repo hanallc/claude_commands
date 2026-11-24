@@ -47,7 +47,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
+    GATE_SCRIPTS,
     OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
     parse_command_program, read_step_names, verify_command,
 )
@@ -2651,7 +2651,7 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     program = parse_command_program(command)
-    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
+    if not isinstance(program, OtherCommand) and program[0] in GATE_SCRIPTS:
         arguments = program[1]
         if "-h" not in arguments and "--help" not in arguments:
             error = first_step.gate_module_mode_error(

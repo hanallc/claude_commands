@@ -18,9 +18,9 @@ from typing import TypedDict, cast
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.hooks.tool_call_text import scan_text
 
-from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
+from scripts.lib.suite_runners import SUITE_MODULE, SUITE_RUNNERS, starts_suite_runner
 
-CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
+CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", SUITE_MODULE, *SUITE_RUNNERS})) + r")\b")
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
 PREFIX_ARGUMENTS = frozenset({"-u", "--unset", "--user", "-g", "--group", "-n", "--adjustment",
@@ -86,7 +86,9 @@ def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
             if option == "--":
                 arguments = arguments[1:]
                 break
-            if option.startswith(("-c", "-m")):
+            if option.startswith("-m"):
+                return starts_suite_runner(arguments)
+            if option.startswith("-c"):
                 return False
             arguments = arguments[2:] if option in {"-W", "-X", "--check-hash-based-pycs"} else arguments[1:]
         return starts_suite_runner(arguments)

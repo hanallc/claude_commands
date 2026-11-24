@@ -218,7 +218,7 @@ unittest.TextTestRunner().run(case)
         home = self.root / "installed-home"
         production = home / ".claude/scripts/production"
         production.mkdir(parents=True)
-        for name, expected in (("gate.py", True), ("merge_gate.py", True), ("targeted_test.py", True),
+        for name, expected in (("gate.py", True), ("merge_gate.py", False), ("targeted_test.py", False),
                                ("merge_checkpoint.py", True), ("other_tool.py", False)):
             entry = production / name
             _ = entry.write_text("import sys\nsys.stdin.read()\n")
