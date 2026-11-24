@@ -15,6 +15,9 @@
 // Use --build-tools as the third argument for the Build tools proof.
 // Use --queue-rows to capture the dark queue card and its tooltips. The fourth argument selects the older page.
 // Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
+// Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
+// Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
+// Add --awscosts as the fourth argument for the AWS costs proof and images.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -50,7 +53,12 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
 const gateMode = args[0] === '--gate';
 if (gateMode) args.shift();
-const [callerFolder, previousPage, comparison] = args;
+const [callerFolder, ...comparisonArgs] = args;
+const awsCostShots = !gateMode && comparisonArgs[0] === '--aws-cost-shots';
+const liveAwsCostSource = awsCostShots ? comparisonArgs[1] : undefined;
+const approvedAwsCostShot = awsCostShots && !liveAwsCostSource;
+const [previousPage, comparison] = awsCostShots ? [] : comparisonArgs;
+const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
@@ -224,11 +232,11 @@ async function assertRowCenters(evaluate) {
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+  const fixtureOutput = liveAwsCostSource ? '' : execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture()))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
-  const page = await readFile(join(folder, 'memory_live.html'));
+  const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
+  const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
   const beforePath = queueRowsProof || standingProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
@@ -244,46 +252,98 @@ try {
   const waitTipComparison = comparison === '--wait-tip';
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
-  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
-  const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
-  const liveShot = queueRowsProof && !beforePage;
-  const fixtureTime = liveShot ? Math.floor(Date.now() / 1000) : readings.good.read_at;
-  for (const reading of Object.values(readings)) {
-    const shift = fixtureTime - reading.read_at;
-    for (const row of reading.walk) {
-      if (row.started_at) row.started_at += shift;
-      if (row.read_at) row.read_at += shift;
-      for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
-    }
-    for (const waiter of reading.waiters) waiter.since += shift;
-    if (liveShot) reading.fresh_until += shift;
-    reading.read_at = fixtureTime;
-  }
+  const awsCostsComparison = comparison === '--awscosts';
+  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || requestedShot);
+  const readings = liveAwsCostSource
+    ? {good: JSON.parse(await readFile(join(liveAwsCostSource, 'memory.json'), 'utf8'))}
+    : JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const base = readings.good;
-  base.waiters = structuredClone(readings.spacing.waiters);
-  base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'handler';
-  base.walk.find(row => row.queued).showrunner = 'sdlc';
-  const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
-    category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
-  const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
-    'outside', {owner_count:1}));
-  const smaller = swapOwners.slice(base.swap_rows);
-  const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
-  const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
-  base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
-    reserve_share_percent:50};
-  base.swap_by = [...swapOwners.slice(0,base.swap_rows),
-    swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
-      {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
-    swapRow('Unclassified groups', 'ungrouped', 1024),
-    swapRow('Not attributed', 'unattributed', 7),
-    swapRow('All swap used', 'total', swapUsed, 'all')];
-  readings.shrink = structuredClone(base);
-  const extra = structuredClone(base.walk.find(row => row.queued));
-  extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
-  readings.shrink.walk.unshift(extra);
-  readings.shrink.waiters = [];
+  const queueShot = queueRowsProof && !beforePage;
+  const fixtureTime = approvedAwsCostShot ? Date.parse('2026-11-23T20:00:00Z') / 1000
+    : queueShot ? Math.floor(Date.now() / 1000) : base.read_at;
+  const clockTime = liveAwsCostSource ? Date.now() : fixtureTime * 1000;
+  if (liveAwsCostSource) {
+    base.report = JSON.parse(await readFile(join(liveAwsCostSource, 'report.json'), 'utf8'));
+  } else {
+    await prepareFixtures();
+  }
+
+  async function prepareFixtures() {
+    const costs = JSON.parse(await readFile(join(folder, 'aws_cost_fixture.json'), 'utf8'));
+    if (approvedAwsCostShot) prepareApprovedAwsCosts(costs);
+    readings.aws_costs = {...structuredClone(readings.good), report_version:'aws-cost-proof',
+      report:{...readings.good.report, aws_costs:costs}};
+    for (const reading of Object.values(readings)) {
+      const shift = fixtureTime - reading.read_at;
+      for (const row of reading.walk) {
+        if (row.started_at) row.started_at += shift;
+        if (row.read_at) row.read_at += shift;
+        for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
+      }
+      for (const waiter of reading.waiters) waiter.since += shift;
+      if (queueShot) reading.fresh_until += shift;
+      reading.read_at = fixtureTime;
+    }
+    base.waiters = structuredClone(readings.spacing.waiters);
+    base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
+    base.walk.find(row => row.queued).unit = 'handler';
+    base.walk.find(row => row.queued).showrunner = 'sdlc';
+    const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
+      category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
+    const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
+      'outside', {owner_count:1}));
+    const smaller = swapOwners.slice(base.swap_rows);
+    const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
+    const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
+    base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
+      reserve_share_percent:50};
+    base.swap_by = [...swapOwners.slice(0,base.swap_rows),
+      swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
+        {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
+      swapRow('Unclassified groups', 'ungrouped', 1024),
+      swapRow('Not attributed', 'unattributed', 7),
+      swapRow('All swap used', 'total', swapUsed, 'all')];
+    readings.shrink = structuredClone(base);
+    const extra = structuredClone(base.walk.find(row => row.queued));
+    extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
+    readings.shrink.walk.unshift(extra);
+    readings.shrink.waiters = [];
+  }
+  function prepareApprovedAwsCosts(costs) {
+    Object.assign(costs, {zone:'America/Los_Angeles', today:'2026-11-23', price_day:'2026-11-18',
+      read_at:Date.parse('2026-11-19T18:43:00Z') / 1000,
+      next_read_at:Date.parse('2026-11-20T18:43:00Z') / 1000, read_error:'AWS refuses the key'});
+    const daysWithoutRuns = [23,22,21,20].map(day => {
+      const amount = day === 20 ? '2.00' : '0.94';
+      return {day:'2026-11-' + day, state:'estimate', amount_usd:amount, runs:0, jobs:[], hana:null,
+        units:[], unrecorded_compute_usd:'0.00', no_run_usd:amount, runs_list:[]};
+    });
+    const [nov19, nov18] = costs.days;
+    Object.assign(nov18, {state:'billed', amount_usd:'7.73'});
+    Object.assign(nov19, {amount_usd:'5.53', runs:194, no_run_usd:'1.71'});
+    Object.assign(nov19.hana, {cost_usd:'0.70', idle_usd:'0.69', idle_seconds:8572});
+    const attempts = nov19.runs_list.filter(run => run.kind === 'hana');
+    const gates = nov19.runs_list.filter(run => run.kind === 'gate');
+    gates.push({...gates.at(-1), id:'fixture-extra'});
+    function setGroup(runs, job, cents) {
+      const share = Math.floor(cents / runs.length), extra = cents % runs.length;
+      runs.forEach((run, index) => {
+        run.job = job;
+        run.cost_usd = ((share + Number(index < extra)) / 100).toFixed(2);
+      });
+    }
+    setGroup(gates.slice(0,66), 'test affected', 107);
+    setGroup(gates.slice(66), 'test all', 205);
+    setGroup(attempts, null, 1);
+    attempts.forEach((run, index) => Object.assign(run, {
+      seconds:[0,0,0,44,47,41,50][index], region:'us-east-2', machine:'m7a.4xlarge',
+    }));
+    nov19.runs_list = [...gates, ...attempts];
+    for (const day of costs.days) {
+      for (const run of day.runs_list) run.unit = null;
+    }
+    costs.days.unshift(...daysWithoutRuns);
+  }
   function pngPixels(buffer) {
     let width, height, channels;
     const chunks = [];
@@ -389,7 +449,7 @@ try {
       reading = {...reading, move_line, waiters:reading.waiters.map(row =>
         row.move ? {...row, place:places.get(row.move.row_id)} : row)};
     }
-    res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(base.report)
+    res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(awsCostShots ? servedReading.report : base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
   });
   try {
@@ -469,7 +529,7 @@ try {
         await call('Emulation.setScrollbarsHidden', {hidden:true});
         await call('Page.addScriptToEvaluateOnNewDocument', {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
-            + 'Date.now = () => ' + fixtureTime * 1000 + ';'});
+            + 'Date.now = () => ' + clockTime + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
         const navigate = async path => {
@@ -494,6 +554,14 @@ try {
           fitLabels();
           })()`);
         };
+        if (awsCostShots) {
+          servedReading = liveAwsCostSource ? base : readings.aws_costs;
+          await navigate('memory_live.html');
+          const shots = approvedAwsCostShot ? await captureApprovedAwsCosts(evaluate, call)
+            : await captureAwsCosts(evaluate, call, base.report.aws_costs.today);
+          console.log(JSON.stringify({shots,output:folder}));
+          break browserProof;
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
@@ -1175,6 +1243,250 @@ try {
         }
       }
 
+      async function captureApprovedAwsCosts(evaluate, call) {
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1400,deviceScaleFactor:1,mobile:false});
+        const shown = await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          const row = date => pane.querySelector('tr[data-period="day-' + date + '"]');
+          row('2026-11-23').querySelector('button').click();
+          row('2026-11-19').querySelector('button').click();
+          const detail = pane.querySelector('[data-aws-day="2026-11-19"]');
+          const hana = [...detail.querySelectorAll('[data-aws-group] button')]
+            .find(button => button.textContent.trim() === 'Hana check and lint');
+          hana.click();
+          const box = pane.getBoundingClientRect();
+          return {text:pane.innerText, counts:[23,22,21].map(day =>
+            [...row('2026-11-' + day).cells].slice(1,3).map(cell => cell.textContent.trim())),
+            fits:[...pane.querySelectorAll('.aws-scroll')].every(box => box.scrollWidth <= box.clientWidth + 1),
+            clip:{x:0,y:Math.floor(box.top+scrollY)-16,width:innerWidth,height:Math.ceil(box.height)+32,scale:1}};
+        })()`);
+        assert.match(shown.text, /In Pacific time, a day starts at 4:00 PM/);
+        assert.match(shown.text, /No AWS read since Nov 19: AWS refuses the key/);
+        assert.deepEqual(shown.counts, Array.from({length:3}, () => ['0','~$0.94']));
+        assert.match(shown.text, /Hana machine with no run[^\n]*\s+2 h 22 min 52 s/);
+        assert.ok(shown.fits, 'The AWS tables fit inside the pane.');
+        const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
+        const name = 'awscosts-main-dark.png';
+        await writeFile(join(folder,name), Buffer.from(shot.data,'base64'));
+        return [name];
+      }
+
+      async function captureAwsCosts(evaluate, call, liveDay = null) {
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1400,deviceScaleFactor:1,mobile:false});
+        const capture = async name => {
+          const clip = await evaluate(`(() => {
+            const r = document.querySelector('#aws-costs').getBoundingClientRect();
+            return {x:r.left+scrollX, y:r.top+scrollY, width:r.width, height:r.height, scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
+        };
+        if (liveDay) {
+          const result = await evaluate(`(() => {
+            const pane = document.querySelector('#aws-costs');
+            const detail = pane.querySelector('[data-aws-day="' + ${JSON.stringify(liveDay)} + '"]');
+            const day = awsCostReport.days.find(day => day.day === detail.dataset.awsDay);
+            const dayCents = awsCents(day.amount_usd);
+            const select = group => detail.querySelector('[data-aws-group-by="' + group + '"]').click();
+            const tableTotal = group => {
+              select(group);
+              const rows = [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')];
+              const total = rows.pop();
+              const cents = row => awsCents(row.cells[3].textContent.replace(/[~$,]/g, ''));
+              const sum = rows.reduce((amount, row) => amount + cents(row), 0);
+              return {sum, displayed:cents(total)};
+            };
+            const totals = Object.fromEntries(['region', 'machine', 'job'].map(group => [group, tableTotal(group)]));
+            const hana = [...detail.querySelectorAll('tr[data-aws-group] button')]
+              .find(button => button.textContent.trim() === 'Hana check and lint');
+            const hanaCells = hana.closest('tr').cells;
+            const groupTime = hanaCells[2].textContent;
+            const hanaRuns = day.runs_list.filter(run => run.kind === 'hana');
+            const expectedGroupTime = hanaRuns.length
+              ? awsRunTime(hanaRuns.reduce((total, run) => total + run.seconds, 0)) : '—';
+            const perRun = hanaCells[4].textContent;
+            const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
+            hana.click();
+            const expanded = detail.querySelector('.aws-group-detail');
+            const rows = [...expanded.querySelectorAll('.aws-run-scroll > table > tbody > tr')];
+            const idle = rows.filter(row => row.cells[0].textContent === 'Hana machine with no run');
+            const csv = awsRunsCsv(awsCostReport.days).split('\\r\\n');
+            const ids = awsCostReport.days.flatMap(day => day.runs_list.map(run => run.id));
+            pane.scrollIntoView({block:'start'});
+            return {group:hana.textContent.trim(), runs:rows.length - idle.length, expectedRuns:day.hana.runs,
+              groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[row.cells.length - 2].textContent),
+              expectedIdleTime:day.hana.idle_seconds == null ? '—' : awsRunTime(day.hana.idle_seconds),
+              idleRows:idle.length, expectedIdleRows:Number(awsCents(day.hana.idle_usd) !== 0), dayCents, totals,
+              csvHeader:csv[0], csvRows:csv.length - 2,
+              recordedRuns:new Set(ids).size, hasRunIds:ids.every(Boolean),
+              fits:[...pane.querySelectorAll('.aws-scroll')].every(box => box.scrollWidth <= box.clientWidth + 1)};
+          })()`);
+          const reconciled = Object.values(result.totals).every(({sum, displayed}) =>
+            sum === result.dayCents && displayed === result.dayCents);
+          if (!reconciled || !result.fits || result.runs !== result.expectedRuns || result.idleRows !== result.expectedIdleRows ||
+              result.groupTime !== result.expectedGroupTime || result.idleTimes.some(time => time !== result.expectedIdleTime) ||
+              !result.hasRunIds || result.csvRows !== result.recordedRuns) {
+            throw new Error('The live Day image or CSV is incomplete. ' + JSON.stringify(result));
+          }
+          const name = 'aws-cost-day-live-dark-6';
+          await capture(name);
+          console.log(JSON.stringify({day:liveDay, ...result}));
+          const historical = await evaluate(`(() => {
+            const current = ${JSON.stringify(liveDay)};
+            const day = '2026-11-07';
+            const periodButton = date => document.querySelector('tr[data-period="day-' + date + '"] button');
+            periodButton(current).click();
+            if (!periodButton(day)) document.querySelector('#aws-older').click();
+            periodButton(day).click();
+            const detail = document.querySelector('[data-aws-day="' + day + '"]');
+            return [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')].map(row =>
+              [row.cells[0].textContent.trim(), row.cells[3].textContent]);
+          })()`);
+          const historicalName = 'aws-cost-nov7-dark';
+          await capture(historicalName);
+          console.log(JSON.stringify({day:'2026-11-07', charges:historical}));
+          return [name + '.png', historicalName + '.png'];
+        }
+        await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          pane.scrollIntoView({block:'start'});
+          const date = pane.querySelector('[data-tip="aws-cost:day-2026-11-16"]');
+          const bounds = date.getBoundingClientRect();
+          showTip(date.dataset.tip, bounds.right, bounds.top);
+          const tip = document.querySelector('#tip');
+          showTip(date.dataset.tip, bounds.right + 22 + tip.offsetWidth / 2, bounds.bottom + tip.offsetHeight);
+        })()`);
+        await capture('aws-cost-day-dark');
+        await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          pane.querySelector('[data-aws-view="month"]').click();
+          pane.querySelector('tr[data-period^="week-"] button').click();
+          pane.querySelector('[data-tip="aws-cost:day-2026-11-17"]').click();
+        })()`);
+        await capture('aws-cost-month-open-dark');
+        return ['aws-cost-day-dark.png', 'aws-cost-month-open-dark.png'];
+      }
+
+      async function checkAwsCosts(evaluate, drillDown) {
+        const summary = await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          const lines = [...pane.querySelectorAll('.aws-total-value')].map(tile => tile.textContent.trim());
+          const body = pane.innerText.replace(/\\s+/g, ' ');
+          return {lines, body, fits:pane.scrollWidth <= pane.clientWidth,
+            days:pane.querySelectorAll('tr[data-period]').length, open:pane.querySelector('.aws-toggle').getAttribute('aria-expanded')};
+        })()`);
+        assert.deepEqual(summary.lines, ['~$5.25 of $35.00 limit','~$9.03','~$104.47 of $400.00 limit']);
+        assert.equal(summary.days,14);
+        assert.equal(summary.open,'true');
+        assert.ok(summary.fits, 'The AWS history scrolls inside the pane.');
+        assert.match(summary.body, /AWS amounts read Wed Nov 18, 1:43 PM EST/);
+        assert.match(summary.body, /Thu Nov 19 · started Wed 7:00 PM EST · ends Thu 7:00 PM EST/);
+        assert.match(summary.body, /In Eastern time, a day starts at 7:00 PM on the day before and ends at 7:00 PM\./);
+        assert.match(summary.body, /The next AWS read is due Thu Nov 19, 12:43 PM EST/);
+        assert.match(summary.body, /Group by.*Download CSV.*Hana check and lint.*Costs with no run.*Total 193/);
+        assert.match(summary.body, /Kept resources now cost \$28.20 each month/);
+        assert.doesNotMatch(summary.body, /\bgate\b|targeted test/i);
+        if (!drillDown) return;
+        const result = await evaluate(`(async () => {
+          const pane = document.querySelector('#aws-costs');
+          const select = view => pane.querySelector('[data-aws-view="' + view + '"]').click();
+          const content = pane.querySelector('.aws-rule');
+          renderReport(structuredClone(latest.report));
+          const sameContent = content === pane.querySelector('.aws-rule');
+          const row = id => pane.querySelector('tr[data-period="' + id + '"]');
+          const open = id => row(id).querySelector('button').click();
+          const fields = key => {
+            const trigger = pane.querySelector('[data-tip="aws-cost:' + key + '"]');
+            const box = trigger.getBoundingClientRect();
+            showTip(trigger.dataset.tip, box.left, box.bottom);
+            return [...document.querySelectorAll('#tip dl.tip dt')].map(term => [term.textContent, term.nextElementSibling.textContent]);
+          };
+          const dayLimit = fields('day-limit');
+          const monthLimit = fields('month-limit');
+          const dayTip = fields('day-2026-11-19');
+          hideTip();
+          pane.querySelector('#aws-older').click();
+          const count = pane.querySelectorAll('tr[data-period]').length;
+          const missing = row('day-2026-11-03').cells[2].textContent.trim();
+          const zero = [row('day-2026-11-02').cells[2], row('day-2026-11-02').cells[4]].map(cell => cell.textContent.trim());
+          pane.querySelector('#aws-older').click();
+          const detail = pane.querySelector('[data-aws-day="2026-11-19"]');
+          const groupBy = group => detail.querySelector('[data-aws-group-by="' + group + '"]').click();
+          const groupButton = label => [...detail.querySelectorAll('tr[data-aws-group] button')]
+            .find(button => button.textContent.trim() === label);
+          groupButton('integrate').click();
+          const runCount = detail.querySelectorAll('.aws-group-detail tbody tr').length;
+          const runFields = [...detail.querySelector('.aws-group-detail tbody tr').cells].slice(1).map(cell => cell.textContent);
+          groupButton('integrate').click();
+          groupButton('Hana check and lint').click();
+          const hanaCells = groupButton('Hana check and lint').closest('tr').cells;
+          const hanaTime = hanaCells[2].textContent;
+          const hanaPerRun = hanaCells[4].textContent;
+          const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
+          const hanaDetails = [...detail.querySelectorAll('.aws-group-detail tbody tr')].map(row => row.cells[7].textContent);
+          const groupNames = () => [...detail.querySelectorAll('tr[data-aws-group] button')].map(button => button.textContent.trim());
+          const idleCharge = () => [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')]
+            .find(row => row.cells[0].textContent === 'Hana machine with no run').cells[2].textContent;
+          groupBy('region');
+          const regions = groupNames();
+          const idleTimes = [idleCharge()];
+          groupBy('machine');
+          const machines = groupNames();
+          idleTimes.push(idleCharge());
+          groupBy('unit');
+          const units = groupNames();
+          idleTimes.push(idleCharge());
+          groupBy('none');
+          const rawRows = detail.querySelectorAll('.aws-run-scroll tbody tr').length;
+          groupBy('job');
+          open('day-2026-11-19');
+          select('week');
+          const week = [...row('week-2026-11-16').cells].slice(1,3).map(cell => cell.textContent);
+          select('month');
+          const month = [...row('month-2026-11-01').cells].slice(1,3).map(cell => cell.textContent);
+          open('week-2026-11-16');
+          open('day-2026-11-17');
+          const billed = pane.querySelector('.aws-day-detail').innerText.replace(/\\s+/g, ' ');
+          select('year');
+          const year = [...row('year-2026-01-01').cells].slice(1,3).map(cell => cell.textContent);
+          select('day');
+          const savedDay = row('day-2026-11-19').querySelector('button').getAttribute('aria-expanded');
+          select('month');
+          const savedMonthDay = row('day-2026-11-17').querySelector('button').getAttribute('aria-expanded');
+          select('day');
+          open('day-2026-11-19');
+          return {sameContent,dayLimit,monthLimit,dayTip,count,missing,zero,runCount,runFields,hanaTime,hanaPerRun,hanaDetails,
+            totalTime,regions,machines,units,idleTimes,rawRows,week,month,year,billed,savedDay,savedMonthDay};
+        })()`);
+        assert.equal(result.sameContent,true);
+        assert.deepEqual(result.dayLimit, [['Daily limit',''],['Limit','$35.00'],['New work stops at','$32.00'],
+          ['Starts again','Thu Nov 19, 7:00 PM EST']]);
+        assert.deepEqual(result.monthLimit, [['Monthly limit',''],['Limit','$400.00'],['New work stops at','$397.00'],
+          ['Starts again','Mon Nov 30, 7:00 PM EST']]);
+        assert.deepEqual(result.dayTip, [['Thu Nov 19 (UTC)',''],['Starts','Wed Nov 18, 7:00 PM EST'],
+          ['Ends','Thu Nov 19, 7:00 PM EST']]);
+        assert.deepEqual([result.count,result.missing,result.runCount,result.rawRows], [18,'no record',84,196]);
+        assert.deepEqual(result.zero, ['$0.00','Billed, not final']);
+        assert.deepEqual(result.runFields, ['integrate','report','us-east-1','us-east-1a','c7i.8xlarge','Spot','9 min 34 s','~$0.02']);
+        assert.equal(result.hanaTime, '21 s');
+        assert.equal(result.hanaPerRun, '—');
+        assert.equal(result.totalTime, '29 h 39 min 45 s');
+        assert.deepEqual(result.hanaDetails, ['0 s','1 s','2 s','3 s','4 s','5 s','6 s','2 h 22 min 55 s']);
+        assert.deepEqual(result.idleTimes, Array(3).fill('2 h 22 min 55 s'));
+        assert.deepEqual(result.regions, ['us-east-1','us-west-2']);
+        assert.deepEqual(result.machines, ['c7i.8xlarge','m7a.8xlarge']);
+        assert.deepEqual(result.units, ['report','Unit not recorded']);
+        assert.deepEqual(result.week,['934','~$19.87']);
+        assert.deepEqual(result.month,['2,986','~$104.47']);
+        assert.deepEqual(result.year,result.month);
+        assert.match(result.billed,/Job not recorded/);
+        assert.match(result.billed,/Runs before Thu Nov 19 have no unit record\./);
+        assert.doesNotMatch(result.billed,/Our estimate before the AWS amount/);
+        assert.deepEqual([result.savedDay,result.savedMonthDay],['false','true']);
+      }
+
       async function checkPage(navigate, evaluate, call) {
         const readPixel = async (x, y) => {
           const clip = {x:Math.floor(x),y:Math.floor(y),width:1,height:1,scale:1};
@@ -1372,7 +1684,11 @@ try {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.aws_costs);
+            await checkAwsCosts(evaluate, theme === 'dark' && width === 1400);
             await show(base);
+            await evaluate(`renderAwsCosts(undefined)`);
+            assert.equal(await evaluate(`document.querySelector('#aws-cost-content').textContent`), 'no record');
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
             await evaluate('scrollTo(0,0)');
             const timeCells = await evaluate(`({
@@ -3414,6 +3730,12 @@ try {
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');
         await capture('gate-tooltip-dark-desktop','#tip');
+        if (awsCostsComparison) {
+          servedReading = readings.aws_costs;
+          await navigate('memory_live.html');
+          await show(readings.aws_costs);
+          await captureAwsCosts(evaluate, call);
+        }
         if (comparisonImages) {
           await show(base);
           await evaluate('hideTip()');

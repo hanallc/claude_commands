@@ -1436,6 +1436,14 @@ Snapshot rows have priority on equal distances.
 
 **BRP launches** (`scripts/buildlog/launches.py`). `collect() -> LaunchCounts` turns each `brp_launch` result in `~/.claude/projects/*/*.jsonl` (`BUILDLOG_TRANSCRIPTS` replaces the root) into a `build` step with caller `brp-launch`: `ended_at` = `metadata.launch_timestamp`, `started_at` = that minus the launch duration, argv `cargo build --workspace --bin|--example <target> [--release]` (`--bin` only when `metadata.launched_as` is `app`), no memory fields. It reads `mcpMeta.structuredContent`, list `tool_result` items and `<task-notification><result>JSON</result>` strings, and skips any line lacking `brp_launch` or one of those markers before parsing. `launch_record(line, transcript, *, backfill=False) -> RecordedLaunch | LaunchOutcome` takes the location from `parameters.path`, else `metadata.working_directory`, else `LaunchOutcome.NO_LOCATION`; repo and worktree come only from `record.git_facts(location)`. Each launch is `launch-<sha256(session:timestamp)>.jsonl`, written only when absent (temporary file, hard link). `launches_state.json` holds each transcript's offset and marks; an entry without `reread_complete` is re-read once from the start, launches before its saved offset recorded with `branch` and `sha` null. `LaunchCounts.summary()` prints on stdout for `buildlog launches` and on stderr for `buildlog report`. `day_report` collects before `index.update()`.
 
+### AWS costs on the Builds page
+
+The report feed reads saved AWS bills, the cost ledger, and launch records. It makes no AWS calls.
+The pane groups amounts by UTC bill day and uses the user time zone for times and CSV exports.
+A late read shows the last read date and the saved reason, when available.
+Days with fixed costs and no runs show the cost and zero runs.
+The job view shows Hana attempts and machine time outside those attempts.
+
 ### Build log: commands and report
 
 | Command | Output |

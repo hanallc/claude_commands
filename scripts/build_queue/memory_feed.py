@@ -44,7 +44,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, cost_actions, mac_idle, mac_idle_alert, machine_facts, parse
+from scripts.buildlog import aws_costs, charts, cost_actions, mac_idle, mac_idle_alert, machine_facts, parse
 from scripts.buildlog.store import host_name, root
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -1191,8 +1191,13 @@ class ReportFile:
     version: str
 
 
-def report_file(report: ReportSections | charts.IndexUnavailable) -> ReportFile:
-    text = json.dumps(codec.snapshot_value(report))
+def report_file(report: ReportSections | charts.IndexUnavailable,
+                costs: aws_costs.AwsCosts | None = None) -> ReportFile:
+    payload = codec.snapshot_value(report)
+    assert isinstance(payload, dict)
+    if costs is not None:
+        payload["aws_costs"] = costs
+    text = json.dumps(payload, separators=(",", ":"))
     return ReportFile(text, hashlib.sha256(text.encode()).hexdigest()[:REPORT_VERSION_LENGTH])
 
 
@@ -3547,7 +3552,8 @@ def main(argv: Sequence[str]) -> int:
             return 1
         now = time.monotonic()
         if now >= next_report_at:
-            report = report_file(report_reading(configuration.history_days))
+            report = report_file(report_reading(configuration.history_days),
+                                 aws_costs.read_saved_costs(int(time.time())))
             if report.version != report_version:
                 # The report goes first, so memory.json never names a report that is not written.
                 write_text_atomic(configuration.output_folder / REPORT_NAME, report.text, new_file_mode=0o644)
