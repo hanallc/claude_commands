@@ -536,9 +536,17 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
             if row is not None:
                 observed = worker_panes.observe_worker(parent.id, row, record)
                 if isinstance(observed, worker_panes.OpenWorker) and worker_panes.worker_state(observed) == "busy":
-                    delivery = pass_recorder.dispatch_delivery(passed if isinstance(match, pass_recorder.MatchedDispatch) else {})
-                    ready = staff_worker.dispatch_turn_ready(parent.id, observed, herdr.Herdr(herdr.shared_session()),
-                        delivery.line, delivery.completion_id, run=run)
+                    locked = worker_panes.check_worker_lock(row)
+                    if isinstance(locked, worker_panes.Kept):
+                        print(locked.blocker, file=sys.stderr)
+                        return staff_worker.ExitCode.BUSY
+                    client = herdr.Herdr(herdr.shared_session())
+                    if (isinstance(match, pass_recorder.MatchedDispatch)
+                            and (delivery := pass_recorder.dispatch_delivery(passed)).line):
+                        ready = staff_worker.dispatch_turn_ready(parent.id, observed, client,
+                            delivery.line, delivery.completion_id, run=run)
+                    else:
+                        ready = staff_worker.dispatch_pane_ready(parent.id, observed, client)
                     if isinstance(ready, staff_worker.ExitCode):
                         return ready
                 slot = chosen.value

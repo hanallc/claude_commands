@@ -744,13 +744,10 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return startup_result(name, current_start)
         started = current_start
         if not isinstance(matched, pass_recorder.MatchedDispatch):
-            ready = _dispatch_ready(parent, started, _client())
+            ready = dispatch_pane_ready(parent, started, _client())
             if not isinstance(ready, worker_panes.OpenWorker):
                 return ready
             started = ready
-            if started.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-                print(f"{started.row.name}: agent is {started.status.value}", file=sys.stderr)
-                return ExitCode.BUSY
 
         def submitted() -> None:
             _ = cleanup.pop_all()
@@ -827,33 +824,42 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
     return current
 
 
+def _idle_dispatch_pane(pane: worker_panes.OpenWorker | ExitCode) -> worker_panes.OpenWorker | ExitCode:
+    if isinstance(pane, worker_panes.OpenWorker) and pane.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+        print(f"{pane.row.name}: agent is {pane.status.value}", file=sys.stderr)
+        return ExitCode.BUSY
+    return pane
+
+
+def dispatch_pane_ready(parent: StaffId, started: worker_panes.OpenWorker,
+                        client: herdr.Herdr) -> worker_panes.OpenWorker | ExitCode:
+    """Wait for a pane to accept a new prompt."""
+    return _idle_dispatch_pane(_dispatch_ready(parent, started, client))
+
+
 def dispatch_turn_ready(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
                         line: str, dispatch_id: str, *, run: Path,
                         ) -> worker_panes.OpenWorker | DispatchSubmission | ExitCode:
-    """Check pane readiness. A saved delivery can wait for the pane."""
+    """Check the saved delivery receipt before and after the pane wait."""
     if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
         return _blocked_question(client, started)
-    if line:
-        receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
-        if isinstance(receipt, DispatchEvidenceUnknown):
-            print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-            return ExitCode.UNCERTAIN
-        if not isinstance(receipt, DispatchNotSubmitted):
-            return DispatchSubmission.SUBMITTED
-    ready = _dispatch_ready(parent, started, client) if line else started
+    receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.UNCERTAIN
+    if not isinstance(receipt, DispatchNotSubmitted):
+        return DispatchSubmission.SUBMITTED
+    ready = _dispatch_ready(parent, started, client)
     if not isinstance(ready, worker_panes.OpenWorker):
         return ready
-    if line and started.status == herdr.AgentStatus.WORKING:
+    if started.status == herdr.AgentStatus.WORKING:
         receipt = dispatch_receipt(ready.row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchEvidenceUnknown):
             print(f"{ready.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
             return ExitCode.UNCERTAIN
         if not isinstance(receipt, DispatchNotSubmitted):
             return DispatchSubmission.SUBMITTED
-    if ready.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-        print(f"{ready.row.name}: agent is {ready.status.value}", file=sys.stderr)
-        return ExitCode.BUSY
-    return ready
+    return _idle_dispatch_pane(ready)
 
 
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
