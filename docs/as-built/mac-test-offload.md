@@ -59,6 +59,22 @@ A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
 
+The probe, arm, gate stream, and cleanup retry an inner SSH connect reset or refusal.
+The Mac gives the inner SSH client a private log and deletes it when the shell exits.
+When SSH exits 255 and the log contains only the connect error, the shell reports the error with a reserved status.
+The route checks the reserved status, the Mac marker, and empty standard output before it retries.
+The probe, arm, and gate stream allow three attempts within the unreachable wait, with one second between attempts.
+The arm covers the gate stream's connect window and allows time for the arm reply and guest lock setup.
+The gate stream sends the remaining connect time to the Mac after the outer SSH hop starts the Mac shell.
+The Mac applies that time to the inner SSH hop. The sender declines the inner hop when less than one second remains.
+The local stream enforces the deadline until the guest accepts the command.
+The guest acceptance line starts the transfer timeout and the bundle upload.
+If the deadline expires before acceptance, the queue can try another target after the guest confirms cleanup.
+Cleanup continues until it gets end proof or the proof deadline expires.
+It waits one second between the first three connect attempts, then uses the normal proof interval before a new group.
+An interrupt preserves the proof deadline and the count of attempts in the current group.
+The hand-made command stream combines output and diagnostics and uses one stream attempt.
+
 ## Mac queue runs
 
 `mac_queue_run.py` checks the Mac block for each kind (`shot`, `install`, `probe` and `run`) before placement, before remote preparation, and before the remote command.
