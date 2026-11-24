@@ -63,7 +63,7 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.assertIsInstance(run, wire.RunIdentity)
         assert isinstance(run, wire.RunIdentity)
         self.assertEqual([row["run_id"] for row in rows], [f"{run.pid}:{run.start_time}"] * 5)
-        self.assertTrue(all(request.run == run for request in placements if request.identity.step != "doc"))
+        self.assertTrue(all(request.run == run for request in placements))
         routes = list(dict.fromkeys((request.identity.step, request.route) for request in placements))
         self.assertEqual(routes, [
             ("check", target_config.LocalRequired("requires Linux kernel")),
@@ -84,6 +84,42 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         doc = remote_verbs[-1]
         self.assertEqual(doc[doc.index("--verb") + 1], "doc")
         self.assertIn("extra", doc)
+        self.assertIn("Mac only (Mac-only docs + Swift)", result.stderr)
+        self.assert_removed()
+
+    def test_quoted_plus_is_a_routing_reason(self) -> None:
+        self.prepare_repository()
+        self.fixture.environment["BUILDLOG_OFF"] = "0"
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        result = self.run_verify("check", "+", "doc", "--mac", "+")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Mac only (+)", result.stderr)
+        rows = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual([row["verb"] for row in rows], ["check", "doc"])
+        doc = cast(list[str], self.mac_rows()[-1]["args"])
+        self.assertEqual(doc[doc.index("--verb") + 1], "doc")
+        self.assert_removed()
+
+    def test_invalid_later_step_leaves_no_temp_folder_or_git_objects(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        _ = (root / "src/lib.rs").write_text("pub fn unstaged() {}\n")
+        objects = set((root / ".git/objects").rglob("*"))
+        trace = root / "trace"
+        tmpdir = root / "missing-tmp"
+        for prepared in ("", str(root)):
+            with self.subTest(prepared=prepared):
+                result = self.fixture.verify("check", "+", "lint", "--keep-going", extra={
+                    "BUILDLOG_PREPARED_COPY": prepared, "TMPDIR": str(tmpdir), "VERIFY_PY_TRACE": str(trace),
+                })
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse(tmpdir.exists(), "preflight created TMPDIR")
+                self.assertEqual(set((root / ".git/objects").rglob("*")), objects)
+                self.assertEqual(list(root.glob("trace*")), [])
+                self.assertIn("Usage:", result.stderr)
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.fixture.cargo_events(), [])
+        self.assertEqual(self.fixture.call_records(), [])
         self.assert_removed()
 
     def test_invalid_later_arguments_never_start_first_step(self) -> None:

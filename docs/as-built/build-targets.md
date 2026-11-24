@@ -605,11 +605,13 @@ No package selects the whole workspace.
 
 A comma list accepts one optional package and no verb flags.
 A step list uses a lone `+` between `check`, `test`, `lint`, and `doc` steps.
+The splitter keeps `+` when a flag expects a value.
 Each step uses its own package and flags. A routing flag applies only to its step.
 Verify checks every step's arguments before it starts the list. A usage error exits 2.
 The first failure ends either list with its status.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
-Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
+Steps in a plus list keep their queue place even when they need a checkout slot.
+Other steps with a checkout slot omit the identity from placement requests and can leave a grant without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.
