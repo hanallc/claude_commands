@@ -1284,7 +1284,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         else:
             fields, body = store.read(identity)
             if fields.get("producer", keeper) != assigned_to:
-                raise ListError(f"{identity} is assigned to another producer")
+                raise ListError(f"{identity} is assigned to another producer. "
+                                + "A producer can change only its own items.")
             item = _read_item(store, identity, fields, body)
         request = page_action
         if isinstance(page_action, PageItemNotice):
@@ -1401,7 +1402,8 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
 
 
 _LAUNCHER = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
-_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence")
+_PRODUCER_UPDATE_FIELDS = ("title", "done_when", "unit", "latest_status", "next_step", "eta", "state", "next_check",
+                           "evidence", "add_evidence")
 _PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
 
 
@@ -1528,7 +1530,8 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
-         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
     if isinstance(until, datetime):
@@ -1544,7 +1547,7 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
         if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
             raise ListError("This item is already delivered.")
         return replace(item, parked_until=until)
-    return _change(keeper, identity, edit, event, source, page_action=notice).item
+    return _change(keeper, identity, edit, event, source, page_action=notice, assigned_to=assigned_to).item
 
 
 def unread_delivery(item: ListItem) -> bool:
@@ -1571,7 +1574,8 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
 
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
-          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     _validate_closing_words(words)
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if item.state == ItemState.CLOSED:
@@ -1584,15 +1588,16 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
                        questions=answered, log=(*item.log, *closed_questions))
     return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
-                   unread=False, page_action=notice).item
+                   unread=False, page_action=notice, assigned_to=assigned_to).item
 
 
-def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
+def reopen(keeper: staff.StaffId, identity: str, *, source: str,
+           assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     def edit(item: ListItem, _: datetime) -> ListItem:
         if item.state != ItemState.CLOSED:
             return item
         return replace(item, state=ItemState.NEW, closed=NoTimestamp.UNSET, closing_words="", parked_until=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, Reopened(), source).item
+    return _change(keeper, identity, edit, Reopened(), source, assigned_to=assigned_to).item
 
 
 def _unread_log_content(content: LogContent) -> str | dict[str, object]:
@@ -2207,7 +2212,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
-        if assigned_to is not AllItems.INCLUDED and name != "add":
+        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close", "reopen"):
             raise ListError(f"only morty can run {name}")
         assert source is not None
         if name == "clean-evidence":
@@ -2261,11 +2266,12 @@ def main(argv: list[str] | None = None) -> int:
             print(item.id)
             return _notify_producer_assignment(item, caller.id, keeper)
         elif name == "park":
-            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source)
+            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source,
+                     assigned_to=assigned_to)
         elif name == "close":
-            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source)
+            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source, assigned_to=assigned_to)
         elif name == "reopen":
-            _ = reopen(keeper, cast(str, args.id), source=source)
+            _ = reopen(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         else:
             _ = mark_read(keeper, cast(str, args.id), source=source)
         return 0
