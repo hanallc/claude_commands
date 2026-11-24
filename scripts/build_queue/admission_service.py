@@ -3538,6 +3538,8 @@ class AdmissionServer:
             consumed = (current and self.current_assignments.get(assignment.episode) == key
                         and isinstance(saved.permission, placement.PermissionConsumed))
             confirmed = confirmed_guest_run(assignment, evidence) if consumed else None
+            if consumed and isinstance(start := saved.confirmed_guest_start, records.ConfirmedGuestStart):
+                confirmed = records.ConfirmedGuestRun(target="mac-linux", attempt=start.attempt)
             local = request.local
             counter = (progress.read_counter(Path(local.sidecar))
                        if guest and consumed and isinstance(local, wire.LocalAdmissionContext) and local.sidecar
@@ -5638,6 +5640,16 @@ done
             if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
                     or not isinstance(request.evidence, execution_identity.ObservedExecution)):
                 self.execution_evidence[key] = request.evidence
+            if (isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
+                    and self.current_assignments.get(assignment.episode) == key
+                    and isinstance(saved.state, placement.CurrentAssignment)
+                    and isinstance(saved.permission, placement.PermissionConsumed)
+                    and isinstance(request.evidence, execution_identity.ObservedExecution)
+                    and isinstance(request.evidence.identity, execution_identity.CloudExecution)
+                    and confirmed_guest_run(assignment, request.evidence) is not None):
+                saved = replace(saved, confirmed_guest_start=records.ConfirmedGuestStart(
+                    assignment.episode, assignment.attempt, self.clock.now()))
+                self.assignments[key] = saved
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)

@@ -793,6 +793,55 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
+    def test_guest_start_report_survives_restart_and_closure(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            def assignment_row(saved: records.SavedPlacementAssignment) -> dict[str, object]:
+                return cast(dict[str, object], json.loads(wire.encode_record(saved)))
+
+            original = fixture.server.assignments[key]
+            path = fixture.state_dir / "state.json"
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            rows = cast(dict[str, dict[str, object]], state["assignments"])
+            _ = rows[key].pop("confirmed_guest_start", None)
+            _ = path.write_text(json.dumps(state))
+            fixture.restart()
+            self.assertEqual(fixture.server.assignments[key], original)
+
+            fixture.clock.advance(1)
+            started_at = fixture.clock.now()
+            execution = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                "mac-linux", "fixture-boot", "fixture-machine", assignment.attempt))
+            report = wire.ExecutionReport("guest-started", assignment, granted.claim, execution)
+            _ = fixture.server.handle_request(report)
+            expected = {"kind": "ConfirmedGuestStart", "episode": assignment.episode,
+                        "attempt": assignment.attempt, "accepted_at": started_at}
+            fixture.restart()
+            self.assertEqual(assignment_row(fixture.server.assignments[key]).get("confirmed_guest_start"), expected)
+            _ = fixture.run_pass()
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            running, = (step for step in view.reading.view.running if step.assignment_target == "mac-linux")
+            self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+
+            fixture.clock.advance(1)
+            _ = fixture.server.handle_request(replace(report, request_id="guest-start-repeated"))
+            completed, = fixture.server.handle_request(replace(report, request_id="guest-completed",
+                evidence=execution_identity.ExecutionEvidenceUnavailable("guest exited", fixture.clock.now()),
+                outcome=placement.AttemptCompleted(0), path=placement.DispatchPathSettled()))
+            assert isinstance(completed, wire.DispatchStatus)
+            self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
+            closed = service.read_state(fixture.state_dir).assignments[key]
+            self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
+            self.assertEqual(assignment_row(closed).get("confirmed_guest_start"), expected)
+
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
         with PlacementFixture() as fixture:
             backoff = mac_linux_fixture(fixture, enabled="off")
