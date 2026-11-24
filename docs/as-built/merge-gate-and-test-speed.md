@@ -135,6 +135,7 @@ It prints `Mac Linux guest took no run: <cause>`.
 In merge mode, it undoes the merge and reports the rollback.
 Status 79 identifies a refusal before tests started.
 Status 80 identifies a run with no verdict or a launch that still needs settlement.
+A completed AWS run with open settlement keeps its verdict and prints one warning on standard error.
 A direct gate or `copies.py gate-step` uses one placement.
 `copies.py run` and `copies.py gate-step` preserve status 79 or 80 if cleanup fails.
 They report the cleanup error on standard error.
