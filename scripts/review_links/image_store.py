@@ -98,11 +98,18 @@ def _answers_path(directory: Path, identity: str) -> Path:
 
 
 def deleted_answer_ids(directory: Path) -> Iterator[str]:
-    """Find answer records for removed pictures."""
+    """Find saved answers for pictures with no picture record."""
     for path in sorted(directory.glob(f"{_ANSWERS_PREFIX}*.json")):
         identity = path.stem.removeprefix(_ANSWERS_PREFIX)
-        if IDENTITY.fullmatch(identity) and not path.is_symlink() and not (directory / identity).exists():
+        folder = directory / identity
+        if not IDENTITY.fullmatch(identity) or path.is_symlink() or folder.is_symlink():
+            continue
+        try:
+            _ = (folder / RECORD).lstat()
+        except FileNotFoundError:
             yield identity
+        except OSError:
+            continue
 
 
 def _texts(value: object) -> list[str]:

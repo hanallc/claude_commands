@@ -2263,7 +2263,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(503, "Could not save the picture change. Try again.", error)
             return
         if isinstance(delivery, images.ImageAnswerSent):
-            self.json_response(200, {"state": "done", **({"notice": delivery.notice} if delivery.notice else {})})
+            result: dict[str, object] = {"state": "done"}
+            if delivery.notice:
+                result["notice"] = delivery.notice
+            if delivery.draft_confirmed:
+                result["draft_confirmed"] = True
+            self.json_response(200, result)
             return
         try:
             self.json_response(200, {"state": "done"})

@@ -62,6 +62,20 @@ class AnswerNotSent(Exception):
 @dataclass(frozen=True)
 class ImageAnswerSent:
     notice: str = ""
+    draft_confirmed: bool = False
+
+
+@dataclass(frozen=True)
+class _AnswerDraft:
+    action: str
+    words: str
+    round_id: str | None
+
+    def key(self, folder: Path, registered_at: str) -> str:
+        parts = [registered_at, self.action, self.words]
+        if self.round_id is not None:
+            parts.append(self.round_id)
+        return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts))
 
 
 def images_root(root: Path) -> Path:
@@ -314,7 +328,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {
-            "image", "token", "feedback", "action", "feedback_round", "retry_key"} or any(
+            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -330,10 +344,19 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
     if action == "retry":
-        if set(fields) != {"image", "token", "action", "retry_key"} or not fields["retry_key"][0]:
+        required = {"image", "token", "action", "retry_key"}
+        if not required <= fields.keys() or not fields["retry_key"][0]:
             raise question_record.AnswerRefused("use the Retry button on this page")
-        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0])
-    if "retry_key" in fields:
+        draft_fields = fields.keys() - required
+        draft_action = fields.get("draft_action", [""])[0]
+        draft = None
+        if draft_fields:
+            if (not {"draft_action", "feedback"} <= draft_fields <= {"draft_action", "feedback", "feedback_round"}
+                    or draft_action not in ANSWERS):
+                raise question_record.AnswerRefused("use the Retry button on this page")
+            draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0])
+        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft)
+    if "retry_key" in fields or "draft_action" in fields:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
@@ -416,10 +439,7 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
     else:
-        parts = [saved["registered_at"], answer, feedback]
-        if round_id is not None:
-            parts.append(round_id)
-        key = change_page.review_delivery_key(folder / image_store.RECORD, identity, json.dumps(parts))
+        key = _AnswerDraft(answer, feedback, round_id).key(folder, saved["registered_at"])
         words = f"Image {identity}: {ANSWERS[answer]}"
         if feedback:
             words += "\n" + feedback
@@ -475,7 +495,7 @@ def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
 
 
 def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None,
-                retry_key: str | None = None) -> ImageAnswerSent:
+                retry_key: str | None = None, draft: _AnswerDraft | None = None) -> ImageAnswerSent:
     """Send to each recipient that has yet to confirm this answer."""
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
@@ -513,7 +533,8 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
                 record = image_store.read_record(folder)
             except FileNotFoundError:
                 owner = _recipient_name(staff.snapshot(), saved["owner"])
-                return ImageAnswerSent(f"This picture was removed; your words went to {owner}.")
+                return ImageAnswerSent(f"This picture was removed; your words went to {owner}.",
+                                       draft_confirmed=draft is not None and draft.key(folder, saved["registered_at"]) == key)
             if (record["registered_at"] == saved["registered_at"] and record["owner"] == saved["owner"]
                     and "feedback_at" not in record and not answered_question_ids(record) - set(delivery["answered"])):
                 record["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
@@ -625,19 +646,21 @@ function storeDrafts() {
   if (savedDrafts.size) sessionStorage.setItem(draftStorageKey, JSON.stringify([...savedDrafts]));
   else sessionStorage.removeItem(draftStorageKey);
 }
+function draftValue(form) {
+  const {feedback, token, feedback_round: round} = form.elements;
+  const sameRetry = form.dataset.retryWords === feedback.value;
+  return {words: feedback.value, token: token.value, round: round.value,
+          retryAction: sameRetry ? form.dataset.retryAction : undefined,
+          retryRound: sameRetry ? form.dataset.retryRound : undefined};
+}
+function rememberDraft(form) {
+  const image = form.elements.image.value, draft = draftValue(form);
+  if (draft.words) savedDrafts.set(image, draft);
+  else savedDrafts.delete(image);
+}
 function saveDraftsForReload() {
   const hadDrafts = savedDrafts.size > 0;
-  for (const form of draftForms(list)) {
-    const {image, feedback, token, feedback_round: round} = form.elements;
-    if (!feedback.value) {
-      savedDrafts.delete(image.value);
-      continue;
-    }
-    const sameRetry = form.dataset.retryWords === feedback.value;
-    savedDrafts.set(image.value, {words: feedback.value, token: token.value, round: round.value,
-                                 retryAction: sameRetry ? form.dataset.retryAction : undefined,
-                                 retryRound: sameRetry ? form.dataset.retryRound : undefined});
-  }
+  for (const form of draftForms(list)) rememberDraft(form);
   if (hadDrafts || savedDrafts.size) storeDrafts();
 }
 function restoreDrafts() {
@@ -664,9 +687,14 @@ function restoreDrafts() {
     }
   }
 }
-function clearDraft(image) {
-  if (!savedDrafts.delete(image)) return;
+function updateStoredDraft(form) {
+  if (!savedDrafts.has(form.elements.image.value)) return;
+  rememberDraft(form);
   try { storeDrafts(); } catch { /* Storage can become unavailable while the page is open. */ }
+}
+function clearDraft(form) {
+  form.elements.feedback.value = '';
+  updateStoredDraft(form);
 }
 function bind(root) {
   root.querySelectorAll('form[data-image-form]').forEach(form => form.addEventListener('submit', async event => {
@@ -689,6 +717,13 @@ function bind(root) {
     if (form.dataset.retryAction === body.get('action') && form.dataset.retryWords === body.get('feedback')) {
       body.set('feedback_round', form.dataset.retryRound);
     }
+    const answerForm = retrying && draftForms(list).find(other => other.elements.image.value === body.get('image'));
+    const answerDraft = answerForm && draftValue(answerForm);
+    if (answerDraft?.retryAction) {
+      body.set('draft_action', answerDraft.retryAction);
+      body.set('feedback', answerDraft.words);
+      if (answerDraft.retryRound !== undefined) body.set('feedback_round', answerDraft.retryRound);
+    }
     status.textContent = '';
     let postFailed = false, retry = !question && !retrying;
     setCardSubmitting(form, true);
@@ -702,10 +737,7 @@ function bind(root) {
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
       }
-      if (draft) {
-        clearDraft(form.elements.image.value);
-        draft.value = '';
-      }
+      if (draft) clearDraft(form);
       if (question) {
         card.remove();
         list.dataset.waitingImages += ' ' + card.dataset.image;
@@ -714,6 +746,17 @@ function bind(root) {
         pageRefresh.restart();
       } else {
         const result = await response.json().catch(() => ({}));
+        if (answerForm && answerForm.isConnected) {
+          const currentDraft = draftValue(answerForm);
+          if (result.draft_confirmed && currentDraft.words === answerDraft.words
+              && currentDraft.retryAction === answerDraft.retryAction && currentDraft.retryRound === answerDraft.retryRound) {
+            clearDraft(answerForm);
+            answerForm.closest('article').remove();
+          } else {
+            // Keep edits made after the stored draft was restored.
+            updateStoredDraft(answerForm);
+          }
+        }
         if (result.notice) {
           notice.textContent = result.notice;
           notice.hidden = false;

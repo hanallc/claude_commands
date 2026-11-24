@@ -2282,6 +2282,122 @@ class ImagesServerTests(ImagesFixture):
         self.assertEqual(the_list.load(keeper.id, item.id), saved)
         self.assertNotIn(key, self.http("GET", images.PAGE_PATH)[2].decode())
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_retry_clears_only_the_matching_draft_after_reload(self) -> None:
+        first, second = self.register("First shot"), self.register("Second shot")
+        words = "Keep the title."
+        round_id = images.feedback_round(set())
+        picture_ids = [first["id"], second["id"]]
+        drafts: list[tuple[str, dict[str, str]]] = []
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            for record, draft_action in ((first, "feedback"), (second, "approved")):
+                identity = record["id"]
+                token = images.request_token(images.console_token(self.root), identity)
+                body = urlencode({"image": identity, "token": token, "action": "feedback",
+                                  "feedback": words, "feedback_round": round_id})
+                self.assertEqual(self.http("POST", images.PAGE_PATH, body)[0], 503)
+                images.delete(self.root, identity)
+                drafts.append((identity, {"words": words, "token": token, "round": round_id,
+                                          "retryAction": draft_action, "retryRound": round_id}))
+        seed = """<script>
+if (!sessionStorage.getItem('probe-phase')) {
+  sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringify(DRAFTS));
+}
+</script>""".replace("DRAFTS", json.dumps(drafts))
+        probe = r"""<script>
+(async () => {
+ const ids = IDS, failures = [];
+ const draft = id => document.getElementById('feedback-' + id);
+ const retry = id => [...document.querySelectorAll('button[value=retry]')]
+   .find(button => button.form.elements.image.value === id);
+ const check = (ok, text) => { if (!ok) failures.push(text); };
+ const phase = sessionStorage.getItem('probe-phase');
+ if (!phase) {
+   check(ids.every(id => draft(id)?.value === 'Keep the title.'), 'Both drafts start with their saved words.');
+   for (const id of ids) {
+     retry(id).click();
+     for (let step = 0; step < 80 && retry(id); step++) {
+       await new Promise(resolve => setTimeout(resolve, 50));
+     }
+     check(!retry(id), 'The confirmed retry leaves the page.');
+   }
+   check(!draft(ids[0]), 'Retry removes the matching editable draft.');
+   check(draft(ids[1])?.value === 'Keep the title.', 'Retry keeps the draft for another verdict.');
+   sessionStorage.setItem('probe-phase', JSON.stringify(failures));
+   location.reload();
+   return;
+ }
+ failures.push(...JSON.parse(phase));
+ check(!draft(ids[0]), 'The confirmed draft stays clear after reload.');
+ check(draft(ids[1])?.value === 'Keep the title.', 'The other draft survives reload.');
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
+</script>""".replace("IDS", json.dumps(picture_ids))
+        results: list[list[str]] = []
+        complete = threading.Event()
+        fixture = self
+
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/complete":
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.send_payload(204, "", b"")
+                elif self.path == "/":
+                    self.send_payload(200, "text/html", f'<iframe src="{images.PAGE_PATH}"></iframe>'
+                                      .encode() + b'<img hidden src="/complete">')
+                elif self.path == images.PAGE_PATH:
+                    _, kind, page = fixture.http("GET", self.path)
+                    page = page.replace(b"<head>", b"<head>" + seed.encode(), 1)
+                    self.send_payload(200, kind, page.replace(b"</body>", probe.encode() + b"</body>"))
+                else:
+                    self.send_error(404)
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(body)))
+                    self.send_payload(204, "", b"")
+                    complete.set()
+                else:
+                    self.send_payload(*fixture.http("POST", self.path, body))
+
+            def send_payload(self, status: int, kind: str, payload: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                _ = self.wfile.write(payload)
+
+        self.run_firefox(Probe, "retry-draft", release=complete.set)
+        self.assertEqual(results, [[]])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_retry_recovers_an_answer_after_an_interrupted_delete(self) -> None:
+        record = self.register()
+        identity = record["id"]
+        token = images.request_token(images.console_token(self.root), identity)
+        body = urlencode({"image": identity, "token": token, "action": "feedback", "feedback": "Keep the title."})
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            self.assertEqual(self.http("POST", images.PAGE_PATH, body)[0], 503)
+
+        def stop_delete(folder: Path) -> None:
+            (folder / image_store.RECORD).unlink()
+            raise OSError("Delete stopped.")
+
+        with patch.object(shutil, "rmtree", side_effect=stop_delete):
+            with self.assertRaisesRegex(OSError, "Delete stopped"):
+                images.delete(self.root, identity)
+        directory = images.images_root(self.root)
+        self.assertTrue((directory / identity).is_dir())
+        key, = image_store.read_answers(directory, identity)["attempts"]
+        page = self.http("GET", images.PAGE_PATH)[2].decode()
+        self.assertIn(f"Removed picture {identity}", page)
+        self.assertIn(f'name="retry_key" value="{key}"', page)
+        self.assertIn("Keep the title.", page)
+        retry = urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key})
+        self.assertEqual(self.http("POST", images.PAGE_PATH, retry)[0], 200)
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn(key, self.http("GET", images.PAGE_PATH)[2].decode())
+
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()
         folder = self.root / image_store.IMAGES_FOLDER
