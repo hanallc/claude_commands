@@ -841,6 +841,62 @@ try {
             }
             if (!shootBefore) assert.deepEqual(scroll.bars, {right:0, bottom:0, down:0, sideways:0},
               'The Running/Queued scroll box shows a scrollbar.');
+            if (!shootBefore) {
+              const pointer = await evaluate(`(() => {
+                const style = document.createElement('style');
+                style.textContent = 'html { overflow-y: scroll; } html::-webkit-scrollbar { width: 15px; }';
+                document.head.append(style);
+                const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                icon.scrollIntoView({block:'center', inline:'nearest'});
+                const box = icon.getBoundingClientRect();
+                return {x:box.left+box.width/2, y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+              const before = await evaluate("document.querySelector('#tip.on > .tip').getBoundingClientRect().toJSON()");
+              await call('Emulation.setDeviceMetricsOverride', {width:390,height:300,deviceScaleFactor:1,mobile:false});
+              const resized = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const viewport = document.documentElement;
+                const box = document.querySelector('#tip.on > .tip');
+                return {box:box.getBoundingClientRect().toJSON(), viewport:{width:viewport.clientWidth,height:viewport.clientHeight},
+                  innerWidth, overflow:box.scrollHeight-box.clientHeight, key:tips.key()};
+              })()`);
+              const {box, viewport} = resized;
+              assert.equal(resized.key, 'row:shot-guest');
+              assert.ok(before.right > viewport.width && box.left < before.left,
+                'The tooltip did not move after resize with a stationary pointer.');
+              assert.ok(resized.innerWidth > viewport.width, 'The proof needs a classic scrollbar.');
+              assert.ok(box.left >= 8 && box.right <= viewport.width-8, 'The tooltip exceeds the visible width.');
+              assert.ok(box.top >= 8 && box.bottom <= viewport.height-8, 'The tooltip exceeds the visible height.');
+              assert.ok(resized.overflow > 0, 'The tooltip has no content below its visible area.');
+
+              const rowPoint = await evaluate(`(() => {
+                const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                row.scrollIntoView({block:'center', inline:'nearest'});
+                const bounds = row.getBoundingClientRect();
+                const x = Math.max(bounds.left, ${box.left}) + 12;
+                const y = bounds.top + bounds.height/2;
+                row.addEventListener('click', () => { row.dataset.proofClicked = 'yes'; }, {once:true});
+                return {x, y};
+              })()`);
+              assert.ok(rowPoint.x > box.left && rowPoint.x < box.right && rowPoint.y > box.top && rowPoint.y < box.bottom,
+                'The guest row click is outside the tooltip.');
+              const click = async point => {
+                await call('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
+                await call('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+              };
+              await click(rowPoint);
+              assert.equal(await evaluate(`document.querySelector('tr[data-tip="row:shot-guest"]').dataset.proofClicked`),
+                'yes', 'The tooltip blocks the guest row click.');
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'The trigger click did not close the tooltip.');
+
+              await click(rowPoint);
+              assert.deepEqual(await evaluate("[tips.key(), getComputedStyle(document.querySelector('#tip')).pointerEvents]"),
+                ['row:shot-guest', 'none'], 'The click should open a pointer-transparent tooltip.');
+              await call('Input.dispatchKeyEvent', {type:'keyDown', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              await call('Input.dispatchKeyEvent', {type:'keyUp', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'Escape did not close the tooltip.');
+            }
           } finally {
             await call('Emulation.setScrollbarsHidden', {hidden:true});
           }
