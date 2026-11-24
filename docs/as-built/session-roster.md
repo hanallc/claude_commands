@@ -684,7 +684,7 @@ Release recalculates the priority of a kept decision.
   Use `send.py --to <address>` for one session and `broadcast.py` for groups.
   The sender hook refuses native `SendMessage` to another session, including urgent messages.
   Use `send.py --urgent` for urgent messages.
-- **Codex sessions** read `~/.codex/AGENTS.md`, workers included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, and the sandbox rerun.
+- **Codex sessions** read `~/.codex/AGENTS.md`, workers included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, the sandbox rerun, the images and links rules, and the user-specified behavior rule.
 - Both texts carry the same outcome and recovery words.
 - `scripts/message/install_codex_agents.py [--machine HOST] [--agents-file PATH]` writes that text into `~/.codex/AGENTS.md` between `<!-- claude-messaging: begin -->` and `<!-- claude-messaging: end -->`:
   - No markers: appends the block, creating the file and parent if needed.
