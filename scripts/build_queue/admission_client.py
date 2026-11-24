@@ -605,6 +605,39 @@ def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
     raise wire.AdmissionUnavailable("invalid execution report answer")
 
 
+def report_owner_end(request: wire.OwnerEnd) -> None:
+    """Report the guest gate result within one queue query timeout."""
+    from scripts.build_queue import admission_protocol as wire, admission_records as records
+
+    started = CLOCK.monotonic()
+    config = records.read_memory_config(report=False)
+    timeout = config.query_timeout_seconds
+    deadline = started + timeout
+    pause = min(config.reconnect_seconds, timeout / 4)
+    outgoing = wire.encode_owner_end(request).encode()
+    while True:
+        try:
+            with _connect(_remaining_seconds(deadline)) as connection:
+                connection.settimeout(_remaining_seconds(deadline))
+                connection.sendall(outgoing)
+                line = _line(connection, bytearray(), deadline)
+        except OSError as error:
+            remaining = deadline - CLOCK.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no answer in {timeout:g} s") from error
+            CLOCK.sleep(min(pause, remaining))
+        else:
+            break
+
+    reply = wire.parse_reply(line)
+    if isinstance(reply, wire.Refused):
+        raise wire.AdmissionUnavailable(reply.reason)
+    if (not isinstance(reply, wire.DispatchStatus) or reply.assignment != request.assignment
+            or not isinstance(reply.state, placement.ClosedAssignment)
+            or not isinstance(reply.permission, placement.PermissionConsumed) or reply.reason):
+        raise wire.AdmissionUnavailable("the queue did not confirm the end of the guest assignment")
+
+
 class _HistoryNeeded(BaseException):
     pass
 

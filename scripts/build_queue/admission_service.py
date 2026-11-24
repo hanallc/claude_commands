@@ -1472,7 +1472,7 @@ class Connection:
     socket: socket.socket
     received: bytes = b""
     sending: bytes = b""
-    request: wire.Request | NoRequest = NoRequest()
+    request: wire.ServiceRequest | NoRequest = NoRequest()
     finished: bool = False
     version: int = 1
     placement_request_digest: bytes | None = None
@@ -1614,7 +1614,7 @@ def _placed_step(request: wire.PlacementRequest) -> RunStep:
     return _run_step(request.owner, request.since, profile.step, scope)
 
 
-def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
+def _refreshes(first: wire.ServiceRequest | NoRequest, request: wire.ServiceRequest) -> bool:
     """A new estimate for the same episode keeps its connection, so the waiter keeps its place."""
     same_kind = ((isinstance(first, wire.AdmitRequest) and isinstance(request, wire.AdmitRequest))
                  or (isinstance(first, wire.LaunchRequest) and isinstance(request, wire.LaunchRequest))
@@ -5694,7 +5694,36 @@ done
             self._publish_replies(self._project_replies(self._queue_order()))
         return [self._placement_status(assignment, check_lifetime=False)]
 
-    def _authorize(self, request: wire.Request, uid: int) -> str:
+    def _handle_owner_end(self, request: wire.OwnerEnd, connection: Connection | NoConnection
+                          ) -> wire.DispatchStatus | wire.Refused:
+        assignment = request.assignment
+        saved = self._saved_assignment(assignment.episode, assignment.attempt)
+        if isinstance(saved, status_wire.UnknownPlacementStatus) or saved.assignment != assignment:
+            return wire.Refused("the assignment does not match a saved attempt")
+        if request.owner != assignment.owner:
+            return wire.Refused("the submitting owner does not match")
+        if not isinstance(connection, Connection) or request.owner.host != self.host:
+            return wire.Refused("the socket peer is not the submitting owner")
+        credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        pid, _, _ = struct.unpack("3i", credentials)
+        if pid != request.owner.pid or self.proc.owner_start(pid) != LiveOwnerIdentity(request.owner.start_time):
+            return wire.Refused("the socket peer is not the submitting owner")
+        if assignment.destination.provider != "ssh" or assignment.destination.target != "mac-linux":
+            return wire.Refused("the assignment target is not the Mac Linux guest")
+        if not isinstance(saved.permission, placement.PermissionConsumed):
+            return wire.Refused("the assignment has no consumed launch permission")
+        if isinstance(saved.state, placement.ClosedAssignment):
+            return self._placement_status(assignment, check_lifetime=False)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        if self.current_assignments.get(assignment.episode) != key:
+            return wire.Refused("the assignment is no longer current")
+
+        terminal = placement.TerminalAttemptReport(placement.AttemptCompleted(request.status),
+                                                    placement.DispatchPathSettled(), self.clock.now())
+        self._close_for_report(replace(saved, terminal_report=terminal), terminal)
+        return self._placement_status(assignment, check_lifetime=False)
+
+    def _authorize(self, request: wire.ServiceRequest, uid: int) -> str:
         if isinstance(request, status_wire.PlacementStatusRequest):
             return ""
         if isinstance(request, wire.VerifyRunSlotRequest):
@@ -5702,7 +5731,7 @@ done
                 return "Verify process belongs to another account or no longer exists"
             return ""
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
-                                wire.PrerequisiteReport, wire.CancelPlacement)):
+                                wire.PrerequisiteReport, wire.CancelPlacement, wire.OwnerEnd)):
             owner = request.owner if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport, wire.CancelPlacement)) else request.assignment.owner
             episode = request.episode if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport, wire.CancelPlacement)) else request.assignment.episode
             if uid != os.getuid() and (not episode.startswith(f"uid:{uid}:") or self._account(owner) != uid):
@@ -5790,7 +5819,7 @@ done
             session.session_id if isinstance(session, OwningSession) else ""),
             step=identity.step or request.profile.step, folder=identity.folder or request.profile.worktree)
 
-    def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
+    def handle_request(self, request: wire.ServiceRequest, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
         started, cpu_started = self.clock.monotonic(), time.thread_time()
         try:
@@ -5798,19 +5827,28 @@ done
         finally:
             self._log_request_timing(request, started, cpu_started)
 
-    def _log_request_timing(self, request: wire.Request, started: float, cpu_started: float) -> None:
+    def _log_request_timing(self, request: wire.ServiceRequest, started: float, cpu_started: float) -> None:
         wall = self.clock.monotonic() - started
         if wall > self.request_slow_seconds:
             cpu = time.thread_time() - cpu_started
             print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
                   file=sys.stderr, flush=True)
 
-    def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
+    def _handle_request(self, request: wire.ServiceRequest, connection: Connection | NoConnection
                         ) -> list[wire.Reply]:
         uid = peer_uid(connection)
         refusal = self._authorize(request, uid)
         if refusal:
             return [wire.Refused(refusal)]
+        if isinstance(request, wire.OwnerEnd):
+            return [self._handle_owner_end(request, connection)]
+        if isinstance(request, wire.ExecutionReport) and isinstance(request.outcome, placement.AttemptCompleted):
+            assignment = request.assignment
+            if assignment.destination.provider == "ssh" and assignment.destination.target == "mac-linux":
+                saved = self._saved_assignment(assignment.episode, assignment.attempt)
+                if (isinstance(saved, records.SavedPlacementAssignment) and saved.assignment == assignment
+                        and isinstance(saved.state, placement.ClosedAssignment)):
+                    return [self._placement_status(assignment, check_lifetime=False)]
         if isinstance(request, status_wire.PlacementStatusRequest):
             saved = self._saved_assignment(request.episode, request.attempt)
             if isinstance(saved, status_wire.UnknownPlacementStatus):

@@ -32,6 +32,8 @@ from scripts.build_queue.placement import (
     RetryDecision as RetryDecision,
     DispatchPathSettled as DispatchPathSettled,
     DispatchPathPending as DispatchPathPending,
+    PlacementAssignment,
+    SubmittingOwner,
 )
 from scripts.build_queue.admission_wire import (
     AdmissionUnavailable as AdmissionUnavailable,
@@ -114,12 +116,45 @@ from scripts.build_queue.admission_wire import (
     parse_envelope,
     encode_request as encode_request,
     parse_request as parse_request,
-    parse_request_envelope as parse_request_envelope,
+    parse_request_envelope as parse_wire_request_envelope,
     noncleanup_request_started as noncleanup_request_started,
     REPLY_TYPES,
 )
 
 Profile = records.StepProfile | records.ProgramProfile
+
+
+@dataclass(frozen=True)
+class OwnerEnd:
+    """The submitting owner reports the exit of its guest gate child."""
+
+    request_id: str
+    assignment: PlacementAssignment
+    owner: SubmittingOwner
+    status: int
+
+
+ServiceRequest = Request | OwnerEnd
+_OWNER_END_REQUEST = {"owner_end": OwnerEnd}
+
+
+def encode_owner_end(request: OwnerEnd) -> str:
+    return encode_envelope(request, _OWNER_END_REQUEST)
+
+
+def parse_request_envelope(line: str | bytes) -> tuple[int, ServiceRequest]:
+    try:
+        return parse_wire_request_envelope(line)
+    except UnsupportedVersion:
+        raise
+    except ValueError as error:
+        try:
+            version, request = parse_envelope(line, _OWNER_END_REQUEST)
+        except ValueError:
+            raise error from None
+        if version < 3:
+            raise ValueError("placement requires version 3")
+        return version, cast(OwnerEnd, request)
 
 
 @dataclass(frozen=True)

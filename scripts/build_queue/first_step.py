@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from uuid import uuid4
 
@@ -57,6 +58,7 @@ class FirstStepAdmission:
     queue_position: SlotQueuePosition
     grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment | GatePlacement | HandedOff
     assignment_file: Path
+    _guest_end_report_failed: bool = field(default=False, init=False)
 
     def handoff(self, tree: Path) -> None:
         """End preparation or pass the assignment to the command."""
@@ -102,7 +104,32 @@ class FirstStepAdmission:
         grant = self.grant
         if not isinstance(grant, GatePlacement):
             return run()
-        return run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
+        result = run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
+        self.report_gate_end(result.returncode)
+        return result
+
+    def report_gate_end(self, status: int) -> None:
+        """Report the final exit of the guest gate child."""
+        grant = self.grant
+        if not isinstance(grant, GatePlacement) or status == MAC_LINUX_PRELAUNCH_REFUSED_STATUS:
+            return
+        try:
+            assignment = read_assignment(self.assignment_file).assignment
+            if assignment.destination.provider != 'ssh' or assignment.destination.target != 'mac-linux':
+                return
+            if not assignment_matches_request(assignment, grant.request):
+                raise wire.AdmissionUnavailable('the saved assignment does not match the gate request')
+            client.report_owner_end(wire.OwnerEnd(uuid4().hex, assignment, grant.request.owner, status))
+        except (OSError, ValueError, wire.AdmissionUnavailable) as error:
+            if isinstance(error, TimeoutError):
+                # The queue checks the assignment when the owner exits.
+                self.grant = HandedOff()
+            self._guest_end_report_failed = True
+            with suppress(OSError, ValueError):
+                reason = ' '.join(str(error).split())
+                print(f'Mac Linux gate owner end report failed: {reason}', file=sys.stderr, flush=True)
+        else:
+            self.grant = HandedOff()
 
     def close(self) -> None:
         """Release preparation after an error before command startup."""
@@ -118,7 +145,7 @@ class FirstStepAdmission:
                 _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, assignment.episode,
                     assignment.owner, reason))
             except wire.AdmissionUnavailable as error:
-                if error.reason != wire.PLACEMENT_REQUEST_MISSING_REASON:
+                if error.reason != wire.PLACEMENT_REQUEST_MISSING_REASON and not self._guest_end_report_failed:
                     raise
         self.grant = HandedOff()
 

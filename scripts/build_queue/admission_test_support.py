@@ -209,7 +209,7 @@ class ObservedAdmissionServer(service.AdmissionServer):
             connection.sending[queued:].decode()).encode()
 
     @override
-    def handle_request(self, request: wire.Request,
+    def handle_request(self, request: wire.ServiceRequest,
                        connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
         self.check_access("handle_request")
         if isinstance(request, wire.PlacementRequest) and isinstance(self.proc, TestProcesses):

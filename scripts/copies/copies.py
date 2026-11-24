@@ -2700,6 +2700,7 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
             if result.stderr:
                 _ = sys.stderr.write(result.stderr)
             status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+            admitted.report_gate_end(result.returncode)
     except Exception as error:
         if status not in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
             raise

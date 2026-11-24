@@ -806,6 +806,73 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual(start.accepted_at, accepted_at)
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
+    def test_guest_owner_and_branch_reports_keep_the_first_completion(self) -> None:
+        cases = ((True, 0), (False, 0), (True, 7))
+        for owner_first, status in cases:
+            with self.subTest(owner_first=owner_first, status=status), PlacementFixture() as fixture:
+                request = mac_linux_and_natedev_request(fixture)
+                owner = fixture.fixture_owner(os.getpid(), "owner-start")
+                request = replace(request, owner=replace(request.owner, pid=owner.pid, start_time=owner.start_time),
+                                  run=wire.RunIdentity(owner.pid, owner.start_time))
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                assert isinstance(granted, wire.FirstAuthorization), granted
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                owner_end = wire.encode_owner_end(wire.OwnerEnd("owner-end", assignment, assignment.owner, status))
+                branch_status = 0 if owner_first else 3
+                branch_end = wire.ExecutionReport("branch-end", assignment, granted.claim,
+                    execution_identity.ExecutionEvidenceUnavailable("guest ended", fixture.clock.now()),
+                    placement.AttemptCompleted(branch_status), placement.DispatchPathSettled(), code_version="branch")
+                first, second = (owner_end, branch_end) if owner_first else (branch_end, owner_end)
+
+                closed, = fixture.connect(first).replies()
+                assert isinstance(closed, wire.DispatchStatus), closed
+                self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
+                self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                saved = fixture.server.assignments[key]
+                report = saved.terminal_report
+                assert isinstance(report, placement.TerminalAttemptReport), report
+                self.assertEqual(report.outcome, placement.AttemptCompleted(status if owner_first else branch_status))
+                self.assertEqual(report.path, placement.DispatchPathSettled())
+                self.assertEqual(service.read_state(fixture.state_dir).assignments[key], saved)
+                evidence = fixture.server.execution_evidence.copy()
+                versions = fixture.server.caller_versions.copy()
+
+                self.assertEqual(fixture.connect(second).replies(), [closed])
+                self.assertEqual(fixture.server.assignments[key], saved)
+                self.assertEqual(fixture.server.execution_evidence, evidence)
+                self.assertEqual(fixture.server.caller_versions, versions)
+
+    def test_guest_owner_end_refuses_a_wrong_owner_peer_permission_or_target(self) -> None:
+        for case in ("owner", "peer", "permission", "target"):
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                request = (placement_request(fixture) if case == "target"
+                           else mac_linux_and_natedev_request(fixture))
+                if case != "peer":
+                    owner = fixture.fixture_owner(os.getpid(), "owner-start")
+                    request = replace(request, owner=replace(request.owner, pid=owner.pid, start_time=owner.start_time),
+                                      run=wire.RunIdentity(owner.pid, owner.start_time))
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                if case == "target":
+                    claim = adopt_assignment(fixture, request, assignment)
+                    granted, = fixture.connect(consume_permission("start", assignment, claim)).replies()
+                    self.assertIsInstance(granted, wire.FirstAuthorization)
+                elif case != "permission":
+                    granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                    self.assertIsInstance(granted, wire.FirstAuthorization)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                reported_owner = replace(assignment.owner, start_time="different") if case == "owner" else assignment.owner
+                request_text = wire.encode_owner_end(wire.OwnerEnd("invalid-end", assignment, reported_owner, 0))
+
+                refused, = fixture.connect(request_text).replies()
+                assert isinstance(refused, wire.Refused), refused
+                self.assertIn(case, refused.reason)
+                self.assertEqual(fixture.server.assignments[key], saved)
+                self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+
     def test_guest_start_report_survives_restart_and_closure(self) -> None:
         configuration = self.enterContext(TemporaryDirectory())
         with mock.patch.dict(os.environ, {"CONF_DIR": configuration}), PlacementFixture() as fixture:

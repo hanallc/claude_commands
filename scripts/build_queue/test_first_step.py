@@ -1,10 +1,13 @@
 """Test first-step admission and handoff."""
 
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, redirect_stderr
 from dataclasses import replace
+import io
 import os
 from pathlib import Path
+import socket
 import subprocess
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -12,10 +15,12 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_records as records, execution_identity, queue_place
 from scripts.build_queue import admission_client as client, admission_protocol as wire, first_step, placement
 from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_queue.admission_test_support import FakeClock
 from scripts.build_queue.test_placement import (
-    PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate, mac_linux_candidate,
-    placement_request, publish_candidate,
+    PlacementFixture, adopt_assignment, assignment_for, consume_guest_permission, consume_permission, guest_gate,
+    local_candidate, mac_linux_and_natedev_request, mac_linux_candidate, placement_request, publish_candidate,
 )
+from scripts.copies import copies
 from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import command_job
@@ -56,6 +61,92 @@ def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "o
 
 
 class FirstStepTests(unittest.TestCase):
+    def consumed_guest_gate(self, fixture: PlacementFixture) -> first_step.FirstStepAdmission:
+        request = mac_linux_and_natedev_request(fixture)
+        owner = fixture.fixture_owner(os.getpid(), "owner-start")
+        request = replace(request, owner=replace(request.owner, pid=owner.pid, start_time=owner.start_time),
+                          run=wire.RunIdentity(owner.pid, owner.start_time))
+        _ = publish_candidate(fixture, request)
+        assignment = assignment_for(fixture, request)
+        granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+        self.assertIsInstance(granted, wire.FirstAuthorization)
+        grant = wire.Assignment(assignment)
+        path = fixture.root / "assignment.json"
+        client.write_assignment(path, grant)
+        return first_step.FirstStepAdmission(SlotQueuePosition(request.episode, request.since),
+                                            first_step.GatePlacement(grant, request), path)
+
+    def test_copies_gate_step_closes_an_old_branch_without_a_completion_report(self) -> None:
+        with PlacementFixture() as fixture:
+            admitted = self.consumed_guest_gate(fixture)
+            assignment = client.read_assignment(admitted.assignment_file).assignment
+            args = copies.CopyArguments(repo=str(fixture.root), targets="mac-linux")
+            child = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, 0))
+            with (fixture.serving(), mock.patch.dict(os.environ),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
+                  mock.patch.object(copies, "subprocess", SimpleNamespace(run=child))):
+                self.assertEqual(copies.run_gate_step(args, GATE_COMMAND), 0)
+            child.assert_called_once()
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            saved = fixture.server.assignments[key]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            status = saved.terminal_report
+            assert isinstance(status, placement.TerminalAttemptReport), status
+            self.assertEqual(status.outcome, placement.AttemptCompleted(0))
+            self.assertEqual(status.path, placement.DispatchPathSettled())
+
+    def test_guest_owner_end_retries_until_the_queue_answers(self) -> None:
+        with PlacementFixture() as fixture:
+            admitted = self.consumed_guest_gate(fixture)
+            assignment = client.read_assignment(admitted.assignment_file).assignment
+            clock = FakeClock()
+            timeouts: list[float] = []
+
+            def connect_after_refusal(timeout: float) -> socket.socket:
+                timeouts.append(timeout)
+                if len(timeouts) == 1:
+                    raise ConnectionRefusedError("fixture queue is down")
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(timeout)
+                connection.connect(str(fixture.socket_path))
+                return connection
+
+            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 5)
+            timeout = records.read_memory_config().query_timeout_seconds
+            with (fixture.serving(), mock.patch.object(client, "CLOCK", clock),
+                  mock.patch.object(client, "_connect", side_effect=connect_after_refusal)):
+                self.assertIs(admitted.run_gate(lambda: result), result)
+                self.assertEqual(len(timeouts), 2)
+                self.assertEqual(timeouts[0], timeout)
+                self.assertGreater(timeouts[1], 0)
+                self.assertLess(timeouts[1], timeout)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            saved = fixture.server.assignments[key]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport), saved
+            self.assertEqual(saved.terminal_report.outcome, placement.AttemptCompleted(5))
+
+    def test_guest_owner_end_deadline_warns_once_and_preserves_the_child_status(self) -> None:
+        with PlacementFixture() as fixture:
+            admitted = self.consumed_guest_gate(fixture)
+            assignment = client.read_assignment(admitted.assignment_file).assignment
+            clock = FakeClock()
+            timeout = records.read_memory_config().query_timeout_seconds
+            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 7)
+            with (mock.patch.object(client, "CLOCK", clock),
+                  mock.patch.object(client, "_connect", side_effect=FileNotFoundError("fixture queue is down")) as connect,
+                  mock.patch.object(client, "cancel_placement") as cancel,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertIs(admitted.run_gate(lambda: result), result)
+                admitted.close()
+            cancel.assert_not_called()
+            self.assertGreater(connect.call_count, 1)
+            self.assertEqual(clock.monotonic(), timeout)
+            self.assertEqual(errors.getvalue().splitlines(),
+                             [f"Mac Linux gate owner end report failed: no answer in {timeout:g} s"])
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+
     def test_explicit_gate_targets_override_the_claude_default(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
