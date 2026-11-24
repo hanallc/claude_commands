@@ -2741,7 +2741,7 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
 
                 limit = memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS
-                fixture.clock.advance(limit if proof_late else limit - 1)
+                fixture.clock.advance(limit if proof_late else limit - 2)
                 write_guest_no_start_proof(fixture, claim)
                 worker = fixture.server.host_readers[key].worker
                 assert isinstance(worker, ManualEvidenceWorker)
@@ -2803,6 +2803,38 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(fixture.server.handle_request(request), [reply])
             self.assertIsInstance(fixture.server.assignments[attempt].state, placement.ClosedAssignment)
             self.assertEqual(assignment_for(fixture, other).destination, guest.destination)
+
+    def test_reused_episode_times_out_when_the_first_marker_clear_check_is_late(self) -> None:
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(service, "send_admission_alert", return_value=True)):
+            guest, claim, key = self.cancel_unindexed_guest_owner(fixture)
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            pending = claim_state.pending_start_path(claim_state.state_paths(guest.destination.target),
+                claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt))
+            pending.parent.mkdir(parents=True)
+            pending.touch()
+            request = replace(mac_linux_and_natedev_request(fixture, natedev=False), episode=guest.episode)
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+
+            limit = memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS
+            fixture.clock.advance(limit - 1)
+            write_guest_no_start_proof(fixture, claim)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+
+            fixture.clock.advance(2)
+            pending.unlink()
+            _ = fixture.run_pass()
+            _ = publish_candidate(fixture, request)
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.DispatchStatus), reply
+            self.assertEqual(reply.assignment, placement.UnknownAssignment(guest.episode, ""))
+            self.assertEqual(reply.retry, placement.DoNotRetry(reply.reason))
+            self.assertIn(guest.attempt, reply.reason)
+            self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("cancelled"))
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
 
     def test_reused_episode_expires_at_its_own_deadline_after_restart(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
