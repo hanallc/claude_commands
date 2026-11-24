@@ -883,7 +883,7 @@ The paired trial replaces the size/start trials.
 The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
-## Cloud gate region fallback
+## Cloud gate placement and region retries
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
@@ -894,9 +894,11 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after all capacity choices refuse.
-With `enabled=off` in `cloud_gate.conf`, merge gates and targeted tests without a placement assignment run on natedev.
-For each request, the route reads this setting before it reads deployment state or calls AWS.
+Direct gate placement uses natedev and `mac-linux`.
+A merge gate or targeted test with a prepared copy handoff from `copies.py run` can use the cloud route without a placement assignment.
+The cloud route reserves a queue slot before it requests a box.
+The route checks `enabled` in `cloud_gate.conf` before it reads deployment state and again before a new launch.
+With `enabled=off`, a gate without a placement assignment runs its tests on natedev.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
@@ -905,9 +907,10 @@ The route saves the interruption count and the next choice in `current.json` bef
 Resume restores both values, so a crash cannot reset the retry budget.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
-The final natedev fallback row includes the interruption count when retries or capacity choices end.
+The final fallback row includes the interruption count when retries or capacity choices end.
+A gate without a placement assignment runs the tests on natedev after a final cloud refusal.
 A complete gate failure keeps its failed result and gets no retry.
-An unconfirmed termination or another controller error retains the existing fallback behavior.
+An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -954,7 +957,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-The controller then uses the normal natedev fallback.
+If the cloud route returns a final refusal, a gate without a placement assignment uses the natedev fallback.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
