@@ -107,7 +107,10 @@ A second decline from the guest in the same run ends the guest for that run, so 
 If no named machine remains, the gate step stops with "Gate placement blocked".
 A refused placement during the retry stops the gate step with "Gate placement blocked".
 A failure after the first test started is not placed again: the gate fails.
-`copies.py run` with named gate targets does not place the gate again yet.
+`copies.py run` does not place a gate again after a guest decline.
+Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
