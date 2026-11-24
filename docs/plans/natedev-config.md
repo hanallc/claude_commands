@@ -470,7 +470,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Acceptance gate:**
 - `test_config_form.py` passes, and `COMMENT_LIMIT_FILES` is gone.
 - `git diff -U0 -- config/` shows only added comment and blank lines.
-- A script checks each stored value of each changed stem against its limit line, host overrides included, with Git recovery off. (`check_comment_limits` checks only that a limit line exists, and a `conf.read` with recovery can return an older value.) `config/models.conf` is checked by section through the model registry reader. The proof also covers the four Phase 10 keys: `head_stall.times_tail_bytes`, `disk.min_outside_directory_bytes`, `report.edited_crate_max_crates`, `nextest.summary_scan_bytes`.
+- A script checks each stored value of each changed stem against its limit line, host overrides included, with Git recovery off. (`check_comment_limits` checks only that a limit line exists, and a `conf.read` with recovery can return an older value.) `config/models.conf` is checked by section through the model registry reader. The proof also covers the four Phase 10 keys: `head_stall.times_tail_bytes`, `disk.min_outside_directory_bytes`, `report.edited_crate_max_crates`, `nextest.summary_scan_bytes`; and the five Phase 11 keys: `context_usage` `transcript.tail_bytes`, `notify` `pushover.max_source_chars`, `waste_watch` `alert.max_wait_share`, `codex_pacer` `sampling.max_step_percent`, `mac_linux` `ssh.connect_attempts`.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
@@ -502,54 +502,38 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Ruled out:** a command-line argument for the Summary scan limit. It changes the `run TAIL SUMMARY COMMAND...` form, and macOS gets no copy of the script for each run.
 
 ### Phase 11 — Message and notice literals to config  · status: done
-**Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** Each `tunable` literal of the message and notice batch is a commented, limit-checked key in `config/`, read at use, with the same value, and its allow list row is gone.
-
-**Spec:**
-
-0. **Names.** The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST). The batch merges with them; nate reviews the names later, and a later change is a rename.
-1. Batch folders: `scripts/notify`, `scripts/message`, `scripts/hooks`, `scripts/usage`, `scripts/whoami`, `scripts/maintenance`. Examples from P807: `scripts/notify/auto_silence.py:54` `JOB_TIMEOUT_SECONDS = 300`. `scripts/notify/pushover.py:79` `TITLE_MAX` is `external` and stays.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply.
-3. The code reads the key with `conf.read(stem)` at use. Delete the constant.
-4. Values stay the same.
-5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
-7. Hooks run on each tool call. A hook reads its key once for each run, never at import.
-8. **Bounds.** Both context hooks use `scripts/hooks/context_usage.py`. Give `context_usage.transcript.tail_bytes` the limit `# whole: 1..4194304`, so the first scan is never larger than the 4 MiB `TAIL_BYTES_RETRY`, which stays in the code. Each hook reads the key on the host that runs it. Give `notify.pushover.max_source_chars` an upper bound before it reaches the source slices.
-9. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
-10. **Main merge literal.** Main brought `scripts/build_targets/mac_linux.py` `CONNECT_ATTEMPTS = 3` after the build tool batch. It moves in this phase to `config/mac_linux.conf` `ssh.connect_attempts=3` (`# whole: 1..`), read by `read_settings` (bob's working name, showrunner 11-24 00:50 PST). `SSH_CONNECT_TIMEOUT_SECONDS` and `CONNECT_RETRY_SECONDS` are wait limits and stay in the code. Main also left no blank line before the `excluded_notice_seconds.mac` limit line in `config/build_targets.conf`; add it.
+- Five keys replace the batch constants, with the same values. `context_usage` `transcript.tail_bytes=524288` (`whole: 1..4194304`). `notify` `pushover.max_source_chars=80` (`whole: 1..256`). `waste_watch` `alert.max_wait_share=0.10` (`range: 0..1`, new file). `codex_pacer` `sampling.max_step_percent=3.0` (`range: 0..100`, new file). `mac_linux` `ssh.connect_attempts=3` (`whole: 1..`, bob's working name).
+- `context_usage.latest_reading(path, configuration)` scans `transcript.tail_bytes`, then the 4 MiB `TAIL_BYTES_RETRY`. An unusable size skips only the first scan. Each hook run makes one `conf.read("context_usage")`.
+- `pushover.parent_source` and `sender_name` read `pushover.max_source_chars` at use. `post_message` refuses an unusable sender limit: it logs `REFUSED_BEFORE_SENDING: <diagnostic>`, prints one stderr line and returns 2. It builds the footer once and cuts the body to `MESSAGE_MAX - len(footer)`. `cancel` calls `parent_source` only when no `--source` is given.
+- `stop_resume._alert_pending_moves` catches `conf.Unusable` from `phone_message_limit` and returns the move results.
+- `waste_watch.watch()` reads `alert.max_wait_share` once per pass and passes it to `UnitUsage.wait_alert(max_wait_share)`. `main` reports `conf.Unusable` with exit 1. `codex_pacer` ingest reads `sampling.max_step_percent` only when readings exist; backfill catches `conf.Unusable`.
+- `mac_linux.read_settings` reads `ssh.connect_attempts` into `GuestSettings.connect_attempt_limit`. `retry_guest_connect(..., attempt_limit=)` and `GuestEndWait` use it. `SSH_CONNECT_TIMEOUT_SECONDS` and `CONNECT_RETRY_SECONDS` are wait limits and stay in code.
+- The batch rows and `_MESSAGE_BATCH` left `scripts/lib/config_form_exceptions.py`. `config/build_targets.conf` has a blank line before `excluded_notice_seconds.mac`.
 
 **Files:**
-- `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
-- `scripts/**/*.py` — the source files of the batch rows, and their tests
-- `config/*.conf` — the stems that get keys
-- `docs/as-built/usage-ledger.md` — names a moved constant
-- `scripts/build_targets/mac_linux.py`, `scripts/build_targets/test_mac_linux.py`, `config/mac_linux.conf`, `config/build_targets.conf` — the main merge literal and blank line
+- `config/context_usage.conf`, `config/notify.conf`, `config/waste_watch.conf`, `config/codex_pacer.conf`, `config/mac_linux.conf` — the five keys
+- `scripts/hooks/context_usage.py`, `scripts/hooks/post-tool-use-context-usage.py`, `scripts/production/stall_watch.py` — the scan size
+- `scripts/notify/pushover.py`, `scripts/agents/stop_resume.py` — the sender limit and its refusal
+- `scripts/usage/waste_watch.py`, `scripts/whoami/codex_pacer.py` — the wait share and the pacer step
+- `scripts/build_targets/mac_linux.py` — the attempt limit
+- `scripts/lib/config_form_exceptions.py` — batch rows removed
+- `config/README.md`, `docs/as-built/message-clarity.md`, `docs/as-built/usage-ledger.md`, `docs/as-built/mac-test-offload.md` — the keys and their rules
+- `scripts/hooks/test_showrunner_compaction.py`, `scripts/notify/test_pushover.py`, `scripts/notify/test_silence.py`, `scripts/agents/test_stop_resume.py`, `scripts/usage/test_waste_watch.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/build_targets/test_mac_linux.py` — unusable-limit and `CONF_DIR` fixture tests
+- `scripts/hooks/test_push_gate.py`, `scripts/whoami/test_mac_token_delivery.py`, `scripts/hooks/test_stop_direct_continue.py`, `scripts/production/test_hand_made_guest.py`, `scripts/build_queue/test_placement.py`, `scripts/production/test_stall_watch.py` — literal fixtures carry the new keys
 
-**Workers:** 2 writers — split by reader.
-- `impl` — the context hooks (`scripts/hooks/context_usage.py` and its callers) and Pushover (`scripts/notify/pushover.py`), their tests and stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — waste watch (`scripts/usage/waste_watch.py`) and the Codex pacer (`scripts/whoami/codex_pacer.py`), their tests and stems, and `docs/as-built/usage-ledger.md`
+**Binds later work:** the five key names and limits. The follow-up "Message limit follow-ups" makes `parent_source` never raise and keeps the context alerts when `alert.max_wait_share` is unusable.
 
-**State:** none
+**Gotchas:**
+- A key added to an existing stem must be in every literal test fixture of that stem. `scripts/production/fixture_conf_keys.py` names each fixture that lacks it.
+- A required key in a hook, alert or `finally` path changes failure behavior. Handle `conf.Unusable` at use, or the raise hides other results.
+- `runner_commit` (`scripts/build_targets/mac_linux.py`) refuses an uncommitted change under `scripts/`, so the hand-made guest tests run only on a committed tree.
 
-**Constraints from prior phases:**
-- Phase 3 wrote the literal inventory; each `tunable` row of batch "Message and notice literals to config" holds the proposed stem, key, limit line.
-- The batch has four rows: `scripts/hooks/context_usage.py`, `scripts/notify/pushover.py`, `scripts/usage/waste_watch.py`, `scripts/whoami/codex_pacer.py`. No row is in `scripts/message` or `scripts/maintenance`; Phase 7 owns the `scripts/maintenance` TOML readers.
-- Phase 4 moved `scripts/notify/review.py` to `conf.read("notify")`. `config/notify.conf` has `# range: 5e-324..` above `REVIEW_TIMEOUT_SECONDS`.
-- `scripts/message/notifier.sh` is a zsh script: check it with `zsh -n`, not `bash -n`.
-- Phase 4: resolve each config path at use; a module-level path constant goes stale under a test's `CONF_DIR`.
-- Phase 10: a test spy on a changed function (`test_moments.py`) and current docs that named moved constants broke after the move. Search for both before the edit round ends. A size key gets an upper bound when the code passes it to a read or a slice (`readline` overflows at 2**63).
-
-**Acceptance gate:**
-- Each changed module's tests pass, and each test module with a changed reference passes.
-- `test_config_form.py` passes, and the allow list has no `tunable` row of this batch.
-- `context_usage.transcript.tail_bytes` has the limit `# whole: 1..4194304`, and `notify.pushover.max_source_chars` has an upper bound.
-- A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:**
+- A host override limited by the base key's limit line: an add-on held for nate, because it adds a refusal.
+- A test of the offload doc wording: it would compare constants.
 
 ### Phase 12 — AWS and review tool literals to config  · status: todo
 **Depends on:** Phase 3
@@ -568,7 +552,9 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
 6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 7. **Saved Review items.** `read_submission()` reads saved items with the same image count and evidence limits as new submissions, so a lower `MAX_IMAGES` makes a saved two-image item fail to load. Apply the configured limits to new submissions only. Keep saved submissions readable under the limits in effect before this phase. Keep the saved JSON form. In the domain record, use `NoBugPageState` for absent page state in place of `BugPageState | None`.
+   - The same rule covers capture work accepted before a limit drops. `review_submissions.read_attached_page_screenshot()` (line 1849) applies the current image byte cap during restart recovery, and `_with_screenshot()` (line 1905) applies the current image count during attachment. A screenshot or image set that passed intake is never refused later because a limit went down. Keep a bound on each file read; add no number in code (P807 rule 7). Tests: send an item with a pending capture, lower the byte cap and the image count, then restart recovery and attachment both succeed.
 8. **Review request limits.** `scripts/review_links/serve.py` derives `MAX_NEW_ITEM_BODY` at import from three moved constants and uses it before `rfile.read(size)`. `scripts/review_links/review_submissions.py` imports three moved constants for image decoding. The dialog also sends these limits to the browser. Read one Review limit set for each request, and use it for the body size, the parse and the image decode. Cap the derived body size before the read. Render the dialog from the same keys.
+   - **Unusable limits.** `serve.py` catches `ValueError` around the New item parse and answers `Invalid New item JSON.` (line 1687). `conf.Unusable` is a `ValueError`, so a limit fault would look like a bad request. Read the limit set outside that handler. When a limit is unusable, answer 503 with a message to try again, keep the draft in the dialog, and log the key and the diagnostic on the server. Test a valid request with an unusable limit: the reply is 503, the draft stays, and the log names the key.
 9. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
 
 **Files:**
@@ -589,11 +575,15 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - The batch rows sit in `scripts/aws_target/gpu_size_trial.py`, `scripts/review_links/new_item_dialog.py` (10 rows), `scripts/review_links/serve.py`, `scripts/screen_record/screen_record.py` (2), `scripts/shot_report/transcripts.py`, `scripts/style/style_ledger.py` and `scripts/test_times/module_cost.py`. No row is in `scripts/aws_target/config.py`, which Phase 5 changes for `AWS_TARGET_CONFIG`; this phase does not wait for Phase 5.
 - Phase 4: resolve each config path at use; a module-level path constant goes stale under a test's `CONF_DIR`.
 - Phase 10: a test spy on a changed function and current docs that named moved constants broke after the move. A size key gets an upper bound when the code passes it to a read or a slice.
+- Phase 11: a key added to an existing stem must be in every literal test fixture of that stem. `scripts/production/fixture_conf_keys.py` finds the fixtures that lack it; a test outside the batch folders can need the key.
+- Phase 11: a read in a hook, alert, request handler, `finally` block or batch loop handles `conf.Unusable` at use. It falls back to a step that needs no value, or it refuses with a logged reason. A raise must not hide other results. Forms: `context_usage.latest_reading`, `pushover.post_message`.
 
 **Acceptance gate:**
 - Each changed module's tests pass, and each test module with a changed reference passes.
 - `test_config_form.py` passes, and the allow list has no `tunable` row of this batch.
-- A saved two-image Review item opens after the intake image limit drops to one.
+- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` reports 0 missing keys. Each stem owner reads the fixtures it reports as not checked.
+- A saved two-image Review item opens after the intake image limit drops to one. Restart recovery and attachment of a pending capture succeed after the byte cap and the image count drop.
+- A valid New item request with an unusable limit gets a 503, keeps the draft, and the server log names the key.
 - An oversized request is refused before its body is read. `test_serve.py` keeps its body limit, total image limit and URL slice cases.
 - A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
@@ -618,7 +608,8 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 7. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 8. **Unused reader.** Before the literal moves, after the main merge of item 0: confirm that `scripts/agents/inventory.py` `last_tool_call()` still has no caller. Then remove it, its `_LAST_STEP_BYTES` constant and its inventory row. Do not add `production.inventory.last_step_scan_bytes`.
 9. **Bounds.** Give the `scripts/production/gate.py` `RERUN_LIMIT` key the lower bound 0, and keep the shipped value 8: `test_gate_holds.py` sets it to zero to prove hold recovery with ordinary reruns off; keep that fixture. Bound `worker.history_bytes` (`scripts/production/worker.py` `WORKER_HISTORY_BYTES`) so that `read(limit + 1)` stays in range. Give the nightly diagnostic and board note slices explicit upper bounds.
-10. **Guests.** Selected suites reach the rerun policy in the Mac Linux and AWS guest gates. Prove with a test that each guest gate route reads the candidate's `gate.conf`.
+   - **Unusable limits.** `gate.py` uses the rerun limit after modules report results, and the nightly text is cut after the red result is saved. Read the rerun limit once when the gate starts, before any module runs. Ordinary reruns, memory retries and hold recovery use that one value. An unusable rerun limit stops the gate start with the diagnostic, and no module runs. An unusable nightly display limit never changes the saved red result or its assignment path; the note then shows the diagnostic in place of the cut text. Tests: an unusable rerun limit runs no module; an unusable nightly display limit keeps the red result and its assignment.
+10. **Guests.** Selected suites reach the rerun policy in the Mac Linux and AWS guest gates. Prove with a test that each guest gate route reads the candidate's `gate.conf`. The tests go in `scripts/build_targets/test_mac_linux.py` and `scripts/aws_target/test_cloud_gate.py`.
 11. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
 
 **Files:**
@@ -630,10 +621,11 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/production/the_list.py`, `scripts/production/test_the_list.py` — only if the writer breaks the blank-line form
 - `scripts/agents/inventory.py` — `last_tool_call()` removed
 - `scripts/production/test_gate_holds.py`, `scripts/production/test_gate_suites_reruns.py`, `scripts/production/test_gate_suites_types.py`, `scripts/production/test_worker.py`
+- `scripts/build_targets/test_mac_linux.py`, `scripts/aws_target/test_cloud_gate.py` — the guest gate route tests of Spec item 10
 - `docs/as-built/merge-gate-and-test-speed.md`, `docs/plans/builds-natest.md` — name moved constants
 
 **Workers:** 2 writers — split by folder. Before edits start, the director assigns each destination stem to one slot in the prompts.
-- `impl` — `scripts/production`, `scripts/herdr`, `config/the_list.conf`, `scripts/lib/test_config_form.py`, every edit to `scripts/lib/config_form_exceptions.py`, and the stems assigned to this slot; hub: `scripts/lib/config_form_exceptions.py` (`test` sends its row removals to `impl`)
+- `impl` — `scripts/production`, `scripts/herdr`, `config/the_list.conf`, `scripts/lib/test_config_form.py`, every edit to `scripts/lib/config_form_exceptions.py`, both guest gate tests (`scripts/build_targets/test_mac_linux.py`, `scripts/aws_target/test_cloud_gate.py`), and the stems assigned to this slot; hub: `scripts/lib/config_form_exceptions.py` (`test` sends its row removals to `impl`)
 - `test` opens as impl — `scripts/direct`, `scripts/agents`, `scripts/accounts`, `scripts/worktree`, `scripts/bevy_upgrade`, `scripts/history`, `scripts/orphans`, `scripts/prioritize`, `scripts/lib` except `scripts/lib/test_config_form.py` and `scripts/lib/config_form_exceptions.py`, their tests, and the stems assigned to this slot
 
 **State:** none
@@ -644,11 +636,16 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 5 changed `scripts/direct/assign.py`, `scripts/direct/claude_worker.py` and `scripts/production/staff.py` for `CONF_DIR`.
 - The `TAIL_BYTES` row of `scripts/production/hand_made_limit.py` belongs to the `config/cli.conf` phase (Phase 6), not to this batch.
 - Phase 10: a test spy on a changed function and current docs that named moved constants broke after the move. A size key gets an upper bound when the code passes it to a read or a slice.
+- Phase 11: a key added to an existing stem must be in every literal test fixture of that stem. `scripts/production/fixture_conf_keys.py` finds the fixtures that lack it; a test outside the batch folders can need the key.
+- Phase 11: a read in a hook, alert, notice, `finally` block or batch loop handles `conf.Unusable` at use. It falls back to a step that needs no value, or it refuses with a logged reason. A raise must not hide other results. Forms: `context_usage.latest_reading`, `pushover.post_message`.
+- Phase 11: the controller's `GuestSettings` (`scripts/build_targets/mac_linux.py` `read_settings`) owns `ssh.connect_attempts`; the candidate commit owns `gate.conf`. `runner_commit` (`mac_linux.py:345`) refuses an uncommitted change under `scripts/`, so the hand-made Mac Linux guest tests run only on a committed tree.
 
 **Acceptance gate:**
 - Each changed module's tests pass, and each test module with a changed reference passes.
 - `test_config_form.py` passes. The allow list has no `tunable` row of this batch and no blank-line row.
+- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` reports 0 missing keys. Each stem owner reads the fixtures it reports as not checked.
 - `test_gate_holds.py` passes with its zero rerun fixture. A test proves that the Mac Linux and AWS guest gate routes read the candidate's `gate.conf`.
+- An unusable rerun limit runs no module. An unusable nightly display limit keeps the saved red result and its assignment.
 - `last_tool_call()` and its inventory row are gone, and no `last_step_scan_bytes` key exists.
 - A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
@@ -670,25 +667,29 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
    2. The move is one command in `scripts/accounts/accounts.py`. The live check runs it after both machines pull and every long-lived process that reads accounts restarts. Under the old lock it renames the old file to the new path, then deletes `config/accounts.lock`.
    3. A reader that caches the role map reads it again when the live path changes.
 
-   Tests: the same worker account selection before and after the move; before the move a write takes the old lock and writes the old path; after the move a write takes the new lock and writes the new path; a writer that waits on the old lock during the move resolves the new path after it.
-4. **Cleanup.** After the switch, no old file stays in `config/`. Remove `config/accounts.json` from `.gitignore` (line 23 on the plan base) when nothing writes it.
-5. **Format rule.** The form test's format check also fails on a `.json` or `.lock` runtime file in `config/` on disk that is not tracked. Test: a fixture Git checkout with an untracked `config/x.json` and `config/x.lock`; the repository check finds both by itself, with no path given by the test.
-6. **Live check.** After the merge and the Mac pull, the director checks on natedev and the Mac that the accounts table reads, the worker account selection is unchanged, and no `config/accounts.json`, `config/accounts.lock` or `config/showrunners.lock` remains.
+   4. Resolve the path inside the locks. `scripts/accounts/role_map.py` picks the writer path before it takes `_groups_lock()` and `worker_names.roles_lock()` (line 639), so a writer that waits during the move keeps the old path. The lock-free read in `_local_role_map()` (line 457) can pick the old path, lose the rename race and return an empty role map. Resolve the writer path after the locks are taken. A lock-free read that finds no file resolves the live path again before it reads the file as missing.
+
+   Tests: the same worker account selection before and after the move; before the move a write takes the old lock and writes the old path; after the move a write takes the new lock and writes the new path; a writer that waits on the old lock during the move resolves the new path after it; a lock-free read that loses the rename race returns the moved role map; a late process that opens the old lock path after the move does not make `config/accounts.lock` live again.
+4. **Cleanup.** After the switch, no old file stays in `config/`. Remove `/config/accounts.json` (line 23 on the plan base) and `/config/accounts.lock` (line 24) from `.gitignore` when nothing writes them.
+5. **Format rule.** The form test's format check also fails on a `.json` or `.lock` runtime file in `config/` on disk that is not tracked. Test: a fixture Git checkout with an untracked `config/x.json` and `config/x.lock`; the repository check finds both by itself, with no path given by the test. The scan also finds such a file when `.gitignore` names it.
+6. **Live check.** The two machines read accounts state in two ways. The Mac reads worker selection from natedev (`ssh_role_map`) or its saved cache. Historical account resolution reads the machine-local `home_cutovers` of `accounts.json` (`scripts/accounts/accounts.py:2754`). So the move takes the full local document on each machine where it exists. After the merge and the Mac pull, the director checks on natedev and the Mac that the accounts table reads, the worker account selection is unchanged (remote selection on the Mac), a historical account label resolves as before, and no `config/accounts.json`, `config/accounts.lock` or `config/showrunners.lock` remains.
 
 **Files:**
 - `scripts/accounts/accounts.py`, `scripts/accounts/worker_names.py` — the new paths; their tests also change
+- `scripts/accounts/role_map.py`, `scripts/accounts/test_role_map.py` — the path resolved inside the locks, and the race tests
 - `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/codex_test_support.py`
 - `.gitignore`
 - `scripts/lib/test_config_form.py`, `scripts/lib/config_form_exceptions.py`
+- `docs/accounts.md`, `docs/as-built/accounts.md` — the new state paths
 
 **Workers:** 2 writers — the account state switch and the format rule.
-- `impl` — `accounts.json` and `accounts.lock`: `scripts/accounts/` files, the test support files, `.gitignore`
+- `impl` — `accounts.json` and `accounts.lock`: `scripts/accounts/` files (with `role_map.py`), the test support files, `.gitignore`, `docs/accounts.md`, `docs/as-built/accounts.md`
 - `test` opens as impl — the untracked runtime file rule and its fixture checkout in `scripts/lib/test_config_form.py`; hub: `scripts/lib/config_form_exceptions.py` (`impl` messages this slot for a row)
 
 **State:** moves `accounts.json` and `accounts.lock` on natedev and the Mac; deletes a stale `config/showrunners.lock`.
 
 **Constraints from prior phases:**
-- Phase 7 moved `config/accounts.toml` `[trust] folders` to `config/accounts.conf` `trust.folders`.
+- Phase 7 moves `config/accounts.toml` `[trust] folders` to `config/accounts.conf` `trust.folders`. Phase 7 waits for nate's go, and this phase does not depend on it. If Phase 7 is not done when this phase starts, `trust.folders` is still in `config/accounts.toml`. If both phases run at the same time, they share `scripts/accounts/accounts.py`: the director gives that file to one phase at a time.
 - Phase 1 format check reads tracked files only; Spec item 5 adds the untracked runtime file case. `check_format(root, files)` judges only the paths it gets, and `test_repository_form` passes `git ls-files -z config/`. The untracked case needs its own file list from the `config/` folder on disk, and its own planted row in `test_planted_violations`.
 
 **Acceptance gate:**
@@ -711,6 +712,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 1. **window.** `config/context_deferral.conf` keeps one row, `window=200`, with its comment and the limit line `# whole: 1..`. The key name and the value stay.
 2. **Patterns.** The `action`, `marker`, `state`, `later` and `exclude` rows move with their comments, in order and byte for byte, to the data file `config/context_deferral_patterns.txt` (rule 10). Each line is `<kind>: <regular expression>`; a kind can repeat.
 3. **Reader.** `scripts/hooks/stop-context-deferral.py` (line 44 reads `conf.path("context_deferral")` by hand) reads `window` with `conf.read("context_deferral").whole("window")` at use. It parses the pattern file as data from the same folder (`conf.directory()`), so a test sets both with `CONF_DIR`. The hook runs on each stop: time it before and after, and name the added cost in the reply.
+   - **Config faults.** Today any failure permits the stop (`main` at line 123). A `window` that `conf.read` recovers from the committed file applies, as for every conf key. An unusable `window` or an unreadable pattern file permits the stop, as today. Test each case.
 4. **Allow lists.** Remove the `FORMAT_FILES` row of `config/context_deferral.conf`. Replace the `stop-context-deferral.py` reader row with a `PERMANENT` row that reads `context_deferral_patterns.txt` as data. Add `config/context_deferral_patterns.txt` to `DATA_FILES`.
 5. **README.** Update the `## context_deferral.conf` section of `config/README.md` (line 159), and name the data file.
 6. **Tests.** `scripts/hooks/test_stop_context_deferral.py` writes `context_deferral.conf` with `write_config_fixture` and a pattern file in `CONF_DIR`. The same transcripts give the same decisions before and after.
@@ -776,3 +778,45 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Gotchas:** over SSH, stdout and stderr have no order. `offload.py` merges them and treats output after `mac_exit=` as `MISSING_MAC_STATUS`. A Mac-side diagnostic goes on the status stream before the status line.
 
 **Ruled out:** a cap in code on the edited-crate maximum: the limit line `whole: 1..48` holds the bound.
+
+### Phase 18 — Message limit follow-ups  · status: todo
+**Depends on:** Phase 11
+
+#### Work Order
+
+**Goal:** An unusable `notify` sender limit no longer stops an emergency push cancel or a push sent with no `--source`, and an unusable `waste_watch` wait-share limit no longer stops the context alerts.
+
+**Spec:**
+
+1. **Audit source.** `scripts/notify/pushover.py` `parent_source()` (line 176) cuts the parent command to `pushover.max_source_chars`. Since Phase 11 it raises `conf.Unusable` when that limit has no usable value. Two callers then fail before any log row: `cancel` (line 699) when no `--source` is given, and the post path in `main` (line 408).
+   - `parent_source()` never raises `conf.Unusable`. When the limit is unusable, it returns `parent pid <ppid>` and prints the conf diagnostic on stderr. Add no number (P807 rule 7).
+   - `cancel KEY` with an unusable limit and no `--source` still sends the cancel request and logs its outcome with source `parent pid <ppid>`.
+   - A post with no `--source` and an unusable limit reaches `post_message`, which refuses and logs it (Phase 11).
+2. **Context alerts.** `scripts/usage/waste_watch.py` `watch()` (line 384) reads `alert.max_wait_share` before the context alert check, which does not use that value. When the read raises `conf.Unusable`, the pass prints the diagnostic on stderr, sends no wait alert, and still sends each context alert. The command then exits 1, so the collector journal shows the fault.
+3. **Tests.** Each new test fails before the repair.
+   - `scripts/notify/test_pushover.py`: `cancel` with no `--source` and an unusable limit sends the cancel and logs it with source `parent pid <ppid>`. The post command with no `--source` and an unusable limit returns 2 and logs the refusal.
+   - `scripts/usage/test_waste_watch.py`: with an unusable `alert.max_wait_share`, a pass with a context-flagged thread sends the context alert, sends no wait alert, prints the diagnostic and exits 1.
+4. **Docs.** `docs/as-built/usage-ledger.md` (line 400) says when the watch reads `alert.max_wait_share`. Add the rule of item 2 in one STE sentence.
+
+**Files:**
+- `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py`
+- `scripts/usage/waste_watch.py`, `scripts/usage/test_waste_watch.py`
+- `docs/as-built/usage-ledger.md`
+
+**Workers:** 2 writers — split by module.
+- `impl` — `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py`
+- `test` opens as impl — `scripts/usage/waste_watch.py`, `scripts/usage/test_waste_watch.py`, `docs/as-built/usage-ledger.md`
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 11: `conf.Unusable` is a `ValueError`. It is raised only when the live value and the committed value both fail.
+- Phase 11: `post_message` refuses an unusable sender limit. It logs `REFUSED_BEFORE_SENDING: <diagnostic>` with the detail suffix, prints one stderr line and returns 2. `conf.diagnostics(report=False)` collects conf warnings for one print.
+- Phase 11: `watch()` reads `alert.max_wait_share` once per pass and passes it to `UnitUsage.wait_alert(max_wait_share)`; `alert_text(..., *, wait_alert)` takes the result. `main` reports `conf.Unusable` on stderr with exit 1.
+- Phase 11: tests write `notify.conf` and `waste_watch.conf` fixtures with `write_config_fixture` under `CONF_DIR`.
+
+**Acceptance gate:**
+- The new tests fail before the repair and pass after it.
+- `scripts/notify/test_pushover.py`, `scripts/notify/test_silence.py` and `scripts/usage/test_waste_watch.py` pass.
+- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
+- basedpyright reports zero errors and zero warnings on each changed Python file.
