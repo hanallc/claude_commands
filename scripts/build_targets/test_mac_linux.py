@@ -300,7 +300,7 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert os.environ['USER'] == os.environ['FIXTURE_GUEST_USER']
     assert not {'SSH_AUTH_SOCK', 'GH_TOKEN', 'XDG_CONFIG_HOME', 'CONF_DIR'} & os.environ.keys()
     assert os.cpu_count() == 2 and time_limit.seconds == int(os.environ['FIXTURE_RUN_SECONDS'])
-    assert module_time_limit_s == 3
+    assert module_time_limit_s == float(os.environ.get('FIXTURE_MODULE_SECONDS', '3'))
     assert checked_git(repo, 'show', 'origin/main:history.txt') == 'old source'
     assert int(checked_git(repo, 'rev-list', '--count', 'main', 'origin/main')) >= 2
     assert checked_git(repo, 'rev-parse', 'main') == os.environ['FIXTURE_EXPECTED_MAIN']
@@ -833,7 +833,8 @@ fi
 
     def route(self, scenario: str = 'pass', selected: AllModules | TreeSelection = ALL_MODULES,
               gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED, *,
-              type_dirs: tuple[str, ...] = ()) -> GateRun | mac_linux.GuestNotStarted | str:
+              type_dirs: tuple[str, ...] = (),
+              module_time_limit_s: float | None = 3) -> GateRun | mac_linux.GuestNotStarted | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
         temporary_directory = tempfile.TemporaryDirectory
 
@@ -846,7 +847,7 @@ fi
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
               patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
-                                     module_time_limit_s=3, gate_job=gate_job, assignment=self.placed,
+                                     module_time_limit_s=module_time_limit_s, gate_job=gate_job, assignment=self.placed,
                                      type_dirs=type_dirs)
         self.assertEqual(self.git('for-each-ref', 'refs/mac-linux'), '')
         return result
@@ -2527,7 +2528,11 @@ fi
 
     def test_selected_modules_keep_subset_coverage(self) -> None:
         tree = self.git('rev-parse', 'HEAD^{tree}')
-        result = self.route(selected=TreeSelection(('scripts/fixture/test_second.py',), tree))
+        with (patch.dict(os.environ, {'FIXTURE_MODULE_SECONDS': '7'}),
+              patch.object(mac_linux, 'read_settings', wraps=mac_linux.read_settings) as settings):
+            result = self.route(selected=TreeSelection(('scripts/fixture/test_second.py',), tree),
+                                module_time_limit_s=None)
+        settings.assert_called_once()
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         self.assertEqual(result.coverage, ModuleCoverage.SUBSET)
