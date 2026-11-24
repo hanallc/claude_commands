@@ -213,13 +213,16 @@ An unavailable key permits placement and sends no source key with the copy.
 Changes to the queue files do not trigger a poll.
 The service publishes placement waits and grants after each pass.
 The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
-Each published placement reply carries its request digest and the current input event count.
-A poll uses the published reply when the request digest and input event count both match.
-Pending admission configuration and expired provider evidence prevent reuse.
-An ended claim holder also prevents reuse. The owner can then ask the service to close the attempt under the usual provider rules.
-Reuse needs no pass or state write if the caller version matches.
-Readings, process exits, configuration changes and queue changes advance the count.
-The pass timer also advances the count so the next pass can read the provider journal and check deadlines.
+Each published reply carries the request digest, the input event count, the provider evidence version, and the earliest applicable deadline.
+A poll can reuse a reply when the digest, count, and version match and the deadline is in the future.
+The deadline covers provider evidence expiry, attempt retries, guest backoff, and the hold for a remote start.
+The configuration watch checks admission configuration and the provider settings read by the pass.
+The service compares file stamps for settings outside the watched folder and for settings that use symbolic links.
+A pending configuration change or an ended claim holder prevents reuse.
+The owner can then ask the service to close the attempt under the usual provider rules.
+The reuse check needs no pass or state write.
+Readings, process exits, configuration changes, queue changes, and the pass timer advance the input event count.
+Provider workers change the evidence version when they store new evidence.
 `Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.

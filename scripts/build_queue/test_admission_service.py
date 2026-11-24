@@ -273,6 +273,104 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(repeated.eligibility[0].eligibility,
                                  placement.EvidenceNeeded("provider evidence expired"))
 
+    def test_placement_poll_reads_a_provider_settings_edit_before_the_next_pass(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
+        )
+
+        with PlacementFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            _ = backoff.write_text(str(fixture.clock.now() + 10))
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(mac_linux_candidate(),)))
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                initial, = fixture.connect(request).replies()
+                assert isinstance(initial, wire.PlacementWait)
+                self.assertEqual(initial.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+                self.assert_unchanged_placement_poll(fixture, request, initial)
+                _ = mac_linux_fixture(fixture, enabled="off")
+                fixture.clock.advance(0.25)
+                self.assertLess(fixture.clock.monotonic(), fixture.server.next_pass)
+                repeated, = fixture.connect(request).replies()
+                assert isinstance(repeated, wire.PlacementWait)
+                self.assertEqual(repeated.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_off"))
+
+    def test_placement_poll_rejects_expired_guest_backoff_before_the_next_pass(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
+        )
+
+        with PlacementFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=10)
+            backoff = mac_linux_fixture(fixture)
+            _ = backoff.write_text(str(fixture.clock.now() + 1))
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(mac_linux_candidate(),)))
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                initial, = fixture.server.handle_request(request)
+                assert isinstance(initial, wire.PlacementWait)
+                self.assertEqual(initial.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+                fixture.clock.advance(1)
+                self.assertLess(fixture.clock.monotonic(), fixture.server.next_pass)
+                repeated, = fixture.server.handle_request(request)
+                assert isinstance(repeated, wire.PlacementWait)
+                self.assertEqual(repeated.eligibility[0].eligibility,
+                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+
+    def test_placement_poll_rejects_an_expired_attempt_retry_before_the_next_pass(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, mac_linux_and_natedev_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=10)
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            closed, = fixture.server.handle_request(wire.ClaimFailure("guest-refusal", assignment, placement.MAC_LINUX_NO_ANSWER))
+            assert isinstance(closed, wire.DispatchStatus)
+            assert isinstance(closed.retry, placement.RetryAt)
+            fixture.clock.advance(closed.retry.deadline - fixture.clock.now() - 1)
+            _ = publish_candidate(fixture, request)
+            initial, = fixture.server.handle_request(request)
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(initial.eligibility[0].eligibility,
+                             placement.TemporaryExclusion("retry deadline has not passed"))
+            self.assertEqual(len(initial.retry_notices), 1)
+            fixture.clock.advance(1)
+            self.assertLess(fixture.clock.monotonic(), fixture.server.next_pass)
+            repeated, = fixture.server.handle_request(request)
+            assert isinstance(repeated, wire.Assignment), repeated
+            self.assertNotEqual(repeated.assignment.attempt, assignment.attempt)
+
+    def test_placement_poll_reads_evidence_stored_after_the_loop_reads_events(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request
+
+        with PlacementFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=10)
+            request = placement_request(fixture)
+            key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+            busy = placement.FreshHostEvidence(key, fixture.clock.now(), "host", placement.TemporaryExclusion("busy"))
+            host_reader = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                               getattr(fixture.server, "_host_evidence_reader"))
+            with mock.patch.object(service.HostEvidenceWorker, "_read"):
+                reader = host_reader(key, 10)
+            reader.publish(busy)
+            initial, = fixture.connect(request).replies()
+            assert isinstance(initial, wire.PlacementWait)
+            self.assertEqual(initial.eligibility[0].eligibility, busy.eligibility)
+            fixture.clock.advance(0.25)
+            receive = cast(Callable[[dict[int, service.ConnectionReadiness], bool], None],
+                           getattr(fixture.server, "_receive_requests"))
+
+            def store_then_receive(ready: dict[int, service.ConnectionReadiness], listener_ready: bool) -> None:
+                reader.publish(replace(busy, eligibility=placement.AllowedHost()))
+                receive(ready, listener_ready)
+
+            with mock.patch.object(fixture.server, "_receive_requests", side_effect=store_then_receive):
+                repeated, = fixture.connect(request).replies()
+            self.assertIsInstance(repeated, wire.Assignment)
+
     def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
 
