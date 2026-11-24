@@ -35,7 +35,7 @@ NAMED_OUTPUT_ADVICE = "leave out CARGO_TARGET_DIR"
 TARGET_LINK_ADVICE = ("a cargo build in a checkout that has a build folder makes the target link to that folder; "
                       + "make such a checkout with worktrees.py make <repo> <unit> <short-name>")
 TOOLS_REFUSAL = ("the run writes {bind}, which holds or is in the tools that check the run; use a worktree outside "
-                 + "those tools, leave out CARGO_TARGET_DIR, and give SCCACHE_DIR a folder outside those tools")
+                 + "those tools and leave out CARGO_TARGET_DIR")
 # The texts of the cargo errors that offline mode causes, from cargo 1.99.1 runs with CARGO_NET_OFFLINE=true:
 # a git source, a registry resolve, and a crate download.
 OFFLINE_TEXTS = (b"you are in the offline mode (--offline)", b"offline mode (via `--offline`)",

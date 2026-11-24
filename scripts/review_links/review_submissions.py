@@ -58,6 +58,11 @@ def is_draft_id(value: object) -> bool:
     return isinstance(value, str) and BROWSER_DRAFT_ID.fullmatch(value) is not None
 
 
+def submission_title(words: str) -> str:
+    """The title of a New item: its first line with words, at most 120 characters."""
+    return next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+
+
 @dataclass(frozen=True)
 class CurrentBrowserDraftToken:
     digest: str = field(repr=False)
@@ -2184,7 +2189,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
                                        reply_token_nonce=proof.nonce,
                                        image_digests=tuple((upload.reference.id, upload.digest) for upload in uploads))
-            title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+            title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []
             staging_started = False
 

@@ -1087,6 +1087,11 @@ SCRIPT = r'''(() => {
   return submittedDraft?.mode === 'edit-later';
  }
 
+ function canEditDuringRetry() {
+  return submittedDraft?.mode === 'retry' && submittedDraft.payload.page === 'list' &&
+    Boolean(submittedDraft.payload.defer_capture);
+ }
+
  function pendingPayload() {
   if (isRecovering()) return submittedDraft.payload;
  }
@@ -1101,7 +1106,7 @@ SCRIPT = r'''(() => {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
   const recovering = isRecovering();
-  const locked = recovering || (scheduled && !!savedItem);
+  const locked = (recovering && !canEditDuringRetry()) || (scheduled && !!savedItem);
   dialog.classList.toggle('scheduled-locked', scheduled && locked);
   words.readOnly = locked;
   includePage.disabled = sending || locked;
@@ -1165,11 +1170,14 @@ SCRIPT = r'''(() => {
  }
 
  function editDraft(event) {
-  if (sending || isRecovering()) return;
+  const retry = canEditDuringRetry();
+  if (sending || (isRecovering() && !retry)) return;
   if (event?.target.name === 'kind') {
-   discardCapture();
-   if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
-   ensureDraftId();
+   if (!retry) {
+    discardCapture();
+    if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
+    ensureDraftId();
+   }
    showRecipients();
    showBugPage();
    storeListDraft();
@@ -1182,6 +1190,7 @@ SCRIPT = r'''(() => {
    showOwnerReason();
   }
   if (event?.target === includePage && !pendingPayload()) startCapture();
+  if (retry) laterDraft = {...editSnapshot(), id: undefined};
   showSentDetails();
   setError('');
   updateSend();
@@ -1198,7 +1207,7 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
-  if (sending || isScheduled() || isRecovering()) return;
+  if (sending || isScheduled() || (isRecovering() && !canEditDuringRetry())) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -1403,7 +1412,8 @@ SCRIPT = r'''(() => {
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
   const data = visiblePageData();
   return {
-   place: location.pathname + location.search + location.hash,
+   // The page frame adds the open window under New item, so the screenshot shows it.
+   place: window.pageCapturePlace?.(dialog) ?? location.pathname + location.search + location.hash,
    viewport: viewport(),
    data,
    state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
@@ -1572,7 +1582,8 @@ SCRIPT = r'''(() => {
  }
 
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || isEditingLater() || separateFromNativeDraft || !sendNotice.hidden) return;
+  if (ownerPage !== 'list' || !draftId || isEditingLater() || canEditDuringRetry() ||
+      separateFromNativeDraft || !sendNotice.hidden) return;
   try {
    sessionStorage.setItem(listSendKey, JSON.stringify({
     id: draftId, recipient: selectedRecipient,
@@ -1861,7 +1872,12 @@ SCRIPT = r'''(() => {
  }
 
  async function open(trigger, page) {
-  if (dialog.open || sending) return;
+  if (dialog.open) {
+   (savedItem ? done : words).focus({preventScroll: true});
+   return;
+  }
+  if (sending) return;
+  if (submittedDraft) page = submittedDraft.payload.page;
   ownerPage = page;
   if (!keepDraft || !submittedDraft) pageContext = collectPageContext();
   launcher = trigger;

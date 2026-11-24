@@ -694,7 +694,7 @@ OWNER_OPTIONS_PROBE = r"""
  const failures = [];
  const check = (value, description) => { if (!value) failures.push(description); };
  try {
-  const buttons = document.querySelectorAll('.page-heading button');
+  const buttons = document.querySelectorAll('.page-heading-actions button');
   const dialog = document.querySelector('#review-new-item');
   const recipients = dialog.querySelector('[data-recipients]');
   const loaded = new Promise(resolve => {

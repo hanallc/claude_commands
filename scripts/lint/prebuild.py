@@ -33,6 +33,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+if __name__ == "__main__":
+    with (Path(__file__).resolve().parents[1] / "lib/package_root.py").open() as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
+
+from scripts.mac_test import floor_claims
+
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PACKAGE_OPTIONS = ("-p", "--package")
 WORKSPACE_FLAGS = frozenset({"--workspace", "--all"})
@@ -124,6 +130,8 @@ def read_prebuilds(manifest: Path) -> tuple[Prebuild, ...]:
         env = text(fields.get("env"), f"{where}.env")
         if ENV_NAME.fullmatch(env) is None:
             raise DeclarationError(f"{where}.env must be a variable name")
+        if env == floor_claims.MIRROR_LEASE_FDS:
+            raise DeclarationError(f"{where}.env: the runner sets {env}.")
         names = fields.get("for")
         if not isinstance(names, list) or not names:
             raise DeclarationError(f"{where}.for must be a non-empty list of package names")
@@ -240,7 +248,8 @@ def build(prebuild: Prebuild, manifest: Path, words: tuple[str, ...]) -> int:
     command += [f"--target-dir={value}" for value in option_values(words, ("--target-dir",))[-1:]]
     print("+ " + " ".join(command), file=sys.stderr, flush=True)
     result = subprocess.run([*command, "--message-format=json-render-diagnostics"],
-                            stdout=subprocess.PIPE, text=True, check=False)
+                            stdout=subprocess.PIPE, text=True, check=False,
+                            pass_fds=floor_claims.inherited_mirror_descriptors())
     if result.returncode != 0:
         print(f"prebuild: cargo build of {prebuild.package} failed (status {result.returncode}); the tests did not run",
               file=sys.stderr)

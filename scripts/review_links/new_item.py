@@ -19,6 +19,7 @@ from datetime import UTC, datetime, time
 from enum import IntEnum, StrEnum
 from http.client import HTTPConnection, HTTPException
 from typing import Literal, cast
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf, main_publish
@@ -279,6 +280,14 @@ def _say_schedule(lines: tuple[str, str]) -> None:
     print(*lines, sep="\n", flush=True)
 
 
+class UnlinkedListItem(Exception):
+    """The List item exists, but its link to the Review item failed."""
+
+    def __init__(self, number: int, cause: Exception) -> None:
+        super().__init__(f"List item {number} exists without its Review link: {cause}")
+        self.number: int = number
+
+
 def usage() -> str:
     return "\n".join((
         FORM,
@@ -326,11 +335,10 @@ def producer_question(member: staff.StaffRow, missing: producer_map.NoProducer, 
     return f"{question}\n{producers}"
 
 
-def result_line(item_type: ItemType | Literal["scheduled"], member: staff.StaffRow, mapped: producer_map.MappedProducer,
-                members: staff.StaffSnapshot, *, this_session: bool, list_key: str) -> str:
-    """Say who does the work, who tracks it and why, and the List item number."""
-    assignment = assignment_receipt(item_type, member, mapped, members, this_session=this_session)
-    return filing_receipt(assignment, list_key.partition("/")[2])
+def result_line(item_type: ItemType, member: staff.StaffRow, mapped: producer_map.MappedProducer,
+                members: staff.StaffSnapshot, *, this_session: bool, filed: str) -> str:
+    """Say who does the work, who tracks it and why, and where the item is filed."""
+    return f"{assignment_receipt(item_type, member, mapped, members, this_session=this_session)} {filed}"
 
 
 def assignment_receipt(item_type: ItemType | Literal["scheduled"], member: staff.StaffRow,
@@ -441,15 +449,24 @@ def words_text(item_type: ItemType, description: str, extra: str) -> str:
     return first + (f"\n\n{extra.strip()}" if extra.strip() else "")
 
 
-def set_assignee(list_key: str, member: staff.StaffRow, mapped: producer_map.MappedProducer) -> None:
-    """The List item names a unit assignee and takes the assignee's producer, not the recipient's."""
-    keeper, _, identity = list_key.partition("/")
-    item = the_list.load(staff.StaffId(keeper), identity)
-    changes: the_list.ItemChanges = {"unit": member.name} if member.kind == "unit" else {}
-    if mapped.producer.id != item.producer:
-        changes["producer"] = mapped.producer.id
-    if changes:
-        _ = the_list.update(staff.StaffId(keeper), identity, changes, source=SOURCE)
+def add_list_item(review_key: str, words: str, recipient: Recipient, member: staff.StaffRow,
+                  mapped: producer_map.MappedProducer, members: staff.StaffSnapshot) -> the_list.ListItem:
+    """Make the List item of a filed Review item in morty's folder, which alone allocates List numbers.
+
+    Each run sends a new request ID, so the server never gives one Review key to two runs.
+    """
+    keeper = the_list.producer_id(members, "morty")
+    evidence = review_page.PAGE_PATH + "?show=all#" + urlencode({"show": "open", "jump": review_key})
+    # The item names a unit assignee and takes the assignee's producer, not the recipient's.
+    changes: the_list.ItemChanges = {"latest_status": words, "evidence": evidence, "producer": mapped.producer.id}
+    if member.kind == "unit":
+        changes["unit"] = member.name
+    item = the_list.add(keeper, review_submissions.submission_title(words), owner=recipient.id, source=SOURCE,
+                        changes=changes)
+    try:
+        return the_list.link(keeper, item.id, (review_key,), source=SOURCE)
+    except Exception as error:
+        raise UnlinkedListItem(item.number, error) from error
 
 
 class FilingRefusal(StrEnum):
@@ -561,8 +578,7 @@ def _assignment_message(notice: review_submissions.ListAssignmentNotice, identit
     number = identity.removeprefix("L")
     if notice.role == "producer":
         launcher = cast(str, getattr(the_list, "_LAUNCHER"))
-        options = cast(tuple[str, ...], getattr(the_list, "_PRODUCER_UPDATE_OPTIONS"))
-        update = ", ".join(f"`{option}`" for option in options)
+        update = ", ".join(f"`{option}`" for option in the_list.PRODUCER_SCHEDULE_UPDATE_OPTIONS)
         return (f"You are the producer of item {number}: {notice.text}\n"
                 + f"Run `{launcher} list --all --latest-status` to read it. "
                 + f"Run `{launcher} update --id {identity}` to update it. Use any of {update}.")
@@ -693,10 +709,12 @@ def main(arguments: list[str] | None = None) -> int:
         if isinstance(recipient, Refusal):
             print(f"new_item: {recipient.reason}", file=sys.stderr)
             return Outcome.REFUSED
-        reply = exchange(address, "POST", review_page.NEW_ITEM_PATH, request_body(
-            options, FILED_KINDS[item_type], recipient, words_text(item_type, args.description, args.extra)))
-        list_key = reply.fields.get("list_key")
-        if reply.status != 200 or not isinstance(list_key, str):
+        caller = members.by_current_session(args.session) if args.session else None
+        this_session = caller is not None and caller.id == member.id
+        words = words_text(item_type, args.description, args.extra)
+        reply = exchange(address, "POST", review_page.NEW_ITEM_PATH,
+                         request_body(options, FILED_KINDS[item_type], recipient, words))
+        if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
     except FilingRefused as error:
@@ -708,17 +726,22 @@ def main(arguments: list[str] | None = None) -> int:
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
-    caller = members.by_current_session(args.session) if args.session else None
-    filed = result_line(item_type, member, mapped, members,
-                        this_session=caller is not None and caller.id == member.id, list_key=list_key)
-    if member.id != recipient.id:
-        try:
-            set_assignee(list_key, member, mapped)
-        except (OSError, ValueError, staff.StaffRefused) as error:
-            print(f"new_item: filed, but the List item does not name the assignee and its producer: {filed} {error}",
-                  file=sys.stderr)
-            return Outcome.FAILED
-    print(filed)
+    # The server filed the item, so each path from here exits FILED: a second run would file it again.
+    review_id, review_key = reply.fields.get("id"), reply.fields.get("key")
+    try:
+        if not isinstance(review_key, str) or not review_key:
+            raise ValueError("the console server sent no Review item key")
+        item = add_list_item(review_key, words, recipient, member, mapped, members)
+    except UnlinkedListItem as error:
+        print(result_line(item_type, member, mapped, members, this_session=this_session, filed=str(error)))
+        return Outcome.FILED
+    except Exception as error:
+        shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
+        print(result_line(item_type, member, mapped, members, this_session=this_session,
+                          filed=f"Filed as {shown}, but no List item exists: {error}"))
+        return Outcome.FILED
+    print(result_line(item_type, member, mapped, members, this_session=this_session,
+                      filed=f"List item {item.number}."))
     return Outcome.FILED
 
 

@@ -16,8 +16,9 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.lib import build_folders, testing_folders
-from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, direct_test_fixture_environment,
-                                              run_gate_test_fixture, without_user_test_manager)
+from scripts.lib.checkout_test_support import (STANDALONE_TEST_STARTUP, copy_test_runner,
+                                              direct_test_fixture_environment, run_gate_test_fixture,
+                                              without_user_test_manager)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -32,15 +33,16 @@ class Fixture(unittest.TestCase):
         sys.stdin.read(1)
 """
 GATE_FIXTURE = """import os, subprocess, tempfile, unittest
+from pathlib import Path
 from scripts.lib import build_folders
 class Fixture(unittest.TestCase):
     def test_folder(self):
         print('TMPDIR=' + os.environ['TMPDIR'], flush=True)
         self.assertNotIn('GATE_PARENT_PID', os.environ)
         self.assertNotIn('MERGE_GATE_PARENT_PID', os.environ)
+        for name in ('CONF_READ_LOG', 'SCRATCH_ROOT', 'ASTRA_REVIEW_DIR'):
+            self.assertEqual(Path(os.environ[name]).parent.parent, Path(os.environ['TMPDIR']))
 """
-REPO = Path(__file__).resolve().parents[2]
-MODULE_RUN = REPO / "scripts/test_times/module_run.py"
 DISCOVER_STANDALONE = STANDALONE_TEST_STARTUP + """
 import runpy
 runpy.run_module("unittest", run_name="__main__", alter_sys=True)
@@ -60,9 +62,9 @@ class TestRunFolderTests(unittest.TestCase):
     def environment(self) -> dict[str, str]:
         return self.fixture_environment.copy()
 
-    def start(self, *options: str) -> tuple[subprocess.Popen[str], Path, Path, int]:
+    def start(self, *options: str, shim: Path = SHIM) -> tuple[subprocess.Popen[str], Path, Path, int]:
         environment = without_user_test_manager(self.root, self.environment())
-        process = subprocess.Popen([str(SHIM), *options, "-B", "-c", DISCOVER_STANDALONE, "discover", "-s", str(self.root),
+        process = subprocess.Popen([str(shim), *options, "-B", "-c", DISCOVER_STANDALONE, "discover", "-s", str(self.root),
                                     "-p", "test_fixture.py"],
                                    cwd=self.root, env=environment, text=True,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -82,6 +84,66 @@ class TestRunFolderTests(unittest.TestCase):
         if process.poll() is None:
             process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def checkout_shim(self, checkout: Path) -> Path:
+        copy_test_runner(checkout)
+        return checkout / "scripts/lib/py"
+
+    def assert_run_uses_output(self, shim: Path, output_folder: Path) -> None:
+        process, folder, child, _ = self.start(shim=shim)
+        self.assertTrue(child.is_dir())
+        output, errors = process.communicate("x", timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(folder.parent, output_folder / "test-runs")
+        self.assertFalse(folder.exists())
+        self.assertEqual(list(folder.parent.iterdir()), [])
+
+    def test_a_worktree_run_uses_its_output_and_removes_its_run_folder(self) -> None:
+        checkout = self.root / "worktrees/claude/verify/work"
+        output = self.root / "build/claude/verify/work"
+        shim = self.checkout_shim(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
+        self.assert_run_uses_output(shim, output)
+
+    def test_a_numbered_copy_run_uses_its_own_target(self) -> None:
+        checkout = self.root / "build/claude/verify/7"
+        self.assert_run_uses_output(self.checkout_shim(checkout), checkout / "target")
+
+    def test_a_legacy_main_run_moves_when_it_gets_its_model_link(self) -> None:
+        checkout = self.root / "home/.claude"
+        shim = self.checkout_shim(checkout)
+        self.assert_run_uses_output(shim, self.root)
+        outside = self.root / "outside"
+        outside.mkdir()
+        target = checkout / "target"
+        target.symlink_to(outside, target_is_directory=True)
+        self.assert_run_uses_output(shim, self.root)
+        self.assertFalse((outside / "test-runs").exists())
+        target.unlink()
+        output = self.root / "build/claude/main"
+        output.mkdir(parents=True)
+        target.symlink_to(output, target_is_directory=True)
+        self.assert_run_uses_output(shim, output)
+
+    def test_direct_run_disables_bytecode_for_the_test_and_its_child(self) -> None:
+        case = self.root / "test_bytecode.py"
+        _ = case.write_text(f"""import subprocess, sys, unittest
+class Bytecode(unittest.TestCase):
+    def test_child(self):
+        child = subprocess.check_output(
+            [sys.executable, "-c", "import os; print(os.environ.get('PYTHONDONTWRITEBYTECODE'))"],
+            text=True, timeout={TEST_HANG_GUARD_SECS!r})
+        self.assertEqual(child.strip(), "1")
+        self.assertTrue(sys.dont_write_bytecode)
+""")
+        environment = without_user_test_manager(self.root, self.environment())
+        _ = environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        environment["PYTHONPYCACHEPREFIX"] = str(self.root / "bytecode")
+        result = subprocess.run([str(SHIM), "-c", DISCOVER_STANDALONE, "discover", "-s", str(self.root), "-p", case.name],
+                                cwd=self.root, env=environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_bootstrap_removes_the_run_folder_on_normal_exit(self) -> None:
         for options in ((), ("--isolated",)):
@@ -122,7 +184,13 @@ class TestRunFolderTests(unittest.TestCase):
     def test_a_gate_job_keeps_its_folder_when_a_test_imports_the_maker(self) -> None:
         # On Linux the child finds the gate module among its ancestors and keeps the folder that the
         # gate job gives it. On other systems the child cannot read its ancestors, so it is a direct
-        # test and makes its own run folder.
+        # test and makes its own run folder. The timed runner keeps its folders in the gate's TMPDIR,
+        # also when the checkout has a model output.
+        checkout = self.root / "worktrees/claude/verify/gate"
+        output = self.root / "build/claude/verify/gate"
+        shim = self.checkout_shim(checkout)
+        output.mkdir(parents=True)
+        (checkout / "target").symlink_to(output, target_is_directory=True)
         child_source = """import os, pathlib, sys, unittest
 class Child(unittest.TestCase):
     def test_folder(self):
@@ -142,13 +210,15 @@ class Child(unittest.TestCase):
                 capture_output=True, text=True, timeout={TEST_HANG_GUARD_SECS!r})
             self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
 """
-        case = self.root / "test_gate_fixture.py"
+        case = checkout / "test_gate_fixture.py"
         _ = case.write_text(source)
         environment = {**self.environment(), "PYTHONPATH": str(self.root)}
-        run = run_gate_test_fixture(case, [str(SHIM), str(MODULE_RUN), str(self.root), case.name], environment)
+        arguments = [str(shim), str(checkout / "scripts/test_times/module_run.py"), str(checkout), case.name]
+        run = run_gate_test_fixture(case, arguments, environment)
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn(f"TMPDIR={self.root}\n", run.stdout)
         self.assertFalse((self.root / "test-runs").exists())
+        self.assertFalse((output / "test-runs").exists())
 
     def test_a_run_without_a_build_log_keeps_its_log_in_the_run_folder(self) -> None:
         for caller in ("", str(self.root / "caller-buildlog")):

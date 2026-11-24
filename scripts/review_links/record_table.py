@@ -567,7 +567,16 @@ function restoreLog(){
  const entry=log?.querySelector('[data-log-index="'+CSS.escape(heldLog.index)+'"]');
  if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-heldLog.offset;
 }
-function scheduleWindow(){if(options.mount && !pendingFrame) pendingFrame=requestAnimationFrame(()=>{pendingFrame=0;drawWindow();});}
+function scheduleWindow(){
+ if(!options.mount || pendingFrame) return;
+ pendingFrame=requestAnimationFrame(()=>{
+  pendingFrame=0;
+  const card=openItem?.getBoundingClientRect();
+  if(!rowMotion.size && !revealKey && card?.bottom>0 && card.top<innerHeight)
+   preserveRecordRowTop(drawWindow);
+  else drawWindow();
+ });
+}
 function spacer(node,height){
  node.innerHTML=height>0 ? '<tr aria-hidden="true"><td colspan="'+columns.length+'" style="height:'+height+'px;padding:0;border:0"></td></tr>' : '';
 }
@@ -1317,7 +1326,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
- const inset=typeof stuckPageHeadingBottom==='function' ? stuckPageHeadingBottom() :
+ const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() :
   banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
  row.style.scrollMarginTop=(inset+16)+'px';
  row.querySelector('.list-toggle').focus({preventScroll:true});
