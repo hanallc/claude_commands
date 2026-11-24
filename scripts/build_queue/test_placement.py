@@ -26,9 +26,11 @@ from typing import TextIO, cast, override
 from scripts.build_queue import execution_identity
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.aws_target import cloud_gate, hana_placement as hana, ledger as aws_ledger
+from scripts.aws_target.ledger_test_support import install_aws_fixture_settings
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
+from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import limits_view, memory_feed
 from scripts.build_queue.admission_jobs import StepJob
@@ -36,19 +38,19 @@ from scripts.build_queue.admission_test_support import (
     AdmissionFixture, FixedSystemReader, GIB, ObservedAdmissionServer, only_admitted,
 )
 from scripts.buildlog import store
+from scripts.build_targets import mac_linux, target_config
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 from scripts.lint import memory_admit as gate
-from scripts.production.gate_routes import ALL_MODULES, ModuleCoverage, SuiteMode
+from scripts.production import gate as production_gate
+from scripts.production.gate_routes import ALL_MODULES, GateJobResult, GuestGateBlocked, ModuleCoverage, SuiteMode
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
-from scripts.aws_target.ledger_test_support import install_aws_fixture_settings
-from scripts.build_targets import mac_linux, target_config
 from scripts.build_targets.gate_targets import scaler_candidate
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget, mac_linux_end_proof_journal
 
@@ -1853,6 +1855,82 @@ class PlacementTests(unittest.TestCase):
             closed = service.read_state(fixture.state_dir).assignments[key]
             self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
             self.assertEqual(assignment_row(closed).get("confirmed_guest_start"), expected)
+
+    def test_guest_route_closes_passed_and_failed_attempts_as_completed(self) -> None:
+        for status, checkout_change, expected_status in ((0, "", 0), (17, "", 17),
+                                                         (0, "head", 1), (17, "tree", 17)):
+            with (self.subTest(status=status, checkout_change=checkout_change), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                request = mac_linux_and_natedev_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                holder = guest_gate(fixture, assignment)
+                granted, = consume_guest_permission(fixture, assignment, holder, proof_required=True)
+                assert isinstance(granted, wire.FirstAuthorization)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                claim = claim_state.ClaimIdentity(granted.claim.claim_id, assignment.episode, assignment.attempt)
+                checkout = mac_linux.GuestCheckoutIdentity("guest-machine", "/fixture")
+                source = mac_linux.CandidateSource("head", "commit", "tree", "main", "url", "runner",
+                                                   frozenset(), ModuleCoverage.COMPLETE)
+                job = GateJobResult("fixture", "test_first.py", status, 1, "")
+                result = mac_linux.MacLinuxGateRun((job,), 1, 0, bundle_bytes=1, module_skips={},
+                    bundle_form=mac_linux.BundleForm.FIRST, bundle_reason=mac_linux.BundleReason.FIRST_RUN)
+                head = "other-head" if checkout_change == "head" else source.head
+                tree = "other-tree" if checkout_change == "tree" else source.tree
+
+                def transfer(_repo: Path, settings: mac_linux.GuestSettings, _source: mac_linux.CandidateSource,
+                             guest: mac_linux.GuestRequest, dispatch: mac_linux.GuestGateDispatch) -> mac_linux.GuestReply:
+                    dispatch.arm_requested = True
+                    dispatch.started = mac_linux.ArmedGuestAttempt(guest["attempt"], checkout.machine_id,
+                        "guest-boot", 10, settings.guest_user, checkout.checkout)
+                    dispatch.settled = True
+                    return mac_linux.GuestReply("", 1, result.bundle_form, result.bundle_reason, "", True)
+
+                def send(message: wire.ExecutionReport | status_wire.PlacementStatusRequest, *,
+                         deadline: float, timeout: float) -> wire.Reply:
+                    self.assertGreater(deadline, time.monotonic())
+                    self.assertGreater(timeout, 0)
+                    reply, = fixture.server.handle_request(message)
+                    return reply
+
+                with (mock.patch.object(mac_linux, "new_run_settings", return_value=mac_linux.GuestSettings(
+                          ("fixture-mac", "fixture-guest"), "fixture", 1, 60, 5)),
+                      mock.patch.object(mac_linux, "candidate_source", return_value=source),
+                      mock.patch.object(mac_linux, "read_guest_checkout", return_value=checkout),
+                      mock.patch.object(mac_linux, "mac_linux_reservation", return_value=nullcontext(claim)),
+                      mock.patch.object(mac_linux, "consume_launch_permission", return_value=granted.claim),
+                      mock.patch.object(mac_linux, "transfer_source", side_effect=transfer),
+                      mock.patch.object(mac_linux, "completed_run", return_value=result),
+                      mock.patch.object(production_gate, "checked_git", return_value=head),
+                      mock.patch.object(cloud_gate, "working_tree", return_value=(tree, set[str]())),
+                      mock.patch.object(mac_linux, "_guest_queue_query", side_effect=send) as sent,
+                      redirect_stderr(io.StringIO()) as errors):
+                    verdict = mac_linux.route(fixture.root, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
+                        selected=ALL_MODULES, gate_job=StepJob("gate", "fixture"), assignment=assignment)
+                self.assertEqual(errors.getvalue(), "")
+                if checkout_change:
+                    self.assertEqual(verdict, GuestGateBlocked("the checkout changed during the guest run"))
+                else:
+                    self.assertIs(verdict, result)
+                fixture.end_owner(holder)
+                fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+                _ = fixture.run_pass()
+                evidence_key = fixture.server.settlement_host_keys[key]
+                worker = fixture.server.host_readers[evidence_key].worker
+                assert isinstance(worker, ManualEvidenceWorker)
+                with mock.patch.object(process_start, "process_start", return_value=process_start.Gone()):
+                    self.assertEqual(worker.probe_next(), evidence_key)
+                _ = fixture.run_pass()
+                closed = service.read_state(fixture.state_dir).assignments[key]
+                self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
+                self.assertEqual(closed.terminal_report, placement.TerminalAttemptReport(
+                    placement.AttemptCompleted(expected_status), placement.DispatchPathSettled(), fixture.clock.now()))
+                report_call, status_call = sent.call_args_list
+                self.assertIsInstance(cast(object, report_call.args[0]), wire.ExecutionReport)
+                self.assertEqual(status_call.args, (status_wire.PlacementStatusRequest(
+                    assignment.episode, assignment.attempt, include_permission=True,
+                    code_version=client.LOADED_ADMISSION_CODE_VERSION),))
+                self.assertEqual(status_call.kwargs, report_call.kwargs)
 
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
         with PlacementFixture() as fixture:
