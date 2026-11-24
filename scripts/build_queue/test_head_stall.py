@@ -18,6 +18,7 @@ from unittest import mock
 from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
+from scripts.build_targets.target_config import MAC_ONLY
 from scripts.buildlog import cli, machine_facts, machine_watch, sample
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
 
@@ -62,6 +63,17 @@ STALLED = snapshot([waiter(NOW - 3 * 3600)], (holder(NOW - 3 * 3600),
 
 
 class FindStallTests(unittest.TestCase):
+    def test_head_stall_uses_the_first_waiter_that_can_run_on_natedev(self) -> None:
+        local = waiter(NOW - 3600)
+        mac: records.Waiter = {**local, "pid": 73, "since": NOW - 7200, "route": MAC_ONLY}
+        running = (holder(NOW - 3600),)
+
+        stall = head_stall.find_stall(snapshot([mac, local], running), 0.0, NOW, LIMIT)
+        assert isinstance(stall, head_stall.HeadStall)
+        self.assertEqual(stall.pid, local["pid"])
+        self.assertEqual(stall.waited, 3600)
+        self.assertEqual(head_stall.find_stall(snapshot([mac], running), 0.0, NOW, LIMIT), head_stall.NoStall())
+
     def test_holder_time_starts_at_admission(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 62 * 60),))
         stall = head_stall.find_stall(queue, NOW - 3600, NOW, LIMIT)

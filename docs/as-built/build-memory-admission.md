@@ -2822,7 +2822,7 @@ A move gives the moved row a new anchor and keeps its former successor in place.
 Absent and unnamed waits stay in the full order.
 The page omits waits with no name source.
 Placement, memory admission, and continuation claims use the eligible rows in this order.
-The head-stall snapshot uses the order of local waits.
+The head-stall check uses the first waiter that can run on natedev.
 The grant pass shows a newly granted row in Waiting without a move handle.
 The first pass that counts its reservation shows the row in Running and includes the memory charge.
 When run times tie, the earlier step arrival comes first. PID breaks a tie in step arrival.
