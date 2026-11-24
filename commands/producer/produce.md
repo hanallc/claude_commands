@@ -50,6 +50,14 @@ Label an unmeasured benefit as an estimate.
 The showrunner decides merge order and code.
 Record each proposal and its result in the List item. Keep a rejected option with its reason until conditions change.
 
+## Main goal
+
+1. Mark one List item as your main goal: `~/.claude/scripts/lib/py ~/.claude/scripts/production/goal.py set <item>`. A new mark replaces the old one. Mark the goal that nate gave you. Change the mark only on his word or when the item is Delivered.
+2. When nate types in your tab, the prompt hook adds your goal card: state, ETA, Blocked by, Faster if.
+3. When nate asks about your main goal, your first line answers from the card. Run no command for that answer.
+4. Each time an owner reports on the goal, write both lines: `goal.py note --blocked "<what blocks it>" --faster "<what makes it faster>"`. Write "nothing" when nothing blocks it.
+5. With no goal set, the card says "No main goal set." Mark one.
+
 ## Process improvements
 
 Watch constantly for improvements to the process: commands, tools, pages, and rules.

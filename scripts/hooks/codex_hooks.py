@@ -6,6 +6,7 @@ SubagentStart. Their `*` matchers cover every session source and subagent type.
 Session sources include startup, resume, clear and compact; they are not tool
 names. PreCompact records the start of manual and automatic compaction.
 UserPromptSubmit and PostCompact clear the session's compaction marker.
+UserPromptSubmit adds the producer's goal card to typed prompts.
 Stop sends worker turn completion to the shared handler.
 Listing and trust use the event, matcher, command and timeout together,
 so two events can share one script without sharing a trust identity.
@@ -46,6 +47,14 @@ class PythonHookScript(NamedTuple):
         return command + (" " + shlex.join(self.arguments) if self.arguments else "")
 
 
+_GOAL_CARD_COMMAND = PythonHookScript("goal_card.py").command()
+PROMPT_COMMAND = _GOAL_CARD_COMMAND + " 2>/dev/null || true"
+RETIRED_PROMPT_COMMANDS = frozenset({
+    '"$HOME/.claude/scripts/hooks/compaction-marker-clear.sh"',
+    _GOAL_CARD_COMMAND,
+})
+
+
 class ShellHookFront(NamedTuple):
     """A hook front that starts Python only when its checks need it."""
 
@@ -60,10 +69,10 @@ class CodexHook:
 
     __slots__: tuple[str, ...] = ("name", "command", "event", "_timeout", "matcher")
 
-    def __init__(self, name: str, script: PythonHookScript | ShellHookFront, event: str = "PostToolUse", timeout: int = 10,
+    def __init__(self, name: str, script: PythonHookScript | ShellHookFront | str, event: str = "PostToolUse", timeout: int = 10,
                  matcher: str = "apply_patch") -> None:
         self.name: str = name
-        self.command: str = script.command()
+        self.command: str = script if isinstance(script, str) else script.command()
         self.event: str = event
         self._timeout: int = timeout
         self.matcher: str = matcher
@@ -96,8 +105,7 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("queue-tools", PythonHookScript("codex-queue-drain.py"), matcher="*"),
     CodexHook("compaction-marker", PythonHookScript("pre-compact-marker.py", ("--family", "codex")),
               "PreCompact", matcher="*"),
-    CodexHook("compaction-clear-turn", ShellHookFront("compaction-marker-clear.sh"),
-              "UserPromptSubmit", matcher="*"),
+    CodexHook("compaction-clear-turn", PROMPT_COMMAND, "UserPromptSubmit", matcher="*"),
     CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
               "PostCompact", matcher="*"),
     CodexHook("turn-end", PythonHookScript("../herdr/turn_end.py"), "Stop", matcher="*"),
@@ -187,11 +195,13 @@ def _managed_handlers(group: object, hook: CodexHook) -> list[dict[str, object]]
     ]
 
 
-def _is_retired_handler(handler: object) -> bool:
+def _is_retired_handler(event: str, handler: object) -> bool:
     if not isinstance(handler, dict):
         return False
     entry = cast(dict[str, object], handler)
-    return entry.get("type") == "command" and entry.get("command") == RETIRED_COMMAND
+    command = entry.get("command")
+    return (entry.get("type") == "command" and isinstance(command, str)
+            and (command == RETIRED_COMMAND or event == "UserPromptSubmit" and command in RETIRED_PROMPT_COMMANDS))
 
 
 class HandlerRepairs(NamedTuple):
@@ -205,7 +215,7 @@ def _repair_handlers(hooks: dict[str, object], path: str) -> HandlerRepairs:
     changed = False
     retired_removed = False
     needs_manual_removal = False
-    for groups in hooks.values():
+    for event, groups in hooks.items():
         if not isinstance(groups, list):
             continue
         for group in cast(list[object], groups):
@@ -216,7 +226,7 @@ def _repair_handlers(hooks: dict[str, object], path: str) -> HandlerRepairs:
             if not isinstance(handlers, list):
                 continue
             entries = cast(list[object], handlers)
-            kept = [handler for handler in entries if not _is_retired_handler(handler)]
+            kept = [handler for handler in entries if not _is_retired_handler(event, handler)]
             removed = len(kept) != len(entries)
             retired_removed |= removed
             changed |= removed
