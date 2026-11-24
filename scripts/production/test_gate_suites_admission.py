@@ -299,8 +299,9 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             def held(reply: wire.Wait) -> None:
                 waits.append(reply)
                 on_wait(reply)
-                fixture.proc.kill(older.owner)
-                fixture.free(60 * admission_records.GIB)
+                with fixture.loop_turn():
+                    fixture.proc.kill(older.owner)
+                    fixture.free(60 * admission_records.GIB)
             return admit(request, held, refresh, _attempt=_attempt)
 
         with mock.patch.dict(os.environ, self.environment), \
@@ -344,34 +345,51 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with fixture.loop_turn():
             busy = only_admitted(fixture.server.handle_request(fixture.request()))
             fixture.allow_next_start()
-        fixture.free(0)
-        profiles: list[admission_records.ProgramProfile] = []
-        identities: list[tuple[str, float, wire.Identity]] = []
+            fixture.free(0)
+        initial_requests: list[wire.AdmitRequest] = []
+        refreshed_requests: list[wire.AdmitRequest] = []
         admit = client.admit
+
         def acquire(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None], refresh: Callable[[], wire.AdmitRequest], *,
                     _attempt: Callable[[], None]) -> wire.Admitted | wire.Refused | client.LeftQueue:
+            initial_requests.append(request)
+            advanced = False
+
             def held(reply: wire.Wait) -> None:
+                nonlocal advanced
                 on_wait(reply)
-                self.assertIsInstance(request.profile, admission_records.ProgramProfile)
                 self.assertEqual(reply.snapshot.decision.state, "hold")
-                profiles.append(cast(admission_records.ProgramProfile, request.profile))
-                identities.append((request.episode, request.since, request.identity))
-                if len(profiles) == 1:
-                    fixture.clock.advance(admission_policy_fixture().timing.estimate_refresh_seconds + 1)
-                else:
-                    fixture.free(60 * admission_records.GIB)
-            result = admit(request, held, refresh, _attempt=_attempt)
-            profiles.append(cast(admission_records.ProgramProfile, request.profile))
-            return result
+                cause = reply.reason.cause if isinstance(reply.reason, admission_records.HeadAdmissionStatus) else reply.reason
+                if isinstance(cause, admission_records.EstimateExpired):
+                    with fixture.loop_turn():
+                        fixture.free(60 * admission_records.GIB)
+                elif not advanced:
+                    with fixture.loop_turn():
+                        fixture.clock.advance(admission_policy_fixture().timing.estimate_refresh_seconds + 1)
+                    advanced = True
+
+            def refreshed() -> wire.AdmitRequest:
+                updated = refresh()
+                refreshed_requests.append(updated)
+                return updated
+
+            return admit(request, held, refreshed, _attempt=_attempt)
+
         with mock.patch.object(client, "admit", side_effect=acquire), \
              mock.patch.object(client, "CLOCK", fixture.clock), \
              mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("gate inferred cargo")):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(profiles), 3)
-        self.assertEqual(len(set(identities)), 1)
-        for profile in profiles:
+        self.assertEqual(len(initial_requests), 1)
+        self.assertEqual(len(refreshed_requests), 1)
+        first, = initial_requests
+        refreshed, = refreshed_requests
+        self.assertEqual((refreshed.episode, refreshed.since, refreshed.identity, refreshed.owner),
+                         (first.episode, first.since, first.identity, first.owner))
+        for request in (first, refreshed):
+            profile = request.profile
             self.assertIsInstance(profile, admission_records.ProgramProfile)
+            assert isinstance(profile, admission_records.ProgramProfile)
             self.assertEqual((profile.step, profile.worktree), ("gate", str(self.checkout)))
             self.assertIsInstance(profile.sizing, admission_records.HistoryPeakSizing)
             assert isinstance(profile.sizing, admission_records.HistoryPeakSizing)
@@ -384,7 +402,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with self.admission.loop_turn():
             busy = only_admitted(self.admission.server.handle_request(self.admission.request()))
             self.admission.allow_next_start()
-        self.admission.free(0)
+            self.admission.free(0)
         held: list[str] = []
         disconnected = threading.Event()
         disconnect = cast(Callable[[service.Connection], None], getattr(self.admission.server, "_disconnect"))

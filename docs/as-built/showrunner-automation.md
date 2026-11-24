@@ -299,7 +299,9 @@ Each local Promote checkout must exist before the command pushes.
      `_unit_paths` excludes unchanged paths that an origin merge base contains.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
-     A shrink allows only the plan doc and `<plan stem>-next.md`.
+     A shrink changes the plan doc and can also change `<plan stem>-next.md`.
+     A shrink with no paths in scope passes if a clean test merge leaves the fetched `origin/main` tree unchanged.
+     The test merge uses the shrink's first parent as its base.
      An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
      The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
      It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.

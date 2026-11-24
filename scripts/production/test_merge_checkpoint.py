@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
@@ -80,7 +81,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
-    def test_package_commands_and_retries_use_the_package_folder(self) -> None:
+    def test_package_commands_use_the_workspace_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
                 with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
@@ -98,8 +99,9 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     _ = verify.write_text(
                         f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
                         + "print(f'{sys.argv[1]}={Path.cwd()}')\n"
-                        + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
-                           + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
+                        + ("marker = Path(__file__).with_name('retried')\n"
+                           + "if sys.argv[1] == 'test' and not marker.exists():\n"
+                           + "    marker.touch()\n    sys.exit(1)\n" if retry else ""))
                     verify.chmod(0o755)
                     production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                           checkout / "production.log", ZoneInfo("UTC"))
@@ -110,7 +112,11 @@ class CheckpointTestFolderTests(unittest.TestCase):
                             production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log,
                             merge_head="fixture-merge")
                     output = log.read_text()
-                    self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
+                    initial_folder = checkout.resolve() if workspace else package.resolve()
+                    expected = [f"test={initial_folder}"]
+                    if retry:
+                        expected.append(f"test={package.resolve()}")
+                    self.assertEqual([line for line in output.splitlines() if line.startswith("test=")], expected)
                     self.assertIn("package_proof_crate_EXIT=" + ("1" if retry else "0"), output)
                     if retry:
                         self.assertIn("package_proof_crate_RERUN_EXIT=0", output)
@@ -125,7 +131,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
-        _ = config.write_text((checkout / "config/staff.conf").read_text())
+        _ = copy_config_file_fixture(checkout / "config/staff.conf", config)
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()
@@ -286,6 +292,27 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("merge-base", original, duplicate), base)
         self.assertEqual(self.git("diff", original, duplicate), "")
         return duplicate
+
+    def test_shrink_scope_accepts_an_empty_diff_already_on_main(self) -> None:
+        shrink = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("fetch", "origin", "main")
+        _ = self.git("merge", "--no-ff", "-m", "Bring main into production", "origin/main")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        before = self.git("rev-parse", "HEAD^{tree}")
+        main = self.git("rev-parse", "main", cwd=self.origin)
+        _ = self.git("update-ref", "refs/heads/main", f"{shrink}^1", cwd=self.origin)
+        held = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+        self.assertEqual(held.process.returncode, 1, held.process.stdout + held.process.stderr)
+        self.assertIn("scope: held — shrink paths must be", held.process.stdout)
+        _ = self.git("update-ref", "refs/heads/main", main, cwd=self.origin)
+
+        result = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("scope: ok — 0 changed paths", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "origin/production^{tree}"), before)
+        self.assertEqual(self.git("rev-parse", "origin/production^2"), shrink)
 
     def test_shrink_ancestry_accepts_a_duplicate_shrink_on_another_branch(self) -> None:
         duplicate = self.duplicate_shrink_on_unit_branch()
