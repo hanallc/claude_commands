@@ -384,9 +384,11 @@ class PairedTrialTests(CostFixture):
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
         copy_test_runner(self.repo)
-        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
+        for relative in ('scripts/lib/process_group.py', 'scripts/lib/file_lock.py', 'scripts/lib/atomic_file.py',
+                         'scripts/buildlog/store.py', 'scripts/aws_target/gate_box.py',
                          'scripts/aws_target/__init__.py', 'scripts/build_queue/admission_jobs.py',
-                         'scripts/production/gate_routes.py', 'scripts/test_times/gate_record.py'):
+                         'scripts/production/gate_routes.py', 'scripts/test_times/gate_record.py',
+                         'scripts/test_times/recent_gate_times.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
