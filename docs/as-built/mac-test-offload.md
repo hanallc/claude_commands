@@ -822,7 +822,7 @@ Cleanup removes the token before `stop-checkout` scans the copy.
 The copy stays kept if `stop-checkout` cannot confirm it is clear.
 The Mac wrapper removes any old `status` file before it starts `copies.py run`.
 The file path is `<scratch root>/mac-smoke-<episode>/status` on the Mac.
-The hourly scratch sweep removes the folder after its default lifetime if SSH leaves it behind.
+If SSH leaves the folder behind, the hourly scratch sweep lists it for vetted manual removal after its default lifetime.
 The test and cleanup read stdin from `/dev/null`.
 After remote cleanup, the worker reports readiness and holds the copy until it receives a newline after local cleanup.
 SSH EOF before the newline stops active work and prevents a zero exit code.

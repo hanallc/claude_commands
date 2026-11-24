@@ -380,6 +380,7 @@ def run_smoke_copy(command: list[str]) -> int:
     status = result.returncode if result.returncode >= 0 else 128 - result.returncode
     status_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     now = time.time()
+    # The hourly sweep lists an orphaned status folder for manual removal after it expires.
     scratch.write_record(status_file.parent, scratch.task_or_default("", now), now, throwaway=True)
     write_text_atomic(status_file, f"{status}\n", new_file_mode=0o600)
     return 0
