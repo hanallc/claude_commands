@@ -1734,6 +1734,7 @@ class StopResumeTests(unittest.TestCase):
             write_codex_auth(home, login)
             atomic_file.write_text_atomic(self.root / "notes" / f"{label}.md", f"---\nlogin: {login}\n---\n")
         recorded_identity = self.entry["session_id"]
+        launch_configuration = models_registry.launch_snapshot()
         cases: tuple[tuple[staff.Kind, str, str, str, str], ...] = (
             ("unit", "alpha", "claude", "claude3", recorded_identity),
             ("producer", "own-codex", "codex", "codex1", recorded_identity),
@@ -1754,10 +1755,12 @@ class StopResumeTests(unittest.TestCase):
                     started = False
 
                     def start_staff(member: staff.StaffRow, membership: staff.StaffSnapshot, client: herdr.Herdr,
-                                    *, target_account: str | accounts.AccountSelection) -> str:
+                                    *, target_account: str | accounts.AccountSelection,
+                                    configuration: models_registry.LaunchModelConfiguration | None = None) -> str:
                         nonlocal started
                         self.assertEqual((member, membership, client, target_account),
                                          (row, record, self.client, target or ""))
+                        self.assertEqual(configuration, launch_configuration if row_kind == "producer" else None)
                         started = True
                         return "w1:p2"
 
@@ -1784,10 +1787,14 @@ class StopResumeTests(unittest.TestCase):
                           patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(
                               self.root / f".{expected}"))):
                         result = stop_resume.resume(str(row.id), to=target)
-                    self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", expected))
-                    assert isinstance(result, stop_resume.ClaudeUp)
-                    self.assertEqual(result.start_state, ClaudeStartState.STARTED)
-                    start.assert_called_once_with(row, record, self.client, target_account=target or "")
+                        self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", expected))
+                        assert isinstance(result, stop_resume.ClaudeUp)
+                        self.assertEqual(result.start_state, ClaudeStartState.STARTED)
+                        if row_kind == "producer":
+                            start.assert_called_once_with(row, record, self.client, target_account=target or "",
+                                                          configuration=launch_configuration)
+                        else:
+                            start.assert_called_once_with(row, record, self.client, target_account=target or "")
 
     def test_resume_without_a_staff_row_or_pane_record_finds_no_session(self) -> None:
         identity = self.entry["session_id"]
@@ -1845,9 +1852,12 @@ class StopResumeTests(unittest.TestCase):
         target_home = self.root / ".claude4"
         self.assertEqual(row.home, staff.SessionHome(running_home))
         starts: list[str] = []
+        launch_configuration = models_registry.launch_snapshot()
 
         def started(tab: herdr.TabSession, entry: pane_launch.CurrentLaunch, label: str,
-                    _message: str) -> sessions.LiveSessionProcess:
+                    _message: str, *,
+                    configuration: models_registry.LaunchModelConfiguration) -> sessions.LiveSessionProcess:
+            self.assertEqual(configuration, launch_configuration)
             current = staff.by_id(row.id)
             assert current is not None
             self.assertEqual(current.home, staff.SessionHome(running_home))

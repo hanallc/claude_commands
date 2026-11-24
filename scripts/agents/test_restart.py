@@ -576,15 +576,20 @@ class SessionLaunchTests(RestartTestCase):
 
     def test_restart_reads_plugin_directories_from_the_shutdown_pane_record(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        registry = root / "models.conf"
+        _ = write_registry(registry)
+        snapshot_key = models_registry.OPERATION_ENVIRONMENT[0]
         directories = [str(root / "postmaster"), str(root / "second plugin")]
         entry = pane_record.launch("w1:p2", "saved", str(root), {},
             ["claude", "--plugin-dir", directories[0], "--plugin-dir=" + directories[1]])
         with (patch.object(pane_record, "RECORD_DIR", root / "panes"),
-              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"})):
+              patch.object(restart, "named_account_environment", return_value={"CLAUDE_CONFIG_DIR": "/account"}),
+              patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), snapshot_key: ""})):
             pane_record.write("agents", entry)
             kind, environment, arguments = restart.session_launch("saved", "current-name")
         self.assertEqual(kind, "claude")
-        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account"})
+        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/account",
+                                       snapshot_key: json.dumps([str(registry), registry.read_text()])})
         parsed = pane_record.parse_claude_arguments(["claude", *arguments])
         self.assertEqual(parsed.plugin_directories, tuple(directories))
         self.assertEqual(parsed.values["--resume"], "saved")

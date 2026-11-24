@@ -16,10 +16,10 @@ from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
-from typing import ClassVar, Literal, NamedTuple, cast, final
+from typing import ClassVar, Literal, NamedTuple, cast, final, get_args
 
 from scripts.lib import build_folders
-from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
+from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, names, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION_ENVIRONMENT
 from scripts.lib.operation_environment import agent_environment as agent_environment
@@ -234,7 +234,17 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
 
 COMPACT_WINDOWS = "compact_windows"
 CompactRole = Literal["producer", "showrunner", "unit", "worker"]
-COMPACT_ROLES: tuple[CompactRole, ...] = ("producer", "showrunner", "unit", "worker")
+COMPACT_ROLES = cast(tuple[CompactRole, ...], get_args(CompactRole))
+
+
+def _compact_role_choices() -> str:
+    """List registry keys with the configured display names."""
+    loaded = names.runtime_names()
+    if not isinstance(loaded, names.Names):
+        return ", ".join(COMPACT_ROLES)
+    display = dict(showrunner=loaded.job("showrunner"), worker=loaded.job("worker"))
+    return ", ".join(f"{key} ({display[key]})" if key in display and display[key] != key else key
+                     for key in COMPACT_ROLES)
 
 
 def compact_window_arguments(role: CompactRole, *, session_id: str = "", unit_window: str = "",
@@ -249,7 +259,7 @@ def compact_window_arguments(role: CompactRole, *, session_id: str = "", unit_wi
     windows = {row.key: row.value for row in configuration.rows if row.section == COMPACT_WINDOWS and row.key}
     for key in sorted(windows.keys() - set(COMPACT_ROLES)):
         print(f"anomaly: {configuration.path}: {COMPACT_WINDOWS}.{key}: no role has this name. "
-              + f"Use {', '.join(COMPACT_ROLES)}.", file=sys.stderr)
+              + f"Use {_compact_role_choices()}.", file=sys.stderr)
     if role == "unit" and unit_window:
         return ["--autocompact", unit_window]
     if role == "unit" and session_id:

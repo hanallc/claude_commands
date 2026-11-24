@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import TextIO, cast, final, override
 from unittest.mock import patch
 
-from scripts.lib import land_main, live_settings, main_push_lock, models_registry, registry_rows, waiting_rows
+from scripts.lib import land_main, live_settings, main_push_lock, models_registry, names, registry_rows, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_names import fixture_names
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
@@ -630,10 +631,12 @@ class LaunchSettingsTests(unittest.TestCase):
                 _ = write_registry(self.path, {"compact_windows": {"producer": value}})
                 self.assertEqual(models_registry.compact_window_arguments("producer"), ["--autocompact", expected])
         _ = write_registry(self.path, {"compact_windows": {"producer": "auto", "unknown": "300k"}})
-        with redirect_stderr(io.StringIO()) as errors:
+        with (patch.object(names, "runtime_names", return_value=fixture_names(worker="operator")),
+              redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(models_registry.compact_window_arguments("producer"), [])
         self.assertEqual(errors.getvalue().splitlines(), [
-            f"anomaly: {self.path}: compact_windows.unknown: no role has this name. Use producer, showrunner, unit, worker."])
+            f"anomaly: {self.path}: compact_windows.unknown: no role has this name. "
+            + "Use producer, showrunner, unit, worker (operator)."])
 
 
 @final
