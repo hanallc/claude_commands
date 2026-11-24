@@ -3417,13 +3417,6 @@ class AdmissionServer:
             row["move_id"] = uuid.uuid4().hex
             place = replace(place, move_id=row["move_id"])
         self.places[key] = place
-        if (isinstance(run, wire.RunIdentity) and isinstance(request, wire.AdmitRequest) and not request.sidecar
-                and request.episode not in self.placement_requests and request.identity.step in ("gate", "test-affected")):
-            run_key = records.run_owner(run.pid, run.start_time)
-            rank = self.run_places.get(run_key)
-            if (rank is not None and not rank.move_id and rank.first_owner == place.owner and rank.since == place.since):
-                self.run_places[run_key] = replace(rank, move_id=place.move_id,
-                                                  repository=row.get("repository_name", request.profile.repo))
 
     def _set_queue_pins(self, pins: QueuePins) -> None:
         if pins != self.queue_pins:
@@ -3545,6 +3538,19 @@ class AdmissionServer:
             record = replace(record, slot_staff=step_staff(record.queue_waiter, self.host))
         return self._freeze_test_phase_need(record, config, share_percent)
 
+    def _save_gate_rank(self, admission: ReservationRecord, move_id: str) -> None:
+        run = admission.run
+        row = admission.queue_waiter
+        if (not move_id or not isinstance(run, wire.RunIdentity) or not isinstance(admission.place, wire.LocalPlace)
+                or row.get("step") not in ("gate", "test-affected")):
+            return
+        key = records.run_owner(run.pid, run.start_time)
+        rank = self.run_places.get(key)
+        if (rank is not None and (not rank.move_id or not rank.repository)
+                and rank.first_owner == admission.owner and rank.since == row["since"]):
+            self.run_places[key] = replace(rank, move_id=rank.move_id or move_id,
+                                          repository=rank.repository or row.get("repository_name", admission.repo))
+
     def _gate_gap_start(self, admission: ReservationRecord, now: float) -> str | None:
         """Describe a local grant during an older gate's existing memory gap."""
         run = admission.run
@@ -3593,6 +3599,7 @@ class AdmissionServer:
                     max(0.0, now - waiting.row["since"])))
                 if (line := self._gate_gap_start(admission, now)) is not None:
                     gap_starts.append(line)
+                self._save_gate_rank(admission, waiting.row.get("move_id", ""))
                 self.reservations[request.episode] = admission
                 slot = verify_slots.get(records.waiter_owner(waiting.row))
                 if slot is not None:

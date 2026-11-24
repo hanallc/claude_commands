@@ -1050,6 +1050,34 @@ class PlacementTests(unittest.TestCase):
             assert isinstance(request.run, wire.RunIdentity)
             self.assertIn(records.run_owner(request.run.pid, request.run.start_time), fixture.server.run_places)
 
+    def test_younger_run_logs_once_inside_a_placed_gate_gap(self) -> None:
+        with PlacementFixture() as fixture:
+            base = placement_request(fixture)
+            assert isinstance(base.local, wire.LocalAdmissionContext)
+            request = replace(base, constraints=replace(base.constraints,
+                candidates=(local_candidate(fixture),), command_kind="final"),
+                profile=replace(base.profile, step="gate"), identity=replace(base.identity, step="gate"),
+                local=replace(base.local, sidecar=str(fixture.root / "gate.cgroup")))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            fixture.release(granted.grant)
+            fixture.allow_next_start()
+            slot, = fixture.server.slots.values()
+            self.assertGreater(gate.between_steps(slot).expires_at, fixture.clock.now())
+            run = request.run
+            assert isinstance(run, wire.RunIdentity)
+            younger_run = fixture.run_owner()
+            younger = fixture.request(run=younger_run, step="gate")
+            with redirect_stderr(io.StringIO()) as journal:
+                grant = only_admitted(fixture.server.handle_request(younger))
+                self.assertEqual(only_admitted(fixture.server.handle_request(younger)), grant)
+                _ = fixture.run_pass()
+            lines = [line for line in journal.getvalue().splitlines() if "started in the gate gap" in line]
+            expected = (f"memory admission: run {younger_run.pid}:{younger_run.start_time} "
+                        f"started in the gate gap of {run.pid}:{run.start_time} "
+                        f"for fixture on {fixture.server.host}")
+            self.assertEqual(lines, [expected])
+
     def test_restart_requires_token_confirmation_before_a_local_grant(self) -> None:
         with PlacementFixture() as fixture:
             fixture.free(0)

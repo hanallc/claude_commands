@@ -423,7 +423,7 @@ Queue priority remains the first ordering field.
 A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
 The service retains the run's process watch between steps.
-The first local gate preparation saves its queue row ID and repository name in `RunPlace`.
+If a run starts with a local gate request, the grant saves its queue row ID and repository name in `RunPlace`.
 Each later step receives its own queue row ID.
 The service uses the rank to sort queued steps of the run.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
