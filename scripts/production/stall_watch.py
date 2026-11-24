@@ -474,7 +474,7 @@ def login_limited(pid: int, session_id: str, pattern: re.Pattern[str]) -> LoginV
         return LoginVerdict.LIMITED
 
 
-def context_near_compaction(session_id: str) -> bool:
+def context_near_compaction(session_id: str, pid: int) -> bool:
     """Wake at the context hook's shared handoff threshold using its bounded tail reading."""
     try:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
@@ -485,7 +485,7 @@ def context_near_compaction(session_id: str) -> bool:
         return False
     if reading is None:
         return False
-    window = context_usage.auto_compact_window(reading["model"])
+    window = context_usage.auto_compact_window(reading["model"], pid=pid)
     return (window is not None
             and context_usage.estimate_tokens(reading, 0) >= context_usage.handoff_threshold(window))
 
@@ -1583,7 +1583,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             held_until = (stated_hold_end(turn.group(0), now, zone)
                           if turn and turn.group("kind") == HOLDING_KIND else None)
             if deferred or (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
-                            and not (turn.group("kind") == COMPACTION_WAKE_KIND and context_near_compaction(session_id))):
+                            and not (turn.group("kind") == COMPACTION_WAKE_KIND and context_near_compaction(session_id, pid))):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

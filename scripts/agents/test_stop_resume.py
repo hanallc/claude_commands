@@ -39,8 +39,9 @@ from scripts.accounts import accounts, moves, role_map, worker_names
 from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
-from scripts.agents import member_account, producer_transfer, restart, shutdown_record, stop_resume, stop_results
-from scripts.lib import agent_program, atomic_file, conf, lock_holder, operation_deadline, process_start, process_stop, unit_runs
+from scripts.agents import member_account, producer_creation, producer_transfer, restart, shutdown_record, stop_resume, stop_results
+from scripts.lib import (agent_program, atomic_file, autocompact, conf, lock_holder, models_registry, operation_deadline,
+                         process_start, process_stop, unit_runs)
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
 from scripts.agents.stop_results import ClaudeStartState, StopResult, shutdown_state_root
@@ -363,7 +364,7 @@ class StopResumeTests(unittest.TestCase):
             ("codex", "claude", "before ended write"),
             ("codex", "claude", "before close"), ("claude", "codex", "after close"),
             ("codex", "claude", "after launch"), ("codex", "claude", "stop refused"),
-            ("claude", "claude", "same family"), ("claude", "codex", "configuration restored"),
+            ("claude", "claude", "same family"), ("codex", "claude", "registry changed after selection"),
         )
         for previous, configured, interruption in cases:
             with self.subTest(previous=previous, configured=configured, interruption=interruption), producer_first_fixture(previous) as world:
@@ -447,23 +448,12 @@ class StopResumeTests(unittest.TestCase):
                     self.assertIsInstance(first, stop_resume.ClaudeUp, first)
                     old_row = staff.initial_snapshot().rows[0]
                     old_pane = world.pane
-                    configuration = root / "configuration/models.conf"
+                    registry = root / "configuration/models.conf"
                     if previous != configured:
                         setting = "claude:opus:high" if configured == "claude" else "codex:gpt-test:high"
-                        _ = write_registry(configuration, {"producers": {"dwight": setting}}, update=True)
-                    if previous == configured or interruption == "configuration restored":
-                        first_arguments = restart.producer_first_arguments
-
-                        def restore_configuration(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
-                            selected = first_arguments(name)
-                            if selected[0] == configured:
-                                _ = write_registry(configuration, {"producers": {name: "claude:opus:high"}}, update=True)
-                            return selected
-
-                        restore = (patch.object(restart, "producer_first_arguments", side_effect=restore_configuration)
-                                   if interruption == "configuration restored" else nullcontext())
-                        with restore:
-                            repeated = stop_resume.resume("dwight")
+                        _ = write_registry(registry, {"producers": {"dwight": setting}}, update=True)
+                    if previous == configured:
+                        repeated = stop_resume.resume("dwight")
                         self.assertIsInstance(repeated, stop_resume.ClaudeUp, repeated)
                         assert isinstance(repeated, stop_resume.ClaudeUp)
                         self.assertEqual(repeated.start_state, ClaudeStartState.ALREADY_RUNNING)
@@ -484,7 +474,7 @@ class StopResumeTests(unittest.TestCase):
                         self.assertEqual(case.client.closed, [])
                         self.assertFalse(stop_resume.producer_admission_record("dwight").exists())
                         case.kill.assert_not_called()
-                    elif interruption != "complete":
+                    elif interruption not in ("complete", "registry changed after selection"):
                         with (patch.object(case.client, "close_tab_of", side_effect=close),
                               self.assertRaises(InterruptedResume)):
                             _ = stop_resume.resume("dwight")
@@ -506,7 +496,30 @@ class StopResumeTests(unittest.TestCase):
                         self.assertEqual(staff.initial_snapshot().rows, (old_row,))
                         self.assertEqual(admission.read_bytes(), saved)
                         self.assertEqual(case.launched, {new_identity})
-                    result = stop_resume.resume("dwight")
+                    if interruption == "registry changed after selection":
+                        _ = write_registry(registry, {"compact_windows": {"producer": "300000"}}, update=True)
+                        launch_settings = models_registry.launch_settings
+
+                        def change_registry(section: str, name: str,
+                                            family: Literal["claude", "codex", "assigned"] = "assigned", *,
+                                            configuration: models_registry.LaunchModelConfiguration | None = None
+                                            ) -> models_registry.LaunchSettings:
+                            selected = launch_settings(section, name, family, configuration=configuration)
+                            _ = write_registry(registry, {"producers": {name: "codex:gpt-test:high"},
+                                                         "compact_windows": {"producer": "100000"}}, update=True)
+                            return selected
+
+                        with (patch.object(models_registry, "launch_settings", side_effect=change_registry),
+                              patch.object(models_registry, "launch_snapshot",
+                                           wraps=models_registry.launch_snapshot) as snapshot):
+                            result = stop_resume.resume("dwight")
+                        snapshot.assert_called_once()
+                        self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+                        arguments = world.arguments[-1]
+                        window = arguments.index("--autocompact")
+                        self.assertEqual(arguments[window + 1], "300000")
+                    else:
+                        result = stop_resume.resume("dwight")
                     self.assertIsInstance(result, stop_resume.ClaudeUp, result)
                     assert isinstance(result, stop_resume.ClaudeUp)
                     self.assertEqual(result.start_state, ClaudeStartState.STARTED)
@@ -566,6 +579,32 @@ class StopResumeTests(unittest.TestCase):
                 self.assertIn(reason, result.reason)
                 self.assertEqual(world.case.client.opened, [])
                 self.assertEqual(world.arguments, [])
+
+    def test_producer_first_publication_uses_the_selected_launch_configuration(self) -> None:
+        with producer_first_fixture("claude") as world:
+            registry = world.case.root / "configuration/models.conf"
+            _ = write_registry(registry, {"compact_windows": {"producer": "300000"}}, update=True)
+
+            def launch(name: str, pane: str, kind: str, agent_arguments: list[str],
+                       opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                       timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+                outcome = world.start_agent(name, pane, kind, agent_arguments, opening, timeout_ms)
+                _ = write_registry(registry, {"producers": {"dwight": "codex:gpt-test:high"},
+                                             "compact_windows": {"producer": "100000"}}, update=True)
+                return outcome
+
+            with (patch.object(world.case.client, "start_agent", side_effect=launch),
+                  patch.object(models_registry, "launch_snapshot", wraps=models_registry.launch_snapshot) as snapshot,
+                  patch.object(producer_creation, "require_record", wraps=producer_creation.require_record) as marker):
+                result = stop_resume.resume("dwight")
+            snapshot.assert_called_once()
+            marker.assert_called_once()
+            self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+            arguments, = world.arguments
+            self.assertEqual(arguments[arguments.index("--autocompact") + 1], "300000")
+            publication = pane_record.read("agents")[world.pane]
+            self.assertTrue(publication.get("producer_binding", False))
+            self.assertEqual(staff.initial_snapshot().rows[0].current_session, world.identity)
 
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
         for shown in (None, "old-producer-title"):
@@ -2396,6 +2435,37 @@ class StopResumeTests(unittest.TestCase):
                 else:
                     self.assertNotIn("--effort", arguments)
 
+    def test_a_moved_or_relaunched_member_gets_its_role_compact_window(self) -> None:
+        _ = write_registry(self.root / "configuration/models.conf", {"compact_windows": {
+            "producer": "300000", "showrunner": "250k", "worker": "200000"}}, update=True)
+        fixed = staff.StaffId(self.entry["session_id"])
+        worktree = staff.PresentWorktree(remote.local_machine(), self.root)
+
+        def resumed(kind: staff.Kind) -> list[str]:
+            owner = staff.StaffRow(fixed, kind, "row-name", staff.StaffRoot(), current_session=fixed, worktree=worktree,
+                                   unit_type=staff.NotUnit() if kind == "producer" else staff.UnitDetails("direct"))
+            with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((owner,))):
+                return stop_resume.resume_arguments(self.entry)
+
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            cases: tuple[tuple[staff.Kind, list[str]], ...] = (
+                ("producer", ["--autocompact", "300000"]), ("showrunner", ["--autocompact", "250k"]),
+                ("worker", ["--autocompact", "200000"]), ("unit", []))
+            for kind, expected in cases:
+                with self.subTest(kind=kind):
+                    arguments = resumed(kind)
+                    window = arguments.index("--autocompact") if "--autocompact" in arguments else len(arguments)
+                    self.assertEqual(arguments[window:window + 2], expected)
+                    self.assertEqual(arguments.count("--autocompact"), len(expected) // 2)
+            _ = write_registry(self.root / "configuration/models.conf", {"compact_windows": {"unit": "150k"}}, update=True)
+            for recorded, expected_window in (("", "150k"), ("400k", "400k")):
+                with self.subTest(recorded=recorded):
+                    if recorded:
+                        autocompact.record(str(fixed), recorded)
+                    arguments = resumed("unit")
+                    self.assertEqual((arguments.count("--autocompact"), arguments[arguments.index("--autocompact") + 1]),
+                                     (1, expected_window))
+
     def test_resume_reuses_the_open_shell_with_the_fixed_row_id(self) -> None:
         fixed = staff.StaffId(self.entry["session_id"])
         current = staff.StaffId("019b3a40-4250-7000-8000-000000000103")
@@ -4047,7 +4117,8 @@ class StopResumeTests(unittest.TestCase):
                   patch.object(moves, "store_file", return_value=self.root / platform / "moves.jsonl"),
                   patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.entry["session_id"]}),
                   patch.object(stop_resume, "_detach", wraps=self.real_detach),
-                  patch.object(restart, "producer_launch", return_value=("claude", {}, [])),
+                  patch.object(models_registry, "launch_settings",
+                               return_value=models_registry.LaunchSettings("claude", "opus", "high", "")),
                   patch.object(sys, "platform", platform),
                   patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run,
                   patch.object(subprocess, "Popen", side_effect=confirm_start) as popen):

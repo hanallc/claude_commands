@@ -9,6 +9,7 @@ from scripts.direct import test_claude_worker
 
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -242,6 +243,29 @@ class ClaudeLauncherTests(unittest.TestCase):
                     self.assertEqual(launched["CODEX_HOME"], str(workers))
                 else:
                     self.assertEqual(launched["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude1")))
+
+    def test_claude_exec_uses_the_worker_window_from_the_launch_snapshot(self) -> None:
+        prompt = self.home / "prompt"
+        _ = prompt.write_text("read the task")
+        registry = Path(self.environment["MODELS_CONFIG_FILE"])
+        for window in ("", "200000"):
+            with self.subTest(window=window):
+                if window:
+                    _ = write_registry(registry, {"compact_windows": {"worker": window}}, update=True)
+                configuration = models_registry.launch_snapshot(self.environment)
+                _ = write_registry(registry, {"compact_windows": {"worker": "100000"}}, update=True)
+                command = ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
+                           str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
+                           str(self.home), str(prompt), str(self.home / "output"), str(self.home / "log")]
+                environment = configuration.environment({**self.environment, "AGENT_EXEC_DRY_RUN": "1",
+                                                            "AGENT_EXEC_CLAUDE_MODEL": "opus"})
+                result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                arguments = shlex.split(result.stdout)
+                self.assertEqual(arguments.count("--autocompact"), int(bool(window)))
+                if window:
+                    self.assertEqual(arguments[arguments.index("--autocompact") + 1], window)
 
     def test_claude_exec_does_not_inherit_launch_or_editor_configuration(self) -> None:
         prompt = self.home / "prompt"

@@ -2311,8 +2311,12 @@ runpy.run_path(str(script), run_name='__main__')
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         pane = "● — blocked: my context is full; it compacts on the next turn\n"
         self.panes["unit-one"]["pane"] = pane
-        window = 283_800
+        window = 300_000
         self.write_context_usage(context_usage.handoff_threshold(window) - 1, window=window)
+        self.environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "250000"
+        self.write_panes()
+        cmdline = Path(self.environment["HERDR_PROC"]) / str(self.unit_one_pid) / "cmdline"
+        _ = cmdline.write_bytes(b"claude\0--autocompact\x00300000\0")
         self.state.mkdir(exist_ok=True)
         path = self.watches["unit-one"].stretch_path
         stretch = stall_watch.Stretch(pane_hash=hashlib.sha256(pane.strip().encode()).hexdigest(), since=START - 601,

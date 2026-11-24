@@ -198,6 +198,8 @@ Codex producers use the workers account.
 Claude producers use the producers account when it has a selection.
 They use the showrunners account until the first producers selection.
 `[producers]` in `config/models.conf` selects each producer's family, model, and effort.
+`[compact_windows]` sets the Claude auto-compact window by role when an account move starts a session.
+The unit session's recorded window takes precedence over its role setting.
 An explicit move saves a group selection.
 Status, launch, and preview reads never create a selection.
 

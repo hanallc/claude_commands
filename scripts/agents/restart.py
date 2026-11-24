@@ -900,19 +900,28 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
     if "staff_id" not in projected:
         projected["session_id"] = identity
         projected["name"] = name
-    arguments = pane_record.resume_arguments(projected)
     kind = pane_launch.saved_kind(projected)
+    configuration = models_registry.optional_launch_snapshot() if kind == "claude" else None
+    arguments = pane_record.resume_arguments(projected, record=record, configuration=configuration)
+    environment = configuration.environment({}) if configuration is not None else {}
     home = pane_launch.config_home(projected, record=record)
     if isinstance(home, staff.HomeUnknown):
         print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
-        return kind, {}, arguments
-    environment = {"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path)
+        return kind, environment, arguments
+    environment.update({"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path))
     return kind, environment, arguments
 
 
 def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
-    """Select the configured producer settings without a resume identity."""
-    settings = models_registry.launch_settings("producers", name)
+    """Select the configured producer settings and compact window without a resume identity."""
+    configuration = models_registry.launch_snapshot()
+    settings = models_registry.launch_settings("producers", name, configuration=configuration)
+    return settings.kind, producer_arguments(name, settings, configuration)
+
+
+def producer_arguments(name: str, settings: models_registry.LaunchSettings,
+                       configuration: models_registry.LaunchModelConfiguration) -> list[str]:
+    """Build arguments for a producer from one launch configuration."""
     if settings.kind == "codex":
         arguments = ["--model", settings.model,
                      "-c", f'model_reasoning_effort="{settings.effort}"']
@@ -921,24 +930,33 @@ def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], lis
     else:
         arguments = ["--name", name, "--remote-control", name,
                      "--model", settings.model, "--effort", settings.effort,
+                     *models_registry.compact_window_arguments("producer", configuration=configuration),
                      "--settings", '{"disableAgentView": true}']
-    return settings.kind, arguments
+    return arguments
 
 
-def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+def producer_launch(row: staff.StaffRow, *, configuration: models_registry.LaunchModelConfiguration | None = None
+                    ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Resume the producer's current conversation with its configured settings."""
-    kind, arguments = producer_first_arguments(row.name)
-    return kind, {}, ["resume" if kind == "codex" else "--resume", str(row.current_session), *arguments]
+    configuration = models_registry.launch_snapshot() if configuration is None else configuration
+    settings = models_registry.launch_settings("producers", row.name, configuration=configuration)
+    arguments = producer_arguments(row.name, settings, configuration)
+    environment = configuration.environment({}) if settings.kind == "claude" else {}
+    return settings.kind, environment, ["resume" if settings.kind == "codex" else "--resume", str(row.current_session), *arguments]
 
 
-def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
+def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch, *,
+                    configuration: models_registry.LaunchModelConfiguration | None = None
                     ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Keep saved launch options with the producer's current model settings; a Claude producer runs with Remote Control."""
-    settings = models_registry.launch_settings("producers", row.name)
+    configuration = models_registry.launch_snapshot() if configuration is None else configuration
+    settings = models_registry.launch_settings("producers", row.name, configuration=configuration)
     if settings.kind == "claude":
         entry = entry.copy()
         entry["remote_control"] = True
-    return settings.kind, {}, pane_record.configured_resume_arguments(entry, str(row.current_session), row.name, settings)
+    environment = configuration.environment({}) if settings.kind == "claude" else {}
+    return settings.kind, environment, pane_record.configured_resume_arguments(
+        entry, str(row.current_session), row.name, settings, configuration=configuration)
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
@@ -1081,7 +1099,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
               resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
               live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
-              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
+              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW,
+              configuration: models_registry.LaunchModelConfiguration | None = None) -> str:
     restore_workers = (partial(_restore_workers, reports=resume_checks.worker_restores)
                        if isinstance(resume_checks, DirectorResumeChecks) else _restore_workers)
     with operation_deadline.within(deadline):
@@ -1112,13 +1131,22 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         original = publication.entry if publication is not None else None
         projected = names.resume(original) if original is not None else None
         if row.kind == "producer":
-            kind, environment, arguments = producer_resume(row, original) if original is not None else producer_launch(row)
+            kind, environment, arguments = (producer_resume(row, original, configuration=configuration)
+                if original is not None else producer_launch(row, configuration=configuration))
         else:
             kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
+            if original is None and kind == "claude":
+                configuration = models_registry.optional_launch_snapshot()
+                environment = configuration.environment(environment)
+                arguments = [*arguments, *models_registry.compact_window_arguments(
+                    row.kind, session_id=row.current_session, configuration=configuration)]
         selected = member_account.resume_account(kind, row, to=target_account)
         if isinstance(selected, accounts.NamedAccount):
+            configuration_environment = {key: environment[key] for key in models_registry.OPERATION_ENVIRONMENT[:1]
+                                         if key in environment}
             environment = named_account_environment(selected.dir)
+            environment.update(configuration_environment)
         else:
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:

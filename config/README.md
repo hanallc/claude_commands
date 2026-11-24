@@ -68,10 +68,13 @@ five minutes, and when a source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
 
+`[compact_windows]` sets the Claude auto-compact window for producer, showrunner, unit, or worker at launch.
+
 `[claude.context]` sets the windows for the auto-compaction trigger.
 It contains `default=<window>` and one `<family>=<first version>:<window>` row per Claude family.
 For example, `opus=4.7:1m` sets a window of one million tokens for Opus 4.7 and later.
 Use a finite positive window in tokens. The hook skips windows that it cannot parse.
+The hooks and stall watcher check the Claude process for an explicit window.
 The per-call message uses `context_usage.conf`.
 
 ## codex_daemon.conf

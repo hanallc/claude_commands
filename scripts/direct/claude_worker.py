@@ -49,6 +49,7 @@ class PreparedClaudeLaunch:
     model: str
     environment: dict[str, str]
     loaded: nix_env.Loaded | nix_env.NoEnvrc
+    compact_window: tuple[str, ...]
 
 
 class ClaudeLaunchPreparation(Enum):
@@ -156,8 +157,12 @@ def _prepare_launch(turn: ClaudeTurn, environment: dict[str, str]) -> PreparedCl
     if isinstance(loaded, nix_env.Refused):
         print(loaded.reason, file=sys.stderr)
         raise _LaunchFailed(1)
-    model = models_registry.claude_model(turn.model, loaded.env) if turn.model else ""
-    return PreparedClaudeLaunch(model, environment, loaded)
+    configuration = models_registry.optional_launch_snapshot(loaded.env)
+    if isinstance(configuration, models_registry.UnreadableLaunchModelConfiguration):
+        return PreparedClaudeLaunch(turn.model, environment, loaded, ())
+    model = models_registry.claude_model(turn.model, configuration.environment(loaded.env)) if turn.model else ""
+    window = models_registry.compact_window_arguments("worker", configuration=configuration)
+    return PreparedClaudeLaunch(model, environment, loaded, tuple(window))
 
 
 def prepare_launch(turn: ClaudeTurn) -> PreparedClaudeLaunch | NotDelivered:
@@ -188,6 +193,7 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str],
         arguments += ["--model", prepared.model]
     if turn.effort:
         arguments += ["--effort", turn.effort]
+    arguments += prepared.compact_window
     start_env = models_registry.agent_environment(loaded.env)
     for name in ("UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "MODELS_CONFIG_FILE", "UNIT_RESOLVES_ROUND", "CLAUDE_CODE_CHILD_SESSION"):
         _ = start_env.pop(name, None)
