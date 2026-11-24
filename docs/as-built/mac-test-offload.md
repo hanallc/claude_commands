@@ -97,7 +97,8 @@ The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
 When the proof wait expires, the gate returns status 80 to its placement retry loop.
-The route appends one record to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
+The route records the guest address before it requests permission.
+It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
 It records `proven` when cleanup confirms the end, even when the stream gives no start marker.
 It records `unproven` and saves the armed guest identity when the proof wait expires.
 The route sends the end report only if the stream gave the start marker.
@@ -106,11 +107,16 @@ The writer locks the file during the append and syncs the record to disk.
 A failed report send leaves the proof available on disk.
 `mac_linux.settlement()` reads the file without a lock and skips damaged rows.
 The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
-Only a proven row for that key settles the attempt.
+Only a `proven` or `not started` row for that key settles the attempt.
 The queue can call `reconcile_unproven()` while it holds the slot.
 The call submits a service and returns before the service checks the guest.
-The service uses the saved guest identity and appends a new proof only when cleanup confirms the end.
-An older unproven row without an armed guest identity stays pending.
+When the route saved an armed guest identity, the service uses it to confirm the run ended.
+Otherwise, the service checks the guest address that the route saved before it requested permission.
+The guest checks for an armed record and records refusal under the run lock.
+The guest keeps the refusal and rejects any later arm for the same queue attempt.
+It keeps armed records for queue attempts to prevent a false refusal after the armed deadline.
+After the guest confirms refusal, the service records `not started`.
+An attempt with no saved guest address or armed identity stays pending.
 The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
 
 natedev holds the SSH input open for the whole run.

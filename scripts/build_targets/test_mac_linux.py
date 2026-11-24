@@ -62,11 +62,12 @@ shell = shlex.split(command)[-1]
 assert 'checkout="$HOME/.claude"' in shell
 assert shell.count('$HOME') == 1
 cleanup = 'prove_end()' in shell
-arm = 'prefix, attempt, window = sys.argv[1:]' in shell
-probe = not cleanup and not arm and 'bundle unbundle -' not in shell
+arm_records = 'full_suffix, window, lock_name, descriptor = sys.argv[1:]' in shell
+fence = arm_records and ' refuse mac-linux-armed mac-linux-cancel ' in shell
+probe = not cleanup and not arm_records and 'bundle unbundle -' not in shell
 trace_path = Path(os.environ['FIXTURE_SSH_TRACE'])
 with trace_path.open('a') as trace:
-    trace.write(('cleanup' if cleanup else 'arm' if arm else 'probe' if probe else 'run') + '\\n')
+    trace.write(('cleanup' if cleanup else 'fence' if fence else 'arm' if arm_records else 'probe' if probe else 'run') + '\\n')
 home = Path(os.environ['FIXTURE_GUEST_HOME'])
 if os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
     print('fixture SSH refused the connection', file=sys.stderr)
@@ -75,12 +76,12 @@ environment = dict(os.environ, HOME=str(home))
 if 'FIXTURE_GUEST_PATH' in os.environ:
     environment['PATH'] = os.environ['FIXTURE_GUEST_PATH']
 scenario = os.environ['FIXTURE_GUEST_RESULT']
-if arm:
-    reply = subprocess.check_output(['bash', '-c', shell], stdin=subprocess.DEVNULL, env=environment)
-    if scenario != 'missing-arm-ack':
-        sys.stdout.buffer.write(reply)
+if arm_records:
+    reply = subprocess.run(['bash', '-c', shell], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=environment)
+    if scenario != 'missing-arm-ack' or fence:
+        sys.stdout.buffer.write(reply.stdout)
         sys.stdout.buffer.flush()
-    sys.exit(0)
+    sys.exit(reply.returncode)
 if cleanup:
     if scenario in ('disconnect-before-copy', 'interrupted-before-copy'):
         lock = home / '.claude/.git/mac-linux-run.lock'
@@ -884,7 +885,8 @@ fi
                 self.assertEqual(self.trace.read_text().splitlines()[-1], 'cleanup')
                 self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
                 path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
-                line, = path.read_bytes().splitlines()
+                launch, line = path.read_bytes().splitlines()
+                self.assertEqual(cast(dict[str, object], json.loads(launch))['result'], 'awaiting arm')
                 proof = cast(dict[str, object], json.loads(line))
                 self.assertEqual(proof['claim'], self.consumed[0][0].claim.claim_id)
                 self.assertEqual(proof['result'], 'proven')
@@ -914,6 +916,135 @@ fi
         self.assertIn('Guest cleanup: ended', reason)
         report.assert_not_called()
         self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+
+    def lose_guest_permission_reply(self, attempt: int) -> wire.ConsumePermission:
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+        with patch.object(admission_client, 'consume_permission',
+                          side_effect=wire.AdmissionUnavailable('fixture lost authorization reply')) as consume:
+            self.assertIn('fixture lost authorization reply', self.not_started(self.route()))
+        consume.assert_called_once()
+        request = cast(wire.ConsumePermission, consume.call_args.args[0])
+        self.assertEqual(request.assignment, self.placed)
+        self.assertEqual(self.trace.read_text(), '')
+        return request
+
+    def test_lost_guest_permission_reply_settles_after_the_guest_fences_the_attempt(self) -> None:
+        request = self.lose_guest_permission_reply(23)
+        episode = request.assignment.episode
+        self.assertFalse(self.run_lock().exists())
+        self.assertIsInstance(mac_linux.settlement(episode, 23), placement.Pending)
+
+        with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+            mac_linux.reconcile_unproven(episode, 23)
+        submit.assert_called_once()
+        command = cast(list[str], submit.call_args.args[0])
+        self.assertEqual(command[-3:], ['--reconcile-end', episode, '23'])
+
+        with redirect_stderr(io.StringIO()) as errors:
+            with patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'offline'}):
+                mac_linux.reconcile_guest_end(episode, 23)
+            self.assertIn('fixture SSH refused the connection', errors.getvalue())
+        self.assertIsInstance(mac_linux.settlement(episode, 23), placement.Pending)
+
+        mac_linux.reconcile_guest_end(episode, 23)
+        self.assertEqual(mac_linux.settlement(episode, 23), placement.Settled())
+        self.assert_guest_clean('fence', 'fence')
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        _, proof = path.read_bytes().splitlines()
+        record = cast(dict[str, object], json.loads(proof))
+        self.assertEqual(record['attempt'], execution_identity.attempt_key(episode, self.placed.attempt))
+        self.assertEqual(record['claim'], request.claim.claim_id)
+        self.assertEqual(record['result'], 'not started')
+
+    def test_guest_fence_refuses_a_gate_that_arms_after_reconciliation(self) -> None:
+        self.placed = replace(self.placed, attempt=f'{29:032x}')
+        attempts: list[str] = []
+        arm_guest = mac_linux.arm_guest
+
+        def record_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+            attempts.append(attempt)
+            return arm_guest(settings, attempt)
+
+        def delayed_reply(request: wire.ConsumePermission) -> wire.FirstAuthorization:
+            mac_linux.reconcile_guest_end(request.assignment.episode, 29)
+            self.assertEqual(mac_linux.settlement(request.assignment.episode, 29), placement.Settled())
+            return wire.FirstAuthorization(request.assignment, request.claim)
+
+        with (patch.object(admission_client, 'consume_permission', delayed_reply),
+              patch.object(mac_linux, 'arm_guest', record_arm)):
+            outcome = self.route()
+        self.assertIn('The guest attempt was refused.', self.not_started(outcome))
+        self.assert_guest_clean('fence', 'probe', 'arm')
+        self.assertEqual(list(self.run_lock().parent.glob(f'{mac_linux.ARM_RECORD_PREFIX}.*')), [])
+
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        other = arm_guest(settings, 'other-fixture')
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, other), mac_linux.GuestEndProven)
+        attempt, = attempts
+        with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'The guest attempt was refused.'):
+            _ = arm_guest(settings, attempt + mac_linux.FULL_BUNDLE_RETRY_SUFFIX)
+
+    def test_guest_reconciliation_leaves_armed_and_running_attempts_pending(self) -> None:
+        self.placed = replace(self.placed, attempt=f'{31:032x}')
+        episode = self.placed.episode
+        attempts: list[str] = []
+        arm_guest = mac_linux.arm_guest
+
+        def stop_after_arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+            with patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0):
+                _ = arm_guest(settings, attempt)
+            attempts.append(attempt)
+            raise mac_linux.GuestTookNoRun('fixture stop after arm')
+
+        with patch.object(mac_linux, 'arm_guest', stop_after_arm):
+            self.assertIn('fixture stop after arm', self.not_started(self.route()))
+
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        guest_attempt, = attempts
+        other = mac_linux.arm_guest(settings, 'other-fixture')
+        self.assertIsInstance(mac_linux.prove_guest_end(settings, other), mac_linux.GuestEndProven)
+
+        with redirect_stderr(io.StringIO()) as errors:
+            mac_linux.reconcile_guest_end(episode, 31)
+        self.assertIn('The guest has an armed record', errors.getvalue())
+        self.assertIsInstance(mac_linux.settlement(episode, 31), placement.Pending)
+
+        with self.run_lock().open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            _ = lock.write(f'{os.getpid()} {guest_attempt}\n')
+            lock.flush()
+            with patch.object(mac_linux, '_warn_guest_reconcile') as warn:
+                mac_linux.reconcile_guest_end(episode, 31)
+            warn.assert_called_once()
+            self.assertEqual(warn.call_args.args[1], 'The guest run lock is held.')
+            self.assertIsInstance(mac_linux.settlement(episode, 31), placement.Pending)
+        self.assertEqual(list(self.run_lock().parent.glob(f'{mac_linux.CANCEL_RECORD_PREFIX}.refused.*')), [])
+
+    def test_guest_reconciliation_leaves_a_changed_guest_address_pending(self) -> None:
+        request = self.lose_guest_permission_reply(34)
+        episode = request.assignment.episode
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        changed = replace(settings, ssh_hops=(settings.ssh_hops[0], 'other-guest'))
+        with (patch.object(mac_linux, 'read_settings', return_value=changed),
+              redirect_stderr(io.StringIO()) as errors):
+            mac_linux.reconcile_guest_end(episode, 34)
+        self.assertIn('The Mac Linux guest address changed for this attempt.', errors.getvalue())
+        self.assertIsInstance(mac_linux.settlement(episode, 34), placement.Pending)
+        self.assert_guest_clean()
+
+    def test_reconcile_unproven_skips_an_attempt_with_a_proven_end(self) -> None:
+        request = self.lose_guest_permission_reply(37)
+        episode = request.assignment.episode
+        mac_linux.reconcile_guest_end(episode, 37)
+        self.assertEqual(mac_linux.settlement(episode, 37), placement.Settled())
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        history = path.read_bytes()
+        with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+            mac_linux.reconcile_unproven(episode, 37)
+        submit.assert_not_called()
+        mac_linux.reconcile_guest_end(episode, 37)
+        self.assertEqual(path.read_bytes(), history)
+        self.assert_guest_clean('fence')
 
     def test_reconcile_unproven_guest_after_the_route_returns(self) -> None:
         attempt = 23
@@ -949,6 +1080,7 @@ fi
             self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
             mac_linux.reconcile_unproven(episode, attempt)
             self.assertEqual(start.call_count, 3)
+            mac_linux.reconcile_guest_end(episode, attempt)
         self.assertEqual(prove.call_args_list, [call(armed)] * 3)
         self.assertEqual(errors.getvalue().splitlines(), ['Mac Linux guest reconcile failed: guest unavailable'])
 
@@ -1693,7 +1825,8 @@ fi
                 self.assertIn('guest unreachable: fixture-guest did not confirm the run ended '
                               + f'within 2 seconds ({key})', str(failure))
                 path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
-                line, = path.read_bytes().splitlines()
+                launch, line = path.read_bytes().splitlines()
+                self.assertEqual(cast(dict[str, object], json.loads(launch))['result'], 'awaiting arm')
                 row = cast(dict[str, object], json.loads(line))
                 self.assertEqual(row['attempt'], execution_identity.attempt_key(self.placed.episode, self.placed.attempt))
                 self.assertEqual(row['claim'], self.consumed[0][0].claim.claim_id)
@@ -1707,9 +1840,8 @@ fi
                 self.assertEqual(owner.split()[1], first.attempt)
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
 
-                with self.assertRaises(mac_linux.GuestEndUnproven) as second:
-                    _ = self.route()
-                self.assertTrue(any('The guest run lock is held' in line for line in second.exception.__notes__))
+                second = self.not_started(self.route())
+                self.assertIn('The guest run lock is held', second)
                 self.assertEqual(lock.read_text(), owner)
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
                 self.assertFalse((self.guest_home / 'build').exists())
@@ -2315,7 +2447,7 @@ fi
             result = self.route()
         assert isinstance(result, mac_linux.MacLinuxGateRun), result
         (first_attempt, first_claim), (retry_attempt, retry_claim) = attempts
-        self.assertNotEqual(first_attempt, retry_attempt)
+        self.assertEqual(retry_attempt, first_attempt + mac_linux.FULL_BUNDLE_RETRY_SUFFIX)
         self.assertNotEqual(first_claim, retry_claim)
         self.assertEqual(claim_state.read_claims(paths), ())
         self.assert_bundle(result, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.GUEST_LACKS_PREREQUISITE,
