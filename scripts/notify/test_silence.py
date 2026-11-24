@@ -20,8 +20,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
+from urllib.parse import parse_qs
 
-from scripts.notify import push_texts, silence
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.notify import pushover, push_texts, silence
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
@@ -138,6 +140,36 @@ raise SystemExit(pushover.send(sys.argv[1:], keys, post))
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
         self.assertIn("0 kept pushes delivered; 1 failed", output.getvalue())
+
+    def test_release_continues_after_a_push_with_an_unusable_sender_limit(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = root / "notify.conf"
+        _ = write_config_fixture(configuration, "pushover.max_source_chars=0\n")
+        _ = write_config_fixture(root / "user_zone.conf")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root)})))
+        _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", root / "push.log"))
+        keys = root / "keys"
+        _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
+        _ = self.main("on")
+        second: silence.KeptPush = {**PUSH, "title": "Tests done"}
+        for push in (PUSH, second):
+            _ = silence.keep_here(push)
+        posted: list[str] = []
+
+        def post(_url: str, data: bytes) -> tuple[int, bytes]:
+            posted.append(parse_qs(data.decode())["title"][0])
+            return 200, b'{"status":1}'
+
+        def deliver(push: silence.KeptPush) -> int:
+            if push == second:
+                _ = write_config_fixture(configuration, "pushover.max_source_chars=80\n")
+            return pushover.post_kept(push, keys, post)
+
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            self.assertEqual(silence.off(self.runner, deliver), 1)
+        self.assertIn("1 kept push delivered; 1 failed", output.getvalue())
+        self.assertEqual(posted, [second["title"]])
+        self.assertEqual(silence.read_kept(), [PUSH])
 
     def test_manual_off_logs_an_automatic_end_before_releasing_pushes(self) -> None:
         record: silence.SilenceRecord = {"since": "2026-11-03T06:00:00+00:00", "until": None,

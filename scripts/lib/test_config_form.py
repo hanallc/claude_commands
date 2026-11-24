@@ -1008,8 +1008,8 @@ class ConfigFormTests(unittest.TestCase):
             (check_tunable_literals, "example.py",
              "RELEASE_LOCK_WAIT_S = 60\nFLAG_WAIT = 60.0\nMAX_WAITING_JOBS = 20\n",
              3, "literal", "MAX_WAITING_JOBS = 20"),
-            (check_tunable_literals, "example.py", "WAIT_SHARE_LIMIT = 0.10\n",
-             1, "literal", "WAIT_SHARE_LIMIT = 0.10"),
+            (check_tunable_literals, "example.py", "WAIT_WORK_SHARE_LIMIT = 0.10\n",
+             1, "literal", "WAIT_WORK_SHARE_LIMIT = 0.10"),
         )
         for check, name, source, number, rule, line in cases:
             with self.subTest(rule=rule, line=line), tempfile.TemporaryDirectory() as folder:

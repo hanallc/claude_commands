@@ -14,10 +14,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Protocol, cast, final, override
+from unittest.mock import call as mock_call
 from unittest.mock import patch
 from scripts.hooks import context_usage
+from scripts.lib import conf
 from scripts.lib.file_module import load_file_module
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fault, write_config_fixture
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -123,6 +126,7 @@ class ContextMessageHook(Protocol):
     DEBUG_LOG: Path
 
     def main(self) -> None: ...
+    def message_enabled(self, configuration: conf.ConfigRead) -> bool: ...
 
 
 class ContextMessageSwitchTests(unittest.TestCase):
@@ -151,6 +155,7 @@ class ContextMessageSwitchTests(unittest.TestCase):
             "CONF_DIR": str(self.root), "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
             "CLAUDE_CONTEXT_HOOK_MODE": "dynamic", "CLAUDE_CONTEXT_HOOK_DEBUG": "1",
         }))
+        _ = write_config_fixture(self.root / "context_usage.conf", "transcript.tail_bytes=524288\n")
 
     def call(self, *, subagent: bool = False) -> str:
         payload = {"transcript_path": str(self.transcript), "session_id": "fixture-session"}
@@ -162,7 +167,7 @@ class ContextMessageSwitchTests(unittest.TestCase):
         return output.getvalue()
 
     def test_off_keeps_the_reading_and_log_without_building_either_context_message(self) -> None:
-        _ = (self.root / "context_usage.conf").write_text("message = off\n", encoding="utf-8")
+        _ = write_config_fixture(self.root / "context_usage.conf", "message=off\n")
         with patch.object(self.hook, "showrunner_state") as state, patch.object(self.hook, "build_context") as build:
             for subagent in (False, True):
                 with self.subTest(subagent=subagent):
@@ -176,26 +181,51 @@ class ContextMessageSwitchTests(unittest.TestCase):
         self.assertEqual([record["transcript_read"] for record in records], [str(self.transcript), str(own)])
 
     def test_on_retains_the_main_thread_and_subagent_messages(self) -> None:
-        _ = (self.root / "context_usage.conf").write_text("message = on\n", encoding="utf-8")
+        _ = write_config_fixture(self.root / "context_usage.conf", "message=on\n")
         with patch.object(self.hook, "showrunner_state", return_value=None):
             self.assertIn("write a handoff doc first", self.call())
             self.assertIn("return your results now", self.call(subagent=True))
 
-    def test_missing_key_file_or_bad_value_keeps_the_old_message(self) -> None:
+    def test_missing_switch_or_bad_value_keeps_the_old_message(self) -> None:
         path = self.root / "context_usage.conf"
-        for content in (None, "other = off\n", "message = invalid\n"):
+        for content in ("other = off\n", "message = invalid\n"):
             with self.subTest(content=content), patch.object(self.hook, "showrunner_state", return_value=None):
-                if content is not None:
-                    _ = path.write_text(content, encoding="utf-8")
+                _ = write_config_fault(path, "transcript.tail_bytes=524288\n" + content)
                 self.assertIn("write a handoff doc first", self.call())
+        path.unlink()
+        self.assertTrue(self.hook.message_enabled(conf.read("context_usage")))
+        with patch.object(self.hook, "showrunner_state", return_value=None):
+            self.assertIn("write a handoff doc first", self.call())
+
+    def test_an_unusable_scan_size_still_gives_the_context_message(self) -> None:
+        _ = write_config_fixture(self.root / "context_usage.conf", "message=on\ntranscript.tail_bytes=0\n")
+        with (patch.object(self.hook, "showrunner_state", return_value=None),
+              patch.object(context_usage, "read_tail", wraps=context_usage.read_tail) as scan):
+            self.assertIn("write a handoff doc first", self.call())
+        scan.assert_called_once_with(self.transcript, 4 * 1024 * 1024)
 
     def test_the_switch_is_read_again_in_the_same_process(self) -> None:
         path = self.root / "context_usage.conf"
-        _ = path.write_text("message = off\n", encoding="utf-8")
+        _ = write_config_fixture(path, "message=off\n")
         self.assertEqual(self.call(), "")
-        _ = path.write_text("message = on\n", encoding="utf-8")
+        _ = write_config_fixture(path, "message=on\n")
         with patch.object(self.hook, "showrunner_state", return_value=None):
             self.assertIn("write a handoff doc first", self.call())
+
+    def test_each_tool_call_reads_the_scan_size_once(self) -> None:
+        path = self.root / "context_usage.conf"
+        for size, scans in ((512, [512]), (1, [1, 4194304])):
+            with self.subTest(size=size):
+                _ = write_config_fixture(path, f"transcript.tail_bytes={size}\n")
+                with (patch.object(conf, "read", wraps=conf.read) as read,
+                      patch.object(context_usage, "read_tail", wraps=context_usage.read_tail) as scan):
+                    self.assertEqual(self.call(), "")
+                self.assertEqual([call for call in read.call_args_list if call.args == ("context_usage",)],
+                                 [mock_call("context_usage")])
+                self.assertEqual(scan.call_args_list, [mock_call(self.transcript, count) for count in scans])
+        records = [cast(dict[str, object], json.loads(line))
+                   for line in self.hook.DEBUG_LOG.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record["tokens"] for record in records], [160_000, 160_000])
 
 
 if __name__ == "__main__":

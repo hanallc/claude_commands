@@ -6184,6 +6184,17 @@ class StopResumeTests(unittest.TestCase):
             self.assertNotIn(row.current_session, shown)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()].count("failed"), 20)
 
+    def test_an_unusable_sender_limit_preserves_the_pending_move_results(self) -> None:
+        _ = write_config_fixture(self.root / "configuration/notify.conf", "pushover.max_source_chars=0\n")
+        session = "019b3a40-4250-7000-8000-000000000102"
+        with (patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning),
+              patch.object(stop_resume, "resume", side_effect=OSError("fixture start failed")),
+              patch.object(stop_resume, "_send_move_push") as send):
+            results = stop_resume.move_sessions([session], "claude4", why="move")
+        self.assertEqual(results, [stop_resume.ResumePending(session, "claude4", "fixture start failed")])
+        self.assertEqual([request.member.reference for request in moves.pending_move_requests()], [session])
+        send.assert_called_once()
+
     def test_a_move_by_hand_takes_a_busy_row_when_its_operation_ends(self) -> None:
         busy = staff.StaffId("busy")
         rows = staff.StaffSnapshot((

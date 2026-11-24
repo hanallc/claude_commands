@@ -396,7 +396,13 @@ The context query orders requests by `(at, turn_key)` and compares `input + cach
 The script prints nothing when no alert applies.
 
 - **Units**: each folder's unit comes from the `## Units` tables of every registered showrunner's production doc and of `--production-docs`, longest worktree first, else the folder's last component, else `unknown`.
-- **Wait alert**: a unit whose Codex worker threads (`impl`, `test`, `fix`, `review`, `worker` or unassigned) spend over 10% of their weighted usage on waiting requests, on at least 1,000,000 of their weighted tokens in the window. Claude sessions and other Codex roles never count toward it: a Claude session reads a background task's output once after its completion notice, which the classifier labels wait but is the required step, not a poll. On 2026-10-16 00:30–01:20 EDT those reads alone put two units at 9–11% while no worker polled. Their waiting stays visible in `wait_share`.
+- **Wait alert**. A unit needs at least 1,000,000 weighted tokens from Codex workers in the window.
+  The watch reads `alert.max_wait_share` from `config/waste_watch.conf` once per pass.
+  The alert requires a waiting share above that limit, which ships at 10%.
+  Codex worker roles are `impl`, `test`, `fix`, `review`, `worker`, and unassigned.
+  Waiting by Claude sessions and other Codex roles stays visible in `wait_share`.
+  The classifier counts a Claude session's read of a completed background task as waiting.
+  On 2026-10-16 from 00:30 to 01:20 EDT, these reads gave two units a waiting share of 9–11% without worker polls.
 - **Context flag**: a Codex worker thread alerts after five consecutive requests exceed their models’ compaction limits.
   Worker roles are `impl`, `test`, `fix`, `review`, `worker`, and unassigned.
   Each request uses `turns.model`.
@@ -419,7 +425,7 @@ The script prints nothing when no alert applies.
 - **Delivery**: the registered showrunner (`showrunners.registered_showrunners()`) whose doc lists the unit, running ones first, through `send.py --to uds:<socket> --from usage-waste-watch --text` (`WASTE_WATCH_SEND` replaces the script path in tests). Exit 0 or 1 (queued) is delivered. No showrunner listing the unit, a stopped one or a failed lookup prints the alert to stdout with the reason; a failed send prints it too.
 - **Throttle**: at most one alert per unit per 6 hours, in `<state_dir()>/waste_watch.json` (unit → UTC time), written atomically after a delivery or a printed no-showrunner alert; a failed send is not recorded.
 - **Dry run**: `--dry-run`, and any store other than the default `collect.store_path()`, print each alert with its destination, send nothing, write no state and ignore the throttle. Tests and scratch stores therefore never send.
-- When the window's total waiting is at most 100,000 weighted tokens and no thread is flagged, no unit can alert and no showrunner is looked up.
+- The watch skips showrunner discovery when no thread has a context flag and total worker waiting is at most the configured share of 1,000,000 tokens.
 
 ### Timer
 
@@ -509,7 +515,7 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
 - **The watch's thresholds.** The measured median is 2.1M weighted tokens per folder per two hours.
   A request uses about 19K weighted tokens, so 1M represents about 50 requests.
   Below that minimum, a few waiting requests can dominate the share.
-  The 10% threshold requires at least 100K weighted tokens of waiting usage.
+  The shipped 10% threshold requires more than 100K weighted tokens of waiting usage.
   This exceeds the cost of the showrunner alert.
   Five consecutive requests above the model compaction limit trigger a context alert.
   The `gpt-6.1-sol` cache window of 500,000 tokens gives a compaction limit of 450,000 tokens.

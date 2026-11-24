@@ -501,7 +501,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Ruled out:** a command-line argument for the Summary scan limit. It changes the `run TAIL SUMMARY COMMAND...` form, and macOS gets no copy of the script for each run.
 
-### Phase 11 — Message and notice literals to config  · status: todo
+### Phase 11 — Message and notice literals to config  · status: done
 **Depends on:** Phase 3
 
 #### Work Order
@@ -520,12 +520,14 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 7. Hooks run on each tool call. A hook reads its key once for each run, never at import.
 8. **Bounds.** Both context hooks use `scripts/hooks/context_usage.py`. Give `context_usage.transcript.tail_bytes` the limit `# whole: 1..4194304`, so the first scan is never larger than the 4 MiB `TAIL_BYTES_RETRY`, which stays in the code. Each hook reads the key on the host that runs it. Give `notify.pushover.max_source_chars` an upper bound before it reaches the source slices.
 9. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
+10. **Main merge literal.** Main brought `scripts/build_targets/mac_linux.py` `CONNECT_ATTEMPTS = 3` after the build tool batch. It moves in this phase to `config/mac_linux.conf` `ssh.connect_attempts=3` (`# whole: 1..`), read by `read_settings` (bob's working name, showrunner 11-24 00:50 PST). `SSH_CONNECT_TIMEOUT_SECONDS` and `CONNECT_RETRY_SECONDS` are wait limits and stay in the code. Main also left no blank line before the `excluded_notice_seconds.mac` limit line in `config/build_targets.conf`; add it.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
 - `scripts/**/*.py` — the source files of the batch rows, and their tests
 - `config/*.conf` — the stems that get keys
 - `docs/as-built/usage-ledger.md` — names a moved constant
+- `scripts/build_targets/mac_linux.py`, `scripts/build_targets/test_mac_linux.py`, `config/mac_linux.conf`, `config/build_targets.conf` — the main merge literal and blank line
 
 **Workers:** 2 writers — split by reader.
 - `impl` — the context hooks (`scripts/hooks/context_usage.py` and its callers) and Pushover (`scripts/notify/pushover.py`), their tests and stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)

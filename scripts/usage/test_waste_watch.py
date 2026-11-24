@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.usage import collect, usage_report, waste_watch
 from scripts.production import session_staff, showrunners, staff
 from scripts.production.staff_test_support import (
@@ -55,6 +56,9 @@ class WasteWatchTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CODEX_HOME": str(self.root / ".codex")}))
+        config = self.root / "config"
+        _ = write_config_fixture(config / "waste_watch.conf", "alert.max_wait_share=0.10\n")
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, config_environment(config))))
         self.models_cache = self.root / ".codex/models_cache.json"
         self.models_cache.parent.mkdir()
         _ = self.models_cache.write_text(json.dumps({"models": [
@@ -189,6 +193,10 @@ class WasteWatchTests(unittest.TestCase):
         self.request("worker", 0, 900_000)
         self.wait("worker", 1, 100_000)
         self.assertEqual(self.run_watch(), "")
+        config = self.root / "config/waste_watch.conf"
+        _ = write_config_fixture(config, "alert.max_wait_share=0.09\n")
+        self.assertIn("alpha spent 10%", self.run_watch(dry_run=True))
+        _ = write_config_fixture(config, "alert.max_wait_share=0.10\n")
         self.request("small", 2, 400_000, folder="/invented/small")
         self.wait("small", 3, 400_000, folder="/invented/small")
         self.assertEqual(self.run_watch(), "")

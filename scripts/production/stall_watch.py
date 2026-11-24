@@ -478,7 +478,7 @@ def context_near_compaction(session_id: str) -> bool:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
         if transcript is None:
             return False
-        reading = context_usage.latest_reading(transcript)
+        reading = context_usage.latest_reading(transcript, tunables.read("context_usage"))
     except OSError:
         return False
     if reading is None:

@@ -1993,7 +1993,8 @@ runpy.run_path(str(script), run_name='__main__')
                     path.unlink()
 
     def write_context_usage(self, tokens: int, *, window: int = 300_000) -> None:
-        """A local model registry, configured window and last billed context; no real settings."""
+        """Write the test config and the most recent usage record."""
+        _ = write_config_fixture(self.root / "context_usage.conf", "transcript.tail_bytes=524288\n")
         registry = self.root / "models.conf"
         _ = write_registry(registry, {"claude.context": {"default": str(window)}}, replace_sections=("claude.context",))
         self.environment.update(MODELS_CONFIG_FILE=str(registry), CLAUDE_CODE_AUTO_COMPACT_WINDOW="400k")

@@ -169,7 +169,6 @@ VARIABLE_EXCEPTIONS: tuple[VariableException, ...] = (
     VariableException("CODEX_CONFIG_FILE", "not a config file", ExceptionLifetime.PERMANENT),
 )
 
-_MESSAGE_BATCH = RemoveInPhase("Message and notice literals to config")
 _PRODUCTION_BATCH = RemoveInPhase("Production and direct literals to config")
 _AWS_REVIEW_BATCH = RemoveInPhase("AWS and review tool literals to config")
 
@@ -266,10 +265,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/direct/progress_history.py", "BOARD_NOTE_CHARS", "72",
         "direct", "board.max_note_chars", "# whole: 1..", _PRODUCTION_BATCH,
     ),
-    TunableLiteral(
-        "scripts/hooks/context_usage.py", "TAIL_BYTES", "512 * 1024",
-        "context_usage", "transcript.tail_bytes", "# whole: 1..", _MESSAGE_BATCH,
-    ),
     InternalLiteral(
         "scripts/lib/python_startup/sitecustomize.py", "_GATE_ANCESTOR_LIMIT",
         "Bound the gate ancestor scan during Python startup.",
@@ -293,10 +288,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     ExternalLiteral(
         "scripts/notify/pushover.py", "MESSAGE_MAX",
         "The Pushover Message API sets the message character limit.",
-    ),
-    TunableLiteral(
-        "scripts/notify/pushover.py", "SOURCE_MAX", "80",
-        "notify", "pushover.max_source_chars", "# whole: 1..", _MESSAGE_BATCH,
     ),
     TunableLiteral(
         "scripts/orphans/orphans.py", "MAXIMUM_CORPUS_FILE_BYTES", "2_000_000",
@@ -417,14 +408,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/usage/context_economy_cache.py", "ANCHOR_BYTES",
         "Use a fixed sample to verify the cached scan position.",
-    ),
-    TunableLiteral(
-        "scripts/usage/waste_watch.py", "WAIT_SHARE_LIMIT", "0.10",
-        "waste_watch", "alert.max_wait_share", "# range: 0..1", _MESSAGE_BATCH,
-    ),
-    TunableLiteral(
-        "scripts/whoami/codex_pacer.py", "MAX_STEP", "3.0",
-        "codex_pacer", "sampling.max_step_percent", "# range: 0..100", _MESSAGE_BATCH,
     ),
 )
 

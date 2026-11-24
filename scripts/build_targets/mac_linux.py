@@ -59,7 +59,6 @@ ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
-CONNECT_ATTEMPTS = 3
 # Give the guest port forward time to accept a new connection.
 CONNECT_RETRY_SECONDS = 1
 INNER_CONNECT_READY = 'mac-linux inner SSH ready'
@@ -154,6 +153,7 @@ class GuestSettings:
     jobs: int
     run_time_limit_seconds: int
     unreachable_wait_seconds: int
+    connect_attempt_limit: int
 
     @property
     def guest_timeout_seconds(self) -> int:
@@ -204,6 +204,7 @@ esac
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
     settings = conf.read(eligibility.mac_linux_target(registry).settings)
     hops = settings.value('ssh.hops', str.split, recover_invalid=False)
+    connect_attempt_limit = settings.whole('ssh.connect_attempts')
     user = settings.text('guest.user', recover_invalid=False)
     jobs = settings.value('test.jobs', int, recover_invalid=False)
     limit = settings.value('run.time_limit_seconds', int, recover_invalid=False)
@@ -214,7 +215,7 @@ def read_settings(registry: conf.ConfigRead) -> GuestSettings:
         raise GuestUnavailable('guest.user must name a Linux user')
     if jobs < 1 or limit < 1:
         raise GuestUnavailable('test.jobs and run.time_limit_seconds must be positive')
-    return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait)
+    return GuestSettings((hops[0], hops[1]), user, jobs, limit, proof_wait, connect_attempt_limit)
 
 
 def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
@@ -494,7 +495,8 @@ def inner_connect_failure[Output: (bytes, str)](
 
 
 def retry_guest_connect[Output: (bytes, str)](
-    run: Callable[[float], subprocess.CompletedProcess[Output]], deadline: float, *, bundle_stream: bool = False,
+    run: Callable[[float], subprocess.CompletedProcess[Output]], deadline: float, *,
+    attempt_limit: int, bundle_stream: bool = False,
 ) -> subprocess.CompletedProcess[Output]:
     """Retry only when the inner SSH client could not connect."""
     diagnostic = ''
@@ -505,7 +507,7 @@ def retry_guest_connect[Output: (bytes, str)](
         diagnostic = inner_connect_failure(reply, bundle_stream=bundle_stream)
         if not diagnostic:
             return reply
-        if attempts == CONNECT_ATTEMPTS or deadline - monotonic() <= CONNECT_RETRY_SECONDS:
+        if attempts == attempt_limit or deadline - monotonic() <= CONNECT_RETRY_SECONDS:
             break
         sleep(CONNECT_RETRY_SECONDS)
     if not attempts:
@@ -530,7 +532,8 @@ if [ -f "$checkout/.git/HEAD" ]; then
 fi'''
     command = settings.command(shell)
     reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
-                                monotonic() + settings.unreachable_wait_seconds)
+                                monotonic() + settings.unreachable_wait_seconds,
+                                attempt_limit=settings.connect_attempt_limit)
     if reply.returncode:
         raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
     commit = reply.stdout.strip()
@@ -651,7 +654,8 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
                 raise
         return subprocess.CompletedProcess(command, process.returncode, output, errors)
 
-    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
+    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds,
+                                   attempt_limit=settings.connect_attempt_limit)
     if response.returncode:
         diagnostic = response.stderr.decode(errors='replace').strip() or 'no diagnostic'
         raise GuestUnavailable(f'guest arm exited {response.returncode}: {diagnostic}')
@@ -963,7 +967,7 @@ class GuestEndWait:
             if remaining <= 0:
                 return
             if self.retry:
-                short_retry = 0 < self.connect_attempts < CONNECT_ATTEMPTS
+                short_retry = 0 < self.connect_attempts < self.settings.connect_attempt_limit
                 pause = CONNECT_RETRY_SECONDS if short_retry else SSH_CONNECT_TIMEOUT_SECONDS
                 sleep(min(pause, remaining))
                 if monotonic() >= self.deadline:
@@ -1489,7 +1493,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                                     repo, arguments, bootstrap, settings.transfer_timeout_seconds, link,
                                     armed_for_stream, dispatch, connect_deadline=connect_deadline)
 
-                            stream = retry_guest_connect(send_stream, connect_deadline, bundle_stream=True)
+                            stream = retry_guest_connect(send_stream, connect_deadline,
+                                                         attempt_limit=settings.connect_attempt_limit, bundle_stream=True)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()

@@ -140,7 +140,7 @@ def mac_linux_fixture(fixture: AdmissionFixture, *, enabled: str = "on", registe
         + f"enabled.mac-linux={enabled}\nunreachable_wait_seconds=600\n")
     _ = (fixture.root / "mac_linux.conf").write_text(
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=8\n"
-        + "run.time_limit_seconds=7200\n")
+        + "run.time_limit_seconds=7200\n\n# whole: 1..\nssh.connect_attempts=3\n")
     backoff = fixture.root / "target-state" / "mac-linux" / "unreachable_until"
     backoff.parent.mkdir(parents=True, exist_ok=True)
     return backoff

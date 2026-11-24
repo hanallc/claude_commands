@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
@@ -95,10 +96,15 @@ class UserActionTests(unittest.TestCase):
 
 class ParentSourceTests(unittest.TestCase):
     def test_parent_source_reads_and_limits_the_parent_command(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(root)})))
         command = "python3 a-very-long-parent-command " + "x" * 100
         completed = subprocess.CompletedProcess(["ps"], 0, stdout=command + "\n", stderr="")
         with mock.patch("scripts.notify.pushover.subprocess.run", return_value=completed) as run:
-            self.assertEqual(pushover.parent_source(), command[:80])
+            for limit in (80, 12):
+                with self.subTest(limit=limit):
+                    _ = write_config_fixture(root / "notify.conf", f"pushover.max_source_chars={limit}\n")
+                    self.assertEqual(pushover.parent_source(), command[:limit])
         self.assertEqual(run.call_args.args[0][:3], ["ps", "-o", "args="])
 
 
@@ -199,6 +205,9 @@ class PushoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(folder / "notify.conf", "pushover.max_source_chars=80\n")
+        _ = write_config_fixture(folder / "user_zone.conf")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})))
         binary = folder / "bin"
         binary.mkdir()
         claude = binary / "claude"
@@ -734,20 +743,37 @@ class PushoverTests(unittest.TestCase):
             self.assertIn("refused before sending: no sender", errors.getvalue())
             self.assertEqual(self.log_lines()[-1]["outcome"], "refused before sending: no sender")
 
+    def test_an_unusable_sender_limit_is_logged_and_refused(self) -> None:
+        _ = write_config_fixture(self.keys.parent / "notify.conf", "pushover.max_source_chars=0\n")
+        with redirect_stderr(io.StringIO()) as errors:
+            code = pushover.post_message(PARENT, "0", "t", "m", self.keys,
+                                         mock.Mock(side_effect=AssertionError("posted with an unusable sender limit")),
+                                         "fixture detail")
+        self.assertEqual(code, 2)
+        diagnostic, = errors.getvalue().splitlines()
+        prefix = f"pushover: {REFUSED_BEFORE_SENDING}: "
+        self.assertTrue(diagnostic.startswith(prefix))
+        self.assertIn("pushover.max_source_chars='0'", diagnostic)
+        self.assertIn("no usable committed value", diagnostic)
+        self.assert_log("0", "t", "m", diagnostic.removeprefix("pushover: ") + ", fixture detail")
+
     def test_a_long_body_is_cut_so_the_footer_fits(self) -> None:
         sent: list[str] = []
+        sender = "hana" * 100
 
         def post(_url: str, data: bytes) -> tuple[int, bytes]:
             sent.append(urllib.parse.parse_qs(data.decode())["message"][0])
             return 200, b'{"status":1}'
 
-        with redirect_stdout(io.StringIO()):
-            code = pushover.post_message("send.py in hana", "0", "t", "No action needed.\n" + "B" * 2000, self.keys, post,
-                                         "", text_id="auto_mode.refused")
-        self.assertEqual(code, 0)
-        self.assertEqual(len(sent[0]), pushover.MESSAGE_MAX)
-        self.assertTrue(sent[0].startswith("No action needed.\nBBB"))
-        self.assert_footer(sent[0], "hana", "auto_mode.refused")
+        for limit in (256, 12):
+            with self.subTest(limit=limit), redirect_stdout(io.StringIO()):
+                _ = write_config_fixture(self.keys.parent / "notify.conf", f"pushover.max_source_chars={limit}\n")
+                self.assertEqual(pushover.post_message(
+                    f"send.py in {sender}", "0", "t", "No action needed.\n" + "B" * 2000,
+                    self.keys, post, "", text_id="auto_mode.refused"), 0)
+            self.assertEqual(len(sent[-1]), pushover.MESSAGE_MAX)
+            self.assertTrue(sent[-1].startswith("No action needed.\nBBB"))
+            self.assert_footer(sent[-1], sender[:limit], "auto_mode.refused")
 
     def draft(self, *, answerable: bool = False) -> review.Draft:
         return review.Draft("writer", "0", "Build stopped", ActionRequired("Choose in the natedev terminal."),

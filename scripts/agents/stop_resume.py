@@ -2589,7 +2589,11 @@ def _alert_pending_moves(batch: MoveBatch, entries: Mapping[str, pane_record.Pan
     push = render("alert.decision", sender="shutdown", title="Some sessions still need to move",
                   action=f"Retry pending moves on {machine} with `{moves.RETRY_COMMAND}`.",
                   body=f"These sessions did not finish their move {destination}: " + ", ".join(names) + ".")
-    if len(push.message) > pushover.phone_message_limit(push.sender, push.id):
+    try:
+        needs_shorter_body = len(push.message) > pushover.phone_message_limit(push.sender, push.id)
+    except conf.Unusable:
+        needs_shorter_body = False
+    if needs_shorter_body:
         push = render(push.id, **(push.values | {"body":
             f"{len(names)} sessions did not finish their move {destination}. "
             + f"Read the pending list on {machine} with `{moves.MOVE_COMMAND} result`."}))

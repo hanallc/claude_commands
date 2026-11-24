@@ -33,15 +33,13 @@ from scripts.usage.usage_report import UnitWorktree
 from scripts.production import session_staff, showrunners, staff
 from scripts.agents import remote
 from scripts.message import send_budget, session_send
+from scripts.lib import conf
 from scripts.lib.codex_models_cache import ModelsCacheUnreadable, read_models_cache
 
 
 WINDOW = timedelta(hours=2)
-WAIT_SHARE_LIMIT = 0.10
 # At the measured median of 2.1M weighted tokens per folder per 2 hours and about 19K weighted per
-# request, 1M is about 50 requests. Below it a folder is mostly idle and a handful of polls sets the
-# share; at 10% the waste at the minimum is at least 100K weighted tokens, about five requests, more
-# than the showrunner turn the alert costs.
+# request, 1M is about 50 requests. Below that minimum, a few waiting requests can dominate the share.
 MINIMUM_WEIGHTED = 1_000_000
 # Codex uses each model's compaction limit. Five consecutive requests above that limit trigger an alert.
 # The usage ledger cannot distinguish historical launch settings from pane settings.
@@ -262,8 +260,9 @@ class UnitUsage:
     def wait_weighted(self) -> float:
         return sum(thread.wait_weighted for thread in self.worker_threads)
 
-    def wait_alert(self) -> bool:
-        return self.weighted >= MINIMUM_WEIGHTED and self.wait_weighted > WAIT_SHARE_LIMIT * self.weighted
+    def wait_alert(self, max_wait_share: float) -> bool:
+        weighted = self.weighted
+        return weighted >= MINIMUM_WEIGHTED and self.wait_weighted > max_wait_share * weighted
 
     def context_threads(self) -> list[ThreadUsage]:
         return [thread for thread in self.threads if thread.context_flagged()]
@@ -273,11 +272,11 @@ def thousands(value: float) -> str:
     return f"{value:,.0f}"
 
 
-def alert_text(usage: UnitUsage, start: datetime) -> str:
+def alert_text(usage: UnitUsage, start: datetime, *, wait_alert: bool) -> str:
     since = start.astimezone(timezone.utc).isoformat(timespec="seconds")
     flagged = usage.context_threads()
     lines: list[str] = []
-    if usage.wait_alert():
+    if wait_alert:
         share = usage.wait_weighted / usage.weighted
         lines.append(f"Message from {SENDER}: {usage.unit} spent {share:.0%} of its weighted usage in the last "
                      + "2 hours on requests that only waited")
@@ -382,9 +381,10 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
     with closing(usage_report.open_read_store(db)) as store:
         usage_report.check_store_version(store)
         threads = thread_usage(store, start, moment)
-    # A unit alerts on waiting only above 10% of at least 1M, so less waiting in total cannot alert.
+    max_wait_share = conf.read("waste_watch").number("alert.max_wait_share")
+    # A unit needs more waiting usage than the configured share of the minimum.
     if (sum(thread.wait_weighted for thread in threads if thread.codex_worker())
-            <= WAIT_SHARE_LIMIT * MINIMUM_WEIGHTED
+            <= max_wait_share * MINIMUM_WEIGHTED
             and not any(thread.context_flagged() for thread in threads)):
         return
     resolver = session_staff.RowResolver(staff.snapshot())
@@ -400,11 +400,12 @@ def watch(db: Path, production_docs: Path, *, now: datetime | None = None, dry_r
     alerts = read_state(path)
     changed = False
     for usage in sorted(units.values(), key=lambda usage: usage.unit):
-        if not usage.wait_alert() and not usage.context_threads():
+        wait_alert = usage.wait_alert(max_wait_share)
+        if not wait_alert and not usage.context_threads():
             continue
         if not printing and alerted_recently(alerts, usage.unit, moment):
             continue
-        text = alert_text(usage, start)
+        text = alert_text(usage, start, wait_alert=wait_alert)
         listing = [runner for runner in runners if any(row.unit == usage.unit for row in runner.units)]
         # A running showrunner that lists the unit wins over one that is not running.
         runner = next((runner for runner in listing if runner.address), listing[0] if listing else None)
@@ -464,7 +465,7 @@ def main(argv: Sequence[str] = ()) -> int:
     production_docs = args.production_docs or outcomes.default_sources().production_docs
     try:
         watch(db, production_docs, now=now, dry_run=True if args.dry_run else None)
-    except (OSError, sqlite3.Error, usage_report.StoreVersionMismatch) as error:
+    except (OSError, sqlite3.Error, usage_report.StoreVersionMismatch, conf.Unusable) as error:
         print("waste_watch: " + " ".join(str(error).split()), file=sys.stderr)
         return 1
     return 0

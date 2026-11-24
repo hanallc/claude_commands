@@ -745,10 +745,9 @@ class MacLinuxRouteTests(unittest.TestCase):
         config.mkdir()
         self.registry = config / 'build_targets.conf'
         _ = write_config_fixture(self.registry, f'enabled.mac-linux=on\n{target_config.UNREACHABLE_WAIT_KEY}=20\n')
-        _ = (config / 'mac_linux.conf').write_text(
+        _ = write_config_fixture(config / 'mac_linux.conf',
             f'ssh.hops=fixture-mac fixture-guest\nguest.user={account}\ntest.jobs=2\n'
-            + 'run.time_limit_seconds=7\n',
-            encoding='utf-8')
+            + 'run.time_limit_seconds=7\nssh.connect_attempts=3\n')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
         _ = (config / 'build_admission.conf').write_text(
             '# range: 0.01..\nquery_timeout_seconds=1\n', encoding='utf-8')
@@ -1305,6 +1304,13 @@ fi
         _ = configuration.write_text(original.replace(f'{key}=20', f'{key}=86400'))
         settings = mac_linux.read_settings(conf.read(self.registry))
         self.assertEqual(settings.unreachable_wait_seconds, 86400)
+
+    def test_connect_attempt_limit_requires_a_positive_whole_number(self) -> None:
+        configuration = self.registry.with_name('mac_linux.conf')
+        for value in ('0', '1.5'):
+            with self.subTest(value=value), self.assertRaisesRegex(conf.Unusable, r'ssh\.connect_attempts'):
+                _ = write_config_fixture(configuration, f'ssh.connect_attempts={value}\n')
+                _ = mac_linux.read_settings(conf.read(self.registry))
 
     def test_missing_bwrap_refuses_before_upload(self) -> None:
         binaries = self.root / 'without-bwrap'
@@ -1868,7 +1874,8 @@ fi
 
     def test_each_guest_ssh_hop_waits_the_unreachable_wait_for_a_keepalive_answer(self) -> None:
         # A busy Mac can be silent for more than 30 s, so each hop waits the unreachable wait of 600 s.
-        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600)
+        settings = mac_linux.GuestSettings(('fixture-mac', 'fixture-guest'), 'gate-runner', 4, 1800, 600,
+                                           connect_attempt_limit=3)
         command = settings.command('true')
         alive = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=40']
         mac_hop = list(command[:-2])
@@ -2098,6 +2105,16 @@ fi
         self.assert_guest_clean('probe', 'arm', 'run', 'run', 'run', 'cleanup')
         self.assertFalse((self.guest_home / 'build').exists())
 
+    def test_probe_arm_and_stream_use_the_configured_connect_attempt_limit(self) -> None:
+        _ = write_config_fixture(self.registry.with_name('mac_linux.conf'), 'ssh.connect_attempts=1\n')
+        for stage, events in (('run', ('probe', 'arm', 'run', 'cleanup')),
+                              ('arm', ('probe', 'arm')), ('probe', ('probe',))):
+            with self.subTest(stage=stage), patch.dict(os.environ, {f'FIXTURE_SSH_{stage.upper()}': 'reset'}):
+                _ = self.trace.write_text('')
+                result = self.not_started(self.route())
+                self.assertIn('Connection reset by peer after 1 connect attempt', result)
+                self.assert_guest_clean(*events)
+
     def test_inner_reset_after_the_guest_started_does_not_retry(self) -> None:
         with (patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset-after-start'}),
               self.assertRaises(GateResultUnknown) as result):
@@ -2207,17 +2224,24 @@ fi
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'cleanup', 'cleanup', 'cleanup')
 
     def test_interrupted_cleanup_pause_keeps_the_connect_attempt_count(self) -> None:
-        settings = mac_linux.read_settings(conf.read(self.registry))
-        armed = mac_linux.arm_guest(settings, 'cleanup-connect-interrupt')
-        end = mac_linux.GuestEndWait(settings, armed)
-        with (patch.object(mac_linux, 'sleep', side_effect=[None, KeyboardInterrupt(), None, None]) as delay,
-              patch.dict(os.environ, {'FIXTURE_SSH_CLEANUP': 'reset,reset,reset'})):
-            with self.assertRaises(KeyboardInterrupt):
-                end.run()
-            end.run()
-        self.assertTrue(end.proven)
-        self.assertEqual(delay.call_args_list, [call(1), call(1), call(1), call(8)])
-        self.assert_guest_clean('arm', 'cleanup', 'cleanup', 'cleanup', 'cleanup')
+        for attempt_limit, pauses in ((3, [call(1), call(1), call(1), call(8)]),
+                                      (2, [call(1), call(8), call(8)])):
+            with self.subTest(attempt_limit=attempt_limit):
+                _ = self.trace.write_text('', encoding='utf-8')
+                _ = write_config_fixture(self.registry.with_name('mac_linux.conf'),
+                                         f'ssh.connect_attempts={attempt_limit}\n')
+                settings = mac_linux.read_settings(conf.read(self.registry))
+                armed = mac_linux.arm_guest(settings, 'cleanup-connect-interrupt')
+                end = mac_linux.GuestEndWait(settings, armed)
+                failures = ','.join(['reset'] * attempt_limit)
+                with (patch.object(mac_linux, 'sleep', side_effect=[None, KeyboardInterrupt(), None, None]) as delay,
+                      patch.dict(os.environ, {'FIXTURE_SSH_CLEANUP': failures})):
+                    with self.assertRaises(KeyboardInterrupt):
+                        end.run()
+                    end.run()
+                self.assertTrue(end.proven)
+                self.assertEqual(delay.call_args_list, pauses)
+                self.assert_guest_clean('arm', *(('cleanup',) * (attempt_limit + 1)))
 
     def test_sandboxed_guest_returns_module_metrics(self) -> None:
         result = self.route()

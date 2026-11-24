@@ -55,6 +55,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from scripts.lib import conf
 from scripts.message import session_send
 from scripts.notify import review
 from scripts.notify import push_texts
@@ -80,7 +81,6 @@ TITLE_MAX = 250
 MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
-SOURCE_MAX = 80
 # send.py's default_sender: the Claude session that ran send.py follows this prefix.
 SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
@@ -184,12 +184,14 @@ def parent_source() -> str:
         ).stdout.strip()
     except OSError:
         found = ""
-    return (found or f"parent pid {os.getppid()}")[:SOURCE_MAX]
+    limit = conf.read("notify").whole("pushover.max_source_chars")
+    return (found or f"parent pid {os.getppid()}")[:limit]
 
 
 def sender_name(source: str) -> str:
-    """The "Sent by" name: the session for a send.py source, else the source, on one line."""
-    return " ".join(source.removeprefix(SESSION_SOURCE).split())[:SOURCE_MAX]
+    """Return the sender on one line. Use the session name for a send.py source."""
+    limit = conf.read("notify").whole("pushover.max_source_chars")
+    return " ".join(source.removeprefix(SESSION_SOURCE).split())[:limit]
 
 
 def _phone_footer(sender: str, text_id: str) -> str:
@@ -637,12 +639,23 @@ def post_message(source: str, priority: str, title: str, message: str,
     if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
         return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
     suffix = f", {detail}" if detail else ""
-    sender = sender_name(source)
+    try:
+        with conf.diagnostics(report=False) as diagnostics:
+            sender = sender_name(source)
+    except conf.Unusable as error:
+        diagnostic = " ".join(str(error).splitlines())
+        outcome = f"{REFUSED_BEFORE_SENDING}: {diagnostic}"
+        log(source, priority, title, message, outcome + suffix)
+        print(f"pushover: {outcome}", file=sys.stderr)
+        return 2
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
     if not sender:
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
+    footer = _phone_footer(sender, text_id)
+    message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
     if keys is None:
         outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
@@ -676,12 +689,14 @@ def post_message(source: str, priority: str, title: str, message: str,
 def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post, *,
            asker: AskNatedev = ask_natedev) -> int:
     """Stop every emergency push sent with this key; log the outcome like a post."""
-    source = parent_source()
+    source = ""
     if len(argv) == 3 and argv[0] == "--source" and argv[1].strip():
         source, argv = argv[1], argv[2:]
     if len(argv) != 1 or not argv[0] or argv[0].startswith("--"):
         print(CANCEL_USAGE, file=sys.stderr)
         return 2
+    if not source:
+        source = parent_source()
     key = argv[0]
     tag = push_tag(key)
     title, message = "cancel emergency push", f"key {key}, tag {tag}"

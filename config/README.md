@@ -152,6 +152,8 @@ An exhausted retry count fails the gate. A failed message does not change the re
 `on` enables the existing thresholds and messages.
 A missing file, missing key, or invalid value means `on`.
 The hook reads the file on each call through `scripts.lib.conf`.
+The hook uses `transcript.tail_bytes` for the first scan.
+If this value is unusable, the hook scans once with the 4 MiB retry limit.
 Tests select a temporary config folder with `CONF_DIR`.
 The hook still reads the transcript and writes its debug log.
 Compaction runs by itself during work.
