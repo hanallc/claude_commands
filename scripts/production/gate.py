@@ -3654,10 +3654,13 @@ def _gate_invocation(arguments: Sequence[str], argv: Sequence[str] | None) -> tu
     original = tuple(sys.orig_argv)
     program = parse_command_program(original, keep_path=True)
     if isinstance(program, OtherCommand) and "-c" in original:
-        root_at = original.index("-c") + 2
-        root = str(Path(__file__).resolve().parents[2])
-        if original[root_at:root_at + 3] == (root, "file", sys.argv[0]):
-            return (str(Path(sys.argv[0]).absolute()), *arguments)
+        code_at = original.index("-c") + 1
+        bootstrap = original[code_at:code_at + 4]
+        if len(bootstrap) == 4:
+            code, launcher_root, mode, script = bootstrap
+            if ('run_name="_shim_python_startup"' in code and Path(launcher_root).is_absolute()
+                    and mode == "file" and script == sys.argv[0]):
+                return (str(Path(script).absolute()), *arguments)
     if argv is not None and command_program(original) not in GATE_SCRIPTS:
         return ("scripts/production/gate.py", *arguments)
     if isinstance(program, OtherCommand):

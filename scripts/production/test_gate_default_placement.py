@@ -310,14 +310,17 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 from unittest import mock
 
                 from scripts.build_queue.admission_jobs import StepJob
+                from scripts.build_targets.gate_targets import aws_gate_command
                 from scripts.production import gate
 
                 def gate_command(args, _target):
                     assert args.command == (str(Path(__file__).absolute()), "--tests-only")
                     assert args.gate_job == StepJob("test-all")
+                    assert aws_gate_command(Path.cwd(), args.command)
                     return 0
 
                 with (mock.patch.object(gate, "run_gate_command", gate_command),
+                      mock.patch.object(gate, "__file__", __file__),
                       mock.patch.object(gate, "current_gate_placement", return_value=gate.NO_GATE_ASSIGNMENT)):
                     raise SystemExit(gate.main())
                 """))
