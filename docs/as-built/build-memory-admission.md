@@ -796,7 +796,7 @@ A program uses its history estimate and refreshes it under the normal estimate p
 The gate reads `program_first_peak_gib.gate` at use. Its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
-The merge-gate progress profile key includes `shape` (`tests` or `types`).
+The gate progress profile key includes `shape` (`tests` or `types`).
 Earlier profiles do not match, and nightly runs use separate profiles.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
 The governor bounds module starts when a CPU slot is free; with no job running, it always permits one job.
@@ -828,7 +828,7 @@ The estimate reader decodes only rows that can be in the window (`HistoryWindow`
 Rows append when steps end, so a binary search finds the first row that ended one day before the window.
 The day covers rows that came late; on 2026-11-15 the latest came 19 minutes late. A damaged row stops the search there.
 A row whose bytes do not hold the host and a requested step is not decoded.
-Merge-gate peaks keep their separate class and remain in the anonymous history.
+Gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
 Five keyed rows exclude the older unkeyed rows for the same repository.
@@ -874,7 +874,7 @@ The lifecycle file retains 571 events across 4.92 days, including older token-ga
 The 220 admissions cover 2026-11-04 20:45:52 through 2026-11-05 13:03:36 UTC: 16.30 hours.
 The anonymous file retains 46,262 rows from 2026-10-07 through 2026-11-05.
 The requested window contains 5,205 anonymous rows.
-Replay reconstructs 4,267 estimates and keeps 815 merge-gate cap rows separate.
+Replay reconstructs 4,267 estimates and keeps 815 gate cap rows separate.
 Another 123 rows lack their own dated index match.
 Recorded intervals and reconstructed estimates are separate populations. Do not add their counts.
 
@@ -969,7 +969,7 @@ This measurement changes no estimator tier.
 
 The replay covers 2026-10-21 through 2026-11-04 with the same frozen inputs.
 It evaluates 15,053 runs and omits 195 runs without an index match.
-Another 617 merge-gate rows retain their separate cap class.
+Another 617 gate rows retain their separate cap class.
 Each estimate uses its historical budget: 21 GiB or 24 GiB.
 Under-half means below half the measured peak. Over-three means above three times the measured peak.
 
@@ -2457,9 +2457,13 @@ A waiting CI step has one target: the host machine, where the CI runners run (`m
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.
 An icon keeps the 20 px text line, so it does not make a row taller, and a row of icons never wraps.
-Waiting rows size the `Step` column, so each step shows on one line; a new waiting row can move the columns to its right.
-In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
-Each word of a waiting step with more than one word is in its own `.word` span with `white-space: nowrap`, so a word such as `cargo-style` never breaks at its hyphen.
+`fitWalkDetails` measures the Step header and the running step names.
+The widest measurement sets the minimum `--step` width, including cell padding.
+The chart keeps its minimum width before Step uses spare space, up to 10 rem.
+The Step width calculation excludes waiting names.
+Waiting step names wrap inside that width.
+A hyphenated word stays together and ends in an ellipsis if it exceeds the available width.
+The row tooltip shows the full name.
 A legend under the table shows `Legend:`, then each of the six icons with its name.
 The machine colors apply to SVG symbols and machine names throughout the page.
 Emoji use their own colors.
@@ -2491,12 +2495,17 @@ The table is always beside the chart, and each step uses one row at every pane w
 In a narrow pane the table narrows its column gaps.
 A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
 The card never scrolls down, and its axis labels fit their 16 px row.
-The table starts half the cap line and one gap past the cap, and the fit measures the table at that same place.
+The fit measures and places the table half the cap line plus a gap after the cap.
+The gap starts at 12 px and can decrease to 4 px before the card needs to scroll.
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
 A small line under a title (the showrunner or repository line, or a waiting note with the job start of a CI row) never wraps either. It ends in an ellipsis in the same way.
-The 12rem cap (9rem in a narrow pane) on the label column stays.
+The layout starts with compact gaps and a label width of up to 9 rem.
+It evaluates normal gaps and a label width of up to 12 rem.
+Each larger layout must fit the minimum chart width and preserve the Step width.
+The Machine column reserves one icon per machine family and space for the last badge.
+This fits a gate wait with natedev, mac-linux, and hana-aws.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
 `memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.

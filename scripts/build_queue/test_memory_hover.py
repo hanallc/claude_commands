@@ -989,7 +989,7 @@ const pending = {...guest, guest_run: undefined, guest_unconfirmed: true, state:
                  run_folder: {kind: "RunFolderNotReported"}};
 const key = 'row:' + guest.key;
 render({...confirmed, walk: [pending]});
-const row = document.querySelector('.wrow[data-tip="' + key + '"]');
+const row = document.querySelector('.walk-table tr[data-tip="' + key + '"]');
 row.scrollIntoView({block: "center"});
 const bounds = row.getBoundingClientRect();
 const x = Math.min(bounds.right - 1, innerWidth - 8);

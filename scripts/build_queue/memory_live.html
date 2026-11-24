@@ -14,6 +14,7 @@ html { overflow-anchor: none; }
   --bump: #9c381d; --bump-bg: rgba(156, 56, 29, .09); --bump-ring: rgba(156, 56, 29, .30);
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
+  --machine-icon-width: 28px; --machine-badge-outset: 7px;
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100;
   --agents: #7f6fc4; --desktop: #78756e;
   --tools: #7a9cc4; --ci: #1c5aa8; --programs: #8796ab; --kernel: #3e4a5c; --cache: #d6d4ce; --unattributed: #b9b7b1;
@@ -189,11 +190,11 @@ __PAGE_FRAME_STYLE__
 .machine:is([data-machine="mac" i], [data-machine="mac-linux" i]) { color: var(--machine-mac); }
 .machine:is([data-machine="aws" i], [data-machine="hana-aws" i], [data-machine="hana-gpu" i]) { color: var(--machine-aws); }
 /* The icon fits the 20px text line. CSS draws its badge. */
-.machine-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 24px;
+.machine-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: var(--machine-icon-width); height: 24px;
   margin-block: -2px; vertical-align: top; border-radius: 6px; }
 .machine-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .machine-icon .machine-emoji { font: 20px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
-.machine-icon[data-badge]::after { content: attr(data-badge); position: absolute; right: -7px; bottom: -5px;
+.machine-icon[data-badge]::after { content: attr(data-badge); position: absolute; right: calc(-1 * var(--machine-badge-outset)); bottom: -5px;
   font: 14px/1 "Apple Color Emoji", "Noto Color Emoji", emoji; }
 .machine-icon.run { background: color-mix(in srgb, var(--ink) 7%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 16%, transparent); }
 .machine-icon.dim { opacity: 0.5; }
@@ -350,18 +351,22 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .queue-title > :last-child { flex: none; white-space: pre; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr:is(.wait, .held) { color: var(--ink-2); }
-.walk-table { min-width: 0; width: max-content; max-width: 100%; }
+.walk-table { --column-gap: 12px; --machine-icon-gap: 10px; min-width: 0; width: max-content; max-width: 100%; }
 .walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
 .walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
 .walk-table tbody tr { height: 44px; }
-.walk-table th, .walk-table td { padding: 3px 12px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
+.walk-table th, .walk-table td { padding: 3px var(--column-gap) 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
 .walk-table tbody tr:not(.queue-head) > * { vertical-align: top; padding-block: var(--row-inset); line-height: var(--row-line); }
 .walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .step { width: var(--step); min-width: var(--step); }
-.walk-table td.machine > * + * { margin-left: 10px; }
+.walk-table .machine:is(th, td) {
+  min-width: calc(var(--machine-icon-count) * (var(--machine-icon-width) + var(--machine-icon-gap))
+    - var(--machine-icon-gap) + max(var(--column-gap), var(--machine-badge-outset)));
+}
+.walk-table td.machine > * + * { margin-left: var(--machine-icon-gap); }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { text-align: right; }
 .move-mark { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;
@@ -373,11 +378,11 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table .move-mark { vertical-align: middle; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
-/* A waiting step sizes the Step column (fitWalkDetails). In a tight pane it wraps between words inside the column.
-   The column is never narrower than the widest word. */
 .walk-table .cell-text { display: block; overflow: hidden; text-overflow: ellipsis; }
-.walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; white-space: normal; }
-.walk-table tr.wait .step .word { white-space: nowrap; }
+/* A waiting name wraps inside Step. A hyphenated word uses an ellipsis when it is too wide. */
+.walk-table tr.wait .step .cell-text { width: 0; min-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.walk-table tr.wait .step .word { display: inline-block; max-width: 100%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; vertical-align: top; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - var(--queue-heading-gap)); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
@@ -393,9 +398,9 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 /* The table is measured at its own width, not cut to the walk. */
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
 /* Narrow the column gaps to keep the chart beside the table. */
-.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 6px; }
+.walk.tight .walk-table { --column-gap: 4px; }
 /* The last machine badge extends 7 px past its icon. */
-.walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child) { padding-right: 7px; }
+.walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child) { padding-right: var(--machine-badge-outset); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
@@ -1664,9 +1669,9 @@ function unitName(text) {
   return globalThis.staffNames?.unit(text) ?? esc(text);
 }
 // A row starts with its unit, or else with its owner in its staff color (plain ink when the owner has no staff entry).
-function rowLabel({name, unit = "", owner = "", nameSuffix = ""}, note = "") {
+function rowLabel({name, unit = "", owner = "", failureNote = "", nameSuffix = ""}, note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(name)}${esc(nameSuffix)}</span></span>` +
-    `<span class="owner">${owner ? staffName(owner) : ""}</span>` +
+    `<span class="owner">${owner ? staffName(owner) : esc(failureNote)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, note = "") {
@@ -1779,6 +1784,9 @@ document.addEventListener("focusout", ({target}) => {
 });
 $("machine-key").innerHTML = "<span>Legend:</span>" + [...MACHINE_ICONS.keys()]
   .map(name => `<span class="key">${machineIcon(name)}${name}</span>`).join("");
+// The widest supported gate wait has one icon for each machine family.
+const machineFamilies = new Set([...MACHINE_ICONS.values()].map(({symbol, emoji}) => symbol ?? emoji));
+$("walk").style.setProperty("--machine-icon-count", machineFamilies.size);
 function setSeg(id, value, total) {
   $(id).style.flex = `0 1 ${value / total * 100}%`;
 }
@@ -2614,9 +2622,9 @@ function renderWalk(d) {
     const icons = machine ? machineIcon(machine, "run") : (named || []).map(name => machineIcon(name, "dim")).join("");
     return `<td class="machine">${icons || "—"}${state ? ` ${esc(state)}` : ""}</td>`;
   };
-  // A waiting step can wrap, but only between words: a word such as "cargo-style" never breaks at its hyphen.
-  const stepText = (step, waiting) => waiting && step.includes(" ")
-    ? step.split(" ").map(word => `<span class="word">${esc(word)}</span>`).join(" ") : esc(step);
+  const stepText = (step, waiting) => waiting
+    ? step.split(" ").map(word => word.includes("-") ? `<span class="word">${esc(word)}</span>` : esc(word)).join(" ")
+    : esc(step);
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—", move = null) => {
     const kept = className.startsWith("held"), waiting = kept || className.startsWith("wait");
     const moved = move?.kind === "bump" ? bumpMark(move.who, `moved:${tip}`) : "—";
@@ -2675,7 +2683,7 @@ function renderWalk(d) {
       const deadline = w.kept_until.split(" ", 1)[0];
       cells(String(w.position), {step:"", verify:""}, `until ${deadline}`, null, target, null, tip, rowClass);
       const labels = {unit, name: "", nameSuffix: ": kept place",
-        repository: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
+        failureNote: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
       rows.push(`<div class="wrow ${rowClass}" data-tip="${esc(tip)}">${rowLabel(labels)}</div>`);
       return;
     }
@@ -2783,6 +2791,8 @@ function canvasFont(element) {
 
 const MIN_TRACK_WIDTH = 160;
 const TABLE_CAP_GAP = 12;
+const MIN_TABLE_CAP_GAP = 4;
+const PREFERRED_STEP_REM = 10;
 function fitWalkDetails() {
   const walk = $("walk");
   const table = walk.querySelector(".walk-table");
@@ -2794,37 +2804,36 @@ function fitWalkDetails() {
   walk.style.minWidth = "";
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
+  let tableCapGap = TABLE_CAP_GAP;
   function measure(labelWidth) {
-    // The table starts half the cap line and the gap past the cap, as the placement below sets it.
-    const neededWidth = table.getBoundingClientRect().width + 0.5 + TABLE_CAP_GAP;
+    // The table starts half the cap line plus the gap after the cap.
+    const neededWidth = table.getBoundingClientRect().width + 0.5 + tableCapGap;
     root.style.setProperty("--amt", labelWidth);
     const fullTrackWidth = walk.getBoundingClientRect().right - track.getBoundingClientRect().left;
     const reservedWidth = capFraction > 0
       ? Math.max(0, (neededWidth - fullTrackWidth * (1 - capFraction)) / capFraction)
       : neededWidth;
-    return {reservedWidth, remainingWidth: fullTrackWidth - reservedWidth};
+    const tableSpare = fullTrackWidth - minimumTrackWidth * (capFraction || 1) - neededWidth;
+    return {reservedWidth, remainingWidth: fullTrackWidth - reservedWidth, tableSpare};
   }
   // Normal spacing prevents the mobile styles from reversing the layout choice.
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
-  function measureColumn(name) {
-    // Waiting steps size the Step column, so each stays on one line. In a tight pane a waiting step wraps,
-    // so only its widest word counts.
-    const tight = name === "step" && walk.classList.contains("tight");
-    const widths = [...table.querySelectorAll(`tr > .${name}`)].map(cell => {
-      context.font = canvasFont(cell);
-      const parts = tight && cell.closest("tr.wait") ? cell.textContent.split(/\s+/) : [cell.textContent];
-      return Math.max(...parts.map(part => context.measureText(part).width)) + parseFloat(getComputedStyle(cell).paddingRight);
-    });
-    if (name === "duration") {
-      const header = table.querySelector("th.duration");
-      context.font = canvasFont(header);
-      widths.push(context.measureText(STEP_TABLE_HEADERS.waiting).width + parseFloat(getComputedStyle(header).paddingRight));
-    }
-    root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
+  function textWidthWithPadding(cell, text) {
+    context.font = canvasFont(cell);
+    return context.measureText(text).width + parseFloat(getComputedStyle(cell).paddingRight);
   }
-  measureColumn("duration");
-  measureColumn("step");
+  function measureColumn(name, preferred = 0) {
+    const rows = name === "step" ? "tr:not(.wait)" : "tr";
+    const widths = [...table.querySelectorAll(`${rows} > .${name}`)]
+      .map(cell => textWidthWithPadding(cell, cell.textContent));
+    if (name === "duration") {
+      widths.push(textWidthWithPadding(table.querySelector("th.duration"), STEP_TABLE_HEADERS.waiting));
+    }
+    const width = Math.ceil(Math.max(preferred, ...widths));
+    root.style.setProperty(`--${name}`, `${width}px`);
+    return width;
+  }
   context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
@@ -2852,26 +2861,38 @@ function fitWalkDetails() {
     return context.measureText(text).width + handle;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
-  let labelWidth = `${Math.min(textWidth, 12 * rem)}px`;
-  let fit = measure(labelWidth);
-  if (fit.remainingWidth < minimumTrackWidth) {
-    labelWidth = `${Math.min(textWidth, 9 * rem)}px`;
-    fit = measure(labelWidth);
-  }
-  if (fit.remainingWidth < minimumTrackWidth) {
-    walk.classList.add("tight");
-    measureColumn("step");
-    fit = measure(labelWidth);
-  }
+  const preferredStepWidth = PREFERRED_STEP_REM * rem;
+  const labelWidth = limit => `${Math.min(textWidth, limit * rem)}px`;
   root.classList.remove("layout-measuring");
-  fit = measure(labelWidth);
+  function layout(tight, label) {
+    walk.classList.toggle("tight", tight);
+    measureColumn("duration");
+    const minimum = measureColumn("step");
+    const fit = measure(label);
+    const width = Math.max(minimum, Math.min(preferredStepWidth, minimum + Math.floor(fit.tableSpare)));
+    return {tight, label, width, fits: fit.remainingWidth >= minimumTrackWidth};
+  }
+  // Use more space for gaps or labels only when Step keeps its width.
+  let chosen = layout(true, labelWidth(9));
+  for (const choice of [layout(false, labelWidth(9)), layout(false, labelWidth(12))]) {
+    if (choice.fits && choice.width >= chosen.width) chosen = choice;
+  }
+  walk.classList.toggle("tight", chosen.tight);
+  measureColumn("duration");
+  measureColumn("step", chosen.width);
+  let fit = measure(chosen.label);
+  // Use the available space for the cap gap before widening the walk.
+  if (capFraction > 0 && fit.tableSpare < 0) {
+    tableCapGap = Math.max(MIN_TABLE_CAP_GAP, Math.floor(TABLE_CAP_GAP + fit.tableSpare));
+    fit = measure(chosen.label);
+  }
   const shortBy = minimumTrackWidth - fit.remainingWidth;
   if (shortBy > 0) {
     // Beyond the cap the track runs under the table, so a wider walk gives the chart only the cap share.
     // With no cap the table width is fixed, so the chart takes all of the added width.
     const added = fit.reservedWidth > 0 && capFraction > 0 ? shortBy * capFraction : shortBy;
     walk.style.minWidth = `${Math.ceil(walk.getBoundingClientRect().width + added)}px`;
-    fit = measure(labelWidth);
+    fit = measure(chosen.label);
   }
   const naturalWidth = table.getBoundingClientRect().width;
   root.style.setProperty("--details", `${fit.reservedWidth}px`);
@@ -2879,8 +2900,6 @@ function fitWalkDetails() {
   root.style.setProperty("--bar-details", `${shortBy > 0 ? 0 : fit.reservedWidth}px`);
   walk.classList.add("beside");
   walk.classList.remove("measuring");
-  measureColumn("duration");
-  measureColumn("step");
   // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
   const range = track.getBoundingClientRect();
   const tableRight = walk.getBoundingClientRect().right - naturalWidth;
@@ -2892,7 +2911,7 @@ function fitWalkDetails() {
     headingRight = heading.getBoundingClientRect().left + Math.ceil(context.measureText(heading.textContent).width)
       + parseFloat(getComputedStyle(walk).getPropertyValue("--queue-heading-gap"));
   }
-  const capLeft = range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
+  const capLeft = range.left + range.width * capFraction + 0.5 + tableCapGap;
   const tableLeft = !hasCap(latest) ? tableRight : Math.max(capLeft, Math.min(tableRight, headingRight));
   walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
@@ -2900,7 +2919,7 @@ function fitWalkDetails() {
     if (!metadata) continue;
     const detail = row.querySelector(".amounts");
     if (row.classList.contains("cloud-work"))
-      detail.style.maxWidth = `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px`;
+      detail.style.maxWidth = `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - tableCapGap)}px`;
     row.style.minHeight = "44px";
     metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
