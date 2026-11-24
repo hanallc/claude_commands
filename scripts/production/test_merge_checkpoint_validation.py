@@ -372,6 +372,8 @@ with (state / "refreshed-test-locks").open("a") as output:
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertEqual(self.events("verify.sh"), [])
     def test_two_backticked_known_flakes_each_count_green_alone(self) -> None:
+        self.write(self.unit, "crates/alpha/Cargo.toml",
+                   '[workspace]\nresolver = "2"\nmembers = ["crate-a", "crate-b"]\n')
         for package in ("crate-a", "crate-b"):
             self.write(self.unit, f"crates/alpha/{package}/Cargo.toml",
                        f'[package]\nname = "{package}"\nversion = "0.1.0"\n')
@@ -387,7 +389,10 @@ with (state / "refreshed-test-locks").open("a") as output:
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         self.assertIn("known flake crate-a", self.log.read_text(encoding="utf-8"))
         self.assertIn("known flake crate-b", self.log.read_text(encoding="utf-8"))
-        self.assertEqual(len(self.events("verify.sh")), 4)
+        self.assertEqual(self.events("verify.sh"), [
+            ["test", "crate-a", "+", "test", "crate-b"], ["test", "crate-b"],
+            ["test", "crate-a"], ["test", "crate-b"],
+        ])
     def test_known_flaky_tests_rerun_alone_and_an_unlisted_failure_stays_red(self) -> None:
         """cargo-liner-style: a whole verify.sh merge test where two known flaky tests failed."""
         reader = "shim_registration::reader_scenarios::reader_attributes_compiler_cache"

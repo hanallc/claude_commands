@@ -103,10 +103,12 @@ GATE_PROGRAMS = {
     "targeted-test": ("targeted_test.py",),
 }
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
-# The assigned target started no tests.
-MAC_LINUX_PRELAUNCH_REFUSED_STATUS = 79
+# The assigned target started no tests. A claim failure can allow the queue to place the gate again.
+GATE_PRELAUNCH_REFUSED_STATUS = 79
 # The assigned target could have started tests and supplied no verdict.
 GATE_RESULT_UNKNOWN_STATUS = 80
+GATE_UNSETTLED_LAUNCH_STATUS = GATE_RESULT_UNKNOWN_STATUS
+MAC_LINUX_PRELAUNCH_REFUSED_STATUS = GATE_PRELAUNCH_REFUSED_STATUS
 CLAIM_FAILURE_SUFFIX = ".claim-failure"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
@@ -147,8 +149,6 @@ def _count(arguments: Sequence[str], name: str) -> int:
 
 def gate_natedev_only_flag(arguments: Sequence[str]) -> str | None:
     """Return the gate option that requires natedev."""
-    if _count(arguments, "--module"):
-        return "--module"
     if "--promote-only" in arguments:
         return "--promote-only"
     return None

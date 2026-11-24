@@ -35,7 +35,7 @@ from typing import NamedTuple, cast
 from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
@@ -298,8 +298,8 @@ def worktree_in_repo(row: staff.StaffRow, main_checkout: Path) -> bool:
     if not isinstance(location, staff.PresentWorktree) or location.machine != remote.local_machine():
         return False
     try:
-        return worktrees.main_checkout(location.path) == main_checkout
-    except worktrees.Refused:
+        return worktree_records.main_checkout(location.path) == main_checkout
+    except worktree_records.Refused:
         return False
 
 
@@ -336,8 +336,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     selected = next((row for row in rows if row.name == unit_names.name(name)), None)
     selected = selected if selected is not None else unit_lookup.unit_row(name, record)
     try:
-        main_checkout = worktrees.main_checkout(production.checkout)
-    except worktrees.Refused as error:
+        main_checkout = worktree_records.main_checkout(production.checkout)
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     parent_production: Production | StaffParentIsDestination = StaffParentIsDestination()
     if selected.parent != staff.ReportsTo(production.owner.id):
@@ -680,6 +680,19 @@ def checkpoint_plan(request: MergeRequest) -> Path:
     return configured_path.with_name(match[1] + ".md") if match else configured_path
 
 
+def _shrink_leaves_main_unchanged(request: MergeRequest) -> bool:
+    run_git = partial(git, request.production.checkout)
+    _, *parents = good(run_git("rev-list", "--parents", "-n", "1", request.commit), "scope").split()
+    if not parents:
+        return False
+    try:
+        return git_merge_tree.leaves_target_unchanged(
+            run_git, request.commit, "refs/remotes/origin/main", merge_base=parents[0])
+    except OSError as error:
+        raise checkpoint_gate.Stop("scope", "failed", f"{request.commit} against origin/main: {error}",
+                                   "the showrunner will inspect the failed command") from error
+
+
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")
     if staged:
@@ -692,7 +705,7 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
         plan = checkpoint_plan(request).as_posix()
         next_items = str(Path(plan).with_name(Path(plan).stem + "-next.md"))
         unexpected = [path for path in paths if path not in (plan, next_items)]
-        if unexpected or plan not in paths:
+        if unexpected or (plan not in paths and (paths or not _shrink_leaves_main_unchanged(request))):
             raise checkpoint_gate.Stop("scope", "held", f"shrink paths must be {plan} and optional {next_items}; got {', '.join(paths)}",
                        "commit only the plan doc and its next-items file, then resend the shrink")
     elif isinstance(request.kind, AsBuiltCommit):
@@ -2061,14 +2074,19 @@ def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNot
     return checkpoint_gate.TREE_CHANGED_STATUS if stop.state == "cancelled" else 1
 
 
-def batch_stop_notices(requests: tuple[MergeRequest, ...], stop: checkpoint_gate.Stop) -> Iterable[BatchStopNotice]:
+def batch_stop_notices(requests: tuple[MergeRequest, ...], stop: checkpoint_gate.Stop,
+                       *, held_at: int | None = None) -> Iterable[BatchStopNotice]:
     if isinstance(stop, BatchRed):
         yield from stop.notices
         return
-    for request in requests:
+    for index, request in enumerate(requests):
         label = f"phase {request.phase} ({request.commit[:12]})"
         detail = stop.detail
-        if isinstance(stop, MainConflict):
+        if held_at is not None and index > held_at:
+            held = requests[held_at]
+            detail = f"Not run because {held.unit.name} phase {held.phase} ({held.commit[:12]}) was held."
+            message = detail
+        elif isinstance(stop, MainConflict):
             message = f"{detail}; check your checkpoint against origin/main, resolve any conflict, and resend it"
         else:
             message = f"{detail}; {stop.message}"
@@ -2157,7 +2175,8 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], log: Path,
         stop = error if isinstance(error, checkpoint_gate.Stop) else checkpoint_gate.Stop(
             "run", "failed", str(error), "the showrunner will inspect the failed command")
         rollback = KEEP_BATCH_CHECKOUT if publication_started else batch_checkout
-        return finish_batch_stop(stop, batch_stop_notices(requests, stop), rollback)
+        held_at = len(items) if stop.state == "held" and len(items) < len(requests) else None
+        return finish_batch_stop(stop, batch_stop_notices(requests, stop, held_at=held_at), rollback)
 
 
 def checkpoint_completed(request: MergeRequest, upstream: str) -> bool:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
@@ -12,6 +12,7 @@ import fcntl
 from hashlib import sha256
 import json
 from math import ceil, inf
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -21,8 +22,10 @@ from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, sync_folder, write_text_atomic
 from scripts.lib import conf
+from scripts.lib.file_lock import LockResult, exclusive
+from scripts.build_queue import placement, snapshot_codec
 from scripts.aws_target import hana_result, remote
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -32,6 +35,8 @@ from scripts.aws_target.config import (
 InstanceState = Literal["pending", "running", "stopping", "stopped", "shutting-down", "terminated", "unknown"]
 SpendingPurpose = Literal["deployment", "start", "admission"]
 ChargeKind = Literal["instance", "fixed", "explorer", "reconciliation"]
+
+LEDGER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,10 @@ class GateAbsent:
 class GateTerminated:
     at: int
     instance_id: str
+    additional_instances: tuple[str, ...] = ()
+
+    def confirms(self, instances: tuple[str, ...]) -> bool:
+        return {self.instance_id, *self.additional_instances} == set(instances)
 
 
 @dataclass(frozen=True)
@@ -141,6 +150,42 @@ class GateWorkerOwner:
 
 
 @dataclass(frozen=True)
+class NoGateCleanupOwnerCheck:
+    """The update is independent of a cleanup selection."""
+
+
+NO_GATE_CLEANUP_OWNER_CHECK = NoGateCleanupOwnerCheck()
+
+
+@dataclass(frozen=True)
+class GateCleanupNotStarted:
+    """Cleanup has not reserved the booking for termination."""
+
+
+GATE_CLEANUP_NOT_STARTED = GateCleanupNotStarted()
+
+
+@dataclass(frozen=True)
+class GateCleanupTargets:
+    region: str
+    instances: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GateResultNotReceived:
+    """Use the termination confirmation time until a valid final result arrives."""
+
+
+GATE_RESULT_NOT_RECEIVED = GateResultNotReceived()
+
+
+@dataclass(frozen=True)
+class GateCleanupPending:
+    targets: GateCleanupTargets
+    result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED
+
+
+@dataclass(frozen=True)
 class NoGateTrial:
     pass
 
@@ -168,11 +213,162 @@ class GateReservation:
     mode: str = ''
     trial: GateTrialBudget | NoGateTrial = NoGateTrial()
     root_gib: int = 0
+    placement_claim: str = ''
+    cleanup: GateCleanupNotStarted | GateCleanupPending = GATE_CLEANUP_NOT_STARTED
+
+
+def gate_booking(values: conf.ConfigRead, attempt: str, now: int, expires: int) -> GateReservation:
+    """Use the same booking terms for placement and the worker."""
+    return GateReservation(attempt, now, expires, money(str(values.number('spot_max_usd_per_hour'))),
+        money(str(values.number('attempt_allowance_usd'))), instance_type=values.words('instance_types')[0])
 
 
 def gate_is_open(reservation: GateReservation) -> bool:
     """Keep pending and running reservations open until AWS confirms closure."""
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
+
+
+def gate_dispatch_binding_path(sidecar: Path) -> Path:
+    """Locate the queue's AWS binding beside the placement progress file."""
+    return sidecar.with_name(sidecar.name + '.aws-dispatch.json')
+
+
+@dataclass(frozen=True)
+class GateDispatchBinding:
+    """Identify the queue journal and AWS accounting directory for one claim."""
+    claim: placement.ProviderClaimReference
+    journal: Path
+    directory: Path
+    registry: Path
+    account_settings: Path
+
+    def publish(self, path: Path) -> None:
+        content = json.dumps(snapshot_codec.snapshot_value(self)) + '\n'
+        try:
+            saved = self.read(path)
+        except FileNotFoundError:
+            if create_text_atomic(path, content):
+                return
+            saved = self.read(path)
+        if saved == self:
+            return
+        if (saved.claim.episode != self.claim.episode or saved.claim.attempt == self.claim.attempt
+                or saved.journal.parent != self.journal.parent
+                or not GateDispatchJournal(saved.journal).previous_dispatch_closed(saved)):
+            raise LedgerUnavailable('The AWS placement binding differs from the queue assignment')
+        write_text_atomic(path, content)
+
+    @staticmethod
+    def read(path: Path) -> GateDispatchBinding:
+        return cast(GateDispatchBinding, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(path.read_text())), GateDispatchBinding))
+
+
+GateDispatchSettlement = Literal["no launch", "launch ended"]
+
+
+@dataclass(frozen=True)
+class GateDispatchRecord:
+    """Bind the service folders to the exact queue claim and caller."""
+    binding: GateDispatchBinding
+    holder: placement.ClaimHolderIdentity
+    state: Literal["prelaunch"] | GateDispatchSettlement = "prelaunch"
+    folders: tuple[Path, ...] = ()
+
+
+def _gate_dispatch_text(record: GateDispatchRecord) -> str:
+    return json.dumps(snapshot_codec.snapshot_value(record), sort_keys=True) + '\n'
+
+
+@dataclass(frozen=True)
+class GateDispatchJournal:
+    """Use the path the queue assigned to this gate."""
+    path: Path
+
+    def read(self) -> GateDispatchRecord:
+        return cast(GateDispatchRecord, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(self.path.read_text())), GateDispatchRecord))
+
+    def begin(self, binding: GateDispatchBinding, holder: placement.ClaimHolderIdentity) -> None:
+        """Persist the caller before it requests launch permission."""
+        fresh = GateDispatchRecord(binding, holder)
+        if not create_text_atomic(self.path, _gate_dispatch_text(fresh)):
+            saved = self.require_open(binding.claim, holder)
+            if saved.binding != binding:
+                raise LedgerUnavailable('The AWS journal names a different binding')
+            sync_folder(self.path.parent)
+
+    def require_open(self, claim: placement.ProviderClaimReference,
+                     holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
+        record = self.read()
+        if (record.binding.claim, record.holder) != (claim, holder):
+            raise LedgerUnavailable('The AWS journal names a different claim or caller')
+        if record.state != "prelaunch":
+            raise LedgerUnavailable('The AWS dispatch is closed')
+        return record
+
+    def lock(self, *, wait: bool = True) -> AbstractContextManager[LockResult]:
+        return exclusive(self.path.with_suffix('.lock'), wait=wait)
+
+    def register(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity,
+                 folder: Path) -> None:
+        """Persist a service folder before the service can start."""
+        with self.lock():
+            record = self.require_open(claim, holder)
+            if folder not in record.folders:
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, folders=(*record.folders, folder))))
+
+    def previous_dispatch_closed(self, binding: GateDispatchBinding) -> bool:
+        record = self.read()
+        if record.binding != binding:
+            raise LedgerUnavailable('The saved AWS request names a different dispatch')
+        if record.state == "prelaunch":
+            return False
+        sync_folder(self.path.parent)
+        return True
+
+    def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> GateDispatchSettlement | placement.DispatchPathPending:
+        """Use only local evidence to close a dispatch and fence its workers."""
+        try:
+            with self.lock(wait=False) as access:
+                if access is LockResult.BUSY:
+                    return placement.DispatchPathPending('The AWS worker holds the dispatch lock')
+                record = self.read()
+                if (record.binding.claim, record.holder) != (claim, holder):
+                    raise LedgerUnavailable('The AWS journal names a different claim or caller')
+                if record.state != "prelaunch":
+                    sync_folder(self.path.parent)
+                    return record.state
+                state: GateDispatchSettlement = "no launch"
+                if record.folders:
+                    book = CostLedger(record.binding.directory)
+                    reservations = ({row.attempt: row for row in book.read_snapshot().gate_reservations}
+                                    if book.path.exists() else {})
+                    for folder in record.folders:
+                        reservation = reservations.get(folder.name)
+                        try:
+                            launch = mapping(cast(object, json.loads((folder / 'launch.json').read_text())))
+                        except FileNotFoundError:
+                            launch = {}
+                        if reservation is not None and gate_is_open(reservation):
+                            if not isinstance(reservation.state, GateLaunchPending) or 'arguments' in launch or 'instance' in launch:
+                                return placement.DispatchPathPending(f'AWS launch {folder.name} remains open')
+                            request = mapping(cast(object, json.loads((folder / 'request.json').read_text())))
+                            if request.get('attempt') != folder.name:
+                                raise LedgerUnavailable('The AWS service folder names a different attempt')
+                            book.resolve_gate(folder.name, GateAbsent(int(time.time())))
+                        if reservation is not None and isinstance(reservation.state, GateTerminated):
+                            state = "launch ended"
+                        if 'instance' in launch:
+                            state = "launch ended"
+                        if reservation is None and ('arguments' in launch or 'instance' in launch):
+                            return placement.DispatchPathPending(f'AWS launch {folder.name} has no confirmed end')
+                    if book.path.exists():
+                        sync_folder(book.directory)
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, state=state)))
+                return state
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return placement.DispatchPathPending(f'Local AWS dispatch evidence is unavailable. {error}')
 
 
 @dataclass(frozen=True)
@@ -220,6 +416,7 @@ class HanaStorageExposure:
 @dataclass(frozen=True)
 class GateReserved:
     reservation: GateReservation
+    created: bool = True
 
 
 @dataclass(frozen=True)
@@ -810,6 +1007,55 @@ class LedgerUnavailable(ValueError):
     """Evidence cannot establish a safe spending decision."""
 
 
+class GateCleanupSuperseded(LedgerUnavailable):
+    """The booking closed or changed owner after cleanup selected it."""
+
+
+class GateCleanupInProgress(LedgerUnavailable):
+    """The booking is reserved for cleanup."""
+
+
+def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
+                               owner: GateWorkerOwner | GateOwnerUnknown) -> GateReservation:
+    """Check the cleanup selection while the ledger lock is held."""
+    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+    if booking is None or not gate_is_open(booking):
+        raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking is no longer open')
+    if booking.owner != owner:
+        raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking owner changed')
+    return booking
+
+
+@dataclass
+class GateCleanupTransaction:
+    """Stage cleanup for the selected bookings under the ledger lock."""
+
+    _state: LedgerEvidence
+    has_pending_cleanup: bool = field(default=False, init=False)
+
+    def mark(
+        self, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
+        targets: GateCleanupTargets, *, result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED,
+    ) -> GateCleanupPending | GateTerminated:
+        """Stage pending cleanup or return an exact confirmed end."""
+        state = self._state
+        booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+        if (booking is not None and isinstance(booking.state, GateTerminated)
+                and booking.region == targets.region and booking.state.confirms(targets.instances)):
+            return booking.state
+        booking = require_gate_cleanup_owner(state, attempt, owner)
+        if isinstance(booking.cleanup, GateCleanupPending) and booking.cleanup.targets != targets:
+            raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
+        self.has_pending_cleanup = True
+        if isinstance(booking.cleanup, GateCleanupPending):
+            if isinstance(booking.cleanup.result_seen_at, int) or isinstance(result_seen_at, GateResultNotReceived):
+                return booking.cleanup
+        pending = GateCleanupPending(targets, result_seen_at)
+        state.gate_reservations[state.gate_reservations.index(booking)] = replace(
+            booking, region=targets.region, cleanup=pending)
+        return pending
+
+
 def mapping(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise LedgerUnavailable("expected an evidence record")
@@ -838,7 +1084,7 @@ def rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
 
 
 def _decode(row: dict[str, object]) -> LedgerEvidence:
-    if row.get("version") != 1:
+    if row.get("version") not in (1, LEDGER_VERSION):
         raise LedgerUnavailable("unsupported ledger version")
     observations: list[InstanceObservation] = []
     for record in rows(row, "observations"):
@@ -923,9 +1169,19 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         elif kind == 'absent':
             gate_state = GateAbsent(instant(status, 'at'))
         elif kind == 'terminated':
-            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'))
+            additional = (tuple(text(row, 'id') for row in rows(status, 'additional_instances'))
+                          if 'additional_instances' in status else ())
+            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'), additional)
         else:
             raise LedgerUnavailable('unknown gate reservation state')
+        cleanup = GATE_CLEANUP_NOT_STARTED
+        if 'cleanup' in item:
+            saved = mapping(item['cleanup'])
+            instances = tuple(text(instance, 'id') for instance in rows(saved, 'instances'))
+            if not isinstance(gate_state, (GateRunning, GateLaunchPending)) or not instances:
+                raise LedgerUnavailable('Invalid gate cleanup state')
+            result_seen_at = instant(saved, 'result_seen_at') if 'result_seen_at' in saved else GATE_RESULT_NOT_RECEIVED
+            cleanup = GateCleanupPending(GateCleanupTargets(text(saved, 'region'), instances), result_seen_at)
         evidence.gate_reservations.append(GateReservation(
             text(item, 'attempt'), instant(item, 'at'), instant(item, 'expires'),
             money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state,
@@ -941,7 +1197,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                             text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown(),
             str(item.get('mode', '')),
             GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
-            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0)))))
+            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))),
+            text(item, 'placement_claim') if 'placement_claim' in item else '', cleanup))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     if 'gate_quota_refusals' in row:
@@ -986,7 +1243,7 @@ def _hana_state_record(state: HanaExposureOpen | HanaExposureClosed) -> dict[str
 
 def _encode(state: LedgerEvidence) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": LEDGER_VERSION,
         **({'hana_lifecycle_fence': {'at': state.hana_lifecycle_fence.at,
                                     'generation': state.hana_lifecycle_fence.generation}}
            if isinstance(state.hana_lifecycle_fence, HanaLifecycleFence) else {}),
@@ -1026,6 +1283,12 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
              'mode': r.mode, 'root_gib': r.root_gib,
+             **({'placement_claim': r.placement_claim} if r.placement_claim else {}),
+             **({'cleanup': {
+                 'region': r.cleanup.targets.region,
+                 'instances': [{'id': value} for value in r.cleanup.targets.instances],
+                 **({'result_seen_at': r.cleanup.result_seen_at} if isinstance(r.cleanup.result_seen_at, int) else {})}}
+                if isinstance(r.cleanup, GateCleanupPending) else {}),
              'trial': {'trial_id': r.trial.trial_id, 'limit_usd': str(r.trial.limit_usd)}
                       if isinstance(r.trial, GateTrialBudget) else None,
              'owner': {'pid': r.owner.pid, 'start': r.owner.start, 'folder': r.owner.folder}
@@ -1038,7 +1301,9 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
              {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
              {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
-             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id}}
+             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id,
+              **({'additional_instances': [{'id': value} for value in r.state.additional_instances]}
+                 if r.state.additional_instances else {})}}
             for r in state.gate_reservations],
         "compute_requests": [
             {'at': r.at, 'stack': r.stack, 'region': r.region, 'spot_max_usd_per_hour': str(r.spot_max_usd_per_hour),
@@ -2209,6 +2474,11 @@ class CostLedger:
         """Read the published evidence without creating coordination files."""
         return self._read()
 
+    def gate_claim_reservations(self, claim_id: str) -> tuple[GateReservation, ...]:
+        """Read the reservations for a placement claim without the account lock."""
+        state = _decode(mapping(cast(object, json.loads(self.path.read_text()))))
+        return tuple(row for row in state.gate_reservations if row.placement_claim == claim_id or row.attempt == claim_id)
+
     def record_hana_attempt(self, charge: hana_result.HanaAttemptCharge) -> None:
         """Link transfer and query evidence without adding another dollar total."""
         _ = hana_result.decode_attempt_charge(hana_result.encode_attempt_charge(charge))
@@ -2399,7 +2669,7 @@ class CostLedger:
                 if previous.attempt == request.attempt:
                     if isinstance(previous.state, (GateAbsent, GateTerminated)):
                         return GateAttemptEnded()
-                    return GateReserved(previous)
+                    return GateReserved(previous, created=False)
             settings = read_settings(settings_path)
             if isinstance(request.trial, GateTrialBudget):
                 if request.mode != 'gpu-size-trial' or not request.trial.trial_id or request.trial.limit_usd <= 0:
@@ -2416,15 +2686,34 @@ class CostLedger:
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
                 if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
-            state.gate_reservations.append(request)
-            reason = self.reservation_cap(state, settings, request.at, costs)
-            if reason:
-                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
-                self._save(state)
-                return GateCapReached(reason)
+            reason = self._book_gate(state, settings, request)
             self._save(state)
+            if reason:
+                return GateCapReached(reason)
             return GateReserved(state.gate_reservations[-1])
+
+    def gate_booking_refusal(self, snapshot: LedgerEvidence, settings_path: Path, request: GateReservation) -> str:
+        """Project the booking against local account evidence without changing the ledger."""
+        return self._book_gate(snapshot, read_settings(settings_path), request)
+
+    def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
+        costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+        state.gate_reservations.append(request)
+        reason = self.reservation_cap(state, settings, request.at, costs)
+        if reason:
+            _ = state.gate_reservations.pop()
+        return reason
+
+    def recheck_gate_booking(self, settings_path: Path, attempt: str, now: int) -> str:
+        """Check the pending booking against the current account bill."""
+        with self._locked() as state:
+            booking = self._launchable_gate(state, attempt)
+            if not isinstance(booking.state, GateLaunchPending) or booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot launch a box')
+            settings = read_settings(settings_path)
+            prior = replace(state, gate_reservations=[row for row in state.gate_reservations if row is not booking])
+            costs = _charges(prior, settings, now, current_window=True, require_fresh=False)
+            return self.reservation_cap(state, settings, now, costs)
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:
@@ -2438,6 +2727,21 @@ class CostLedger:
         with self._locked() as state:
             yield state
             self._save(state)
+
+    @contextmanager
+    def gate_cleanup_transaction(self) -> Generator[GateCleanupTransaction]:
+        """Sync pending cleanup before the caller can request termination."""
+        with self._locked() as state:
+            previous = state.gate_reservations.copy()
+            cleanup = GateCleanupTransaction(state)
+            yield cleanup
+            if state.gate_reservations != previous:
+                self._save(state)
+            elif cleanup.has_pending_cleanup:
+                # A failed directory sync can leave the pending record visible.
+                with self.path.open('rb') as stream:
+                    os.fsync(stream.fileno())
+                sync_folder(self.path.parent)
 
     def spending_decision(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
         """Validate account evidence and apply the shared bill cap to a proposed reservation."""
@@ -2489,18 +2793,33 @@ class CostLedger:
             reason = 'monthly_limit'
         return reason
 
+    def require_gate_launchable(self, attempt: str) -> None:
+        """Refuse a saved launch while cleanup owns the booking."""
+        _ = self._launchable_gate(self.read_snapshot(), attempt)
+
+    @staticmethod
+    def _launchable_gate(state: LedgerEvidence, attempt: str) -> GateReservation:
+        booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+        if booking is None or not gate_is_open(booking):
+            raise LedgerUnavailable('The gate booking is no longer open')
+        if isinstance(booking.cleanup, GateCleanupPending):
+            raise GateCleanupInProgress('The gate booking is in cleanup')
+        return booking
+
     def gate_region(self, attempt: str, region: str) -> None:
         """Retain the region before AWS can accept a launch."""
         with self._locked() as state:
-            state.gate_reservations = [replace(row, region=region) if row.attempt == attempt else row
-                                       for row in state.gate_reservations]
+            booking = self._launchable_gate(state, attempt)
+            state.gate_reservations[state.gate_reservations.index(booking)] = replace(booking, region=region)
             self._save(state)
 
-    def gate_owner(self, attempt: str, owner: GateWorkerOwner) -> None:
+    def gate_owner(self, attempt: str, owner: GateWorkerOwner, *, now: float = 0) -> None:
         """Save the worker identity before an attempt can launch a box."""
         with self._locked() as state:
-            state.gate_reservations = [replace(row, owner=owner) if row.attempt == attempt else row
-                                       for row in state.gate_reservations]
+            booking = self._launchable_gate(state, attempt)
+            if booking.placement_claim and booking.expires <= now:
+                raise LedgerUnavailable('The gate booking cannot take a worker')
+            state.gate_reservations[state.gate_reservations.index(booking)] = replace(booking, owner=owner)
             self._save(state)
 
     def record_gate_quota_refusal(self, pool: SpotQuotaPool, now: float) -> None:
@@ -2510,11 +2829,31 @@ class CostLedger:
             state.gate_quota_refusals.append(GateQuotaRefusal(pool, state.live_gate_vcpus(now).get(pool, 0), int(now)))
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '',
+                     expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK,
+                     cleanup: GateCleanupTargets | GateCleanupNotStarted = GATE_CLEANUP_NOT_STARTED) -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
-            if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
+            if isinstance(expected_owner, NoGateCleanupOwnerCheck):
+                booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            else:
+                booking = require_gate_cleanup_owner(state, attempt, expected_owner)
+            if booking is not None and isinstance(booking.state, GateTerminated):
+                if isinstance(cleanup, GateCleanupTargets) and (booking.region != cleanup.region
+                        or not booking.state.confirms(cleanup.instances)):
+                    raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
                 return
+            if isinstance(cleanup, GateCleanupTargets):
+                if (booking is None or not isinstance(booking.cleanup, GateCleanupPending)
+                        or booking.cleanup.targets != cleanup or not isinstance(outcome, GateTerminated)
+                        or outcome.instance_id not in cleanup.instances):
+                    raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
+                if isinstance(booking.cleanup.result_seen_at, int):
+                    outcome = replace(outcome, at=booking.cleanup.result_seen_at)
+                outcome = replace(outcome, additional_instances=tuple(
+                    sorted(set(cleanup.instances) - {outcome.instance_id})))
+            elif booking is not None and isinstance(booking.cleanup, GateCleanupPending):
+                raise GateCleanupInProgress('The gate booking is in cleanup')
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
             cooldown = inf
             if state.gate_quota_refusals:
@@ -2526,7 +2865,8 @@ class CostLedger:
             if isinstance(outcome, GateRunning):
                 # Clear expired marks before this launch increases the count.
                 state.clear_ended_quota_refusals(now, cooldown)
-            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
+            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type,
+                                               cleanup=GATE_CLEANUP_NOT_STARTED)
                                        if row.attempt == attempt else row for row in state.gate_reservations]
             state.clear_ended_quota_refusals(now, cooldown)
             self._price_gates(state, self.read_bills(), now)

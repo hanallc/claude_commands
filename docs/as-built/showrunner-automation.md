@@ -299,7 +299,9 @@ Each local Promote checkout must exist before the command pushes.
      `_unit_paths` excludes unchanged paths that an origin merge base contains.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
-     A shrink allows only the plan doc and `<plan stem>-next.md`.
+     A shrink changes the plan doc and can also change `<plan stem>-next.md`.
+     A shrink with no paths in scope passes if a clean test merge leaves the fetched `origin/main` tree unchanged.
+     The test merge uses the shrink's first parent as its base.
      An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
      The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
      It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.
@@ -461,7 +463,12 @@ Each local Promote checkout must exist before the command pushes.
   A directory lock protects every write without a separate lock file.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
-  A failed commit prints `written but not committed`; the next write commits the complete list.
+  Commits share the vault's main push lock with the other Git writers.
+  The readiness scan also runs after a merge. It tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
+  Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+  Other list writes report a commit failure immediately.
+  The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
   Every new or edited visible row requires a registered image.
