@@ -825,13 +825,32 @@ try {
               assert.ok(box.top >= 8 && box.bottom <= viewport.height-8, 'The tooltip exceeds the visible height.');
               assert.ok(resized.overflow > 0, 'The tooltip has no content below its visible area.');
 
-              await call('Input.dispatchMouseEvent', {type:'mouseWheel', x:box.left+box.width/2,
-                y:box.top+box.height/2, deltaX:0, deltaY:resized.overflow+20});
-              const scrollTop = await evaluate(`(async () => {
-                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-                return document.querySelector('#tip.on > .tip').scrollTop;
+              const rowPoint = await evaluate(`(() => {
+                const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                row.scrollIntoView({block:'center', inline:'nearest'});
+                const bounds = row.getBoundingClientRect();
+                const x = Math.max(bounds.left, ${box.left}) + 12;
+                const y = bounds.top + bounds.height/2;
+                row.addEventListener('click', () => { row.dataset.proofClicked = 'yes'; }, {once:true});
+                return {x, y};
               })()`);
-              assert.equal(scrollTop, resized.overflow, 'The pointer cannot scroll to the end of the tooltip.');
+              assert.ok(rowPoint.x > box.left && rowPoint.x < box.right && rowPoint.y > box.top && rowPoint.y < box.bottom,
+                'The guest row click is outside the tooltip.');
+              const click = async point => {
+                await call('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
+                await call('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+              };
+              await click(rowPoint);
+              assert.equal(await evaluate(`document.querySelector('tr[data-tip="row:shot-guest"]').dataset.proofClicked`),
+                'yes', 'The tooltip blocks the guest row click.');
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'The trigger click did not close the tooltip.');
+
+              await click(rowPoint);
+              assert.deepEqual(await evaluate("[tips.key(), getComputedStyle(document.querySelector('#tip')).pointerEvents]"),
+                ['row:shot-guest', 'none'], 'The click should open a pointer-transparent tooltip.');
+              await call('Input.dispatchKeyEvent', {type:'keyDown', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              await call('Input.dispatchKeyEvent', {type:'keyUp', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'Escape did not close the tooltip.');
             }
           } finally {
             await call('Emulation.setScrollbarsHidden', {hidden:true});

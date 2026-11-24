@@ -299,7 +299,7 @@ The icon uses the Mac color in light and dark modes.
 The cell shows `not confirmed` until confirmation, then `running`.
 The tooltip lists the named targets. It shows the attempt ID after confirmation.
 The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
-Scroll within the tooltip to read content that exceeds the available height.
+The tooltip clips content that exceeds the available height and lets clicks reach the rows beneath it.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.

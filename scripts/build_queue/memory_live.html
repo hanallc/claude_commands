@@ -157,7 +157,6 @@ __PAGE_FRAME_STYLE__
 /* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
 #tip { position: fixed; z-index: 10; width: max-content; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
-#tip.on.scrollable { pointer-events: auto; }
 .tip { display: grid; grid-template-columns: fit-content(44%) minmax(0, 1fr); column-gap: 0; row-gap: 2px; margin: 0;
   width: max-content; min-width: min(15rem, var(--tip-width, 15rem)); max-width: min(24rem, var(--tip-width, 24rem));
   padding: 10px 12px; border-radius: 8px;
@@ -175,7 +174,7 @@ __PAGE_FRAME_STYLE__
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
-#tip > .tip { max-height: var(--tip-height); overflow-y: auto; overscroll-behavior: contain; }
+#tip > .tip { max-height: var(--tip-height); overflow: hidden; }
 .seg-remote { background: var(--remote-memory); }
 /* The one machine color map. Each name matches without case, so the hover words "Mac" and "AWS" match too.
    mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws and hana-gpu are AWS boxes, so they take the aws color. */
@@ -1196,55 +1195,54 @@ function ago(then, now) {
   return h < 24 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
 }
 // Put the tooltip above the pointer, or below it near the top, and keep it inside the window.
-function placeTipAt(tip, x, y) {
+function placeTipAt(tip, x, y, fit) {
   const {clientWidth, clientHeight} = document.documentElement;
   const inset = 8;
+  const maxHeight = Math.max(0, clientHeight - 2 * inset);
   tip.style.setProperty("--tip-width", `${Math.max(0, clientWidth - 2 * inset)}px`);
-  tip.style.setProperty("--tip-height", `${Math.max(0, clientHeight - 2 * inset)}px`);
+  tip.style.setProperty("--tip-height", `${maxHeight}px`);
+  fit?.(tip, maxHeight);
   const w = tip.offsetWidth, h = tip.offsetHeight;
   const left = Math.max(inset, Math.min(x - w / 2, clientWidth - w - inset));
   const above = y - h - 14;
   const top = Math.max(inset, Math.min(above < inset ? y + 18 : above, clientHeight - h - inset));
   tip.style.left = `${left}px`;
   tip.style.top = `${top}px`;
-  const box = tip.firstElementChild;
-  tip.classList.toggle("scrollable", box && box.scrollHeight > box.clientHeight);
 }
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
-// Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
-// content(key) gives the tooltip HTML, or "" for no tooltip.
-function hoverTips(tip, content) {
+// Open a tooltip on hover or click. Click its trigger again or press Escape to close it.
+function hoverTips(tip, content, fit) {
   let shown = null;
-  const place = () => {
-    if (shown) placeTipAt(tip, shown.x, shown.y);
-  };
-  const refresh = (html, keepScroll = true) => {
+  const refresh = html => {
     if (!shown) return;
-    const scrollTop = keepScroll ? tip.firstElementChild?.scrollTop : 0;
     tip.innerHTML = html;
-    place();
-    if (scrollTop && tip.firstElementChild) tip.firstElementChild.scrollTop = scrollTop;
+    placeTipAt(tip, shown.x, shown.y, fit);
   };
   const show = (key, x, y) => {
     const html = content(key);
     if (!html) return;
-    const keepScroll = shown?.key === key;
     shown = {key, x, y};
-    refresh(html, keepScroll);
+    refresh(html);
     tip.classList.add("on");
   };
   const hide = () => { shown = null; tip.classList.remove("on"); };
-  window.addEventListener("resize", place);
+  window.addEventListener("resize", () => {
+    if (!shown) return;
+    const html = content(shown.key);
+    if (html) refresh(html); else hide();
+  });
   document.addEventListener("pointermove", (e) => {
-    if (e.pointerType !== "mouse" || tip.contains(e.target)) return;
+    if (e.pointerType !== "mouse") return;
     const el = e.target.closest("[data-tip]");
     if (el) show(el.dataset.tip, e.clientX, e.clientY); else if (shown) hide();
   });
   document.addEventListener("click", (e) => {
-    if (tip.contains(e.target)) return;
     const el = e.target.closest("[data-tip]");
     if (el && shown?.key !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") hide();
   });
   return {show, hide, refresh, key: () => shown?.key};
 }
