@@ -208,7 +208,7 @@ unchanged skip reasons do not add lines.
 
 A refused environment or failed recovery alerts the nearest showrunner above the session's staff row.
 The message gives the cause, the raw reason, and the recovery commands.
-The healer saves a new showrunner key before the first send in each alert episode.
+The healer creates a new showrunner key for each alert episode. The sweep saves it with the session state after the send.
 Later attempts in that episode use the saved key.
 The healer accepts `SKIPPED` as confirmation when the sender already holds or accepted the alert.
 The healer clears the key after it confirms recovery or after a successful `retry` command.
@@ -218,9 +218,10 @@ The healer writes the fallback reason to stderr. The timer saves it in its run l
 
 1. Repair the nix setup on the affected machine. Get Nate's approval before you change `/etc/nixos`.
 2. Run `heal.py retry --only <id>` after the repair if there is no pending restart. It clears the restart guard and notification flag.
-3. Run `heal.py escalate --only <id>` after the repair if a restart is pending. Nate gets a push to restart the session.
+3. If a restart is pending, run `heal.py escalate --only <id>` after the repair or if you cannot repair the setup.
 
-Run `heal.py escalate --only <id>` if you cannot repair the setup. The healer uses the saved failure reason for the push.
+Run `heal.py escalate --only <id>` if you cannot repair the setup and there is no pending restart.
+The healer uses the saved failure reason to send Nate a push. If a restart is pending, the push asks Nate to restart the session.
 
 Both commands take the same state lock as the sweep. If the lock is busy, run the command again after the sweep ends.
 Retry refuses while a restart is pending. The refusal and the showrunner alert give the escalation command.
