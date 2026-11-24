@@ -96,6 +96,7 @@ ACTIVITY_ALIASES: dict[str, str] = {
     # Named for the stage they are, not a stage of their own.
     "implement": "implementation",
     "team review": "review",
+    "subagent review": "review",
     "as-built": "shrink",
     "closure": "closeout",
     "phase closeout": "closeout",

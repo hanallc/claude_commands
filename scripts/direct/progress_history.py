@@ -824,7 +824,7 @@ def _selected_phase(state: dict[str, object], args: argparse.Namespace, *, close
 
 
 def _optional_epoch(args: argparse.Namespace, name: str, option: str, now: float) -> float:
-    """A past moment an option names, for a phase recorded after the fact; now when absent."""
+    """A past moment an option names, for a phase or activity recorded after the fact; now when absent."""
     value = pass_recorder.optional_arg(args, name)
     if not value:
         return now
@@ -843,6 +843,13 @@ def _optional_epoch(args: argparse.Namespace, name: str, option: str, now: float
     return moment
 
 
+def _mark_backfilled(event: dict[str, object], at: float, now: float) -> None:
+    """Mark an event stamped at a past moment, so readers know it is out of time order."""
+    if at != now:
+        event["recorded_at"] = pass_recorder.iso_time(now)
+        event["backfilled"] = True
+
+
 def _close_active_activity(
     session_dir: Path,
     state: dict[str, object],
@@ -850,21 +857,23 @@ def _close_active_activity(
     status: str,
     result: str,
     now: float,
+    finished_at: float | None = None,
 ) -> None:
+    """Close the active activity at `finished_at`, or at now when absent or before the activity started."""
     activity = pass_recorder.object_dict(phase.get("activity"))
     if activity is None or pass_recorder.string(activity.get("status")) != "active":
         return
-    event = pass_recorder.record_event(state, "activity_finished", now, phase_record=phase, activity_record=activity)
+    started_at = pass_recorder.number(activity.get("started_at"), now)
+    at = now if finished_at is None or finished_at < started_at else finished_at
+    event = pass_recorder.record_event(state, "activity_finished", at, phase_record=phase, activity_record=activity)
     event["status"] = status
     event["activity_result"] = result
-    event["activity_elapsed_seconds"] = max(
-        0,
-        int(now - pass_recorder.number(activity.get("started_at"), now)),
-    )
+    event["activity_elapsed_seconds"] = max(0, int(at - started_at))
+    _mark_backfilled(event, at, now)
     pass_recorder.append_event(state, event)
     activity["status"] = status
     activity["result"] = result
-    activity["finished_at"] = now
+    activity["finished_at"] = at
     pass_recorder.write_state(session_dir, state)
 
 
@@ -877,18 +886,27 @@ def _start_activity(args: argparse.Namespace) -> None:
     if phase is None:
         raise SystemExit("Start a phase before starting an activity")
     now = pass_recorder.now_epoch()
-    _close_active_activity(session_dir, state, phase, "interrupted", "", now)
+    started_at = _optional_epoch(args, "started_at", "--started-at", now)
+    phase_started_at = pass_recorder.number(phase.get("started_at"), started_at)
+    if started_at < phase_started_at:
+        raise SystemExit(
+            f"--started-at is before Phase {pass_recorder.string(phase.get('id'))} started "
+            + f"({pass_recorder.iso_time(phase_started_at)})"
+        )
+    _close_active_activity(session_dir, state, phase, "interrupted", "", now, started_at)
     pass_recorder.refresh_main_identity(session_dir, state)
     activity: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "label": pass_recorder.arg_string(args, "label", "Work") or "Work",
         "activity": pass_recorder.arg_string(args, "activity"),
-        "started_at": now,
+        "started_at": started_at,
         "status": "active",
     }
     phase["activity"] = activity
     pass_recorder.write_state(session_dir, state)
-    pass_recorder.append_event(state, pass_recorder.record_event(state, "activity_started", now, phase_record=phase, activity_record=activity))
+    event = pass_recorder.record_event(state, "activity_started", started_at, phase_record=phase, activity_record=activity)
+    _mark_backfilled(event, started_at, now)
+    pass_recorder.append_event(state, event)
 
 
 def _finish_activity(args: argparse.Namespace) -> None:
@@ -898,13 +916,24 @@ def _finish_activity(args: argparse.Namespace) -> None:
     if phase is None:
         return
     status = pass_recorder.arg_string(args, "status", "completed") or "completed"
+    now = pass_recorder.now_epoch()
+    finished_at = _optional_epoch(args, "finished_at", "--finished-at", now)
+    activity = pass_recorder.object_dict(phase.get("activity"))
+    if activity is not None and pass_recorder.string(activity.get("status")) == "active":
+        started_at = pass_recorder.number(activity.get("started_at"), finished_at)
+        if finished_at < started_at:
+            raise SystemExit(
+                f"--finished-at is before the activity {pass_recorder.string(activity.get('label'))!r} "
+                + f"started ({pass_recorder.iso_time(started_at)})"
+            )
     _close_active_activity(
         session_dir,
         state,
         phase,
         status,
         pass_recorder.arg_string(args, "result"),
-        pass_recorder.now_epoch(),
+        now,
+        finished_at,
     )
 
 
@@ -1106,9 +1135,7 @@ def _start_phase(args: argparse.Namespace) -> None:
                  repository=_phase_metadata_fields(source.repository))
     event["contract_revision"] = _contract_revision()
     event["wait_coverage"] = {"state": "Recorded", "version": 1}
-    if started_at != now:
-        event["recorded_at"] = pass_recorder.iso_time(now)
-        event["backfilled"] = True
+    _mark_backfilled(event, started_at, now)
     event.update(_work_order_metrics(pass_recorder.arg_string(args, "work_order_file")))
     phase["start_event"] = event
     pass_recorder.write_state(session_dir, state)
@@ -2350,6 +2377,7 @@ ROLE_WAVE_SECONDS = 30.0
 # The label the director opens an activity with while the UX helper judges the
 # phase's shots; review-trial counts that time as review time.
 UX_REVIEW_ACTIVITY_LABEL = "UX review"
+SUBAGENT_REVIEW_ACTIVITY_LABEL = "Subagent review"
 # What findings.py's `--lens both` stands for: the two lenses the broad review
 # ran before `craft` joined them.
 LEGACY_BOTH_LENS = "both"
@@ -5282,6 +5310,35 @@ def _finish_wait(args: argparse.Namespace) -> None:
     _end_wait(state, wait, now, unclosed=False)
 
 
+@dataclass(frozen=True)
+class _FinishedPhase:
+    id: str
+    instance_id: str
+    title: str
+    started_at: float
+    status: str
+
+    def phase_record(self) -> dict[str, object]:
+        return {"id": self.id, "instance_id": self.instance_id, "title": self.title, "started_at": self.started_at}
+
+
+@dataclass(frozen=True)
+class _NoFinishedPhase:
+    pass
+
+
+def _finished_phase(events: list[dict[str, object]], phase_id: str) -> _FinishedPhase | _NoFinishedPhase:
+    """Read the newest finished instance of the named phase."""
+    finished = next((event for event in reversed(events)
+                     if event.get("event_type") == "phase_finished" and event.get("phase_id") == phase_id), None)
+    if finished is None:
+        return _NoFinishedPhase()
+    return _FinishedPhase(phase_id, pass_recorder.string(finished.get("phase_instance_id")),
+                          pass_recorder.string(finished.get("phase_title")),
+                          pass_recorder.number(finished.get("phase_started_at")),
+                          pass_recorder.string(finished.get("status")))
+
+
 def _checkpoint(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
@@ -5290,10 +5347,22 @@ def _checkpoint(args: argparse.Namespace) -> None:
     commit = pass_recorder.arg_string(args, "commit")
     if COMMIT_HASH_PATTERN.fullmatch(commit) is None:
         raise SystemExit("checkpoint requires a full commit hash")
-    phase = _selected_phase(state, args)
-    if phase is None:
-        raise SystemExit("checkpoint requires the named open phase")
-    events = _run_events(state)
+    if cast(bool, args.closed):
+        phase_id = pass_recorder.optional_arg(args, "phase_id")
+        if not phase_id:
+            raise SystemExit("checkpoint --closed requires --phase-id")
+        if pass_recorder.open_phase_named(state, phase_id) is not None:
+            raise SystemExit(f"Phase {phase_id} is open. Use checkpoint without --closed.")
+        events = _run_events(state)
+        finished = _finished_phase(events, phase_id)
+        if isinstance(finished, _NoFinishedPhase):
+            raise SystemExit(f"Phase {phase_id} has no finished instance")
+        phase = finished.phase_record()
+    else:
+        phase = _selected_phase(state, args)
+        if phase is None:
+            raise SystemExit("checkpoint requires the named open phase")
+        events = _run_events(state)
     checked: list[str] = []
     for folder in _phase_working_dirs(session_dir, state, events, phase):
         if _is_commit(folder, commit):
@@ -5395,22 +5464,29 @@ def resolve_checkpoint(commit: str, working_dir: Path, phase_id: str) -> (
 ):
     """Match a full checkpoint, including finished instances, across durable runs."""
     events, ignored = load_events()
-    phases = [event for event in events if event.get("event_type") == "phase_started"
-              and pass_recorder.string(event.get("working_dir"))
-              and Path(pass_recorder.string(event.get("working_dir"))).resolve() == working_dir.resolve()
-              and event.get("phase_id") == phase_id]
+    directory = working_dir.resolve()
+    phases = [event for event in events if event.get("event_type") == "phase_started" and event.get("phase_id") == phase_id]
     matches = [event for event in events if event.get("event_type") == "checkpoint"
                and event.get("checkpoint_commit") == commit]
-    valid = [event for event in matches if any(
-        (event.get("run_id"), event.get("phase_instance_id"), event.get("working_dir")) ==
-        (phase.get("run_id"), phase.get("phase_instance_id"), phase.get("working_dir")) for phase in phases)]
+
+    def phase_key(event: dict[str, object]) -> tuple[str, str]:
+        return pass_recorder.string(event.get("run_id")), pass_recorder.string(event.get("phase_instance_id"))
+
+    def in_worktree(event: dict[str, object]) -> bool:
+        path = pass_recorder.string(event.get("working_dir"))
+        try:
+            return bool(path) and Path(path).resolve() == directory
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    instances = {key for phase in phases if all(key := phase_key(phase))}
+    valid = [event for event in matches if phase_key(event) in instances and in_worktree(event)]
     if len(matches) == len(valid) == 1 and not ignored:
         return ResolvedCheckpointPhase(valid[0])
-    candidates = list({(pass_recorder.string(event.get("run_id")), pass_recorder.string(event.get("phase_instance_id"))): event
-                       for event in [*phases, *matches]}.values())
+    candidates = {phase_key(event): event for event in [*filter(in_worktree, phases), *matches]}
     identities = tuple({key: event[key] for key in
                         ("run_id", "phase_id", "phase_instance_id", "session_dir", "working_dir", "checkpoint_commit")
-                        if key in event} for event in candidates)
+                        if key in event} for event in candidates.values())
     reason = (f"checkpoint {commit} has {len(matches)} records and {len(valid)} valid phase matches"
               + (f"; {ignored} unreadable history rows" if ignored else ""))
     return UnresolvedWaitAttribution(reason, identities)
@@ -6195,9 +6271,7 @@ def _finish_phase_with_wait_lock(
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
     event["phase_active_seconds"] = max(0, int(finished_at - started_at - paused))
-    if finished_at != now:
-        event["recorded_at"] = pass_recorder.iso_time(now)
-        event["backfilled"] = True
+    _mark_backfilled(event, finished_at, now)
     pass_recorder.append_event(state, event)
     phase["status"] = status
     phase["finished_at"] = finished_at
@@ -6229,20 +6303,17 @@ def _drop_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
         args.interrupted_worker_passes = passes
         state = pass_recorder.read_state(session_dir)
     events = _run_events(state)
-    finished = next((event for event in reversed(events)
-                     if event.get("event_type") == "phase_finished" and event.get("phase_id") == phase_id), None)
-    if finished is None:
+    phase = _finished_phase(events, phase_id)
+    if isinstance(phase, _NoFinishedPhase):
         raise SystemExit(f"Cannot drop Phase {phase_id}: no open or finished instance")
-    if finished.get("status") == "completed":
+    if phase.status == "completed":
         raise SystemExit(f"Cannot drop Phase {phase_id}: the newest instance completed")
-    instance = pass_recorder.string(finished.get("phase_instance_id"))
     previous = next((event for event in reversed(events)
-                     if event.get("event_type") == "phase_dropped" and event.get("phase_instance_id") == instance), None)
+                     if event.get("event_type") == "phase_dropped" and event.get("phase_instance_id") == phase.instance_id),
+                    None)
     if previous is not None and previous.get("reason") == reason:
         return passes
-    phase = {"id": phase_id, "instance_id": instance, "title": finished.get("phase_title", ""),
-             "started_at": finished.get("phase_started_at", 0)}
-    event = pass_recorder.record_event(state, "phase_dropped", pass_recorder.now_epoch(), phase_record=phase)
+    event = pass_recorder.record_event(state, "phase_dropped", pass_recorder.now_epoch(), phase_record=phase.phase_record())
     event["reason"] = reason
     pass_recorder.append_event(state, event)
     _refresh_phase_table(session_dir)
@@ -6342,7 +6413,8 @@ def _review_trial(args: argparse.Namespace) -> None:
     An unnamed command selects the only open phase or the last closed phase.
     Only the selected instance contributes to the line.
     Its ledger supplies the findings and dispatched rounds, including routed and closed findings.
-    Review-worker minutes count finished review passes and UX review activities.
+    Review-worker minutes count finished review passes, `UX review` activities and
+    `Subagent review` activities.
     UX check minutes count `UX review` activities.
     UX repair minutes count fix passes whose dispatched batch includes a UX finding.
     Each time rounds to the nearest whole minute.
@@ -6411,6 +6483,11 @@ def _review_trial(args: argparse.Namespace) -> None:
             elapsed = pass_recorder.integer(event.get("activity_elapsed_seconds"))
             review_seconds += elapsed
             ux_check_seconds += elapsed
+        elif (
+            event_type == "activity_finished"
+            and pass_recorder.string(event.get("activity_label")) == SUBAGENT_REVIEW_ACTIVITY_LABEL
+        ):
+            review_seconds += pass_recorder.integer(event.get("activity_elapsed_seconds"))
     # A fix pass carries the round the ledger dispatched (`fix_pass`), and the
     # dispatch names the findings that round covers.
     rounds = ledger.get("rounds")
@@ -6525,6 +6602,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = checkpoint.add_argument("--session-dir", required=True)
     _ = checkpoint.add_argument("--phase", "--phase-id", dest="phase_id", default="")
     _ = checkpoint.add_argument("--commit", required=True)
+    _ = checkpoint.add_argument("--closed", action="store_true", help="record a checkpoint for a finished phase")
     checkpoint.set_defaults(handler=_checkpoint)
 
     void_checkpoint = subparsers.add_parser("void-checkpoint")
@@ -6569,6 +6647,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_activity.add_argument("--phase-id", "--phase", default="")
     _ = start_activity.add_argument("--label", required=True)
     _ = start_activity.add_argument("--activity", required=True)
+    _ = start_activity.add_argument("--started-at", default="")
     start_activity.set_defaults(handler=_start_activity)
 
     finish_activity = subparsers.add_parser("finish-activity")
@@ -6584,6 +6663,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="short outcome for the stage table, such as pass, clean, or no change",
     )
+    _ = finish_activity.add_argument("--finished-at", default="")
     finish_activity.set_defaults(handler=_finish_activity)
 
     arm_review = subparsers.add_parser(
