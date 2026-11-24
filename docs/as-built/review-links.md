@@ -1154,6 +1154,20 @@ A retry can use a new screenshot if the first screenshot expires before filing.
 After Send, the List refreshes with the current filters.
 Select a row to open it.
 If a row save is in progress, the List refreshes when that save ends.
+
+The `/new_item` command (`scripts/review_links/new_item.py`) sends the dialog request to the same New item endpoint.
+The server reply holds the Review item ID and key, and no List item.
+The command then makes one List item for the filed Review item. A Send from the dialog makes no List item.
+The command writes the item in morty's List folder, because only that folder allocates List numbers.
+The title is the first line that has words, at most 120 characters. Latest status holds the words.
+Evidence links to the Review item, and the item links to the Review key.
+Owner is the recipient. Producer is the producer of the assignee. A unit assignee also fills Unit.
+Each run sends a new request ID, so each run files a new Review item and a new List item.
+The result line names the type, the assignee and the List item number. It also names the producer of an assignee that is not a producer.
+If the List write fails after the server files the item, the command still exits 0.
+If the List item write fails, the line names the Review item ID, says that no List item exists, and gives the error.
+If only the Review link fails, the line says that List item N exists without its Review link, and gives the error.
+
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
 On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.

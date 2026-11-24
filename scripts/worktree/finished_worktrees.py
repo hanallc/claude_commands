@@ -12,7 +12,7 @@ import sys
 from scripts.agents.remote import local_machine
 from scripts.lib import build_folders, git_files, process_start
 from scripts.production import staff
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 MAC_SCAN_SECONDS = 1
@@ -108,12 +108,12 @@ def process_directories() -> ProcessDirectoriesRead | ProcessDirectoriesUnreadab
 
 def belongs_to_unit(path: Path, unit_folder: Path, unit: str, snapshot: staff.StaffSnapshot) -> bool:
     try:
-        record = worktrees.checkout_record(path)
+        record = worktree_records.checkout_record(path)
         if record is None:
-            return path.parent == unit_folder and not worktrees.record_file(path).is_symlink()
+            return path.parent == unit_folder and not worktree_records.record_file(path).is_symlink()
     except (OSError, ValueError):
         return False
-    if isinstance(record.layout, worktrees.RecordedWorktreeOutput):
+    if isinstance(record.layout, worktree_records.RecordedWorktreeOutput):
         return record.layout.unit == unit
     owner = snapshot.owner_of(record.owner)
     if owner is not None and owner.kind == "unit":
@@ -152,11 +152,11 @@ def finished_worktrees(source: Path, destination: Path, unit: str, snapshot: sta
             continue
         if not belongs_to_unit(path, destination.parent, unit, snapshot):
             continue
-        ancestor = worktrees.git(path, "merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main",
+        ancestor = worktree_records.git(path, "merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main",
                                  check=False)
         if ancestor.returncode:
             continue
-        status = worktrees.git(path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all",
+        status = worktree_records.git(path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all",
                                check=False)
         if not status.returncode and not status.stdout and not status.stderr:
             clean_landed.append(path)
@@ -179,13 +179,13 @@ def main(arguments: list[str]) -> int:
     repo, unit, short_name = arguments
     try:
         destination = build_folders.worktree_path(repo, unit, short_name).resolve()
-        source = worktrees.main_checkout_for_word(repo)
+        source = worktree_records.main_checkout_for_word(repo)
         snapshot = worktrees.staff_record()
         finished = finished_worktrees(source, destination, unit, snapshot)
         if not finished:
             print(worktrees.make(repo, unit, short_name, snapshot))
             return 0
-    except worktrees.Refused as error:
+    except worktree_records.Refused as error:
         print(error, file=sys.stderr)
         return error.code
     except (OSError, ValueError, KeyError, staff.StaffRefused, subprocess.SubprocessError) as error:
