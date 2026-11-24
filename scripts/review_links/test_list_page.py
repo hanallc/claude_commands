@@ -45,7 +45,7 @@ from scripts.production import (change_review, change_routing, delivery_state, i
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, go_ledger, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_page, send_hold
+from scripts.review_links import review_items, review_link, review_page, send_hold
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.browser_test_support import assert_status_states
@@ -7257,7 +7257,6 @@ const change=async path=>{
         item = the_list.mark_read(MORTY.id, added.id, source="nate")
         _ = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge needsme to main.",
                              why="The merge needs nate's go.", config=False, requester=MORTY.id, source="morty")
-        _ = write_config_fixture(self.root / "config" / "review_links.conf", "go_refused_addresses=192.0.2.1\n")
         root = self.root / "reviews"
         results: list[list[str]] = []
         complete = threading.Event()
@@ -7291,6 +7290,10 @@ const settle=async (done,message)=>{
   button.focus();
   check(doc.activeElement===button,'The Go button takes the keyboard focus.');
   button.click();
+  await settle(()=>box.isConnected && !button.disabled &&
+   win.recordDetails(row).querySelector('[data-send-status]')?.textContent.includes("Could not check natedev's addresses."),
+   'The row shows the address error and the ask stays open.');
+  button.click();
   await settle(()=>!box.isConnected && row.hidden,'A Go closes the box and the item leaves Needs me.');
   check(doc.getElementById('filter-show-needs-me').dataset.filterCount==='0','The Needs me count is 0 after the Go.');
   check(row.dataset.state==='Working' && row.querySelector('.list-state').textContent==='Working',
@@ -7320,6 +7323,8 @@ const settle=async (done,message)=>{
         with (patch.object(serve, "ReviewLinksHandler", Probe),
               patch.object(review_page.ReviewSnapshotCache, "start"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(review_link, "tailscale_ip",
+                           side_effect=["192.0.2.1", ValueError("No IPv6 address."), "192.0.2.1", "2001:db8::1"]),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(change_page, "send_to_staff") as delivery,
               patch.object(go_ledger, "natedev_address", return_value=False),
