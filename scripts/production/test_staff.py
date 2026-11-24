@@ -796,6 +796,25 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_pause_keeps_the_worker_mode_in_the_staff_record(self) -> None:
+        _, unit, _ = self.tree()
+        hold = staff.Paused("2026-11-24", "caller", "maintenance", keep_workers=True,
+                            unknown_fields={"future": "field"})
+        kept = staff.set_hold(str(unit.id), hold)
+        self.assertEqual(staff.by_id(unit.id), kept)
+        self.assertEqual(staff.StaffSnapshot.decode(staff.snapshot().encode()).by_id(unit.id), kept)
+        self.assertEqual(hold.to_json()["keep_workers"], True)
+        self.assertEqual(hold.to_json()["future"], "field")
+        self.assertEqual(staff.pause(str(unit.id), "other reason", keep_workers=True), kept)
+
+        paused = staff.pause(str(unit.id), "other reason")
+        self.assertEqual(paused.paused, replace(hold, keep_workers=False))
+        self.assertEqual(staff.by_id(unit.id), paused)
+        self.assertEqual(staff.pause(str(unit.id), "maintenance", keep_workers=True), paused)
+        encoded = replace(hold, keep_workers=False).to_json()
+        self.assertNotIn("keep_workers", encoded)
+        self.assertFalse(staff.Paused.from_json(encoded).keep_workers)
+
     def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
         producer = fixture_member("producer", name="planner")
         mark = staff.RetiredProducer("claude:sonnet:high")

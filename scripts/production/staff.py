@@ -23,7 +23,7 @@ from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast, override
 from uuid import UUID
 
 from scripts.lib import git_files
@@ -354,6 +354,25 @@ class HoldRecord:
 @dataclass(frozen=True)
 class Paused(HoldRecord):
     """The director holds at its prompt."""
+
+    keep_workers: bool = False
+
+    @override
+    def to_json(self) -> dict[str, object]:
+        fields = super().to_json()
+        if self.keep_workers:
+            fields["keep_workers"] = True
+        return fields
+
+    @classmethod
+    @override
+    def from_json(cls, value: object) -> Self:
+        hold = super().from_json(value)
+        unknown = hold.unknown_fields.copy()
+        keep_workers = unknown.pop("keep_workers", False)
+        if not isinstance(keep_workers, bool):
+            raise StaffUnreadable("paused keep_workers must be a boolean")
+        return replace(hold, keep_workers=keep_workers, unknown_fields=unknown)
 
 
 @dataclass(frozen=True)
@@ -2229,7 +2248,13 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
         if row is None:
             raise StaffNotFound(StaffId(reference))
         if isinstance(hold, Paused):
-            changed = replace(row, paused=row.paused if isinstance(row.paused, Paused) else hold, exited=Active())
+            paused = row.paused
+            if isinstance(paused, Paused):
+                if paused.keep_workers and not hold.keep_workers:
+                    paused = replace(paused, keep_workers=False)
+            else:
+                paused = hold
+            changed = replace(row, paused=paused, exited=Active())
         elif isinstance(hold, Exited):
             changed = replace(row, exited=row.exited if isinstance(row.exited, Exited) else hold, paused=Active())
         else:
@@ -2240,16 +2265,19 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
     return _transaction(edit)
 
 
-def _hold(reference: str, why: str, state: type[Paused] | type[Exited]) -> StaffRow:
+def _hold(reference: str, why: str, state: type[Paused] | type[Exited], *, keep_workers: bool = False) -> StaffRow:
     from scripts.lib.user_zone import user_zone
 
     caller = by_current_session(runtime_id())
-    return set_hold(reference, state(datetime.now(user_zone()).isoformat(), caller.name if caller else "", why))
+    since = datetime.now(user_zone()).isoformat()
+    name = caller.name if caller else ""
+    hold = Paused(since, name, why, keep_workers=keep_workers) if state is Paused else Exited(since, name, why)
+    return set_hold(reference, hold)
 
 
-def pause(reference: str, why: str) -> StaffRow:
+def pause(reference: str, why: str, *, keep_workers: bool = False) -> StaffRow:
     """Record the director's pause request."""
-    return _hold(reference, why, Paused)
+    return _hold(reference, why, Paused, keep_workers=keep_workers)
 
 
 def exit(reference: str, why: str) -> StaffRow:

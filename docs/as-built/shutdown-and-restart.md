@@ -27,18 +27,25 @@ Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
 
-`agents pause NAME --why TEXT` stops the workers now.
+`agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.
+By default, pause stops the workers.
+With `--keep-workers`, the workers continue their current work.
 `agents exit NAME --why TEXT` stops the director and its workers.
 Both commands preserve the staff rows, tabs, and shells.
 Add `--finish-step` to wait for the workers' current tasks before stopping them.
 The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
-`agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
+The pause record includes `keep_workers` when pause keeps the workers.
+`agents status` names the kept workers of a paused director.
+JSON status lists the names under `kept_workers`.
+`agents pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
 It reports each held row and its holder when known.
 It resumes the available rows and returns exit 2 if a row lock blocks a resume.
 Resume removes a pause record and sends a running director one continuation message.
+Resume skips worker restoration for a director paused with `--keep-workers`.
+A worker message to a paused director waits in the director's transcript until resume.
 A paused director on the other machine gets the continuation message without a local liveness read.
 The machine comes from its worktree or its showrunner document.
 A stopped paused director starts through the shared resume path, including its requested `--to` account.

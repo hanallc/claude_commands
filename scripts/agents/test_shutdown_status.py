@@ -349,6 +349,33 @@ else:
         self.assertEqual(result, 0)
         self.assertIn("natedev:\n  no sessions on claude2\n", standard_output.getvalue())
 
+    def test_status_names_the_workers_kept_by_the_director_pause(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        other = fixture_member("unit", name="other", parent=owner.id)
+        _ = fixture_worker("review", director.id)
+        _ = fixture_worker("impl", director.id)
+        _ = fixture_worker("unrelated", other.id)
+        _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        _ = staff.pause(str(other.id), "maintenance")
+        reports = [
+            {**complete_session(host={"kind": "unknown"}), "kind": "unit", "name": row.name,
+             "session_id": row.current_session}
+            for row in (director, other)
+        ]
+        report = inventory.parse_inventory(json.dumps({**empty_inventory(), "sessions": reports}))
+        with (patch.object(status_entry, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any("unit selected" in line and "paused (workers kept: impl, review)" in line for line in lines))
+        self.assertFalse(any("unit other" in line and "workers kept" in line for line in lines))
+
+        with (patch.object(status_entry, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here", "--json"]), 0)
+        expected = {**report, "sessions": [{**report["sessions"][0], "kept_workers": ["impl", "review"]},
+                                           report["sessions"][1]]}
+        self.assertEqual(output.getvalue(), json.dumps(expected, sort_keys=True) + "\n")
+
     def test_status_starts_the_peer_before_finishing_the_local_report(self) -> None:
         authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))
         self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)

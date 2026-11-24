@@ -18,9 +18,9 @@ def _usage() -> str:
     return f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
-  agents pause NAME [--finish-step] --why TEXT
+  agents pause NAME [--finish-step] [--keep-workers] --why TEXT
   agents exit NAME [--finish-step] --why TEXT
-  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
+  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
@@ -123,6 +123,7 @@ class CommandLine(argparse.Namespace):
     production: str = ""
     excluded: list[str] = []
     finish_step: bool = False
+    keep_workers: bool = False
     retired: bool = False
     resend_opening_prompt: bool = False
     old: str = ""
@@ -518,11 +519,15 @@ def _lifecycle(options: CommandLine) -> int:
                     code = 2
                     continue
                 started = False
+                keep_workers = isinstance(row.paused, staff.Paused) and row.paused.keep_workers
                 if _paused_resume_needs_message(row):
                     _ = staff.resume(str(row.id))
-                    workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
-                               else "Resume your existing workers. Do not open new workers.")
-                    delivery = _message(row, f"Continue where you stopped. {workers}")
+                    text = stop_resume.PAUSED_CONTINUATION
+                    if not keep_workers:
+                        workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
+                                   else "Resume your existing workers. Do not open new workers.")
+                        text += f" {workers}"
+                    delivery = _message(row, text)
                     if restart_support.message_was_delivered(delivery):
                         started = True
                         shutdown_record.remove_started([str(row.id)])
@@ -534,8 +539,17 @@ def _lifecycle(options: CommandLine) -> int:
                     try:
                         if isinstance(row.paused, staff.Paused):
                             _ = staff.resume(str(row.id))
-                        result = stop_resume.resume(str(row.id), why=why, to=options.to)
+                        if keep_workers:
+                            result = stop_resume.resume(str(row.id), why=why, to=options.to, keep_workers=True)
+                        else:
+                            result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
+                        if started and keep_workers:
+                            started = restart_support.message_was_delivered(_message(row, stop_resume.PAUSED_CONTINUATION))
+                            if not started:
+                                code = max(code, 1)
+                                continue
+                            shutdown_record.remove_started([str(row.id)])
                         if started and row.kind != "producer" and isinstance(row.exited, staff.Exited):
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))
@@ -555,13 +569,15 @@ def _lifecycle(options: CommandLine) -> int:
             code = max(code, stopped)
             continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
-        held = row if already_exited else staff.pause(str(row.id), why)
+        held = row if already_exited else staff.pause(str(row.id), why, keep_workers=options.keep_workers)
         remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
         if remote_exit:
             outcome = unit_remote_command("stop", row, record, finish_step=options.finish_step)
             stopped = int(outcome["code"])
+        elif options.keep_workers:
+            stopped = 0
         else:
             unresolved = stop_resume.stop_unit_workers(row.id, record)
             stopped = int(bool(unresolved))
@@ -648,6 +664,8 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--why", required=True)
             _ = command.add_argument("--finish-step", action="store_true")
             _ = command.add_argument("--except", dest="excluded", action="append", default=[])
+            if verb == "pause":
+                _ = command.add_argument("--keep-workers", action="store_true")
     command = commands.add_parser("retire")
     _ = command.add_argument("session")
     _ = command.add_argument("--to")

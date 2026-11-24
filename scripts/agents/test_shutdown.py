@@ -15,17 +15,126 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import call, patch
 
-from scripts.agents import pane_record, shutdown, shutdown_record, stop_resume, test_stop_resume
+from scripts.agents import pane_record, restart, shutdown, shutdown_record, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
+from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import atomic_file
 from scripts.message import sessions
-from scripts.production import staff
+from scripts.production import staff, worker
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.whoami import quota_state
 
 
 NATIVE_PROCESS = herdr.native_process
+
+
+class PauseWorkersTests(StaffTestCase):
+    def test_named_pause_keeps_the_worker_and_resume_sends_one_continuation(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        child = fixture_member("worker", name="impl", parent=director.id)
+        world = PaneWorld()
+        world.setup(self)
+        world.add(director, "w1:p0")
+        world.add(child, "w1:p1")
+        world.locations["w1:p1"]["agent_status"] = "working"
+        processes = world.foreground.copy()
+        with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+              patch.object(restart, "stop_row", side_effect=world.stop),
+              patch.object(shutdown, "_message", return_value={"kind": "sent"}) as send,
+              patch.object(stop_resume, "running_on_account",
+                           return_value=stop_resume.ClaudeUp(director.current_session, "w1:p0", "claude2")),
+              patch.object(stop_resume, "resume") as start,
+              patch.object(worker, "restore") as restore,
+              patch.object(worker, "resume_workers") as worker_message,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["pause", director.name, "--keep-workers", "--why", "maintenance"]), 0)
+            paused = staff.snapshot().by_id(director.id)
+            assert paused is not None and isinstance(paused.paused, staff.Paused)
+            self.assertTrue(paused.paused.keep_workers)
+            send.assert_called_once_with(director,
+                "Finish your current turn. Hold at the prompt. Do not start new work. Wait for agents resume.")
+            send.reset_mock()
+            self.assertEqual(shutdown.main(["resume", director.name]), 0)
+            send.assert_called_once_with(paused, "Continue where you stopped.")
+        self.assertEqual(staff.by_id(director.id), director)
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(world.foreground, processes)
+        self.assertEqual(world.locations["w1:p1"]["agent_status"], "working")
+        self.assertEqual(world.stops, [])
+        start.assert_not_called()
+        restore.assert_not_called()
+        worker_message.assert_not_called()
+
+    def test_production_pause_keeps_workers_and_skips_the_excluded_director(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        selected = fixture_member("unit", name="selected", parent=owner.id)
+        excluded = fixture_member("unit", name="excluded", parent=owner.id)
+        world = PaneWorld()
+        world.setup(self)
+        for index, director in enumerate((selected, excluded), start=1):
+            child = fixture_member("worker", name="impl", parent=director.id)
+            world.add(director, f"w{index}:p0", workspace=f"w{index}", tab=f"w{index}:t1")
+            world.add(child, f"w{index}:p1", workspace=f"w{index}", tab=f"w{index}:t1")
+        processes = world.foreground.copy()
+        with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+              patch.object(restart, "stop_row", side_effect=world.stop),
+              patch.object(shutdown, "_message", return_value={"kind": "sent"}) as send,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["pause", "--production", owner.name, "--except", excluded.name,
+                                            "--keep-workers", "--why", "maintenance"]), 0)
+        paused = staff.by_id(selected.id)
+        assert paused is not None and isinstance(paused.paused, staff.Paused)
+        self.assertTrue(paused.paused.keep_workers)
+        self.assertEqual(staff.by_id(excluded.id), excluded)
+        self.assertEqual(world.foreground, processes)
+        self.assertEqual(world.stops, [])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], selected)
+
+    def test_plain_pause_stops_the_worker_and_leaves_the_director_running(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.root))
+        child = fixture_member("worker", name="impl", parent=director.id)
+        world = PaneWorld()
+        world.setup(self)
+        world.add(director, "w1:p0")
+        world.add(child, "w1:p1")
+        with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+              patch.object(restart, "stop_row", side_effect=world.stop),
+              patch.object(shutdown, "_message", return_value={"kind": "sent"}),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["pause", director.name, "--why", "maintenance"]), 0)
+        paused = staff.by_id(director.id)
+        assert paused is not None and isinstance(paused.paused, staff.Paused)
+        self.assertFalse(paused.paused.keep_workers)
+        self.assertEqual(world.stops, [child.current_session])
+        self.assertEqual(set(world.foreground), {"w1:p0"})
+
+    def test_stopped_kept_worker_pause_clears_only_after_the_continuation(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        paused = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        for delivered in (False, True):
+            with (self.subTest(delivered=delivered),
+                  patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+                  patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+                  patch.object(stop_resume, "resume",
+                               return_value=stop_resume.ClaudeUp(director.current_session, "w1:p0", "claude2")) as start,
+                  patch.object(shutdown, "_message",
+                               return_value={"kind": "sent" if delivered else "queued"}) as send,
+                  patch.object(shutdown_record, "remove_started") as remove,
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(shutdown.main(["resume", director.name]), 0 if delivered else 1)
+            start.assert_called_once_with(str(director.id), why="resumed by name", to=None, keep_workers=True)
+            send.assert_called_once_with(paused, "Continue where you stopped.")
+            if delivered:
+                remove.assert_called_once_with([str(director.id)])
+            else:
+                remove.assert_not_called()
+            self.assertEqual(staff.by_id(director.id), director if delivered else paused)
 
 
 class ProductionResumeTests(StaffTestCase):

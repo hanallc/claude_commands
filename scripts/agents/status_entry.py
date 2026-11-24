@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from threading import Thread
 from typing import Literal, Never, TypedDict, override
@@ -66,11 +66,13 @@ def _checkout_text(checkout: CheckoutState) -> str:
     )
     return f"{name} {tracking}, {len(checkout['dirty'])} dirty"
 
-def _inventory_lines(report: Inventory) -> list[str]:
+def _inventory_lines(report: Inventory, kept_workers: Mapping[str, list[str]]) -> list[str]:
     lines = [f"{report['machine']}:"]
     for session in report["sessions"]:
         summary = f"  {session['kind']} {session['name']} · {_host_text(session['host'])}"
         summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
+        if (workers := kept_workers.get(session["session_id"])) is not None:
+            summary += " · paused (workers kept" + (f": {', '.join(workers)})" if workers else ")")
         lines.append(summary)
         lines.extend(f"    timer {timer}" for timer in session["timers"])
     lines.extend(
@@ -89,7 +91,13 @@ def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
         "reason": reason.strip() or "remote command failed",
     }
 
-def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
+def _local_inventory(login: str) -> tuple[Inventory, staff.StaffSnapshot]:
+    membership = staff.snapshot()
+    with staff.supplied_snapshot(membership), herdr.observation_snapshot():
+        return inventory(login), membership
+
+
+def _status(selected: Account, here: bool) -> tuple[list[MachineStatusReport], staff.StaffSnapshot]:
     if here:
         reading: staff.PeerStatusAuthority | staff.ReadStatusAuthority = staff.ReadStatusAuthority()
         stdin = sys.stdin
@@ -98,8 +106,9 @@ def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
                 reading = staff.decode_peer_status_authority(stdin.read())
             except (OSError, UnicodeError):
                 pass
-        with staff.status_authority(reading), herdr.observation_snapshot():
-            return [inventory(selected.login)]
+        with staff.status_authority(reading):
+            local, membership = _local_inventory(selected.login)
+            return [local], membership
 
     arguments = ["status", selected.login, "--json", "--here"]
     view = staff.peer_status_authority()
@@ -119,8 +128,7 @@ def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
         # A local failure must let the command exit before the peer replies.
         Thread(target=read_peer, daemon=True).start()
         try:
-            with herdr.observation_snapshot():
-                local = inventory(selected.login)
+            local, membership = _local_inventory(selected.login)
         except BaseException:
             cancellation.cancel()
             raise
@@ -128,13 +136,24 @@ def _status(selected: Account, here: bool) -> list[MachineStatusReport]:
 
         machine = remote.other_machine()
         if status == 255:
-            return [local, {"machine": machine, "unreachable": True}]
+            return [local, {"machine": machine, "unreachable": True}], membership
         if status != 0:
-            return [local, _unavailable(machine, status, output)]
+            return [local, _unavailable(machine, status, output)], membership
         try:
-            return [local, parse_inventory(output)]
+            return [local, parse_inventory(output)], membership
         except InvalidInventory as error:
-            return [local, _unavailable(machine, status, str(error))]
+            return [local, _unavailable(machine, status, str(error))], membership
+
+
+def _report_json(report: MachineStatusReport, kept_workers: Mapping[str, list[str]]) -> Mapping[str, object]:
+    if "sessions" not in report:
+        return report
+    sessions = [
+        {**session, "kept_workers": workers}
+        if (workers := kept_workers.get(session["session_id"])) is not None else session
+        for session in report["sessions"]
+    ]
+    return {**report, "sessions": sessions}
 
 
 class StatusArguments(argparse.Namespace):
@@ -177,14 +196,18 @@ def main(arguments: list[str], *, usage: Callable[[], str]) -> int:
         options = _parse_status(parser, arguments)
     try:
         selected = _selected_account(options.account)
-        reports = _status(selected, options.here)
+        reports, membership = _status(selected, options.here)
+        kept_workers = {str(row.current_session): sorted(child.name for child in membership.find(kind="worker", parent=row.id))
+                        for row in membership.rows
+                        if row.kind in ("unit", "showrunner") and isinstance(row.paused, staff.Paused) and row.paused.keep_workers}
         if options.as_json:
-            print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
+            output = [_report_json(report, kept_workers) for report in reports]
+            print(json.dumps(output[0] if options.here else output, sort_keys=True))
         else:
             print(f"{selected.label} · {selected.login}")
             for report in reports:
                 if "sessions" in report:
-                    print("\n".join(_inventory_lines(report)))
+                    print("\n".join(_inventory_lines(report, kept_workers)))
                 elif "unreachable" in report:
                     print(f"{report['machine']}: unreachable")
                 else:

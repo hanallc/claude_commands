@@ -1,16 +1,19 @@
 ---
 description: Show, pause, exit, retire, rename, move, resume, stop, restart, or reboot sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | reboot [--dry-run] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME [--keep-workers] --why TEXT | pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | reboot [--dry-run] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
 ---
 
 Use the `agents` program.
 
 - `agents help`: show the usage. `agents` without arguments prints the same text.
 - `agents status [ACCOUNT] [--json] [--here]`: show live sessions. `--here` selects this machine.
-- `agents pause NAME --why TEXT`: stop the workers now. Let the director finish its turn and hold at its prompt.
+- Use `agents pause NAME [--keep-workers] --why TEXT` to pause a director.
+  The director finishes its turn and holds at the prompt. The workers stop by default.
 - `agents exit NAME --why TEXT`: stop the director and its workers. Keep their staff rows, tabs, and shells.
 - Add `--finish-step` to pause or exit after the workers finish their current tasks.
-- Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
+- Use `agents pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT` to select a production.
+- Add `--keep-workers` to let the workers continue during the pause.
+  When nate asks in his own words for a pause where the workers continue, use `--keep-workers` without a question to him.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
