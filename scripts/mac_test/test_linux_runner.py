@@ -27,7 +27,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.copies_test_support import copies_environment
-from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test import eligibility, claim_state, floor_claims, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
@@ -932,6 +932,8 @@ class LinuxShellTests(unittest.TestCase):
             self.write_tool(self.root / "bin" / tool)
         stamp = self.root / ".claude/.build-target-script-commit"
         _ = stamp.write_text("fixture-commit\n")
+        # Probe a registered mirror so the disk and tool checks do not start the setup helper.
+        _ = (self.mirror / floor_claims.MIRROR_MARK).write_text("registered remote mirror\n")
 
         result = subprocess.run(
             ["bash", "-c", offload.probe_script(self.identity, "linux", 2)], cwd=self.root,

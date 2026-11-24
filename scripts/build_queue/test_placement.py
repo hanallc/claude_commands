@@ -729,7 +729,8 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(limits_view.wait_words(limits_view.waiting_cause(row)).one, "1 run waits for a machine choice.")
 
     def test_a_guest_reading_after_backoff_can_restore_a_waiting_guest(self) -> None:
-        with PlacementFixture() as fixture:
+        configuration = self.enterContext(TemporaryDirectory())
+        with mock.patch.dict(os.environ, {"CONF_DIR": configuration}), PlacementFixture() as fixture:
             backoff = mac_linux_fixture(fixture)
             guest = mac_linux_candidate()
             request = placement_request(fixture)
@@ -780,6 +781,7 @@ class PlacementTests(unittest.TestCase):
                 pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
                 self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
 
+                accepted_at = fixture.clock.now()
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
@@ -791,7 +793,74 @@ class PlacementTests(unittest.TestCase):
                                  (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
                 self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
                 self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
+
+                fixture.restart()
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                self.assertNotIn(key, fixture.server.execution_evidence)
+                start = fixture.server.assignments[key].confirmed_guest_start
+                assert isinstance(start, records.ConfirmedGuestStart), start
+                self.assertEqual(start.accepted_at, accepted_at)
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
+
+    def test_guest_start_report_survives_restart_and_closure(self) -> None:
+        configuration = self.enterContext(TemporaryDirectory())
+        with mock.patch.dict(os.environ, {"CONF_DIR": configuration}), PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+
+            def assignment_row(saved: records.SavedPlacementAssignment) -> dict[str, object]:
+                return cast(dict[str, object], json.loads(wire.encode_record(saved)))
+
+            original = fixture.server.assignments[key]
+            path = fixture.state_dir / "state.json"
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            rows = cast(dict[str, dict[str, object]], state["assignments"])
+            _ = rows[key].pop("confirmed_guest_start", None)
+            _ = path.write_text(json.dumps(state))
+            fixture.restart()
+            self.assertEqual(fixture.server.assignments[key], original)
+
+            fixture.clock.advance(1)
+            started_at = fixture.clock.now()
+            execution = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                "mac-linux", "fixture-boot", "fixture-machine", assignment.attempt))
+            report = wire.ExecutionReport("guest-started", assignment, granted.claim, execution)
+            _ = fixture.server.handle_request(report)
+            expected = {"kind": "ConfirmedGuestStart", "accepted_at": started_at}
+            hold = fixture.server.assignments[key].remote_start_hold
+            assert isinstance(hold, records.RemoteStartHold), hold
+            place_key, = fixture.server.places
+            self.assertTrue(fixture.server.places[place_key].move_id)
+            fixture.restart()
+            self.assertNotIn(key, fixture.server.execution_evidence)
+            with self.subTest(state="saved start"):
+                self.assertEqual(assignment_row(fixture.server.assignments[key]).get("confirmed_guest_start"), expected)
+            _ = fixture.run_pass()
+            self.assertLess(fixture.clock.now(), hold.deadline)
+            with self.subTest(state="local hold"):
+                self.assertEqual(fixture.server.assignments[key].remote_start_hold, records.RemoteStartHoldEnded())
+            with self.subTest(state="placement rank"):
+                self.assertEqual(fixture.server.places[place_key].move_id, "")
+            view, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(view, wire.ViewReply)
+            running, = (step for step in view.reading.view.running if step.assignment_target == "mac-linux")
+            self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+
+            fixture.clock.advance(1)
+            _ = fixture.server.handle_request(replace(report, request_id="guest-start-repeated"))
+            completed, = fixture.server.handle_request(replace(report, request_id="guest-completed",
+                evidence=execution_identity.ExecutionEvidenceUnavailable("guest exited", fixture.clock.now()),
+                outcome=placement.AttemptCompleted(0), path=placement.DispatchPathSettled()))
+            assert isinstance(completed, wire.DispatchStatus)
+            self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
+            closed = service.read_state(fixture.state_dir).assignments[key]
+            self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
+            self.assertEqual(assignment_row(closed).get("confirmed_guest_start"), expected)
 
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
         with PlacementFixture() as fixture:
