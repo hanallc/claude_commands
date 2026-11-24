@@ -184,6 +184,8 @@ __PAGE_FRAME_STYLE__
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
 .machine[data-machine="aws"] { color: var(--machine-aws); }
+/* The guest runs on the Mac, so it takes the Mac color in light and dark. */
+.machine[data-machine="mac-linux"] { color: var(--machine-mac); }
 .scale { margin-right: var(--bar-details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
@@ -236,6 +238,8 @@ td small { color: var(--ink-3); }
 .target-head .machine { font-weight: 600; }
 .target-state { padding: 0 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.82rem; font-weight: 600; color: var(--block); }
 .target-state.unavailable { color: var(--cap); }
+/* A kept claim is a leftover, not a block, so it takes the kept mark gray. */
+.target-state.kept { color: var(--ink-3); }
 .target-reason { grid-area: reason; overflow-wrap: anywhere; }
 .target-owner { grid-area: owner; }
 .target-until { grid-area: until; }
