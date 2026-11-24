@@ -39,6 +39,7 @@ from unittest.mock import ANY, Mock, call, patch
 from typing import TextIO, cast, override
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 from scripts.aws_target import aws_page, machines_page
@@ -4321,10 +4322,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             native_write(before)
 
         def project_question(before: update_registration.QuestionRecord, members: staff.StaffSnapshot,
-                             *, unowned: bool = False) -> review_items.ReviewItem:
+                             *, unowned: bool = False, zone: ZoneInfo | None = None) -> review_items.ReviewItem:
             if before.path == path:
                 reply()
-            return project(before, members, unowned=unowned)
+            return project(before, members, unowned=unowned, zone=zone)
 
         with patch.object(update_registration, 'write_question_record', write), patch.object(
                 review_items, 'question_item', project_question):

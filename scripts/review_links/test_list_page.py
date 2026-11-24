@@ -2912,6 +2912,7 @@ document.body.append(result);
         check_counts(initial, 0, 2)
         answered = list_page.render(root, include_counts=False).decode()
         check_counts(answered, 2, 0)
+        self.assertEqual(answered.partition('<script>')[0].count('<small data-new-answer>New answer</small>'), 2)
         news = list_page.waiting_updates(console.NewsRequest(root))
         self.assertEqual({key.rsplit('/', 1)[0] for key in news}, {f'{MORTY.id}/{item.id}' for item in items})
         read_responses: list[list_page.SavedActionState] = []
@@ -2944,12 +2945,14 @@ document.body.append(result);
   if(!recordIsOpen(item(number))) item(number).querySelector('.list-toggle').click();
   const detail=recordDetails(item(number));
   check(detail.querySelector('.question-unread')?.textContent==='Unread','The answer is unread.');
+  check(item(number).querySelector('[data-new-answer]')?.textContent==='New answer','The row marks the new answer.');
   submit('read',detail.querySelector('form'));
   finishPost(receipts[number-1]);
   await flush();
   check(item(number).hidden && count('needs-me')===String(2-number) && count('parked')===String(number),
    'Mark read returns the item to the Parked count.');
   check(parkNote(number)===parks[number-1],'Mark read keeps the original parking condition.');
+  check(!item(number).querySelector('[data-new-answer]'),'Mark read removes the mark from the row.');
  }
  show('parked');
  check(!item(1).hidden && !item(2).hidden,'Both items appear in Parked after Mark read.');
@@ -3473,7 +3476,9 @@ window.fetch=(url,options)=>{
         parked = the_list.load(MORTY.id, item.id)
         self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "delivered")
-        self.assertEqual(the_list.feedback_requests(parked)[fields["request"]].parked_until, parked.parked_until)
+        notice = the_list.feedback_requests(parked)[fields["request"]]
+        self.assertEqual(notice.parked_until, parked.parked_until)
+        self.assertEqual(notice.words, f"List page: nate parked item {item.number} until delivered.")
         with self.assertRaisesRegex(the_list.ListError, "different parking"):
             _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-03"}))
         delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
@@ -5142,6 +5147,12 @@ observer.observe(original.parentElement,{childList:true});
                 self.assertEqual(answered["waiting_for_answer"], "false")
                 self.assertEqual(answered["unread"], "true")
                 self.assertEqual(answered["parked"], "false" if unpark else "true")
+                if not unpark:
+                    current = the_list.load(MORTY.id, item.id)
+                    _, read = list_page.save_action(root, urlencode(self.fields(current, "read")), include_detail=True)
+                    assert read is not None
+                    self.assertEqual((read.get("unread_answer"), read["parked"]), ("false", "true"))
+                    self.assertEqual(the_list.load(MORTY.id, item.id).parked_until, until)
 
     def test_another_question_keeps_the_first_failure_visible(self) -> None:
         root = self.root / "reviews"

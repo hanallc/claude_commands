@@ -26,7 +26,7 @@ from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
@@ -44,7 +44,7 @@ from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 
-from scripts.review_links import new_item_dialog, reply_tokens, review_events
+from scripts.review_links import new_item_dialog, question_path, reply_tokens, review_events
 from scripts.usage import agents_log
 
 from scripts.lib import conf, names
@@ -74,9 +74,18 @@ class DeferredUntil:
 class AwaitingReply:
     """The user sent the asker a follow-up; the question is not due until the asker replies."""
     sent: datetime
+    later: datetime | question_path.NoLaterTime = question_path.NO_LATER
 
 
 OutstandingTiming = DueNow | DeferredUntil | AwaitingReply
+
+
+def outstanding_later(timing: OutstandingTiming) -> datetime | question_path.NoLaterTime:
+    if isinstance(timing, DeferredUntil):
+        return timing.at
+    if isinstance(timing, AwaitingReply):
+        return timing.later
+    return question_path.NO_LATER
 
 
 @dataclass(frozen=True)
@@ -252,12 +261,32 @@ def read_followups(value: object, where: str) -> tuple[Followup, ...]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}.followups[{index}]: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"followup", "reply"}, f"{where}.followups[{index}]")
+        check_keys(fields, {"followup", "reply", "question_id", "replied_at"}, f"{where}.followups[{index}]")
         followup, reply = fields.get("followup"), fields.get("reply")
         if not isinstance(followup, str) or not isinstance(reply, str) or not followup.strip() or not reply.strip():
             raise InputError(f"{where}.followups[{index}]: expected the follow-up and its reply")
+        if "question_id" in fields and (not isinstance(fields["question_id"], str) or not fields["question_id"]):
+            raise InputError(f"{where}.followups[{index}].question_id: expected an ID")
+        if "replied_at" in fields:
+            try:
+                stamp = fields["replied_at"]
+                if not isinstance(stamp, str):
+                    raise ValueError
+                _ = datetime.fromisoformat(stamp)
+            except ValueError:
+                raise InputError(f"{where}.followups[{index}].replied_at: expected a time") from None
         exchanges.append(Followup(followup, reply))
     return tuple(exchanges)
+
+
+def check_reply_log_positions(value: object, exchanges: int, where: str) -> None:
+    if not isinstance(value, dict):
+        raise InputError(f"{where}.reply_log_positions: expected an object")
+    positions = cast(dict[object, object], value)
+    exchange_numbers = {str(number) for number in range(exchanges)}
+    if not all(number in exchange_numbers and type(index) is int and index >= 0
+               for number, index in positions.items()):
+        raise InputError(f"{where}.reply_log_positions: expected exchange numbers and log positions")
 
 
 def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
@@ -272,7 +301,7 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
                             "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why",
-                            "review_submission"}, where)
+                            "review_submission", "reply_log_positions", "answered_at"}, where)
         details: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
         if "review_submission" in fields:
             try:
@@ -285,16 +314,28 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
-        if after is not None and (not isinstance(after, str) or not STARTED.match(after)):
-            raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
+        try:
+            later = question_path.read_legacy_later(after)
+        except ValueError as error:
+            raise InputError(f"{where}.after: {error}") from error
         if not isinstance(text, str) or not text.strip():
             raise InputError(f"{where}.text: expected nonempty text")
         # Read legacy titles so the replacement can name their problems.
-        timing: OutstandingTiming = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        timing: OutstandingTiming = DeferredUntil(later) if isinstance(later, datetime) else DueNow()
         pending = read_pending_followup(fields.get("followup"), where)
         if pending is not None:
-            timing = AwaitingReply(datetime.fromisoformat(pending["sent"]))
+            timing = AwaitingReply(datetime.fromisoformat(pending["sent"]), later)
         followups = read_followups(fields.get("followups", []), where)
+        if "reply_log_positions" in fields:
+            check_reply_log_positions(fields["reply_log_positions"], len(followups), where)
+        if "answered_at" in fields:
+            answered_at = fields["answered_at"]
+            try:
+                if not isinstance(answered_at, str):
+                    raise ValueError
+                _ = datetime.fromisoformat(answered_at)
+            except ValueError:
+                raise InputError(f"{where}.answered_at: expected a time") from None
         since_at = datetime.fromisoformat(since)
         question = fields.get("question")
         reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
@@ -368,6 +409,8 @@ class PendingFollowup(TypedDict):
 class FollowupExchange(TypedDict):
     followup: str
     reply: str
+    question_id: NotRequired[str]
+    replied_at: NotRequired[str]
 
 
 class OutstandingItem(TypedDict):
@@ -389,6 +432,8 @@ class OutstandingItem(TypedDict):
     asked_by: NotRequired[str]
     followup: NotRequired[PendingFollowup]
     followups: NotRequired[list[FollowupExchange]]
+    reply_log_positions: NotRequired[dict[str, int]]
+    answered_at: NotRequired[str]
 
 
 class QuestionRegistration(TypedDict):
@@ -910,11 +955,10 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
             if not isinstance(item.get("text"), str) or not cast(str, item["text"]).strip():
                 raise state_error(step, path, f"{key}.text", "nonempty text")
             after = item.get("after", "")
-            if not isinstance(after, str) or (after and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d", after) is None):
+            if not isinstance(after, str):
                 raise state_error(step, path, f"{key}.after", "YYYY-MM-DDTHH:MM")
             try:
-                if after:
-                    _ = datetime.fromisoformat(after)
+                _ = question_path.read_legacy_later(after or None)
             except ValueError:
                 raise state_error(step, path, f"{key}.after", "YYYY-MM-DDTHH:MM") from None
             if "question" in item:
@@ -1020,6 +1064,11 @@ def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff, 
 
 
 @dataclass(frozen=True)
+class ParseQuestionFromFields:
+    """Parse a Question that a writer constructed in memory."""
+
+
+@dataclass(frozen=True)
 class QuestionRecord:
     """A question issue with a fixed asker and its existing queue fields."""
 
@@ -1028,6 +1077,14 @@ class QuestionRecord:
     asker: staff.StaffId
     item: OutstandingItem
     status: str
+    read_snapshot: Outstanding | ParseQuestionFromFields = field(
+        default=ParseQuestionFromFields(), repr=False, compare=False)
+
+    def parsed_snapshot(self) -> Outstanding:
+        """Reuse the parse from the record read."""
+        if isinstance(self.read_snapshot, ParseQuestionFromFields):
+            return parse_outstanding_entries([self.item], self.path)[0]
+        return self.read_snapshot
 
 
 def question_records(production: QuestionScope, identities: QuestionStaff, *, strict: bool = False) -> list[QuestionRecord]:
@@ -1162,7 +1219,7 @@ def _question_records(issues: list[Issue], *, legacy_owner: str = "") -> list[Qu
         if not isinstance(raw, dict):
             raise RegistrationFailure("questions", f"{path}: invalid question registration")
         fields = cast(dict[str, object], raw)
-        _ = parse_outstanding_entries([fields], path)
+        parsed, = parse_outstanding_entries([fields], path)
         item = cast(OutstandingItem, cast(object, fields))
         asker = item.get("asked_by", "")
         if not asker or asker != issue.value("asked_by"):
@@ -1171,7 +1228,7 @@ def _question_records(issues: list[Issue], *, legacy_owner: str = "") -> list[Qu
         if status not in {"open", "closed"}:
             raise RegistrationFailure("questions", f"{path}: question status must be open or closed")
         owner = record_store.record_owner(record_store.RecordKind.QUESTION, issue, legacy_owner)
-        records.append(QuestionRecord(path, owner, staff.StaffId(asker), item, status))
+        records.append(QuestionRecord(path, owner, staff.StaffId(asker), item, status, parsed))
     return records
 
 
@@ -1556,12 +1613,12 @@ def questions_table(production: QuestionScope, *, identities: QuestionStaff | No
         label = identities.display(row)[1] if row is not None else f"unavailable staff {record.asker}"
         item = record.item
         state = "waiting for your answer"
-        after = item.get("after", "")
-        if after and datetime.fromisoformat(after) > now:
-            state = f"deferred until {after}"
+        parsed = record.parsed_snapshot()
+        later = outstanding_later(parsed.timing)
+        if isinstance(later, datetime) and later > now:
+            state = "deferred until " + item.get("after", "")
         if "review_unavailable" in item:
             state += "; review unavailable"
-        parsed = parse_outstanding_entries([item], record.path)[0]
         title = parsed.reference_text if isinstance(parsed, SentOutstandingQuestion) else item["text"]
         cells = (label, title, item["since"], state)
         print("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
@@ -1754,7 +1811,10 @@ def question_queue_name(owner: str, below: bool = False) -> str:
 
 def question_entry(owner: str, item: OutstandingItem, path: Path) -> urgency.Entry[OutstandingItem]:
     """The queue entry of one stored question, keyed as `open_lists` keys it."""
-    parsed = parse_outstanding_entries([item], path)[0]
+    return ranked_question_entry(owner, item, parse_outstanding_entries([item], path)[0])
+
+
+def ranked_question_entry(owner: str, item: OutstandingItem, parsed: Outstanding) -> urgency.Entry[OutstandingItem]:
     key = parsed.key if isinstance(parsed, SentOutstandingQuestion) else item_key(owner, item["text"])
     return urgency.Entry(key, item, parsed.rank.urgency, parsed.since,
                          after=item_key(owner, parsed.rank.follows) if parsed.rank.follows else "")
@@ -2286,6 +2346,17 @@ def answer_followup(entry: OutstandingItem, text: str) -> None:
     entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
 
 
+def record_followup_reply(entry: OutstandingItem, words: str, who: str) -> None:
+    """Save the reply and its log position together."""
+    events = review_events.decode(entry.get("review_log", ""))
+    exchange = len(entry.get("followups", []))
+    answer_followup(entry, words)
+    entry.setdefault("reply_log_positions", {})[str(exchange)] = len(events)
+    event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, "Answer: " + words)
+    entry["answered_at"] = event.time.isoformat()
+    entry["review_log"] = review_events.encode((*events, event))
+
+
 def review_sent_question(record: QuestionRecord, scope: QuestionScope,
                          action: Literal["answer", "feedback", "question", "read", "mark-important"], words: str,
                          new_reply_proof: reply_tokens.ReplyTokenProof | reply_tokens.MintReplyProof
@@ -2335,10 +2406,7 @@ def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, wo
             raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
         if repeated:
             return False
-        answer_followup(current.item, words)
-        events = review_events.decode(current.item.get("review_log", ""))
-        event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), current.owner, "Answer: " + words)
-        current.item["review_log"] = review_events.encode(review_events.append(events, event))
+        record_followup_reply(current.item, words, current.owner)
         write_question_record(current)
         return True
 
@@ -2358,10 +2426,7 @@ def reply_record(record: QuestionRecord, text: str, who: str, *, identities: Que
             _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
         if "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
-        answer_followup(current.item, text)
-        events = review_events.decode(current.item.get("review_log", ""))
-        event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, 'Answer: '+text)
-        current.item["review_log"] = review_events.encode(review_events.append(events, event))
+        record_followup_reply(current.item, text, who)
         _ = _publish_question(current)
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
 
@@ -2490,6 +2555,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["followup"] = stored["followup"]
     if "followups" in stored:
         entry["followups"] = stored["followups"]
+    if "reply_log_positions" in stored:
+        entry["reply_log_positions"] = stored["reply_log_positions"]
     if "waiting_why" in stored:
         entry["waiting_why"] = stored["waiting_why"]
     if "review_id" in stored:
