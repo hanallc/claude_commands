@@ -137,9 +137,10 @@ class GateDefaultPlacementTests(unittest.TestCase):
             command = ["./scripts/lib/py", "scripts/production/gate.py", "--tests-only"]
 
             def launch(arguments: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...],
-                       env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                       env: dict[str, str], text: bool) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(arguments, command)
                 self.assertEqual(cwd, tree)
+                self.assertTrue(text)
                 reader, = pass_fds
                 self.assertEqual(env[copies.PREPARED_GATE_FD], str(reader))
                 # The parent keeps its descriptor during the child run.
@@ -152,7 +153,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
 
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
                   mock.patch.object(copies, "caller_owner", return_value="fixture"),
-                  mock.patch.object(copies, "command_tree", return_value=nullcontext(tree)),
+                  mock.patch("scripts.copies.copies._command_copy",
+                             return_value=nullcontext(copies.DirectCommandCopy(tree))),
                   mock.patch.object(subprocess, "run", side_effect=launch),
                   mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
                   mock.patch.object(first_step, 'admitted_run') as admit,
@@ -171,9 +173,10 @@ class GateDefaultPlacementTests(unittest.TestCase):
             command = ["sh", "-c", "gate.py --tests-only"]
 
             def launch(arguments: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...],
-                       env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                       env: dict[str, str], text: bool) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(arguments, command)
                 self.assertEqual(cwd, tree)
+                self.assertTrue(text)
                 self.assertEqual(pass_fds, ())
                 with mock.patch.dict(os.environ, env, clear=True):
                     status = gate.main(["--tests-only", "--repo", directory])
@@ -181,7 +184,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
 
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
                   mock.patch.object(copies, "caller_owner", return_value="fixture"),
-                  mock.patch.object(copies, "command_tree", return_value=nullcontext(tree)),
+                  mock.patch("scripts.copies.copies._command_copy",
+                             return_value=nullcontext(copies.DirectCommandCopy(tree))),
                   mock.patch.object(subprocess, "run", side_effect=launch),
                   mock.patch.object(gate, "run_tests_only", return_value=0) as run,
                   mock.patch.object(first_step, "admitted_run") as admit,
@@ -269,6 +273,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 assignment = placed(target)
                 with (self.subTest(target=target, tools=tools),
                       mock.patch.object(cloud_gate, 'working_tree', return_value=('tree', set())),
+                      mock.patch.object(gate, 'checked_git', return_value='fixture-commit'),
                       mock.patch.object(conf, 'read', return_value=mock.Mock(value=mock.Mock(return_value=True))),
                       mock.patch.object(gate, 'guest_has_type_tools', return_value=tools),
                       mock.patch.object(mac_linux, 'route', return_value=result) as guest,

@@ -22,7 +22,8 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import atomic_file, conf, urgency
+from scripts.lib import atomic_file, conf, conf_reads, urgency
+from scripts.lib import user_zone as user_zone_config
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -41,11 +42,10 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
-from scripts.review_links import question_record
+from scripts.review_links import question_path, question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
@@ -72,6 +72,8 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
             entry['type'] = review_items.ReviewType.RESPONSE
         if len(row) > 14 and isinstance(action_status := row[14], str):
             entry['actionStatus'] = action_status
+        if len(row) > 15 and row[15] is True:
+            entry['unreadAnswer'] = True
         entries.append(entry)
     return entries
 
@@ -1204,15 +1206,26 @@ window.fetch=(url,options)=>{
 
     def test_snapshot_retains_the_time_zone_and_versions_zone_edits(self) -> None:
         proposal, _ = self.decisions()
+        report = self.investigation()
+        key = f'investigation/{report.owner}/{report.id}'
+        proposal_path = Path(proposal.removeprefix('proposal/'))
+        proposed_at = datetime(2026, 11, 1, tzinfo=ZoneInfo('UTC'))
+        event, = review_events.rows((review_events.ReviewLog(proposed_at, 'nate', 'Proposal log event'),))
+        _ = proposal_path.write_text(proposal_path.read_text().replace(
+            'date_created: 2026-11-01', 'date_created: 2026-11-01\nreview_log:\n  - ' + json.dumps(event)))
         with patch.object(review_page, 'user_zone', return_value=ZoneInfo('UTC')):
             original = review_page.build_snapshot(self.root)
         filed = original.records[proposal].times.filed
+        report_filed = original.records[key].times.filed
         with patch.object(review_page, 'user_zone', side_effect=ValueError('Invalid live zone')):
             self.assertIn(filed.astimezone(ZoneInfo('UTC')).strftime('%b %d %H:%M').encode(), original.body(proposal))
+            self.assertIn(report_filed.astimezone(ZoneInfo('UTC')).strftime('%b %d %H:%M').encode(), original.body(key))
         with patch.object(review_page, 'user_zone', return_value=ZoneInfo('Asia/Tokyo')):
             updated = review_page.build_snapshot(self.root)
         self.assertNotEqual(updated.version, original.version)
         self.assertIn(filed.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%b %d %H:%M').encode(), updated.body(proposal))
+        self.assertIn(report_filed.astimezone(ZoneInfo('Asia/Tokyo')).strftime('%b %d %H:%M').encode(), updated.body(key))
+        self.assertEqual(updated.records[proposal].times.filed.replace(tzinfo=None), filed.replace(tzinfo=None))
 
     def test_snapshot_keeps_good_cards_and_opens_bad_cards_with_an_error(self) -> None:
         proposal, _ = self.decisions()
@@ -1503,6 +1516,32 @@ window.fetch=(url,options)=>{
         index = page.split('<script type="application/json" data-review-index>', 1)[1].split('</script>', 1)[0]
         self.assertEqual(next(entry['id'] for entry in unpack_index(index) if entry['key']==key), 'page-owner/Q1')
         self.assertIn('"review_id": "Q1"', path.read_text())
+
+        after = '2030-02-11T08:00'
+        for zone, utc_hour in (('America/New_York', 13), ('Europe/Paris', 7)):
+            with self.subTest(after=after, zone=zone), patch.dict(os.environ, {'USER_ZONE': zone}):
+                record.item['after'] = after
+                update_registration.write_question_record(record)
+                with patch.object(question_path, 'read_later', wraps=question_path.read_later) as decode:
+                    item = review_page.build_snapshot(self.root).records[key]
+                self.assertEqual(item.times.later, datetime(2030, 2, 11, utc_hour, tzinfo=ZoneInfo('UTC')))
+                self.assertEqual([call.args[0] for call in decode.call_args_list], [after])
+
+        with patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
+            utc = ZoneInfo('UTC')
+            now = datetime.now(utc)
+            local_after = (now - timedelta(hours=2)).replace(tzinfo=None, second=0, microsecond=0)
+            record.item['after'] = local_after.strftime('%Y-%m-%dT%H:%M')
+            update_registration.write_question_record(record)
+            snapshot = review_page.build_snapshot(self.root)
+            item = snapshot.records[key]
+            owner = next(member for member in snapshot.members.rows if member.id == record.owner)
+            identities = update_registration.QuestionStaff.for_record(snapshot.members)
+            self.assertIs(item.queue_at(now), question_path.Queue.LATER)
+            self.assertEqual(counts_row.question_counts(owner, utc, identities, None),
+                             (0, str(int(local_after.replace(tzinfo=ZoneInfo('America/New_York')).timestamp()))))
+            _, entries = review_items.next_queue('question', self.fixture.production, False, snapshot.members)
+            self.assertNotIn(item.queue_key, {entry.key for entry in entries})
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_ask_keeps_later_edits_and_ignores_a_response_after_reopen(self) -> None:
@@ -3173,11 +3212,15 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         key = 'page-owner/C1'
         until = datetime.now(user_zone()) + timedelta(days=1)
         review_later.save(key, until)
+        other = 'page-owner/C2'
+        legacy_time = until.replace(tzinfo=None)
+        review_later.save(other, legacy_time)
         with patch.object(time, 'time', return_value=1794902400):
             delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
         change_page.deliver(delivery, self.status)
         with self.subTest(later='cleared by hand-off'):
             self.assertNotIn(key, review_later.times())
+            self.assertEqual(review_later.stored_times(review_later.path())[other], legacy_time.isoformat())
         review_later.save(key, until)
         snapshot = review_page.build_snapshot(self.root)
         entry = next(item for item in snapshot.entries if item['key'] == key)
@@ -3283,6 +3326,20 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
                 self.assertEqual([event.words for event in snapshot.records[key].log][-3:],
                                  ['Asked page-owner to validate', 'Asked a question about validation',
                                   'Answered the question'])
+        with self.subTest(state='unread validation answer'):
+            members = staff.snapshot()
+            now = datetime.now(user_zone())
+            self.assertTrue(answered.records[key].for_you(now))
+            self.assertIn(key, {item.key for item in review_items.read_open(self.root)})
+            document = self.fixture.production
+            entries = next_item.read_queue('change', document, record=members).entries
+            self.assertEqual({entry.key for entry in entries}, {'C1'})
+            self.assertEqual(footer_counts.change_counts(document, members), (1, 0))
+            marked = cache.save(self.card_body(answered, key, 'read'), self.status)
+            self.assertEqual(marked.answer, 'marked read')
+            self.assertNotIn(key, {item.key for item in review_items.read_open(self.root)})
+            self.assertEqual(next_item.read_queue('change', document, record=members).entries, [])
+            self.assertEqual(footer_counts.change_counts(document, members), (0, 0))
         result = change_review.save_verdict(check.page.review_list, check.row, 'works', self.fixture.production,
                                             validation_id=check.attempt)
         self.assertIsInstance(result, change_review.VerdictSaved)
@@ -3350,16 +3407,38 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
         assert isinstance(request, change_page.OpenFeedback)
         change_page.deliver(delivery, self.status)
         now = datetime.now(user_zone())
-        review_later.save(key, now + timedelta(days=1))
+        until = now + timedelta(days=1)
+        review_later.save(key, until)
         self.assertTrue(change_page.answer_item(key, 'The spacing is adjusted.', request.question_id, self.status))
         returned = next(item for item in review_items.read(self.root) if item.key == key)
         self.assertEqual(returned.state, review_items.ReviewState.OPEN)
         with self.subTest(finding='F007'):
             self.assertTrue(returned.for_you(now), 'The returned feedback is visible in Open.')
-            self.assertNotIn(key, review_later.times())
+            # Mark read returns the item to Later.
+            self.assertEqual(review_later.times()[key], until)
         with self.subTest(finding='F008'):
             self.assertEqual([entry.words.rstrip() for entry in returned.log[1:]],
                              ['feedback: Adjust the spacing.', 'Answer: The spacing is adjusted.'])
+        with self.subTest(state='read after Later'):
+            snapshot = review_page.build_snapshot(self.root)
+            entries = unpack_index(review_page.index_json(snapshot.entries))
+            self.assertTrue(next(entry for entry in entries if entry['key'] == key).get('unreadAnswer'))
+            if shutil.which('firefox'):
+                proof = """<script>
+const row=document.querySelector('[data-list-item][data-key="'+KEY+'"]');
+const marked=row && !row.hidden && row.querySelector('[data-new-answer]')?.textContent==='New answer';
+void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Open Change needs a New answer mark.'])});
+</script>""".replace('KEY', json.dumps(key))
+                markup = snapshot.render().replace(b'</body>', proof.encode() + b'</body>')
+                self.assertEqual(firefox_probe_results(markup), [[]])
+            body = self.card_body(snapshot, key, 'read')
+            _, result = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+            self.assertEqual(result, 'marked read')
+            read = review_page.build_snapshot(self.root).records[key]
+            self.assertFalse(read.unread_answer)
+            self.assertTrue(read.hidden_until(now))
+            self.assertFalse(read.for_you(now))
+            self.assertEqual(review_later.times()[key], until)
 
     def test_legacy_feedback_gets_a_review_log_on_return(self) -> None:
         key = 'page-owner/C1'
@@ -4374,13 +4453,18 @@ window.fetch=async(url,options)=>{
                     records.append(replace(examples[kind], key=key, id=key, owner=owner, source_unit=owner,
                                            state=state, actions=()))
 
+        validating = next(item for item in records if item.state == state_type.VALIDATING)
+        answered_key = 'change/validation-answer'
+        records.append(replace(validating, key=answered_key, id=answered_key, answer_time=datetime.now(user_zone())))
+
         show_states = {'open': (state_type.OPEN,), 'Validating': (state_type.VALIDATING,),
                        'all': review_items.selected_states('active')}
         expected: dict[str, dict[str, dict[str, int]]] = {}
         for show, selected_states in show_states.items():
             expected[show] = {}
             for kind in ('', *review_items.REVIEW_TYPES):
-                counts = {str(owner): sum(item.owner == owner and item.state in selected_states and
+                counts = {str(owner): sum(item.owner == owner and
+                                          (item.state in selected_states or show == 'open' and item.key == answered_key) and
                                           (not kind or item.type == kind) for item in records)
                           for owner in owners}
                 expected[show][kind] = {'': sum(counts.values()), **counts}
@@ -4635,9 +4719,10 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
 
         def all_states(kind: review_items.ReviewType, scope: Path | staff.StaffRow,
                        record: staff.StaffSnapshot, *, below: bool = False, sources: list[Path] | None = None,
-                       own: list[Issue] | None = None, show: str = 'all') -> list[review_items.ReviewItem]:
+                       own: list[Issue] | None = None, show: str = 'all',
+                       zone: ZoneInfo | None = None) -> list[review_items.ReviewItem]:
             _ = show
-            return original(kind, scope, record, below=below, sources=sources, own=own)
+            return original(kind, scope, record, below=below, sources=sources, own=own, zone=zone)
 
         def results() -> tuple[footer_counts.FooterCounts, tuple[int, str], list[next_item.Queue], str]:
             counts = footer_counts.read_counts(self.fixture.production, record=members)
@@ -4654,6 +4739,21 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                                   if item.for_you(now))
         self.assertEqual(review_page.waiting_items(console.NewsRequest(self.root)), expected_news,
                          'Console news and the nav new mark keep the same records and revisions.')
+
+        listing = self.fixture.review_list
+        saved = listing.read_text()
+        _ = listing.write_text(re.sub(r'\| C1 \|[^\n]*', lambda row: row[0].replace('works', '', 1), saved))
+        unrelated = change_routing.delivery_path(self.root, listing, 'C97')
+        for has_delivery in (False, True):
+            with self.subTest(reviewed_without_verdict=True, has_delivery=has_delivery):
+                if has_delivery:
+                    _ = unrelated.write_text('{}')
+                visible = {item.queue_key for item in review_items.read_open(self.root)
+                           if item.type == review_items.ReviewType.CHANGE}
+                self.assertIn('C1', visible)
+                self.assertEqual({entry.key for entry in next_item.read_queue('change', self.fixture.production).entries},
+                                 visible)
+                self.assertEqual(footer_counts.change_counts(self.fixture.production, members), (len(visible), 0))
 
     def test_review_reads_each_store_that_the_page_shows_once(self) -> None:
         with patch.object(review_items, 'proposal_items', return_value=[]) as proposals, patch.object(
@@ -4757,8 +4857,9 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 assert isinstance(request,change_page.OpenQuestion)
                 args += ['--question',request.question_id]
                 now = datetime.now(user_zone())
+                until = now + timedelta(days=1)
                 if item.type == review_items.ReviewType.CHANGE:
-                    review_later.save(key, now + timedelta(days=1))
+                    review_later.save(key, until)
                 self.assertEqual(change_page.main(args),0)
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state, review_items.ReviewState.OPEN)
@@ -4766,7 +4867,17 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(sum('Check the second case.' in entry.words for entry in returned.log),1)
                 if item.type == review_items.ReviewType.CHANGE:
                     self.assertTrue(returned.for_you(now), 'The answered change is visible in Open.')
-                    self.assertNotIn(key, review_later.times())
+                    # Mark read returns the item to Later.
+                    self.assertEqual(review_later.times()[key], until)
+                if key in decisions:
+                    snapshot = review_page.build_snapshot(self.root)
+                    self.assertTrue(snapshot.records[key].unread_answer)
+                    request = self.card_body(snapshot, key, 'read')
+                    _, result = review_page.submit(self.root, request, self.status, snapshot=snapshot)
+                    self.assertEqual(result, 'marked read')
+                    read = review_page.build_snapshot(self.root).records[key]
+                    self.assertFalse(read.unread_answer)
+                    self.assertTrue(read.for_you(now))
 
         with self.subTest(finding='F022'):
             members = staff.snapshot()
@@ -5168,17 +5279,35 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 raise OSError('fixture send result failed')
             write(target, content, mode=mode)
 
-        cases = (('C1', 'closeout'), ('C2', 'slots'), ('C3', 'receipt and slots'))
+        _ = change_review.append_rows(self.fixture.review_list, pictured_changes([
+            change_review.Visible('Retry the Question log', 'Ask the validator.', 'The question arrives.'),
+        ]), datetime.now(user_zone()).date(), '', self.fixture.production, record=staff.snapshot())
+        cases = (('C1', 'closeout'), ('C2', 'slots'), ('C3', 'receipt and slots'), ('C4', 'question log'))
         write_text = atomic_file.write_text_atomic
         for row, failed_write in cases:
             with self.subTest(write=failed_write):
                 self.fixture.messages.clear()
                 key = 'page-owner/'+row
                 check, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
+                assert isinstance(check, change_page.MessageDelivery)
                 change_page.deliver(check, self.status)
                 self.fixture.messages.clear()
                 snapshot = review_page.build_snapshot(self.root)
                 body = self.card_body(snapshot, key, 'question', words)
+                if failed_write == 'question log':
+                    with (patch.object(change_review, 'record_review_log', side_effect=OSError('fixture log write failed')),
+                          self.assertRaisesRegex(OSError, 'fixture log write failed')):
+                        _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+                    pending = self.status.slots(check.page, row).question
+                    assert isinstance(pending, change_page.OpenQuestion)
+                    self.assertIsInstance(pending.delivery, change_page.DeliveryIntent)
+                    change_page.recover_pending(self.status)
+                    change_page.recover_pending(self.status)
+                    self.assertEqual(len(self.fixture.messages), 1)
+                    self.assertIn(words, self.fixture.messages[0][2])
+                    self.assertEqual(self.status.slots(check.page, row).question,
+                                     replace(pending, delivery=change_page.NoDelivery()))
+                    continue
                 delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
                 assert isinstance(delivery, change_page.MessageDelivery)
                 path = (self.status.closeout_path(delivery.page, row) if failed_write == 'closeout'
@@ -5205,6 +5334,363 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 recovered = self.status.slots(delivery.page, row).question
                 self.assertEqual(recovered, replace(pending, delivery=change_page.NoDelivery()))
 
+    def test_review_projects_legacy_and_positioned_answers(self) -> None:
+        now = datetime.now(user_zone())
+        before = now - timedelta(hours=2)
+        read_at = now - timedelta(hours=1)
+        after = now - timedelta(minutes=30)
+        until = now + timedelta(days=1)
+        expected: list[tuple[str, tuple[str, ...], question_path.Queue, bool]] = []
+        question = 'Does the layout fit?'
+        repeated = 'The layout fits.'
+        old_reply = 'The earlier result passed.'
+        new_reply = 'The current result passed.'
+        for case, positions, log_id, stamps, later, answers, queue, unread in (
+            ('first reply unlogged', {}, 'second', (before, after), True, (old_reply, new_reply),
+             question_path.Queue.NEEDS_ME, True),
+            ('saved position wins', {'1': 1}, 'first', (before, after), True, (repeated, repeated),
+             question_path.Queue.NEEDS_ME, True),
+            ('read after reply', {}, 'second', (before, before), True, (old_reply, new_reply),
+             question_path.Queue.LATER, False),
+            ('read at the reply time', {}, '', (before, read_at), False, (old_reply, new_reply),
+             question_path.Queue.NEEDS_ME, False),
+            ('unnamed log copy', {}, '', (before, after), False, (repeated, repeated),
+             question_path.Queue.NEEDS_ME, True),
+        ):
+            key = self.question(case)
+            path = self.question_path(key)
+            record, = update_registration.selected_question_records([path], (), None)
+            record.item['followups'] = [
+                update_registration.FollowupExchange(followup=question, reply=words,
+                                                     question_id=identifier, replied_at=stamp.isoformat())
+                for identifier, words, stamp in zip(('first', 'second'), answers, stamps, strict=True)
+            ]
+            if positions:
+                record.item['reply_log_positions'] = positions
+            read_words = 'Later until ' + until.isoformat() if later else 'Marked read'
+            record.item['review_log'] = review_events.encode((
+                review_events.ReviewLog(read_at, 'nate', read_words),
+                review_events.ReviewLog(stamps[-1], record.asker, 'Answer: ' + answers[-1], log_id),
+            ))
+            update_registration.write_question_record(record)
+            if later:
+                review_later.save(key, until)
+            shown = (*answers, answers[-1]) if not positions and not log_id else answers
+            expected.append((key, shown, queue, unread))
+
+        def legacy_question(title: str, replies: tuple[str, ...], events: tuple[review_events.ReviewLog, ...],
+                            positions: dict[str, int]) -> str:
+            key = self.question(title)
+            record, = update_registration.selected_question_records([self.question_path(key)], (), None)
+            record.item['followups'] = [
+                update_registration.FollowupExchange(followup=question, reply=reply) for reply in replies]
+            if positions:
+                record.item['reply_log_positions'] = positions
+            record.item['review_log'] = review_events.encode(events)
+            update_registration.write_question_record(record)
+            review_later.save(key, until)
+            return key
+
+        parked = review_events.ReviewLog(read_at, 'nate', 'Later until ' + until.isoformat())
+        owner_answer = review_events.ReviewLog(after, 'page-owner', 'Answer: ' + new_reply)
+        old_answer = review_events.ReviewLog(before, 'page-owner', 'Answer: ' + old_reply)
+        for title, replies, events, positions, shown, queue, unread in (
+            ('undated native reply', (new_reply,), (parked,), {}, (new_reply,), question_path.Queue.LATER, False),
+            ('unnamed answer after Later', (new_reply,), (parked, owner_answer), {}, (new_reply, new_reply),
+             question_path.Queue.NEEDS_ME, True),
+            ('log-only Question', (), (parked, old_answer, owner_answer), {}, (new_reply, old_reply),
+             question_path.Queue.NEEDS_ME, True),
+            ('old reply with a positioned answer', (old_reply, new_reply,), (old_answer, owner_answer, parked),
+             {'1': 1}, (old_reply, new_reply, old_reply), question_path.Queue.NEEDS_ME, True),
+        ):
+            key = legacy_question(title, replies, events, positions)
+            expected.append((key, shown, queue, unread))
+
+        orphan = legacy_question('unowned Question', (), (parked, owner_answer), {})
+        members = staff.snapshot()
+        orphan_owner = next(member for member in members.rows if member.name == 'page-owner')
+        without_owner = replace(members, rows=tuple(member for member in members.rows if member.id != orphan_owner.id))
+        expected.append((orphan, (new_reply,), question_path.Queue.NEEDS_ME, True))
+
+        extra_changes = [
+            change_review.Visible(title, 'Read the log.', 'The result is present.')
+            for title in ('Delayed answer log', 'Named answer without a saved time', 'Repeated Change feedback',
+                          'Answer before the new handoff', 'Answer before the current question',
+                          'Answer while a new question is open', 'Log written after a new handoff')]
+        _ = change_review.append_rows(self.fixture.review_list, pictured_changes(extra_changes), now.date(), '',
+                                      self.fixture.production, record=staff.snapshot())
+        page = self.fixture.page
+
+        class EventClock(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(event.time.timestamp(), tz)
+
+        for row, validating, answer_type, saved_time, named, read in (
+            ('C1', False, change_page.AnsweredQuestion, after, False, False),
+            ('C2', True, change_page.AnsweredQuestion, after, False, False),
+            ('C3', False, change_page.AnsweredQuestion, before, False, True),
+            ('C4', False, change_page.AnsweredQuestion, before, True, True),
+            ('C5', False, change_page.AnsweredQuestion, None, True, False),
+            ('C6', False, change_page.CompletedFeedback, after, False, False),
+        ):
+            key = 'page-owner/' + row
+            if validating:
+                event = review_events.ReviewLog(read_at, 'nate', 'validate')
+                with patch.object(change_review, 'datetime', EventClock):
+                    delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
+                change_page.deliver(delivery, self.status)
+            previous = new_reply if row == 'C6' else old_reply
+            events = [review_events.ReviewLog(before, 'page-owner', 'Answer: ' + previous, 'older')]
+            if read:
+                events.append(replace(parked, words='Marked read: current') if row == 'C4' else parked)
+                review_later.save(key, until)
+            elif row in ('C1', 'C6'):
+                review_later.save(key, until)
+            if named:
+                events.append(replace(owner_answer, feedback_request_id=question_path.answer_log_id('current')))
+            for event in events:
+                with patch.object(change_review, 'datetime', EventClock):
+                    change_review.record_review_log(page.review_list, row, event.words, page.production,
+                                                    feedback_request_id=event.feedback_request_id)
+            with self.status.locked():
+                slots = self.status.slots(page, row)
+                self.status.write_slots(page, row, replace(slots,
+                    question=answer_type('current', question, new_reply)))
+            if saved_time is not None:
+                path = self.status.path(page, row)
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                fields['answered_at'] = saved_time.isoformat()
+                if validating:
+                    fields['handed_at'] = read_at.isoformat()
+                _ = path.write_text(json.dumps(fields))
+            shown = (previous, new_reply) if validating else (new_reply, previous)
+            expected.append((key, shown, question_path.Queue.LATER if read else question_path.Queue.NEEDS_ME, not read))
+
+        for row, reply_time, current_request, expected_answers in (
+            ('C7', before, change_page.NoQuestion(), (old_reply,)),
+            ('C8', read_at + timedelta(minutes=15), change_page.AnsweredQuestion('current', question, new_reply),
+             (old_reply, new_reply)),
+            ('C9', read_at + timedelta(minutes=15), change_page.OpenQuestion('current', question, change_page.NoDelivery()),
+             (old_reply,)),
+        ):
+            key = 'page-owner/' + row
+            event = review_events.ReviewLog(read_at, 'nate', 'validate')
+            with patch.object(change_review, 'datetime', EventClock):
+                delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
+            change_page.deliver(delivery, self.status)
+            events = [replace(old_answer, time=reply_time, feedback_request_id='older')]
+            if row != 'C7':
+                events.append(review_events.ReviewLog(after, 'nate', 'question: ' + question, 'current'))
+            for event in events:
+                with patch.object(change_review, 'datetime', EventClock):
+                    change_review.record_review_log(page.review_list, row, event.words, page.production,
+                                                    feedback_request_id=event.feedback_request_id)
+            with self.status.locked():
+                slots = self.status.slots(page, row)
+                self.status.write_slots(page, row, replace(slots, question=current_request))
+            path = self.status.path(page, row)
+            fields = cast(dict[str, object], json.loads(path.read_text()))
+            fields['handed_at'] = read_at.isoformat()
+            _ = path.write_text(json.dumps(fields))
+            expected.append((key, expected_answers, question_path.Queue.VALIDATING, False))
+
+        key = 'page-owner/C10'
+        _ = self.status.ask(page, 'C10', question)
+        request = self.status.slots(page, 'C10').question
+        assert isinstance(request, change_page.OpenQuestion)
+        save_log = change_review.record_review_log
+
+        def write_delayed_log(path: Path, row: str, words: str, production: Path, who: str = 'nate', *,
+                              feedback_request_id: str = '', **saved_time: datetime) -> None:
+            nonlocal event
+            if row == 'C10' and words == 'Answer: ' + new_reply:
+                event = review_events.ReviewLog(read_at, 'nate', 'validate')
+                with (patch.object(change_review, 'datetime', EventClock),
+                      patch.object(time, 'time', return_value=read_at.timestamp())):
+                    delivery, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
+                    change_page.deliver(delivery, self.status)
+                event = replace(owner_answer, time=after)
+            with patch.object(change_review, 'datetime', EventClock):
+                save_log(path, row, words, production, who, feedback_request_id=feedback_request_id, **saved_time)
+
+        event = replace(owner_answer, time=before)
+        with (patch.object(change_page, 'datetime', EventClock),
+              patch.object(change_review, 'record_review_log', new=write_delayed_log)):
+            self.assertTrue(change_page.answer_item(key, new_reply, request.question_id, self.status))
+        expected.append((key, (new_reply,), question_path.Queue.VALIDATING, False))
+
+        for kind, legacy in ((investigation.InvestigationKind.INVESTIGATION, False),
+                             (investigation.InvestigationKind.INVESTIGATION, True),
+                             (investigation.InvestigationKind.BUG, False)):
+            report = investigation.file(self.fixture.unit.id, 'Why did the gate stop?', 'Read the gate log.',
+                                        waiting_why='The owner has the log.', kind=kind)
+            key = f'investigation/{report.owner}/{report.id}'
+            review_later.save(key, until)
+            path = investigation.folder(report.owner) / (report.id + '.md')
+            previous_log = next(line for line in path.read_text().splitlines(keepends=True)
+                                if line.startswith('review_log: '))
+            _ = investigation.answer(report.owner, report.id, new_reply)
+            if legacy:
+                _ = path.write_text(''.join(previous_log if line.startswith('review_log: ') else line
+                                            for line in path.read_text().splitlines(keepends=True)))
+            # Main shows both the native answer and the unnamed log answer.
+            expected.append((key, (new_reply,) if legacy else (new_reply, new_reply), question_path.Queue.NEEDS_ME, True))
+
+        proposal, efficiency = self.decisions()
+        proposal_path = Path(proposal.removeprefix('proposal/'))
+        _ = proposal_issue.record_review(proposal_path, 'Answer: ' + new_reply, review_events.KeepMark(), now.date())
+        review_later.save(proposal, until)
+        expected.append((proposal, (new_reply,), question_path.Queue.NEEDS_ME, True))
+
+        document = self.fixture.production
+        _ = document.write_text(document.read_text().replace(
+            '# Demo\n', '# Demo\n\n> **Status: PRODUCTION — running.**\n', 1))
+        legacy_response = self.file_response(orphan_owner.id)
+        cached_response = self.file_response(orphan_owner.id)
+        for key, response_case in ((cached_response, 'positioned'),
+                                   (self.file_response(orphan_owner.id), 'named exchange'),
+                                   (legacy_response, 'legacy with a named log')):
+            if response_case != 'positioned':
+                record, = update_registration.selected_question_records([self.question_path(key)], (), None)
+                del record.item['reply_log_positions']
+                del record.item['answered_at']
+                assert 'review_log' in record.item and 'followups' in record.item
+                events = review_events.decode(record.item['review_log'])
+                record.item['review_log'] = review_events.encode(
+                    (*events[:-1], replace(events[-1], feedback_request_id=question_path.answer_log_id('current'))))
+                if response_case == 'named exchange':
+                    record.item['followups'][-1]['question_id'] = 'current'
+                update_registration.write_question_record(record)
+            if key in (legacy_response, cached_response):
+                review_later.save(key, until)
+            expected.append((key, ('Use the wide layout.',), question_path.Queue.NEEDS_ME, True))
+
+        ledger = Path(efficiency.removeprefix('efficiency/').rsplit('/', 1)[0])
+        _ = ledger.write_text(''.join(f'- 2026-11-01 tests: Check {number} — proposed\n' for number in range(6)))
+        stored: dict[str, object] = {}
+        for index in range(6):
+            key = f'efficiency/{ledger}/{index}'
+            later = index % 2 == 1
+            events = (
+                review_events.ReviewLog(before.replace(tzinfo=None), 'owner', 'Answer: ' + new_reply),
+                *((review_events.ReviewLog(read_at.replace(tzinfo=None), 'nate', 'Marked read'),) if later else ()),
+            )
+            stored[f'E{index+1}'] = {'log': review_events.rows(events)}
+            if later:
+                review_later.save(key, until)
+            expected.append((key, (new_reply,), question_path.Queue.LATER if later else question_path.Queue.NEEDS_ME,
+                             not later))
+        _ = efficiency_reviews.path(ledger).write_text(json.dumps(stored))
+
+        snapshot = review_page.build_snapshot(self.root)
+        late_event, = [entry for entry in snapshot.records['page-owner/C10'].log
+                       if entry.feedback_request_id == question_path.answer_log_id(request.question_id)]
+        self.assertEqual(late_event.time, before)
+        with patch.object(staff, 'snapshot', return_value=without_owner):
+            orphan_snapshot = review_page.build_snapshot(self.root)
+        self.assertIsInstance(orphan_snapshot.records[orphan].source, review_items.UnownedQuestionSource)
+        answers = re.compile('|'.join(re.escape(word) for word in (old_reply, new_reply, repeated, 'Use the wide layout.')))
+        entries = {entry['key']: entry for entry in unpack_index(review_page.index_json(snapshot.entries))}
+        entries[orphan] = next(entry for entry in unpack_index(review_page.index_json(orphan_snapshot.entries))
+                               if entry['key'] == orphan)
+        for key, words, queue, unread in expected:
+            page_snapshot = orphan_snapshot if key == orphan else snapshot
+            item = page_snapshot.records[key]
+            with self.subTest(record=item.title, key=key):
+                self.assertEqual(tuple(answers.findall(page_snapshot.body(key).decode())), words)
+                self.assertIs(item.queue_at(now), queue)
+                self.assertEqual(bool(entries[key].get('unreadAnswer')), unread)
+
+        for key, submission_snapshot in ((orphan, orphan_snapshot), (legacy_response, None), (cached_response, None)):
+            record_type = 'Question' if key == orphan else 'Response'
+            with self.subTest(record=f'Mark read on an unowned {record_type}', key=key), patch.object(
+                    staff, 'snapshot', return_value=without_owner):
+                card = orphan_snapshot.body(key).decode()
+                self.assertIn('value="read">Mark read</button>', card)
+                if record_type == 'Response':
+                    form = card.split('<form method="post" data-review-form>', 1)[1].split('</form>', 1)[0]
+                    parser = test_change_page.SavedAnswerForm()
+                    parser.feed(form)
+                    body = urlencode(parser.fields)
+                else:
+                    body = self.card_body(orphan_snapshot, key, 'read')
+                if key == cached_response:
+                    cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+                    self.addCleanup(cache.close)
+                    saved = cache.save(body, self.status)
+                    delivery, answer = saved.delivery, saved.answer
+                else:
+                    delivery, answer = review_page.submit(self.root, body, self.status, snapshot=submission_snapshot)
+                if record_type == 'Response':
+                    self.assertIn('<input type="hidden" name="feedback" value="">', card)
+                self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+                self.assertEqual(answer, 'marked read')
+                updated = review_page.build_snapshot(self.root).records[key]
+                self.assertIs(updated.queue_at(now), question_path.Queue.LATER)
+                self.assertFalse(updated.unread_answer)
+
+        with self.subTest(count='six legacy Efficiency rows'):
+            zone_path = self.fixture.temporary / 'user_zone.conf'
+            _ = zone_path.write_text('zone=America/New_York\n')
+            with (patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)),
+                  patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads):
+                _ = os.environ.pop('USER_ZONE', None)
+                self.assertEqual(review_items.efficiency(document, record=snapshot.members), 3)
+            self.assertEqual(sum(call.args[0] == str(zone_path) for call in reads.call_args_list), 1)
+
+    def test_an_answer_returns_a_later_investigation_until_mark_read(self) -> None:
+        for legacy_answer in (False, True):
+            with self.subTest(legacy_answer=legacy_answer):
+                self.check_later_investigation_answer(legacy_answer)
+
+    def check_later_investigation_answer(self, legacy_answer: bool) -> None:
+        record = self.investigation(False)
+        key = f'investigation/{record.owner}/{record.id}'
+        now = datetime.now(user_zone())
+        until = now + timedelta(days=1)
+        item = review_page.build_snapshot(self.root).records[key]
+        _ = review_actions.later(item, until.isoformat(), '')
+        before = review_page.build_snapshot(self.root)
+        self.assertFalse(before.records[key].for_you(now))
+
+        path = investigation.folder(record.owner) / (record.id + '.md')
+        earlier_log = next(line for line in path.read_text().splitlines() if line.startswith('review_log: '))
+        _ = investigation.answer(record.owner, record.id, 'The gate log has the answer.')
+        if legacy_answer:
+            lines = path.read_text().splitlines(keepends=True)
+            _ = path.write_text(''.join(earlier_log + '\n' if line.startswith('review_log: ') else line for line in lines))
+        zone_path = self.fixture.temporary / 'user_zone.conf'
+        _ = zone_path.write_text('zone=America/New_York\n')
+        with patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)):
+            _ = os.environ.pop('USER_ZONE', None)
+            answered = review_page.build_snapshot(self.root)
+            with patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads:
+                self.assertTrue(answered.records[key].for_you(now))
+                entries = unpack_index(review_page.index_json(answered.entries))
+                self.assertTrue(answered.records[key].unread_answer)
+            self.assertEqual([call for call in reads.call_args_list if call.args[0] == str(zone_path)], [])
+        self.assertTrue(next(entry for entry in entries if entry['key'] == key).get('unreadAnswer'))
+        self.assertIn(b'value="read"', answered.body(key))
+        self.assertEqual(review_later.times()[key], until)
+        if shutil.which('firefox'):
+            proof = """<script>
+const row=document.querySelector('[data-list-item][data-key="'+KEY+'"]');
+const marked=row?.querySelector('[data-new-answer]')?.textContent==='New answer';
+void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Open row needs a New answer mark.'])});
+</script>""".replace('KEY', json.dumps(key))
+            markup = answered.render().replace(b'</body>', proof.encode() + b'</body>')
+            self.assertEqual(firefox_probe_results(markup), [[]])
+
+        delivery, result = review_page.submit(self.root, self.card_body(answered, key, 'read'), self.status, snapshot=answered)
+        self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+        self.assertEqual(result, 'marked read')
+        current = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertFalse(current.unread_answer)
+        self.assertTrue(current.hidden_until(now))
+        self.assertEqual(review_later.times()[key], until)
+
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
             pictured_changes([change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')]),
@@ -5218,6 +5704,15 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         for key in keys:
             with self.subTest(key=key):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
+                if key == 'page-owner/C1':
+                    delivery, _ = review_page.submit(self.root, self.body(key, 'question', 'Did the check pass?'), self.status)
+                    assert isinstance(delivery, change_page.MessageDelivery)
+                    change_page.deliver(delivery, self.status)
+                    request = self.status.slots(delivery.page, delivery.row).question
+                    assert isinstance(request, change_page.OpenQuestion)
+                    self.assertTrue(change_page.answer_item(key, 'The check passed.', request.question_id, self.status))
+                    item = review_page.build_snapshot(self.root).records[key]
+                    self.assertTrue(item.unread_answer)
                 body = self.body(key,'later','Read this tomorrow.')+'&'+urlencode({'later':until.isoformat()})
                 if key == question:
                     with (patch.object(review_later, 'write_text_atomic', side_effect=OSError('fixture deadline write failed')),
@@ -5236,6 +5731,63 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 _,entries = review_items.next_queue(item.type,self.fixture.production,False,staff.snapshot())
                 self.assertNotIn(item.queue_key,[entry.key for entry in entries])
                 self.assertEqual(review_later.times()[key],until)
+        for action, prior_logged_answer in (('read', False), ('later', False), ('read', True), ('later', True)):
+            with self.subTest(legacy_question_reply=True, action=action, prior_logged_answer=prior_logged_answer):
+                key = self.question(f'Review the legacy reply with {action}?')
+                path = self.question_path(key)
+                if prior_logged_answer:
+                    record, = update_registration.selected_question_records([path], (), None)
+                    asked = 'Does the latest layout fit?'
+                    replied = 'The full layout fits.'
+                    earlier = datetime.now(user_zone()).replace(tzinfo=None) - timedelta(minutes=1)
+                    record.item['followups'] = [update_registration.FollowupExchange(
+                        followup=asked, reply=replied, question_id='legacy-layout')]
+                    record.item['reply_log_positions'] = {'0': 1}
+                    record.item['review_log'] = review_events.encode((
+                        review_events.ReviewLog(earlier, 'nate', 'question: ' + asked, 'legacy-layout'),
+                        review_events.ReviewLog(earlier, record.asker, 'Answer: ' + replied),
+                    ))
+                    update_registration.write_question_record(record)
+                item = review_page.build_snapshot(self.root).records[key]
+                _ = review_actions.later(item, until.isoformat(), '')
+                record, = update_registration.selected_question_records([path], (), None)
+                record.item['answered_at'] = datetime.now(user_zone()).isoformat()
+                record.item.setdefault('followups', []).append(update_registration.FollowupExchange(
+                    followup='Does the latest layout fit?', reply='The full layout fits.'))
+                update_registration.write_question_record(record)
+                answered = review_page.build_snapshot(self.root)
+                self.assertIn(key, {item.key for item in review_items.read_open(self.root)})
+                self.assertTrue(next(entry for entry in answered.entries if entry['key'] == key).get('unreadAnswer'))
+                self.assertIn(b'The full layout fits.', answered.body(key))
+                words = [event.words for event in answered.records[key].log]
+                self.assertEqual(words.count('The full layout fits.'), 1)
+                self.assertEqual(words.count('Does the latest layout fit?'), 1)
+                body = self.card_body(answered, key, action, 'Keep this note.' if action == 'later' else '')
+                if action == 'later':
+                    body += '&'+urlencode({'later': (until+timedelta(days=1)).isoformat()})
+                _ = review_page.submit(self.root, body, self.status, snapshot=answered)
+                current = review_page.build_snapshot(self.root).records[key]
+                self.assertFalse(current.unread_answer)
+                self.assertTrue(current.hidden_until(datetime.now(user_zone())))
+                record, = update_registration.selected_question_records([path], (), None)
+                record.item['answered_at'] = datetime.now(user_zone()).isoformat()
+                record.item.setdefault('followups', []).append(update_registration.FollowupExchange(
+                    followup='Did the test keep the control visible?', reply='The control remains visible.'))
+                update_registration.write_question_record(record)
+                current = review_page.build_snapshot(self.root).records[key]
+                self.assertTrue(current.unread_answer)
+                if prior_logged_answer:
+                    record, = update_registration.selected_question_records([path], (), None)
+                    record.item['followup'] = update_registration.PendingFollowup(
+                        text='Does the new layout fit?', sent=datetime.now(user_zone()).strftime('%Y-%m-%dT%H:%M'))
+                    update_registration.record_followup_reply(record.item, 'The full layout fits.', record.asker)
+                    update_registration.write_question_record(record)
+                    current = review_page.build_snapshot(self.root).records[key]
+                    self.assertTrue(current.unread_answer)
+                    words = [event.words for event in current.log]
+                    self.assertEqual(words.count('Answer: The full layout fits.'), 2)
+                    self.assertEqual(words.count('The full layout fits.'), 1)
+
         class AfterLater(datetime):
             @classmethod
             @override
@@ -5294,6 +5846,14 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             self.assertTrue(any(entry.words == 'Later until '+until.isoformat()+': Read the unrouted change tomorrow.'
                                 for entry in saved.log))
             self.assertEqual(review_later.times()[key], until)
+
+        with self.subTest(value='delivered'):
+            key = 'page-owner/C2'
+            before = review_later.path().read_bytes()
+            body = self.body(key, 'later')+'&'+urlencode({'later':'delivered'})
+            with self.assertRaisesRegex(question_record.AnswerRefused, r'^Review Later requires a time\.$'):
+                _ = review_page.submit(self.root, body, self.status)
+            self.assertEqual(review_later.path().read_bytes(), before)
 
     def test_decision_cards_list_current_assignees_in_role_colors(self) -> None:
         proposal, efficiency = self.decisions()
@@ -5901,6 +6461,7 @@ window.fetch=async(url)=>{
  const failures=[];
  try{
   const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
+  const actions=document.querySelector('[data-page-actions]');
   const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
   const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
   await document.fonts.ready;
@@ -5910,10 +6471,11 @@ window.fetch=async(url)=>{
    const t=bounds(title), n=bounds(name), o=bounds(owner), r=bounds(row);
    const beside=Math.abs(center(t)-center(o))<=1;
    const atRight=Math.abs(o.right-r.right)<=1;
-   if(innerWidth!==width || row.querySelectorAll('button').length!==1 || !row.contains(owner) ||
+   if(innerWidth!==width || row.querySelector('button') || actions.querySelectorAll('button').length!==1 ||
+      !actions.contains(owner) ||
       Math.abs(center(n)-center(o))>1 || o.left<n.right+4 ||
       n.left<r.left-1 || !atRight ||
-      (beside ? n.left<t.right+4 : width===1280 || o.top<t.bottom+4)){
+      (beside ? n.left<t.right+4 : width===1280 || o.bottom+4>t.top)){
     failures.push('The owner button is the only title action and fits at '+width+' px.');
    }
    if(width===320 && Math.abs(t.height-parseFloat(getComputedStyle(title).lineHeight))>1){

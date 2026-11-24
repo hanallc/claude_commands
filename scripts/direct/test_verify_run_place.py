@@ -16,8 +16,10 @@ from typing import TypedDict, cast
 import unittest
 from unittest import mock
 
+from scripts.agents import detached_runs
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+from scripts.lib.process_start import Started, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 from scripts.production import staff
@@ -29,10 +31,11 @@ class RunProbe(TypedDict):
     pid: int
     run: str
     name: str
+    first_step: dict[str, str]
 
 
 class VerifyRunPlaceTests(unittest.TestCase):
-    def script(self, fixture: AdmissionFixture) -> Path:
+    def script(self, fixture: AdmissionFixture, *, verb_list: bool = False) -> Path:
         """Execute startup and detachment without the command guard."""
         scripts = fixture.root / "scripts"
         direct = scripts / "direct"
@@ -54,24 +57,42 @@ class VerifyRunPlaceTests(unittest.TestCase):
         _ = copy_helpers(fixture.root, *VERIFY_HELPERS)
         probe = direct / "probe.py"
         _ = probe.write_text('''import json, os, sys
-print(json.dumps({"pid": int(sys.argv[1]), "run": os.environ.get("BUILDLOG_RUN", ""), "name": sys.argv[2]}), flush=True)
-if not sys.stdin.readline():
+print(json.dumps({"pid": int(sys.argv[1]), "run": os.environ.get("BUILDLOG_RUN", ""), "name": sys.argv[2],
+                  "first_step": {key: value for key, value in os.environ.items()
+                                 if key.startswith("BUILDLOG_FIRST_STEP_")}}), flush=True)
+if "PROBE_VERB_TRAPS" not in os.environ and not sys.stdin.readline():
     raise SystemExit("probe lost its controller")
 ''')
         prefix, command_marker, dispatch = VERIFY.read_text().partition('\nCMD="${1:-}"\n')
         self.assertTrue(command_marker, 'verify.sh startup marker is missing: CMD="${1:-}"')
         _, detach_marker, after_detach_marker = dispatch.partition('\nDETACHED_RUNS_SCRIPT=')
         self.assertTrue(detach_marker, "verify.sh startup marker is missing: DETACHED_RUNS_SCRIPT=")
-        detach_and_identity, shift_marker, _ = after_detach_marker.partition('\nshift\n')
+        detach_and_identity, shift_marker, after_shift = after_detach_marker.partition('\nshift\n')
         self.assertTrue(shift_marker, "verify.sh startup marker is missing: shift after the run identity")
         script = direct / "verify.sh"
-        _ = script.write_text(prefix + detach_marker + detach_and_identity + '''
+        if verb_list:
+            list_dispatch, next_command, _ = after_shift.partition('\nif [[ "$CMD" == example-test ]]')
+            self.assertTrue(next_command, "verify.sh verb list dispatch is missing")
+            source = prefix + command_marker + detach_marker + detach_and_identity + '''
+wait() {
+    trap -p INT TERM HUP > "$PROBE_VERB_TRAPS"
+    builtin wait "$@"
+}
+''' + shift_marker + list_dispatch + '''
+"$PY" "${BASH_SOURCE[0]%/*}/probe.py" "$$" "$CMD"
+IFS= read -r status
+finish_verify_run "$status"
+exit "$status"
+'''
+        else:
+            source = prefix + detach_marker + detach_and_identity + '''
 "$PY" "${BASH_SOURCE[0]%/*}/probe.py" "$$" "$1"
 if [[ "$1" == outer ]]; then
     bash "${BASH_SOURCE[0]}" inner
 fi
 :
-''')
+'''
+        _ = script.write_text(source)
         copy_runtime(fixture.root)
         return script
 
@@ -107,6 +128,74 @@ fi
         assert process.stdin is not None
         _ = process.stdin.write("continue\n")
         process.stdin.flush()
+
+    def verb_status(self, process: subprocess.Popen[str], status: int) -> None:
+        assert process.stdin is not None
+        _ = process.stdin.write(f"{status}\n")
+        process.stdin.flush()
+
+    def test_detached_list_parent_saves_the_combined_exit_status(self) -> None:
+        for statuses in ((0, 0), (41,)):
+            with self.subTest(statuses=statuses), AdmissionFixture() as fixture:
+                record_path = fixture.root / "run.json"
+                script = self.script(fixture, verb_list=True)
+                process = self.start(script, "test,lint", UNIT_DETACHED_RUN="1",
+                                     UNIT_DETACHED_RECORD=str(record_path), PROBE_VERB_TRAPS=str(fixture.root / "traps"))
+                started = process_start(process.pid)
+                self.assertIsInstance(started, Started)
+                assert isinstance(started, Started)
+                record: detached_runs.RunRecord = {
+                    "run_id": "run", "status": "running", "session_dir": str(fixture.root),
+                    "worker": "fixture", "staff_id": "", "label": "verify list",
+                    "command": ["bash", str(script), "test,lint"],
+                    "log": str(fixture.root / "run.log"), "started_at": 1.0, "pid": 0,
+                    "director_dir": "", "done_message_file": "",
+                    "command_pid": process.pid, "command_started": started.start,
+                }
+                _ = record_path.write_text(json.dumps(record))
+                for verb, status in zip(("test", "lint"), statuses):
+                    self.assertEqual(self.probe(process)["name"], verb)
+                    self.verb_status(process, status)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, statuses[-1], output + errors)
+                saved = cast(detached_runs.RunRecord, json.loads(record_path.read_text()))
+                self.assertEqual(detached_runs.command_result(saved), detached_runs.CompletedCommand(statuses[-1]))
+
+    def test_later_verbs_use_fresh_placement(self) -> None:
+        with AdmissionFixture() as fixture:
+            assignment = {
+                "BUILDLOG_FIRST_STEP_ASSIGNMENT": str(fixture.root / "first.json"),
+                "BUILDLOG_FIRST_STEP_ROUTE": "first-route",
+                "BUILDLOG_FIRST_STEP_SINCE": "123",
+                "BUILDLOG_FIRST_STEP_PID": "321",
+                "BUILDLOG_FIRST_STEP_EPISODE": "first-episode",
+            }
+            process = self.start(self.script(fixture, verb_list=True), "test,lint",
+                                 PROBE_VERB_TRAPS=str(fixture.root / "traps"), **assignment)
+            first = self.probe(process)
+            self.verb_status(process, 0)
+            second = self.probe(process)
+            self.verb_status(process, 0)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            self.assertEqual(first["first_step"], assignment)
+            self.assertEqual(second["first_step"], {})
+            self.assertEqual(first["run"], second["run"])
+
+    def test_verb_list_stops_its_child_without_setting_signal_traps(self) -> None:
+        with AdmissionFixture() as fixture:
+            traps = fixture.root / "traps"
+            process = self.start(self.script(fixture, verb_list=True), "test,lint", PROBE_VERB_TRAPS=str(traps))
+            self.assertEqual(self.probe(process)["name"], "test")
+            process.send_signal(signal.SIGTERM)
+            # Keep the input open. The child must end even though it has no result.
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+            assert process.stdout is not None and process.stderr is not None
+            self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "the active verb still holds the output pipe")
+            self.assertEqual(process.stdout.readline(), "")
+            self.assertIn(process.returncode, (-signal.SIGTERM, 128 + signal.SIGTERM), process.stderr.read())
+            self.assertEqual(traps.read_text(), "")
 
     def identity(self, fixture: AdmissionFixture, probe: RunProbe) -> wire.RunIdentity:
         owner = fixture.proc.owner_start(probe["pid"])
@@ -270,20 +359,29 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
         except ProcessLookupError:
             pass
 
-    def test_mac_startup_reads_no_proc_and_creates_no_run_identity(self) -> None:
+    def test_startup_keeps_an_inherited_run_identity(self) -> None:
         with AdmissionFixture() as fixture:
-            script = self.script(fixture)
-            shim = fixture.root / "scripts/lib/py"
-            shim.unlink()
-            _ = shim.write_text(python_tool_source('''import os, sys
-if sys.argv[2:3] == ["start"]:
-    raise SystemExit("Mac startup requested a process start time")
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-'''))
-            shim.chmod(0o755)
-            process = self.start(script, "mac", OSTYPE="darwin23")
-            probe = self.probe(process)
-            self.assertEqual(probe["run"], "")
+            inherited = "321:987654"
+            process = self.start(self.script(fixture), "inherited", BUILDLOG_RUN=inherited)
+            self.assertEqual(self.probe(process)["run"], inherited)
             self.proceed(process)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 0, output + errors)
+
+    def test_non_linux_startup_reads_no_proc_and_creates_no_run_identity(self) -> None:
+        for os_type in ("darwin23", "freebsd14"):
+            with self.subTest(os_type=os_type), AdmissionFixture() as fixture:
+                script = self.script(fixture)
+                shim = fixture.root / "scripts/lib/py"
+                shim.unlink()
+                _ = shim.write_text(python_tool_source('''import os, sys
+if sys.argv[2:3] == ["start"]:
+    raise SystemExit("Non-Linux startup requested a process start time")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+'''))
+                shim.chmod(0o755)
+                process = self.start(script, "non-linux", OSTYPE=os_type)
+                self.assertEqual(self.probe(process)["run"], "")
+                self.proceed(process)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, 0, output + errors)

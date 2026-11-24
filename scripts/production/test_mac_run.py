@@ -26,7 +26,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import config_environment, memory_gate_shell_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
-from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.shell_test_support import fixture_zsh_environment, shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import claim_state, floor_claims
 from scripts.production.cli_fixture import ImmutableGitSeed
@@ -398,7 +398,7 @@ class MacRunTests(unittest.TestCase):
             **{name: value for name, value in memory_gate_shell_environment().items() if name not in SESSION_SELECTORS},
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
-            "__ETC_ZSHENV_SOURCED": "1",
+            **fixture_zsh_environment(),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "COPIES_CONFIG": str(copies_config),

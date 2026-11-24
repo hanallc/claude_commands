@@ -21,7 +21,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -32,6 +32,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
+from scripts.review_links.server_test_support import started_review_server
 
 SEND_MESSAGE = change_page.send_message
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
@@ -1771,8 +1772,6 @@ class ImagePairTests(ImagesFixture):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_image_pair_stays_side_by_side_at_1024_pixels(self) -> None:
-        from scripts.review_links.test_accounts_page import firefox_probe_results
-
         _ = self.register_pair()
         owner = self.owner
         assert owner is not None
@@ -1786,7 +1785,7 @@ class ImagePairTests(ImagesFixture):
   frameElement.style.height='800px';
   document.querySelector('[data-image-layout]').style.minHeight='300vh';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const heading=document.querySelector('.page-heading'), groups=document.querySelector('[data-image-groups]');
+  const actions=document.querySelector('[data-page-actions]'), groups=document.querySelector('[data-image-groups]');
   for(const top of [0,64,800]){
    scrollTo({top,behavior:'instant'});
    await painted();
@@ -1796,12 +1795,13 @@ class ImagePairTests(ImagesFixture):
     failures.push('The Images pair must fit side by side at 1024 px and scroll position '+top+'.');
    }
   }
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
-  if(!heading.hasAttribute('data-page-heading-stuck') || Math.abs(heading.getBoundingClientRect().top-space)>=1){
-   failures.push('At scroll position 800 the heading row must stick at the top.');
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
+  const controls=Math.max(...[...actions.children].map(control=>control.getBoundingClientRect().bottom));
+  if(Math.abs(actions.getBoundingClientRect().top-space)>=1 || document.querySelector('.page-heading').getBoundingClientRect().bottom>0){
+   failures.push('At scroll position 800 the action area must stick at the top and the title must scroll away.');
   }
-  if(groups.getBoundingClientRect().top<heading.getBoundingClientRect().bottom+16){
-   failures.push('The image group index must stick below the heading row.');
+  if(groups.getBoundingClientRect().top<controls+16){
+   failures.push('The image group index must stick below the action area.');
   }
   frameElement.style.width='1382px';
   groups.querySelector('a span').textContent='admin-console-reviewer';
@@ -1840,9 +1840,8 @@ class ImagesServerTests(ImagesFixture):
         super().setUp()
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         with patch.object(change_page, "recover_pending"):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
