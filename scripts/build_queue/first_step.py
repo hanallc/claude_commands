@@ -23,7 +23,8 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
-    VerifyCommand, command_job, command_program, parse_command_program, read_step_names, verify_command,
+    VerifyCommand, command_job, command_program, gate_natedev_only_flag, parse_command_program, read_step_names,
+    verify_command,
 )
 from scripts.mac_test import claim_state
 
@@ -275,6 +276,10 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
                   owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
+    arguments = tuple(command)
+    flag = gate_natedev_only_flag(arguments)
+    if flag is not None and "natedev" not in targets:
+        raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
     local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar))
     tree_key = treekey.tree_key(str(source))
     source_key = (execution_identity.SourceKeyKnown(tree_key) if tree_key
@@ -284,7 +289,6 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     configured = target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT)
     ordered_names = dict.fromkeys((*(target.name for target in configured if target.name in targets), *targets))
     builder = client.placement_constraint_builder()
-    arguments = tuple(command)
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:
         fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
@@ -292,7 +296,8 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
         named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)
         if not named:
             raise FirstStepRefused(f'gate target {name} is not configured')
-        candidates.extend(named)
+        candidates.extend(replace(candidate, eligibility=placement.FixedExclusion(f"{flag} runs only on natedev"))
+            if flag is not None and candidate.destination.target != "natedev" else candidate for candidate in named)
     constraints = placement.PlacementConstraints(source_key, arguments, str(source), '', session,
         tuple(candidates), command_kind='final')
     route = target_config.PinnedTarget(targets[0]) if len(targets) == 1 else target_config.ANY_ELIGIBLE_TARGET
