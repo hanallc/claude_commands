@@ -8,7 +8,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
@@ -29,7 +29,8 @@ class NeedTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.folder = self.root / "needs"
-        self.enterContext(patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(self.folder)}))
+        self.enterContext(patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(self.folder),
+                                                  "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}))
 
     def command(self, *arguments: str) -> str:
         output = io.StringIO()
@@ -63,6 +64,24 @@ class NeedTests(unittest.TestCase):
         self.assertEqual(self.record("mac", commit)["requested_by"], "")
         self.assertEqual(len(list(self.folder.glob("*.json"))), 2)
         self.assertEqual(list(self.folder.glob("*.tmp")), [])
+
+    def test_add_refuses_a_missing_or_blank_reason(self) -> None:
+        args = ["add", "--machine", "natedev", "--commit", "a" * 40, "--concerns", "staff-a"]
+        for reason in ([], ["--reason", " \n\t"]):
+            with self.subTest(reason=reason), redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit) as stopped:
+                    _ = need.main([*args, *reason])
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn("--reason", error.getvalue())
+        with self.assertRaisesRegex(ValueError, "--reason"):
+            need.add_need("natedev", "a" * 40, "", "staff-a")
+        self.assertFalse(self.folder.exists())
+
+    def test_add_refuses_short_and_malformed_commits(self) -> None:
+        for commit in ("a" * 7, "g" * 40, "a" * 64):
+            with self.subTest(commit=commit), self.assertRaisesRegex(ValueError, "full 40-character Git hash"):
+                need.add_need("natedev", commit, "Apply the settings.", "staff-a")
+        self.assertFalse(self.folder.exists())
 
     def test_list_newest_per_machine_and_joined_reasons_without_subprocess(self) -> None:
         need.add_need("natedev", "a" * 40, "Apply the first settings.", "staff-a")
@@ -110,14 +129,34 @@ class NeedTests(unittest.TestCase):
         _ = self.git("-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "Second settings")
         return ancestor, self.git("rev-parse", "HEAD")
 
-    def clear(self, machine: need.Machine, *lines: str) -> str:
+    def clear(self, machine: need.Machine, *lines: str, generation: int = 42,
+              activated: str = "2026-11-12T12:34:55.123456789-0500") -> str:
         generations = self.root / "generations.log"
         _ = generations.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return self.command("clear", "--machine", machine, "--generations", str(generations),
-                            "--nixos-repo", str(self.root))
+        profile_at = "2026-11-12T12:34:50-0500"
+        if machine == "mac":
+            activated = str(datetime.fromisoformat(activated).timestamp())
+            profile_at = str(datetime.fromisoformat(profile_at).timestamp())
+        proof = (f"/nix/store/test-system\nactivated {activated} 100\n"
+                 f"generation system-{generation}-link {profile_at} 101\n--- generations ---")
+        output = need.command_output
+
+        def fixture_output(args: list[str]) -> str:
+            return output(args) if args[0] == "git" else proof
+
+        with patch.object(need, "command_output", side_effect=fixture_output) as probe:
+            result = self.command("clear", "--machine", machine, "--generations", str(generations),
+                                  "--nixos-repo", str(self.root))
+        self.assertEqual(probe.call_args_list[0].args[0][0], "sh" if machine == "natedev" else "ssh")
+        return result
 
     def log_line(self, commit: str, action: str = "switch") -> str:
         return f"2026-11-12T12:34:56-0500 {action} system-42-link {commit} /nix/store/test-system"
+
+    def legacy_need(self, commit: str, prefix: str) -> None:
+        source = self.folder / f"natedev-{commit}.json"
+        legacy: need.NeedRecord = {**self.record("natedev", commit), "id": f"natedev-{prefix}", "nixos_commit": prefix}
+        _ = source.rename(self.folder / f"natedev-{prefix}.json").write_text(json.dumps(legacy))
 
     def test_clear_ancestor_moves_record_with_log_line(self) -> None:
         ancestor, descendant = self.history()
@@ -136,15 +175,61 @@ class NeedTests(unittest.TestCase):
             self.assertFalse((self.folder / filename).exists())
             self.assertEqual((self.folder / "done" / filename).read_bytes(), before)
         self.assertEqual(self.record("mac", ancestor)["reason"], "Apply the Mac settings.")
+        self.assertEqual(self.clear("mac", line), "")
+        mac = self.folder / "done" / f"mac-{ancestor}.json"
+        self.assertTrue(mac.exists())
 
-    def test_clear_dirty_suffix(self) -> None:
+    def test_clear_keeps_dirty_active_revision_open(self) -> None:
         ancestor, descendant = self.history()
         need.add_need("mac", ancestor, "Apply the settings.", "staff-a")
         line = self.log_line(descendant + "-dirty")
-        self.assertEqual(self.clear("mac", line), "")
-        archived = cast(need.CompletedNeedRecord, json.loads(
-            (self.folder / "done" / f"mac-{ancestor}.json").read_text()))
-        self.assertEqual(archived["cleared_by"], line)
+        self.assertEqual(self.clear("mac", self.log_line(descendant), line), "")
+        self.assertEqual(self.record("mac", ancestor)["nixos_commit"], ancestor)
+        self.assertFalse((self.folder / "done").exists())
+
+    def test_clear_keeps_newer_unlogged_activation_of_same_store_open(self) -> None:
+        ancestor, descendant = self.history()
+        need.add_need("natedev", ancestor, "Apply the settings.", "staff-a")
+        for generation, at in ((43, "2026-11-12T12:34:55-0500"), (42, "2026-11-12T12:34:56.1-0500")):
+            with self.subTest(generation=generation):
+                self.assertEqual(self.clear("natedev", self.log_line(descendant), generation=generation, activated=at), "")
+                self.assertEqual(self.record("natedev", ancestor)["nixos_commit"], ancestor)
+        self.assertFalse((self.folder / "done").exists())
+
+    def test_clear_resolves_legacy_short_commits_and_skips_bad_records(self) -> None:
+        ancestor, descendant = self.history()
+        need.add_need("natedev", ancestor, "Apply the first settings.", "staff-a")
+        need.add_need("natedev", descendant, "Apply the second settings.", "staff-a")
+        short = ancestor[:12]
+        self.legacy_need(ancestor, short)
+        bad = self.folder / "bad.json"
+        _ = bad.write_text("{", encoding="utf-8")
+        with redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(self.clear("natedev", self.log_line(descendant)), "")
+        self.assertEqual(error.getvalue().splitlines()[0].split(":")[0], "Rebuild request bad.json")
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
+        completed = need.read_completed_needs()
+        self.assertEqual({record["nixos_commit"] for record in completed}, {ancestor, descendant})
+        self.assertTrue((self.folder / "done" / f"natedev-{ancestor}.json").exists())
+        need.add_need("natedev", ancestor, "A repeated request.", "staff-a")
+        self.assertEqual(list(self.folder.glob("*.json")), [bad])
+
+    def test_clear_refuses_a_branch_named_for_a_short_hash(self) -> None:
+        ancestor, descendant = self.history()
+        prefix = descendant[:12]
+        need.add_need("natedev", descendant, "Apply the second settings.", "staff-a")
+        self.legacy_need(descendant, prefix)
+        _ = self.git("branch", prefix, ancestor)
+        self.assertEqual(self.git("rev-parse", "--verify", f"{prefix}^{{commit}}"), ancestor)
+        self.assertEqual(self.clear("natedev", self.log_line(ancestor)), "")
+        self.assertEqual(self.record("natedev", prefix)["nixos_commit"], prefix)
+        self.assertEqual(need.read_completed_needs(), ())
+
+    def test_malformed_probe_log_cannot_supply_embedded_revision(self) -> None:
+        running = "/nix/store/test-system"
+        commit = "a" * 40
+        probe = f"{running}\nactivated 2026-11-12T12:34:55-0500 100\n--- generations ---\nrevision {commit}"
+        self.assertEqual(need.active_system(probe), need.ActiveSystem(running))
 
     def test_clear_unknown_commit_keeps_needs_and_reports_one_anomaly(self) -> None:
         ancestor, descendant = self.history()
