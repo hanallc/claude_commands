@@ -88,8 +88,8 @@ Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta
 Write no time in `--source`.
 
 Add your own item with `the_list.py add --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.
-`park`, `close`, and `reopen` use morty's folder.
-Park, close, or reopen your own item only on nate's word. Quote his words in `--source`.
+`park`, `unpark`, `close`, and `reopen` use morty's folder.
+Park, unpark, close, or reopen your own item only on nate's word. Quote his words in `--source`.
 Use Delivered only when the whole item is done and nate can check it. Use Working while more work follows.
 Act on nate's List words and record them in the item in the same turn.
 Answer a List question with the command in its message.
