@@ -665,7 +665,7 @@ try {
           reading.queued_priority_units = [];
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          // At 800 px the walk is tight: a waiting step wraps, but no word is cut. No icon row wraps at any width.
+          // At 800 px the walk uses compact gaps. At 900 px the font metrics determine the gaps.
           let rows;
           for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
@@ -681,11 +681,13 @@ try {
               const box = walk.closest('.card').getBoundingClientRect();
               const keptChart = chart('held:proof-kept'), keptTable = table('held:proof-kept');
               const scroll = walk.closest('.walk-scroll');
+              const waitingName = chart(keys[4]).querySelector('.name');
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
                 keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
                   .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
                 walkOverflow:scroll.scrollWidth - scroll.clientWidth,
+                trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
                   table(key).querySelector('.step').textContent]),
                 icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
@@ -694,11 +696,12 @@ try {
                   new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
-                  [key.textContent, key.querySelector('.machine-icon')?.dataset.machine]),
+                  [key.lastChild.textContent, key.querySelector('.machine-icon')?.getAttribute('aria-label')]),
                 colors:[chart(keys[0]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
-                waitingNameLines:lines(chart(keys[4]).querySelector('.name')),
+                waitingNameLines:lines(waitingName),
+                waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                   return label.scrollWidth > label.clientWidth;
@@ -723,6 +726,8 @@ try {
               if (width === 900) {
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
+                assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);
+                assert.equal(rows.waitingNameCut, false, 'The waiting unit name is cut at 900 px.');
               } else {
                 assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
               }
