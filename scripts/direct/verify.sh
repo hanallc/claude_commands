@@ -2459,10 +2459,6 @@ note_event() {
     collect_hold_wait
     [[ -f "${BUILDLOG_RECORD:-}" ]] || return 0
     local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0
-    local interrupted_wait_dir=""
-    if [[ "$outcome" == interrupted && "${PLACEMENT_POLL_PENDING:-0}" == 1 && "${PLACEMENT_WAIT_MEMORY:-0}" == 1 ]]; then
-        interrupted_wait_dir="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}"
-    fi
     if [[ -n "${CACHE_DIR}" ]]; then
         cached=1
     fi
@@ -2474,7 +2470,7 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_WAIT_DIR="$HOLD_WAIT_DIR" BUILDLOG_INTERRUPTED_WAIT_DIR="$interrupted_wait_dir" \
+    BUILDLOG_WAIT_DIR="$HOLD_WAIT_DIR" \
         BUILDLOG_TOKEN_WAIT_FILE="${TOKEN_WAIT_FILE:-}" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" \
         BUILDLOG_TOKEN_WAIT_DIR="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}" \
         BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
@@ -3223,7 +3219,9 @@ placement_once() {
     fi
     [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
     PLACEMENT_CALL_NUMBER=$((${PLACEMENT_CALL_NUMBER:-0} + 1))
-    local wait_result="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}-$PLACEMENT_CALL_NUMBER"
+    local pending_wait="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}.pending"
+    local wait_result="$pending_wait/sample-$PLACEMENT_CALL_NUMBER"
+    [[ -d "$pending_wait" ]] || mkdir -- "$pending_wait" || return $?
     # An empty file means the client did not return a measurement.
     : > "$wait_result" || return $?
     # A builtin wait lets the parent handle signals during a service outage.
@@ -3238,7 +3236,11 @@ placement_once() {
     if [[ "$monitor" == 0 ]]; then set +m; fi
     wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
-    reply=$(< "$HOLD_WAIT_DIR/placement-reply")
+    reply=$(< "$HOLD_WAIT_DIR/placement-reply") || return $?
+    # Publish the samples together after reading a grant or a refusal.
+    if (( status == 0 || status == 2 )) && [[ -n "$reply" && -s "$wait_result" ]]; then
+        mv -- "$pending_wait" "${pending_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
+    fi
     while IFS= read -r line; do
         case "$line" in
             first|holder\ *|resource\ *|memory-seconds\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
@@ -3371,7 +3373,6 @@ take_local_placement() {
 
 route_test() {
     local last_decline="" wait_reason="" wait_holder="" name eligibility reason settings platform refresh_source=0
-    local PLACEMENT_POLL_PENDING=0
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -3390,7 +3391,6 @@ route_test() {
         placement_once "$refresh_source" || placement_status=$?
         refresh_source=0
         if (( placement_status == 78 )); then
-            PLACEMENT_POLL_PENDING=1
             if [[ "${LINT_MEND_WAIT:-0}" == 1 && "$STEP_WRITES_TREE" == 1 \
                     && "$PLACEMENT_WAIT_MEMORY" == 1 && -n "$MAC_LEAVE_SETTINGS" ]] \
                     && STEP_WRITES_TREE=0 step_can_retry; then
@@ -3416,7 +3416,6 @@ route_test() {
             wait_for_placement
             continue
         fi
-        PLACEMENT_POLL_PENDING=0
         (( placement_status == 0 )) || return "$placement_status"
         if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && "${PLACEMENT_COMMAND[0]:-}" == cargo
                 && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then

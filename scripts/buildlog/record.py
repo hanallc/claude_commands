@@ -1268,7 +1268,6 @@ def call_waits(directory: Path, verb: str, token_wait: int) -> dict[str, object]
     """Read the wait totals before Verify removes its wait directory."""
     token_file = os.environ.get("BUILDLOG_TOKEN_WAIT_FILE", "")
     token_directory = Path(os.environ.get("BUILDLOG_TOKEN_WAIT_DIR") or directory)
-    interrupted_directory = os.environ.get("BUILDLOG_INTERRUPTED_WAIT_DIR", "")
     step_waits: dict[str, int | None] = {}
     wait_total = 0.0
     hold_total: float | None = None
@@ -1285,16 +1284,21 @@ def call_waits(directory: Path, verb: str, token_wait: int) -> dict[str, object]
         if folder == token_directory:
             token += token_wait
         memory = sum(optional_int(line) or 0 for line in wait_lines(folder / "memory-seconds"))
-        measured = str(folder) != interrupted_directory
+        measured = True
         for path in folder.glob("placement-call-*"):
-            if path.suffix == ".tmp":
-                continue
-            lines = wait_lines(path)
-            elapsed = optional_int(lines[0]) if lines else None
-            if elapsed is None:
+            if path.suffix == ".pending":
                 measured = False
-            else:
-                memory += elapsed
+                continue
+            samples = path.glob("sample-*") if path.is_dir() else (path,)
+            for sample in samples:
+                if sample.suffix == ".tmp":
+                    continue
+                lines = wait_lines(sample)
+                elapsed = optional_int(lines[0]) if lines else None
+                if elapsed is None:
+                    measured = False
+                else:
+                    memory += elapsed
         total = memory + token + hold
         if total or label != verb or not measured:
             step_waits[label] = int(total) if measured else None

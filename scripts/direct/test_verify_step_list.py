@@ -247,7 +247,6 @@ else:
         self.assert_removed()
 
     def test_term_during_the_memory_poll_marks_the_wait_as_not_measured(self) -> None:
-        self.prepare_repository()
         root = self.fixture.root
         waiter = root / "interrupt-poll.py"
         _ = waiter.write_text("""\
@@ -256,14 +255,40 @@ from pathlib import Path
 import signal
 
 directory = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).parent
-sample, = directory.glob("placement-call-*")
+sample, = directory.glob("placement-call-*.pending/sample-*")
 elapsed = int(sample.read_text())
 owner = int(Path("poll-owner").read_text())
 assert os.getppid() == owner
 Path("poll-sample").write_text(str(elapsed))
 os.kill(owner, signal.SIGTERM)
 """)
-        self.fixture.environment.update({"BUILDLOG_OFF": "0", "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter)})
+        self.fixture.environment["VERIFY_LOCAL_RELEASE_WAIT_SCRIPT"] = str(waiter)
+        self.check_term_with_unfinished_memory_sample()
+
+    def test_term_before_verify_reads_the_memory_wait_reply(self) -> None:
+        startup = self.fixture.root / "interrupt-placement.sh"
+        _ = startup.write_text('''\
+if [[ ${0##*/} == verify.sh ]]; then
+    wait() {
+        local status=0
+        builtin wait "$@" || status=$?
+        if [[ ${PLACEMENT_CLIENT_ACTIVE:-0} == 1 && $1 == "$HOLD_WAITER_PID" && $status == 78 ]]; then
+            local sample
+            IFS= read -r sample < "$wait_result" || return 2
+            printf '%s\\n' "$sample" > poll-sample
+            kill -s TERM "$BASHPID"
+        fi
+        return "$status"
+    }
+fi
+''')
+        self.fixture.environment["BASH_ENV"] = str(startup)
+        self.check_term_with_unfinished_memory_sample()
+
+    def check_term_with_unfinished_memory_sample(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        self.fixture.environment["BUILDLOG_OFF"] = "0"
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
         admission = caller_admission(self.fixture, root, self.fixture.environment)
         previous = admission.server.handle_request
