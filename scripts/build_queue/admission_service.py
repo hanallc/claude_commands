@@ -3875,9 +3875,12 @@ class AdmissionServer:
         if rank is None or (rank.move_id and rank.repository) or rank.first_owner != admission.owner:
             return
         line = rank.unit_place
-        # A run can take an earlier rank before its first grant.
+        # A step can take an earlier rank and use SSH permission before it starts.
         if (rank.since == row["since"] or (rank.since < row["since"]
-                and isinstance(line, status_wire.UnitPlace) and line.took_place and line.reservations == 0)):
+                and isinstance(line, status_wire.UnitPlace) and line.took_place
+                and (line.reservations == 0 or (line.reservations == 1
+                    and isinstance(line.first_status, status_wire.NoFirstStatus)
+                    and line.first_step == _local_step(admission).key)))):
             self.run_places[key] = replace(rank, move_id=rank.move_id or move_id,
                                           repository=rank.repository or row.get("repository_name", admission.repo))
 

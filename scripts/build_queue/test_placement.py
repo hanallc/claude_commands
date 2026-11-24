@@ -1086,6 +1086,55 @@ class PlacementTests(unittest.TestCase):
                         f"for fixture on {fixture.server.host}")
             self.assertEqual(lines, [expected])
 
+    def test_younger_run_logs_the_gate_gap_after_an_ssh_prelaunch_refusal(self) -> None:
+        from scripts.build_queue.test_place_take import failed_run, place_rules, unit_place
+
+        with PlacementFixture() as fixture:
+            place_rules(fixture)
+            _, failed = failed_run(fixture)
+            fixture.allow_next_start()
+            base = mac_linux_and_natedev_request(fixture)
+            assert isinstance(base.local, wire.LocalAdmissionContext)
+            request = replace(base, constraints=replace(base.constraints, command_kind="final"),
+                profile=replace(base.profile, step="gate"),
+                identity=replace(base.identity, step="gate", unit=failed.identity.unit, job=failed.identity.job),
+                local=replace(base.local, sidecar=str(fixture.root / "gate.cgroup")))
+            run = request.run
+            assert isinstance(run, wire.RunIdentity)
+            self.assertGreater(request.since, failed.since)
+            _ = publish_candidate(fixture, request)
+            remote = assignment_for(fixture, request)
+            self.assertEqual(remote.destination.provider, "ssh")
+            holder = guest_gate(fixture, remote)
+            authorized, = consume_guest_permission(fixture, remote, holder)
+            assert isinstance(authorized, wire.FirstAuthorization), authorized
+            self.assertEqual(unit_place(fixture, run).reservations, 1)
+            self.assertEqual(unit_place(fixture, run).took_place, "failed")
+            refused, = fixture.server.handle_request(wire.ExecutionReport(
+                "ssh-prelaunch-refused", remote, authorized.claim, execution_identity.ExecutionNotStarted(),
+                placement.PrelaunchRefused("disk"), placement.DispatchPathSettled()))
+            assert isinstance(refused, wire.DispatchStatus), refused
+            self.assertEqual(refused.state, placement.ClosedAssignment("disk"))
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion("disk"))
+            _ = fixture.run_pass()
+            local, = fixture.server.handle_request(request)
+            assert isinstance(local, wire.LocalPlacementGranted), local
+            self.assertEqual(unit_place(fixture, run).reservations, 1)
+            fixture.release(local.grant)
+            fixture.allow_next_start()
+            slot, = fixture.server.slots.values()
+            self.assertGreater(gate.between_steps(slot).expires_at, fixture.clock.now())
+
+            younger_run = fixture.run_owner()
+            younger = fixture.request(run=younger_run, step="gate")
+            with redirect_stderr(io.StringIO()) as journal:
+                _ = only_admitted(fixture.server.handle_request(younger))
+            lines = [line for line in journal.getvalue().splitlines() if "started in the gate gap" in line]
+            expected = (f"memory admission: run {younger_run.pid}:{younger_run.start_time} "
+                        f"started in the gate gap of {run.pid}:{run.start_time} "
+                        f"for fixture on {fixture.server.host}")
+            self.assertEqual(lines, [expected])
+
     def test_restart_requires_token_confirmation_before_a_local_grant(self) -> None:
         with PlacementFixture() as fixture:
             fixture.free(0)
