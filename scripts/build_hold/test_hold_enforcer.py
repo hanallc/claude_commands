@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Callable, Mapping
@@ -34,6 +35,7 @@ from scripts.mac_test import claim_state
 from scripts.herdr import worker_panes
 from scripts.lib import process_stop
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production import staff
 
@@ -90,12 +92,20 @@ class HoldEnforcerTests(unittest.TestCase):
 
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
         }))
+        self.addCleanup(self.finish_hold_recorders, set(threading.enumerate()))
         self.write_holder()
         # Registering a stopped session must use this temporary cycle.
         with build_hold.release_lock():
             cycle = build_hold.open_cycle(datetime.fromtimestamp(100, timezone.utc))
             cycle["holders"]["holder"] = {"since": datetime.fromtimestamp(100, timezone.utc).isoformat(), "released_at": ""}
             build_hold.save_cycle(cycle)
+
+    def finish_hold_recorders(self, existing: set[threading.Thread]) -> None:
+        """Wait for this fixture's recorder processes before cleanup."""
+        for thread in threading.enumerate():
+            if thread not in existing and thread.name == "hold-event-recorder":
+                thread.join(timeout=TEST_HANG_GUARD_SECS)
+                self.assertFalse(thread.is_alive(), "The hold event recorder did not exit")
 
     def read_claims(self, proc_root: Path) -> build_hold.LiveClaims:
         self.assertEqual(proc_root, self.proc)
@@ -378,7 +388,7 @@ class HoldEnforcerTests(unittest.TestCase):
                                           self.uid, enforcer_pid, self.claimed)
 
     def rows(self) -> list[dict[str, object]]:
-        return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+        return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/hold-builds-*.jsonl")
                 for line in path.read_text().splitlines()]
 
     def write_step(self, call_id: str, state: step_record.StepState, pid: int) -> None:
@@ -1632,8 +1642,7 @@ class HoldEnforcerTests(unittest.TestCase):
         if exits:
             self.write_holder()
             _ = build_hold.open_cycle(datetime.fromtimestamp(100, timezone.utc))
-            for path in (self.root / "buildlog").glob("*/*.jsonl"):
-                path.unlink()
+            hold_enforcer.hold_build_log(holder).unlink()
 
     def test_release_recovers_a_direct_stop_after_an_audit_save_failure(self) -> None:
         self.assert_release_recovers_stop("direct")
