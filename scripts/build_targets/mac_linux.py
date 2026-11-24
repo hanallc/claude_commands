@@ -60,6 +60,7 @@ SSH_CONNECT_TIMEOUT_SECONDS = 8
 CONNECT_ATTEMPTS = 3
 # Give the guest port forward time to accept a new connection.
 CONNECT_RETRY_SECONDS = 1
+INNER_CONNECT_READY = 'mac-linux inner SSH ready'
 INNER_CONNECT_MARKER = 'mac-linux inner SSH connect failed'
 INNER_CONNECT_STATUS = 254
 GUEST_ACCEPTED = 'mac-linux command accepted'
@@ -162,31 +163,42 @@ class GuestSettings:
     def transfer_timeout_seconds(self) -> int:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
-    def command(self, shell: str, *, diagnose_connect: bool = True,
+    def command(self, shell: str, *, diagnose_connect: bool = True, budget_inner_connect: bool = False,
                 connect_timeout: int = SSH_CONNECT_TIMEOUT_SECONDS) -> tuple[str, ...]:
         mac, guest = self.ssh_hops
-        options = (*SSH_OPTIONS, '-o', f'ConnectTimeout={connect_timeout}',
-                   *eligibility.server_alive_options(self.unreachable_wait_seconds))
+        options = (*SSH_OPTIONS, *eligibility.server_alive_options(self.unreachable_wait_seconds))
+        fixed_timeout = f'ConnectTimeout={connect_timeout}'
+        inner_timeout = '"ConnectTimeout=$guest_connect_timeout"' if budget_inner_connect else fixed_timeout
         guest_command = shlex.join((*options, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell))))
-        inner = f'ssh {guest_command}'
+        guest_arguments = f'-o {inner_timeout} {guest_command}'
+        inner = f'ssh {guest_arguments}'
         if diagnose_connect:
             # Only the SSH client writes this log. The shell reserves one status for a verified connect failure.
             inner = f'''log=$(mktemp "${{TMPDIR:-/tmp}}/mac-linux-ssh.XXXXXXXXXX") || exit 1
 trap 'rm -f -- "$log"' EXIT
-LC_ALL=C ssh -E "$log" {guest_command}
-status=$?
-if [ "$status" -eq 255 ] && LC_ALL=C awk '
+LC_ALL=C ssh -E "$log" {guest_arguments}
+guest_ssh_status=$?
+if [ "$guest_ssh_status" -eq 255 ] && LC_ALL=C awk '
+    {{ sub(/\\r$/, "") }}
     NR == 1 && /^ssh: connect to host [^[:space:]]+ port [0-9]+: Connection (reset by peer|refused)$/ {{ found = 1 }}
     END {{ exit !(NR == 1 && found) }}
 ' "$log"; then
     printf '%s\\n' {shlex.quote(INNER_CONNECT_MARKER)} >&2
-    status={INNER_CONNECT_STATUS}
-elif [ "$status" -eq {INNER_CONNECT_STATUS} ]; then
-    status=255
+    guest_ssh_status={INNER_CONNECT_STATUS}
+elif [ "$guest_ssh_status" -eq {INNER_CONNECT_STATUS} ]; then
+    printf '%s\\n' 'The guest SSH command exited {INNER_CONNECT_STATUS}.' >&2
+    guest_ssh_status=255
 fi
 cat "$log" >&2
-exit "$status"'''
-        return ('ssh', *options, mac, inner)
+exit "$guest_ssh_status"'''
+        if budget_inner_connect:
+            inner = f'''printf '%s\\n' {shlex.quote(INNER_CONNECT_READY)}
+IFS= read -r guest_connect_timeout || exit 1
+case "$guest_connect_timeout" in
+    ""|0*|*[!0-9]*) exit 1 ;;
+esac
+{inner}'''
+        return ('ssh', '-o', fixed_timeout, *options, mac, inner)
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
@@ -1105,6 +1117,10 @@ bundle() {
 }
 send() {
     if [ -n "$count" ]; then
+        IFS= read -r guest_connect_timeout || exit 1
+        printf '%s\\n' "$guest_connect_timeout" || exit 1
+        # Keep this sender as one process until the guest accepts the command.
+        IFS= read -r upload || exit 1
         { cat && bundle; } | tee >(wc -c >&4) || exit
     else
         { cat && bundle; } || exit
@@ -1268,6 +1284,11 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     _ = reports.callback(collect)
 
 
+def ssh_connect_timeout(remaining: float) -> int:
+    # OpenSSH uses whole seconds. The local deadline also covers a fraction of a second.
+    return max(1, min(SSH_CONNECT_TIMEOUT_SECONDS, int(remaining)))
+
+
 def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
                              armed: ArmedGuestAttempt, dispatch: GuestGateDispatch,
                              reports: ExitStack, *, connect_deadline: float = math.inf) -> tuple[bytes, bytes]:
@@ -1276,8 +1297,12 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
     from scripts.build_queue import progress_profile
 
     assert stream.stdin is not None and stream.stdout is not None and stream.stderr is not None
+    stream_input = stream.stdin
+    payload = bootstrap
     connected = connect_deadline == math.inf
+    budget_sent = connected
     deadline = monotonic() + timeout if connected else connect_deadline
+    mac_ready_line = bytearray(INNER_CONNECT_READY.encode())
     accepted_line = f'{GUEST_ACCEPTED} {armed.attempt}'.encode()
     start_line = run_start_line(armed.attempt).encode()
     progress_prefix = GUEST_PROGRESS.encode()
@@ -1289,13 +1314,16 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
     started = False
 
     def observe_guest(line: bytes) -> None:
-        nonlocal connected, deadline, started
+        nonlocal connected, deadline, payload, started
         line = line.rstrip(b'\r')
-        if not connected and line == accepted_line:
+        if not connected and budget_sent and line == accepted_line:
             now = monotonic()
             if now < deadline:
                 connected = True
                 deadline = now + timeout
+                payload = b'\n' + bootstrap
+                if not stream_input.closed:
+                    _ = ready.register(input_fd, EVENT_WRITE)
         if not connected or started or line != start_line:
             return
         started = True
@@ -1306,7 +1334,10 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
         *lines, tail = data.split(b'\n')
         for line in lines:
             reply_line.extend(line)
-            if not reply_line.startswith(progress_prefix):
+            if not budget_sent and reply_line == mac_ready_line:
+                if input_fd not in ready.get_map():
+                    _ = ready.register(input_fd, EVENT_WRITE)
+            elif not reply_line.startswith(progress_prefix):
                 stdout.extend(reply_line)
                 stdout.append(10)
             elif sidecar:
@@ -1321,14 +1352,15 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
             reply_line.clear()
         reply_line.extend(tail)
 
-    input_fd, output_fd, error_fd = stream.stdin.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
+    input_fd, output_fd, error_fd = stream_input.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
     sent = parsed = 0
     try:
         with DefaultSelector() as ready:
-            if bootstrap:
-                _ = ready.register(input_fd, EVENT_WRITE)
-            else:
-                stream.stdin.close()
+            if connected:
+                if bootstrap:
+                    _ = ready.register(input_fd, EVENT_WRITE)
+                else:
+                    stream_input.close()
             _ = ready.register(output_fd, EVENT_READ)
             _ = ready.register(error_fd, EVENT_READ)
             while ready.get_map():
@@ -1337,13 +1369,24 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
                     raise subprocess.TimeoutExpired(stream.args, timeout)
                 for key, _events in ready.select(left):
                     if key.fd == input_fd:
-                        try:
-                            sent += os.write(input_fd, bootstrap[sent:sent + PIPE_BUF])
-                        except BrokenPipeError:
-                            sent = len(bootstrap)
-                        if sent == len(bootstrap):
+                        if not budget_sent:
+                            remaining = deadline - monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(stream.args, timeout)
+                            try:
+                                _ = os.write(input_fd, f'{ssh_connect_timeout(remaining)}\n'.encode())
+                            except BrokenPipeError:
+                                stream_input.close()
+                            budget_sent = True
                             _ = ready.unregister(input_fd)
-                            stream.stdin.close()
+                            continue
+                        try:
+                            sent += os.write(input_fd, payload[sent:sent + PIPE_BUF])
+                        except BrokenPipeError:
+                            sent = len(payload)
+                        if sent == len(payload):
+                            _ = ready.unregister(input_fd)
+                            stream_input.close()
                         continue
                     data = os.read(key.fd, 65536)
                     if not data:
@@ -1399,7 +1442,8 @@ def bundle_send(repo: Path, source: CheckoutSource, bundle: FullBundle | DeltaBu
 def stream_arguments(settings: GuestSettings, shell: str, prefix: str, send: BundleSend, *,
                      count: bool, link: int, connect_timeout: int = SSH_CONNECT_TIMEOUT_SECONDS) -> list[str]:
     """Send the bootstrap and bundle, then hold the link."""
-    command = settings.command(shell, diagnose_connect=count, connect_timeout=connect_timeout)
+    command = settings.command(shell, diagnose_connect=count, budget_inner_connect=count,
+                               connect_timeout=connect_timeout)
     return ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, send.base, send.header,
             'count' if count else '', str(link), *command]
 
@@ -1434,10 +1478,9 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             connect_deadline = monotonic() + settings.unreachable_wait_seconds
 
                             def send_stream(remaining: float) -> subprocess.CompletedProcess[bytes]:
-                                connect_timeout = max(1, min(SSH_CONNECT_TIMEOUT_SECONDS, int(remaining)))
                                 arguments = stream_arguments(
                                     settings, shell, prefix, send, count=True, link=link,
-                                    connect_timeout=connect_timeout)
+                                    connect_timeout=ssh_connect_timeout(remaining))
                                 return stream_guest_bundle(
                                     repo, arguments, bootstrap, settings.transfer_timeout_seconds, link,
                                     armed_for_stream, dispatch, connect_deadline=connect_deadline)

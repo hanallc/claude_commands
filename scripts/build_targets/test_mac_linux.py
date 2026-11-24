@@ -60,7 +60,10 @@ if os.environ.get('FIXTURE_CHECK_SIDECAR'):
 if host == 'fixture-mac':
     environment = dict(os.environ, TMPDIR=str(Path(os.environ['FIXTURE_SSH_TRACE']).parent),
                        FIXTURE_MAC_CONNECT_TIMEOUT=connect_timeout)
-    sys.exit(subprocess.call(['bash', '-c', command], env=environment))
+    if 'bundle unbundle -' in command:
+        time.sleep(float(os.environ.get('FIXTURE_MAC_STREAM_DELAY', '0')))
+    mac_shell = os.environ.get('FIXTURE_MAC_SHELL', 'bash')
+    sys.exit(subprocess.call([mac_shell, '-c', command], env=environment))
 assert host == 'fixture-guest'
 assert sys.argv[-4:-2] == ['-l', os.environ['FIXTURE_GUEST_USER']]
 shell = shlex.split(command)[-1]
@@ -82,7 +85,7 @@ if fault in ('reset', 'refused', 'denied'):
               'denied': 'fixture-guest: Permission denied (publickey).'}
     if '-E' in sys.argv:
         with open(sys.argv[sys.argv.index('-E') + 1], 'a') as client_log:
-            print(errors[fault], file=client_log)
+            client_log.write(errors[fault] + '\\r\\n')
     else:
         print(errors[fault], file=sys.stderr)
     sys.exit(255)
@@ -92,6 +95,9 @@ if fault == 'slow-connect':
     time.sleep(7)
     sys.exit(255)
 if fault in ('reset-before-lock', 'forged-marker'):
+    first_command = shell.splitlines()[0]
+    assert 'mac-linux command accepted' in first_command
+    subprocess.run(['bash', '-c', first_command], check=True)
     received = sys.stdin.buffer.read(16)
     trace_path.with_name('received-before-lock').write_bytes(received)
     if fault == 'forged-marker':
@@ -1891,12 +1897,17 @@ fi
                              armed: mac_linux.ArmedGuestAttempt, _dispatch: mac_linux.GuestGateDispatch,
                              _reports: ExitStack, *, connect_deadline: float,
                              ) -> tuple[bytes, bytes]:
-            assert process.stdin is not None and process.stderr is not None
-            _ = process.stdin.write(bootstrap)
-            process.stdin.close()
+            assert process.stdin is not None and process.stdout is not None and process.stderr is not None
             self.assertGreater(connect_deadline, time.monotonic())
+            self.assertTrue(select.select([process.stdout], [], [], 6)[0])
+            self.assertEqual(process.stdout.readline(), f'{mac_linux.INNER_CONNECT_READY}\n'.encode())
+            _ = process.stdin.write(b'8\n')
+            process.stdin.flush()
             self.assertTrue(select.select([process.stderr], [], [], 6)[0])
             self.assertEqual(process.stderr.readline(), f'{mac_linux.GUEST_ACCEPTED} {armed.attempt}\n'.encode())
+            _ = process.stdin.write(b'\n' + bootstrap)
+            process.stdin.close()
+            self.assertTrue(select.select([process.stderr], [], [], 6)[0])
             self.assertEqual(process.stderr.readline(), b'fixture local SSH is still active\n')
             raise KeyboardInterrupt
 
@@ -2053,8 +2064,9 @@ fi
         with patch.dict(os.environ, {'FIXTURE_SSH_PROBE': 'reset', 'FIXTURE_SSH_ARM': 'refused',
                                      'FIXTURE_SSH_RUN': 'reset', 'FIXTURE_SSH_CLEANUP': 'reset'}):
             result = self.route()
-        assert isinstance(result, GateRun), result
+        assert isinstance(result, mac_linux.MacLinuxGateRun), result
         self.assertTrue(result.passed)
+        self.assert_bundle(result, mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN, 'first')
         self.assertEqual(len(self.consumed), 1)
         self.assert_guest_clean('probe', 'probe', 'arm', 'arm', 'run', 'run', 'cleanup', 'cleanup')
 
@@ -2097,21 +2109,43 @@ fi
                 reason = self.not_started(self.route())
                 self.assertIn('SSH or source stream exited 255', reason)
                 self.assertIn('Connection reset by peer', reason)
+                if fault == 'forged-marker':
+                    self.assertIn('The guest SSH command exited 254.', reason)
                 self.assertEqual(len((self.root / 'received-before-lock').read_bytes()), 16)
                 self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
                 self.assertEqual(list(self.root.glob('mac-linux-ssh.*')), [])
 
     def test_stream_connect_deadline_bounds_both_ssh_hops_and_the_local_wait(self) -> None:
         key = target_config.UNREACHABLE_WAIT_KEY
-        _ = self.registry.write_text(self.registry.read_text().replace(f'{key}=20', f'{key}=3'))
-        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,slow-connect'}):
+        _ = self.registry.write_text(self.registry.read_text().replace(f'{key}=20', f'{key}=5'))
+        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'slow-connect', 'FIXTURE_MAC_STREAM_DELAY': '2.1'}):
             result = self.route()
         elapsed = time.monotonic()
         mac_timeout, guest_timeout, started = (self.root / 'connect-timing').read_text().split()
-        self.assertEqual((mac_timeout, guest_timeout), ('ConnectTimeout=1', 'ConnectTimeout=1'))
+        mac_seconds = int(mac_timeout.removeprefix('ConnectTimeout='))
+        guest_seconds = int(guest_timeout.removeprefix('ConnectTimeout='))
+        self.assertLessEqual(guest_seconds, mac_seconds - 1)
         self.assertLess(elapsed - float(started), 4)
         self.assertIn('guest SSH connect deadline expired before command acceptance', str(result))
-        self.assert_guest_clean('probe', 'arm', 'run', 'run', 'cleanup')
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_mac_wrapper_runs_under_bash_and_zsh(self) -> None:
+        for shell in ('bash', 'zsh'):
+            with self.subTest(shell=shell), patch.dict(os.environ, {'FIXTURE_MAC_SHELL': shell}):
+                _ = self.trace.write_text('')
+                result = self.route()
+                assert isinstance(result, GateRun), result
+                self.assertTrue(result.passed)
+                self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+                self.assertEqual(list(self.root.glob('mac-linux-ssh.*')), [])
+
+    def test_guest_probe_retries_a_crlf_ssh_client_log(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        with (patch.dict(os.environ, {'FIXTURE_SSH_PROBE': 'reset'}),
+              patch.object(mac_linux, 'sleep') as delay):
+            self.assertIsInstance(mac_linux.read_guest_main(settings), mac_linux.EmptyGuestMain)
+        delay.assert_called_once_with(mac_linux.CONNECT_RETRY_SECONDS)
+        self.assert_guest_clean('probe', 'probe')
 
     def test_arm_stays_valid_through_a_connect_retry(self) -> None:
         with (patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 1),
