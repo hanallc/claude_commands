@@ -46,14 +46,16 @@ def natedev_only_flag(command: tuple[str, ...]) -> str | None:
     return None if isinstance(program, OtherCommand) else gate_natedev_only_flag(program[1])
 
 
+def is_claude_gate_source(repo_root: Path) -> bool:
+    try:
+        return build_folders.repo_word(repo_root) == "claude"
+    except build_folders.InvalidFolderForm:
+        return False
+
+
 def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...] | NoEnabledTarget:
     """Select the enabled targets that can run a Claude gate."""
-    if natedev_only_flag(command) is not None:
-        return ()
-    try:
-        if build_folders.repo_word(repo_root) != "claude":
-            return ()
-    except build_folders.InvalidFolderForm:
+    if natedev_only_flag(command) is not None or not is_claude_gate_source(repo_root):
         return ()
     registry = conf.read("build_targets")
     builder = placement_constraint_builder()

@@ -650,6 +650,139 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_pending_scaler_settlement_blocks_reassignment_across_restart(self) -> None:
+        with PlacementFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = placement.assigned_claim_reference(assignment)
+            consume = consume_permission("launch", assignment, claim)
+            self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.FirstAuthorization)
+            settle = mock.Mock(return_value=placement.Pending("launch unknown"))
+            provider = mock.Mock(spec=placement.CloudGateProvider, settlement=settle)
+            pending_read, settled_read = threading.Event(), threading.Event()
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            run_probe = cast(Callable[[service.HostEvidenceWorker, placement.HostEvidenceKey, object], bool],
+                             getattr(service.HostEvidenceWorker, "_probe"))
+
+            def observe(worker: service.HostEvidenceWorker, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                keep_running = run_probe(worker, key, subscription)
+                with worker.lock:
+                    observed = worker.dispatch_observations.get(attempt)
+                    if keep_running and observed is not None:
+                        if isinstance(observed.result, placement.DispatchPathSettled):
+                            settled_read.set()
+                        else:
+                            pending_read.set()
+                return keep_running
+
+            with (mock.patch.object(service, "scaler_provider", return_value=provider),
+                  mock.patch.object(service.HostEvidenceWorker, "_probe", observe)):
+                probe = wire.SettlementRequest(assignment)
+                payload = wire.encode_request(probe)
+                self.assertNotIn('"request_id"', payload)
+                self.assertNotIn('"code_version"', payload)
+                self.assertEqual(wire.parse_request(payload), probe)
+                self.assertIsInstance(fixture.server.handle_request(probe)[0], wire.Ok)
+                self.assertTrue(pending_read.wait(TEST_HANG_GUARD_SECS))
+                settle.assert_called_with(assignment.episode, int(assignment.attempt, 16))
+                fixture.restart()
+                pending_read.clear()
+                settle.reset_mock()
+                key = publish_candidate(fixture, request).key
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+                self.assertEqual(fixture.server.current_assignments.get(request.episode), attempt)
+                reader = fixture.server.host_readers[key].worker
+                reader.expedite(key)
+                self.assertTrue(pending_read.wait(TEST_HANG_GUARD_SECS))
+                settle.assert_called_with(assignment.episode, int(assignment.attempt, 16))
+                settle.return_value = placement.Settled()
+                reader.expedite(key)
+                self.assertTrue(settled_read.wait(TEST_HANG_GUARD_SECS))
+                _ = fixture.run_pass()
+                replacement = assignment_for(fixture, request)
+                self.assertEqual((replacement.episode, replacement.since), (assignment.episode, assignment.since))
+                self.assertNotEqual(replacement.attempt, assignment.attempt)
+
+    def test_scaler_recovers_after_two_capacity_declines(self) -> None:
+        with PlacementFixture() as fixture:
+            request = scaler_gate_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=request.constraints.candidates[:1]))
+            provider = mock.Mock(spec=placement.CloudGateProvider, settlement=mock.Mock(return_value=placement.Settled()))
+            with (mock.patch.object(service, "scaler_provider", return_value=provider),
+                  mock.patch.object(service.HostEvidenceWorker, "dispatch_pending",
+                                    autospec=True, side_effect=dispatch_probe_pending)):
+                attempts: set[str] = set()
+                for decline in range(2):
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    attempts.add(assignment.attempt)
+                    _ = fixture.server.handle_request(wire.ClaimFailure(f"decline-{decline}", assignment, "no capacity"))
+                    _ = fixture.run_pass()
+                replacement = assignment_for(fixture, request)
+                self.assertEqual(replacement.destination, request.constraints.candidates[0].destination)
+                self.assertNotIn(replacement.attempt, attempts)
+
+    def test_gate_retry_requests_each_persist_once(self) -> None:
+        with PlacementFixture() as fixture:
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            server = fixture.server
+            peer = fixture.proc.spawn(used=0)
+            outbound, inbound = socket.socketpair()
+
+            def record_version(_request: wire.Request, _connection: service.Connection, *,
+                               persist_change: bool = True) -> None:
+                server.caller_versions[records.run_owner(peer.pid, peer.start_time)] = "fixture-version"
+                if persist_change:
+                    server.persist()
+
+            with (outbound, inbound, mock.patch.object(server, "_record_caller_version", side_effect=record_version),
+                  mock.patch.object(server, "_pass_gap_open", return_value=True),
+                  mock.patch.object(server, "persist", wraps=server.persist) as persist):
+                failure = wire.ClaimFailure("decline", assignment, "no capacity", code_version="fixture-version")
+                connection = service.Connection(outbound)
+                result, = server.handle_request(failure, connection)
+                assert isinstance(result, wire.DispatchStatus), result
+                self.assertIsInstance(result.retry, placement.RetryAt)
+                persist.assert_called_once()
+                persist.reset_mock()
+                with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=True):
+                    self.assertIsInstance(server.handle_request(request, connection)[0], wire.PlacementWait)
+                persist.assert_called_once()
+                persist.reset_mock()
+                with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=False):
+                    self.assertIsInstance(server.handle_request(request, connection)[0], wire.Assignment)
+                persist.assert_called_once()
+
+    def test_scaler_execution_report_persists_one_transition(self) -> None:
+        with PlacementFixture() as fixture:
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = placement.assigned_claim_reference(assignment)
+            self.assertIsInstance(fixture.server.handle_request(consume_permission("launch", assignment, claim))[0],
+                                  wire.FirstAuthorization)
+            outbound, inbound = socket.socketpair()
+            with outbound, inbound:
+                server = fixture.server
+
+                def record_version(_request: wire.Request, _connection: service.Connection, *,
+                                   persist_change: bool = True) -> None:
+                    if persist_change:
+                        server.persist()
+
+                for path in (placement.DispatchPathPending("pending"), placement.DispatchPathSettled()):
+                    report = wire.ExecutionReport("execution", assignment, claim, execution_identity.ExecutionNotStarted(),
+                                                  placement.AttemptDeclined("ended"), path, code_version="fixture-version")
+                    with (mock.patch.object(server, "_record_caller_version", side_effect=record_version),
+                          mock.patch.object(server, "persist", wraps=server.persist) as persist):
+                        self.assertIsInstance(server.handle_request(report, service.Connection(outbound))[0],
+                                              wire.DispatchStatus)
+                        persist.assert_called_once()
+
     def test_gate_uses_guest_when_local_waits_and_aws_has_no_quota(self) -> None:
         for mode in ("allowed", "fixed exclusion", "Mac block"):
             with self.subTest(mode=mode), PlacementFixture() as fixture:
@@ -1655,6 +1788,56 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(settled.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
             self.assertIsInstance(settled.permission, placement.PermissionConsumed)
             self.assertEqual(settled.retry, placement.RetryAt(fixture.clock.now() + 180))
+            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
+    def test_guest_execution_outlives_holder_and_arbitrary_refusal_keeps_assignment(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization), granted
+            observed = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                assignment.destination.host, "guest-boot", 4321, "guest-start"))
+            _ = fixture.server.handle_request(wire.ExecutionReport("running", assignment, granted.claim,
+                observed, placement.AttemptRunning()))
+            fixture.end_owner(holder)
+            with mock.patch.object(fixture.server, "_start_pending", return_value=False):
+                status, = fixture.server.handle_request(wire.ClaimFailure("lost-holder", assignment, "holder ended"))
+                claimed_no_run, = fixture.server.handle_request(wire.ClaimFailure("no-run", assignment, MAC_LINUX_NO_ANSWER))
+            assert isinstance(status, wire.DispatchStatus), status
+            assert isinstance(claimed_no_run, wire.DispatchStatus), claimed_no_run
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            self.assertEqual(claimed_no_run.state, placement.CurrentAssignment())
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+
+    def test_observed_guest_survives_both_owners_until_settlement(self) -> None:
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization), granted
+            observed = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                assignment.destination.target, "guest-boot", "guest-machine", assignment.attempt))
+            _ = fixture.server.handle_request(wire.ExecutionReport("running", assignment, granted.claim, observed))
+            fixture.end_owner(holder)
+            fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+            for restart in (False, True):
+                if restart:
+                    fixture.restart()
+                with mock.patch.object(fixture.server, "_start_pending", return_value=False):
+                    _ = publish_candidate(fixture, request)
+                    _ = fixture.run_pass()
+                self.assertIn(assignment.episode, fixture.server.current_assignments)
+
+            settled = wire.ExecutionReport("ended", assignment, granted.claim, observed,
+                placement.AttemptCompleted(0), placement.DispatchPathSettled())
+            reply, = fixture.server.handle_request(settled)
+            assert isinstance(reply, wire.DispatchStatus), reply
+            self.assertEqual(reply.state, placement.ClosedAssignment("completed"))
             self.assertNotIn(assignment.episode, fixture.server.current_assignments)
 
     def test_a_guest_attempt_stays_current_after_its_gate_ends_while_its_owner_lives(self) -> None:

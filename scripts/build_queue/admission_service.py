@@ -1556,6 +1556,7 @@ class WaiterClaimDisposition(Enum):
 
 
 BeforeLaunchRefusal = placement.PrelaunchRefused | execution_identity.HanaCommandAdmissionRefused
+SCALER_SETTLEMENT_REQUESTED = placement.AttemptDeclined("scaler settlement requested")
 
 
 @dataclass
@@ -4172,6 +4173,8 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
+        if saved.guest_execution_observed:
+            return False
         # Only copies.py knows if the guest gate took a run.
         # While it lives, its claim failure or its end closes the guest attempt.
         guest_owner_live = (assignment.destination.target == "mac-linux"
@@ -4189,7 +4192,8 @@ done
         send a terminal report, and a pending start can still launch, so both keep it current until
         the owner asks again (`_close_abandoned_attempt`).
         """
-        return (self._ended_claim_holder(saved)
+        return (not saved.guest_execution_observed
+            and self._ended_claim_holder(saved)
             and not self._placement_owner_live(saved.assignment.owner)
             and not self._start_pending(saved))
 
@@ -4222,11 +4226,12 @@ done
         """
         saved = self.assignments.get(self.current_assignments.get(episode, ""))
         if (saved is None or not isinstance(saved.state, placement.CurrentAssignment)
+                or saved.assignment.destination.target == "mac-linux"
                 or not isinstance(saved.terminal_report, placement.NoTerminalReport)
                 or not self._ended_claim_holder(saved) or not self._next_claim_takes_over(saved)):
             return
         report = self._lost_report()
-        self._close_for_report(replace(saved, terminal_report=report), report)
+        self._close_for_report(replace(saved, terminal_report=report), report, persist_change=False)
 
     def _next_claim_takes_over(self, saved: records.SavedPlacementAssignment) -> bool:
         """A mac_test claim gives its kept claim and pending start to the next claim for its scope.
@@ -4393,11 +4398,11 @@ done
         previous = [saved for saved in self.assignments.values()
             if saved.assignment.episode == request.episode and saved.assignment.destination == destination
             and isinstance(saved.state, placement.ClosedAssignment)]
-        if not previous:
-            return placement.RetryAt(0)
         # A guest that took no run twice in one run has a cause that does not clear; the next named machine takes it.
         if sum(closed.state == placement.ClosedAssignment(MAC_LINUX_NO_ANSWER) for closed in previous) > 1:
             return placement.DoNotRetry(MAC_LINUX_NO_ANSWER)
+        if not previous:
+            return placement.RetryAt(0)
         saved = previous[-1]
         retry = saved.retry
         if (isinstance(retry, placement.DoNotRetry) and retry.reason in placement.SETTINGS_REFUSAL_REASONS
@@ -5045,7 +5050,8 @@ done
         holder = saved.holder
         return (saved.assignment.destination.target == "mac-linux"
                 and isinstance(saved.permission, placement.PermissionConsumed)
-                and isinstance(request.claim, placement.NoProviderClaim) and bool(request.reason)
+                and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
+                and not saved.guest_execution_observed
                 and isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host
                 and not owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time))
 
@@ -5068,7 +5074,7 @@ done
         return holder.pid in gate.process_tree({owner.pid: owner.start_time}, processes)
 
     def _close_placement(self, saved: records.SavedPlacementAssignment, reason: str,
-                         retry: placement.RetryDecision) -> None:
+                         retry: placement.RetryDecision, *, persist_change: bool = True) -> None:
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         self._remove_waiter(self.waiters.get(assignment.episode))
@@ -5084,7 +5090,8 @@ done
         if current and request is not None and self._placement_waiting(request):
             self._save_place(request, self._placement_row(request))
         self._prune_host_evidence()
-        self.persist()
+        if persist_change:
+            self.persist()
         self.next_pass = self.clock.monotonic()
 
     def _settle_hana_prelaunch(self, saved: records.SavedPlacementAssignment,
@@ -5124,7 +5131,7 @@ done
                 continue
             report = saved.terminal_report
             if assignment.destination.provider == "scaler":
-                self._settle_scaler_attempt(saved)
+                self._settle_scaler_attempt(saved, persist_change=False)
                 continue
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
@@ -5140,7 +5147,7 @@ done
                 report = replace(report, path=placement.DispatchPathSettled())
                 saved = replace(saved, terminal_report=report)
             if (isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
-                    and not isinstance(report.outcome, placement.AttemptDeclined)):
+                    and (saved.guest_execution_observed or not isinstance(report.outcome, placement.AttemptDeclined))):
                 self._close_for_report(saved, report)
                 continue
             if assignment.destination.provider == "local":
@@ -5172,12 +5179,32 @@ done
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
 
-    def _settle_scaler_attempt(self, saved: records.SavedPlacementAssignment) -> None:
+    def _request_scaler_settlement(self, request: wire.SettlementRequest) -> wire.Ok | wire.Refused:
+        assignment = request.assignment
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        saved = self.assignments.get(key)
+        if assignment.destination.provider != "scaler" or saved is None or saved.assignment != assignment:
+            return wire.Refused("settlement requires the exact scaler assignment")
+        if isinstance(saved.state, placement.ClosedAssignment):
+            return wire.Ok()
+        if self.current_assignments.get(assignment.episode) != key:
+            return wire.Refused("the scaler attempt is not current")
+        if isinstance(saved.terminal_report, placement.NoTerminalReport):
+            terminal = placement.TerminalAttemptReport(SCALER_SETTLEMENT_REQUESTED,
+                placement.DispatchPathPending("the scaler launch is unsettled"), self.clock.now())
+            saved = replace(saved, terminal_report=terminal)
+            self.assignments[key] = saved
+            self.persist()
+        self._settle_scaler_attempt(saved)
+        self.next_pass = self.clock.monotonic()
+        return wire.Ok()
+
+    def _settle_scaler_attempt(self, saved: records.SavedPlacementAssignment, *, persist_change: bool = True) -> None:
         """Release the scaler slot only when the report or ledger proves settlement."""
         assignment = saved.assignment
         report = saved.terminal_report
         if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled):
-            self._close_for_report(saved, report)
+            self._close_for_report(saved, report, persist_change=persist_change)
             return
         owner_live = self._placement_owner_live(assignment.owner)
         if isinstance(report, placement.NoTerminalReport) and owner_live and not self._ended_claim_holder(saved):
@@ -5200,9 +5227,10 @@ done
         else:
             terminal = placement.TerminalAttemptReport(placement.AttemptCancelled("coordinator ended"),
                 placement.DispatchPathSettled(), self.clock.now())
-        self._close_for_report(replace(saved, terminal_report=terminal), terminal)
+        self._close_for_report(replace(saved, terminal_report=terminal), terminal, persist_change=persist_change)
 
-    def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
+    def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport, *,
+                          persist_change: bool = True) -> None:
         outcome = report.outcome
         assignment = saved.assignment
         if (assignment.destination.provider == "local" and isinstance(outcome, placement.PrelaunchRefused)
@@ -5212,16 +5240,20 @@ done
             if assignment.episode in self.reservations:
                 return
         if isinstance(outcome, placement.AttemptCompleted):
-            self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
+            self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"),
+                                  persist_change=persist_change)
         elif isinstance(outcome, placement.AttemptCancelled):
-            self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
+            self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason),
+                                  persist_change=persist_change)
         elif isinstance(outcome, execution_identity.HanaCommandAdmissionRefused):
             self._close_placement(saved, outcome.reason,
-                placement.retry_decision(saved.assignment.destination, outcome, report.received_at))
+                placement.retry_decision(saved.assignment.destination, outcome, report.received_at),
+                persist_change=persist_change)
         elif not self._settle_hana_prelaunch(saved, report):
             self._close_placement(saved, outcome.reason,
                 saved.retry if isinstance(saved.retry, placement.RetryAt) else
-                placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
+                placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at),
+                persist_change=persist_change)
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
                           | wire.PrerequisiteReport | wire.CancelPlacement,
@@ -5310,7 +5342,6 @@ done
             if self._placement_waiting(request):
                 self._save_place(request, self._placement_row(request))
             self._watch_owner(request.owner)
-            self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
                 self.parked_placements.append(ParkedPlacement(request, connection))
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
@@ -5349,6 +5380,8 @@ done
                             or not scopes_overlap(request.claim.scope, destination.scope, mac=destination.provider == "mac")):
                         return [self._placement_status(assignment, "retained claim does not match the assigned provider scope",
                             check_lifetime=False)]
+                if isinstance(connection, Connection):
+                    self._record_caller_version(request, connection, persist_change=False)
                 terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
                     placement.DispatchPathPending('provider settlement remains pending'), self.clock.now())
                 retained = request.claim if isinstance(request.claim, placement.ProviderClaimReference) else saved.provider
@@ -5377,15 +5410,23 @@ done
                 and request.claim.episode == assignment.episode and request.claim.attempt == assignment.attempt
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
+            if assignment.destination.provider == "scaler" and isinstance(connection, Connection):
+                self._record_caller_version(request, connection, persist_change=False)
             if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
                     or not isinstance(request.evidence, execution_identity.ObservedExecution)):
                 self.execution_evidence[key] = request.evidence
+                if (assignment.destination.target == "mac-linux"
+                        and isinstance(request.evidence, execution_identity.ObservedExecution)):
+                    saved = replace(saved, guest_execution_observed=True)
+                    self.assignments[key] = saved
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)
                     and isinstance(request.evidence, execution_identity.ExecutionNotStarted)):
                 previous = saved.terminal_report
-                if isinstance(previous, placement.NoTerminalReport):
+                if (isinstance(previous, placement.NoTerminalReport)
+                        or previous.outcome == SCALER_SETTLEMENT_REQUESTED
+                        and isinstance(previous.path, placement.DispatchPathPending)):
                     terminal = placement.TerminalAttemptReport(outcome, request.path, self.clock.now())
                     retry = saved.retry
                     if isinstance(outcome, execution_identity.HanaCommandAdmissionRefused):
@@ -5402,7 +5443,7 @@ done
             if (self.current_assignments.get(assignment.episode) == key
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
-                    and (assignment.destination.provider == "scaler"
+                    and (assignment.destination.provider == "scaler" or saved.guest_execution_observed
                          or not isinstance(report.outcome, placement.AttemptDeclined))):
                 self._close_for_report(saved, report)
             else:
@@ -5419,7 +5460,7 @@ done
             if uid != os.getuid() and process_uid(request.owner.pid, self.proc.path) != uid:
                 return "Verify process belongs to another account or no longer exists"
             return ""
-        if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
+        if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport, wire.SettlementRequest,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             owner = request.owner if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport, wire.CancelPlacement)) else request.assignment.owner
             episode = request.episode if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport, wire.CancelPlacement)) else request.assignment.episode
@@ -5539,8 +5580,12 @@ done
         if isinstance(request, wire.VerifyRunSlotRequest):
             # Older clients can still ask. Only a local memory grant takes a slot.
             return [wire.Ok()]
-        if isinstance(connection, Connection):
-            self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
+        if isinstance(request, wire.SettlementRequest):
+            return [self._request_scaler_settlement(request)]
+        scaler_report = isinstance(request, wire.ExecutionReport) and request.assignment.destination.provider == "scaler"
+        if isinstance(connection, Connection) and not scaler_report and not isinstance(request, wire.ClaimFailure):
+            self._record_caller_version(request, connection,
+                persist_change=not isinstance(request, (wire.ConsumePermission, wire.PlacementRequest)))
         if isinstance(request, wire.PlacementRequest):
             identity = self._placement_identity(request)
             members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
@@ -5998,7 +6043,7 @@ done
 
     def _record_caller_version(self, request: wire.Request, connection: Connection,
                                *, persist_change: bool = True) -> None:
-        if not request.code_version:
+        if not isinstance(request, wire.CallerCode) or not request.code_version:
             return
         pid, uid, gid = struct.unpack("3i", connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         del uid, gid

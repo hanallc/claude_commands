@@ -388,7 +388,8 @@ class AdmissionResources:
 
 
 def _is_placement_control(request: wire.Request) -> bool:
-    return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport, wire.CancelPlacement))
+    return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport,
+                                wire.CancelPlacement, wire.SettlementRequest))
 
 
 def _waits_for_live_service(request: wire.Request) -> bool:
@@ -399,7 +400,7 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | wire.SettlementRequest | status_wire.PlacementStatusRequest) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
@@ -408,6 +409,7 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
         if isinstance(reply, wire.Refused):
             raise wire.AdmissionUnavailable(reply.reason)
         return reply
+    assert isinstance(request, wire.CallerCode)
     request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
     timeout = records.read_memory_config().query_timeout_seconds
     deadline = CLOCK.monotonic() + timeout
@@ -594,6 +596,11 @@ def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
     raise wire.AdmissionUnavailable("invalid execution report answer")
 
 
+def request_settlement(request: wire.SettlementRequest) -> None:
+    if not isinstance(_query(request), wire.Ok):
+        raise wire.AdmissionUnavailable("invalid settlement answer")
+
+
 class _HistoryNeeded(BaseException):
     pass
 
@@ -741,10 +748,30 @@ class AcquisitionRetry:
 _ACQUISITION_RETRY: ContextVar[AcquisitionRetry | None] = ContextVar("acquisition_retry", default=None)
 
 
+_PLACEMENT_RETRY_DEADLINE: ContextVar[float] = ContextVar("placement_retry_deadline", default=float("inf"))
+
+
+def launch_wait_limit_seconds() -> int:
+    return _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
+
+
+@contextmanager
+def scaler_retry_window(since: float) -> Generator[None]:
+    """Use the launch wait limit for replacement placement after a scaler decline."""
+    remaining = launch_wait_limit_seconds() - max(0.0, CLOCK.now() - since)
+    if remaining <= 0:
+        raise wire.AdmissionUnavailable(LAUNCH_WAIT_LIMIT_REASON)
+    token = _PLACEMENT_RETRY_DEADLINE.set(CLOCK.monotonic() + remaining)
+    try:
+        yield
+    finally:
+        _PLACEMENT_RETRY_DEADLINE.reset(token)
+
+
 @contextmanager
 def placement_acquisition() -> Generator[None]:
     """Preserve one leave schedule across placement replies and estimate requests."""
-    token = _ACQUISITION_RETRY.set(AcquisitionRetry(float("inf")))
+    token = _ACQUISITION_RETRY.set(AcquisitionRetry(_PLACEMENT_RETRY_DEADLINE.get()))
     try:
         yield
     except _QueueUnreachable as error:
@@ -907,7 +934,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
-        limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
+        limit = launch_wait_limit_seconds()
         launch = isinstance(request, wire.LaunchRequest)
         deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
                     if isinstance(request, wire.RepositorySlotRequest) else
@@ -923,7 +950,8 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 return refuse(str(error), checker=True)
         else:
             resolved = configuration
-        request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
+        if isinstance(request, wire.CallerCode):
+            request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
         if report_refusal and isinstance(resolved, records.MemoryConfig):
             records.warn_configuration_diagnostics(resolved.diagnostics)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest)):
@@ -1545,7 +1573,7 @@ def launch(request: wire.LaunchRequest, on_wait: Callable[[wire.Wait], None],
 def _first_request_wait[Request, Reply](launching: bool, refresh: Callable[[], Request],
                                         wait: Callable[[Request], Reply]) -> Reply | wire.Refused | LeftQueue:
     """Build the first request inside the retry schedule that its refreshes use."""
-    limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
+    limit = launch_wait_limit_seconds()
     token = _ACQUISITION_RETRY.set(AcquisitionRetry(CLOCK.monotonic() + limit if launching and limit > 0 else float("inf"),
                                                     launch_without_wait=launching and limit == 0))
     try:

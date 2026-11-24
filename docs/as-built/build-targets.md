@@ -47,9 +47,9 @@ A Claude gate requests placement on every eligible target in `build_targets.conf
 The caller reads the targets in registry order and applies the fixed placement rules.
 It omits any target whose `enabled.<target>` switch is off.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
-Standalone named module tests and nightly suites can request the same targets.
+Standalone named module tests and nightly suites run on natedev.
 A nested named module can use its parent reservation. Promotion without tests uses natedev.
-Hana gates have no repository default.
+A Hana gate without requested targets uses its existing unassigned cloud route.
 
 The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
 To register a scaler, include its name in `targets` and set `kind.<name>=scaler`.

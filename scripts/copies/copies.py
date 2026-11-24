@@ -1451,13 +1451,15 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
 def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
                  merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
     """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
-    with _admitted_command_tree(owner, repo, policy, command, merge=merge, step=step, gate_targets=gate_targets) as (tree, _):
+    with _admitted_command_tree(owner, repo, policy, command, merge=merge, step=step, gate_targets=gate_targets,
+                                place_unnamed_gate=False) as (tree, _):
         yield tree
 
 
 @contextmanager
 def _admitted_command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-                           merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = ()
+                           merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (),
+                           place_unnamed_gate: bool = True,
                            ) -> Generator[tuple[Path, first_step.FirstStepAdmission | None]]:
     from scripts.build_targets.gate_targets import uses_parent_reservation
 
@@ -1468,12 +1470,13 @@ def _admitted_command_tree(owner: str, repo: str | Path, policy: SourcePolicy, c
             admitted: first_step.FirstStepAdmission | None = None
             if isinstance(job, StepJob) and (gate_targets or not uses_parent_reservation(tuple(command))):
                 source = Path(repo).expanduser().resolve()
-                if command_program(command) in GATE_SCRIPTS or isinstance(verify_command(command), VerifyCommand):
+                if (gate_targets or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
+                        or isinstance(verify_command(command), VerifyCommand)):
                     source = scope.enter_context(requested_source(source, policy, merge))
                     policy = CommittedSource(commit_at(source, "HEAD"))
                     merge = NO_MERGE
-                admission = (first_step.admitted_run(command, source, targets=gate_targets) if gate_targets
-                             else first_step.admitted_run(command, source))
+                admission = first_step.admitted_run(command, source, targets=gate_targets,
+                                                    place_unnamed_gate=place_unnamed_gate)
                 admitted = scope.enter_context(admission)
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command))
                 admitted.handoff(tree)

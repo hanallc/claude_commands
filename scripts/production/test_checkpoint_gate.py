@@ -23,7 +23,7 @@ from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_placement import PlacementFixture
 from scripts.copies import copies
 from scripts.lib import build_folders, process_stat
-from scripts.lib.build_steps import gate_job_from_process
+from scripts.lib.build_steps import GATE_UNSETTLED_LAUNCH_STATUS, gate_job_from_process
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate
@@ -250,6 +250,17 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertEqual(stopped.exception.red, (checkpoint_gate.RedStep(fixture.step, frozenset({red})),))
         self.assertEqual(run.call_count, 2)
         fixture.report_failure.assert_called_once_with(fixture.refusal)
+
+    def test_exit_80_blocks_checkpoint_without_rerun(self) -> None:
+        fixture = GatePlacementFixture(self)
+        result = subprocess.CompletedProcess(COMMAND, GATE_UNSETTLED_LAUNCH_STATUS, "", "settlement pending")
+        with (mock.patch.object(checkpoint_gate, "run_test_command", return_value=result) as run,
+              self.assertRaises(checkpoint_gate.Stop) as stopped):
+            _ = checkpoint_gate.run_test_steps(fixture.production, [fixture.step], frozenset(),
+                                               frozenset(), fixture.log)
+        self.assertEqual(stopped.exception.state, "blocked")
+        self.assertIn("settlement", stopped.exception.detail)
+        run.assert_called_once_with(COMMAND, fixture.step.folder)
 
     def test_unsettled_attempt_blocks_another_launch(self) -> None:
         fixture = GatePlacementFixture(self)
