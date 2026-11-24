@@ -22,6 +22,7 @@ from scripts.direct import assign, progress_history, recorder_state
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
+from scripts.direct.test_phase_reservation import make_fixture_worktree
 from scripts.herdr import herdr, turn_end, worker_panes
 from scripts.lib import unit_runs
 from scripts.lint import style_review
@@ -804,6 +805,20 @@ class AssignLauncherTests(HookAssignmentFixture):
                               check=True, capture_output=True, text=True).stdout
         self.assertEqual((self.session_dir / "phases/3/phase_baseline").read_text(), head)
         self.assertEqual((self.session_dir / "baseline-at-worker-assign").read_text(), head)
+
+    def test_herdr_assignment_starts_the_worker_in_the_claimed_checkout(self) -> None:
+        other = make_fixture_worktree(self.project, "fixture", "phase-7")
+        directories: list[object] = []
+
+        def read_directory() -> None:
+            pane = self.native.agent.submitted[-1][0]
+            directories.append(self.native.fixture.world.locations[pane]["cwd"])
+
+        self.native.agent.during_prompt = read_directory
+        _ = self.successful("implement", "--cwd", str(other))
+
+        self.assertEqual((self.session_dir / "phases/7/worktree").read_text().strip(), str(other))
+        self.assertEqual(directories, [str(other)])
 
     def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
         status = self.session_dir / "phases/3/impl_status"

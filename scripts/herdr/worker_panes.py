@@ -86,6 +86,8 @@ class DurableDesignRole:
 
 PaneTarget = StaffWorker | ConsultationPane | DurableDesignRole
 
+CLAIMED_WORKING_DIR_ENV = "UNIT_CLAIMED_WORKING_DIR"
+
 
 @dataclass(frozen=True)
 class DispatchRun:
@@ -1499,7 +1501,10 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
-    directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
+    if claimed := os.environ.get(CLAIMED_WORKING_DIR_ENV):
+        directory = Path(claimed).resolve()
+    else:
+        directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
     prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):

@@ -518,9 +518,11 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
-    if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(),
-            log, assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
-        return 1
+    claimed_cwd = Path(args.cwd).expanduser().resolve()
+    if role != "review":
+        if not assign_claude.claim_phase(run, phase, claimed_cwd, log,
+                                        assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
+            return 1
     command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),
                "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
                "--lens", args.lens, "--fix-cause", args.fix_cause,
@@ -542,6 +544,9 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
                 "--new-pass-instance-id", str(instance)]
     worker_env = {**env, progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
+    _ = worker_env.pop(worker_panes.CLAIMED_WORKING_DIR_ENV, None)
+    if role != "review":
+        worker_env[worker_panes.CLAIMED_WORKING_DIR_ENV] = str(claimed_cwd)
     _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
