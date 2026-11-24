@@ -2515,13 +2515,12 @@ def run_recorded_batch(resume_record: BatchResumeRecord, upstream: str) -> int:
         try:
             atomic_file.sync_folder(resume_record.path.parent)
         except OSError as error:
-            stop = checkpoint_gate.Stop("batch", "held", f"could not confirm the saved batch drop: {error}",
+            detail = (f"could not confirm the saved batch drop in {resume_record.path}: {error}. "
+                      "Resolve the filesystem error, then resume with the same batch.")
+            stop = checkpoint_gate.Stop("batch", "held", detail,
                                         "the showrunner will inspect the batch record")
             pending = tuple(row for row in resume_record.checkpoints if not checkpoint_completed(row, upstream))
-            rollback: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT
-            if any(row.commit == drop.commit for row in resume_record.unpublished_checkpoints):
-                rollback = ResetBatchCheckout(production, drop.start_tip, drop.tested_tip, drop.published_tip, resume_record)
-            return finish_batch_stop(stop, batch_stop_notices(pending, stop), rollback)
+            return finish_batch_stop(stop, batch_stop_notices(pending, stop), KEEP_BATCH_CHECKOUT)
     if not isinstance(resume_record.merge_state, NoBatchMerge) and isinstance(
             read_open_merge(merge_head_path(production.checkout)), NoOpenMerge):
         resume_record.store_merge_state(NO_BATCH_MERGE)
