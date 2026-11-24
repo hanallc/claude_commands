@@ -3828,23 +3828,24 @@ def check_named_modules(repo: Path, names: Sequence[str]) -> None:
                               + "Use a path under scripts/, for example lib/test_x.py.")
 
 
-def gate_source_check(arguments: Sequence[str], parser: argparse.ArgumentParser) -> Callable[[Path], None] | None:
-    """Parse the gate command before copies prepares its source."""
+def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.ArgumentParser, source: Path) -> None:
+    """Check the gate arguments and named modules in the prepared source."""
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
         _ = parse_nightly_arguments(arguments, parser)
-        return None
+        return
     args = parse_gate_arguments(arguments, parser, repo_default=".")
     if not args.modules:
-        return None
-
-    def check(source: Path) -> None:
-        repo = source / Path(args.repo.replace("{tree}", str(source))).expanduser()
-        try:
-            check_named_modules(repo.resolve(), args.modules)
-        except GateRefused as error:
-            parser.error(str(error))
-
-    return check
+        return
+    repo = (source / Path(args.repo.replace("{tree}", str(source))).expanduser()).resolve()
+    if not repo.is_relative_to(source) or not (repo / "scripts").resolve().is_relative_to(source):
+        parser.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
+    try:
+        check_named_modules(repo, args.modules)
+    except GateRefused as error:
+        parser.error(str(error))
+    for name in args.modules:
+        if not (repo / "scripts" / name).resolve().is_relative_to(source):
+            parser.error(f"--module {name!r} points outside the prepared source.")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

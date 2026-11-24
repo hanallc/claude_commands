@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import ast
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -16,7 +17,6 @@ from enum import Enum, auto
 import json
 import fcntl
 import hashlib
-from importlib import import_module
 import shlex
 import math
 import os
@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NoReturn, Protocol, TextIO, cast, override
+from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
@@ -1466,25 +1466,70 @@ class DirectCommandCopy:
     tree: Path
 
 
-class GateCommandParser(argparse.ArgumentParser):
-    @override
-    def error(self, message: str) -> NoReturn:
-        raise CopyError(message)
+GATE_SCRIPT = Path("scripts/production/gate.py")
+GATE_MODULE = "scripts.production.gate"
+GATE_CHECK_HELP = 3
+GATE_CHECK_PROGRAM = """
+import argparse
+from pathlib import Path
+import sys
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise SystemExit(message)
+
+root = Path.cwd()
+sys.path.insert(0, str(root))
+from scripts.production.gate import check_prepared_gate_source
+
+try:
+    check_prepared_gate_source(sys.argv[2:], Parser(prog="gate.py", allow_abbrev=False), root)
+except SystemExit as error:
+    if error.code == 0:
+        raise SystemExit(int(sys.argv[1])) from None
+    raise
+"""
 
 
-class GateSourceCheck(Protocol):
-    def gate_source_check(self, arguments: Sequence[str], parser: argparse.ArgumentParser) -> Callable[[Path], None] | None: ...
+def gate_command_source_check(command: Sequence[str], checkout: Path) -> Callable[[Path], None] | None:
+    """Select the check for the gate script or its qualified module."""
+    program = parse_command_program(command, keep_path=True)
+    if isinstance(program, OtherCommand):
+        module = parse_command_program(command)
+        if isinstance(module, OtherCommand) or module[0] != GATE_SCRIPT.name:
+            return None
+        _, arguments = module
+        word = command[len(command) - len(arguments) - 1]
+        if word != GATE_MODULE and word.partition("m")[2] != GATE_MODULE:
+            return None
+    else:
+        script, arguments = program
+        path = Path(script.replace("{tree}", str(checkout))).expanduser()
+        if checkout / path != checkout / GATE_SCRIPT:
+            return None
 
+    def check(source: Path) -> None:
+        path = source.resolve() / GATE_SCRIPT
+        if not path.is_file() or path.resolve() != path:
+            return
+        try:
+            syntax = ast.parse(path.read_bytes(), filename=str(path))
+        except SyntaxError:
+            return
+        if not any(isinstance(node, ast.FunctionDef) and node.name == "check_prepared_gate_source"
+                   for node in syntax.body):
+            return
+        result = subprocess.run(
+            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), *arguments],
+            cwd=source, capture_output=True, text=True,
+        )
+        if result.returncode == GATE_CHECK_HELP:
+            print(result.stdout, end="")
+            raise SystemExit(0)
+        if result.returncode:
+            raise CopyError(result.stderr.rstrip() or f"Gate argument check exited with status {result.returncode}.")
 
-def gate_command_source_check(command: Sequence[str]) -> Callable[[Path], None] | None:
-    program = parse_command_program(command)
-    if isinstance(program, OtherCommand) or program[0] not in GATE_SCRIPTS:
-        return None
-    name, arguments = program
-    if name == "targeted_test.py":
-        arguments = ("--affected", *arguments)
-    gate = cast(GateSourceCheck, cast(object, import_module("scripts.production.gate")))
-    return gate.gate_source_check(arguments, GateCommandParser(prog=name, allow_abbrev=False))
+    return check
 
 
 @contextmanager
@@ -2678,9 +2723,9 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
-    check_source = gate_command_source_check(command)
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
+    check_source = gate_command_source_check(command, source)
     verification = verify_command(command)
     with ExitStack() as scope:
         captured = ""
@@ -2751,7 +2796,7 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
 
     if command_program(command) not in GATE_SCRIPTS:
         raise CopyError("gate-step requires a gate command")
-    if check := gate_command_source_check(command):
+    if check := gate_command_source_check(command, source):
         check(source)
     targets = first_step.gate_targets(command, source, args.targets)
 

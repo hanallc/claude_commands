@@ -514,9 +514,10 @@ The six merge flags are required for a checkpoint merge.
 Use `--tests-only` for a merge-line test run and `--affected` for a unit test run.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
 Give each path relative to `scripts/`, for example `lib/test_x.py`.
-`copies.py run` uses the gate parser before it requests placement.
-Both entry points check the module files before they request placement.
-For a copy, the check uses the requested source snapshot.
+`copies.py run` uses the gate parser from the requested source snapshot before it requests placement.
+Revisions without the validation entry point check arguments when the gate starts.
+For a named run in a copy, the inner repository and module paths must stay in the snapshot.
+Use `--repo '{tree}'` to select the snapshot root.
 A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
 A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.
 A named run on natedev uses a live ancestor's reservation when they share the admission queue or CPU pool.
