@@ -5398,7 +5398,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = (other / "draft.txt").write_text("still served", encoding="utf-8")
         errors = StringIO()
         with patch.object(shutil, "rmtree", side_effect=PermissionError("cannot delete snapshot")), redirect_stderr(errors):
-            with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+            with started_review_server(("127.0.0.1", 0), self.root) as server:
                 # handle_request serves one disposable connection without a background service.
                 thread = threading.Thread(target=server.handle_request)
                 thread.start()
@@ -6617,7 +6617,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
                 errors = StringIO()
                 with patch.object(Path, "is_dir", new=checked_is_dir), redirect_stderr(errors):
-                    with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+                    with started_review_server(("127.0.0.1", 0), self.root) as server:
                         self.port = server.server_port
                         thread = threading.Thread(target=server.handle_request)
                         thread.start()
@@ -6880,17 +6880,17 @@ class SnapshotSweepTests(unittest.TestCase):
         with (patch.object(time, "time", return_value=now),
               patch.object(time, "monotonic", return_value=100.0) as elapsed,
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server):
+              started_review_server(("127.0.0.1", 0), self.root) as server):
             self.assertFalse(expired_at_start.exists())
             self.assertFalse(flat_at_start.exists())
             expires_later = self.snapshot("session", "expires-later", now - 8 * 24 * 60 * 60)
             flat_later = self.snapshot("", "def456", now - 8 * 24 * 60 * 60)
             elapsed.return_value = 100.0 + 3599.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertTrue(expires_later.exists())
             self.assertTrue(flat_later.exists())
             elapsed.return_value = 100.0 + 3600.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertFalse(expires_later.exists())
             self.assertFalse(flat_later.exists())
 
@@ -7014,7 +7014,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.load_module(self.module_file)
 
     def start_server(self) -> serve.ReviewLinksServer:
-        return self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.checkout / "snapshots"))
+        return self.enterContext(started_review_server(("127.0.0.1", 0), self.checkout / "snapshots"))
 
     def load_module(self, path: Path) -> None:
         spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -7038,17 +7038,17 @@ class ServerCodeHealthTests(unittest.TestCase):
 
         with patch.object(conf, "read", count_service_reads):
             self.elapsed = 104.0
-            server.service_actions()
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_not_called()
             self.elapsed = 105.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_called_once_with("review_links")
             self.elapsed = 109.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_called_once_with("review_links")
             self.elapsed = 110.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertEqual(read.call_count, 2)
 
     def test_a_module_imported_through_a_file_symlink_keeps_its_target_stamp(self) -> None:
@@ -7068,7 +7068,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.module_file.unlink()
         self.elapsed = 105.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(self.module_file), str(changed.exception))
 
     def test_a_module_loaded_after_start_joins_the_checks_without_a_restart(self) -> None:
@@ -7078,11 +7078,11 @@ class ServerCodeHealthTests(unittest.TestCase):
         os.utime(late_module, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
         self.load_module(late_module)
         self.elapsed = 105.0
-        server.service_actions()
+        serve.ReviewLinksServer.service_actions(server)
         _ = late_module.write_text("VALUE = 'changed later'\n")
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(late_module), str(changed.exception))
 
     def test_a_newly_seen_module_modified_after_process_start_requires_a_restart(self) -> None:
@@ -7093,7 +7093,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.load_module(late_module)
         self.elapsed = 105.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(late_module), str(changed.exception))
 
     def test_an_active_verdict_defers_restart_and_keeps_the_recorded_stamps(self) -> None:
@@ -7105,12 +7105,12 @@ class ServerCodeHealthTests(unittest.TestCase):
         _ = self.module_file.write_text("VALUE = 'changed during the verdict'\n")
         os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
         self.elapsed = 105.0
-        server.service_actions()
+        serve.ReviewLinksServer.service_actions(server)
         self.assertEqual(server.module_stamps, stamps)
         status.record(change_page.MessageDelivery(page, "C1", (), "", attempt))
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(self.module_file), str(changed.exception))
 
 
