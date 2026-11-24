@@ -21,7 +21,8 @@ A task, and what ends it:
   * `gate:worker-<staff id>`: the worker's assignment; the worker close path ends it;
   * `landed:<unit>/<branch>`: the branch is in its recorded land target and all work is saved;
   * `row:<showrunner>-C<n>`: change_review.py verdict;
-  * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the hourly temporary sweep ends the task when its time passes.
+  * `until:<YYYY-MM-DDTHHMMZ>/<id>`: the deadline ends the task.
+    The hourly sweep lists eligible folders for vetted manual removal.
     `--until` takes `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in the user's zone.
     Each call makes a random id with scratch.conf suffix_length characters.
     With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
@@ -1539,7 +1540,7 @@ FOLDER_REMOVAL = FolderRemoval()
 
 @dataclass(frozen=True)
 class ExpiredFolderRemoval:
-    """Recheck a copy's expired lifetime before a sweep removes its folder."""
+    """Recheck an expired copy before the sweep lists it for vetted manual removal."""
     now: float
 
 

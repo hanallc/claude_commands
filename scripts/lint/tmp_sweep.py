@@ -12,7 +12,7 @@ in nixos modules/darwin/tmp-sweep.nix runs `tmp_sweep.py` every hour.
 For hand cleanup use `tmp_sweep.py --plan <new-plan.json>` first; it lists every
 candidate with keep/remove and a reason, writes the plan, and removes nothing.
 This diagnostic plan requires evidence that the work ended.
-Use removal_guard.py to remove entries from a reviewed removal list.
+Review the removal_guard.py list before manual removal.
 The timed sweep keeps top-level /tmp/claude entries and direct unit/delegate run
 folders without that end evidence until nothing in them changed for 7 days.
 Files and links at the top level also wait 7 days. Tempfile-named entries and
@@ -123,7 +123,7 @@ delete_tree = delete_sweep_tree
 GIB = 1 << 30
 HOUR_SECONDS = 3600
 IDLE_SECONDS = 4 * HOUR_SECONDS
-# A scratch folder whose task is open goes after this long anyway: an ender can fail.
+# List eligible scratch folders after this many idle seconds, even for open tasks.
 TASK_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
 # Inside a running session's folders only an entry this large can go (showrunner, 2026-10-25).
 SESSION_ENTRY_MIN_BYTES = GIB
@@ -173,8 +173,8 @@ INVOKE_TEMP_NAME = re.compile(r"lint_invoke\.\d+\.\d+\.log|buildlog\.\d+\.\d+\.(
 TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp" + build_folders.MKDTEMP_SUFFIX_PATTERN)
 # direct/verify.sh's run folder (its copy folders sit inside it), named with the run's pid. Its EXIT
 # trap removes it, but a killed run leaves it (47 hold and 6 copy folders in natedev /tmp, 2026-10-27).
-# A named pid that is no verify.sh run started before the folder ends the folder at once; an old name
-# with no pid waits out the 4 h rule.
+# If the named run ended, list the eligible folder for vetted manual removal.
+# A folder name without a PID uses the 4 h rule.
 def verify_temp_name() -> re.Pattern[str]:
     """Read the current prefixes for verify run folders."""
     return re.compile(
@@ -323,7 +323,7 @@ class Roots:
         lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
         scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     ) -> Limit:
-        """How long entry must be idle to go, and how a change in it counts."""
+        """Return the idle limit and the time fields used to assess the entry."""
         if isinstance(lint_settings, UseConfiguredValue):
             lint_settings = conf.read("lint")
         if isinstance(scratch_settings, UseConfiguredValue):

@@ -153,7 +153,7 @@ Stdout prints `published: <absolute path> <full commit>` for each file.
 A path that does not exist prints `copies: publish: <path> not built` on stderr.
 A copy failure ends the scratch folder and prints `copies: publish: <error>` on stderr.
 Publication never changes the exit status of `run`.
-The scratch deadline removes the folder; the hourly sweep does the removal.
+After the scratch deadline, the hourly sweep lists the eligible folder for vetted manual removal.
 The scratch default task has a random suffix, so `scratch.end()` removes only this folder.
 The folder is outside the cache root, so a unit reads it with no permission prompt.
 `/hana_shot` launches a gate build with the `published:` path as `--binary`.
