@@ -1,4 +1,4 @@
-"""A copy run waits for memory before it holds a repository slot."""
+"""A copy run waits for memory before it holds a numbered copy."""
 from __future__ import annotations
 
 from contextlib import ExitStack, nullcontext
@@ -24,7 +24,8 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import execution_identity
-from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records, admission_service, first_step, placement
+from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import admission_records, admission_service, first_step, placement, queue_place
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
@@ -139,6 +140,13 @@ class SlotOrderTests(unittest.TestCase):
         environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
+        server = self.queue.server
+        provider_probe = server.host_probe
+
+        def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            return server.read_provider_evidence(key) if key.destination.provider == "local" else provider_probe(key)
+
+        server.host_probe = probe
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
             "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
@@ -173,7 +181,7 @@ class SlotOrderTests(unittest.TestCase):
                 self.waiting.set()
             if isinstance(reply, (wire.Wait, wire.PlacementWait, wire.LocalPlacementGranted)):
                 # Wake a file waiter that also ends when its process exits.
-                (self.root / "queue-wait").touch()
+                _ = (self.root / "queue-wait").write_text("")
             return reply
 
         _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
@@ -320,6 +328,27 @@ class SlotOrderTests(unittest.TestCase):
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
 
+    def test_scratch_gate_keeps_the_program_grant_without_placement(self) -> None:
+        owner = fixture_member("showrunner", name="scratch-owner")
+        production = Production(self.root / "production.md", owner.name, "main", self.source,
+                                self.root / "production.log", ZoneInfo("UTC"), owner)
+        unit = waiting.Unit("scratch-unit", "", "main", self.source, None, owner.id)
+        command = shlex.join((sys.executable, str(self.source / "gate.py"), "--tests-only"))
+
+        def run(_command: object, **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
+            return subprocess.CompletedProcess(command, 0)
+
+        with (mock.patch.object(waiting, "named_unit", return_value=unit),
+              mock.patch.object(waiting, "subprocess", SimpleNamespace(run=run, STDOUT=subprocess.STDOUT)),
+              mock.patch.object(copies, "standing", return_value=nullcontext(self.source)),
+              mock.patch.object(build_folders, "repo_word", return_value="claude"),
+              mock.patch.object(first_step, "_program_grant", return_value=wire.Admitted("program", 1, "test", "", "", {})) as admit,
+              mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
+              mock.patch.object(first_step, "_placement_grant", side_effect=AssertionError("scratch gate placement"))):
+            waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
+        admit.assert_called_once()
+
     def test_bump_queue_command_waits_before_it_creates_a_slot(self) -> None:
         self.queue.hold_starts()
         tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
@@ -382,6 +411,7 @@ class SlotOrderTests(unittest.TestCase):
                         os.environ["UNIT_DETACHED_RUN"] = previous
                     else:
                         _ = os.environ.pop("UNIT_DETACHED_RUN", None)
+                    self.queue.allow_next_start()
                     command = (sys.executable, str(self.source / "gate.py"), "--tests-only")
                     with self.assertRaisesRegex(ValueError, "private command failed") if fails else nullcontext():
                         with first_step.admitted_run(command, self.source) as admitted:
@@ -404,6 +434,7 @@ class SlotOrderTests(unittest.TestCase):
             ((sys.executable, "-X", "--affected", gate, "--tests-only"), "gate"),
         ):
             with self.subTest(command=command):
+                self.queue.allow_next_start()
                 offset = len(self.requests)
                 with first_step.admitted_run(command, self.source) as admitted:
                     admitted.handoff(self.source)
@@ -624,7 +655,6 @@ placement_once
             self.assertEqual({request.run for request in memory}, {first.run})
             preparation = [request for request in memory if request.episode == first.episode]
             self.assertEqual({request.since for request in preparation}, {first.since})
-            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in requests))
             if since_age:
                 self.assertLess(first.since, started_at - since_age / 2)
 
@@ -650,7 +680,8 @@ placement_once
                 replies = ", ".join(type(reply).__name__ for reply in self.replies[first_reply:])
                 self.fail(f"verify did not wait for memory pressure; replies: {replies}; output: "
                           + "".join(step.communicate(timeout=TEST_HANG_GUARD_SECS)))
-            request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+            request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest)
+                           and request.constraints.command_kind != "final")
             self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_folders.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
@@ -1039,7 +1070,6 @@ placement_once
             verify_checkout, = (folder for folder, (_, process) in running.items() if process is verify_caller)
             self.assertNotIn(verify_checkout, wrapper_folders)
             self.assertEqual(build_slots.source_checkout(verify_checkout), tools.root)
-            self.assertFalse(any(isinstance(request, wire.RepositorySlotRequest) for request in self.requests))
 
             def finish_caller(process: subprocess.Popen[str]) -> None:
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)

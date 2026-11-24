@@ -116,6 +116,51 @@ The route returns `GuestNotStarted` with the refusal reason before any upload or
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
+When the proof wait expires, the gate returns status 80 after it records the holder's release.
+The default root is `~/.local/state/build-targets`. The `BUILD_TARGETS_STATE_DIR` setting can supply a different root.
+The admission service creates each missing directory at startup and on reload.
+It syncs each directory entry from the state root up to the home directory, or to the filesystem root for paths outside home.
+The service logs the result before it accepts placement requests.
+If setup fails, the service retries on the next guest placement request.
+Until setup succeeds, the service refuses guest placement and launch permission. Other targets remain available.
+The gate refuses the launch before it consumes permission if the state root is missing or is a file.
+Run `./scripts/lib/py scripts/build_targets/build_targets.py setup-mac-linux` on natedev to perform the same setup manually.
+The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
+The arm checks the saved guest identity before it writes any guest records.
+It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
+It records `proven` when cleanup confirms the end of a run.
+It records `not started` if the gate consumed permission and sent no arm request.
+It records `unproven` and saves the armed guest identity when the proof wait expires.
+The route sends a completion report when it receives a start marker and a valid result.
+When the stream loses the result, end proof leaves the result unknown.
+For a proven no-run, it sends a refusal for the consumed claim and releases the holder in the journal.
+If the consume or arm reply is lost, the route releases the holder in the journal.
+The gate exits 80 if the guest can have run and the gate lacks a result.
+The gate also exits 80 if the journal cannot record the holder's release.
+The placement loop requests settlement for the exact attempt.
+The loop retries an exit 80 in the same episode only if the gate records a refusal for that attempt.
+The checkpoint stops when the placement loop returns exit 80.
+The queue can acknowledge the end report while it waits to read the proof.
+Each record contains the queue attempt key, the result, the detail, and the wall time.
+Each record includes the Mac claim ID.
+The writer locks the file during the append. It syncs the journal file, the journal directory, and the state root.
+A failed report send leaves the proof available on disk.
+`mac_linux.settlement()` reads the file without a lock and skips damaged rows.
+The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
+A matching `proven` or `not started` row settles the attempt after the holder exits or gives up the attempt.
+The queue can call `reconcile_unproven()` while it holds the slot.
+If a launch remains unproven, recovery waits for the gate process to exit or give up the attempt.
+The adapter reads the journal again before it submits the service.
+When the route saved an armed guest identity, the service uses it to confirm the run ended.
+For a launch with an unknown arm result, the service requires the saved guest identity.
+A guest with a held run lock leaves the attempt pending.
+For a known launch, the guest checks both arm names and records refusal under the run lock.
+The refusal prevents later arms and runs for that queue attempt.
+The service records `proven` if the guest found an arm and `not started` if it found none.
+An unrecorded legacy attempt settles after the launch holder and the submitting owner both exit.
+The queue uses this rule even if it received a start report.
+The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
+
 natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.

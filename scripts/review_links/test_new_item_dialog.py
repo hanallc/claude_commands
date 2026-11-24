@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast, override
@@ -17,8 +18,9 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
-from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
-from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
+from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
+                                  review_submissions)
+from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
 RECIPIENTS = [{"id": str(OWNER), "name": "builds", "proposal": True}] + [
@@ -728,6 +730,98 @@ def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
     owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
     return page_frame.with_owner(page, "builds", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render).replace(
         b'</body>', b'<script>' + probe.encode() + b'</script></body>')
+
+
+ROW_EVIDENCE_PROBE = r"""
+(async () => {
+ const failures = [];
+ const check = (value, description) => { if (!value) failures.push(description); };
+ try {
+  const dialog = document.querySelector('#review-new-item');
+  const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
+  const status = dialog.querySelector('[data-recipients-status]'), error = dialog.querySelector('.new-item-error');
+  const evidence = dialog.querySelector('[data-evidence]');
+  const include = dialog.querySelector('[name="include_page"]').closest('label');
+  const capture = __CAPTURE__, other = {...capture, step_id: 'other-step', title: 'cargo test', tip: []};
+  const cells = document.querySelectorAll('.fixture-active td:last-child, .fixture-active + tr td:last-child');
+  const [first, second] = [...cells].map(cell => {
+   const button = document.createElement('button');
+   button.type = 'button';
+   button.textContent = '+';
+   cell.append(button);
+   return button;
+  });
+  const until = test => test() ? Promise.resolve() : new Promise(resolve => {
+   const observer = new MutationObserver(() => { if (test()) { observer.disconnect(); resolve(); } });
+   observer.observe(dialog, {attributes: true, childList: true, subtree: true, characterData: true});
+  });
+  const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
+  async function openRow(trigger, data) {
+   window.reviewNewItem.open({trigger, recipientName: 'builds', evidence: data});
+   await until(() => status.textContent !== 'Loading recipients…');
+  }
+  function type(text) {
+   words.value = text;
+   words.dispatchEvent(new InputEvent('input', {bubbles: true}));
+  }
+  check(window.reviewNewItem.evidenceLimits.tipEntries === 64, 'The launcher API exposes the evidence limits.');
+  await openRow(first, capture);
+  check(dialog.querySelector('[name="kind"]:checked').value === 'question', 'A row opens a Question.');
+  check(selected() === 'builds-staff', 'A row selects builds by name.');
+  check(!evidence.hidden && evidence.querySelector('h4').textContent === 'hana nextest', 'The row evidence shows.');
+  const memory = evidence.querySelector('.new-item-memory');
+  check(memory.querySelector('strong').textContent === '17.9 GiB' &&
+        memory.querySelector('.new-item-cap').textContent === 'Queue cap 27.9 GiB' &&
+        memory.querySelector('.new-item-memory-legend span').textContent === 'Builds 9.9 GiB',
+        'The evidence uses the displayed amounts from the capture.');
+  check(include.hidden && dialog.querySelector('[data-capture-slot]').hidden &&
+        dialog.querySelector('[data-bug-page-state]').hidden, 'A row sends no screenshot or page state.');
+  type('Why does this step wait?');
+  dialog.querySelector('[data-cancel]').click();
+  await openRow(second, other);
+  check(!words.value && evidence.querySelector('h4').textContent === 'cargo test',
+        'Another row opens with its own evidence and an empty draft.');
+  dialog.querySelector('[data-cancel]').click();
+  await openRow(first, {...capture, title: 'A newer reading'});
+  check(words.value === 'Why does this step wait?' && evidence.querySelector('h4').textContent === 'hana nextest',
+        'Reopen keeps the row draft and its evidence.');
+  dialog.querySelector('[name="kind"][value="investigation"]').click();
+  send.click();
+  await until(() => !error.hidden);
+  check(error.textContent === 'Fixture rejected the first send.' && words.value, 'A failed send keeps the draft.');
+  send.click();
+  await until(() => !dialog.querySelector('#new-item-saved').hidden);
+  check(dialog.querySelector('#new-item-saved').textContent === 'Saved I1.', 'Send saves the row item.');
+  dialog.querySelector('[data-done]').click();
+  check(!dialog.open && document.activeElement === first, 'Done returns focus to the row.');
+  await openRow(second, other);
+  type('What does this step run?');
+  send.click();
+  await until(() => !dialog.querySelector('#new-item-saved').hidden);
+  check(dialog.querySelector('#new-item-saved').textContent === 'Saved Q1.', 'Send saves the second row item.');
+  dialog.querySelector('[data-done]').click();
+  check(!dialog.open && document.activeElement === second, 'Done returns focus to the second row.');
+  document.querySelector('[data-owner-new]').click();
+  await until(() => status.textContent !== 'Loading recipients…');
+  check(evidence.hidden && !include.hidden && dialog.querySelector('[name="kind"]:checked').value === 'bug',
+        'The page owner button still opens the page dialog without row evidence.');
+  dialog.querySelector('[data-cancel]').click();
+ } catch (failure) { failures.push(String(failure)); }
+ await fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+"""
+
+
+def row_evidence_page() -> bytes:
+    captured = asdict(EVIDENCE)
+    captured["memory"] = {
+        "free_for_next_gib": EVIDENCE.memory.free_for_next_gib, "queue_cap_gib": EVIDENCE.memory.queue_cap_gib,
+        "free_text": "17.9 GiB", "cap_text": "27.9 GiB",
+        "segments": [{**asdict(segment), "text": text} for segment, text in zip(
+            EVIDENCE.memory.segments, ("9.9 GiB", "30.0 GiB", "2.0 GiB", "8.0 GiB", "29.0 GiB"), strict=True)],
+    }
+    return fixture_page(1440, photo=False, script=ROW_EVIDENCE_PROBE.replace("__CAPTURE__", json.dumps(captured)))
 
 
 BUG_PROBE = r"""
@@ -1440,6 +1534,38 @@ class NewItemDialogTests(unittest.TestCase):
                         pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
         self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: []})
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_builds_row_sends_its_evidence_to_builds_without_the_page(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        recipient = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((recipient,))))
+        fixture = DialogFixture(temporary / "row")
+        (fixture.root / "config").mkdir(parents=True)
+        capture_dialogs(temporary / "row.png", {1440: fixture}, pages={1440: row_evidence_page()})
+        self.assertEqual(fixture.results, [])
+        rejected, request, other = fixture.posts
+        self.assertEqual(rejected, request)
+        self.assertEqual((request.kind, request.recipient_id, request.page), (
+            review_submissions.SubmissionKind.INVESTIGATION, OWNER, ""))
+        self.assertEqual((other.kind, other.recipient_id, other.page), (review_submissions.SubmissionKind.QUESTION, OWNER, ""))
+        self.assertNotEqual(other.request_id, request.request_id)
+        assert isinstance(other.evidence, new_item_dialog.BuildStepEvidence)
+        self.assertEqual(other.evidence.step_id, "other-step")
+        for wire in fixture.wire_posts:
+            self.assertNotIn("page", wire)
+            self.assertNotIn("capture_key", wire)
+        assert isinstance(request.evidence, new_item_dialog.BuildStepEvidence)
+        self.assertEqual((request.evidence.step_id, request.evidence.memory.free_text), ("build-step-50", "17.9 GiB"))
+        with patch.dict(os.environ, fixture.environment()):
+            saved, = investigation.records(OWNER)
+        assert isinstance(saved.submission, new_item_dialog.ReviewSubmission)
+        card = review_page.submission_assets("investigation/fixture/I1", saved.submission)
+        self.assertIn("17.9 GiB free for the next step · Queue cap 27.9 GiB", card)
+        self.assertIn("Builds 9.9 GiB · Free RAM 30.0 GiB", card)
+        legacy = review_page.submission_assets("investigation/fixture/I1", replace(saved.submission, evidence=EVIDENCE))
+        self.assertIn("18 GiB free for the next step · Queue cap 28 GiB", legacy)
+        self.assertIn("Builds 10 GiB · Free RAM 30 GiB", legacy)
+
     def test_render_mounts_one_dialog_with_five_types(self) -> None:
         markup = new_item_dialog.render()
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
@@ -1451,6 +1577,34 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-sent-details aria-labelledby="sent-details-title"', markup)
         self.assertIn('data-capture-slot hidden', markup)
+
+    def test_build_step_retry_uses_a_receipt_from_before_display_text(self) -> None:
+        fixture = DialogFixture(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        (fixture.root / "config").mkdir()
+        recipient = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        members = staff.StaffSnapshot((recipient,))
+        memory = replace(EVIDENCE.memory, queue_cap_gib=None)
+        evidence = {**asdict(EVIDENCE), "memory": {
+            "free_for_next_gib": memory.free_for_next_gib, "queue_cap_gib": memory.queue_cap_gib,
+            "segments": [{"label": segment.label, "gib": segment.gib, "tone": segment.tone}
+                         for segment in memory.segments],
+        }}
+        request = new_item_dialog.read_request({
+            "request_id": f"r1-{'a' * 32}-bug-{OWNER}", "kind": "bug", "recipient_id": OWNER,
+            "words": DISPLAY_WORDS, "evidence": evidence, "images": [],
+        })
+        legacy_hash = hashlib.sha256(json.dumps(["bug", DISPLAY_WORDS, evidence, []], sort_keys=True).encode()).hexdigest()
+        with (patch.dict(os.environ, fixture.environment()), patch.object(Path, "home", return_value=fixture.root),
+              patch.object(staff, "snapshot", return_value=members)):
+            with patch.object(review_submissions, "_submission_fingerprint", return_value=legacy_hash):
+                saved = review_submissions.submit(request, members=members)
+            receipt_path = review_submissions.image_folder(saved).parent / "receipt.json"
+            receipt = receipt_path.read_bytes()
+            fields = cast(dict[str, object], json.loads(receipt))
+            self.assertEqual(fields.get("payload_hash"), legacy_hash)
+            self.assertEqual(review_submissions.submit(request, members=members), saved)
+            self.assertEqual(receipt_path.read_bytes(), receipt)
+            self.assertEqual([item.id for item in investigation.records(OWNER)], [saved.id])
 
     def test_page_data_and_capture_size_are_checked(self) -> None:
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}

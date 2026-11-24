@@ -47,10 +47,6 @@ from scripts.build_queue.admission_wire import (
     AdmitRequest as AdmitRequest,
     SessionNotSent as SessionNotSent,
     ServiceEstimateRequest as ServiceEstimateRequest,
-    RepositorySlotRequest as RepositorySlotRequest,
-    RepositorySlotWaiting as RepositorySlotWaiting,
-    RepositorySlotReady as RepositorySlotReady,
-    RepositorySlotExpired as RepositorySlotExpired,
     VerifyRunSlotRequest as VerifyRunSlotRequest,
     VerifyRunSlotWaiting as VerifyRunSlotWaiting,
     LaunchRequest as LaunchRequest,
@@ -92,6 +88,7 @@ from scripts.build_queue.admission_wire import (
     ClaimFailure as ClaimFailure,
     ConsumePermission as ConsumePermission,
     ExecutionReport as ExecutionReport,
+    SettlementRequest as SettlementRequest,
     PlacementWait as PlacementWait,
     PlacementResourceWait as PlacementResourceWait,
     PlacementEvidenceWait as PlacementEvidenceWait,
@@ -138,22 +135,11 @@ class CloudRow:
 
 
 @dataclass(frozen=True)
-class RepositorySlotRow:
-    """A transient repository slot wait appears beside queued memory waits."""
-    owner: Owner
-    identity: Identity
-    since: float
-    machine: str
-    wait: RepositorySlotWaiting
-
-
-@dataclass(frozen=True)
 class CloudQueueRead(records.QueueRead):
     """The queue reading includes cloud rows, slot capacity, and stale push counts."""
     cloud: tuple[CloudRow, ...] = ()
     cloud_slots: int = 0
     cloud_gate_stale_pushes: int = field(kw_only=True)
-    repository_slots: tuple[RepositorySlotRow, ...] = ()
 
 
 @dataclass(frozen=True)

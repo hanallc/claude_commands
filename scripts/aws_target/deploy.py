@@ -10,7 +10,7 @@ import argparse
 import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -398,6 +398,15 @@ def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...
     )
 
 
+def quota_display_name(label: str) -> str:
+    return 'Standard Spot' if label == 'Spot' else label
+
+
+def _quota_request_timestamp(request: Mapping[str, object]) -> float:
+    created = request.get('Created')
+    return quota_requests.timestamp(request.get('LastUpdated') if created is None else created)
+
+
 def _quota_request_age(created: float, now: float) -> str:
     """Show the age in the largest whole unit."""
     if not math.isfinite(created):
@@ -409,40 +418,34 @@ def _quota_request_age(created: float, now: float) -> str:
     return f'{elapsed}s old'
 
 
-@dataclass(frozen=True)
-class _ReportedQuotaRequest:
-    order_time: float
-    requested_vcpus: Decimal
-    status_label: str
-
-
-def _reported_quota_request(row: dict[str, object]) -> _ReportedQuotaRequest:
-    created = row.get('Created')
-    moment = quota_requests.request_time(row.get('LastUpdated') if created is None else created)
-    order_time = moment.timestamp() if isinstance(moment, datetime) else float('-inf')
-    return _ReportedQuotaRequest(order_time, conf.decimal(str(row['DesiredValue'])).normalize(),
-                                 ledger.text(row, 'Status'))
-
-
-def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
+def request_spot_quota(api: AwsCli, code: str, desired: int, label: str,
+                       histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]]) -> bool:
     """Request one regional quota unless its value is sufficient or a request is open."""
     region = api.region
     try:
         quota = spot_quota(api, code)
         if quota >= desired:
+            histories[region, code] = ()
             print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
             return True
-        opened = [row for row in quota_requests.read_quota_request_rows(api, code)
-                  if ledger.text(row, 'Status') not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES]
+        name = quota_display_name(label)
+        opened: list[quota_requests.OpenQuotaRequest] = []
+        for row in quota_requests.read_quota_request_rows(api, code):
+            status = ledger.text(row, 'Status')
+            if status not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+                opened.append(quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, row))
+        histories[region, code] = tuple(opened)
         if opened:
-            for row in opened:
-                status = ledger.text(row, 'Status')
-                value = conf.decimal(str(row['DesiredValue'])).normalize()
-                print(f'{region}: open {label} quota request {value:f} vCPUs; status {status}')
+            for request in opened:
+                print(f'{region}: open {label} quota request {request.asked_vcpus} vCPUs; status {request.status}')
             return True
         reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
             '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
-        status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+        row = ledger.mapping(reply['RequestedQuota'])
+        status = ledger.text(row, 'Status')
+        if status not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+            histories[region, code] = (
+                quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, {'DesiredValue': desired, **row}),)
         print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
         return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
     except (admin_secrets.SecretsRefused, DeploymentRefused):
@@ -2689,17 +2692,27 @@ class Deployment:
 
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
+        with quota_requests.command_lock(self.directory):
+            return self._quota_request()
+
+    def _quota_request(self) -> bool:
         settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         success = True
+        histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]] = {}
         for regions, code, desired, label in quota_targets(settings.region):
             for region in regions:
-                if not request_spot_quota(api.in_region(region), code, desired, label):
+                if not request_spot_quota(api.in_region(region), code, desired, label, histories):
                     success = False
+        quota_requests.save(self.directory, histories, int(self.clock()), complete=False)
         return success
 
     def quota_status(self) -> bool:
-        """Read regional Spot quotas with the plan identity."""
+        """Report applied quotas and save open requests without changing AWS."""
+        with quota_requests.command_lock(self.directory):
+            return self._quota_status()
+
+    def _quota_status(self) -> bool:
         from scripts.aws_target import gpu_size_trial
         plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
         _ = plan.credential
@@ -2710,13 +2723,14 @@ class Deployment:
         regional: dict[str, list[tuple[str, str, int]]] = {}
         for regions, code, desired, label in quota_targets(settings.region):
             for region in dict.fromkeys(regions):
-                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label, desired))
+                regional.setdefault(region, []).append((code, quota_display_name(label), desired))
         success = True
         ready: list[str] = []
         opened: list[str] = []
         unknown: list[str] = []
         unknown_quota: list[str] = []
         lines: list[str] = []
+        histories: dict[quota_requests.RegionalQuota, tuple[quota_requests.OpenQuotaRequest, ...]] = {}
         for region, quotas in regional.items():
             target = api.in_region(region)
             lines.append(region)
@@ -2727,18 +2741,26 @@ class Deployment:
                     lines.append(f'  {name}: {applied.normalize():f} vCPUs applied, {desired} vCPUs needed')
                     if code == 'L-3819A6DF' and applied >= needed:
                         ready.append(region)
-                    requests = sorted((_reported_quota_request(row)
-                                       for row in quota_requests.read_quota_request_rows(target, code)),
-                                      key=lambda request: request.order_time, reverse=True)
+                    requests = sorted(quota_requests.read_quota_request_rows(target, code),
+                                      key=_quota_request_timestamp, reverse=True)
+                    open_requests: list[quota_requests.OpenQuotaRequest] = []
+                    for request in requests:
+                        status = ledger.text(request, 'Status')
+                        asked = quota_requests.format_asked_vcpus(request['DesiredValue'])
+                        if status not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+                            entry = quota_requests.OpenQuotaRequest.from_reply(region, code, name, status, request)
+                            open_requests.append(entry)
+                            opened.append(f'{region} {name} {asked} vCPUs ({status})')
+                    histories[region, code] = tuple(open_requests)
                     if requests:
                         newest = requests[0]
-                        age = _quota_request_age(newest.order_time, now)
-                        lines.append(f'    Newest request: {newest.status_label} for {newest.requested_vcpus:f} vCPUs ({age}).')
+                        created = _quota_request_timestamp(newest)
+                        age = _quota_request_age(created, now)
+                        status = ledger.text(newest, 'Status')
+                        asked = quota_requests.format_asked_vcpus(newest['DesiredValue'])
+                        lines.append(f'    Newest request: {status} for {asked} vCPUs ({age}).')
                     else:
                         lines.append('    No requests.')
-                    for item in requests:
-                        if item.status_label not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
-                            opened.append(f'{region} {name} {item.requested_vcpus:f} vCPUs ({item.status_label})')
                 except (KeyError, OSError, OverflowError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
                     if code_text in QUOTA_PLAN_AUTH_FAILURES:
@@ -2763,6 +2785,7 @@ class Deployment:
         lines.append(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
                      + 'open requests: ' + requests_text + incomplete)
         print('\n'.join(lines), flush=True)
+        quota_requests.save(self.directory, histories, int(now), complete=success)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
