@@ -406,11 +406,19 @@ def home_worktree(directory: Path) -> Path:
     return _phase_run_home(directory).root
 
 
+def phase_worktree_override(directory: Path) -> Path | None:
+    """Read the saved checkout path if the phase has an override."""
+    path = directory / WORKTREE_FILE
+    try:
+        checkout = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    except FileNotFoundError:
+        return None
+    return Path(checkout) if checkout else None
+
+
 def phase_worktree(directory: Path) -> KnownPhaseWorktree:
     """Read the explicit checkout override or the unit folder from staff."""
-    path = directory / WORKTREE_FILE
-    root = Path(path.read_text(encoding="utf-8").strip()) if path.is_file() else home_worktree(directory)
-    return KnownPhaseWorktree(root)
+    return KnownPhaseWorktree(phase_worktree_override(directory) or home_worktree(directory))
 
 
 def claimed_launch_directory(directory: Path, requested: Path) -> Path:
@@ -468,16 +476,25 @@ def _require_model_worktree(
         raise StateRefused(f"{root}: {error}. {fix}") from error
 
 
+def read_baseline_file(path: Path) -> str | None:
+    """Read the phase baseline. Return None if the file is absent."""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+
+
 def _validate_retained_baseline(directory: Path, root: Path) -> bool:
     """Return True if the retained baseline exists and names a commit in the checkout."""
     baseline = directory / BASELINE_FILE
     legacy_baseline = directory.parent.parent / BASELINE_FILE
     if legacy_baseline.is_file() and _read_located_phase_state(directory).directory == legacy_baseline.parent:
         baseline = legacy_baseline
-    if not baseline.exists():
+    recorded = read_baseline_file(baseline)
+    if recorded is None:
         return False
     try:
-        _ = commit_id(root, baseline.read_text().strip())
+        _ = commit_id(root, recorded)
     except StateRefused as refused:
         raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
     return True
@@ -537,8 +554,8 @@ class _RecordedCheckout(NamedTuple):
 def _recorded_checkout(directory: Path, home_root: Path) -> _NoRecordedCheckout | _RecordedCheckout:
     if not _has_recorded_checkout(directory):
         return _NoRecordedCheckout()
-    override = directory / WORKTREE_FILE
-    root = Path(override.read_text(encoding="utf-8").strip()).resolve() if override.is_file() else home_root
+    override = phase_worktree_override(directory)
+    root = override.resolve() if override is not None else home_root
     git_root = repository_root(root)
     available = git_root is not None and git_root.resolve() == root
     # An empty folder can remain after checkout removal. The claim can replace it.
