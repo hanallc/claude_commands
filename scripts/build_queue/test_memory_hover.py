@@ -878,6 +878,35 @@ class MemoryHoverTests(unittest.TestCase):
         html = self.page_expression(render, reading, walk=True)
         self.assertNotIn("last run failed in", str(html))
 
+    def test_queue_drag_updates_the_kept_place_before_the_next_view(self) -> None:
+        reading = {"total": 64, "read_at": 200, "move_revision": "original",
+            "held_places": [self.kept_place_row()],
+            "waiters": [{"name": "phases", "since": 70, "order_since": 40, "place": 1, "move": {"row_id": "first"}},
+                        {"name": "cloud", "kind": "cloud", "since": 60},
+                        {"name": "research", "since": 60, "order_since": 60, "place": 3, "move": {"row_id": "last"}}]}
+        result = self.page_expression("""(() => {
+          const snapshot = JSON.stringify(data);
+          const positions = reading => queueRows(reading.waiters, reading.held_places)
+            .map(row => [row.key, row.position ?? row.place ?? null]);
+          const original = positions(data);
+          queueDrag = {reading:data, rows:data.waiters, row:data.waiters[2], pointer:null};
+          previewQueueMove(data.waiters[0]);
+          const preview = positions(painted);
+          const previewHover = pageTooltipHtml("held:4242-99", data).includes("place 1");
+          queueReply = {previousRevisions:[data.move_revision],
+            line:{revision:"confirmed", members:[{row_id:"last"}, {row_id:"first"}]}};
+          const confirmed = queueReading(data);
+          showWalk(confirmed);
+          const confirmedHover = pageTooltipHtml("held:4242-99", data).includes("place 1");
+          return [original, preview, positions(confirmed), queuePlace(confirmed, "last", "confirmed"),
+            previewHover, confirmedHover, snapshot === JSON.stringify(data)];
+        })()""", reading, walk=True, queue_move=True)
+        self.assertEqual(result, [
+            [["fixture-wait-0", 1], ["4242-99", 2], ["fixture-wait-1", None], ["fixture-wait-2", 3]],
+            [["4242-99", 1], ["fixture-wait-2", 2], ["fixture-wait-1", None], ["fixture-wait-0", 3]],
+            [["4242-99", 1], ["fixture-wait-2", 2], ["fixture-wait-1", None], ["fixture-wait-0", 3]],
+            2, True, True, True])
+
     def test_kept_place_hover_names_the_failure_and_the_deadline(self) -> None:
         reading = {"held_places": [self.kept_place_row()]}
         html = self.page_expression("tooltipHtml('held:4242-99', data)", reading, walk=True)
@@ -889,7 +918,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual({node.text: tip[index + 1].text for index, node in enumerate(tip)
                           if node.tag == "dt" and index > 0}, fields)
         self.assertEqual(tip.findtext("dd[@class='long']"),
-            "If the next run of unit queue (same repository and job) arrives before 22:37 PST, "
+            "If the next run of unit queue (same repository and test family) arrives before 22:37 PST, "
             + "it starts from place 2. Runs behind place 2 do not wait for it.")
 
     @staticmethod
@@ -1332,7 +1361,7 @@ process.stdout.write(JSON.stringify(steps));
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
     def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False,
-                        limits: bool = False) -> object:
+                        limits: bool = False, queue_move: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
@@ -1350,6 +1379,16 @@ const $ = id => {
   return elements.get(id);
 };
 function fitLabels() {}
+"""
+        if queue_move:
+            start = html.index("const queueMovePath =")
+            functions += html[start:html.index('$("queue-action").addEventListener', start)]
+            start = html.index("function pageTooltipHtml(")
+            functions += html[start:html.index("let lastBuildLimitsHtml", start)]
+            constants += """
+const document = {activeElement:null};
+let painted;
+renderWalk = reading => { painted = reading; };
 """
         if swap:
             start = html.index("const swapView =")

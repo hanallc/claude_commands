@@ -1032,6 +1032,7 @@ class MemoryWaitRow(WaitRow):
     """A step that holds a place in the memory queue."""
 
     place: int
+    order_since: float
     move: NotRequired[admission_records.QueueMoveMember]
     order_note: NotRequired[str]
     job_start: NotRequired[str]
@@ -3155,7 +3156,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     if isinstance(move_line, admission_records.QueueMoveLine) else {})
     matched_move_ids: set[str] = set()
     positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
-    for place, waiter in enumerate(waiting, 1):
+    for place, (waiter, order_since) in enumerate(parsed.waiting_with_order_times(), 1):
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
         ci_label = recorded_ci_label(waiter, ci_runners)
@@ -3201,7 +3202,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
-                        "need": gib(need), "since": waiter.since,
+                        "need": gib(need), "since": waiter.since, "order_since": order_since,
                         "reason": reason,
                         "fits": not targets and not isinstance(cause, admission_records.NatedevHeld)
                                 and need <= captured.signed_room, "place": waiting_position,

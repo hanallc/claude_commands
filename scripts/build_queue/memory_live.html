@@ -1076,7 +1076,7 @@ function tooltipRows(key, data) {
       field('Unit', unit, 'field', true), field('Failed run', row.failed_run),
       field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
       field('Kept until', row.kept_until),
-      field('', `If the next run of unit ${unit} (same repository and job) arrives before ${row.kept_until}, ` +
+      field('', `If the next run of unit ${unit} (same repository and test family) arrives before ${row.kept_until}, ` +
         `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`, 'long')];
   }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
@@ -1527,7 +1527,10 @@ function limitTooltipRows(key, limits) {
   return rows.length ? [field(identity, name, "title"), ...rows] : [];
 }
 function pageTooltipHtml(key, data) {
-  if (!key.startsWith("limit:")) return tooltipHtml(key, data);
+  if (!key.startsWith("limit:")) {
+    const queueTip = key.startsWith("held:") || key.startsWith("wait:");
+    return tooltipHtml(key, queueTip && displayedQueue ? displayedQueue : data);
+  }
   const rows = limitTooltipRows(key, data.build_limits);
   return rows.length ? `<div class="build-limit-tip">${tipRowsHtml(rows)}</div>` : "";
 }
@@ -1706,6 +1709,7 @@ let queueAccess = null;
 let queueDrag = null;
 let queueSending = false;
 let queueReply = null;
+let displayedQueue = null;
 let queueHighlight = "";
 let queueHighlightTimer;
 let queueAction = null;
@@ -1732,8 +1736,8 @@ function queueReading(d) {
   const shownIds = new Set(shown.map(member => member.row_id));
   const ordered = shown.map(member => ({...rows.get(member.row_id), move:member}));
   let index = 0;
-  return {...d, move_revision:queueReply.line.revision,
-    waiters:d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row)};
+  return queueWithOrder({...d, move_revision:queueReply.line.revision},
+    d.waiters.map(row => shownIds.has(row.move?.row_id) ? ordered[index++] : row));
 }
 
 function showQueue(d) {
@@ -1746,6 +1750,7 @@ function showQueue(d) {
 }
 
 function showWalk(d) {
+  displayedQueue = d;
   const focusedMove = document.activeElement?.dataset.moveId;
   renderWalk({...d, queueControls:{
     canMove:Boolean(d.move_revision && d.queueReady !== false && queueAccess?.token),
@@ -1779,7 +1784,7 @@ function previewQueueMove(neighbor) {
   drag.rows = drag.rows.map(row => row.move ? rows[index++] : row);
   drag.destination = to === 0 ? {kind:"QueueHeadDrop"}
     : {kind:"QueueDrop", neighbor:neighbor.move.row_id, side:to < from ? "before" : "after"};
-  const preview = {...drag.reading, waiters:drag.rows};
+  const preview = queueWithOrder(drag.reading, drag.rows);
   const place = queuePlace(preview, drag.row.move.row_id, preview.move_revision);
   queueMessage(drag.pointer === null ? `Place ${place}` : "");
   showWalk(preview);
@@ -2020,6 +2025,27 @@ function renderWalk(d) {
     : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
   $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
+}
+
+function queueWithOrder(reading, waiters) {
+  if (!reading.held_places?.length) return {...reading, waiters};
+  const numbered = [...waiters];
+  let next = 0, position = 1;
+  const advance = () => {
+    const row = waiters[next];
+    if (row.kind !== "cloud") numbered[next] = {...row, place:position++};
+    next++;
+  };
+  const held = reading.held_places.map(place => {
+    while (next < waiters.length) {
+      const row = waiters[next];
+      if (row.kind !== "cloud" && (row.order_since ?? row.since) >= place.since) break;
+      advance();
+    }
+    return {...place, position:position++};
+  });
+  while (next < waiters.length) advance();
+  return {...reading, waiters:numbered, held_places:held};
 }
 
 // Cloud waits have no numbered place.

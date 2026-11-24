@@ -3613,7 +3613,7 @@ class AdmissionServer:
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
         reading = self._placement_reading(reading)
         reading = replace(self._cloud_reading(reading, self.configuration),
-                          held_places=records.number_held_places(reading.view.waiting, self.held_places))
+                          held_places=reading.number_held_places(self.held_places))
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
