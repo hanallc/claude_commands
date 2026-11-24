@@ -2004,6 +2004,20 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.feedback_requests(sent)["request"].read_update, target)
         self.assertEqual(the_list.unread_update(sent), target)
 
+    def test_mark_read_keeps_the_answer_read_after_the_clock_moves_back(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Is it ready?"), status)
+        with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Yes.")[0], 0)
+        self.assertEqual(the_list.unread_answer_ids(the_list.load(MORTY.id, item.id)), {"Q1"})
+
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "The next check passed."}, source="morty")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.unread_since, START)
+        self.assertEqual(the_list.unread_answer_ids(saved), set())
+
     def test_mark_read_checks_the_update_target_inside_the_store_lock(self) -> None:
         item = self.add()
         target = the_list.unread_update(item)
@@ -2267,6 +2281,54 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
                              (0, "", ""))
             self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
+
+    def test_parking_reads_the_old_answer_and_a_new_answer_returns_to_needs_me(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+
+        def answer(item_id: str, question_id: str, moment: datetime) -> None:
+            with patch.object(the_list, "now", return_value=moment):
+                request = the_list.PageRequest(f"ask-{question_id}", "question", "Is it ready?")
+                _ = the_list.ask_question(MORTY.id, item_id, request, status)
+                self.assertEqual(self.command("answer", item_id, "--question", question_id, "--text", "Yes.")[0], 0)
+
+        def check(item_id: str, answers: set[str], chip: list_page.ListChip) -> None:
+            saved = the_list.load(MORTY.id, item_id)
+            unread = the_list.unread_answer_ids(saved)
+            self.assertEqual(unread, answers)
+            self.assertIs(list_page.list_chip(saved.state, parked=the_list.parking_active(saved.parked_until, START),
+                                              open_question=the_list.has_open_question(saved),
+                                              unread_answer=bool(unread)), chip)
+
+        for until in (the_list.ParkUntilDelivered.DELIVERED, START + timedelta(days=1)):
+            with self.subTest(until=until):
+                item = self.add(changes={"state": the_list.ItemState.WORKING})
+                answer(item.id, "Q1", START)
+                check(item.id, {"Q1"}, list_page.ListChip.NEEDS_ME)
+                with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
+                    _ = the_list.park(MORTY.id, item.id, until, source="nate")
+                check(item.id, set(), list_page.ListChip.PARKED)
+                answer(item.id, "Q2", START + timedelta(minutes=2))
+                check(item.id, {"Q2"}, list_page.ListChip.NEEDS_ME)
+
+    def test_legacy_park_receipt_reads_an_older_answer(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        until = START + timedelta(days=1)
+        _ = the_list.park(MORTY.id, item.id, until, source="nate")
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Is it ready?"), status)
+        with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Yes.")[0], 0)
+        self.assertEqual(the_list.unread_answer_ids(the_list.load(MORTY.id, item.id)), {"Q1"})
+
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        receipt = {"time": (START + timedelta(minutes=2)).isoformat(), "source": the_list.PAGE_SOURCE,
+                   "receipt": {"request": "park-again", "action": "park", "words": "Parked until tomorrow."}}
+        with path.open("a", encoding="utf-8") as log:
+            _ = log.write(f"\n- {json.dumps(receipt)}\n")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertTrue(the_list.has_park_receipt(saved, "park-again"))
+        self.assertEqual(saved.parked_until, until)
+        self.assertEqual(the_list.unread_answer_ids(saved), set())
 
     def test_delivery_does_not_clear_a_saved_date(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})

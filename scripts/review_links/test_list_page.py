@@ -3110,6 +3110,76 @@ document.body.append(result);
             'ANSWERED_PAGE', json.dumps(answered).replace('<', r'\u003c'))
         self.browser_action_sequence(steps, add_item=False, markup=initial, reduced_motion=True)
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_parking_clears_existing_answers_and_keeps_newer_answers(self) -> None:
+        root = self.root / "reviews"
+        items = [self.add("Check the answer") for _ in range(2)]
+        choices = ("delivered", "2026-12-03")
+
+        def answer(question: str) -> None:
+            for item in items:
+                current = the_list.load(MORTY.id, item.id)
+                list_page.deliver(list_page.submit(root, urlencode(self.fields(current, "question", words="Is it ready?"))))
+                self.assertEqual(the_list.main(["answer", item.id, "--question", question, "--text", "Yes."]), 0)
+
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            answer("Q1")
+            initial = list_page.render(root, include_counts=False).decode()
+            requests = [urlencode(self.fields(the_list.load(MORTY.id, item.id), "park", until=choice))
+                        for item, choice in zip(items, choices, strict=True)]
+            with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=1)):
+                states = [list_page.save_action(root, fields, include_detail=True)[1] for fields in requests]
+            for state in states:
+                assert state is not None
+                self.assertEqual((state["parked"], state.get("unread_answer")), ("true", "false"))
+            parked = list_page.render(root, include_counts=False).decode().partition("<script>")[0]
+            controls = parked.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
+            self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["2", "0", "0", "0", "0", "2"])
+            self.assertNotIn("<small data-new-answer>New answer</small>", parked)
+            with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=2)):
+                answer("Q2")
+            answered = list_page.render(root, include_counts=False).decode()
+
+        for item, fields, choice in zip(items, requests, choices, strict=True):
+            _ = list_page.submit(root, fields)
+            saved = the_list.load(MORTY.id, item.id)
+            self.assertEqual(the_list.unread_answer_ids(saved), {"Q2"})
+            with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=3)):
+                _ = list_page.submit(root, urlencode(self.fields(saved, "park", until=choice)))
+            parked_again = the_list.load(MORTY.id, item.id)
+            self.assertEqual(parked_again.parked_until, saved.parked_until)
+            self.assertEqual(the_list.unread_answer_ids(parked_again), set())
+
+        steps = r'''
+ const item=number=>document.querySelector('[data-number="'+number+'"]');
+ const count=chip=>document.getElementById('filter-show-'+chip).dataset.filterCount;
+ const states=PARK_STATES,choices=PARK_CHOICES;
+ show('needs-me');
+ for(const number of [1,2]){
+  const row=item(number);
+  check(!row.hidden && row.querySelector('[data-new-answer]'),'Needs me shows the first answer.');
+  if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
+  const form=recordDetails(row).querySelector('form');
+  if(number===1) submit('park-until-delivered',form);
+  else {form.elements.until.value=choices[number-1];submit('park',form);}
+  check(requests.at(-1).get('until')===choices[number-1],'The form posts the selected park.');
+  finishPost(states[number-1]);await flush();
+  check(row.hidden && !row.querySelector('[data-new-answer]'),'Park removes the answer mark and hides the row.');
+  check(count('needs-me')===String(2-number) && count('parked')===String(number),'Park updates both chip counts.');
+ }
+ show('parked');
+ check(!item(1).hidden && !item(2).hidden,'Both parked items appear in Parked.');
+ refreshMarkup=ANSWERED_PAGE;
+ document.dispatchEvent(new Event('visibilitychange'));await flush();
+ show('needs-me');
+ check([1,2].every(number=>!item(number).hidden && item(number).querySelector('[data-new-answer]')),
+  'Newer answers return both items to Needs me.');
+ check(count('needs-me')==='2' && count('parked')==='0','Newer answers update both chip counts.');
+'''.replace('PARK_STATES', json.dumps(states).replace('<', r'\u003c')).replace(
+            'PARK_CHOICES', json.dumps(choices)).replace('ANSWERED_PAGE', json.dumps(answered).replace('<', r'\u003c'))
+        self.browser_action_sequence(steps, add_item=False, markup=initial, reduced_motion=True)
+
     def test_count_strip_colors_its_showrunner_with_the_page_name_reading(self) -> None:
         members = staff.StaffSnapshot((replace(OWNER, doc=staff.LiveDoc(local_machine(), self.root / "sdlc.md")),))
         with (patch.object(staff, "snapshot", return_value=members),
