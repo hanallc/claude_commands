@@ -546,7 +546,11 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         if (current.get("instance_id") != instance or not isinstance(saved, progress_history.HookCompletion)
                 or saved.finished or not _same_completion(saved, completion)):
             return outcome
-        return _finalize_completion(member, parent, run, instance, delivery, saved, state, hold, pane)
+        current_state = state
+        if (isinstance(lock, worker_panes.WorkerLockAtUse) and isinstance(pane, worker.CloseCompletedPane)
+                and saved.pane_closed and isinstance(state, worker_panes.ClosedWorker)):
+            current_state = worker_panes.observe_worker(parent.id, member, record)
+        return _finalize_completion(member, parent, run, instance, delivery, saved, current_state, hold, pane)
 
     def send_notice() -> TurnOutcome:
         _ = decision.send_notice()
@@ -582,7 +586,10 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
                     raise ValueError(evidence.blocker)
             completion = replace(completion, pane_closed=True)
             progress_history.save_hook_completion(run, instance, completion)
-        if isinstance(pane, worker.CloseCompletedPane) and not completion.pane_closed:
+        if isinstance(pane, worker.CloseCompletedPane) and not (
+                completion.pane_closed and isinstance(state, worker_panes.ClosedWorker)):
+            # Reuse can save the flag while the pane is still open.
+            completion = replace(completion, pane_closed=False)
             with redirect_stderr(io.StringIO()) as errors:
                 if delivery.actions.end_worker:
                     ended = worker.end(parent.id, name, lock=hold, retire=False)
@@ -954,6 +961,7 @@ def _finalize_stopped(row: staff.StaffRow, parent: staff.StaffRow, run: Path, in
             return worker.CompletionRecovery.PENDING_CLOSE
         completion = replace(completion, pane_closed=True)
         progress_history.save_hook_completion(run, instance, completion)
+        state = worker_panes.ClosedWorker(row)
     _ = _finalize_completion(row, parent, run, instance, delivery, completion, state, hold, pane)
     saved = progress_history.hook_completion(progress_history.pass_for_finalization(run, instance))
     if isinstance(saved, progress_history.HookCompletion) and saved.finished:

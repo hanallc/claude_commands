@@ -6975,6 +6975,47 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(pane, self.fixture.world.locations)
         self.assertIsNone(staff.by_id(row.id))
 
+    def test_end_closes_the_pane_after_reuse_stops_at_the_saved_flag(self) -> None:
+        parent = self.fixture.parent.id
+        name = staff.WorkerName.parse("impl")
+        self.agent.finish_after = 1
+        self.assertIs(worker.dispatch(parent, name, "impl", self.prompt, session_dir=self.run_dir,
+            slot=name.value, phase="8", kind="impl", launcher_command=["assign.sh"], reply=self.reply,
+            completion_actions=progress_history.CompletionActions(end_worker=True)),
+            worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        instance = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
+        self.agent.complete(pane)
+        next_prompt = self.run_dir / "next-assignment.md"
+        worker.save_reply(next_prompt, "Read the next assignment.")
+        save = progress_history.save_hook_completion
+
+        def stop_after_reuse_write(run: Path, pass_id: str, completion: progress_history.HookCompletion) -> None:
+            save(run, pass_id, completion)
+            if pass_id == instance and completion.pane_closed:
+                raise KeyboardInterrupt
+
+        with patch.object(progress_history, "save_hook_completion", side_effect=stop_after_reuse_write):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = worker.dispatch(parent, name, "impl", next_prompt, session_dir=self.run_dir,
+                    slot="next", phase="8", kind="impl", launcher_command=["assign.sh"])
+        saved = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
+        assert isinstance(saved, progress_history.HookCompletion)
+        self.assertTrue(saved.pane_closed)
+        self.assertFalse(saved.finished)
+        self.assertEqual(len(self.agent.submitted), 1)
+        self.assertIn(pane, self.fixture.world.locations)
+
+        with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch("scripts.production.staff_sources.require_worker_stopped"),
+              patch.object(worker_panes, "close", wraps=worker_panes.close) as close):
+            self.assertIs(worker.end(parent, name), worker.ExitCode.OK)
+            close.assert_called_once()
+        self.assertEqual(self.fixture.world.closed, [(pane, "terminal-" + pane)])
+        self.assertNotIn(pane, self.fixture.world.locations)
+        self.assertIsNone(staff.by_id(row.id))
+
     def check_end_after_delivered_stop(self, *, late_done: bool) -> None:
         name = staff.WorkerName.parse("late-done-after-stop" if late_done else "restored-after-stop")
         parent = self.fixture.parent.id
