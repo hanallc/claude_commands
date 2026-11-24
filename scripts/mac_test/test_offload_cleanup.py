@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
 )
@@ -724,10 +725,14 @@ class MacActivityShellTests(unittest.TestCase):
 
     def test_activity_and_leftover_texts_use_the_shared_mirror_selector(self) -> None:
         marker = "select_leftovers() { return 1; }\n"
+        root = MacMirrorRoot("saved/mirror")
         with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
             self.assertTrue(offload.leftover_check_script(HANA).startswith(marker))
             self.assertTrue(mac_test.mac_activity_script().startswith(marker))
-        self.assertEqual(selector.call_args_list, [mock.call(HANA, "mac", 1), mock.call(offload.ALL_MIRRORS)])
+            observation = offload.leftover_check_script(HANA, observe=True, mirror_root=root)
+            self.assertTrue(observation.startswith(marker))
+        self.assertEqual(selector.call_args_list, [mock.call(HANA, "mac", 1, mirror_root=None),
+            mock.call(offload.ALL_MIRRORS), mock.call(HANA, "mac", 1, mirror_root=root)])
 
     def run_selector(
         self, shell: list[str], scope: offload.MirrorScope, responses: dict[str, tuple[int, str]],
