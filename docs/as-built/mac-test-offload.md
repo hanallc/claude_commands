@@ -173,14 +173,19 @@ It releases the lock when no live claim remains.
 - The watcher reads the claims under `state.lock` and releases the lock before SSH.
   It checks activity once per host, using the recorded `remote_host` or the configured host for a process-bound claim.
   It updates or releases only the exact claim it read.
-- For a kept Mac claim with a saved mirror, the watcher confirms that the saved owner ended and takes the mirror lease.
+- The startup probe saves the mirror root and the Mac's `IOPlatformUUID` with the exact claim.
+  The offload uses the same mirror root for the lease and run.
+- For early release, the watcher confirms that the owner ended and takes the lease for the saved mirror root.
+  The remote check reads the Mac identity before it opens the fence.
+  The watcher requires that identity to match the saved identity.
   The release path opens the exact start fence and takes its lock without waiting.
   Under that lock, the read-only check counts processes by mirror command, working directory, and descriptor 8 on the fence.
   When the count is zero, the release path removes the fence and releases the claim.
   Work in another repository does not delay this release.
-  Both the SSH call and the read-only check use `leftover_timeout_s`.
-- A missing fence gives no proof of the Mac's identity. The saved host is a name, and the fence generation identifies the claim's fence.
-  A complete zero count with a missing fence uses the Mac idle rule.
+  The SSH call, the read-only check, and the held-fence diagnostic use `leftover_timeout_s`.
+- A claim without a saved root or identity uses the Mac idle rule.
+  An identity mismatch also uses the idle rule.
+  A complete zero count with a missing fence uses the idle rule.
   A held fence, a nonzero count, or a failed or partial check keeps the claim.
 - `MacActive` clears `idle_since`. The first `MacIdle` records `idle_since`.
   The idle rule permits release after `claim_idle_minutes` (15) minutes with no Mac activity.

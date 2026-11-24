@@ -34,6 +34,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.mac_test.claim_state import (
     WaitClaimCheck,
     claim_worktree_path,
@@ -1737,7 +1738,9 @@ def watch_claim(
     run = claim.record
     if "remote_host" in run:
         saved = claim_state.saved_mac_repository(run)
-        check_mirror = isinstance(saved, claim_state.MacMirrorIdentity) and recoverable_kept_claim(run)
+        origin = run.get("mac_watch_origin")
+        check_mirror = (origin is not None and isinstance(saved, claim_state.MacMirrorIdentity)
+                        and recoverable_kept_claim(run))
         idle_expired = isinstance(activity, MacIdle) and claim_idle_expired(run, claim.path, config, now)
         if not check_mirror and not idle_expired:
             return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
@@ -1746,7 +1749,11 @@ def watch_claim(
 
         with ExitStack() as lease:
             try:
-                lease.enter_context(offload.mac_cleanup_lease(saved, run["remote_host"], paths.target))
+                if origin is None:
+                    lease.enter_context(offload.mac_cleanup_lease(saved, run["remote_host"], paths.target))
+                else:
+                    root = MacMirrorRoot(origin["mirror_root"])
+                    lease.enter_context(offload.mac_cleanup_lease(saved, run["remote_host"], paths.target, mirror_root=root))
             except copies.BusyRemoteMirror:
                 return True
             except (OSError, copies.CopyError, conf.Unusable) as error:
@@ -1814,12 +1821,15 @@ def apply_claim_activity(
         except (OSError, ValueError) as error:
             result = ClaimReleaseRefused(str(error))
         if isinstance(result, ClaimReleaseRefused):
-            if not result.fence_missing:
-                print(f"Mac claim mirror check kept the claim: {result.reason}", flush=True)
-            return True
-        print_claim_release(result)
-        mirror_ended = not result.fence_missing
-    else:
+            if not result.idle_only:
+                if not result.fence_missing:
+                    print(f"Mac claim mirror check kept the claim: {result.reason}", flush=True)
+                return True
+            check_mirror = False
+        else:
+            print_claim_release(result)
+            mirror_ended = not result.fence_missing
+    if not check_mirror:
         if not idle_release:
             return True
         release = CliArguments()
@@ -2619,12 +2629,14 @@ class ClaimReleaseRefused:
     """The reason explains why the claim release was refused."""
     reason: str
     fence_missing: bool = False
+    idle_only: bool = False
 
 
 def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
     return (claim_owner(current) == claim_owner(record)
             and current.get("remote_host") == record.get("remote_host")
             and current.get("mac_repository") == record.get("mac_repository")
+            and current.get("mac_watch_origin") == record.get("mac_watch_origin")
             and current.get("slot") == record.get("slot"))
 
 
@@ -2697,14 +2709,17 @@ def release_exact_claims(
                                if fence is not None else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
                 else:
                     command = ""
+                origin = record.get("mac_watch_origin")
                 if watched_claim is not None:
-                    if not isinstance(saved, claim_state.MacMirrorIdentity):
-                        return ClaimReleaseRefused("the saved mirror is unavailable")
+                    if origin is None or not isinstance(saved, claim_state.MacMirrorIdentity):
+                        return ClaimReleaseRefused("the saved Mac or mirror is unavailable", idle_only=True)
+                    machine_id = origin["machine_id"]
+                    root = MacMirrorRoot(origin["mirror_root"])
                     fence = offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
                     observation = offload.leftover_check_script(offload.mac_cleanup_scope(saved), paths.target,
-                                                                fence=fence, observe=True)
+                                                                fence=fence, observe=True, mirror_root=root)
                     command = offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
-                        report_holders=True, leftover_observation=(observation, connection.leftover_timeout_s))
+                        report_holders=True, leftover_observation=(observation, connection.leftover_timeout_s, machine_id))
                 elif fence_pending:
                     command += offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
                                                          report_holders=paths.platform == "macos") + "\n"
@@ -2712,10 +2727,16 @@ def release_exact_claims(
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
                                                   release_deadline=release_deadline)
-                if watched_claim is not None:
-                    prefix = ["leftovers=0", "rc=0"]
+                if watched_claim is not None and origin is not None:
+                    machine_id = origin["machine_id"]
                     key = claim_state.pending_start_key(identity)
                     lines = observed.output.splitlines()
+                    identity_reply = "dispatch_mac_id="
+                    if len(lines) == 1 and lines[0].startswith(identity_reply):
+                        actual = claim_state.mac_machine_id(lines[0].removeprefix(identity_reply))
+                        if actual is not None and actual != machine_id:
+                            return ClaimReleaseRefused("the Mac identity changed", idle_only=True)
+                    prefix = [identity_reply + machine_id, "leftovers=0", "rc=0"]
                     fence_missing = (isinstance(observed.result, offload.LeftoversEnded)
                                      and lines == [*prefix, f"dispatch_start_missing={key}"])
                     if fence_missing:
