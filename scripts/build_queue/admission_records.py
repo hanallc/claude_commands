@@ -102,8 +102,6 @@ class GuestStartNotRecorded:
 class ConfirmedGuestStart:
     """The queue accepted a start report for this guest attempt."""
 
-    episode: str
-    attempt: str
     accepted_at: float
 
 

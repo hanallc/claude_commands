@@ -780,7 +780,12 @@ class PlacementTests(unittest.TestCase):
                 pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
                 self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
 
+                accepted_at = fixture.clock.now()
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                start = fixture.server.assignments[key].confirmed_guest_start
+                assert isinstance(start, records.ConfirmedGuestStart), start
+                self.assertEqual(start.accepted_at, accepted_at)
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
@@ -822,11 +827,21 @@ class PlacementTests(unittest.TestCase):
                 "mac-linux", "fixture-boot", "fixture-machine", assignment.attempt))
             report = wire.ExecutionReport("guest-started", assignment, granted.claim, execution)
             _ = fixture.server.handle_request(report)
-            expected = {"kind": "ConfirmedGuestStart", "episode": assignment.episode,
-                        "attempt": assignment.attempt, "accepted_at": started_at}
+            expected = {"kind": "ConfirmedGuestStart", "accepted_at": started_at}
+            hold = fixture.server.assignments[key].remote_start_hold
+            assert isinstance(hold, records.RemoteStartHold), hold
+            place_key, = fixture.server.places
+            self.assertTrue(fixture.server.places[place_key].move_id)
             fixture.restart()
-            self.assertEqual(assignment_row(fixture.server.assignments[key]).get("confirmed_guest_start"), expected)
+            self.assertNotIn(key, fixture.server.execution_evidence)
+            with self.subTest(state="saved start"):
+                self.assertEqual(assignment_row(fixture.server.assignments[key]).get("confirmed_guest_start"), expected)
             _ = fixture.run_pass()
+            self.assertLess(fixture.clock.now(), hold.deadline)
+            with self.subTest(state="local hold"):
+                self.assertEqual(fixture.server.assignments[key].remote_start_hold, records.RemoteStartHoldEnded())
+            with self.subTest(state="placement rank"):
+                self.assertEqual(fixture.server.places[place_key].move_id, "")
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             running, = (step for step in view.reading.view.running if step.assignment_target == "mac-linux")
