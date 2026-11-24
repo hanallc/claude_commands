@@ -3401,9 +3401,8 @@ class AdmissionServer:
     def _cloud_slots_used(self) -> int:
         """Count legacy cloud reservations and current AWS placements."""
         return (sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
-                + sum(saved.assignment.destination.provider == "scaler"
-                      for key in self.current_assignments.values()
-                      if (saved := self.assignments.get(key)) is not None))
+                + sum(self.assignments[key].assignment.destination.provider == "scaler"
+                      for key in self.current_assignments.values()))
 
     def _cloud_slots_full(self) -> bool:
         return (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)

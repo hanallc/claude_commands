@@ -1391,7 +1391,7 @@ class PlacementTests(unittest.TestCase):
     def test_ending_a_remote_start_releases_only_the_heads_claim(self) -> None:
         hold_seconds = 600
         deadline_cases = ("deadline with a newer slot", "deadline with no initial claim")
-        for ending in (*deadline_cases, "lost local eligibility", "missing assignment"):
+        for ending in (*deadline_cases, "lost local eligibility", "cancelled assignment"):
             with self.subTest(ending=ending), PlacementFixture() as fixture:
                 fixture.configure(remote_start_hold_seconds=hold_seconds)
                 run = fixture.run_owner()
@@ -1430,8 +1430,9 @@ class PlacementTests(unittest.TestCase):
                     reply, = fixture.connect(retry).replies()
                     self.assertIsInstance(reply, wire.Assignment)
                 else:
-                    key = execution_identity.attempt_key(remote.episode, remote.attempt)
-                    del fixture.server.assignments[key]
+                    reply, = fixture.server.handle_request(wire.CancelPlacement(
+                        "cancel-remote-start", head.episode, head.owner, "the step ended"))
+                    self.assertIsInstance(reply, wire.Ok)
                     _ = fixture.run_pass()
 
                 self.assertNotIn(head.episode, fixture.server.waiters)
