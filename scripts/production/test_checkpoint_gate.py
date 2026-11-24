@@ -131,6 +131,124 @@ class CheckpointGateTests(unittest.TestCase):
                              "No enabled build target can run this Claude gate. Check enabled.* in build_targets.conf.")
 
 
+@final
+class PackageStepFixture:
+    def __init__(self, case: unittest.TestCase) -> None:
+        root = Path(case.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.production = ProductionDocument(root / "production.md", "fixture", "merge", root,
+                                             root / "production.log", ZoneInfo("UTC"))
+        self.log = root / "test.log"
+        self.verify = str(root / "verify.sh")
+        _ = (root / "Cargo.toml").write_text(
+            '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\nexclude = ["crates/solo", "vendor/wesl"]\n')
+        self.paths = tuple(self.write_package(f"crates/{name}") for name in ("alpha", "beta", "gamma"))
+        self.steps = self.select_steps()
+        self.joined = ["bash", self.verify, "test", "alpha", "+", "test", "beta", "+", "test", "gamma"]
+        self.beta_red = subprocess.CompletedProcess(self.joined, 1, "  FAIL [  0.1s] (1/1) beta unit_red\n",
+            "verify.sh: step result: test alpha exit=0\nverify.sh: step result: test beta exit=1\n")
+
+    def write_package(self, path: str) -> str:
+        folder = self.production.checkout / path
+        (folder / "src").mkdir(parents=True)
+        _ = (folder / "Cargo.toml").write_text(f'[package]\nname = "{folder.name}"\nversion = "0.1.0"\n')
+        (folder / "src/lib.rs").touch()
+        return f"{path}/src/lib.rs"
+
+    def select_steps(self, *paths: str) -> list[checkpoint_gate.CheckpointTestStep]:
+        with mock.patch.object(checkpoint_gate, "tool", return_value=self.verify):
+            return checkpoint_gate.test_steps(self.production, (*self.paths, *paths), ())
+
+
+class CheckpointPackageTests(unittest.TestCase):
+    def test_three_packages_use_one_verify_step_list(self) -> None:
+        fixture = PackageStepFixture(self)
+        rows = "".join(f"verify.sh: step result: test {name} exit=0\n" for name in ("alpha", "beta", "gamma"))
+        with mock.patch.object(subprocess, "run",
+                               return_value=subprocess.CompletedProcess(fixture.joined, 0, "", rows)) as run:
+            result = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(), fixture.log)
+        run.assert_called_once_with(fixture.joined, cwd=fixture.production.checkout, capture_output=True, text=True,
+                                    check=False, pass_fds=())
+        self.assertEqual(result, "package alpha, package beta, package gamma")
+        self.assertIn(rows, fixture.log.read_text())
+
+    def test_member_with_cargo_config_runs_separately_from_its_siblings(self) -> None:
+        for filename in ("config.toml", "config"):
+            with self.subTest(filename=filename):
+                fixture = PackageStepFixture(self)
+                root = fixture.production.checkout
+                beta = root / "crates/beta"
+                (root / ".cargo").mkdir()
+                (root / ".cargo/config.toml").touch()
+                (beta / ".cargo").mkdir()
+                (beta / ".cargo" / filename).touch()
+
+                with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                    _ = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(), fixture.log)
+
+                self.assertEqual(run.call_args_list, [
+                    mock.call(["bash", fixture.verify, "test", "alpha", "+", "test", "gamma"], cwd=root,
+                              capture_output=True, text=True, check=False, pass_fds=()),
+                    mock.call(["bash", fixture.verify, "test", "beta"], cwd=beta, capture_output=True, text=True,
+                              check=False, pass_fds=()),
+                ])
+
+    def test_vendored_workspace_uses_its_own_verify_call(self) -> None:
+        fixture = PackageStepFixture(self)
+        root = fixture.production.checkout
+        vendor = root / "vendor" / "wesl"
+        path = fixture.write_package("vendor/wesl/crates/wesl")
+        _ = (vendor / "Cargo.toml").write_text('[workspace]\nresolver = "2"\nmembers = ["crates/wesl"]\n')
+
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            result = checkpoint_gate.run_test_steps(fixture.production, fixture.select_steps(path),
+                                                    frozenset(), frozenset(), fixture.log)
+
+        self.assertEqual(run.call_args_list, [
+            mock.call(fixture.joined, cwd=root, capture_output=True, text=True, check=False, pass_fds=()),
+            mock.call(["bash", fixture.verify, "test", "wesl"], cwd=vendor, capture_output=True, text=True,
+                      check=False, pass_fds=()),
+        ])
+        self.assertEqual(result, "package alpha, package beta, package gamma, package wesl")
+
+    def test_excluded_package_runs_from_its_own_folder(self) -> None:
+        fixture = PackageStepFixture(self)
+        root = fixture.production.checkout
+        path = fixture.write_package("crates/solo")
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            _ = checkpoint_gate.run_test_steps(fixture.production, fixture.select_steps(path),
+                                               frozenset(), frozenset(), fixture.log)
+        self.assertEqual(run.call_args_list, [
+            mock.call(fixture.joined, cwd=root, capture_output=True, text=True, check=False, pass_fds=()),
+            mock.call(["bash", fixture.verify, "test", "solo"], cwd=root / "crates/solo", capture_output=True,
+                      text=True, check=False, pass_fds=()),
+        ])
+
+    def test_red_step_list_names_the_failed_package(self) -> None:
+        fixture = PackageStepFixture(self)
+        with (mock.patch.object(subprocess, "run", return_value=fixture.beta_red) as run,
+              self.assertRaises(checkpoint_gate.RedCheckpointTests) as red):
+            _ = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(), fixture.log,
+                                               retry_failed_steps=False)
+        run.assert_called_once()
+        self.assertEqual(red.exception.red, (checkpoint_gate.RedStep(fixture.steps[1], frozenset({"unit_red"})),))
+        self.assertIn("package beta (unit_red) failed", red.exception.detail)
+
+    def test_step_list_runs_remaining_packages_and_retries_the_flake(self) -> None:
+        fixture = PackageStepFixture(self)
+        beta, gamma = fixture.steps[1].command, fixture.steps[2].command
+        with mock.patch.object(subprocess, "run", side_effect=[
+            fixture.beta_red, subprocess.CompletedProcess(gamma, 0, "", ""), subprocess.CompletedProcess(beta, 0, "", ""),
+        ]) as run:
+            result = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset({"beta"}),
+                                                    frozenset(), fixture.log)
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [fixture.joined, gamma, beta])
+        self.assertEqual([call.kwargs["cwd"] for call in run.call_args_list],
+                         [fixture.production.checkout, fixture.production.checkout, fixture.steps[1].folder])
+        self.assertEqual(result, "package alpha, package beta, package gamma")
+        self.assertIn("known flake beta", fixture.production.log.read_text())
+
+
 COMMAND = ["python3", "gate.py", "--tests-only"]
 RED_OUTPUT = "  FAIL [  0.1s] (1/1) check known_flake\n--- lib/test_infrastructure.py exit=1 ---\n"
 
