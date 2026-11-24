@@ -389,6 +389,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 released.assert_not_called()
                 owner = build_hold.ProcessIdentity(reply.assignment.owner.pid, reply.assignment.owner.start_time)
                 with (mock.patch.object(build_hold, "caller_processes", return_value=frozenset({owner})),
+                      mock.patch.object(copies, "take_prepared_gate_handoff", return_value=mode_flag == "--affected"),
                       mock.patch.object(gate, "gate_job_from_process",
                                         return_value=gate_job_for_command(["gate.py", *argv])),
                       mock.patch.object(mac_linux, "route") as guest,

@@ -1467,7 +1467,8 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                                       delivery_pending: bool | None = None, builds_version: str = "") -> None:
                         if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
-                        super().html_response(status, content, delivery_pending=delivery_pending, builds_version=builds_version)
+                        super().html_response(status, content, delivery_pending=delivery_pending,
+                                              builds_version=builds_version)
 
                     @override
                     def review_response(self, content: bytes, content_type: str, prepared: bytes = b"", *,
@@ -5417,6 +5418,25 @@ observer.observe(original.parentElement,{childList:true});
   'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
  show('morty-answering');
  check(!row.hidden && !status.hidden,'Morty answering keeps the Unpark confirmation.');
+''', reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_unpark_focuses_the_parked_filter_without_window_focus(self) -> None:
+        item = self.add("Check the parked item", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=7), source="morty")
+        self.browser_action_sequence('''
+ document.hasFocus=()=>false;
+ show('parked');
+ const chip=document.getElementById('filter-show-parked');
+ const unpark=form.querySelector('[value="unpark"]');
+ unpark.focus();
+ check(parent===window && !document.hasFocus(),'The top-level page reports no window focus.');
+ check(!row.hidden && recordIsOpen(row) && document.activeElement===unpark,'Unpark has focus in the open row.');
+ submit('unpark');
+ finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
+ await flush();
+ check(row.hidden && !recordIsOpen(row),'Unpark hides and closes the row.');
+ check(document.activeElement===chip,'The Parked filter receives focus.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")

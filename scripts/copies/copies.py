@@ -47,8 +47,9 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS, StepJob, VerifyCommand, build_call_arguments, command_job,
-    command_program, read_step_names, verify_command,
+    GATE_SCRIPTS, MERGE_GATE_PROGRAMS,
+    OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, command_program,
+    parse_command_program, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -90,11 +91,13 @@ class AdmissionSourceCopy:
 
 ADMISSION_SOURCE_COPIES: ContextVar[tuple[AdmissionSourceCopy, ...]] = ContextVar("admission_source_copies", default=())
 
+COPY_ERROR_STATUS = 2
+
 
 class CopyError(Exception):
     """An invalid request or an unavailable checkout."""
 
-    exit_code: int = 2
+    exit_code: int = COPY_ERROR_STATUS
 
 
 # Git's exit status when `git remote get-url` names no configured remote.
@@ -2648,6 +2651,15 @@ def run_prepared_gate(command: Sequence[str], *, cwd: Path, descriptors: tuple[i
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
+    program = parse_command_program(command)
+    if not isinstance(program, OtherCommand) and program[0] in MERGE_GATE_PROGRAMS:
+        arguments = program[1]
+        if "-h" not in arguments and "--help" not in arguments:
+            error = first_step.gate_module_mode_error(
+                has_modules=any(word == "--module" or word.startswith("--module=") for word in arguments),
+                tests_only="--tests-only" in arguments, affected="--affected" in arguments)
+            if error:
+                raise CopyError(error)
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     verification = verify_command(command)
@@ -2723,24 +2735,15 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
     targets = first_step.gate_targets(command, source, args.targets)
 
     def run() -> subprocess.CompletedProcess[str]:
-        return subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
+        environment = {**os.environ, "BUILDLOG_PREPARED_COPY": str(source)}
+        return run_prepared_gate(command, cwd=source, descriptors=tuple(args.lease_fd), environment=environment)
 
     if not targets and uses_parent_reservation(tuple(command)):
         result = run()
     else:
         with first_step.admitted_run(command, source, targets=targets) as admitted:
             admitted.handoff(source)
-
-            def run_assigned() -> subprocess.CompletedProcess[str]:
-                grant = admitted.grant
-                if (isinstance(grant, first_step.GatePlacement)
-                        and grant.grant.assignment.destination.provider == "scaler"):
-                    environment = {**os.environ, "BUILDLOG_PREPARED_COPY": str(source)}
-                    return run_prepared_gate(command, cwd=source, descriptors=tuple(args.lease_fd),
-                                             environment=environment)
-                return run()
-
-            result = run_assigned()
+            result = run()
             admitted.preserve_exit_status = first_step.is_gate_placement_exit(result.returncode)
     if result.stderr:
         _ = sys.stderr.write(result.stderr)
@@ -3178,7 +3181,7 @@ def main(argv: list[str] | None = None) -> int:
     except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, build_folders.InvalidFolderForm,
             SlotGitFailure, conf.Unusable, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
-        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else 2
+        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else COPY_ERROR_STATUS
     return 0
 
 

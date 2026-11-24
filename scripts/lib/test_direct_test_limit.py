@@ -22,7 +22,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 REPO = Path(__file__).resolve().parents[2]
 MODULE_RUN = REPO / "scripts/test_times/module_run.py"
 CASE_LIMIT = 2
-LIMIT_LINE = f"stopped at the {CASE_LIMIT}-second direct test limit; run longer tests with targeted_test.py --module"
+LIMIT_LINE = (f"stopped at the {CASE_LIMIT}-second direct test limit. "
+              "Run longer tests with copies.py run and gate.py --affected --module.")
 LIMIT_REQUEST = f"scope requested: {CASE_LIMIT}"
 SELECTION_REFUSAL = "more than one test: run it with copies.py --affected or --module"
 FIXTURE_SCOPE = "claude-direct-test-" + "0" * 32 + ".scope"

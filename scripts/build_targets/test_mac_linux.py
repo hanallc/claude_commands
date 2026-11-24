@@ -34,6 +34,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
+from scripts.copies import copies
 from scripts.lib import atomic_file, conf, process_group, process_start, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
@@ -1613,9 +1614,16 @@ fi
                 assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
 
         def run_gate() -> subprocess.CompletedProcess[str]:
+            environment = {'BUILDLOG_PREPARED_COPY': str(self.repo)}
             errors = io.StringIO()
-            with redirect_stderr(errors):
-                code = gate.main(args)
+            reader, writer = os.pipe()
+            with os.fdopen(reader, 'rb') as pipe:
+                with os.fdopen(writer, 'wb') as token:
+                    _ = token.write(f'{os.getpid()}\n'.encode('ascii'))
+                # gate.main closes the descriptor that it reads.
+                environment[copies.PREPARED_GATE_FD] = str(os.dup(pipe.fileno()))
+                with patch.dict(os.environ, environment), redirect_stderr(errors):
+                    code = gate.main(args)
             return subprocess.CompletedProcess(command, code, "", errors.getvalue())
 
         with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'main-probe-failure'}),
