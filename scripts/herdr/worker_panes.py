@@ -262,6 +262,10 @@ def _worker_lock_path(key: str) -> Path:
     return staff.record_path().parent / "locks" / f"{key}.lock"
 
 
+def _worker_name_lock_path(parent: StaffId, name: str) -> Path:
+    return _worker_lock_path(f"{parent}-{name}")
+
+
 @contextmanager
 def worker_id_lock(identity: StaffId, *, blocking: bool = False,
                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[None]:
@@ -318,7 +322,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
-        path = _worker_lock_path(f"{parent}-{name.value}")
+        path = _worker_name_lock_path(parent, name.value)
         path.parent.mkdir(parents=True, exist_ok=True)
         creation = operations.enter_context(path.open("a"))
         try:
@@ -941,20 +945,28 @@ class ReleasedWorkerPass(Enum):
 WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
 
 
+class DispatchLockAvailable(Enum):
+    AVAILABLE = "the dispatch lock does not block this operation"
+
+
 def check_worker_lock(row: staff.StaffRow,
-                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
-    """Check the worker lock without creating a file."""
+                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
+                      include_name: bool = False) -> DispatchLockAvailable | Kept:
+    """Check the fixed-ID lock and optionally the name lock without creating files."""
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
-        path = _worker_lock_path(row.id)
-        try:
-            with path.open("r") as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return Kept("dispatch lock is held")
-        except FileNotFoundError:
-            pass
-    return CloseAllowed()
+        paths = [_worker_lock_path(row.id)]
+        if include_name and isinstance(row.parent, staff.ReportsTo):
+            paths.insert(0, _worker_name_lock_path(row.parent.id, row.name))
+        for path in paths:
+            try:
+                with path.open("r") as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return Kept("dispatch lock is held")
+            except FileNotFoundError:
+                continue
+    return DispatchLockAvailable.AVAILABLE
 
 
 class RunningDetachedWorkers(Protocol):

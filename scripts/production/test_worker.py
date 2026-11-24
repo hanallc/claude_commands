@@ -5789,9 +5789,11 @@ class WorkerCommandTests(unittest.TestCase):
                                         prompt: Path, launcher_command: list[str],
                                         work: progress_history.DispatchWork | progress_history.DispatchWorkAtUse,
                                         target: staff.WorkerName | progress_history.DispatchTargetAtUse,
+                                        prompt_source: Path | bytes,
                                         ) -> pass_recorder.DispatchSelection | pass_recorder.ActiveDispatchPromptConflict:
                     result = read_dispatch(session_dir, slot=slot, phase=phase, role=role,
-                                           prompt=prompt, launcher_command=launcher_command, work=work, target=target)
+                        prompt=prompt, launcher_command=launcher_command, work=work, target=target,
+                        prompt_source=prompt_source)
                     atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
                     return result
 
@@ -6189,8 +6191,9 @@ class WorkerCommandTests(unittest.TestCase):
         original = cast(Callable[..., object], Path.open)
         def opened(path: Path, *args: object, **kwargs: object) -> object:
             return HistoryReads(content) if path == history else original(path, *args, **kwargs)
-        def check_lock(row: staff.StaffRow, *_args: object) -> worker_panes.CloseAllowed | worker_panes.Kept:
-            return worker_panes.Kept("TEST dispatch lock") if row.id == other.id else worker_panes.CloseAllowed()
+        def check_lock(row: staff.StaffRow, *_args: object) -> worker_panes.DispatchLockAvailable | worker_panes.Kept:
+            return (worker_panes.Kept("TEST dispatch lock") if row.id == other.id
+                    else worker_panes.DispatchLockAvailable.AVAILABLE)
         with (patch.object(Path, "open", autospec=True, side_effect=opened),
               patch.object(worker_panes, "check_worker_lock", side_effect=check_lock),
               patch.object(json, "loads", wraps=json.loads) as decoded):

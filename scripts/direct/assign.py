@@ -495,7 +495,7 @@ def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_
         return progress_history.record_assignment_launch_exit(run, instance, outcome)
 
 
-def assignment_prompt(args: Arguments, run: Path, phase: str, role: str, slot: str,
+def assignment_prompt(args: Arguments, run: Path, phase: str, role: staff.WorkerRole, slot: str,
                       launcher: list[str], alias: Path, content: str,
                       summary: Path) -> tuple[Path, NoStyleAssignment | StyleAssignment]:
     """Reuse the recorded prompt or publish a new immutable copy."""
@@ -503,7 +503,7 @@ def assignment_prompt(args: Arguments, run: Path, phase: str, role: str, slot: s
     state = read_object(run / unit_runs.STATE_FILE)
     passed = object_map(object_map(state.get("pass")).get(selected))
     saved_path = text(passed.get("prompt_file"))
-    if saved_path and role in staff.WORKER_ROLES:
+    if saved_path:
         saved = Path(saved_path)
         style_path = progress_history.dispatch_delivery(passed).actions.style_directory
         style = StyleAssignment(Path(style_path), summary) if style_path else NoStyleAssignment()
@@ -528,8 +528,8 @@ def assignment_prompt(args: Arguments, run: Path, phase: str, role: str, slot: s
         _ = create_text_atomic(message, content)
     if message.read_text() != content:
         refuse(f"Saved prompt differs from the assignment: {message}")
-    if not alias.exists():
-        _ = create_text_atomic(alias, content)
+    if alias != Path(saved_path) and (not alias.is_file() or alias.read_text() != content):
+        write_text_atomic(alias, content)
     if args.style_since:
         end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
         directory = style_review.start(Path(args.cwd), args.style_since, alias.parent, message, slot, end)
@@ -538,29 +538,82 @@ def assignment_prompt(args: Arguments, run: Path, phase: str, role: str, slot: s
 
 
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
-                  role: str, paths: list[str], env: dict[str, str]) -> int:
-    """Keep generated prompts until the worker command records the dispatch."""
-    with (run / remove_run_scratch.ASSIGNMENT_PROMPT_LOCK).open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
-        return _execute_herdr(args, run, phase, prompt, role, paths, env, lock.fileno())
-
-
-def _execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
-                   role: str, paths: list[str], env: dict[str, str], prompt_lock: int) -> int:
+                  role: staff.WorkerRole, paths: list[str], env: dict[str, str]) -> int:
+    """Check the worker before publishing assignment files."""
     directory = phase_reservation.phase_directory(run, phase)
-    directory.mkdir(parents=True, exist_ok=True)
     launcher = launcher_command()
-    slot = args.to or args.new_worker or role
+    named = args.to or args.new_worker
+    slot = named or role
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
-    summary = directory / f"{slot}_summary{suffix}.txt"
-    status = directory / f"{slot}_status{suffix}"
-    message = directory / f"{slot}_prompt{suffix}.txt"
-    reply = directory / f"{slot}_reply{suffix}.txt"
-    log = directory / f"{slot}_agent{suffix}.log"
     content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
+    state = read_object(run / unit_runs.STATE_FILE)
+    record = staff.snapshot()
+    parent = unit_runs.run_owner(state, record)
+    if isinstance(parent, staff.StaffRow):
+        work = progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0)
+        saved_slot = progress_history.launch_slot(run, slot, launcher)
+        passed = pass_recorder.pass_slots(state).get(saved_slot, {})
+        saved_path = text(passed.get("prompt_file"))
+        saved_command = passed.get("launcher_command")
+        same_launcher = isinstance(saved_command, list) and (
+            saved_command == launcher or (passed.get("status") in ("active", "refused")
+                and pass_recorder.worker_launcher(cast(list[str], saved_command),
+                                                  text(passed.get("worker_name"))) == launcher))
+        proposed = content
+        candidate = directory / f"{slot}_prompt{suffix}.txt"
+        style_directory = progress_history.dispatch_delivery(passed).actions.style_directory
+        if same_launcher and saved_path and Path(saved_path).is_file() and bool(style_directory) == bool(args.style_since):
+            candidate = Path(saved_path)
+            if style_directory:
+                addition = (Path(style_directory) / "assignment.md").read_text()
+                if addition:
+                    proposed += "\n" + addition
+        retry = staff_worker.admit_dispatch(parent.id, progress_history.DispatchTargetAtUse.FROM_LAUNCHER,
+            role, candidate, session_dir=run, slot=slot, phase=phase, launcher_command=launcher,
+            work=work, prompt_source=proposed.encode("utf-8"), record=record)
+        if isinstance(retry, staff_worker.ExitCode):
+            return retry
+        if named:
+            chosen = staff.WorkerName.parse(named)
+        elif isinstance(retry.action, pass_recorder.MatchedDispatch):
+            chosen = staff.WorkerName.parse(retry.action.worker_name)
+        else:
+            chosen = staff_worker.select_worker(parent.id, role, record, additional_runs=(run,))
+        if not isinstance(chosen, staff.WorkerName):
+            return staff_worker.startup_result(staff.WorkerName.parse(role), chosen)
+        slot = chosen.value
+        if slot != saved_slot:
+            candidate = directory / f"{slot}_prompt{suffix}.txt"
+            proposed = content
+        admission = staff_worker.admit_dispatch(parent.id, chosen, role, candidate, session_dir=run, slot=slot,
+            phase=phase, launcher_command=launcher, work=work, prompt_source=proposed.encode("utf-8"), record=record)
+        if isinstance(admission, staff_worker.ExitCode):
+            return admission
+    check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
+             "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
+    if args.lens:
+        check += ["--lens", args.lens]
+    checked = call(check, env, check=False)
+    if checked.returncode:
+        return 3 if checked.returncode == 3 else 2
+    with (run / remove_run_scratch.ASSIGNMENT_PROMPT_LOCK).open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        return _execute_herdr(args, run, phase, role, paths, env, lock.fileno(),
+                              directory=directory, launcher=launcher, slot=slot, suffix=suffix, content=content)
+
+
+def _execute_herdr(args: Arguments, run: Path, phase: str, role: staff.WorkerRole, paths: list[str],
+                   env: dict[str, str], prompt_lock: int, *, directory: Path, launcher: list[str], slot: str,
+                   suffix: str, content: str) -> int:
+    directory.mkdir(parents=True, exist_ok=True)
+    message = directory / f"{slot}_prompt{suffix}.txt"
+    summary = directory / f"{slot}_summary{suffix}.txt"
+    status = directory / f"{slot}_status{suffix}"
+    reply = directory / f"{slot}_reply{suffix}.txt"
+    log = directory / f"{slot}_agent{suffix}.log"
     message, style = assignment_prompt(args, run, phase, role, slot, launcher, message, content, summary)
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
@@ -894,14 +947,7 @@ def main() -> int:
         return submission_result(execute_astra_review(args, cwd, prompt, env))
     paths = authorized_paths(args, cwd)
     run, phase = prepare_run(args, cwd, prompt, env)
-    role = "impl" if args.role == "implement" else args.role
-    check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
-             "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
-    if args.lens:
-        check += ["--lens", args.lens]
-    checked = call(check, env, check=False)
-    if checked.returncode:
-        return 3 if checked.returncode == 3 else 2
+    role = "impl" if args.role == "implement" else cast(staff.WorkerRole, args.role)
     return submission_result(execute_herdr(args, run, phase, prompt, role, paths, env))
 
 

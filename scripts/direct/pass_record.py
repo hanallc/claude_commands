@@ -928,7 +928,7 @@ class DispatchPromptRefused(RuntimeError):
 
 def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool,
+                    dispatch_owned: bool, prompt_source: Path | bytes,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
         return NoMatchedDispatch()
@@ -953,7 +953,8 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
             return NoMatchedDispatch()
     if dispatch_owned and not stage_two:
         try:
-            digest = hashlib.sha256(Path(string(fields.get("prompt_file"))).read_bytes()).hexdigest()
+            content = prompt_source.read_bytes() if isinstance(prompt_source, Path) else prompt_source
+            digest = hashlib.sha256(content).hexdigest()
         except OSError:
             return NoMatchedDispatch()
         if active.get("prompt_digest") != digest:
@@ -1070,7 +1071,8 @@ def start_pass(args: argparse.Namespace,
     }
     active = pass_slots(state).get(team_slot)
     match = dispatch_match(active, phase, dispatch_fields, launcher_command,
-                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)))
+                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
+                           prompt_source=Path(optional_arg(args, "prompt_file")))
     if isinstance(match, ActiveDispatchPromptConflict):
         raise DispatchPromptRefused(match)
     if isinstance(selection, DispatchSelection):

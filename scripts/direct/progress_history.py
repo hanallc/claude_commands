@@ -1172,7 +1172,7 @@ def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
     """Find the worker for this dispatch retry without changing recorder state."""
     selected = select_dispatch(session_dir, slot=slot, phase=phase, role=role, prompt=prompt,
                                launcher_command=launcher_command, work=work,
-                               target=DispatchTargetAtUse.FROM_LAUNCHER)
+                               target=DispatchTargetAtUse.FROM_LAUNCHER, prompt_source=prompt)
     if isinstance(selected, pass_recorder.ActiveDispatchPromptConflict):
         return selected
     return selected.action if isinstance(selected.action, pass_recorder.MatchedDispatch) else pass_recorder.NoMatchedDispatch()
@@ -1192,7 +1192,7 @@ class DispatchTargetAtUse(Enum):
 
 def select_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                     prompt: Path, launcher_command: list[str], work: DispatchWork | DispatchWorkAtUse,
-                    target: staff.WorkerName | DispatchTargetAtUse,
+                    target: staff.WorkerName | DispatchTargetAtUse, prompt_source: Path | bytes,
                     ) -> pass_recorder.DispatchSelection | pass_recorder.ActiveDispatchPromptConflict:
     """Select the pass before worker recovery can change the slot."""
     state = pass_recorder.read_state(session_dir) if pass_recorder.state_path(session_dir).is_file() else {}
@@ -1207,7 +1207,7 @@ def select_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
         if saved_phase is not None and pass_recorder.string(saved_phase.get("id")) == phase:
             match_phase = saved_phase
     match = (pass_recorder.dispatch_match(previous, match_phase, _dispatch_fields(role, prompt, work),
-                             launcher_command, dispatch_owned=True)
+                             launcher_command, dispatch_owned=True, prompt_source=prompt_source)
              if match_phase is not None else pass_recorder.NoMatchedDispatch())
     if isinstance(match, pass_recorder.ActiveDispatchPromptConflict):
         return match

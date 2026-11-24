@@ -1,6 +1,7 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import select
@@ -1357,6 +1358,115 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual((status.read_bytes(), status.stat().st_ino), saved)
         self.assertEqual(self.turn_starts, 1)
         self.assertIn("role=impl; exit 6", (self.session_dir / "board.log").read_text())
+
+        self.native.agent.finish_after = 100
+        _ = self.successful("implement", "--to", "impl")
+        phase = status.parent
+        files = {path: path.read_bytes() for path in phase.iterdir() if path.is_file()}
+        self.assertIn(b"Implement the second change.", files[phase / "impl_prompt.txt"])
+        run_files = (self.session_dir / "board.log", self.session_dir / "heartbeat.log",
+                     self.session_dir / unit_runs.STATE_FILE)
+        saved_run = {path: path.read_bytes() for path in run_files}
+        history = self.events()
+        pane, line = self.native.agent.submitted[-1]
+        row = self.native.agent.row(pane)
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        source = worker_admission.transcript_source(row, backend)
+        transcript = source.read_text()
+        question = "Which output format must I use?"
+        world = self.native.fixture.world
+        locations = world.locations
+        for case, role, expected in (("working", "test", worker.ExitCode.BUSY),
+                                     ("missing receipt", "implement", worker.ExitCode.BUSY),
+                                     ("held lock with receipt", "implement", worker.ExitCode.BUSY),
+                                     ("held name lock with receipt", "implement", worker.ExitCode.BUSY),
+                                     ("done with an active pass", "implement", worker.ExitCode.BUSY),
+                                     ("completion waits for a detached run", "test", worker.ExitCode.BUSY),
+                                     ("blocked", "test", worker.ExitCode.BLOCKED)):
+            with self.subTest(state=case), ExitStack() as cleanup:
+                locations[pane]["agent_status"] = "working"
+                world.first_turn_timeout = case in ("working", "missing receipt")
+                _ = cleanup.callback(setattr, world, "first_turn_timeout", False)
+                task = "Implement" if role == "implement" else "Test"
+                self.write_phase_prompt("7", "Assignment core", f"{task} the second change.")
+                if case == "missing receipt":
+                    entry = json.dumps(line)
+                    write_text_atomic(source, "".join(item for item in transcript.splitlines(keepends=True)
+                                                       if entry not in item))
+                    _ = cleanup.callback(write_text_atomic, source, transcript)
+                if case == "blocked":
+                    locations[pane]["agent_status"] = "blocked"
+                    self.native.agent.questions[pane] = question
+                if case == "done with an active pass":
+                    locations[pane]["agent_status"] = "done"
+                    self.write_phase_prompt("7", "Assignment core", "Change the active prompt.")
+                    self.assertEqual(worker_panes.worker_pass(row, self.session_dir).get("status"), "active")
+                if case == "completion waits for a detached run":
+                    passed = worker_panes.worker_pass(row, self.session_dir)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    self.native.agent.append(pane, "assistant", f"Changes complete.\nDONE {delivery.completion_id}")
+                    _ = cleanup.callback(write_text_atomic, source, transcript)
+                    path, detached = self.native.detached_record(row, "verification")
+                    supervisor = cleanup.enter_context(subprocess.Popen(
+                        [sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                        stdin=subprocess.PIPE))
+                    detached.update(status="running", pid=supervisor.pid, pane_dispatch_id=str(passed["instance_id"]))
+                    write_text_atomic(path, json.dumps(detached))
+                    _ = cleanup.callback(path.unlink)
+                if case == "held lock with receipt":
+                    hold = cleanup.enter_context(worker_panes.worker_lock(self.native.fixture.parent.id,
+                                                                          staff.WorkerName.parse("impl")))
+                    self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                if case == "held name lock with receipt":
+                    name_lock = staff.record_path().parent / "locks" / f"{self.native.fixture.parent.id}-impl.lock"
+                    name_handle = cleanup.enter_context(name_lock.open("r"))
+                    fcntl.flock(name_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if role == "implement":
+                    delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.session_dir))
+                    receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id, run=self.session_dir)
+                    self.assertIsInstance(receipt, worker.DispatchNotSubmitted if case == "missing receipt"
+                                          else worker.DispatchSubmitted)
+                refused = self.launch(role, "--to", "impl")
+                self.assertEqual(refused.returncode, expected, refused.stdout + refused.stderr)
+                if case in ("held lock with receipt", "held name lock with receipt"):
+                    self.assertIn("dispatch lock is held", refused.stderr)
+                if case == "done with an active pass":
+                    self.assertIn("has different prompt content", refused.stderr)
+                if case == "completion waits for a detached run":
+                    self.assertEqual(locations[pane]["agent_status"], "done")
+                    self.assertIn(worker.CompletionRecovery.WAITING_ON_RUNS.value, refused.stderr)
+                if case == "blocked":
+                    self.assertIn(question, refused.stderr)
+                self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, files)
+                self.assertEqual({path: path.read_bytes() for path in run_files}, saved_run)
+                self.assertEqual(self.events(), history)
+                self.assertEqual(self.turn_starts, 2)
+        locations[pane]["agent_status"] = "working"
+        alternate = self.native.opened("impl2")
+        self.write_phase_prompt("7", "Assignment core", "Implement the third change.")
+        arguments = ["--role", "implement", "--cwd", str(self.project), "--phase", "7",
+                     "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
+        for case in ("idle alternate", "repeat on the alternate"):
+            with self.subTest(state=case):
+                result = invoke_assignment(arguments, os.environ.copy())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.turn_starts, 3)
+                self.assertEqual(self.native.agent.submitted[-1][0], alternate.pane)
+                self.assertEqual({path: path.read_bytes() for path in phase.glob("impl_*")},
+                                 {path: content for path, content in files.items() if path.name.startswith("impl_")})
+
+        settling = self.native.opened("impl3")
+        locations[settling.pane]["agent_status"] = "working"
+        world.turn_end_status = herdr.AgentStatus.DONE
+        world.commands.clear()
+        self.write_phase_prompt("7", "Assignment core", "Implement the fourth change.")
+        _ = self.successful("implement", "--to", "impl3")
+        waits = [command for command in world.commands if command[:2] == ("agent", "wait")]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(self.turn_starts, 4)
+        self.assertEqual(self.native.agent.submitted[-1][0], settling.pane)
+        self.assertIn("Implement the fourth change.", (phase / "impl3_prompt.txt").read_text())
 
     def test_a_failed_worker_records_an_error_pass_and_returns_worker_failure(self) -> None:
         status = self.session_dir / "phases/7/impl_status"
