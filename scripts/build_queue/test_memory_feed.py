@@ -994,9 +994,12 @@ process.stdout.write(JSON.stringify({
                     else:
                         self.assertTrue(machine)
                         self.assertEqual([name for _, name in machine_icons(cell)], [machine])
-                    cpus = row.get("vcpus")
-                    shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
-                    self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
+                    if kind == "wait":
+                        self.assertIn('<td class="vcpus" colspan="2"></td>', cell)
+                    else:
+                        cpus = row.get("vcpus")
+                        shown_cpus = str(cpus) if isinstance(cpus, int) else "—"
+                        self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
                     title = cast(memory_feed.QueueRowTitle, row["title"])
                     # A row with no unit shows the step after ": " in its name.
                     name = str(row["name"])
