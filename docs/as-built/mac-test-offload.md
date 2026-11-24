@@ -97,6 +97,10 @@ The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
 When the proof wait expires, the gate returns status 80 after it records the holder's release.
+Run `./scripts/lib/py scripts/build_targets/build_targets.py setup-mac-linux` on natedev before you use the guest gate.
+The setup command creates the state root and syncs its existing parent directory.
+The default root is `~/.local/state/build-targets`. The `BUILD_TARGETS_STATE_DIR` setting can supply a different root.
+The gate refuses the launch before it consumes permission if the state root is missing or is a file.
 The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
 The arm checks the saved guest identity before it writes any guest records.
 It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
@@ -115,7 +119,7 @@ The checkpoint stops when the placement loop returns exit 80.
 The queue can acknowledge the end report while it waits to read the proof.
 Each record contains the queue attempt key, the result, the detail, and the wall time.
 Each record includes the Mac claim ID.
-The writer locks the file during the append and syncs the record to disk.
+The writer locks the file during the append. It syncs the journal file, the journal directory, and the state root.
 A failed report send leaves the proof available on disk.
 `mac_linux.settlement()` reads the file without a lock and skips damaged rows.
 The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
