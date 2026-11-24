@@ -28,7 +28,7 @@ import time
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -39,7 +39,7 @@ from pathlib import Path
 from unittest.mock import ANY, Mock, call, patch
 
 
-from typing import IO, TextIO, cast, override
+from typing import IO, Literal, TextIO, TypedDict, cast, override
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -50,7 +50,7 @@ from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
 from scripts.for_you.action import ActionStore
-from scripts.message import send_result
+from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
 from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
@@ -146,6 +146,42 @@ def capture_sender(name: str) -> Generator[Mock]:
 
     with patch.object(change_page, name, new=capture):
         yield send
+
+
+class NewItemNotice(TypedDict):
+    address: str
+    words: str
+    rows: list[str]
+
+
+_SEND_REVIEW_MESSAGE = change_page.send_message
+
+
+@contextmanager
+def new_item_notice_log(folder: Path, keeper: staff.StaffId) -> Generator[Path]:
+    """Run a local sender that records the notice and the List rows it can see."""
+    log = folder / "new-item-notices.jsonl"
+    sender = folder / "record-new-item-notice.py"
+    _ = log.write_text("")
+    _ = sender.write_text(f"""
+import json
+import sys
+from pathlib import Path
+
+options = sys.argv[1:]
+rows = sorted(path.stem for path in Path({str(the_list.folder(keeper))!r}).glob("L*.md"))
+notice = dict(address=options[options.index("--to") + 1], words=options[options.index("--text") + 1], rows=rows)
+with Path({str(log)!r}).open("a") as stream:
+    print(json.dumps(notice), file=stream)
+print("SENT: recorded by the fixture")
+""")
+    with (patch.object(session_send, "SEND_SCRIPT", sender),
+          patch.object(change_page, "send_message", _SEND_REVIEW_MESSAGE)):
+        yield log
+
+
+def read_new_item_notices(log: Path) -> list[NewItemNotice]:
+    return [cast(NewItemNotice, json.loads(line)) for line in log.read_text().splitlines()]
 
 
 class HandlerCalls:
@@ -582,9 +618,16 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(json.loads(response.body), {"error": "Select a recipient with a native proposal folder."})
         self.assertFalse(any(item.type == review_items.ReviewType.PROPOSAL for item in cache.get().records.values()))
 
+    def map_list_recipient(self, *owners: staff.StaffId) -> staff.StaffRow:
+        keeper = fixture_member("producer", name="morty")
+        _ = conf.path("producer_map").write_text(
+            "".join(f"{owner} = {keeper.id}\n" for owner in owners), encoding="utf-8")
+        return keeper
+
     def test_list_replays_a_draft_after_the_selected_recipient_disappears(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = self.map_list_recipient(owner.id)
         other = fixture_member("producer", name="another-recipient")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -605,10 +648,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             recipients = cast(list[dict[str, object]], options["recipients"])
             self.assertNotIn(other.id, [row["id"] for row in recipients])
             response = self.new_item_http(self.new_item_body(request), finished=True)
-            self.assertEqual(response.status, 409, response.body)
-            replay = cast(dict[str, str], json.loads(response.body))
-            self.assertEqual((replay["code"], replay["id"]), ("already_filed", saved["id"]))
-            self.assertEqual(replay["key"], saved["key"])
+            self.assertEqual(response.status, 200, response.body)
+            replay = cast(dict[str, object], json.loads(response.body))
+            self.assertEqual(replay, {**saved, "version": replay["version"]})
 
         self.assertEqual(cache.get().records[cast(str, saved["key"])].owner, other.id)
         self.assertEqual(len(investigation.records(other.id)), 1)
@@ -635,6 +677,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_list_draft_with_edited_words_returns_the_item_from_the_lost_reply(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = self.map_list_recipient(owner.id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
@@ -663,6 +706,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_concurrent_list_sends_of_one_draft_file_one_item(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = self.map_list_recipient(owner.id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
@@ -704,6 +748,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        morty = self.map_list_recipient(owner.id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
@@ -726,17 +771,43 @@ class ReviewLinksServerTests(unittest.TestCase):
             deliver.assert_not_called()
             with patch.object(server, "page_captures", serve.PageCaptures(self.root / ".review-link-empty-captures")):
                 retry = self.new_item_http(body, finished=True)
-                self.assertEqual(retry.status, 409, retry.body)
+                self.assertEqual(retry.status, 200, retry.body)
                 saved = cast(dict[str, str], json.loads(retry.body))
-                self.assertEqual(saved["code"], "already_filed")
+                self.assertEqual(self.new_item_http(body, finished=True).status, 200)
+                replacement = server.page_captures.start(replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH))
+                _ = server.page_captures.complete(replacement, image)
+                changed = json.dumps({**asdict(request), "token": server.new_item_token,
+                                      "capture_key": replacement}).encode()
+                conflict = self.new_item_http(changed, finished=True)
+                self.assertEqual(conflict.status, 409, conflict.body)
+                fields = cast(dict[str, object], json.loads(conflict.body))
+                self.assertEqual((fields["code"], fields["key"]), ("already_filed", saved["key"]))
             deliver.assert_called_once()
 
         self.assertEqual(saved["id"], original.id)
+        row, = the_list.records(morty.id)
+        self.assertEqual((row.number, row.reviews), (saved["list_number"], (saved["key"],)))
         self.assertEqual(the_list.records(owner.id), [])
         self.assertEqual(investigation.records(owner.id), [original])
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": saved["key"], "id": review_submissions.PAGE_SCREENSHOT.id})),
             HttpReply(200, "image/png", image.png))
+
+        without_preview = replace(request, request_id="r6-" + uuid4().hex, words="Check the other record.")
+        with (patch.object(server, "review_cache", cache),
+              patch.object(server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            first = self.new_item_http(self.new_item_body(without_preview), finished=True)
+            self.assertEqual(first.status, 200, first.body)
+            expired = json.dumps({**asdict(without_preview), "token": server.new_item_token,
+                                  "capture_key": without_preview.request_id + uuid4().hex}).encode()
+            retry = self.new_item_http(expired, finished=True)
+            self.assertEqual(retry.status, 409, retry.body)
+            fields = cast(dict[str, object], json.loads(retry.body))
+            self.assertEqual((fields["code"], fields["key"]), ("already_filed", json.loads(first.body)["key"]))
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(owner.id)), 2)
+        self.assertEqual(len(the_list.records(morty.id)), 2)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_shared_dialog_opens_from_all_ten_served_console_pages(self) -> None:
@@ -908,9 +979,76 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(current_options["page_owner"], default.id)
         self.assertCountEqual(cast(list[dict[str, object]], current_options["recipients"]), expected)
 
+        producer = fixture_member("producer", name="list-producer")
+        config = conf.path("producer_map")
+        git = self.root / "git"
+        git_calls = self.root / "git-calls"
+        _ = git.write_text(f"#!/bin/sh\nprintf '%s\\n' git >> {shlex.quote(str(git_calls))}\nexit 1\n")
+        git.chmod(0o700)
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message") as send):
+            inactive = str(uuid4())
+            skipped = (
+                ("missing", "", f"{default.name} has no producer yet."),
+                ("stale", f"{default.id} = {inactive}\n", f"The row of {default.name} names {inactive}, who is not active."),
+                ("unreadable", "", f"Cannot read the producer map at {config}"),
+                ("retires at the lock", f"{default.id} = {producer.id}\n", f"{producer.name}: retired producer."),
+            )
+            for scenario, mapping, reason in skipped:
+                with (self.subTest(mapping=scenario), ExitStack() as setup,
+                      new_item_notice_log(self.root, morty.id) as log, redirect_stderr(StringIO()) as errors):
+                    if scenario == "unreadable":
+                        _ = config.write_bytes(b"\xff")
+                        _ = cast(object, setup.enter_context(patch.dict(os.environ, {
+                            "PATH": str(git.parent) + os.pathsep + os.environ.get("PATH", "")})))
+                    else:
+                        _ = config.write_text(mapping, encoding="utf-8")
+                    before = set(cache.get().records)
+                    draft = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, default.id),
+                                    page="list", request_id="r6-" + uuid4().hex)
+                    body = self.new_item_body(draft)
+                    if scenario == "retires at the lock":
+                        list_lock = the_list.folder(morty.id) / ".lock"
+                        list_lock.parent.mkdir(parents=True, exist_ok=True)
+                        waiting = threading.Event()
+                        locked = record_store.NumberedRecords.locked
+
+                        @contextmanager
+                        def mark_wait(store: record_store.NumberedRecords, *,
+                                      check: Callable[[], object] | None = None) -> Generator[None]:
+                            if store.lock_path() == list_lock:
+                                waiting.set()
+                            with locked(store, check=check):
+                                yield
+
+                        with ThreadPoolExecutor(max_workers=1) as client:
+                            with file_lock.exclusive(list_lock), patch.object(record_store.NumberedRecords, "locked", mark_wait):
+                                filing = client.submit(self.new_item_http, body, finished=True)
+                                self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+                                _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("claude:sonnet:high"))
+                            filed = filing.result(timeout=TEST_HANG_GUARD_SECS)
+                        _ = staff.set_producer_retirement(producer.id, staff.Active())
+                    else:
+                        filed = self.new_item_http(body, finished=True)
+                    self.assertEqual(filed.status, 200, (filed.body, git_calls.exists()))
+                    saved = cast(dict[str, object], json.loads(filed.body))
+                    self.assertNotIn("list_number", saved)
+                    key, = set(cache.get().records) - before
+                    self.assertEqual(saved["key"], key)
+                    self.assertEqual(cache.get().records[key].owner, default.id)
+                    repeated = self.new_item_http(body, finished=True)
+                    self.assertEqual(repeated.status, 200, repeated.body)
+                    retry = cast(dict[str, object], json.loads(repeated.body))
+                    self.assertEqual(retry, saved | {"version": retry["version"]})
+                    self.assertEqual(the_list.records(morty.id), [])
+                    notice, = read_new_item_notices(log)
+                    self.assertEqual((notice["address"], notice["rows"]), (f"session:{default.current_session}", []))
+                    self.assertIn(draft.words, notice["words"])
+                    self.assertEqual(errors.getvalue().count(reason), 1)
+                    if scenario == "unreadable":
+                        self.assertFalse(git_calls.exists(), "Window Send started Git.")
+            _ = config.write_text(f"{default.id} = {producer.id}\n", encoding="utf-8")
             cases = (
                 (new_item_dialog.SubmissionKind.QUESTION, review_items.ReviewType.QUESTION, morty),
                 (new_item_dialog.SubmissionKind.INVESTIGATION, review_items.ReviewType.INVESTIGATION, morty),
@@ -933,11 +1071,24 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(retry.status, 200, retry.body)
                     repeated = cast(dict[str, str], json.loads(retry.body))
                     self.assertEqual(repeated, saved | {"version": repeated["version"]})
-                    self.assertEqual(the_list.records(recipient.id, include_closed=True), [])
-                    self.assertNotIn("list_key", saved)
+                    number = saved["list_number"]
+                    row = the_list.load(morty.id, f"L{number}")
+                    self.assertEqual((row.owner, row.producer, row.reviews),
+                                     (recipient.id, producer.id if recipient == default else morty.id, (saved["key"],)))
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
 
     def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
+        _ = self.check_new_item_command()
+
+    def test_new_item_command_reuses_the_draft_after_a_lost_reply(self) -> None:
+        for change_mapping in (False, True):
+            with self.subTest(change_mapping=change_mapping), self.lose_list_send_response() as responses:
+                item = self.check_new_item_command(fail_retry=True, change_mapping=change_mapping)
+                first, = responses
+                self.assertEqual(first["list_number"], item.number)
+                self.assertEqual(first["key"], item.reviews[0])
+
+    def check_new_item_command(self, *, fail_retry: bool = False, change_mapping: bool = False) -> the_list.ListItem:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         unit = case.fixture.unit
@@ -946,26 +1097,200 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         _ = conf.path("producer_map").write_text(f"{owner.id} = {producer.id}\n", encoding="utf-8")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
         words = "The frame time graph has a gap."
         output, errors = StringIO(), StringIO()
+        exchange = new_item.exchange
+        posts: list[object] = []
+        authority_snapshot = staff.authority_snapshot
+        locked = case.status.locked
+        list_locked = record_store.NumberedRecords.locked
+        locks = threading.local()
+        in_lock_reads: list[tuple[bool, bool]] = []
+
+        @contextmanager
+        def track_delivery_lock() -> Generator[None]:
+            with locked():
+                locks.delivery = True
+                try:
+                    yield
+                finally:
+                    locks.delivery = False
+
+        @contextmanager
+        def track_list_lock(store: record_store.NumberedRecords, *,
+                            check: Callable[[], object] | None = None) -> Generator[None]:
+            with list_locked(store, check=check):
+                if store.collection != "list":
+                    yield
+                    return
+                locks.list = True
+                try:
+                    yield
+                finally:
+                    locks.list = False
+
+        def read_staff() -> staff.StaffSnapshot:
+            list_held = bool(getattr(locks, "list", False))
+            delivery_held = bool(getattr(locks, "delivery", False))
+            if list_held or delivery_held:
+                in_lock_reads.append((list_held, delivery_held))
+            return authority_snapshot()
+
+        def post(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
+                 body: bytes = b"") -> new_item.ServerReply:
+            if method == "POST":
+                fields = cast(dict[str, object], json.loads(body))
+                posts.append(fields["request_id"])
+                if fail_retry and len(posts) == 2:
+                    raise new_item.ServerUnavailable("The automatic retry could not connect.")
+                if not fail_retry and len(posts) == 1:
+                    fields["recipient_id"] = morty.id
+                    body = json.dumps(fields).encode()
+            return exchange(address, method, target, body)
+
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
               patch("platform.system", return_value="Linux"),
-              capture_sender("send_message"), redirect_stdout(output), redirect_stderr(errors)):
-            code = new_item.main(["bug", unit.name, words, "--session", "another-session"])
-            # The server replies before it delivers the item.
+              patch.object(new_item, "exchange", post),
+              patch.object(case.status, "locked", track_delivery_lock),
+              patch.object(record_store.NumberedRecords, "locked", track_list_lock),
+              patch.object(staff, "authority_snapshot", read_staff),
+              new_item_notice_log(self.root, morty.id) as log, redirect_stdout(output), redirect_stderr(errors)):
+            arguments = ["bug", unit.name, words, "--session", "another-session"]
+            code = new_item.main(arguments)
             self.assertTrue(self.new_item_posts.wait_until_none_run())
-        # The server's request log shares stderr with the command.
+            if fail_retry:
+                self.assertEqual(code, new_item.Outcome.FAILED)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("The automatic retry could not connect.", errors.getvalue())
+                self.assertEqual(len(the_list.records(morty.id)), 1)
+                self.assertEqual(len(read_new_item_notices(log)), 1)
+                if change_mapping:
+                    _ = conf.path("producer_map").write_text("", encoding="utf-8")
+                code = new_item.main(arguments)
+                self.assertTrue(self.new_item_posts.wait_until_none_run())
+                self.assertEqual(posts, [posts[0]] * 3)
+            else:
+                self.assertEqual(code, new_item.Outcome.FAILED)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("The List assignee or recipient changed.", errors.getvalue())
+                self.assertEqual(investigation.records(owner.id), [])
+                self.assertEqual(the_list.records(morty.id), [])
+                self.assertEqual(read_new_item_notices(log), [])
+                code = new_item.main(arguments)
+                self.assertTrue(self.new_item_posts.wait_until_none_run())
+                refused, retried = posts
+                self.assertNotEqual(refused, retried)
         self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
-        self.assertNotIn("new_item:", errors.getvalue())
         key, = [key for key, record in cache.get().records.items() if record.type == review_items.ReviewType.BUG]
         self.assertEqual(cache.get().records[key].owner, owner.id)
         item, = the_list.records(morty.id, include_closed=True)
-        self.assertEqual(output.getvalue(), f"Bug \u2192 {unit.name}, a unit of {owner.name}. "
-                         + f"Producer: bob (from {owner.name}). List item {item.number}.\n")
+        notice, = read_new_item_notices(log)
+        self.assertEqual(notice["rows"], [item.id])
+        self.assertEqual(notice["address"], f"session:{owner.current_session}")
+        self.assertIn(words, notice["words"])
+        self.assertEqual(in_lock_reads, [(True, False)])
+        producer_line = "" if fail_retry else f" Producer: bob (from {owner.name})."
+        self.assertEqual(output.getvalue(),
+                         f"Bug → {unit.name}, a unit of {owner.name}.{producer_line} List item {item.number}.\n")
         self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
                          (words, owner.id, producer.id, unit.name, (key,)))
+        return item
+
+    def test_restart_recovers_a_list_notice_after_the_row_exists(self) -> None:
+        self.check_list_notice_recovery(stop_before_row=False)
+
+    def test_restart_recovers_a_list_row_after_its_number_is_reserved(self) -> None:
+        for scenario in ("active", "retired", "authority unavailable", "staff unavailable with answered marker"):
+            with self.subTest(scenario=scenario):
+                self.check_list_notice_recovery(stop_before_row=True, retire_producer=scenario == "retired",
+                                                authority_unavailable=scenario == "authority unavailable",
+                                                answered_marker=scenario == "staff unavailable with answered marker")
+
+    def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
+                                   authority_unavailable: bool = False, answered_marker: bool = False) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        morty = fixture_member("producer", name="morty")
+        producer = fixture_member("producer", name="list-producer") if retire_producer else morty
+        _ = conf.path("producer_map").write_text(f"{owner.id} = {producer.id}\n", encoding="utf-8")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+                          page="list", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        body = self.new_item_body(request)
+        stop = (patch.object(the_list, "_save", side_effect=OSError("The List write stopped.")) if stop_before_row
+                else patch.object(case.status, "write_slots", side_effect=OSError("The notice claim stopped.")))
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              new_item_notice_log(self.root, morty.id) as log, redirect_stderr(StringIO()) as errors):
+            with stop:
+                failed = self.new_item_http(body, finished=True)
+            self.assertEqual(failed.status, 503, failed.body)
+            before = the_list.records(morty.id, include_closed=True)
+            self.assertEqual(len(before), 0 if stop_before_row else 1)
+            self.assertEqual(read_new_item_notices(log), [])
+            original, = investigation.records(owner.id)
+            expected_records = [original]
+            assert isinstance(original.submission, new_item_dialog.ReviewSubmission)
+            pending_request_id = original.submission.request_id
+            if retire_producer:
+                _ = staff.set_producer_retirement(producer.id, staff.RetiredProducer("claude:sonnet:high"))
+
+            restarted = change_page.DeliveryStatus(case.root)
+            change_page.recover_pending(restarted)
+            if answered_marker:
+                waiting = case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
+                answered = review_submissions.submit(waiting, initial_delivery=review_submissions.InitialDelivery())
+                self.assertTrue(review_submissions.answer(answered.key, "The check passed.",
+                                                          answered.details.reply_token))
+                expected_records = investigation.records(owner.id)
+                self.assertEqual(len(expected_records), 2)
+                pending = {item.address.request_id for item in review_submissions.pending_initial_deliveries(case.root)}
+                self.assertEqual(pending, {answered.request_id, pending_request_id})
+            if authority_unavailable or answered_marker:
+                failure = staff.StaffUnreadable("The staff authority is unavailable.")
+                snapshot = staff.supplied_snapshot(staff.snapshot()) if authority_unavailable else nullcontext()
+                with (snapshot, patch.object(staff, "authority_snapshot", side_effect=failure) as read_staff,
+                      patch.object(restarted, "locked", wraps=restarted.locked) as delivery_lock):
+                    review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+                read_staff.assert_called_once_with()
+                self.assertEqual(delivery_lock.call_count, int(answered_marker))
+                self.assertIn(str(failure), errors.getvalue())
+                self.assertEqual([item.address.request_id for item in
+                                  review_submissions.pending_initial_deliveries(case.root)], [pending_request_id])
+                self.assertEqual(the_list.records(morty.id, include_closed=True), [])
+                self.assertEqual(read_new_item_notices(log), [])
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            rows = the_list.records(morty.id, include_closed=True)
+            notice, = read_new_item_notices(log)
+            self.assertEqual(notice["rows"], [row.id for row in rows])
+            self.assertIn(request.words, notice["words"])
+
+            if retire_producer:
+                _ = staff.set_producer_retirement(producer.id, staff.Active())
+            retry = self.new_item_http(body, finished=True)
+            self.assertEqual(retry.status, 200, retry.body)
+        self.assertEqual(the_list.records(morty.id, include_closed=True), rows)
+        self.assertEqual(investigation.records(owner.id), expected_records)
+        self.assertEqual(read_new_item_notices(log), [notice])
+        receipt = cast(dict[str, object], json.loads(retry.body))
+        if retire_producer:
+            self.assertEqual(rows, [])
+            self.assertEqual(receipt["id"], original.id)
+            self.assertNotIn("list_number", receipt)
+            self.assertEqual(errors.getvalue().count(f"{producer.name}: retired producer."), 1)
+            return
+        row, = rows
+        if before:
+            self.assertEqual(row, before[0])
+        else:
+            self.assertEqual(row.number, 1)
+        self.assertEqual((receipt["list_number"], receipt["key"]), (row.number, row.reviews[0]))
 
     def test_list_draft_retries_after_failed_delivery_setup(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -1025,6 +1350,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     other = fixture_member("showrunner", name="other", doc=staff.LiveDoc(local_machine(), other_doc))
                     # Make the older item's marker sort first.
                     owner, later_owner = sorted((owner, other), key=lambda row: row.id)
+                _ = self.map_list_recipient(owner.id, *((later_owner.id,) if later_owner else ()))
                 _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
                 cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
                 request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
@@ -2142,6 +2468,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         from scripts.review_links.test_review_submissions import PNG
 
         _, cache, request = self.page_bug_fixture()
+        _ = self.map_list_recipient(request.recipient_id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
         server = self.server
         page_capture = replace(FIXTURE_CAPTURE, place=list_page.PAGE_PATH)
@@ -2195,6 +2522,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_deferred_capture_failure_keeps_the_item_and_page_data(self) -> None:
         _, cache, request = self.page_bug_fixture()
+        _ = self.map_list_recipient(request.recipient_id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={request.recipient_id}\n")
         with (patch.object(change_page, "send_to_staff") as deliver,
               patch.object(self.server, "launch_page_capture") as launch):
@@ -2469,6 +2797,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = self.map_list_recipient(owner.id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         server = self.server
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -2523,6 +2852,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
+        _ = self.map_list_recipient(owner.id)
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
         request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
                           page="list", request_id="r2-" + uuid4().hex)

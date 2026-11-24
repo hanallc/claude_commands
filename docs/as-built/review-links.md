@@ -1224,25 +1224,37 @@ For a new draft, **To** selects the owner configured in `page.list.owner`.
 The List assigns numbers only when its own record writer creates an item.
 The browser stores the recipient selection with the draft ID and restores both after a reload.
 The user can edit the draft before a retry.
-Each draft ID can file one Review item.
-A retry of a filed draft returns the original Review item ID.
+Each draft ID can file one Review item and one linked List row.
+An exact retry returns the saved item ID and closes the window.
+The reply includes the List number if the row exists.
+If a retry changes the saved draft, the window shows the saved item ID and preserves the new text.
 A retry can use a new screenshot if the first screenshot expires before filing.
+After filing, an exact retry uses the saved screenshot identity and digest even if the preview expires.
 After Send, the List refreshes with the current filters.
 Select a row to open it.
 If a row save is in progress, the List refreshes when that save ends.
 
 The `/new_item` command (`scripts/review_links/new_item.py`) sends the dialog request to the same New item endpoint.
-The server reply holds the Review item ID and key, and no List item.
-The command then makes one List item for the filed Review item. A Send from the dialog makes no List item.
-The command writes the item in morty's List folder, because only that folder allocates List numbers.
-The title is the first line that has words, at most 120 characters. Latest status holds the words.
-Evidence links to the Review item, and the item links to the Review key.
-Owner is the recipient. Producer is the producer of the assignee. A unit assignee also fills Unit.
-Each run sends a new request ID, so each run files a new Review item and a new List item.
-The result line names the type, the assignee and the List item number. It also names the producer of an assignee that is not a producer.
-If the List write fails after the server files the item, the command still exits 0.
-If the List item write fails, the line names the Review item ID, says that no List item exists, and gives the error.
-If only the Review link fails, the line says that List item N exists without its Review link, and gives the error.
+The server checks the producer against current staff under the List lock.
+If the producer is active, the server writes the row in morty's List folder before it sends the notice.
+The server reply contains the Review item ID and key.
+The title uses at most 120 characters from the first line with words.
+Latest status holds the words.
+Evidence links to the Review item.
+The server saves the row and its Review link in one write.
+Owner is the recipient.
+The command sends the assignee ID so the server can find the producer and unit.
+For a List window Send, the server uses the recipient's producer.
+Send reads the producer map from disk without Git recovery.
+If the server cannot read a usable map or find a producer, it files the Review item and sends the notice.
+The same path applies if the producer retires before the List write.
+The server logs the reason it skipped the List row.
+The command saves its draft ID and recipient before the POST.
+While the result is uncertain, a retry sends the saved ID and recipient before any routing checks for a new filing.
+The command clears the draft after success or a confirmed refusal before filing.
+The result names the type and assignee.
+It includes the List number if the server filed a row.
+For a new filing to a showrunner or unit, it also names the producer.
 
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
@@ -2309,6 +2321,13 @@ The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
 New item saves a first-message marker before it writes the native record.
+For a List Send, the server saves the List route before it writes the native record.
+The server holds the recipient locks while it reserves a List number and saves the linked row.
+It releases the recipient locks before it takes the delivery lock.
+Recovery reuses the reserved number if the process stops during the List write or before the notice claim.
+If the producer retires before the row saves, recovery logs the reason, skips the row, and sends the notice.
+If the staff authority is temporarily unavailable, the server leaves the List write and notice pending.
+Recovery still clears the first-message markers for items that already have an answer.
 The delivery claim reads the native owner under the same lock as wrap.
 The server clears the marker after the claim saves.
 Startup recovers a marked message only when the native record exists.

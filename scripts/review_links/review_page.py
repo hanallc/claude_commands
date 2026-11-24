@@ -570,6 +570,7 @@ class PublishedSubmission:
     saved: review_submissions.SavedSubmission
     key: str
     version: str
+    members: staff.StaffSnapshot
 
 
 @dataclass
@@ -738,7 +739,7 @@ class ReviewSnapshotCache:
                                           replaced_key=previous_key)
             finally:
                 self.invalidate()
-            return PublishedSubmission(saved, item.key, fresh.version)
+            return PublishedSubmission(saved, item.key, fresh.version, members)
 
     def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> bool:
         """Add the screenshot to the native record and refresh its Review card."""

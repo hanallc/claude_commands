@@ -26,7 +26,7 @@ from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
-from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.production import delivery_state, record_store, session_pane, staff
@@ -39,6 +39,10 @@ class ListError(ValueError):
 
 class SavedReadFailed(OSError):
     """The save is on disk, but the item could not be read again."""
+
+
+class RetiredListProducer(ListError):
+    """A retired producer cannot take an open List item."""
 
 
 class ItemState(StrEnum):
@@ -1217,7 +1221,7 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
     for identity in producers:
         producer = record.by_id(identity)
         if producer is not None and isinstance(producer.retirement, staff.RetiredProducer):
-            raise ListError(f"{producer.name}: retired producer. Choose an active producer.")
+            raise RetiredListProducer(f"{producer.name}: retired producer. Choose an active producer.")
 
 
 def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
@@ -1404,24 +1408,68 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
             raise ListError(f"{identity}: the item already exists")
         if chosen < next_number:
             raise ListError(f"{identity}: the next available number is L{next_number}")
-        moment = now()
-        defaults = _CREATION_DEFAULTS.copy()
-        defaults["requested_by"] = requested_by
-        item = ListItem(chosen, title, owner, keeper, unread_since=moment, opened=moment, updated=moment,
-                        closed=NoTimestamp.UNSET, log=(), **defaults)
-        if changes:
-            item = replace(item, **changes)
-        initial: LogFields = {"title": item.title, "owner": item.owner, "producer": item.producer,
-                                "state": item.state, "eta": item.eta,
-                                "next_step": item.next_step, "latest_status": item.latest_status,
-                                "requested_by": item.requested_by, **changes}
-        item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
-        _validate(item)
+        item = _new_item(chosen, title, owner, keeper, source, changes, requested_by=requested_by)
         _check_links(read_reference, item.number, changes)
         _require_active_open_producers((item,))
         store.reserve_number(chosen)
         _save(store, item)
         return item
+
+
+def _new_item(number: int, title: str, owner: ItemOwner, keeper: staff.StaffId, source: str,
+              changes: ItemChanges, *, requested_by: RequestedBy = RequestedBy.NATE,
+              reviews: tuple[str, ...] = ()) -> ListItem:
+    moment = now()
+    defaults = _CREATION_DEFAULTS.copy()
+    defaults["requested_by"] = requested_by
+    item = ListItem(number, title, owner, keeper, unread_since=moment, opened=moment, updated=moment,
+                    closed=NoTimestamp.UNSET, log=(), reviews=reviews, **defaults)
+    if changes:
+        item = replace(item, **changes)
+    initial: LogFields = {"title": item.title, "owner": item.owner, "producer": item.producer,
+                          "state": item.state, "eta": item.eta, "next_step": item.next_step,
+                          "latest_status": item.latest_status, "requested_by": item.requested_by, **changes}
+    log = (ItemChange(moment, FieldChange("Added", initial), source),)
+    if reviews:
+        log += (ItemChange(moment, ReviewLinksChanged("Linked reviews", reviews), source),)
+    item = replace(item, log=log)
+    _validate(item)
+    return item
+
+
+def reserved_review_number(path: Path) -> int | NextNumber:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return NextNumber.AVAILABLE
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise ListError(f"{path}: invalid List number reservation")
+    return int(value)
+
+
+def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, producer: staff.StaffId,
+                    unit: str, words: str, evidence: str, review_key: str, source: str, reservation: Path) -> int:
+    """Reserve a number for this Review filing and publish its linked row under the List lock."""
+    store = _store(keeper)
+    number = reserved_review_number(reservation)
+    if isinstance(number, int) and store.path(f"L{number}").is_file():
+        sync_folder(store.folder())
+        return number
+    with store.list_allocation():
+        number = reserved_review_number(reservation)
+        if isinstance(number, int) and store.path(f"L{number}").is_file():
+            sync_folder(store.folder())
+            return number
+        chosen = store.next_number() if isinstance(number, NextNumber) else number
+        item = _new_item(chosen, title, owner, keeper, source,
+                         {"producer": producer, "unit": unit, "latest_status": words, "evidence": evidence},
+                         reviews=(review_key,))
+        _require_active_open_producers((item,))
+        if isinstance(number, NextNumber):
+            store.reserve_number(chosen)
+            write_text_atomic(reservation, f"{chosen}\n", new_file_mode=0o600)
+        _save(store, item)
+        return chosen
 
 
 def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, datetime], ListItem],

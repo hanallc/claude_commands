@@ -43,7 +43,7 @@ from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
-from scripts.production import change_routing, change_review, staff, tidy_wrapped
+from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
@@ -1715,7 +1715,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             evidence = fields.get("evidence")
             has_evidence = (key or fields.get("images") or fields.get("page_state")
                             or isinstance(evidence, dict) and cast(dict[str, object], evidence).get("kind") == "page-data")
-            initial_delivery = review_submissions.InitialDelivery(site if has_evidence else "")
+            list_assignee: review_submissions.ListCommandAssignee | review_submissions.ListWindowAssignee
+            list_assignee = review_submissions.ListWindowAssignee.RECIPIENT
+            if "list_assignee" in fields:
+                if not list_draft_id:
+                    raise new_item_dialog.SubmissionError("Send a List assignee with a List draft.")
+                list_assignee = review_submissions.list_command_assignee(fields["list_assignee"])
+            initial_delivery = review_submissions.InitialDelivery(site if has_evidence else "", list_assignee)
             with ExitStack() as captures:
                 screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
                 pending = False
@@ -1733,7 +1739,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             screenshot = capture
                         return review_submissions.ListDraftFiling(item, screenshot, bool(preview_key))
 
-                    submission = review_submissions.ListDraftSend(list_draft_id, prepare_list_draft)
+                    preview = (review_submissions.RequestedListPreview(preview_key) if preview_key
+                               else review_submissions.NoRequestedListPreview.ABSENT)
+                    submission = review_submissions.ListDraftSend(list_draft_id, prepare_list_draft, preview)
                     created = server.review_cache.create_submission(
                         submission, capture_intent=deferred, capture_target=capture_target,
                         initial_delivery=initial_delivery)
@@ -1754,7 +1762,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 saved = created.saved
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
-                response = {"id": saved.id, "key": created.key, "version": created.version}
+                response: dict[str, object] = {"id": saved.id, "key": created.key, "version": created.version}
                 on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
                 if list_draft_id and edited:
                     request = None
@@ -1773,8 +1781,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 # Concurrent Sends wait for the delivery of the same item.
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
                     delivery = review_actions.prepare_submission_delivery(
-                        saved, saved.words, status, evidence_page=evidence_page)
+                        saved, saved.words, status, evidence_page=evidence_page, members=created.members)
                     outcome = self.deliver_review(server, delivery, report_outcome=True)
+                    if on_list:
+                        number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
+                        if isinstance(number, int):
+                            response["list_number"] = number
                     if (isinstance(delivery, change_page.MessageDelivery)
                             and not isinstance(outcome, change_page.DeliveryConfirmed)):
                         # Recovery can save the confirmation from an earlier send.
