@@ -2325,12 +2325,14 @@ class MemoryHoverTests(unittest.TestCase):
                 ram = {**RAM_FIXTURE, "build_covered_bytes": 0, "build_target_bytes": missing,
                        "build_missing_bytes": missing, "shortfall_bytes": missing}
                 shown = self.page_expression(
-                    "[reserveAlert(shownReading(data)), tipText('reserved',data)[1], tipText('shortfall',data)[0]]",
-                    {"ram": ram})
+                    "[reserveAlert(shownReading(data)), tipText('reserved',data)[1], tipText('shortfall',data)[0], "
+                    + "capUnavailableNote(shownReading(data)).split('; ').at(-1)]",
+                    {"cap": None, "ram": ram})
                 self.assertEqual(shown, [
                     "Free RAM is short by <0.1 GiB. Build reserved holds 0.0 of <0.1 GiB.",
                     "Held for running builds to grow into\nTarget  <0.1 GiB\nNot covered  <0.1 GiB",
                     "Shortfall  <0.1 GiB",
+                    "shortfall <0.1 GiB",
                 ])
 
     def test_reserve_tooltips_show_the_basis_of_each_target(self) -> None:

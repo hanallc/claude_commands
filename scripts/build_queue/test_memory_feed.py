@@ -4998,17 +4998,20 @@ const refresh = createPageRefresh(tick);
         room = reading.explanation.room
         assert isinstance(room, admission_records.MemoryRoom)
         missing_run = replace(room.runs[0].memory, use=admission_records.RunUseUnavailable("private memory.stat is missing"))
-        for cap in (admission_records.CapUnavailable(()), admission_records.CapUnavailable((missing_run,))):
+        for cap, reason in (
+                (room.cap, ""),
+                (admission_records.CapUnavailable(()),
+                 "Cap unavailable because memory use is unavailable for a running build"),
+                (admission_records.CapUnavailable((missing_run,)),
+                 f"Cap unavailable because memory use is unavailable for {missing_run.owner}: private memory.stat is missing")):
             with self.subTest(cap=cap):
                 changed = replace(reading, explanation=replace(reading.explanation, room=replace(room, cap=cap)))
                 with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(changed)):
                     page = memory_feed.reading()
-                self.assertIsInstance(page["cap"], admission_records.CapUnavailable)
+                self.assertIsInstance(page["cap"], admission_records.CapUnavailable if reason else float)
                 self.assertEqual(page["room"], room.room / admission_records.GIB)
                 self.assertTrue(page["walk"])
-                self.assertIn("unavailable", page["cap_text"])
-                if cap.runs:
-                    self.assertIn("private memory.stat is missing", page["cap_text"])
+                self.assertEqual(page["cap_text"], reason)
 
     def test_an_unavailable_run_use_keeps_its_named_reason(self) -> None:
         reading = reservation_reading()

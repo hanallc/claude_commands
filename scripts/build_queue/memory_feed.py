@@ -52,7 +52,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import cloud_progress, limits_view, person_actions, placement, program_memory_feed, queue_snapshot
 from scripts.build_targets import targets
 from scripts.build_targets.mac_linux import TRANSFER_ALLOWANCE_SECONDS
-from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
+from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
@@ -3571,7 +3571,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "staff_names": staff_display.registry(), "unit_open": staff_display.unit_open(),
         "ok": True, "read_at": published.written_at, "fresh_until": published.fresh_until,
         "render_seconds": 0.0, "total": total, "available": gib(captured.available),
-        "cap": cap, "floor": safety, "cap_text": room_text(captured),
+        "cap": cap, "floor": safety,
+        "cap_text": f"Cap unavailable because {cap_unavailable_reason(cap)}"
+                    if isinstance(cap, admission_records.CapUnavailable) else "",
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
         "limit": "room and head protection", "ram": ram,

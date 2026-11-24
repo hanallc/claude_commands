@@ -435,8 +435,8 @@ body:not(:has(#review-new-item)) .walk-table .row-action { display: none; }
 .walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 6px; }
 /* The last machine badge extends 7 px past its icon. */
 .walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child) { padding-right: 7px; }
-body:has(#review-new-item) .walk.tight .walk-table :is(th, td):not(:last-child, .machine, .moved) { padding-right: 3px; }
-body:has(#review-new-item) .walk.tight .walk-table .moved { padding-right: 0; }
+.walk.has-cap.tight .walk-table :is(th, td):not(:last-child, .machine, .moved) { padding-right: 3px; }
+.walk.has-cap.tight .walk-table .moved { padding-right: 0; }
 .walk.tight .walk-table .row-action { padding-left: 4px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }

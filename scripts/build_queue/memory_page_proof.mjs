@@ -2964,24 +2964,29 @@ try {
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
-                cap:document.querySelector('#cap-value').textContent, text:document.body.textContent,
+                cap:document.querySelector('#cap-value').textContent, note:document.querySelector('#cap-reason').textContent,
                 room:document.querySelector('#v-room').textContent})`);
               assert.equal(state.cap, 'Queue cap unavailable', 'The missing cap has a value.');
               assert.ok(state.rows > 0);
               assert.equal(state.room, proof.room);
-              assert.match(state.text, /unavailable/);
-              if (name==='missing_use') assert.match(state.text, /private memory.stat is missing/);
+              const [reason, ...amounts] = state.note.split('; ');
+              assert.match(reason, /unavailable/);
+              if (name==='missing_use') assert.match(reason, /private memory.stat is missing/);
+              assert.deepEqual(amounts.map(term => term.replace(/ [^ ]+ GiB$/, '')),
+                ['free RAM', 'safety', 'swap coming back', 'kept aside', 'room']);
               if (name === 'missing_cap') {
-                const columns = await evaluate(`(() => {
+                const checkColumns = () => evaluate(`(() => {
                   const scroll = document.querySelector('.walk-scroll');
                   const dialog = document.querySelector('#review-new-item');
                   const positions = () => {
                     scroll.scrollLeft = 0;
-                    return [...scroll.querySelectorAll('th[scope="col"]:not(.row-action)')].map(cell => {
+                    const columns = [...scroll.querySelectorAll('th[scope="col"]:not(.row-action)')].map(cell => {
                       const {left, width} = cell.getBoundingClientRect();
-                      return {left, width};
+                      return {left, width, padding: getComputedStyle(cell).paddingRight};
                     });
+                    return {columns, tight: document.querySelector('#walk').classList.contains('tight')};
                   };
+                  fitLabels();
                   const withAction = positions();
                   dialog.removeAttribute('id');
                   fitLabels();
@@ -2995,8 +3000,16 @@ try {
                   scroll.scrollLeft = 0;
                   return {withAction, withoutAction, reachable};
                 })()`);
-                assert.deepEqual(columns.withAction, columns.withoutAction, 'The action moves data columns with no cap.');
-                assert.ok(columns.reachable, 'The action is clipped with no cap.');
+                for (const capWidth of new Set([width, 390])) {
+                  if (capWidth !== width) await call('Emulation.setDeviceMetricsOverride',
+                    {width:capWidth,height:1200,deviceScaleFactor:1,mobile:false});
+                  const {withAction, withoutAction, reachable} = await checkColumns();
+                  if (capWidth === 390) assert.ok(withAction.tight, 'The no-cap proof needs compact gaps at 390 px.');
+                  assert.deepEqual(withAction, withoutAction, `The action moves data columns with no cap at ${capWidth} px.`);
+                  assert.ok(reachable, `The action is clipped with no cap at ${capWidth} px.`);
+                }
+                if (width !== 390) await call('Emulation.setDeviceMetricsOverride',
+                  {width,height:1200,deviceScaleFactor:1,mobile:false});
               }
             }
             for (const name of ['empty_report','missing_report']) {
