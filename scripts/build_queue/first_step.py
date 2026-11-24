@@ -30,7 +30,7 @@ from scripts.lib.build_steps import (
 from scripts.mac_test import claim_state
 
 
-_GATE_VERDICT_STATUSES = (0, 1)
+_GATE_PASS_STATUS = 0
 
 
 class FirstStepRefused(RuntimeError):
@@ -117,9 +117,9 @@ class FirstStepAdmission:
         return result
 
     def report_gate_end(self, status: int) -> None:
-        """Report a pass or fail verdict from the guest gate child."""
+        """Report a pass from the guest gate child."""
         grant = self.grant
-        if not isinstance(grant, GatePlacement) or status not in _GATE_VERDICT_STATUSES:
+        if not isinstance(grant, GatePlacement) or status != _GATE_PASS_STATUS:
             return
         try:
             assignment = read_assignment(self.assignment_file).assignment

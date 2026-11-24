@@ -90,7 +90,7 @@ class FirstStepTests(unittest.TestCase):
         return first_step.FirstStepAdmission(SlotQueuePosition(request.episode, request.since),
                                             first_step.GatePlacement(grant, request), path)
 
-    def test_copies_gate_step_closes_an_old_branch_without_a_completion_report(self) -> None:
+    def test_guest_gate_exit_zero_sends_owner_end_and_closes_completed(self) -> None:
         with PlacementFixture() as fixture:
             admitted = self.consumed_guest_gate(fixture)
             assignment = client.read_assignment(admitted.assignment_file).assignment
@@ -110,21 +110,31 @@ class FirstStepTests(unittest.TestCase):
             self.assertEqual(status.outcome, placement.AttemptCompleted(0))
             self.assertEqual(status.path, placement.DispatchPathSettled())
 
-    def test_guest_without_a_verdict_keeps_its_assignment_for_cleanup(self) -> None:
-        for status in (-9, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS, 2):
-            with self.subTest(status=status), PlacementFixture() as fixture:
-                admitted = self.consumed_guest_gate(fixture)
-                assignment = client.read_assignment(admitted.assignment_file).assignment
-                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
-                saved = fixture.server.assignments[key]
-                with mock.patch.object(client, "report_owner_end") as report:
-                    admitted.report_gate_end(status)
-                    report.assert_not_called()
-                self.assertEqual(fixture.server.assignments[key], saved)
-                self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+    def assert_guest_exit_skips_owner_end(self, status: int) -> None:
+        with PlacementFixture() as fixture:
+            admitted = self.consumed_guest_gate(fixture)
+            assignment = client.read_assignment(admitted.assignment_file).assignment
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            saved = fixture.server.assignments[key]
+            with mock.patch.object(client, "report_owner_end") as report:
+                admitted.report_gate_end(status)
+                report.assert_not_called()
+            self.assertEqual(fixture.server.assignments[key], saved)
+            self.assertIsInstance(admitted.grant, first_step.GatePlacement)
+
+    def test_guest_gate_exit_one_skips_owner_end_and_keeps_assignment(self) -> None:
+        self.assert_guest_exit_skips_owner_end(1)
+
+    def test_guest_gate_signal_exit_skips_owner_end_and_keeps_assignment(self) -> None:
+        self.assert_guest_exit_skips_owner_end(-9)
+
+    def test_guest_gate_other_exits_skip_owner_end_and_keep_assignment(self) -> None:
+        for status in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS, 2):
+            with self.subTest(status=status):
+                self.assert_guest_exit_skips_owner_end(status)
 
     def test_guest_cleanup_uses_saved_configuration_after_skipped_or_refused_report(self) -> None:
-        for status in (-9, 1):
+        for status in (-9, 0):
             with self.subTest(status=status), PlacementFixture() as fixture:
                 admitted = self.consumed_guest_gate(fixture)
                 assignment = client.read_assignment(admitted.assignment_file).assignment
@@ -136,7 +146,7 @@ class FirstStepTests(unittest.TestCase):
                       mock.patch.object(client, "cancel_placement", wraps=client.cancel_placement) as cancel):
                     self.assertIs(admitted.run_gate(lambda: result), result)
                     admitted.close()
-                self.assertEqual(report.call_count, int(status == 1))
+                self.assertEqual(report.call_count, int(status == 0))
                 cancel.assert_called_once()
                 self.assertEqual(fixture.server.assignments[key], saved)
                 self.assertIsInstance(admitted.grant, first_step.HandedOff)
@@ -159,7 +169,7 @@ class FirstStepTests(unittest.TestCase):
                 connection.connect(str(fixture.socket_path))
                 return connection
 
-            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 1)
+            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 0)
             with (fixture.serving(), mock.patch.object(client, "CLOCK", clock),
                   mock.patch.object(client, "_connect", side_effect=connect_after_refusal)):
                 self.assertIs(admitted.run_gate(lambda: result), result)
@@ -170,7 +180,7 @@ class FirstStepTests(unittest.TestCase):
             saved = fixture.server.assignments[key]
             self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
             assert isinstance(saved.terminal_report, placement.TerminalAttemptReport), saved
-            self.assertEqual(saved.terminal_report.outcome, placement.AttemptCompleted(1))
+            self.assertEqual(saved.terminal_report.outcome, placement.AttemptCompleted(0))
 
     def test_guest_owner_end_deadline_warns_once_and_preserves_the_child_status(self) -> None:
         with PlacementFixture() as fixture:
@@ -178,7 +188,7 @@ class FirstStepTests(unittest.TestCase):
             assignment = client.read_assignment(admitted.assignment_file).assignment
             clock = FakeClock()
             timeout = records.read_memory_config().unreachable_limit_seconds
-            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 1)
+            result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 0)
             with (mock.patch.object(client, "CLOCK", clock),
                   mock.patch.object(client, "_connect", side_effect=FileNotFoundError("fixture queue is down")) as connect,
                   mock.patch.object(client, "cancel_placement") as cancel,

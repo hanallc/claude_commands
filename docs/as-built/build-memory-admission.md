@@ -260,9 +260,9 @@ A current `mac-linux` assignment of another episode makes the guest busy.
 The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
 A guest gate that took no run sends its claim failure after the gate process ends, and the queue closes the attempt with the guest delay.
 While `copies.py` lives, a pass that reads the ended gate does not close the attempt.
-Only `copies.py` knows if the gate took a run, so its claim failure or its end closes the attempt.
-So the claim failure finds the attempt current, and the queue places the episode only once.
-When the gate ran and ended, the attempt stays current until `copies.py` ends. Then the next pass closes it as lost with `RetryAt(now)`.
+`copies.py` sends the end of a passed guest gate (exit 0).
+The gate of a branch with `0725967a05` sends its own completion.
+A failed run of a branch without 0725967a05 closes as lost until the branch merges main.
 Final command results remain terminal.
 A retry retains the episode, queue time, run place, and priority.
 Each retry receives a new attempt identity.
