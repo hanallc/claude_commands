@@ -246,6 +246,14 @@ Its subject is `Merge <unit> phase <N> as-built (<short>) into <branch>`.
 `Promote: none` and an absent field both mean `NoPromotion`.
 Each local Promote checkout must exist before the command pushes.
 
+For an enrolled production, use the exact staff document for live policy.
+The showrunner starts in the main checkout from `Repository`.
+The serving merge unit publishes from the integration worktree on `Merge branch`.
+Run the enrolled production's merge checks in item 143 test copies.
+Resolve the live LOG relative to the main checkout.
+Removal tools protect both checkouts and their branches.
+Sync refuses incoming paths that overlap the live document, LOG, or notes.
+
 - **Origin ancestry:** The checkpoint must occur on an origin branch. The command fetches and checks the unit's Branch first. If necessary, it fetches all origin heads. Machine-readable fetch output identifies current origin refs. Stale tracking refs cannot certify a checkpoint. Neither ancestry checks nor worktree cleanup prune shared refs. This also applies when the checkout normally fetches one branch. The ancestry line names the containing branch. Without a containing branch, the result stays `commit is not on origin`. Scope, conflict checks, and merging use the submitted checkpoint hash. The overlap report checks other units' branches and dirty worktrees. It excludes the submitting unit. Push preparation, publication, batch preparation, and promotion fetch explicit refspecs before they read full origin ref names.
 - **Inputs:** The showrunner staff row supplies the production name and document path. Unit staff rows supply the worktrees. `.unit.toml` supplies each plan. The document supplies `Merge branch`, `Showrunner checkout`, `Log`, and `Merge tests`. It also supplies `Known flakes` and `Known flaky tests`. Flakes name packages. Flaky tests use the form `` `<path::test>`, `<path::test>` ``. `Push` selects `validate_and_push` by default, or `git`. `Promote` accepts `<checkout>[, mac <path>]`. Its type is `NoPromotion | PromoteTo(checkouts, MacCheckout | NoMac)`.
 
@@ -367,7 +375,7 @@ Each local Promote checkout must exist before the command pushes.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
      Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
      The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
-     It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
+     It reads the printed `rc=` line and uses `mac_pull_tries` and `mac_pull_retry_seconds` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
   10. Record the code checkpoint's review ledger row and production log line.
@@ -569,7 +577,7 @@ Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
-Old records without the field default to morty.
+Old records without the field use their record keeper.
 `record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -587,10 +595,18 @@ States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`,
 Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
-The List hides an item with unanswered questions while each send is pending or successful.
+The List shows a waiting panel while each unanswered question has a pending send or confirmed delivery.
 If a question send fails, the item shows Question not delivered.
-The `the_list.py list` command still shows the item.
-The producer uses `the_list.py answer` to save an answer and mark the item unread.
+The `the_list.py list` command still shows the item when it is in morty's folder.
+The `the_list.py answer` command accepts answers from the saved recipient, the record keeper, or morty.
+A saved answer marks the item unread.
+Use `answer --keeper` to select the item's folder.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, or morty's folder otherwise.
+`update` uses morty's folder by default.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -616,6 +632,21 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+
+`ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
+The ids are `A1`, `A2` and on for each item.
+Only the item's producer or morty can open an ask. The target must have a staff row.
+`--config` marks a settings.json, CLAUDE.md or config change. The page shows the same button for it.
+Each ask stores the kind, What, Why, the target, the config flag, the opened time, the closed time and the go id.
+The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
+An open ask makes the item unread, and the log gets an “Ask opened” line.
+The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
+When no ask that shows a box stays open, the item becomes read if it has no other unread change.
+An ask whose target has no staff row shows no box.
+A Go that leaves no ask with a box on a Waiting for nate item also sets Working and asks the producer for the next step, as Mark read does.
+A Go message that does not reach a recipient adds a “Go not delivered” log line.
+nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
@@ -629,33 +660,50 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
+Producers can update their own items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
 Their updates use the caller's staff name as the log source.
-They can also run `park`, `close`, and `reopen` on those items.
-These commands use the `--source` words as the log source.
-The command refuses each item of another producer.
+Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
+The CLI refuses another producer and `--number` on their `add`.
+The CLI saves new items in morty's store on the machine where it runs. Every producer runs on natedev.
+`park`, `unpark`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
+These commands require `--source` and use its words as the log source.
+Close clears the parking time.
+The writer checks the assigned producer under the same lock as the save.
+Only morty can change the owner or producer of an existing item.
 Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-Morty's new items default to morty.
-Changing the producer to someone other than morty sends two notices after the save.
+New items that morty adds without `--producer` default to morty.
+An assignment that morty makes to another producer sends two notices after the save.
+When another producer adds their own item, the CLI sends only the showrunner notice after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
 The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
 If the recipient is offline, the notice fails and stays unsent.
-If the producer retires before the staff refresh, the CLI reports the failed producer notice.
+If a producer that morty assigned retires before the staff refresh, the CLI reports the failed producer notice.
 The showrunner gets a notice that the saved assignment needs a new producer.
 When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
-When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
+When the staff refresh fails, the CLI reports the saved item ID and the notices it could not send.
 The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+Use `--done-when` to name every result the item needs before it can close.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
+The CLI reads character limits in `config/the_list.conf` when add or update sets the applicable field.
+
+| Config key | Limit |
+| --- | --- |
+| `max_chars.latest_status` | 200 characters for the latest status |
+| `max_chars.next_step` | 160 characters for the next step |
+| `max_chars.evidence_line` | 300 characters for each replacement or appended evidence line |
+
+The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
+The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in morty's List folder.
+References use numbers in the folder of the item that the command edits.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
@@ -1021,7 +1069,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A missing pane launch record does not make a resolved staff worker unknown.
     `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
     `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
-    `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
+    `unit_phases.send_anomalies` sends all lines once to `unit_anomalies_to` from `config/production.conf` (`sdlc`).
     The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.

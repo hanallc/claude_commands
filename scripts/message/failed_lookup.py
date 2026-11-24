@@ -97,7 +97,7 @@ def notice_owner(sender: str) -> str:
                 return str(parent.id)
             visited.add(parent.id)
             parent = membership.parent_of(parent)
-    return conf.read("production").text("UNIT_ANOMALIES_TO")
+    return conf.read("production").text("unit_anomalies_to")
 
 
 def caller_command_line() -> str:

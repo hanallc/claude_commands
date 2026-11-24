@@ -97,7 +97,7 @@ class DailySimplifyTests(NixFixture):
         self.env.update(private_slot_config(self.root, repository="origin").environment)
         settings = Path(self.env["CONF_DIR"])
         _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
-        _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")
+        _ = write_config_fixture(settings / "direct.conf", "simplify_lens=on\nsimplify_first_run_before=2026-11-05T22:50:00-05:00\n")
         startup = self.root / "startup"
         startup.mkdir()
         _ = (startup / "sitecustomize.py").write_text('''import datetime, os, sys
@@ -188,7 +188,7 @@ raise SystemExit(1 if failed else 0)
         return (session or self.session) / "simplify" / day
 
     def test_off_starts_no_claude_and_does_not_read_origin(self) -> None:
-        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "direct.conf", "SIMPLIFY_LENS=off\n")
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "direct.conf", "simplify_lens=off\n")
         _ = self.git("remote", "set-url", "origin", str(self.root / "missing.git"))
         result = self.launch()
         self.assertEqual((result.returncode, result.stdout.strip()), (0, "simplify: off"), result.stderr)
@@ -214,7 +214,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(self.refs()["refs/simplify/claim/" + self.day], self.tip)
 
     def test_first_run_uses_the_root_when_no_commit_precedes_the_cutoff(self) -> None:
-        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "direct.conf", "SIMPLIFY_FIRST_RUN_BEFORE=2000-01-01T00:00:00+00:00\n")
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "direct.conf", "simplify_first_run_before=2000-01-01T00:00:00+00:00\n")
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.artifacts() / "diff").read_text().strip(), self.git("diff", self.first, self.tip))

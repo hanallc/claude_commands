@@ -5,18 +5,18 @@ description: Show suite, module and test times.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/test_times/show.py $ARGUMENTS` and show its lines unchanged.
 
 - `top [--limit N] [--repo PATH] [--host NAME]`: rank the slowest tests of the working repository, or of PATH. This is the default command.
-- `trend [--days N]`: show daily CPU, wall time and cost for targeted tests and full suite runs. The default is `TREND_DAYS`.
+- `trend [--days N]`: show daily CPU, wall time and cost for targeted tests and full suite runs. The default is `trend_days`.
 - `suites [--days N]`: show recent gate runs.
 - `suite <folder> [--days N]`: show one folder suite's history.
 - `module <folder>/<file> [--runs N]`: show each module execution and its slowest kept tests.
 - `test <text> [--runs N]`: show kept test names that contain the text and later missing measurements.
 
 In the ~/.claude repository, `top` ranks live gate modules by median CPU time.
-Each module uses up to `TOP_RUNS` runs, ordered by the commit time of their merge base with `origin/main`.
+Each module uses up to `top_runs` runs, ordered by the commit time of their merge base with `origin/main`.
 The start time breaks ties. Runs with unknown commit times sort last.
 `code date` shows the merge-base date of the latest counted run, or `unknown`.
 The nightly type check has a footnote with its latest passed CPU and wall time. It does not count toward the limit.
-In another repository, `top` ranks recorded nextest tests on the current host within `TOP_MAX_AGE_DAYS`.
+In another repository, `top` ranks recorded nextest tests on the current host within `top_max_age_days`.
 The repository key follows its origin, so worktrees share the same test history.
 Each list holds the records from the last complete index update.
 The `rows as of` time names the last update that changed rows.
@@ -28,13 +28,13 @@ A newer gate record appears on a later run after that refresh ends.
 The first list after a gate can omit that gate.
 When no complete compatible index exists, the report builds an index before it prints.
 Use `--host NAME` to select another host. The default is the current host. The heading names the selected host.
-Use `--host aws` to rank the gate modules of every AWS gate host from `TOP_AWS_CHECKOUT`.
+Use `--host aws` to rank the gate modules of every AWS gate host from `top_aws_checkout`.
 
 The nextest table shows the median of passed runs, including successful retries.
 It also shows retained run counts, failed and timed-out run counts, and the latest duration.
 Tests with only failed runs follow passed tests, ordered by their latest duration.
 The heading names the repository, host and recording threshold.
-The recorder retains failures, retries, SLOW results and tests above `NEXTEST_SLOW_TEST_S`.
+The recorder retains failures, retries, SLOW results and tests above `nextest_slow_test_s`.
 
 Run `python3 ~/.claude/scripts/test_times/module_cost.py --tree <path> <folder>/<file> [<folder>/<file> ...]` for module costs.
 It reports CPU seconds, process starts, successful execs, wall seconds and test status.
@@ -75,6 +75,6 @@ An unpriced reservation has no cost record.
 AWS tables report missing cost counts below the table. A group with no cost records shows `—`.
 Other hosts show `—`. Missing cost records do not delay caching.
 `gate-trend.json` beside the gate index caches finished days with their run ids and CPU and wall statistics.
-A day finishes after a complete refresh starts `TREND_SETTLE_MINUTES` after its end (default 60).
+A day finishes after a complete refresh starts `trend_settle_minutes` after its end (default 60).
 The cache records that start after the refresh completes. An exclusive lock protects each cache update.
 Later runs query the index only for open days. A missing, unreadable or incompatible cache is rebuilt.

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, write_text_atomic
+from scripts.lib.file_lock import exclusive
 from scripts.lib.showrunner_state import state_root
 
 if TYPE_CHECKING:
@@ -59,6 +60,19 @@ def goal_path(producer: staff.StaffId) -> Path:
 def card_path(producer: staff.StaffId) -> Path:
     """Find the ready card for this producer."""
     return goal_path(producer).with_name("main-goal-card.json")
+
+
+def _lock_path(producer: staff.StaffId) -> Path:
+    return goal_path(producer).with_name(".main-goal.lock")
+
+
+@contextmanager
+def locked(producer: staff.StaffId) -> Generator[None]:
+    """Lock the producer's goal across all List stores."""
+    path = _lock_path(producer)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive(path):
+        yield
 
 
 def _read_json(path: Path) -> object:
@@ -204,7 +218,12 @@ def list_item_change(keeper: staff.StaffId, identity: str, producer: staff.Staff
 
         published = False
         try:
-            for owner in producers:
+            for owner in sorted(producers):
+                try:
+                    _ = preserved.enter_context(exclusive(_lock_path(owner)))
+                except FileNotFoundError:
+                    # A first mark for this item must acquire the List lock.
+                    continue
                 backup = preserved.enter_context(_mark_stale(owner))
                 if backup is not None:
                     backups[owner] = backup

@@ -506,7 +506,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     def test_a_merge_gate_leaves_an_unused_reservation_to_its_caller(self) -> None:
         argv = ["--repo", str(self.checkout), "--merge-branch", "integration", "--unit-branch", "unit-phase",
                 "--checkpoint", "checkpoint", "--previous-checkpoint", "previous", "--unit", "fixture",
-                "--phase", "phase-2"]
+                "--phase", "phase-2", "--production", "quiet"]
         waits: list[placement.AssignmentState] = []
         with placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ):
             def wait_until_free() -> None:
@@ -517,6 +517,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 reply, admitted = self.hand_off_a_natedev_gate(queue, ("natedev", "mac-linux"))
                 owner = build_hold.ProcessIdentity(reply.assignment.owner.pid, reply.assignment.owner.start_time)
                 with (mock.patch.object(build_hold, "caller_processes", return_value=frozenset({owner})),
+                      mock.patch.dict(os.environ, {"STAFF_FILE": self.environment["STAFF_FILE"]}),
                       mock.patch.object(gate, "gate_job_from_process",
                                         return_value=gate_job_for_command(["gate.py", *argv])),
                       mock.patch.object(gate.BuildHoldWait, "wait_until_free", side_effect=wait_until_free),

@@ -94,6 +94,11 @@ class RemoteStartHoldEnded:
 
 
 @dataclass(frozen=True)
+class GuestStartNotReported:
+    """The assignment has no saved guest execution folder."""
+
+
+@dataclass(frozen=True)
 class GuestStartNotRecorded:
     """The queue has no saved confirmation of a guest start."""
 
@@ -123,6 +128,7 @@ class SavedPlacementAssignment:
     guest_execution_observed: bool = False
     guest_proof_required: bool = False
     confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
+    guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -207,7 +213,7 @@ class RepositoryRunLimits:
         return self.for_repository(machine, repository)
 
     def for_repository(self, machine: str, repository: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
-        key = f"{machine}.{repository}"
+        key = f"{conf.host_key_name(machine)}.{repository}"
         if key not in self.by_machine_and_repository:
             return NoRepositoryRunLimit()
         return RepositoryRunLimit(self.by_machine_and_repository[key])
@@ -1271,6 +1277,8 @@ def execution_group(step: RunningStep, fallback: str) -> str:
         identity = evidence.identity
         if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        if isinstance(identity, execution_identity.GuestExecution):
+            return repr((identity.target, identity.attempt))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:
         return repr((step.assignment_host, fallback))

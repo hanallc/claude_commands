@@ -173,10 +173,15 @@ __PAGE_FRAME_STYLE__
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
+.tip:has(dd.call) :is(dt, dd):not(.call, .folder) { white-space: normal; overflow-wrap: anywhere; }
 .tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden; white-space: normal; }
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+#tip > .tip:has(dd.folder) { min-width: min-content; grid-template-columns: fit-content(44%) minmax(min-content, 1fr); }
+.tip:has(dd.folder) :is(dt, dd):not(.call, .folder) { white-space: normal; overflow-wrap: anywhere; }
+.tip dd.folder { white-space: normal; overflow-wrap: normal; }
+.tip dd.folder span { display: inline-block; white-space: pre; }
 /* shared:step-tip:end */
 #tip > .tip { max-height: var(--tip-height); overflow: hidden; }
 .seg-remote { background: var(--remote-memory); }
@@ -1372,13 +1377,11 @@ function doneText(row) {
     : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
-// A Showrunner or Caller name that already shows as Started by is left out, so no name shows twice.
 function ownerFields(row) {
-  const starter = row.started_by?.name || '';
   const showrunner = ownerText(row.showrunner);
-  const fields = [staffField('Started by', [starter]), staffField('Showrunner', [showrunner === starter ? '' : showrunner])];
+  const fields = [staffField('Showrunner', [showrunner])];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
-  if (row.caller && row.caller !== starter) fields.push(field('Caller', row.caller));
+  if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
 function olderStepTitle(row) {
@@ -1400,6 +1403,14 @@ function becauseRows(reason, parts) {
 function routeFields(row) {
   return [machineField('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
     ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
+}
+function runFolderFields(folder) {
+  if (!folder) return [];
+  if (folder.kind === 'RunFolderNotReported') return [field('Folder', 'not reported yet')];
+  if (folder.kind !== 'RecordedRunFolder') return [];
+  const {path, home} = folder;
+  const shown = home && (path === home || path.startsWith(home + '/')) ? '~' + path.slice(home.length) : path;
+  return [field('Folder', shown, 'folder')];
 }
 function progressRows(row) {
   const progress = row.progress;
@@ -1424,7 +1435,11 @@ function stepTooltip(key, data) {
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
   const guest = guestRow(row);
-  const guestFields = guest ? [machineField('Runs on', row.machine), ...progressRows(row)] : [];
+  const folderFields = waiting ? [] : runFolderFields(row.run_folder);
+  const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
+  const runningLocation = [machineField('Runs on', machine), ...folderFields];
+  const guestFields = guest ? [...runningLocation, ...progressRows(row)] : [];
+  const unavailableLocation = guest ? guestFields : folderFields;
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && (guest || namesGuest)
     ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || ''), ...becauseRows(row.because || '')] : [];
@@ -1438,7 +1453,7 @@ function stepTooltip(key, data) {
   if (macRow(row) && row.gate_label && !row.gate_label.startsWith('placement ')) {
     detailFields.push(field('Mac build', row.gate_label));
   }
-  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...guestFields, ...namedTargets,
+  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...unavailableLocation, ...namedTargets,
     ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
@@ -1486,8 +1501,7 @@ function stepTooltip(key, data) {
       rows.push(...groupRows(need));
     }
   } else {
-    const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(...(guest ? guestFields : [machineField('Runs on', machine)]), ...namedTargets);
+    rows.push(...(guest ? guestFields : runningLocation), ...namedTargets);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
@@ -1565,6 +1579,7 @@ function tipRowsHtml(rows) {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
     const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
+      : row.kind === 'folder' ? row.value.split(/(?<=\/)(?=.)/).map(segment => `<span>${esc(segment)}</span>`).join('<wbr/>')
       : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
     const cell = `<dd${attr}>${value}</dd>`;
     return ['caption','long'].includes(row.kind) ? cell
@@ -1632,15 +1647,15 @@ function publicParts(parts) {
   }
   return shown;
 }
-// One function gives the row start, its small text and the Step and Verify cells, so any console page can use them.
-// A row with a unit starts with the unit; its showrunner is the small text. A Mac build with no unit starts with who
-// started it, in the same form: its repository is the small text and its step fills Step. Another row starts with the
-// owner before ": " in its name, and the text after it fills Step.
+// Use the same owner and step layout for all Running rows.
 function queueRowLabels(row) {
-  if (row.started_by) return {name: row.started_by.name, unit: "", owner: "", starter: row.started_by.name,
-    repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const verify = row.verify?.verb || "";
+  const showrunner = unit ? ownerText(row.showrunner) : "";
+  const owner = showrunner === unit ? "" : showrunner;
+  if (row.kind === "mac-build" && row.row_owner !== undefined) {
+    return {name: row.row_owner, unit, owner, step: row.row_step, verify};
+  }
   if (!unit) {
     // A row with no unit starts with its owner, the text before ": " in its name. The step goes in Step.
     // The owner has no small line: it would repeat the owner.
@@ -1648,9 +1663,7 @@ function queueRowLabels(row) {
     return {name: split < 0 ? row.name : row.name.slice(0, split), unit, owner: "",
       step: split < 0 ? "" : row.name.slice(split + 2), verify};
   }
-  const showrunner = ownerText(row.showrunner);
-  return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
-    step: row.title?.unit ? row.title.step : "", verify};
+  return {name: row.name, unit, owner, step: row.title?.unit ? row.title.step : "", verify};
 }
 // A unit always shows in the unit color, by its role, also when it has no staff entry. Python makes the span.
 function unitName(text) {
@@ -1692,7 +1705,15 @@ function placeTipAt(tip, x, y, fit, anchor) {
   tip.style.setProperty("--tip-width", `${Math.max(0, clientWidth - 2 * inset)}px`);
   tip.style.setProperty("--tip-height", `${maxHeight}px`);
   fit?.(tip, maxHeight);
-  const w = tip.offsetWidth, h = tip.offsetHeight;
+  const folderTip = tip.querySelector(':scope > .tip:has(dd.folder)');
+  if (folderTip) {
+    tip.style.left = "0px";
+    folderTip.style.zoom = "";
+    const scale = Math.min(1, Math.max(1, clientWidth - 2 * inset) / folderTip.getBoundingClientRect().width);
+    if (scale < 1) folderTip.style.zoom = scale;
+    folderTip.style.maxHeight = `${Math.floor(maxHeight / scale)}px`;
+  }
+  const {width: w, height: h} = (folderTip || tip).getBoundingClientRect();
   const rightEdge = clientWidth - w - inset;
   const above = y - h - 14;
   let left = x - w / 2;
