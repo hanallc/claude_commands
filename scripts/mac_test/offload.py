@@ -686,8 +686,6 @@ def remaining():
     return max(0.0, deadline - time.monotonic())
 
 machine_id = mac_machine_id(remaining())
-if not machine_id:
-    sys.exit("the Mac identity check gave no answer")
 print("dispatch_mac_id=" + machine_id, flush=True)
 if machine_id != sys.argv[5]:
     sys.exit(0)

@@ -2733,7 +2733,10 @@ def release_exact_claims(
                     lines = observed.output.splitlines()
                     identity_reply = "dispatch_mac_id="
                     if len(lines) == 1 and lines[0].startswith(identity_reply):
-                        actual = claim_state.mac_machine_id(lines[0].removeprefix(identity_reply))
+                        reported_id = lines[0].removeprefix(identity_reply)
+                        if not reported_id:
+                            return ClaimReleaseRefused("the Mac identity is unavailable", idle_only=True)
+                        actual = claim_state.mac_machine_id(reported_id)
                         if actual is not None and actual != machine_id:
                             return ClaimReleaseRefused("the Mac identity changed", idle_only=True)
                     prefix = [identity_reply + machine_id, "leftovers=0", "rc=0"]

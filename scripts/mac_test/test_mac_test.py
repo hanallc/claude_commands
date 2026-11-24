@@ -3220,8 +3220,9 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         from scripts.mac_test.offload_test_commands import write_shell
 
         write_shell(self.root / "pgrep", '[[ $* == *"/hana("* ]] || exit 2\nexit 1\n')
-        write_shell(self.root / "ioreg", 'printf \'"IOPlatformUUID" = "%s"\\n\' '
-                    + '"${WATCH_MACHINE_ID:-' + self.machine_id + '}"\n')
+        write_shell(self.root / "ioreg", f'machine_id="${{WATCH_MACHINE_ID-{self.machine_id}}}"\n'
+                    + '[[ -n "$machine_id" ]] || exit 0\n'
+                    + 'printf \'"IOPlatformUUID" = "%s"\\n\' "$machine_id"\n')
         write_shell(self.root / "lsof", r'''
 if [[ $* == *"-d cwd"* ]]; then
     printf 'p2345\nn%s/.local/state/mac-test/mirror/cargo-liner\n' "$HOME"
@@ -3338,6 +3339,25 @@ fi
         self.assertFalse(path.exists())
         self.assertTrue(fence.exists())
         self.assertIn("nothing ran on the Mac for 15 minutes", output)
+
+    def test_missing_remote_uuid_uses_the_idle_rule(self) -> None:
+        path, fence = self.saved_mirror_claim()
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        with mock.patch.dict(os.environ, {"WATCH_MACHINE_ID": ""}), self.watch_mirror(mac_test.MacIdle()) as check:
+            _ = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        _ = path.write_text(json.dumps({**record, "idle_since": expired}))
+        with mock.patch.dict(os.environ, {"WATCH_MACHINE_ID": ""}), self.watch_mirror(mac_test.MacIdle()) as check:
+            output = self.watch_once()
+        self.assertFalse(path.exists())
+        self.assertTrue(fence.exists())
+        self.assertIn("nothing ran on the Mac for 15 minutes", output)
+        check.assert_called_once()
 
     def test_kept_claim_without_saved_origin_uses_the_idle_rule(self) -> None:
         for origin in (None, {"mirror_root": self.original_root}, {"machine_id": self.machine_id}):
