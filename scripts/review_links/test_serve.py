@@ -842,6 +842,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
         self.assertEqual(response.status, 200, response.body)
         saved = cast(dict[str, str], json.loads(response.body))
+        self.assertEqual(cast(str, send.call_args.args[2]).splitlines()[0],
+                         f"New investigation {saved['id']} from Review.")
         item = cache.get().records[saved["key"]]
         self.assertEqual((item.owner, item.type), (other.id, review_items.ReviewType.INVESTIGATION))
         filed, = investigation.records(other.id)
@@ -906,16 +908,21 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
         words = "The frame time graph has a gap."
-        self.check_new_item_list_filing("bug", review_items.ReviewType.BUG, words, words)
+        self.check_new_item_list_filing("bug", review_items.ReviewType.BUG, words, words, notice_type="bug")
+
+    def test_feedback_command_notifies_the_recipient_and_files_an_investigation(self) -> None:
+        words = "The queue chart is easy to read."
+        self.check_new_item_list_filing("feedback", review_items.ReviewType.INVESTIGATION, words, words,
+                                        notice_type="Feedback")
 
     def test_enhancement_command_files_and_prefixes_the_list_title_at_the_word_limit(self) -> None:
         first_line = "Show the next check in the row."
         words = first_line + "\n" + "x" * (new_item_dialog.MAX_WORDS_LENGTH - len(first_line) - 1)
         self.check_new_item_list_filing("enhancement", review_items.ReviewType.INVESTIGATION,
-                                        words, f"Enhancement: {words}")
+                                        words, f"Enhancement: {words}", notice_type="Enhancement")
 
     def check_new_item_list_filing(self, kind: str, review_type: review_items.ReviewType, words: str,
-                                   filed_words: str) -> None:
+                                   filed_words: str, *, notice_type: str) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         unit = case.fixture.unit
@@ -929,12 +936,15 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(self.server, "delivery_status", case.status),
               patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
               patch("platform.system", return_value="Linux"),
-              capture_sender("send_message"), redirect_stdout(output), redirect_stderr(errors)):
+              capture_sender("send_message") as send, redirect_stdout(output), redirect_stderr(errors)):
             code = new_item.main([kind, unit.name, words, "--session", "another-session"])
             self.assertTrue(self.new_item_posts.wait_until_none_run())
         self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
         self.assertNotIn("new_item:", errors.getvalue())
         key, = [key for key, record in cache.get().records.items() if record.type == review_type]
+        item_id = cache.get().records[key].id.rsplit("/", 1)[-1]
+        send.assert_called_once_with(f"session:{owner.current_session}", change_page.SENDER, ANY)
+        self.assertEqual(cast(str, send.call_args.args[2]).splitlines()[0], f"New {notice_type} {item_id}.")
         item, = the_list.records(morty.id, include_closed=True)
         title = filed_words.splitlines()[0]
         self.assertEqual((cache.get().records[key].title, cache.get().records[key].owner), (title, owner.id))
@@ -1191,6 +1201,35 @@ class ReviewLinksServerTests(unittest.TestCase):
                         key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                         recipient_key=sent_to.id)
                     self.assertEqual(register.call_count, 2 if later_owner is not None or scenario == "config-reopen" else 1)
+
+    def test_migrated_list_feedback_retry_recovers_the_filing_without_a_notice(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
+                          page="list", request_id="r2-" + uuid4().hex)
+        migrated = replace(request, request_id="r6-" + request.request_id[3:],
+                           page_recipient=new_item_dialog.PageRecipient.SELECTED,
+                           notice=new_item_dialog.SubmissionNotice("feedback"))
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            first = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(first.status, 200, first.body)
+            saved = cast(dict[str, str], json.loads(first.body))
+            for attempt in (migrated, replace(migrated, words="An edit after the old Feedback was filed.")):
+                retry = self.new_item_http(self.new_item_body(attempt), finished=True)
+                self.assertEqual(retry.status, 409, retry.body)
+                fields = cast(dict[str, str], json.loads(retry.body))
+                self.assertEqual((fields["code"], fields["key"]), ("already_filed", saved["key"]))
+
+        send.assert_called_once()
+        record, = investigation.records(owner.id)
+        self.assertEqual((record.id, record.question), (saved["id"], request.words))
+        assert isinstance(record.submission, new_item_dialog.ReviewSubmission)
+        self.assertEqual(record.submission.notice, new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW)
 
     def test_f014_standard_new_replays_the_item_filed_for_the_new_page_owner(self) -> None:
         case = self.review_fixture()

@@ -1524,6 +1524,7 @@ class NewItemDialogTests(unittest.TestCase):
                 for report, title in zip(records[-2:], ("First queue state", "Second queue state"), strict=True):
                     self.assertEqual(report.question, "Show the queue state.")
                     assert isinstance(report.submission, new_item_dialog.ReviewSubmission)
+                    self.assertEqual(report.submission.notice, new_item_dialog.SubmissionNotice("feedback"))
                     evidence = report.submission.evidence
                     assert isinstance(evidence, new_item_dialog.PageDataEvidence)
                     self.assertEqual(evidence.title, title)

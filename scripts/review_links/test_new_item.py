@@ -155,6 +155,7 @@ class NewItemTests(ServerFixture):
                 self.assertEqual(code, 0)
                 self.assertEqual(output, f"{item_type.value.capitalize()} \u2192 bob. List item 3.\n")
                 self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type])
+                self.assertEqual(self.server.posts[-1]["notice"], {"kind": item_type.value, "from_command": True})
                 words = "Efficiency: Check the chart." if item_type == new_item.ItemType.EFFICIENCY else "Check the chart."
                 self.assertEqual(self.server.posts[-1]["words"], words)
         with self.assertRaises(SystemExit):
@@ -295,6 +296,7 @@ class NewItemTests(ServerFixture):
         self.assertTrue(review_submissions.is_draft_id(request_id))
         self.assertEqual(body, {
             "token": "fixture-token", "kind": "proposal", "recipient_id": SPACETIME.id,
+            "notice": {"kind": "proposal", "from_command": True},
             "words": "Add a chart.\n\nNext week.", "evidence": {"kind": "none"}, "images": [],
             "page": "list", "page_recipient": "selected"})
         request = new_item_dialog.read_request({**body, "request_id": request_id})

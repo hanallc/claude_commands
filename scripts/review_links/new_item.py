@@ -233,10 +233,11 @@ def recipient_for(member: staff.StaffRow, options: Options, members: staff.Staff
     return found
 
 
-def request_body(options: Options, kind: _WireKind, recipient: Recipient, words: str) -> bytes:
+def request_body(options: Options, item_type: ItemType, recipient: Recipient, words: str) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": kind,
+        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": FILED_KINDS[item_type],
+        "notice": {"kind": item_type, "from_command": True},
         "recipient_id": recipient.id, "words": words, "evidence": {"kind": "none"}, "images": [],
         "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value,
     }).encode()
@@ -314,9 +315,8 @@ def main(arguments: list[str] | None = None) -> int:
         caller = members.by_current_session(args.session) if args.session else None
         this_session = caller is not None and caller.id == member.id
         words = words_text(item_type, args.description, args.extra)
-        kind = FILED_KINDS[item_type]
         reply = exchange(address, "POST", review_page.NEW_ITEM_PATH,
-                         request_body(options, kind, recipient, words))
+                         request_body(options, item_type, recipient, words))
         if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
@@ -328,8 +328,8 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         if not isinstance(review_key, str) or not review_key:
             raise ValueError("the console server sent no Review item key")
-        if kind == "enhancement":
-            words = new_item_dialog.read_words(words, "Your words", kind=kind)
+        if item_type == ItemType.ENHANCEMENT:
+            words = new_item_dialog.read_words(words, "Your words", kind="enhancement")
         item = add_list_item(review_key, words, recipient, member, mapped, members)
     except UnlinkedListItem as error:
         print(result_line(item_type, member, mapped, members, this_session=this_session, filed=str(error)))
