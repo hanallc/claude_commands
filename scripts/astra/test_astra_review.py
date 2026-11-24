@@ -557,7 +557,7 @@ class AstraReviewTests(StaffTestCase):
                                 self.assertEqual(run_pointer(), staff.OpenRun(run))
                                 self.assertEqual(progress_history.pass_for_finalization(run, second_id)["status"], "interrupted")
                             self.fixture.agent.complete(second_pane)
-                            outcome = (turn_end.TurnOutcome.STOPPED if scenario == "run end while a reviewer runs"
+                            outcome = (turn_end.TurnOutcome.LATE_DONE if scenario == "run end while a reviewer runs"
                                        else turn_end.TurnOutcome.DONE)
                             self.assertEqual(self.fixture.finish(second.name), outcome)
                         self.assertEqual(run_pointer(), staff.OpenRun(run))

@@ -1618,7 +1618,7 @@ class TurnEndTests(unittest.TestCase):
             self.assertEqual(current["status"], "active")
             self.assertIs(progress_history.hook_completion(current), progress_history.NoHookCompletion.UNRECORDED)
             self.assertIn(pane, self.case.fixture.world.locations)
-            self.assertFalse(status.exists())
+            self.assertEqual(status.read_text(), "running\n")
         if case == "old-marker":
             self.assertIn(f"DONE {older} from another pass", interim)
         elif stop_text:
@@ -2193,6 +2193,35 @@ class TurnEndTests(unittest.TestCase):
                     self.assertNotEqual(worker_panes.worker_pass(row, run)["instance_id"], instance)
                 else:
                     self.assertNotIn(pane, self.case.fixture.world.locations)
+
+    def test_assignment_reuses_an_idle_pane_after_a_linked_stop(self) -> None:
+        self.case.agent.finish_after = 1
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        run = self.case.run_dir
+        parent = self.case.fixture.parent.id
+        passed = worker_panes.worker_pass(row, run)
+        instance = str(passed["instance_id"])
+        notice = progress_history.stop_dispatch(run, str(passed["team_slot"]), instance, row, parent,
+                                               run_id="stopped-run", reason="Stop the worker pass.")
+        self.assertIsInstance(notice, progress_history.StoppedPassNotice)
+        path, result = self.case.detached_record(row, "linked-result")
+        result.update(pane_dispatch_id=instance, delivery=f"sent: worker {row.name} at {pane}")
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        self.case.agent.append(pane, "user", "Detached run: linked-result\nRun finished: verification")
+        self.case.prompt = run / "next-assignment.md"
+        worker.save_reply(self.case.prompt, "Read the next assignment.")
+        self.case.fixture.world.locations[pane]["agent_status"] = "working"
+        self.assertIs(self.case.dispatch(), worker.ExitCode.BUSY)
+        self.assertEqual(len(self.case.agent.submitted), 1)
+        self.case.fixture.world.locations[pane]["agent_status"] = "idle"
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(len(self.case.agent.submitted), 2)
+        self.assertEqual(self.case.agent.submitted[-1][0], pane)
+        self.assertEqual(self.case.agent.row(pane).id, row.id)
+        self.assertNotEqual(worker_panes.worker_pass(row, run)["instance_id"], instance)
+        self.assertEqual(self.case.fixture.world.closed, [])
 
     def test_detached_result_keeps_an_ended_pass_until_a_later_matching_done(self) -> None:
         self.case.agent.finish_after = 1
@@ -3232,7 +3261,7 @@ class TurnEndTests(unittest.TestCase):
                 with patch.object(sys, "argv", args):
                     if failure == "state write":
                         with (patch.object(pass_recorder, "write_text_atomic", side_effect=fail_state_write),
-                              self.assertRaisesRegex(OSError, "state write failed")):
+                              self.assertRaisesRegex(SystemExit, "state write failed")):
                             progress_history.main()
                         self.assertEqual(worker_panes.worker_pass(row, run)["status"], "active")
                     else:

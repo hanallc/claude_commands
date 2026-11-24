@@ -15,6 +15,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.agents import remote
+from scripts.agents.remote import local_machine
 from scripts.astra import astra_roles
 from scripts.astra.design_role_test_support import HeldRolePaneCase
 from scripts.direct import assign, progress_history, recorder_state
@@ -129,8 +130,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         begin = assign.execute_herdr
 
         def lose_staff(args: assign.Arguments, run: Path, phase: str, prompt: Path,
-                       role: str, paths: list[str], environment: dict[str, str]) -> int:
-            with patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable("private reread failure")):
+                       role: staff.WorkerRole, paths: list[str], environment: dict[str, str]) -> int:
+            with patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("private reread failure")):
                 return begin(args, run, phase, prompt, role, paths, environment)
 
         submitted = case.agent.submitted.copy()
@@ -144,6 +145,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         self.assertEqual(case.agent.submitted, submitted)
 
     def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
+        _ = self.enterContext(patch.object(remote, "local_machine", new=local_machine))
         write_text_atomic(Path(os.environ["LINT_CONFIG_FILE"]), "style_review=on\n")
         project = self.panes.root / "project"
         project.mkdir()

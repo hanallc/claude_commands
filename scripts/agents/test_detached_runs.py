@@ -3251,7 +3251,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         _ = self.enterContext(patch.object(detached_run_process, "process_args", side_effect=fixture_arguments))
         config = self.fixture.root / "conf"
         _ = write_config_fixture(config / "detached_runs.conf",
-                                 "result_push_retries=3\nRESULT_PUSH_RETRY_SECONDS=5\n")
+                                 "result_push_retries=3\nresult_push_retry_seconds=5\n")
         for name in ("send", "postmaster", "codex_daemon", "shutdown"):
             _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / f"config/{name}.conf",
                                          config / f"{name}.conf")
@@ -5524,6 +5524,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(progress_history.end_run(self.run_dir, progress_history.RunEndRequested("stopped")),
                       progress_history.RunEndSettled.CLOSED)
         self.assertIsNone(unit_runs.open_run(str(parent.current_session)))
+        self.assertEqual(detached_runs.main(["deliver", str(case.detached_record)]), 0)
         self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], False)
         write_text_atomic(case.diagnostics, "{")
 
@@ -5746,11 +5747,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         with (patch.object(send, "send", side_effect=stage_late_reply),
               patch.object(detached_runs, "_group_is_live", return_value=False)):
-            self.assertEqual(detached_runs.main(["deliver", str(case.detached_record)]), 0)
+            self.assertEqual(detached_runs.main(["deliver", str(case.detached_record)]), 1)
         late_reply, = late_replies
         self.assertEqual(len(case.agent.notices), 1)
         self.assertFalse(pass_notices.is_settled(self.run_dir, case.dispatch, "stopped"))
-        pass_notices.deliver(self.run_dir, case.dispatch, ("stopped",))
+        self.assertIs(worker_lifecycle.read_json_object(case.detached_record)["completion_pending"], True)
+        self.assertEqual(detached_runs.main(["deliver", str(case.detached_record)]), 0)
         self.assert_stop_notices(case, late_reply)
 
     def test_a_late_reply_after_a_stop_notice_crash_reaches_the_director_through_retry(self) -> None:

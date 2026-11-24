@@ -23,7 +23,6 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import BinaryIO, ClassVar, Literal, cast, final, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -5096,7 +5095,7 @@ observer.observe(original.parentElement,{childList:true});
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, 1366, 768)
 
-        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=load)):
+        with patch("scripts.review_links.browser_test_support.run_process_group", side_effect=load):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -5803,6 +5802,25 @@ observer.observe(original.parentElement,{childList:true});
   'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
  show('producer-answering');
  check(!row.hidden && !status.hidden,'Producer answering keeps the Unpark confirmation.');
+''', reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_unpark_focuses_the_parked_filter_without_window_focus(self) -> None:
+        item = self.add("Check the parked item", number=1)
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=7), source="morty")
+        self.browser_action_sequence('''
+ document.hasFocus=()=>false;
+ show('parked');
+ const chip=document.getElementById('filter-show-parked');
+ const unpark=form.querySelector('[value="unpark"]');
+ unpark.focus();
+ check(parent===window && !document.hasFocus(),'The top-level page reports no window focus.');
+ check(!row.hidden && recordIsOpen(row) && document.activeElement===unpark,'Unpark has focus in the open row.');
+ submit('unpark');
+ finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
+ await flush();
+ check(row.hidden && !recordIsOpen(row),'Unpark hides and closes the row.');
+ check(document.activeElement===chip,'The Parked filter receives focus.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -8267,7 +8285,7 @@ window.fetch=async(_path,options={})=>{
             width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
-        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=screenshot)):
+        with patch("scripts.review_links.browser_test_support.run_process_group", side_effect=screenshot):
             assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")

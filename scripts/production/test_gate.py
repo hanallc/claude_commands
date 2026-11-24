@@ -219,6 +219,7 @@ class DirectGatePlacementTests(unittest.TestCase):
                       mock.patch.object(gate, "gate_state_dir", return_value=Path(directory)),
                       mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
                       mock.patch.object(copies, "source_owner", return_value=""),
+                      mock.patch.object(gate, "gate_production", return_value=Path(directory)),
                       mock.patch.object(gate, "merge_checkpoint", side_effect=refusal),
                       mock.patch.object(gate, "run_gate_suites", side_effect=refusal),
                       mock.patch.object(gate.GateRecovery, "finish",

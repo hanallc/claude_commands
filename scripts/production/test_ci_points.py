@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
+from scripts.agents import remote
 from scripts.production import ci_points, promotion
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_checkpoint import merge_lock
@@ -320,9 +321,10 @@ class CiPointsTests(unittest.TestCase):
         from scripts.production import staff
         self.env["STAFF_FILE"] = str(self.root / "staff.json")
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            machine = remote.local_machine()
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc(machine, self.doc))
             _ = fixture_member("unit", name="alpha", parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", self.checkout))
+                               worktree=staff.PresentWorktree(machine, self.checkout))
         _ = self.git("push", "-u", "origin", "production")
         self.ci_result(self.git("rev-parse", "HEAD"))
         self.write(self.stub_state / "registered-workflows.json", json.dumps({
