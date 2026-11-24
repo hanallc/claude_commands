@@ -1622,6 +1622,16 @@ def is_mac_linux_guest(destination: placement.PlacementDestination) -> bool:
     return destination.provider == "ssh" and destination.target == "mac-linux"
 
 
+def _placement_history_applies(saved: records.SavedPlacementAssignment, request: wire.PlacementRequest) -> bool:
+    """Keep a cancelled guest's retry decision with its coordinator after settlement."""
+    assignment = saved.assignment
+    return (assignment.episode == request.episode
+            and (saved.state != placement.ClosedAssignment("cancelled")
+                 or not is_mac_linux_guest(assignment.destination)
+                 or not isinstance(saved.permission, placement.PermissionConsumed)
+                 or assignment.owner == request.owner and assignment.since == request.since))
+
+
 def _holds_consumed_guest_slot(saved: records.SavedPlacementAssignment) -> bool:
     # A consumed guest holds the slot until the service records closure.
     return (isinstance(saved.state, placement.CurrentAssignment)
@@ -4488,7 +4498,9 @@ done
             return False
         return not any(saved.assignment.episode == request.episode
             and (_holds_consumed_guest_slot(saved) or _holds_scaler_slot(saved)
-                 or isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled"))
+                 or isinstance(saved.state, placement.ClosedAssignment)
+                 and saved.state.reason in ("completed", "cancelled")
+                 and _placement_history_applies(saved, request))
             for saved in self.assignments.values())
 
     def _placement_admission(self, request: wire.PlacementRequest) -> wire.AdmitRequest | wire.LaunchRequest:
@@ -4521,8 +4533,8 @@ done
                       destination: placement.PlacementDestination, keys: PlacementEvidenceKeys
                       ) -> placement.RetryDecision | placement.EvidenceNeeded | RetryAfterAvailability:
         saved = next((saved for saved in reversed(self.assignments.values())
-            if saved.assignment.episode == request.episode and saved.assignment.destination == destination
-            and isinstance(saved.state, placement.ClosedAssignment)), None)
+            if saved.assignment.destination == destination and isinstance(saved.state, placement.ClosedAssignment)
+            and _placement_history_applies(saved, request)), None)
         if saved is None:
             return placement.RetryAt(0)
         retry = saved.retry
@@ -4819,7 +4831,8 @@ done
                     self.next_pass = self.clock.monotonic()
                 guest = expired
             report = guest.terminal_report
-            if (isinstance(guest.permission, placement.PermissionConsumed)
+            if (guest.assignment.owner == request.owner and guest.assignment.since == request.since
+                    and isinstance(guest.permission, placement.PermissionConsumed)
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.outcome, placement.AttemptCancelled)):
                 return self._placement_status(guest.assignment, report.outcome.reason, check_lifetime=False)
@@ -4851,8 +4864,9 @@ done
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
-        terminal = [saved for saved in self.assignments.values() if saved.assignment.episode == request.episode
-                    and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]
+        terminal = [saved for saved in self.assignments.values() if isinstance(saved.state, placement.ClosedAssignment)
+                    and saved.state.reason in ("completed", "cancelled")
+                    and _placement_history_applies(saved, request)]
         if terminal:
             saved = terminal[-1]
             return self._placement_status(saved.assignment,
@@ -5207,8 +5221,8 @@ done
     def _guest_took_no_run(self, saved: records.SavedPlacementAssignment, request: wire.ClaimFailure) -> bool:
         """A guest gate that consumed its launch permission took no run and ended.
 
-        The gate reports no claim, so the reply settles the attempt as for an available permission.
-        A new process read confirms the end, because the last system reading can still show the gate.
+        The no-run report can close a legacy attempt if no start is pending.
+        A fresh process read checks the gate because the last system reading can still show it.
         """
         return (saved.assignment.destination.target == "mac-linux"
                 and isinstance(saved.permission, placement.PermissionConsumed)
@@ -5610,7 +5624,7 @@ done
         current = self.current_assignments.get(assignment.episode) == key
         if guest and not current:
             return [self._placement_status(assignment, "the attempt is no longer current", check_lifetime=False)]
-        guest_needs_proof = _holds_consumed_guest_slot(saved)
+        guest_holds_slot = _holds_consumed_guest_slot(saved)
         if (isinstance(request, wire.ExecutionReport) and assignment.destination.provider == "scaler"
                 and request.claim != saved.provider):
             return [self._placement_status(assignment, "claim does not match the scaler assignment", check_lifetime=False)]
@@ -5646,7 +5660,7 @@ done
                                   refusal_settings=request.refusal_settings)
                 if guest or not self._settle_hana_prelaunch(refused, terminal):
                     retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
-                    if guest_needs_proof or self._start_pending(saved):
+                    if (guest_holds_slot and saved.guest_proof_required) or self._start_pending(saved):
                         self.assignments[key] = replace(refused, retry=retry)
                         self.persist()
                         self.next_pass = self.clock.monotonic()
@@ -5682,7 +5696,7 @@ done
                     and isinstance(request.evidence, execution_identity.ExecutionNotStarted)):
                 previous = saved.terminal_report
                 path = (placement.DispatchPathPending("Mac Linux settlement is pending")
-                        if guest_needs_proof else request.path)
+                        if guest_holds_slot else request.path)
                 if (isinstance(previous, placement.NoTerminalReport)
                         or previous.outcome in (SCALER_SETTLEMENT_REQUESTED, GUEST_SETTLEMENT_REQUESTED)
                         and isinstance(previous.path, placement.DispatchPathPending)):
@@ -5701,7 +5715,7 @@ done
                     self.assignments[key] = replace(saved, provider=request.claim, terminal_report=terminal)
             saved = self.assignments[key]
             report = saved.terminal_report
-            if (current and not guest_needs_proof
+            if (current and not guest_holds_slot
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
                     and (assignment.destination.provider == "scaler" or guest
