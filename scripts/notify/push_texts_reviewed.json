@@ -31,59 +31,75 @@
     "file_change_no_waits": {
       "objections": [
         {
-          "quote": "hana: demo command refused",
+          "quote": "demo: 1 command refused",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "write phases/34h/delegated_phase_reservation_state.json",
+          "quote": "Go: run the refused command",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Auto mode refused a file change in the demo session.",
+          "quote": "On natedev, in the demo pane, type: Go: run the refused command",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "demo: 1 command refused",
           "rule": "what-happened-why-what-you-do"
         },
         {
-          "quote": "Allow rule: auto mode lets this command run from then on.",
+          "quote": "Go: run the refused command",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
-      "time": "2026-11-06T06:23:26.488387-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 07:37 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2164e19306982a2a955b8a59521d7c0330fcaec96da59078e00781e360479203",
+      "time": "2026-11-24T10:44:42.577252-05:00"
     },
     "one_with_rule": {
       "objections": [
         {
-          "quote": "build-followups: messaging command refused",
+          "quote": "messaging: 1 command refused; its work waits",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Go: the session runs this command now, and auto mode can refuse this command again.",
-          "rule": "every-choice-says-what-it-does"
+          "quote": "the refused command",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Go: run the refused command",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "On natedev, in the messaging pane, type: Go: run the refused command",
+          "rule": "first-150-stand-alone"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
-      "time": "2026-11-06T06:23:15.528138-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 07:37 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2164e19306982a2a955b8a59521d7c0330fcaec96da59078e00781e360479203",
+      "time": "2026-11-24T10:44:34.809793-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style: modules commands refused",
+          "quote": "modules: 2 commands refused; its build waits",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "implement.sh --to modules-impl",
+          "quote": "modules: 2 commands refused; its build waits",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Go: the session runs these commands now, and auto mode can refuse these commands again.",
+          "quote": "modules: 2 commands refused; its build waits",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Go: run the refused commands",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
-      "time": "2026-11-06T06:23:02.002895-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 07:37 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2164e19306982a2a955b8a59521d7c0330fcaec96da59078e00781e360479203",
+      "time": "2026-11-24T10:44:26.572994-05:00"
     }
   },
   "aws.snapshot_failed": {

@@ -434,20 +434,22 @@ class PushTextTests(unittest.TestCase):
     def test_auto_mode_refusal_says_what_happened_and_what_to_type(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
         self.assertEqual(entry.need, "decision")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "cargo-liner-style: modules commands refused")
-        # The first line says what auto mode refused and where (user, 2026-10-23); each command follows on its own line.
-        self.assertEqual(push.message.split("\n")[:5], [
-            "Session: modules", "Action: On natedev, in the modules pane, type: Go: run the refused commands",
-            "Auto mode refused 2 shell commands in the modules session. The modules build waits for them.",
-            "implement.sh --to modules-impl", "review.sh --to modules-test"])
-        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Go", "Allow rule"])
-        self.assertTrue(push.body.endswith("auto mode lets these commands run from then on."))
-        one = push_texts.render_entry(entry, entry.examples[1].values)
-        self.assertTrue(one.body.startswith("Auto mode refused a shell command in the messaging session."
-                                            + " The merge of the messaging work waits for it.\n"
-                                            + "git push origin build-followups-messaging\n"))
-        self.assertTrue(one.body.endswith(" The rule: Bash(git push:*)"))
+        typical, one_with_rule, no_waits = entry.examples
+        modules_message = "Session: modules\nAction: On natedev, in the modules pane, type: Go: run the refused commands"
+        for example, title, message in (
+            (typical, "modules: 2 commands refused; its build waits", modules_message),
+            (one_with_rule, "messaging: 1 command refused; its work waits",
+             "Session: messaging\nAction: On natedev, in the messaging pane, type: Go: run the refused command"),
+            (no_waits, "demo: 1 command refused",
+             "Session: demo\nAction: On natedev, in the demo pane, type: Go: run the refused command"),
+            (PushExample("long_waits", typical.values | {"waits": "its release waits"}),
+             "modules: 2 commands refused", modules_message),
+        ):
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertEqual(push.title, title)
+                self.assertEqual(push.message, message)
+                self.assertEqual(push.values, example.values)
 
     def test_paid_credits_keeps_the_user_approved_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")
