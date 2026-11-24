@@ -3152,9 +3152,6 @@ class ReviewLinksServerTests(unittest.TestCase):
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={showrunner.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        # The dialog sends Feedback as an Investigation.
-        kinds = [new_item_dialog.SubmissionKind(kind if kind != "feedback" else "investigation")
-                 for kind, _, _ in new_item_dialog.KINDS]
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
               capture_sender("send_message")):
@@ -3168,14 +3165,17 @@ class ReviewLinksServerTests(unittest.TestCase):
                     continue
                 proposal_names = [row["name"] for row in recipients if row["proposal"]]
                 self.assertCountEqual(proposal_names, [showrunner.name, producer.name])
-                for kind in kinds:
+                for chip, _, _ in new_item_dialog.KINDS:
+                    kind = (chip if chip == "enhancement" else
+                            new_item_dialog.SubmissionKind("investigation" if chip == "feedback" else chip))
                     for row in recipients:
                         if kind == new_item_dialog.SubmissionKind.PROPOSAL and row["name"] not in proposal_names:
                             continue
-                        with self.subTest(page=page, kind=kind, name=row["name"]):
-                            request = replace(case.submission_request(kind, staff.StaffId(str(row["id"]))), page=page,
-                                              page_recipient=new_item_dialog.PageRecipient.SELECTED,
-                                              request_id="r6-" + uuid4().hex)
+                        with self.subTest(page=page, kind=chip, name=row["name"]):
+                            request = new_item_dialog.NewItemRequest(
+                                "r6-" + uuid4().hex, kind, staff.StaffId(str(row["id"])),
+                                f"Check the {kind} record.", new_item_dialog.NoEvidence(), page=page,
+                                page_recipient=new_item_dialog.PageRecipient.SELECTED)
                             response = self.new_item_http(self.new_item_body(request), finished=True)
                             self.assertEqual(response.status, 200, response.body)
 
