@@ -9005,14 +9005,25 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.stop.assert_not_called()
 
     def test_worker_name_collision_between_units_has_no_detached_context(self) -> None:
-        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.agents import detached_run_process, detached_runs
 
         row = self.worker("w74", live=False)
         other_unit = fixture_member("unit", name="other-director", parent=self.owner.parent)
         other_worker = fixture_worker(row.name, other_unit.id)
-        with live_detached_run(self.run_dir, row):
+        record_path = self.run_dir / "detached_runs" / f"{row.name}.json"
+        pid = 90001
+        record: detached_runs.RunRecord = {
+            "worker": row.name, "staff_id": row.id, "run_id": row.name,
+            "log": str(record_path.with_suffix(".log")), "status": "running", "pid": pid,
+            "command": ["fixture-check"], "label": "private verification", "started_at": 1,
+            "session_dir": str(self.run_dir), "director_dir": str(self.run_dir), "done_message_file": "",
+        }
+        atomic_file.write_text_atomic(record_path, json.dumps(record))
+        supervisor = ["python3", "detached_runs.py", "supervise", str(record_path)]
+        with patch.object(detached_run_process, "process_args", return_value=supervisor) as process_args:
             self.assertIn(f"Detached run {row.name} remains live.", accounts.detached_move_context(str(row.id)))
             self.assertEqual(accounts.detached_move_context(row.name), "")
+        process_args.assert_called_once_with(pid)
         self.assertNotEqual(row.id, other_worker.id)
 
     def test_worker_name_collision_with_a_non_worker_has_no_detached_context(self) -> None:

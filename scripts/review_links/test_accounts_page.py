@@ -948,10 +948,14 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(orders["next-reverse"], [0, 1, 3, 2])
 
     def test_weekly_forecast_columns_use_recent_history_for_both_tools(self) -> None:
+        lookback = 50
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+
         def history(used: float, rate: float, age_minutes: int = 0) -> list[run_out.Reading]:
-            return [run_out.Reading(AT - timedelta(minutes=age_minutes + 10 * step),
-                                    used - rate * step / 6 - max(0, step - 6))
-                    for step in range(12, -1, -1)]
+            ages = (*range(age_minutes, lookback, 10), lookback, lookback + 10)
+            return [run_out.Reading(AT - timedelta(minutes=age),
+                                    used - rate * (age - age_minutes) / 60 - max(0, age - lookback) / 10)
+                    for age in reversed(ages)]
 
         rows = (
             status_row("claude1"),
@@ -1036,13 +1040,23 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
                 page, newer=newer_reply, place=place, holds=False,
                 start=draft + "document.querySelector('textarea').hidden=true;"), [[]])
         with self.subTest(hold="a color save that never answers"):
-            # The save closes the color dialog, so only the save holds the reload.
-            save = ("document.querySelector('[data-color-key=\"account.claude1\"]').click();"
-                    + "type(document.querySelector('#account-color-value'),'#123456');"
-                    + "document.querySelector('[data-color-picker] [data-color-save]').click();"
-                    + "check(!document.querySelector('[data-color-picker]').open,'the save closes the color dialog');")
+            save = """
+  const timeout=AbortSignal.timeout, saveDeadline=new AbortController();
+  AbortSignal.timeout=()=>saveDeadline.signal;
+  try{
+   document.querySelector('[data-color-key="account.claude1"]').click();
+   type(document.querySelector('#account-color-value'),'#123456');
+   document.querySelector('[data-color-picker] [data-color-save]').click();
+  }finally{AbortSignal.timeout=timeout;}
+  check(!document.querySelector('[data-color-picker]').open,'the save closes the color dialog');
+"""
+            # Report failures before navigation clears the probe state.
+            release = """
+  if(failures.length) throw new Error('The save hold checks failed.');
+  saveDeadline.abort(new DOMException('The save timed out.','TimeoutError'));
+"""
             self.assertEqual(newer_script_reload_results(
-                page, newer=newer_reply, place=place, start=save, saves=True), [[]])
+                page, newer=newer_reply, place=place, start=save, saves=True, end=release), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:

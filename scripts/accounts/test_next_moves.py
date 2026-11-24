@@ -16,6 +16,7 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, test_refusal_watch as watch_tests
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.whoami import run_out, usage_store
 from scripts.whoami import quota_alert
 
@@ -563,14 +564,21 @@ class NextMovesTests(unittest.TestCase):
 
     def test_half_point_duration_uses_selected_accounts_recent_rate(self) -> None:
         path = self.home / "pace.jsonl"
+        lookback = 45
+        config = conf.path("accounts")
+        _ = write_config_fixture(config, f"rate.lookback_minutes={lookback}\n")
+        account_config = conf.read(config)
+        ages = range(lookback, -1, -15)
         for recent, expected in ((1.0, 30), (0.7, 43)):
             with self.subTest(recent=recent):
-                samples = [("claude1", age, 51 - recent * (60 - age) / 60) for age in range(60, -1, -10)]
-                samples += [("claude1", 120, 91), ("claude2", 60, 80), ("claude2", 0, 60)]
+                samples = [("claude1", age, 51 - recent * (lookback - age) / 60) for age in ages]
+                samples += [("claude2", age, 80 - (lookback - age) / 3) for age in ages]
+                samples.append(("claude1", lookback + 15, 91))
                 _ = path.write_text("\n".join(json.dumps({"account": label,
                     "at": (NOW - timedelta(minutes=age)).isoformat(), "remaining": left})
                     for label, age, left in samples))
-                resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW)
+                resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW,
+                                                   account_config=account_config)
                 self.assertEqual(resolved.minutes, expected)
                 assert isinstance(resolved.source, next_moves.PaceEstimate)
                 self.assertAlmostEqual(resolved.source.points_per_hour, recent)
