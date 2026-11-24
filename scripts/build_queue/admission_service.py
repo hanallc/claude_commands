@@ -175,7 +175,8 @@ def scaler_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], bo
 
 
 class GuestSettlementProvider(Protocol):
-    def settlement(self, episode: str, attempt: int) -> placement.Settled | placement.Pending: ...
+    def settlement(self, episode: str, attempt: int, *,
+                   legacy_holder_ended: bool = False) -> placement.Settled | placement.Pending: ...
 
 
 def mac_linux_provider() -> GuestSettlementProvider:
@@ -184,26 +185,17 @@ def mac_linux_provider() -> GuestSettlementProvider:
 
 
 def guest_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], bool],
-                     legacy: placement.LegacyGuestClaim | placement.RecordedGuestRecoveryOnly =
-                     placement.RECORDED_GUEST_RECOVERY_ONLY) -> placement.DispatchPathState:
+                     legacy_holder_ended: bool = False) -> placement.DispatchPathState:
     try:
         provider = mac_linux_provider()
-        result = provider.settlement(episode, attempt)
+        result = provider.settlement(episode, attempt, legacy_holder_ended=legacy_holder_ended)
     except AttributeError:
         return placement.DispatchPathPending("Mac Linux settlement is unavailable")
     if isinstance(result, placement.Pending):
-        reconcile = cast(GuestReconcile | None, getattr(provider, "reconcile_unproven", None))
+        reconcile = cast(Callable[[str, int], None] | None, getattr(provider, "reconcile_unproven", None))
         if reconcile is not None and holds_slot():
-            if isinstance(legacy, placement.LegacyGuestClaim):
-                reconcile(episode, attempt, legacy=legacy)
-            else:
-                reconcile(episode, attempt)
+            reconcile(episode, attempt)
     return placement.DispatchPathSettled() if isinstance(result, placement.Settled) else placement.DispatchPathPending(result.reason)
-
-
-class GuestReconcile(Protocol):
-    def __call__(self, episode: str, attempt: int, *,
-                 legacy: placement.LegacyGuestClaim | placement.RecordedGuestRecoveryOnly = ...) -> None: ...
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -5284,7 +5276,7 @@ done
         episode = assignment.episode
         attempt_key = execution_identity.attempt_key(episode, assignment.attempt)
 
-        def read_dispatch(_key: placement.HostEvidenceKey) -> placement.DispatchPathState:
+        def read_dispatch() -> placement.DispatchPathState:
             return scaler_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
                 holds_slot=lambda: not self.closed and self.current_assignments.get(episode) == attempt_key)
 
@@ -5304,18 +5296,15 @@ done
         episode = assignment.episode
         attempt_key = execution_identity.attempt_key(episode, assignment.attempt)
 
-        def read_dispatch(key: placement.HostEvidenceKey) -> placement.DispatchPathState:
-            holder, claim, generation = saved.holder, saved.provider, saved.assigned_settings_generation
-            legacy = (placement.LegacyGuestClaim(claim.claim_id, holder)
-                      if isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host
-                      and isinstance(claim, placement.ProviderClaimReference) and not saved.guest_execution_observed
-                      and isinstance(generation, placement.AssignedSettingsGeneration)
-                      and generation.digest == key.configuration_generation
-                      and not owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time)
-                      and generation.digest == _provider_configuration().generation(assignment.destination.target, key.settings)
-                      else placement.RECORDED_GUEST_RECOVERY_ONLY)
+        def read_dispatch() -> placement.DispatchPathState:
+            holder = saved.holder
+            legacy_holder_ended = isinstance(holder, placement.ClaimHolderIdentity) and all(
+                identity.host == self.host
+                and not owner_may_be_live(self.proc.owner_start(identity.pid), identity.start_time)
+                for identity in (holder, assignment.owner))
             return guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
-                holds_slot=lambda: not self.closed and self.current_assignments.get(episode) == attempt_key, legacy=legacy)
+                holds_slot=lambda: not self.closed and self.current_assignments.get(episode) == attempt_key,
+                legacy_holder_ended=legacy_holder_ended)
 
         if self._dispatch_settlement_pending(saved, read_dispatch):
             return
@@ -5325,7 +5314,7 @@ done
         self._close_for_report(replace(saved, terminal_report=terminal), terminal, persist_change=False)
 
     def _dispatch_settlement_pending(self, saved: records.SavedPlacementAssignment,
-                                     read: Callable[[placement.HostEvidenceKey], placement.DispatchPathState]) -> bool:
+                                     read: Callable[[], placement.DispatchPathState]) -> bool:
         assignment = saved.assignment
         submitted = self.placement_requests.get(assignment.episode)
         if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
@@ -5336,7 +5325,7 @@ done
         self.host_requests[key] = submitted
         self.placement_host_keys[(submitted.episode, assignment.destination)] = key
         reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-        return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, lambda: read(key)))
+        return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read))
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport, *,
                           persist_change: bool = True) -> None:
