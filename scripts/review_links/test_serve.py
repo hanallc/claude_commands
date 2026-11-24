@@ -56,7 +56,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -900,6 +900,46 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(the_list.records(recipient.id, include_closed=True), [])
                     self.assertNotIn("list_key", saved)
                     send.assert_called_once_with(f"session:{recipient.current_session}", change_page.SENDER, ANY)
+
+    def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
+        words = "The frame time graph has a gap."
+        self.check_new_item_list_filing("bug", review_items.ReviewType.BUG, words, words)
+
+    def test_enhancement_command_files_and_prefixes_the_list_title_at_the_word_limit(self) -> None:
+        first_line = "Show the next check in the row."
+        words = first_line + "\n" + "x" * (new_item_dialog.MAX_WORDS_LENGTH - len(first_line) - 1)
+        self.check_new_item_list_filing("enhancement", review_items.ReviewType.INVESTIGATION,
+                                        words, f"Enhancement: {words}")
+
+    def check_new_item_list_filing(self, kind: str, review_type: review_items.ReviewType, words: str,
+                                   filed_words: str) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        unit = case.fixture.unit
+        morty = fixture_member("producer", name="morty")
+        producer = fixture_member("producer", name="bob")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        _ = conf.path("producer_map").write_text(f"{owner.id} = {producer.id}\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        output, errors = StringIO(), StringIO()
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
+              patch("platform.system", return_value="Linux"),
+              capture_sender("send_message"), redirect_stdout(output), redirect_stderr(errors)):
+            code = new_item.main([kind, unit.name, words, "--session", "another-session"])
+            self.assertTrue(self.new_item_posts.wait_until_none_run())
+        self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
+        self.assertNotIn("new_item:", errors.getvalue())
+        key, = [key for key, record in cache.get().records.items() if record.type == review_type]
+        item, = the_list.records(morty.id, include_closed=True)
+        title = filed_words.splitlines()[0]
+        self.assertEqual((cache.get().records[key].title, cache.get().records[key].owner), (title, owner.id))
+        self.assertEqual((item.title, item.owner, item.producer, item.unit, item.reviews),
+                         (title, owner.id, producer.id, unit.name, (key,)))
+        self.assertEqual(item.latest_status, filed_words)
+        self.assertEqual(output.getvalue(), f"{kind.capitalize()} \u2192 {unit.name}, a unit of {owner.name}. "
+                         + f"Producer: bob (from {owner.name}). List item {item.number}.\n")
 
     def test_list_draft_retries_after_failed_delivery_setup(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -3864,7 +3904,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
         with (patch.object(self.server, 'review_cache', cache),
               patch.object(self.server, 'delivery_status', case.status),
               capture_sender('send_to_staff') as send):
@@ -3878,7 +3919,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             path = review_items.source_path(waiting)
             initial = review_items.submission_origin(waiting)
             assert isinstance(initial, new_item_dialog.ReviewSubmission)
-            reply_key = new_item_dialog.submission_key(request.kind, owner.id, sent['id'], request.request_id)
+            reply_key = new_item_dialog.submission_key(kind, owner.id, sent['id'], request.request_id)
             self.assertTrue(change_page.answer_item(reply_key, 'Use the wide layout.', initial.reply_token, case.status))
             response, _ = cache.publish_record(cache.get(), key)
             self.assertEqual(response.records[key].type, review_items.ReviewType.RESPONSE)
