@@ -1836,7 +1836,7 @@ def apply_claim_activity(
         release.pid, release.target = current["pid"], paths.target
         release.claim_id = current["claim_id"]
         release.episode, release.attempt = current["episode"], current["attempt"]
-        if command_release(release, paths) != 0:
+        if command_release(release, paths, watched_idle=True) != 0:
             return True
     released_at = local_time(timestamp(now), include_zone=False)
     quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
@@ -2689,6 +2689,10 @@ def release_exact_claims(
                     return ClaimReleaseRefused(f"the cleanup lease is unavailable: {error}")
             pending = claim_state.claim_pending_start(paths, path, record)
             fence_pending = pending.exists()
+            origin = record.get("mac_watch_origin")
+            check_mac_identity = paths.platform == "macos" and fence_pending and watched_idle and watched_claim is None
+            if check_mac_identity and origin is None:
+                return ClaimReleaseRefused("the saved Mac identity is unavailable")
             count_legacy = (paths.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository)
                             and isinstance(remote_work, EndStoppedWork))
             if "remote_host" in record and (fence_pending or count_legacy or watched_claim is not None):
@@ -2709,10 +2713,9 @@ def release_exact_claims(
                                if fence is not None else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
                 else:
                     command = ""
-                origin = record.get("mac_watch_origin")
                 if watched_claim is not None:
                     if origin is None or not isinstance(saved, claim_state.MacMirrorIdentity):
-                        return ClaimReleaseRefused("the saved Mac or mirror is unavailable", idle_only=True)
+                        return ClaimReleaseRefused("the saved Mac or mirror is unavailable", idle_only=not fence_pending)
                     machine_id = origin["machine_id"]
                     root = MacMirrorRoot(origin["mirror_root"])
                     fence = offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
@@ -2723,10 +2726,15 @@ def release_exact_claims(
                 elif fence_pending:
                     command += offload.start_fence_command(identity, paths.target, settle=True, scope_key=scope_key,
                                                          report_holders=paths.platform == "macos") + "\n"
+                    if check_mac_identity and origin is not None:
+                        timeout = (release_deadline.remaining() if isinstance(release_deadline, offload.ClaimReleaseDeadline)
+                                   else connection.leftover_timeout_s)
+                        command = offload.mac_fence_identity_command(origin["machine_id"], timeout) + command
                 if watched_claim is None and isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
-                                                  release_deadline=release_deadline)
+                                                  release_deadline=release_deadline,
+                                                  discard_failed_output=watched_claim is not None or check_mac_identity)
                 if watched_claim is not None and origin is not None:
                     machine_id = origin["machine_id"]
                     key = claim_state.pending_start_key(identity)
@@ -2735,10 +2743,10 @@ def release_exact_claims(
                     if len(lines) == 1 and lines[0].startswith(identity_reply):
                         reported_id = lines[0].removeprefix(identity_reply)
                         if not reported_id:
-                            return ClaimReleaseRefused("the Mac identity is unavailable", idle_only=True)
+                            return ClaimReleaseRefused("the Mac identity is unavailable", idle_only=not fence_pending)
                         actual = claim_state.mac_machine_id(reported_id)
                         if actual is not None and actual != machine_id:
-                            return ClaimReleaseRefused("the Mac identity changed", idle_only=True)
+                            return ClaimReleaseRefused("the Mac identity changed", idle_only=not fence_pending)
                     prefix = [identity_reply + machine_id, "leftovers=0", "rc=0"]
                     fence_missing = (isinstance(observed.result, offload.LeftoversEnded)
                                      and lines == [*prefix, f"dispatch_start_missing={key}"])
@@ -2752,6 +2760,10 @@ def release_exact_claims(
                     reason = offload.start_fence_reason(identity, observed.output)
                     if reason is not None:
                         return ClaimReleaseRefused(reason)
+                    if check_mac_identity and origin is not None:
+                        expected = "dispatch_mac_id=" + origin["machine_id"] + "\n"
+                        if not observed.output.startswith(expected):
+                            return ClaimReleaseRefused("the Mac identity check gave no matching answer")
                 if not isinstance(observed.result, offload.LeftoversEnded):
                     return ClaimReleaseRefused("the remote work of the claim has not ended")
             with nullcontext() if provider_lock_held else locked(paths.lock):
@@ -2761,7 +2773,7 @@ def release_exact_claims(
                 current = read_run(path)
                 if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
-                if watched_claim is not None and not same_cleanup_claim(current, watched_claim.record):
+                if (watched_claim is not None or check_mac_identity) and not same_cleanup_claim(current, record):
                     return ClaimReleaseRefused("the exact claim changed during cleanup")
                 try:
                     retired.update(claim_state.retire_replaced_reservation(paths, path, current))
@@ -2786,7 +2798,7 @@ def print_claim_release(released: ClaimsReleased) -> None:
 
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False,
-                    finish_wait: bool = False) -> int:
+                    finish_wait: bool = False, watched_idle: bool = False) -> int:
     from scripts.mac_test import offload
 
     deadline = args.deadline_monotonic
@@ -2796,7 +2808,7 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
                         else conf.UseConfiguredValue.CURRENT)
     released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
                                     args.settings, provider_lock_held=provider_lock_held, finish_wait=finish_wait,
-                                    release_deadline=release_deadline)
+                                    release_deadline=release_deadline, watched_idle=watched_idle)
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12

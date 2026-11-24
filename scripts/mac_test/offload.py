@@ -567,6 +567,20 @@ def mac_machine_id(timeout):
 '''
 
 
+MAC_FENCE_IDENTITY_PROGRAM = MAC_MACHINE_ID_PROGRAM + '''import sys
+
+machine_id = mac_machine_id(float(sys.argv[2]))
+print("dispatch_mac_id=" + machine_id, flush=True)
+if not machine_id or machine_id != sys.argv[1]:
+    sys.exit("the Mac identity did not match the saved identity")
+'''
+
+
+def mac_fence_identity_command(machine_id: str, timeout: float) -> str:
+    """Require the saved Mac before the SSH session can access a fence."""
+    return shlex.join(["python3", "-c", MAC_FENCE_IDENTITY_PROGRAM, machine_id, str(timeout)]) + " || exit 1\n"
+
+
 FENCE_HOLDER_PROGRAM = '''import os, subprocess
 
 def fence_holders(path, timeout=None):
@@ -2850,6 +2864,7 @@ class LeftoverObservation:
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
                    target: str, *,
                    release_deadline: ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                   discard_failed_output: bool = False,
                    ) -> LeftoverObservation:
     """End and count one mirror's work without exposing the check to a second signal."""
     timeout = (release_deadline.remaining() if isinstance(release_deadline, ClaimReleaseDeadline)
@@ -2875,11 +2890,12 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
     if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
+        output = "" if discard_failed_output else result.stdout
         if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
             from scripts.mac_test import linux_runner
             if result.returncode == linux_runner.SLOT_PROCESSES_UNRESOLVED:
-                return LeftoverObservation(LeftoversRemain(UnresolvedLeftoverCount()), result.stdout)
-        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}"), result.stdout)
+                return LeftoverObservation(LeftoversRemain(UnresolvedLeftoverCount()), output)
+        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}"), output)
     answer = parse_leftover_check(result.stdout)
     if isinstance(answer, LeftoverCheckFailed):
         reason = " ".join(result.stderr.split())

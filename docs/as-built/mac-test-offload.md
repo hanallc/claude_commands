@@ -183,10 +183,12 @@ It releases the lock when no live claim remains.
   When the count is zero, the release path removes the fence and releases the claim.
   Work in another repository does not delay this release.
   The SSH call, the read-only check, and the held-fence diagnostic use `leftover_timeout_s`.
-- A claim without a saved root or identity uses the Mac idle rule.
-  An identity mismatch also uses the idle rule.
-  A complete zero count with a missing fence uses the idle rule.
+- When no start marker is pending, a missing or different identity can use the Mac idle rule.
+  A complete zero count with a matching identity and a missing fence also uses the idle rule.
   A held fence, a nonzero count, or a failed or partial check keeps the claim.
+- When a start marker is pending, the watcher requires a matching saved Mac UUID before release.
+  A missing or different UUID keeps the claim and the marker.
+  The watcher uses output only when SSH exits with status zero.
 - `MacActive` clears `idle_since`. The first `MacIdle` records `idle_since`.
   The idle rule permits release after `claim_idle_minutes` (15) minutes with no Mac activity.
   A failed activity check keeps the claim.
@@ -505,6 +507,9 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   Cleanup sends TERM, then KILL, then counts again.
   The cleanup SSH call uses `leftover_timeout_s` from `OffloadConfig`.
   The runner closes descriptor 8 and settles the fence in the command's SSH session.
+  The claim watcher checks the saved UUID in the SSH session that opens the fence.
+  After a failed, timed-out, or incomplete probe, the active call attempts to settle the exact fence over SSH.
+  The active call releases the claim if SSH confirms settlement. This path does not require a saved UUID.
   Each routed Mac command uses that limit from the time it receives the verdict.
   A separate cleanup stream starts the limit before it starts SSH.
   It returns `LeftoversEnded`, `LeftoversRemain`, or `LeftoverCheckFailed`.
