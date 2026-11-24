@@ -46,6 +46,7 @@ import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from functools import partial
 from io import StringIO
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -60,7 +61,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, git_files, unit_runs, build_folders
+from scripts.lib import process_group, process_start, conf, berth_board, git_files, git_merge_tree, unit_runs, build_folders
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
@@ -1199,37 +1200,6 @@ def retirement_rebase(unit: RetiringUnit, *, settings: conf.ConfigRead) -> Path 
     return None
 
 
-def _merge_leaves_target_tree_unchanged(unit: RetiringUnit, ref: str, merge_ref: str,
-                                        *, settings: conf.ConfigRead) -> bool:
-    """Check that a merge of the branch leaves the merge tree unchanged."""
-    branch = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", settings=settings)
-    if branch.returncode:
-        raise OSError(f"cannot resolve commit {ref}: {retirement_failure(branch)}")
-    target = retirement_git(unit, "rev-parse", "--verify", "--quiet", f"{merge_ref}^{{commit}}", settings=settings)
-    if target.returncode:
-        raise OSError(f"cannot resolve commit {merge_ref}: {retirement_failure(target)}")
-    drivers = retirement_git(unit, "config", "--get-regexp", r"^merge\..+\.driver$", settings=settings)
-    if drivers.returncode == 0:
-        return False
-    if drivers.returncode != 1:
-        raise OSError(retirement_failure(drivers))
-
-    target_commit = target.stdout.strip()
-    merged = retirement_git(unit, "merge-tree", "--write-tree", target_commit, branch.stdout.strip(), settings=settings)
-    merged_tree = merged.stdout.partition("\n")[0]
-    if merged.returncode:
-        if merged.returncode == 1 and merged_tree:
-            conflict_tree = retirement_git(unit, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                                           f"{merged_tree}^{{tree}}", settings=settings)
-            if conflict_tree.returncode == 0 and conflict_tree.stdout.strip() == merged_tree:
-                return False
-        raise OSError(retirement_failure(merged))
-    current = retirement_git(unit, "rev-parse", f"{target_commit}^{{tree}}", settings=settings)
-    if current.returncode:
-        raise OSError(retirement_failure(current))
-    return bool(merged_tree) and merged_tree == current.stdout.strip()
-
-
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and branch content missing from the merge branch."""
     present = unit.worktree.is_dir()
@@ -1253,11 +1223,13 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     # The fetched origin commit comes last when origin has the branch.
     merge_target = merge_refs[-1]
+    run_git = partial(retirement_git, unit, settings=settings)
     for ref in refs:
-        commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
+        commits = run_git("rev-list", "--no-merges", ref, "--not", *merge_refs)
         if commits.returncode:
             raise OSError(retirement_failure(commits))
-        if commits.stdout.strip() and not _merge_leaves_target_tree_unchanged(unit, ref, merge_target, settings=settings):
+        if commits.stdout.strip() and not git_merge_tree.leaves_target_unchanged(
+                run_git, ref, merge_target, failure=retirement_failure):
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
     return found

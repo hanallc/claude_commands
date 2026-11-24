@@ -18,7 +18,7 @@ from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, investigation, proposal_issue, staff, update_registration
 from scripts.production.production_doc import Production
 from scripts.review_links import change_page, decision_store, efficiency_reviews, new_item_dialog, review_items, review_later, review_submissions
-from scripts.review_links import question_record, reply_tokens
+from scripts.review_links import question_path, question_record, reply_tokens
 from scripts.review_links.review_events import KeepMark, MarkChange, NoMark, ReviewMark
 
 PY = '~/.claude/scripts/lib/py ~/.claude/scripts/'
@@ -212,9 +212,12 @@ def later(item: review_items.ReviewItem, value: str, words: str, *,
     if isinstance(item.source, review_items.ChangeSource) and isinstance(
             item.source.assignment.production, change_routing.UnavailableProduction):
         raise question_record.AnswerRefused("the production document is not available")
-    until = datetime.fromisoformat(value)
-    until = until.replace(tzinfo=user_zone()) if until.tzinfo is None else until.astimezone(user_zone())
-    event = 'Later until '+until.isoformat()+(': '+words if words else '')
+    zone = user_zone()
+    selected = question_path.read_later(value, lambda time: time.replace(tzinfo=zone))
+    if isinstance(selected, question_path.UntilDelivered):
+        raise question_record.AnswerRefused('Review Later requires a time.')
+    until = selected.astimezone(zone)
+    event = 'Later until '+question_path.write_later(until)+(': '+words if words else '')
 
     def record_later(publish_deadline: Callable[[], None]) -> None:
         def check_and_publish() -> None:
