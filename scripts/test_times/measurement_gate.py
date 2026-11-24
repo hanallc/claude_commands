@@ -8,7 +8,7 @@ import sys
 
 from scripts.build_queue.queue_place import HeldReservation, QueuePlace
 from scripts.lib import conf
-from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD, startup_pythonpath
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import SuiteMode
@@ -40,10 +40,6 @@ def measurement_child(place: QueuePlace | None, environment: dict[str, str], fds
     admitted = {**environment, "BUILDLOG_CALLER": SuiteMode.GATE.value}
     if place is not None:
         admitted = place.child_environment(admitted)
-    child = gate._gate_job_environment(admitted, fds)  # pyright: ignore[reportPrivateUsage]
-    if sys.platform == "linux":
-        source = gate._gate_program_source().fileno()  # pyright: ignore[reportPrivateUsage]
-        child[GATE_PARENT_SOURCE_FD] = str(source)
-        fds = (*fds, source)
+    child, fds = gate.gate_child_environment(admitted, fds)
     child["PYTHONPATH"] = startup_pythonpath(child.get("PYTHONPATH", ""))
     return child, fds

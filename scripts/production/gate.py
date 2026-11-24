@@ -1141,9 +1141,14 @@ def _gate_program_source() -> BinaryIO:
 _GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE")
 
 
-def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
-    """Remove the gate placement, and filter descriptor variables with names that end in _FD or _FDS, or contain _FD_."""
-    passed_leases = {str(lease) for lease in leases}
+def gate_child_environment(environment: Mapping[str, str], descriptors: tuple[int, ...], *,
+                           kind: GateJobKind = GateJobKind.TEST_MODULE) -> tuple[dict[str, str], tuple[int, ...]]:
+    """Return the child environment and its descriptors.
+
+    Remove the gate placement and filter descriptor variables against the passed descriptors.
+    Add the gate source descriptor for a Linux test module.
+    """
+    passed_leases = {str(descriptor) for descriptor in descriptors}
     job_environment: dict[str, str] = {}
     for name, value in environment.items():
         if name in ("LISTEN_FDS", GATE_PARENT_SOURCE_FD, *_GATE_PLACEMENT_VARIABLES):
@@ -1156,7 +1161,11 @@ def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...
             continue
         job_environment[name] = value
     job_environment["GATE_PARENT_PID"] = str(os.getpid())
-    return job_environment
+    if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
+        source = _gate_program_source().fileno()
+        job_environment[GATE_PARENT_SOURCE_FD] = str(source)
+        descriptors = (*descriptors, source)
+    return job_environment, descriptors
 
 
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
@@ -1168,12 +1177,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
-            descriptors = copies.COMMAND_LOCKS.get()
-            job_environment = _gate_job_environment(environment, descriptors)
-            if sys.platform == "linux" and kind is GateJobKind.TEST_MODULE:
-                descriptor = _gate_program_source().fileno()
-                job_environment[GATE_PARENT_SOURCE_FD] = str(descriptor)
-                descriptors = (*descriptors, descriptor)
+            job_environment, descriptors = gate_child_environment(environment, copies.COMMAND_LOCKS.get(), kind=kind)
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env=job_environment,
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
