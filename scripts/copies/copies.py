@@ -1445,11 +1445,27 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             COMMAND_LOCKS.reset(token)
 
 
+@dataclass(frozen=True)
+class AdmittedCommandCopy:
+    """The caller holds the copy and its first-step admission."""
+
+    tree: Path
+    admission: first_step.FirstStepAdmission
+
+
+@dataclass(frozen=True)
+class DirectCommandCopy:
+    """The caller holds the copy and starts the command directly."""
+
+    tree: Path
+
 
 @contextmanager
-def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
-    """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
+def _command_copy(
+    owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+    merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (),
+) -> Generator[AdmittedCommandCopy | DirectCommandCopy]:
+    """Hold the copy and any first-step admission through the caller scope."""
     job = command_job(command)
     label = step or (job.step if isinstance(job, StepJob) else "")
     try:
@@ -1465,14 +1481,22 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                 admitted = scope.enter_context(admission)
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command))
                 admitted.handoff(tree)
+                yield AdmittedCommandCopy(tree, admitted)
             else:
-                # OtherCommand has no first queue step to admit.
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
-            yield tree
+                yield DirectCommandCopy(tree)
     except first_step.FirstStepRefused as error:
         failure = CopyError(str(error))
         failure.exit_code = error.exit_code
         raise failure from error
+
+
+@contextmanager
+def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
+    """Admit a queue command before preparing its slot and hold the slot through the caller scope."""
+    with _command_copy(owner, repo, policy, command, merge=merge, step=step, gate_targets=gate_targets) as prepared:
+        yield prepared.tree
 
 
 def list_trees() -> None:
@@ -2590,7 +2614,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         captured = ""
         if isinstance(verification, VerifyCommand):
             tree = scope.enter_context(requested_source(source, policy, merge))
-            environment = {**os.environ, "COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
+            prepared = DirectCommandCopy(tree)
+            environment = {"COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
                            "COPIES_STEP_REPOSITORY": str(source),
                            "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(os.getpid()), "UNIT_DETACHED_RUN": "1"}
             target = tree / "target"
@@ -2605,15 +2630,23 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
             targets = first_step.gate_targets(command, source, args.targets)
-            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge, gate_targets=targets))
-            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
+            prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
+                                                         gate_targets=targets))
+            tree = prepared.tree
+            environment = {"PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
                            "BUILDLOG_PREPARED_COPY": str(tree)}
             target = tree / "target"
             locks = COMMAND_LOCKS.get()
         arguments = [part.replace("{tree}", str(tree)) for part in command]
         environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
         before = publication_candidates(tree, target, arguments, args.publish)
-        result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env=environment)
+        if isinstance(prepared, AdmittedCommandCopy):
+            result = prepared.admission.run_gate(lambda: subprocess.run(
+                arguments, cwd=tree, pass_fds=locks, env={**os.environ, **environment}, text=True))
+            if result.stderr:
+                _ = sys.stderr.write(result.stderr)
+        else:
+            result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env={**os.environ, **environment})
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         selection = PublicationSelection.CHANGED
         if command_exit == 0 and not isinstance(verification, VerifyCommand):

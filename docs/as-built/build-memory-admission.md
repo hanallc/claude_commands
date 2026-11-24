@@ -387,7 +387,7 @@ Not in this repo; listed because the code here reads it.
 | Piece | Setting |
 | --- | --- |
 | `builds.slice` (user slice, `modules/linux/development.nix`) | `MemoryMax=44G`, no `MemoryHigh`, `MemorySwapMax=4G`, `CPUWeight=20` against `app.slice`'s 100, so the sessions and their panes get the CPU first. CI's `hana.slice` sits at 5 against `user.slice`'s 100 (`modules/linux/hana-runners.nix`). Holds every recorded step's scope (`run-*.scope`), the `sccache.service` user service, and the `buildlog` unit (nightly Rust trial, `OOMScoreAdjust=200`). |
-| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. A direct cargo call takes the hold check and enters a new scope in the run's own slice. A cargo call in a queued step starts at once. Its memory counts once as build memory through the step's reservation. |
+| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. A direct cargo call takes the hold check and enters a new scope in the run's own slice. A cargo call in a queued step or a queued program starts at once. Its memory counts once as build memory through the step's reservation. |
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. `OOMScoreAdjust=500`, so its compiles rank with the build steps. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
@@ -1177,6 +1177,14 @@ Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
 `finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
+A place that holds a reservation gives `--scope-start` the word `--reserved` (`program_start.ScopeReservation.HELD`).
+For such a place, the scoped wrapper exports `BUILDLOG_STEP_SCOPE`, the published scope folder, before program execution.
+A cargo call of the program then starts at once in that scope, also under `builds-detached.slice`.
+`memory_admit` charges the compilers that sccache runs for the program to the program's reservation.
+An `UnreservedProgram` place, such as the rust-analyzer editor server, exports no value.
+No reservation pays for its scope, so its flycheck compilers stay in the global sccache figure.
+`test_queue_place.test_transient_scope_sidecar_and_sampler_use_the_program_scope` proves the exported value.
+`test_queue_place.test_editor_server_starts_while_builds_wait` proves that the editor server gets no value.
 `QueuePlace.popen` installs no signal handler.
 It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
 It then restores the caller's previous signal mask.
@@ -1281,8 +1289,11 @@ Non-building commands such as `metadata`, `fmt` and `tree` run immediately in Ba
 `test_cargo_wrapper.test_non_building_commands_start_with_no_python_and_no_queue_request` proves this.
 A call already in `builds.slice` runs at once, unless it runs under `builds-detached.slice`.
 Such a call comes from a queued step or an editor scope, so it has no second queue place.
-A queued step of a detached run also runs its calls at once.
-The wrapper finds such a step when its cgroup folder equals `BUILDLOG_STEP_SCOPE`, which the step scope exports.
+A queued step or a reserved `queue_place` program of a detached run also runs its calls at once.
+The wrapper finds such a scope when its cgroup folder equals `BUILDLOG_STEP_SCOPE`.
+Each step scope of `invoke.sh` and each reserved program scope of `queue_place` exports this variable.
+A stale value from another scope does not start cargo at once and does not skip the folder step.
+`cargo_folder.folder_step_due` uses the same rule.
 Any other call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
 These building calls check `hold_applies.py` when the hold directory has an entry.
 An applicable hold refuses the command.
@@ -1573,8 +1584,9 @@ So a damaged record of a killed gate does not make the hold claims unreadable fo
 Without a state file, the reader keeps the original row.
 The open state file supplies the UTC update time from its modification time.
 An unknown state word returns `UnreadableRecord` through the existing validation path.
-`on_mac` selects `mac`, `on_natedev` selects `natedev`, and `on_ssh` selects its supplied target.
-Other state words clear the selected target.
+`on_mac` selects `mac`, and `on_natedev` selects `natedev`.
+`on_ssh` and `waiting_ssh` keep their supplied target.
+`verify.sh` supplies a target only with these two words, so other state words have no selected target.
 Readers continue to find records through `*.json` only.
 
 A tree-writing step publishes `writes_tree <state>` with an optional target for its whole lifetime.
@@ -2583,10 +2595,11 @@ The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
 
-`job_start` walks up the parent processes of the front to the `Runner.Worker` ancestor.
+`ci_job_start.job_start` walks up the parent processes of a CI cargo call to the `Runner.Worker` ancestor.
 The runner starts one `Runner.Worker` process for each job, so its start in `/proc/<pid>/stat` is the job start.
 `process_stat.name_and_fields` reads each process name and stat fields.
 A parent cycle in `/proc` ends the walk without a job start.
+A parent that started after the process below it has a reused pid, so the walk ends without a job start.
 Each building call reads its job start once, in CLOCK_BOOTTIME seconds.
 When `GITHUB_ACTIONS=true` and no `Runner.Worker` ancestor is readable, the call prints one `::warning::` line on stderr.
 
@@ -2597,6 +2610,11 @@ The front converts the job start once to the queue clock with `queue_job_start`.
 It reads the queue clock and CLOCK_BOOTTIME at the same moment and subtracts the boot age of the job start from the queue clock.
 `ServiceEstimateRequest.job_start` carries `JobStart(started_at)` or `NoJobStart`.
 An older client sends no field, and the service reads it as `NoJobStart`.
+For a request with a runner and `NoJobStart`, the service first uses the job start saved with the place of the same episode.
+Without one, it reads the job start itself with `ci_job_start.read_queue_job_start` on the request pid and its start time.
+The read needs a readable `Runner.Worker` ancestor, and a request pid with another start time gives no job start.
+So a CI step that waited from an older front gets its job start when it reconnects after a service reload.
+A later failed read keeps the saved job start.
 The service copies a `JobStart` into the waiting row as `ci_job_start` and into the saved `WaiterPlace`.
 The service sets `order_since` to the earliest of the step arrival, the run place, and the job start.
 So each step of one CI job ranks at the job start, ahead of steps that arrived after the job started.
