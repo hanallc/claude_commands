@@ -14,7 +14,7 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
-from scripts.review_links import setting_controls
+from scripts.review_links import send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
@@ -923,6 +923,156 @@ document.addEventListener('click',event=>{
 })();'''
 
 
+# The server holds a marked send for undo_seconds (send_hold.py).
+# heldFetch shows a fading Undo toast on the top page or in its open modal dialog.
+# Undo throws SendUndone. After the hold, heldFetch returns the response of the real send.
+# New item and linked Review callers close their dialogs before the hold and reopen them on Undo or failure.
+# The card and dialog scripts share one definition of heldFetch and SendUndone in each frame.
+HELD_SEND_STYLE = '''
+[data-send-undo-stack]{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;
+display:grid;gap:8px;margin:0;width:max-content;max-width:calc(100vw - 32px)}
+[data-send-undo]{position:relative;display:flex;align-items:center;gap:16px;padding:10px 10px 12px 16px;
+border:1px solid var(--border,#2d3748);border-radius:8px;background:var(--nav,#141b28);color:var(--text,#e4eaf4);
+box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden;min-width:0}
+[data-send-undo] span{min-width:0;overflow-wrap:anywhere}
+[data-send-undo] button{flex:none;padding:4px 10px;border:0;border-radius:4px;background:none;color:var(--accent,#c2d4ff);
+font:600 14px/20px system-ui,sans-serif;cursor:pointer}
+[data-send-undo] button:is(:hover,:focus-visible){background:#fff2}
+[data-send-undo-bar]{position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--accent,#c2d4ff);
+transform-origin:left}
+'''
+
+HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
+                    f'SEND_UNDO_STYLE={json.dumps(HELD_SEND_STYLE)};\n') + r'''class SendUndone extends Error{
+ constructor(){super('Undone. Edit and send again.');this.name='SendUndone';}
+}
+function sendUndoHost(){
+ try{ return window.top.document; }catch{ return document; }
+}
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function showSendUndo(hold,seconds,receiver){
+ const host=sendUndoHost(),view=host.defaultView || window;
+ if(!host.querySelector('style[data-send-undo-style]')){
+  const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
+  host.head.append(style);
+ }
+ let stack=host.querySelector('[data-send-undo-stack]');
+ if(!stack){
+  stack=host.createElement('div');stack.dataset.sendUndoStack='';stack.setAttribute('role','status');
+ }
+ // The stack moves to the top open modal dialog, or to the body, so no dialog hides it or makes it inert.
+ const rehome=()=>{
+  const place=host.activeElement?.closest('dialog:modal') ||
+   [...host.querySelectorAll('dialog:modal')].pop() || host.body;
+  if(stack.parentElement!==place) place.append(stack);
+ };
+ rehome();
+ const watch=new MutationObserver(rehome);
+ watch.observe(host.body,{subtree:true,childList:true,attributes:true,attributeFilter:['open']});
+ const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
+ const bar=host.createElement('div');
+ const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
+ toast.dataset.sendUndo='';text.textContent=receiver || receiver===null ? sent : 'Sending.';
+ button.type='button';button.textContent='Undo';
+ bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
+ // The Undo stays clear for the first half of the time, then fades out until the send leaves.
+ const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
+ const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
+ const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
+ return new Promise(resolve=>{
+  let done=false;
+  const remove=()=>{
+   toast.remove();watch.disconnect();view.removeEventListener('pagehide',closed);removeEventListener('pagehide',closed);
+   if(!stack.children.length) stack.remove();
+  };
+  const finish=undone=>{
+   if(done) return;
+   done=true;remove();resolve(undone);
+  };
+  const reportResult=async(response,late=false)=>{
+   const result=await response?.clone().json().catch(()=>null);
+   if(!late && !result?.send_failure){remove();return;}
+   const summary=response?.ok && result && !result.send_failure
+    ? (result.no_message ? 'Saved.' : sent)
+    : result?.send_failure || result?.reason || result?.error || 'The send result is unavailable.';
+   text.textContent=(late ? 'Too late to undo. ' : '')+summary;
+   fade.cancel();toast.style.display='';
+   pause(3000).then(remove);
+  };
+  // A closed console or card frame sends at once.
+  const closed=()=>{
+   if(done) return;
+   done=true;remove();
+   fetch(SEND_HOLD_PATH+'/'+hold+'/send',{method:'POST',keepalive:true}).catch(()=>{});
+   // A page that comes back from the browser cache reads the result.
+   resolve(false);
+  };
+  view.addEventListener('pagehide',closed);
+  // A card frame that goes away takes its toast with it, so it sends at once too.
+  if(view!==window) addEventListener('pagehide',closed);
+  fade.finished.then(()=>{
+   if(done) return;
+   done=true;
+   button.remove();bar.remove();toast.style.display='none';
+   resolve(reportResult);
+  },()=>{});
+  button.addEventListener('click',async()=>{
+   button.disabled=true;fade.pause();shrink.pause();
+   let answer=null;
+   for(let tries=0;tries<2 && !answer;tries++){
+    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
+   }
+   if(answer?.ok){finish(true);return;}
+   done=true;
+   button.remove();bar.remove();fade.cancel();
+   if(answer?.status===409){
+    text.textContent='Too late to undo. Checking the result…';
+    resolve(response=>reportResult(response,true));
+    return;
+   }
+   text.textContent='Undo failed. The send can still leave.';
+   resolve(false);
+   pause(3000).then(remove);
+  });
+ });
+}
+async function heldFetch(url,init={},receiver){
+ const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
+ const first=await fetch(url,{...init,headers});
+ if(first.headers.get('X-Send-Hold')!=='held') return first;
+ const {hold,seconds}=await first.json();
+ const undo=await showSendUndo(hold,seconds,receiver);
+ if(undo===true) throw new SendUndone();
+ // A server restart drops the connection; the held send waits in its file, so read its result again.
+ for(let failures=0;;){
+  try{
+   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
+   if(response.headers.get('X-Send-Hold')!=='pending'){
+    if(typeof undo==='function') await undo(response);
+    return response;
+   }
+  }catch(error){
+   if(++failures>=30){
+    if(typeof undo==='function') await undo();
+    throw error;
+   }
+   await pause(1000);
+  }
+ }
+}
+function sendActionReceiver(form,data){
+ const action=data.get('outcome');
+ const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
+ if(action==='approve' && data.get('assignee')){
+  const option=form.elements.assignee?.selectedOptions[0];
+  return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
+ }
+ return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+}
+window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
+})();
+'''
+
 CARD_SUBMIT_SCRIPT = r'''function cardSubmitBlocked(form,fading=false){
  return !form.isConnected || Boolean(form.dataset.sending) || fading;
 }
@@ -930,7 +1080,7 @@ function setCardSubmitting(form,submitting,controls=form){
  if(submitting) form.dataset.sending='true';else delete form.dataset.sending;
  controls.querySelectorAll('button').forEach(button=>button.disabled=submitting);
 }
-'''
+''' + HELD_SEND_SCRIPT
 
 
 @dataclass(frozen=True)

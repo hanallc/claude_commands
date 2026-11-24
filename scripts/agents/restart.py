@@ -26,7 +26,7 @@ from enum import Enum
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast, override
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, TypeVar, cast, override
 from importlib import import_module
 from uuid import uuid4
 
@@ -304,6 +304,7 @@ class FollowUp:
     unit: str = ""
     operator: bool = False
     director_check: bool = False
+    worker_inspection: bool = False
 
     def line(self) -> str:
         reason = " ".join(self.reason.split()).rstrip(".")
@@ -317,6 +318,7 @@ class FollowUpFields(TypedDict):
     unit: str
     operator: bool
     director_check: bool
+    worker_inspection: NotRequired[bool]
 
 
 class DetachedReport(TypedDict):
@@ -410,6 +412,7 @@ class BulkReport:
         issues: dict[str, FollowUpFields] = {key: {
             "name": issue.name, "reason": issue.reason, "step": issue.step,
             "unit": issue.unit, "operator": issue.operator, "director_check": issue.director_check,
+            "worker_inspection": issue.worker_inspection,
         } for key, issue in self.issues.items()}
         data: DetachedReport = {
             "retry": self.retry,
@@ -468,8 +471,10 @@ class BulkReport:
         if units:
             count = len(units)
             actions.append("1 unit needs a step." if count == 1 else f"{count} units need a step.")
-        if any(item.unit and not item.director_check for item in issues.values()):
+        if any(item.unit and not (item.director_check or item.worker_inspection) for item in issues.values()):
             actions.append("The affected directors run worker.py restore.")
+        if any(item.worker_inspection for item in issues.values()):
+            actions.append("The affected directors inspect the workers.")
         if any(item.director_check for item in issues.values()):
             actions.append("The affected directors check the continuation message.")
         inherited = self.inherited - self.not_started.keys()
@@ -484,7 +489,7 @@ class BulkReport:
         elif actions and not any(item.operator for item in issues.values()):
             actions.append("Nate has no step.")
         actions.extend(f"{item.name}: {item.step}" for item in sorted(
-            (item for key, item in issues.items() if key in inherited), key=lambda issue: issue.name))
+            (item for key, item in issues.items() if key in inherited and not item.worker_inspection), key=lambda issue: issue.name))
         if received is not None:
             lines.append(f"{self.command}: {received.name} stopped the run.")
         if actions or received is None:
@@ -651,6 +656,8 @@ class WorkerRestoreReports:
         return result.restored | (result.skipped.keys() - result.failures.keys())
 
     def report(self) -> None:
+        from scripts.production.worker import RestoreFailureAction
+
         owners: dict[staff.StaffId, staff.StaffRow] = {}
         scopes: dict[staff.StaffId, dict[staff.StaffId, RestoreReport]] = {}
         for scope, (owner, result) in self.attempts.items():
@@ -662,23 +669,29 @@ class WorkerRestoreReports:
             run_failures: dict[Path, str] = {}
             skipped: dict[staff.StaffId, str] = {}
             record_busy: set[staff.StaffId] = set()
+            failure_actions: dict[staff.StaffId, RestoreFailureAction] = {}
             for result in scopes[owner.id].values():
                 restored.update(result.restored)
                 failures.update(result.failures)
                 run_failures.update(result.run_failures)
                 skipped.update(result.skipped)
                 record_busy.update(result.record_busy)
+                failure_actions.update(result.failure_actions)
             if (bulk := _BULK_REPORT.get()) is not None:
                 for identity in restored:
                     _ = bulk.targets.setdefault(identity, str(identity))
                     bulk.finish(identity)
                 for identity, (name, reason) in failures.items():
                     bulk.targets[identity] = name
-                    bulk.issues[identity] = (
-                        FollowUp(f"{owner.name} / {name}", reason,
-                            _record_retry_step(replace(self.command, only=(identity,)).retry()), operator=True)
-                        if identity in record_busy else FollowUp(f"{owner.name} / {name}", reason,
-                            f"The director runs worker.py restore in {owner.name}.", owner.name))
+                    label = f"{owner.name} / {name}"
+                    if failure_actions.get(identity) is RestoreFailureAction.INSPECT_WORKER:
+                        bulk.issues[identity] = FollowUp(label, reason, "", owner.name, worker_inspection=True)
+                    elif identity in record_busy:
+                        step = _record_retry_step(replace(self.command, only=(identity,)).retry())
+                        bulk.issues[identity] = FollowUp(label, reason, step, operator=True)
+                    else:
+                        bulk.issues[identity] = FollowUp(label, reason,
+                            f"The director runs worker.py restore in {owner.name}.", owner.name)
                 for identity, reason in skipped.items():
                     if identity in bulk.targets and identity not in restored and identity not in failures:
                         bulk.issues[identity] = FollowUp(bulk.targets[identity], reason,
@@ -692,10 +705,12 @@ class WorkerRestoreReports:
             next_step = f"run worker.py restore in {owner.name}"
             for identity, (name, reason) in sorted(failures.items(), key=lambda item: item[1]):
                 status = "restored" if identity in restored else "not restored"
-                step = (_record_retry_step(replace(self.command, only=(identity,)).retry())
-                        if identity in record_busy else next_step)
-                print(f"restart anomaly: {owner.name}: worker {name} {status}: "
-                      + f"{' '.join(reason.splitlines())}; {step}", file=sys.stderr)
+                detail = " ".join(reason.splitlines())
+                if failure_actions.get(identity) is not RestoreFailureAction.INSPECT_WORKER:
+                    step = (_record_retry_step(replace(self.command, only=(identity,)).retry())
+                            if identity in record_busy else next_step)
+                    detail = f"{detail}; {step}"
+                print(f"restart anomaly: {owner.name}: worker {name} {status}: {detail}", file=sys.stderr)
             for run, reason in sorted(run_failures.items()):
                 print(f"restart anomaly: {owner.name}: cannot reap detached runs in {run}: "
                       + f"{' '.join(reason.splitlines())}; {next_step}", file=sys.stderr)
@@ -1075,6 +1090,8 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     else:
         reports.attempts[row.id] = parent, report
     if result != worker.ExitCode.OK:
+        if worker.RestoreFailureAction.INSPECT_WORKER in report.failure_actions.values():
+            raise WorkerRestoreIncomplete(worker.RestoreFailureAction.INSPECT_WORKER.value)
         raise WorkerRestoreIncomplete(f"run worker.py restore in {parent.name}")
     return started_panes.get(row.id, "")
 

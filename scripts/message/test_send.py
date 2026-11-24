@@ -1243,9 +1243,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.relayed: list[send.Message] = []
         self.outcome: send.Result = send.Result("sent", "ok")
         self.cases: list[rca.Report] = []
-        # What the fake push review gives; None approves the draft. Each review's draft and time limit.
+        # The fake review approves the draft when the test supplies no verdict.
         self.verdict: review.ReviewOutcome | None = None
-        self.reviews: list[tuple[review.Draft, float]] = []
+        self.reviews: list[tuple[review.Draft, float, str]] = []
 
     @override
     def setUp(self) -> None:
@@ -1263,7 +1263,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.
         _ = self.enterContext(mock.patch.object(rca, "open_case", self.open_case))
-        # No test runs the real push review (claude -p): an auto_mode.refused send reviews its waits sentence.
+        # Use a fake review for the waits clause.
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         for name, value in (("STATE", self.root), ("SESSIONS", self.root / "sessions"), ("relay", self.relay)):
             patcher = mock.patch.object(send, name, value)
@@ -2137,9 +2137,9 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.relayed.append(message)
         return self.outcome
 
-    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
+    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0, text_id: str = "") -> review.ReviewOutcome:
         del revision
-        self.reviews.append((draft, limit))
+        self.reviews.append((draft, limit, text_id))
         return self.verdict or review.Approved(draft)
 
     def send(self, *args: str) -> send.Result:
@@ -7125,30 +7125,31 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 *(item for key, value in values.items() for item in ("--value", f"{key}={value}")),
                 *(item for command in commands for item in ("--value", f"command={command}")), *extra]
 
-    def test_auto_mode_template_takes_its_sender_from_this_session_and_shows_each_refused_command(self) -> None:
+    def test_auto_mode_template_uses_its_sender_and_hides_refused_commands(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-style"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
-        options = local_options(self.auto_mode_arguments())
-        self.assertEqual(options.summary, "cargo-liner-style: modules commands refused")
+        options = local_options(self.auto_mode_arguments(waits="its build waits"))
+        self.assertEqual(options.summary, "modules: 2 commands refused; its build waits")
         self.assertEqual(options.sender, "cargo-liner-style")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=cargo-liner-style", options.values)
-        self.assertIn("rule_line=", options.values)
-        self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n"
-                      + "assign.sh --role implement --to modules-impl\nreview.sh --to modules-test\n\n"
-                      + "Go: the session runs these commands now, and auto mode can refuse these commands again.", options.text or "")
-        self.assertTrue((options.text or "").endswith("Allow rule: auto mode lets these commands run from then on."))
+        self.assertEqual(options.text, "Session: modules\n")
+        self.assertEqual(options.action, ActionRequired("On natedev, in the modules pane, type: Go: run the refused commands"))
+        self.assertNotIn("rule", send.template_values(options))
+        self.assertNotIn("rule_line", send.template_values(options))
         one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
-                                                     waits="The merge waits for it.", rule="Bash(git push:*)"))
-        self.assertIn("Auto mode refused a shell command in the modules session. The merge waits for it.\n"
-                      + "git push origin build-followups-messaging\n\n"
-                      + "Go: the session runs this command now, and auto mode can refuse this command again.", one.text or "")
-        self.assertTrue((one.text or "").endswith("lets this command run from then on. The rule: Bash(git push:*)"))
+                                                     waits="its merge waits", rule="Bash(git push:*)"))
+        self.assertEqual(one.summary, "modules: 1 command refused; its merge waits")
+        self.assertEqual(one.text, "Session: modules\n")
+        self.assertEqual(one.action, ActionRequired("On natedev, in the modules pane, type: Go: run the refused command"))
+        self.assertEqual(send.template_values(one)["rule"], "Bash(git push:*)")
+        self.assertEqual(send.refusal_report(one).commands, ("git push origin build-followups-messaging",))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
         self.assertEqual(command[command.index("--text-id") + 1], "auto_mode.refused")
         self.assertIn("sender=cargo-liner-style", command)
+        self.assertEqual(self.cases[0].commands, ("assign.sh --role implement --to modules-impl", "review.sh --to modules-test"))
         for arguments in (self.auto_mode_arguments("--value", "sender=someone"), self.auto_mode_arguments("--from", "someone"),
                           self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(commands=()),
                           self.auto_mode_arguments(commands=("assign.sh", " ")), self.auto_mode_arguments(count="2"),
@@ -7206,48 +7207,70 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
                 self.assertEqual(send.wrong_template(options, rendered.body), send.AUTO_MODE_HELD)
 
-    def test_auto_mode_cuts_a_long_refused_command_to_90_characters(self) -> None:
+    def test_auto_mode_hides_long_commands_and_gives_rca_the_full_text(self) -> None:
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
         options = local_options(self.auto_mode_arguments(commands=(exact, long)))
-        self.assertIn(f"The P542 build waits for them.\n{exact}\n{long[:89]}…\n\nGo:", options.text or "")
+        self.assertEqual(options.summary, "modules: 2 commands refused")
+        self.assertEqual(options.text, "Session: modules\n")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(self.cases[0].commands, (exact, long))
 
     def test_auto_mode_waits_says_what_waits_and_gives_no_instruction(self) -> None:
         self.writer_session()
-        # The tile push that reached the phone: its waits gave a second action in a second session.
+        # The tile push gave a second action in a second session.
         tile = "Type ! kill -TERM -3137969 -3138422 in the cargo-liner session."
         for waits in (tile, "The build waits; type: /resume", "The merge waits in the cargo-liner pane"):
             with self.subTest(waits=waits), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = send.parse(self.auto_mode_arguments(session="tile", commands=("cargo test -p tile",), waits=waits))
             self.assertIn("waits says only what waits", errors.getvalue())
-        options = local_options(self.auto_mode_arguments(waits="The merge waits for them.."))
-        self.assertIn(" in the modules session. The merge waits for them.\nassign.sh", options.text or "")
+        for waits, normalized in (
+            ("The merge waits for them..", "The merge waits for them"),
+            ("Type\nchecking for the modules build waits for the refused commands.",
+             "Type checking for the modules build waits for the refused commands"),
+        ):
+            with self.subTest(waits=waits):
+                options = local_options(self.auto_mode_arguments(waits=waits))
+                self.assertEqual(send.template_values(options)["waits"], normalized)
+                self.assertEqual(options.summary, "modules: 2 commands refused")
+                self.assertEqual(options.text, "Session: modules\n")
 
-    def test_auto_mode_keeps_its_waits_sentence_only_when_the_review_approves_it_within_30_seconds(self) -> None:
+    def test_auto_mode_reviews_its_waits_clause_within_30_seconds(self) -> None:
         self.writer_session()
-        options = local_options(self.auto_mode_arguments())
-        withheld = review.Withheld(review.Draft("s", "1", "t", NoActionRequired(), "b", False), "asks for nothing")
+        options = local_options(self.auto_mode_arguments(waits="its build waits"))
+        example = review.Draft("s", "1", "t", NoActionRequired(), "b", False)
+        withheld = review.Withheld(example, "asks for nothing")
+        title_issue = review.RuleFailure("title-names-the-stake", "modules: 2 commands refused")
+        action_issue = review.RuleFailure("every-choice-says-what-it-does", "Go: run the refused commands")
+        waits_issue = review.RuleFailure("plain-words", "its build waits")
         for verdict, kept in ((None, True), (review.Unreviewed("timeout"), False), (review.Unreviewed("review unavailable"), False),
-                              (review.Failed(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
-                              (review.Rewritten(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
+                              (review.Failed(example, ["plain-words"]), False),
+                              (review.Rewritten(example, ["plain-words"]), False),
+                              (review.Failed(example, [title_issue.rule, action_issue.rule], failures=(title_issue, action_issue)), True),
+                              (review.Failed(example, [action_issue.rule, waits_issue.rule], failures=(action_issue, waits_issue)), False),
                               (withheld, False)):
             self.verdict, self.reviews, self.cases = verdict, [], []
             with (self.subTest(verdict=verdict), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run,
+                  mock.patch.object(send, "user", wraps=send.user) as deliver,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(send.send(options).outcome, "sent")
-            # The review reads the whole alert with its waits sentence, and holds it back at most 30 s.
-            [(draft, limit)] = self.reviews
+            [(draft, limit, text_id)] = self.reviews
             self.assertEqual(limit, send.waits_review_seconds())
             self.assertEqual(send.waits_review_seconds(), 30)
-            self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n", draft.body)
+            self.assertEqual(text_id, "auto_mode.refused")
+            self.assertEqual(draft.title, "modules: 2 commands refused")
+            self.assertEqual(draft.body, "its build waits.")
             pushed = cast(list[str], run.call_args.args[0])
-            self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
-            text = cast(str, self.log()[-1]["text"])
-            self.assertIn("in the modules session. The P542 build waits for them.\nassign.sh" if kept else
-                          "Auto mode refused 2 shell commands in the modules session.\nassign.sh", text)
-            self.assertEqual(self.cases[0].waits, "The P542 build waits for them" if kept else "")
-            self.assertEqual("goes without its waits sentence" in errors.getvalue(), not kept)
-        # With the review off, or no waits sentence, nothing is reviewed.
+            self.assertIn("waits=its build waits" if kept else "waits=", pushed)
+            self.assertFalse(any(value.startswith("waits_line=") for value in pushed))
+            message = cast(send.Message, deliver.call_args.args[0])
+            title = "modules: 2 commands refused; its build waits" if kept else "modules: 2 commands refused"
+            self.assertEqual(message.summary, title)
+            self.assertEqual(self.log()[-1]["text"], "Session: modules")
+            self.assertEqual(self.cases[0].waits, "Its build waits" if kept else "")
+            self.assertEqual("goes without its waits clause" in errors.getvalue(), not kept)
+        # The switch disables the waits review.
         self.verdict, self.reviews = None, []
         (self.root / "notify").mkdir(exist_ok=True)
         _ = (self.root / "notify/review_off").write_text("")
@@ -7286,11 +7309,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
         options = local_options(self.auto_mode_arguments(session="types", commands=("save_counts.py --per-unit",),
                                                          waits="The trunk plan waits for it"))
-        self.assertEqual(options.summary, "cargo-liner: types command refused")
+        self.assertEqual(options.summary, "types: 1 command refused")
         self.assertEqual(options.sender, "cargo-liner")
         self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, type: Go: run the refused command"))
-        self.assertIn("Auto mode refused a shell command in the types session. The trunk plan waits for it.\n"
-                      + "save_counts.py --per-unit", options.text or "")
+        self.assertEqual(options.text, "Session: types\n")
+        self.assertEqual(send.refusal_report(options).commands, ("save_counts.py --per-unit",))
 
     def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
         self.writer_session()
@@ -9291,6 +9314,14 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertEqual(self.fixture.world.commands, before)
                 if state == "blocked":
                     self.assertIn("Worker blocked: worker is blocked", retained)
+                    marker = "Detached run: fixture"
+                    result = send.deliver_worker_text(row, staff.snapshot(), marker,
+                        sender="detached-runs", timeout=send.delivery_timeout(),
+                        receipt=send.WorkerResultReceipt(marker))
+                    self.assertEqual(result.outcome, "retry", result.detail)
+                    self.assertEqual(result.detail, "worker is blocked")
+                    self.assertEqual(self.fixture.world.commands, before)
+                    self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
                 elif state == "unknown":
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())

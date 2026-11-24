@@ -740,8 +740,7 @@ try {
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
-          // bob, 2026-11-23: a Mac build with no unit starts with who started it, here a terminal.
-          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit === 'trunk');
           Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
@@ -844,7 +843,7 @@ try {
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
                   [key.lastChild.textContent, ...iconDetails(key.querySelector('.machine-icon'))]),
-                colors:[chart(keys[0]),chart(keys[4])].map(row => [
+                colors:[chart(keys[0]),chart(keys[2]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
@@ -864,13 +863,13 @@ try {
               await assertRowCenters(evaluate);
               assert.deepEqual(rows.headers, runningHeaders);
               assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
-                ['queue','builds','','gate'],['terminal','hana','','build'],['hana CI','','',''],
+                ['queue','builds','','gate'],['trunk','hana','','nextest'],['hana CI','','',''],
                 ['admin-console','builds','','test affected']]);
               assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
                 [runningIcon('natedev')],waitingIcons]);
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
-              assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
+              assert.deepEqual(rows.colors, Array.from({length:3},()=>['role.unit-director','role.showrunner']));
               assert.equal(rows.heading, 'Waiting, in queue order');
               assert.equal(rows.runAge, `${runAgeMinutes} min`);
               assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
@@ -879,6 +878,25 @@ try {
                 assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut at 1440 px.');
               }
               if (width === 900) {
+                const pidLayouts = await evaluate(`(() => {
+                  const walk = document.querySelector('#walk');
+                  const scroll = walk.closest('.walk-scroll');
+                  const layouts = [[999999,999999], [999999,4194304], [4194304,4194304]].map(([runningPid,waitingPid]) => {
+                    renderWalk({...latest, walk:latest.walk.map(row => ({...row,pid:runningPid})),
+                      waiters:latest.waiters.map(row => ({...row,pid:waitingPid}))});
+                    fitLabels();
+                    return {
+                      runningPid, waitingPid, pidWidth:walk.querySelector('thead .pid').getBoundingClientRect().width,
+                      overflow:scroll.scrollWidth - scroll.clientWidth,
+                      trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
+                    };
+                  });
+                  renderWalk(latest);
+                  fitLabels();
+                  return layouts;
+                })()`);
+                assert.ok(pidLayouts.every(({overflow, trackWidth}) => overflow <= 1 && trackWidth >= 159),
+                  'The 900 px walk does not fit both PID widths. ' + JSON.stringify(pidLayouts));
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
                 assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);
@@ -2639,14 +2657,13 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            // A Mac build with no unit starts with its owner; the step after ": " goes in Step.
-            assert.deepEqual(macProof.map(row=>row.name),['terminal','trunk','cargo-liner']);
+            assert.deepEqual(macProof.map(row=>row.name),['trunk-p172-assembly-rows','trunk','cargo-liner']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.step),['build','nextest','nextest']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
-              repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
+              owner:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['hana','hana','']);
+            assert.deepEqual(macLabels.map(row=>row.owner),['','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -2666,7 +2683,7 @@ try {
             assert.equal(failedMac.unknown,'—');
             await show(base);
 
-            // A waiting step sizes the Step column, so it can move the columns to the right of Step, but no column before it.
+            // Waiting step names must leave Duration and Verify in place.
             const positions=()=>evaluate(`(() => {
               const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
               return ['.duration','.verify'].map(selector=>{
@@ -2686,6 +2703,125 @@ try {
               assert.ok(Math.abs(beforeWait[index].left-afterWait[index].left)<=1,'A waiting row moves a table column. '+JSON.stringify({width,theme,beforeWait,afterWait}));
               if(index===0) assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,
                 'A waiting row changes the Duration width. '+JSON.stringify({width,theme,beforeWait,afterWait}));
+            }
+            const longStep = 'check generated-artifacts-and-cross-platform-test-manifests';
+            const walkOverflow = () => evaluate(`(() => {
+              const walk = document.querySelector('.walk-scroll');
+              return walk.scrollWidth - walk.clientWidth;
+            })()`);
+            const beforeLongOverflow = await walkOverflow();
+            const waiter = waiting.waiters[0];
+            waiter.name = waiter.name.split(': ', 1)[0] + ': ' + longStep;
+            if (waiter.title) waiter.title.step = longStep;
+            await show(waiting);
+            const longName = await evaluate(`(() => {
+              const row = document.querySelector('.walk-table tr.wait');
+              return {step:row.querySelector('.step').textContent, tip:tipText(row.dataset.tip, latest)[0]};
+            })()`);
+            assert.equal(longName.step, longStep);
+            const afterLongWait = await positions();
+            for (let index = 0; index < beforeWait.length; index++) {
+              assert.ok(Math.abs(beforeWait[index].left - afterLongWait[index].left) <= 1,
+                'A long waiting step moves a table column. ' + JSON.stringify({width,theme,beforeWait,afterLongWait}));
+              assert.ok(Math.abs(beforeWait[index].width - afterLongWait[index].width) <= 1,
+                'A long waiting step changes a column width. ' + JSON.stringify({width,theme,beforeWait,afterLongWait}));
+            }
+            assert.ok(await walkOverflow() <= beforeLongOverflow + 1, 'A long waiting step adds horizontal overflow.');
+            assert.ok(longName.tip.includes(longStep), 'The waiting row tooltip omits the full step name.');
+            if (width === 900 || width === 1400) {
+              const onlyWaiting = structuredClone(waiting);
+              onlyWaiting.walk = [];
+              const cargoStyle = onlyWaiting.waiters[0];
+              cargoStyle.unit = '';
+              cargoStyle.name = 'cargo-liner: build cargo-style';
+              cargoStyle.title = {unit:'', step:cargoStyle.name};
+              await show(onlyWaiting);
+              const waitingLayout = () => evaluate(`(() => {
+                const table = document.querySelector('.walk-table');
+                const text = table.querySelector('tr.wait .step .cell-text');
+                const columns = ['.duration','.verify','.step'].map(selector => {
+                  const {left, width} = table.querySelector('thead ' + selector).getBoundingClientRect();
+                  return {left, width};
+                });
+                const cut = [text, ...text.children].some(part => part.scrollWidth > part.clientWidth);
+                return {columns, cut, step:text.textContent, running:table.querySelectorAll('tr[data-tip^="row:"]').length};
+              })()`);
+              const cargoLayout = await waitingLayout();
+              assert.equal(cargoLayout.running, 0);
+              assert.equal(cargoLayout.step, 'build cargo-style');
+              assert.equal(cargoLayout.cut, false, `The cargo-style waiting step is cut at ${width} px in ${theme} mode.`);
+              onlyWaiting.waiters = structuredClone(waiting.waiters);
+              await show(onlyWaiting);
+              const changedLayout = await waitingLayout();
+              assert.deepEqual(changedLayout.columns, cargoLayout.columns,
+                'Changing the waiting rows moves the columns with no running steps.');
+              if (width === 1400) {
+                const setWidth = width => call('Emulation.setDeviceMetricsOverride',
+                  {width,height:1200,deviceScaleFactor:1,mobile:false});
+                Object.assign(cargoStyle, {
+                  unit:'cargo-liner-in-a-long-fixture-unit', targets:['natedev','mac'],
+                  title:{unit:'cargo-liner-in-a-long-fixture-unit',step:'build cargo-style'},
+                });
+                onlyWaiting.waiters = [cargoStyle];
+                await show(onlyWaiting);
+                const atWidth = async width => {
+                  await setWidth(width);
+                  const layout = await evaluate(`(() => {
+                    fitLabels();
+                    return {label:parseFloat(document.documentElement.style.getPropertyValue('--amt')),
+                      tight:document.querySelector('#walk').classList.contains('tight')};
+                  })()`);
+                  const {columns, cut, step} = await waitingLayout();
+                  return {width, ...layout, stepWidth:columns[2].width, cut, step};
+                };
+                const originalEdge = [await atWidth(930), await atWidth(931), await atWidth(932)];
+                // The viewport widths at the layout changes depend on the browser font.
+                const layoutEdge = async (property, start) => {
+                  let narrow = await atWidth(start);
+                  let wide = await atWidth(1200);
+                  assert.notEqual(wide[property], narrow[property], 'The fixture needs both values of ' + property);
+                  while (wide.width - narrow.width > 1) {
+                    const middle = await atWidth(Math.floor((narrow.width + wide.width) / 2));
+                    if (middle[property] === narrow[property]) narrow = middle;
+                    else wide = middle;
+                  }
+                  return [narrow, wide, await atWidth(wide.width + 1)];
+                };
+                const adjacent = await layoutEdge('label', 900);
+                const tightEdge = await layoutEdge('tight', 760);
+                await setWidth(1440);
+                const dualTargets = structuredClone(base);
+                dualTargets.walk = [
+                  structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify)),
+                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build')),
+                ];
+                dualTargets.walk[0].machine = 'natedev';
+                dualTargets.walk[1].machine = 'mac';
+                dualTargets.waiters = [];
+                await show(dualTargets);
+                const emptyQueue = await positions();
+                dualTargets.waiters = [{...cargoStyle, unit:'cargo-liner', title:{unit:'cargo-liner',step:'build cargo-style'}}];
+                await show(dualTargets);
+                assert.equal(await evaluate("document.querySelectorAll('tr.wait td.machine .machine-icon').length"), 2);
+                const twoIcons = await positions();
+                dualTargets.waiters = structuredClone(readings.three_target_gate_wait.waiters);
+                await show(dualTargets);
+                assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr.wait td.machine .machine-icon')]
+                  .map(icon => icon.dataset.machine)`), ['natedev','mac-linux','hana-aws']);
+                const threeIcons = await positions();
+                const stepFits = group => group.every((view, index) =>
+                  !view.cut && view.step === 'build cargo-style' && (!index || view.stepWidth >= group[index - 1].stepWidth));
+                const labelFits = [originalEdge, adjacent].every(stepFits);
+                const tightFits = stepFits(tightEdge);
+                const columnsStay = withIcons => emptyQueue.every((column, index) =>
+                  column.left === withIcons[index].left && column.width === withIcons[index].width);
+                const twoStay = columnsStay(twoIcons);
+                const threeStay = columnsStay(threeIcons);
+                assert.ok(labelFits && tightFits && twoStay && threeStay, 'Step clips or a waiting row moves Duration or Verify. ' +
+                  JSON.stringify({theme, originalEdge, adjacent, tightEdge, labelFits, tightFits,
+                    emptyQueue, twoIcons, threeIcons, twoStay, threeStay}));
+                await setWidth(width);
+              }
             }
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
@@ -3450,7 +3586,6 @@ try {
           const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
           Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
             progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
-          delete mac.started_by;
           const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
           Object.assign(aws, {machine:'aws',used:1.5});
           const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,

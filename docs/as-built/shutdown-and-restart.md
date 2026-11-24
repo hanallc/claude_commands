@@ -10,6 +10,16 @@ Callers handle `ProcessLookupError` when the group has ended.
 Shell callers use their checkout's helper through `scripts/lib/py`.
 The helper returns exit 3 for a missing group and exit 2 for refusal or failure.
 `test_process_group.unguarded_group_signals` checks Python references, embedded scripts, and shell commands for unguarded signals.
+`run_process_group(command, timeout=..., env=...)` runs a command in its own group and returns its text output.
+It waits up to the timeout for the command to exit, then stops the whole group.
+After a timeout it stops the group and raises `subprocess.TimeoutExpired` with the output.
+Output goes to temporary files, so a helper process that keeps the output open cannot delay the result.
+Bytes that are not UTF-8 decode as replacement characters.
+`stop_process_group(process)` sends TERM, then KILL, to the group of a `start_new_session` child and closes its pipes.
+Every headless Firefox and Chrome run starts with `run_process_group`, or with `Popen(start_new_session=True)` and ends with `stop_process_group`.
+On macOS the gate has no subreaper, and its group kill does not reach a browser group when it stops a module during a browser run.
+The Node proof `memory_page_proof.mjs` starts Chrome, so its tests start Node with `run_process_group`.
+A browser leaves helper processes after its own exit or a timeout, and a plain `subprocess.run` stops only the leader.
 
 ## Session commands
 
@@ -18,6 +28,11 @@ The `/agents` skill uses the `agents` program.
 The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
+SESSION is a staff id, a session id, a unique name, or a staff path.
+A staff path is the full path, such as `hana/assembly/fix2`, or a path under a showrunner, such as `assembly/fix2`.
+A unit path stops the unit and its workers.
+A path that matches no staff row goes to the native session stop, which can match a saved session name such as `review/x`.
+A path that matches more than one staff row stops nothing and returns status 2 with the matching paths.
 Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.

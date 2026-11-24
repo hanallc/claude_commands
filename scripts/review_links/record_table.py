@@ -1053,7 +1053,7 @@ function showHiddenActionResults(items){
  if(status.textContent!==text) status.textContent=text;
  status.hidden=!text;
 }
-/** @param {{kind:'success' | 'failure', message:string, hiddenMessage?:string}} result */
+/** @param {{kind:'success' | 'failure' | 'undone', message:string, hiddenMessage?:string}} result */
 function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  const key=item.dataset.key;
  actionNotices.set(key,{message,hiddenMessage});
@@ -1062,7 +1062,8 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  if(status) status.textContent=message;
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(kind==='failure' && restored && rowMotion.has(item)){
+ // A refused or undone send brings its departing row back.
+ if(kind!=='success' && restored && rowMotion.has(item)){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }

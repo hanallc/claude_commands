@@ -16,12 +16,13 @@ import io
 import json
 import shlex
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import time
 from threading import Event
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.lib.transcripts import uncompressed_path
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
 from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
@@ -209,9 +211,22 @@ class CloseAllowed:
     """The close checks permit closure; the pane remains open."""
 
 
+class CompletionRecovery(Enum):
+    NO_PENDING_NOTICE = "no pending completion notice"
+    RECOVERED = "completion recovery finished"
+    PENDING_CLOSE = "completion has pending pane cleanup"
+    WAITING_ON_RUNS = "the completion waits for a detached run"
+    WAITING_ON_REPLY = "a detached run result awaits a matching DONE"
+    WAITING_ON_REAP = "reap must record the run result"
+
+
 @dataclass(frozen=True)
 class Kept:
-    blocker: str
+    reason: str | CompletionRecovery
+
+    @property
+    def blocker(self) -> str:
+        return self.reason if isinstance(self.reason, str) else self.reason.value
 
 
 @dataclass(frozen=True)
@@ -247,6 +262,10 @@ def _worker_lock_path(key: str) -> Path:
     return staff.record_path().parent / "locks" / f"{key}.lock"
 
 
+def _worker_name_lock_path(parent: StaffId, name: str) -> Path:
+    return _worker_lock_path(f"{parent}-{name}")
+
+
 @contextmanager
 def worker_id_lock(identity: StaffId, *, blocking: bool = False,
                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[None]:
@@ -278,15 +297,20 @@ class WorkerLockHold:
 
     def bind(self, row: staff.StaffRow, *, deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
         """Acquire the fixed-id lock before creation serialization ends."""
-        if not self.active or not row.reports_to(self.parent) or row.name != self.name.value:
+        if self.owns(row):
+            return
+        if (not self.active or self.bound or row.kind != "worker"
+                or not row.reports_to(self.parent) or row.name != self.name.value):
             raise ValueError("worker lock does not own this worker")
-        if row.id not in self._held:
-            self._operations.enter_context(worker_id_lock(row.id, blocking=self._blocking, deadline=deadline))
-            self._held.add(row.id)
+        self._operations.enter_context(worker_id_lock(row.id, blocking=self._blocking, deadline=deadline))
+        self._held.add(row.id)
+
+    @property
+    def bound(self) -> bool:
+        return bool(self._held)
 
     def owns(self, row: staff.StaffRow) -> bool:
-        return self.active and row.id in self._held
-
+        return self.active and row.id in self._held and row.kind == "worker" and row.reports_to(self.parent)
 
 @contextmanager
 def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
@@ -298,7 +322,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
-        path = _worker_lock_path(f"{parent}-{name.value}")
+        path = _worker_name_lock_path(parent, name.value)
         path.parent.mkdir(parents=True, exist_ok=True)
         creation = operations.enter_context(path.open("a"))
         try:
@@ -556,7 +580,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         else:
             states.append(ClosedWorker(row))
     terminals: frozenset[str] = frozenset()
-    if isinstance(selection, SelectedWorkers):
+    if isinstance(selection, (SelectedWorkers, SelectedWorkerRows)):
         worker_ids = {row.id for row in workers}
         terminals = frozenset(_text(pane, "terminal_id") for pane in panes
             if (launch_owners.get(_text(pane, "pane_id")) in worker_ids
@@ -566,7 +590,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
 
 
 def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr, *,
-              selection: SelectedWorkers | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
+              selection: SelectedWorkers | SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
     return _parent_evidence(parent, record, _read_panes(record, client), client, selection=selection)
 
 
@@ -774,6 +798,53 @@ def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
     return row.role.value if isinstance(row.role, staff.KnownWorkerRole) else WorkerRoleUnavailable("dispatch role is unavailable")
 
 
+class NoTranscriptTurn(Enum):
+    UNRECORDED = "no verified turn after the dispatch prompt"
+
+
+@dataclass(frozen=True)
+class TranscriptCursor:
+    """Identify a boundary within one transcript stream."""
+
+    stream: str
+    position: int
+    prefix: str
+
+    def at_or_after(self, boundary: TranscriptCursor) -> bool:
+        return self.stream == boundary.stream and self.position >= boundary.position
+
+    @classmethod
+    def from_json(cls, value: object) -> TranscriptCursor | NoTranscriptTurn:
+        if not isinstance(value, dict):
+            return NoTranscriptTurn.UNRECORDED
+        fields = cast(dict[str, object], value)
+        stream, position, prefix = fields.get("stream"), fields.get("position"), fields.get("prefix")
+        if (not isinstance(stream, str) or not stream or not isinstance(position, int) or isinstance(position, bool)
+                or position < 1 or not isinstance(prefix, str) or not re.fullmatch(r"[a-f0-9]{64}", prefix)):
+            return NoTranscriptTurn.UNRECORDED
+        return cls(stream, position, prefix)
+
+
+def worker_input_digest(text: str) -> str:
+    """Hash the input text with the transcript's trailing whitespace rule."""
+    return hashlib.sha256(text.rstrip().encode()).hexdigest()
+
+
+def transcript_stream(row: staff.StaffRow, source: Path) -> str:
+    return f"{row.current_session}:{uncompressed_path(source.resolve())}"
+
+
+def transcript_record_cursors[T: str | dict[str, object] | worker_admission.TornTranscriptRecord](
+    entries: Iterable[T], stream: str,
+) -> Generator[tuple[T, TranscriptCursor]]:
+    """Identify each record by its position and the hash of the transcript prefix."""
+    prefix = hashlib.sha256()
+    for position, entry in enumerate(entries, 1):
+        data = None if isinstance(entry, worker_admission.TornTranscriptRecord) else entry
+        prefix.update(json.dumps(data, sort_keys=True).encode() + b"\n")
+        yield entry, TranscriptCursor(stream, position, prefix.hexdigest())
+
+
 def _transcript_messages(row: staff.StaffRow) -> list[str] | Kept:
     try:
         backend = staff.backend(row)
@@ -816,13 +887,16 @@ class RecordedCompletionEvidence(Protocol):
                             detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
 
 
-def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object]) -> CloseAllowed | Kept:
-    """Require the saved stage and its reply before a pass can release its evidence."""
+def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object], *,
+                              worker_is_working: bool = False) -> CloseAllowed | Kept:
+    """Accept a finished hook or check the saved reply against the transcript."""
 
+    completion = progress_history.hook_completion(passed)
+    if isinstance(completion, progress_history.HookCompletion) and completion.finished:
+        return Kept("agent state is working") if worker_is_working else CloseAllowed()
     delivery = pass_recorder.dispatch_delivery(passed)
     if not delivery.line or not delivery.completion_id:
         return Kept("the dispatch has no saved completion id")
-    completion = progress_history.hook_completion(passed)
     reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
     receipts = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
     return receipts.completion_close_evidence(row, delivery, run=run, reply_file=reply_file)
@@ -842,7 +916,12 @@ def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
 
 @dataclass(frozen=True)
 class DispatchHoldsWorker:
-    blocker: str
+    reason: str | CompletionRecovery
+    parked: bool = False
+
+    @property
+    def blocker(self) -> str:
+        return self.reason if isinstance(self.reason, str) else self.reason.value
 
 
 @dataclass(frozen=True)
@@ -869,20 +948,28 @@ class ReleasedWorkerPass(Enum):
 WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
 
 
+class DispatchLockAvailable(Enum):
+    AVAILABLE = "the dispatch lock does not block this operation"
+
+
 def check_worker_lock(row: staff.StaffRow,
-                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
-    """Check the worker lock without creating a file."""
+                      lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
+                      include_name: bool = False) -> DispatchLockAvailable | Kept:
+    """Check the fixed-ID lock and optionally the name lock without creating files."""
     if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
-        path = _worker_lock_path(row.id)
-        try:
-            with path.open("r") as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return Kept("dispatch lock is held")
-        except FileNotFoundError:
-            pass
-    return CloseAllowed()
+        paths = [_worker_lock_path(row.id)]
+        if include_name and isinstance(row.parent, staff.ReportsTo):
+            paths.insert(0, _worker_name_lock_path(row.parent.id, row.name))
+        for path in paths:
+            try:
+                with path.open("r") as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return Kept("dispatch lock is held")
+            except FileNotFoundError:
+                continue
+    return DispatchLockAvailable.AVAILABLE
 
 
 class RunningDetachedWorkers(Protocol):
@@ -916,7 +1003,9 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
             return DispatchHoldsWorker("a detached run record is unreadable")
         live = row.id in detached.staff_ids
     if live:
-        return DispatchHoldsWorker("a detached run is live")
+        membership = staff.local_snapshot() if record is None else record
+        passed = _pass_in(row, _run_state(run, read), membership)
+        return DispatchHoldsWorker("a detached run is live", parked=progress_history.parked_worker_pass(passed))
     record = staff.local_snapshot() if record is None else record
     if isinstance(detached, DetachedWorkAtUse):
         # Direct pane operations use the current pass.
@@ -952,6 +1041,8 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
 
 def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, object], status: object,
                          dispatch: object, *, live_runs_checked: bool) -> WorkerDispatchState:
+    if status == "canceled":
+        return ReleasedWorkerPass.ENDED
     delivery = pass_recorder.dispatch_delivery(passed)
     completion = progress_history.hook_completion(passed)
     active = status == "active" and bool(delivery.line)
@@ -964,7 +1055,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
         if isinstance(hold, Kept):
-            return DispatchHoldsWorker(hold.blocker)
+            return DispatchHoldsWorker(hold.reason, parked=progress_history.parked_worker_pass(passed))
         if active:
             return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "completed":
@@ -991,7 +1082,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
 def _idle_checks(row: staff.StaffRow, run: Path,
                  lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
     state = worker_dispatch_state(row, run, lock)
-    return Kept(state.blocker) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
+    return Kept(state.reason) if isinstance(state, DispatchHoldsWorker) else CloseAllowed()
 
 
 def stage_two_completion_id(dispatch_id: str) -> str:
@@ -999,37 +1090,64 @@ def stage_two_completion_id(dispatch_id: str) -> str:
     return dispatch_id + "-2"
 
 
+@dataclass(frozen=True)
+class ParkWaitingPass:
+    """Close an idle pane while its accepted pass waits only on live runs."""
+
+    run: Path
+    instance: str
+    stage: str
+
+
+class CloseEndedPane(Enum):
+    CHECK = "use the normal closure rules"
+
+
 def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
-              lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+              lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
+              park: ParkWaitingPass | CloseEndedPane = CloseEndedPane.CHECK) -> CloseAllowed | Kept:
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
+    if isinstance(park, ParkWaitingPass):
+        if not isinstance(lock, WorkerLockHold) or not lock.owns(worker.row):
+            return Kept("the worker lock is unavailable for parking")
+        if not isinstance(worker, OpenWorker) or not worker.status.idle:
+            return Kept("the worker pane is no longer idle")
+        if worker_run(worker.row, record=record) != park.run:
+            return Kept("the worker run changed before parking")
+        return CloseAllowed()
     directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
     if isinstance(worker, ClosedWorker):
         return _idle_checks(worker.row, directory, lock)
     state = worker_dispatch_state(worker.row, directory, lock)
     if isinstance(state, DispatchHoldsWorker):
-        return Kept(state.blocker)
+        return Kept(state.reason)
 
+    working = isinstance(worker, OpenWorker) and worker.status == herdr.AgentStatus.WORKING
     if isinstance(state, CompletedWorkerPass):
         passed = worker_pass(worker.row, directory)
         if pass_recorder.dispatch_delivery(passed).line:
-            completion = recorded_completion_close(worker.row, directory, passed)
+            completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
         else:
             completion = _completed_turn(worker.row, state.dispatch_id)
     elif state is ReleasedWorkerPass.ENDED:
         passed = worker_pass(worker.row, directory)
+        if passed.get("status") == "canceled":
+            if isinstance(worker, OpenWorker) and not worker.status.idle:
+                return Kept(f"agent state is {worker.status.value}")
+            return CloseAllowed()
         hook = progress_history.hook_completion(passed)
         if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
                 and isinstance(worker, OpenWorker) and not worker.status.idle):
             return Kept(f"agent state is {worker.status.value}")
         delivery = pass_recorder.dispatch_delivery(passed)
         if delivery.line:
-            completion = recorded_completion_close(worker.row, directory, passed)
+            completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
         elif isinstance(hook, progress_history.HookCompletion) and hook.outcome in ("done", "late DONE"):
@@ -1075,6 +1193,21 @@ def checked_role_policy(role: WorkerRole | WorkerRoleUnavailable,
         return CheckedRolePolicy(role, launch_policy(role, family))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, f"{role}: {error}")
+
+
+def parked_launch_policy(row: staff.StaffRow, passed: dict[str, object]
+                         ) -> LaunchPolicy | progress_history.ParkedLaunchUnavailable:
+    """Use the saved policy only for the same native conversation."""
+    from scripts.direct import progress_history
+
+    saved = progress_history.parked_worker_launch(passed)
+    backend = staff.backend(row)
+    if (isinstance(saved, progress_history.ParkedLaunchUnavailable)
+            or isinstance(backend, staff.BackendUnavailable) or saved.family != backend.family
+            or saved.thread != row.current_session):
+        return progress_history.ParkedLaunchUnavailable.MISSING
+    settings = models_registry.LaunchSettings(saved.family, saved.model, saved.effort, saved.service_tier)
+    return replace(_launch_policy(settings, saved.sandbox), permission=saved.permission)
 
 
 def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
@@ -1322,7 +1455,9 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
                     account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection = ConfiguredWorkerAccount.CURRENT,
                     lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
                     policy: UseRolePolicy | LaunchPolicy = UseRolePolicy.CURRENT, runs: dict[str, list[str]] | None = None,
-                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> WorkerStart:
+                    codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                    selection: SelectedWorkerRows | Literal["by_name"] = "by_name",
+                    ) -> WorkerStart:
     if isinstance(role, WorkerRoleUnavailable):
         return StartRefused(StartRefusal.ROLE_UNAVAILABLE, role.reason)
     if role not in staff.WORKER_ROLES:
@@ -1331,28 +1466,36 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     owner = record.by_id(parent)
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
-    existing = worker_admission.find_worker(record, parent, name.value)
-    run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
-    if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), DispatchHoldsWorker):
-        run = worker_run(owner, record=record, scanned=runs)
-    allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
-        worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
+    expected = worker_admission.find_worker(record, parent, name.value)
     keep_model = isinstance(policy, UseRolePolicy)
-    if isinstance(policy, UseRolePolicy):
-        saved = _checked_resume_policies.get({}).get(existing.current_session) if existing is not None else None
-        checked = saved if saved is not None and saved.role == role else checked_role_policy(role)
-        if isinstance(checked, StartRefused):
-            return checked
-        policy = checked.launch
     try:
         with ExitStack() as operations:
-            held = operations.enter_context(worker_lock(parent, name, blocking=existing is None)) if isinstance(lock, WorkerLockAtUse) else lock
+            held = operations.enter_context(worker_lock(parent, name, blocking=expected is None)) if isinstance(lock, WorkerLockAtUse) else lock
             if isinstance(held, Kept):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, held.blocker)
-            if not held.active or held.parent != parent or held.name != name:
+            record = staff.snapshot()
+            existing = worker_admission.find_worker(record, parent, name.value)
+            if (not held.active or held.parent != parent or held.name != name
+                    or (existing is None and held.bound)
+                    or (existing is not None and not held.owns(existing))
+                    or (expected is not None and (existing is None or existing.id != expected.id
+                                                  or existing.current_session != expected.current_session))):
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
+            if isinstance(policy, UseRolePolicy):
+                saved = _checked_resume_policies.get({}).get(existing.current_session) if existing is not None else None
+                checked = saved if saved is not None and saved.role == role else checked_role_policy(role)
+                if isinstance(checked, StartRefused):
+                    return checked
+                policy = checked.launch
+            run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
+            if existing is not None and not isinstance(worker_dispatch_state(existing, run, held), DispatchHoldsWorker):
+                run = worker_run(owner, record=record, scanned=runs)
+            allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
+                worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
+            target = SelectedWorkers(frozenset({name.value})) if selection == "by_name" else selection
             with worker_admission.worker_operation(allowed):
-                result = _start_locked(owner, name, role, policy, account, allowed, held, codex, keep_model=keep_model)
+                result = _start_locked(owner, name, role, policy, account, allowed, held, codex,
+                                       keep_model=keep_model, selection=target)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1400,7 +1543,8 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
-                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool) -> WorkerStart:
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool,
+                  selection: SelectedWorkers | SelectedWorkerRows) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1411,14 +1555,26 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     deadline = started + start_seconds
     client = _client()
     record = staff.snapshot()
-    selection = SelectedWorkers(frozenset({name.value}))
-    evidence = _evidence(owner.id, record, client, selection=selection)
+    refreshed = worker_admission.find_worker(record, owner.id, name.value)
+    if isinstance(allowed.slot, worker_admission.ExistingWorkerSlot):
+        expected = allowed.slot.row
+        if (refreshed is None or refreshed.id != expected.id or not lock.owns(refreshed)
+                or refreshed.current_session != expected.current_session):
+            return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
+    elif refreshed is not None:
+        return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
+
+    def read_evidence(membership: staff.StaffSnapshot) -> PaneEvidence:
+        herdr.refresh_restore_pane_evidence()
+        return _evidence(owner.id, membership, client, selection=selection)
+
+    evidence = read_evidence(record)
     current = next((state for state in evidence.states if state.row.name == name.value), None)
     row = current.row if current is not None else None
     backend = staff.backend(row) if row is not None else staff.BACKEND_UNAVAILABLE
     switching = not isinstance(backend, staff.BackendUnavailable) and backend.family != policy.settings.kind
-    if row is not None:
-        lock.bind(row)
+    if row is not None and not lock.owns(row):
+        return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "the worker changed before startup")
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
     if current is None:
@@ -1457,7 +1613,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                     if row is not None:
                         return _uncertain(row, f"launch proof is incomplete: {error}")
                     return UnpublishedWorker(identity, str(error))
-                recovered = _evidence(owner.id, staff.snapshot(), client, selection=selection)
+                recovered = read_evidence(staff.snapshot())
                 state = next((item for item in recovered.states if item.row.id == row.id), None)
                 if isinstance(state, (OpenWorker, ProcessUnknownWorker, UncertainWorker)):
                     _layout(owner.id, recovered)
@@ -1562,7 +1718,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
                 if not client.close_tab_confirmed(current.pane, target=str(current.row.current_session), terminal=current.terminal):
                     raise herdr_types.HerdrFailure("source pane close is incomplete")
                 _retire_launch(current.row, client, record)
-            fresh = _evidence(owner.id, record, client, selection=selection)
+            fresh = read_evidence(record)
             selected = _destination(owner, name.value, fresh, client)
             if isinstance(selected, StartRefused):
                 raise worker_admission.AdmissionRefused(selected.detail)
@@ -1706,7 +1862,7 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return IncompleteStart(row, launched.pane, launched.outcome.reason, created_pane())
     herdr.forget_pane_evidence(client.session, launched.pane)
-    fresh = _evidence(owner.id, staff.snapshot(), client, selection=selection)
+    fresh = read_evidence(staff.snapshot())
     result = next((state for state in fresh.states if state.row.id == row.id), None)
     _layout(owner.id, fresh)
     if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
@@ -1729,9 +1885,32 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
             pane_launch.retire_launch(path, pane, entry)
 
 
+def _parked_launch(worker: OpenWorker, client: herdr.Herdr) -> progress_history.ParkedWorkerLaunch:
+    from scripts.direct import progress_history
+
+    herdr.forget_pane_evidence(client.session, worker.pane)
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", worker.pane).get("process_info"),
+                             "worker launch policy")
+    owner = herdr.foreground_pane_owner(info)
+    pane = client.pane_row(worker.pane)
+    if (not isinstance(owner, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground))
+            or isinstance(pane, herdr.NoPane) or pane.get("terminal_id") != worker.terminal
+            or herdr.read_foreground_pane_owner(owner, pane).current_identity != worker.row.current_session):
+        raise ValueError("the worker launch does not match the pane")
+    settings = kept_settings(models_registry.LaunchSettings(owner.kind, "", "", ""), owner.arguments)
+    pairs = dict(zip(owner.arguments, owner.arguments[1:]))
+    sandbox, permission = pairs.get("--sandbox", ""), pairs.get("--permission-mode", "")
+    if (not settings.model or owner.kind == "codex" and
+            (not sandbox or pairs.get("--ask-for-approval") != "never") or owner.kind == "claude" and not permission):
+        raise ValueError("the worker launch settings are incomplete")
+    return progress_history.ParkedWorkerLaunch(str(worker.row.current_session), owner.kind, settings.model,
+        settings.effort, settings.service_tier, sandbox, permission)
+
+
 @herdr.pane_evidence_run()
 def close(parent: StaffId, name: WorkerName, *,
-          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
+          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
+          park: ParkWaitingPass | CloseEndedPane = CloseEndedPane.CHECK) -> Closed | Kept | UncertainWorker:
     with ExitStack() as operations:
         held = operations.enter_context(worker_lock(parent, name, blocking=True)) if isinstance(lock, WorkerLockAtUse) else lock
         if isinstance(held, Kept):
@@ -1739,6 +1918,9 @@ def close(parent: StaffId, name: WorkerName, *,
         client = _client()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
+        if (not held.active or held.parent != parent or held.name != name
+                or (row is None and held.bound) or (row is not None and not held.owns(row))):
+            return Kept("the worker changed before close")
         if row is None:
             _layout(parent, _evidence(parent, record, client))
             return Closed()
@@ -1754,14 +1936,55 @@ def close(parent: StaffId, name: WorkerName, *,
             if isinstance(observed, ProcessUnknownWorker):
                 return _uncertain(row, observed.reason)
             if isinstance(observed, (OpenWorker, StoppedWorker)):
-                permission = can_close(observed, lock=held)
+                permission = (can_close(observed, lock=held, park=park) if isinstance(park, ParkWaitingPass)
+                              else can_close(observed, lock=held))
                 if isinstance(permission, Kept):
                     return permission
+                if isinstance(park, ParkWaitingPass):
+                    from scripts.direct import progress_history
+
+                    assert isinstance(observed, OpenWorker)
+                    try:
+                        launch = _parked_launch(observed, client)
+                    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                        return _uncertain(row, str(error))
+                    if not progress_history.record_worker_park(park.run, row.id, park.instance, park.stage, launch=launch):
+                        return Kept("the worker pass changed before parking")
                 if not client.close_terminal_pane(observed.pane, observed.terminal):
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
             return Closed()
+
+
+def close_canceled_worker(run: Path, identity: StaffId, instance: str) -> None:
+    """Close the idle pane only if the canceled pass is still current."""
+    try:
+        record = staff.snapshot()
+        row = record.by_id(identity)
+        if row is None or row.kind != "worker":
+            return
+        parent = record.parent_of(row)
+        if parent is None:
+            return
+        name = WorkerName.parse(row.name)
+        with worker_lock(parent.id, name, blocking=True) as hold:
+            if isinstance(hold, Kept) or not hold.owns(row) or worker_run(row) != run:
+                return
+            current = worker_pass(row, run)
+            if current.get("instance_id") != instance or current.get("status") != "canceled":
+                return
+            with redirect_stderr(io.StringIO()) as diagnostics:
+                closed = close(parent.id, name, lock=hold)
+            if isinstance(closed, Closed):
+                _ = sys.stderr.write(diagnostics.getvalue())
+                return
+            reason = closed.blocker if isinstance(closed, Kept) else closed.reason
+            print(f"anomaly: {row.name}: canceled pane kept: {' '.join(reason.splitlines())}", file=sys.stderr)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+            staff.StaffRefused, staff.StaffUnreadable) as error:
+        print(f"anomaly: {identity}: canceled pane close failed: {' '.join(str(error).splitlines())}",
+              file=sys.stderr)
 
 
 def forget_restart(row: staff.StaffRow) -> None:

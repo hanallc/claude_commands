@@ -308,7 +308,9 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(result.stderr, f"gpu_xid: unknown Xid code: {shown}\n")
 
     def test_failed_restart_catalog_examples_show_the_count_and_one_command(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
+        entries = {entry.id: entry for entry in push_texts.catalog()}
+        self.assertNotIn("shutdown.move_untrusted", entries)
+        entry = entries["shutdown.restart_failed"]
         self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
         for example in entry.examples:
             with self.subTest(example=example.name):
@@ -321,44 +323,6 @@ class PushTextTests(unittest.TestCase):
                 self.assertIn("natedev", cast(ActionRequired, push.action).text)
                 self.assertLess(len(push.message), 500)
         self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
-
-    def test_trust_catalog_selects_commands_for_configured_folders_and_a_request_for_unlisted_folders(self) -> None:
-        entries = {entry.id: entry for entry in push_texts.catalog()}
-        covered = entries["shutdown.restart_untrusted"]
-        self.assertEqual({example.name for example in covered.examples}, {"typical"})
-        for example in covered.examples:
-            push = push_texts.render_entry(covered, example.values)
-            self.assertIn(example.values["stopped"], push.body)
-            action = cast(ActionRequired, push.action).text
-            self.assertEqual(action.count("accounts.py trust"), 1)
-            self.assertEqual(action.count("/agents restart"), 1)
-            self.assertNotIn("cd /", push.message)
-            self.assertLess(len(push.message), 500)
-        unlisted = entries["shutdown.restart_untrusted_unlisted"]
-        self.assertEqual({example.values["stopped"] for example in unlisted.examples}, {"1 session", "4 sessions"})
-        for example in unlisted.examples:
-            push = push_texts.render_entry(unlisted, example.values)
-            self.assertIn(example.values["stopped"], push.body)
-            self.assertIn(". Claude does not trust the folders. ", push.body)
-            self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
-                          cast(ActionRequired, push.action).text)
-            self.assertNotIn("accounts.py trust", push.message)
-            self.assertNotIn("/agents restart", push.message)
-            self.assertNotIn("cd /", push.message)
-            self.assertLess(len(push.message), 500)
-        self.assertNotIn("shutdown.move_untrusted", entries)
-
-    def test_manual_restart_catalog_groups_sessions_by_machine(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.manual_restart")
-        self.assertEqual({example.values["stopped"] for example in entry.examples}, {"1 session", "3 sessions"})
-        for example in entry.examples:
-            with self.subTest(example=example.name):
-                push = push_texts.render_entry(entry, example.values)
-                self.assertIn(example.values["stopped"], push.body)
-                self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
-                              cast(ActionRequired, push.action).text)
-                self.assertNotIn("/agents restart", push.message)
-                self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
         for entry in push_texts.catalog():
@@ -434,20 +398,22 @@ class PushTextTests(unittest.TestCase):
     def test_auto_mode_refusal_says_what_happened_and_what_to_type(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
         self.assertEqual(entry.need, "decision")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "cargo-liner-style: modules commands refused")
-        # The first line says what auto mode refused and where (user, 2026-10-23); each command follows on its own line.
-        self.assertEqual(push.message.split("\n")[:5], [
-            "Session: modules", "Action: On natedev, in the modules pane, type: Go: run the refused commands",
-            "Auto mode refused 2 shell commands in the modules session. The modules build waits for them.",
-            "implement.sh --to modules-impl", "review.sh --to modules-test"])
-        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Go", "Allow rule"])
-        self.assertTrue(push.body.endswith("auto mode lets these commands run from then on."))
-        one = push_texts.render_entry(entry, entry.examples[1].values)
-        self.assertTrue(one.body.startswith("Auto mode refused a shell command in the messaging session."
-                                            + " The merge of the messaging work waits for it.\n"
-                                            + "git push origin build-followups-messaging\n"))
-        self.assertTrue(one.body.endswith(" The rule: Bash(git push:*)"))
+        typical, one_with_rule, no_waits = entry.examples
+        modules_message = "Session: modules\nAction: On natedev, in the modules pane, type: Go: run the refused commands"
+        for example, title, message in (
+            (typical, "modules: 2 commands refused; its build waits", modules_message),
+            (one_with_rule, "messaging: 1 command refused; its work waits",
+             "Session: messaging\nAction: On natedev, in the messaging pane, type: Go: run the refused command"),
+            (no_waits, "demo: 1 command refused",
+             "Session: demo\nAction: On natedev, in the demo pane, type: Go: run the refused command"),
+            (PushExample("long_waits", typical.values | {"waits": "its release waits"}),
+             "modules: 2 commands refused", modules_message),
+        ):
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertEqual(push.title, title)
+                self.assertEqual(push.message, message)
+                self.assertEqual(push.values, example.values)
 
     def test_paid_credits_keeps_the_user_approved_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")

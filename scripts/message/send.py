@@ -136,7 +136,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
@@ -174,6 +174,7 @@ from scripts.message import postmaster  # noqa: E402
 from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
     from scripts.message import roster
+    from scripts.herdr import worker_panes
     from scripts.accounts import accounts
     from scripts.mac_test.mac_test import AskingSession, NoAskingSession
     from scripts.whoami.account import named_account_environment
@@ -201,11 +202,9 @@ MODEL = "sonnet"
 AUTO_MODE_TEXT = "auto_mode.refused"
 AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id auto_mode.refused'
                   + ' --value session=<session> --value machine=<machine>'
-                  + ' --value "command=<a refused command, short: the program and its key arguments>"'
-                  + ' [one --value command=... for each] --value "waits=<a sentence: what waits; no instruction>"'
+                  + ' --value "command=<a refused command>" [one --value command=... for each]'
+                  + ' [--value "waits=<a short clause such as its build waits or its merge waits>"]'
                   + ' [--value "rule=<the allow rule>"]')
-# The push shows a longer refused command cut to its first 89 characters and "…".
-REFUSED_COMMAND_LENGTH = 90
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -804,6 +803,15 @@ class WorkerResultNotSubmitted(Result):
 
 class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
+
+
+@dataclass(frozen=True)
+class BlockedWorkerResult:
+    """The worker needs input, and the result must wait for the pane."""
+
+    detail: str
+    send_to_holder: Callable[[str, str], Result]
+    outcome: Literal["retry"] = field(init=False, default="retry")
 
 
 class RecordedDeliveryAcceptance(Result):
@@ -4723,32 +4731,25 @@ def default_sender() -> str:
 
 
 def auto_mode_values(values: dict[str, str], commands: list[str], sender: str) -> dict[str, str]:
-    """The auto_mode.refused values: the session gives the facts and each refused command, in order.
-    This fills the sender, the kind of action (rca.action_of), the waits sentence and the grammar,
-    and shows each command on its own line."""
+    """Prepare the sender, command count, and waits clause for the catalog."""
     if not sender:
         raise ValueError(AUTO_MODE_TEXT + " is sent by a Claude session: its sender is that session's name,"
                          + " and this run has no session record")
     given = set(values)
-    required = {"session", "machine", "waits"}
-    if not required <= given or not given <= required | {"rule"}:
-        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, command, waits and an optional rule;"
-                         + f" missing {sorted(required - given)}; extra {sorted(given - required - {'rule'})}")
-    shown = [command.strip() for command in commands]
-    if not shown or not all(shown):
+    required = {"session", "machine"}
+    allowed = required | {"waits", "rule"}
+    if not required <= given or not given <= allowed:
+        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, command, and optional waits and rule;"
+                         + f" missing {sorted(required - given)}; extra {sorted(given - allowed)}")
+    if not commands or not all(command.strip() for command in commands):
         raise ValueError(AUTO_MODE_TEXT + ": give each refused command as its own --value command=..., none empty")
-    shown = [command if len(command) <= REFUSED_COMMAND_LENGTH else command[:REFUSED_COMMAND_LENGTH - 1] + "…"
-             for command in shown]
-    waits = values["waits"].strip().rstrip(".")
+    waits = values.get("waits", "").strip().rstrip(".")
     if typed_texts(waits) or named_places(waits):
         raise ValueError(AUTO_MODE_TEXT + ": waits says only what waits; it tells the user to type nothing"
                          + " and names no pane or session. The Action line says what the user does")
-    one = len(shown) == 1
-    rule = values.get("rule", "").strip()
-    return {"sender": sender, "session": values["session"], "machine": values["machine"],
-            "action": rca.action_of(commands), "refused": "\n".join(shown),
-            "noun": "command" if one else "commands", "this": "this" if one else "these",
-            "waits_line": rca.waits_line(waits), "rule_line": " The rule: " + rule if rule else ""}
+    count = len(commands)
+    return values | {"sender": sender, "count": str(count), "noun": "command" if count == 1 else "commands",
+                     "waits": rca.one_line(waits)}
 
 
 def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
@@ -4777,25 +4778,27 @@ def mac_locked_check(asking: AskingSession | NoAskingSession, clears_when: str) 
 
 
 def reviewed_waits(options: Options) -> Options:
-    """Review the waits sentence within the configured budget.
-
-    Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
-    """
+    """Review the waits clause within the budget."""
     values = template_values(options)
-    if not values.get("waits_line") or review.switched_off():
+    waits = values.get("waits", "")
+    if not waits or review.switched_off():
         return options
+    values["waits"] = ""
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
+    # Put the clause in the review body so its text is separate from the fixed title.
     draft = review.Draft(rendered.sender, decision_priority.priority(options.need, options.due), rendered.title, rendered.action,
-                         rendered.body, False, rendered.session)
-    outcome = review.review(draft, False, limit=waits_review_seconds())
+                         rca.waits_line(waits).strip(), False, rendered.session)
+    outcome = review.review(draft, False, limit=waits_review_seconds(), text_id=AUTO_MODE_TEXT)
     if isinstance(outcome, review.Approved):
         return options
+    header = first_line(draft.action, draft.session)
+    if outcome.failures and all(failure.quote and (failure.quote in draft.title or failure.quote in header)
+                                for failure in outcome.failures):
+        return options
     why = outcome.why if isinstance(outcome, review.Unreviewed | review.Withheld) else ", ".join(outcome.failed_rules)
-    print(f"send.py: {AUTO_MODE_TEXT} goes without its waits sentence: the review gave {why}", file=sys.stderr)
-    values["waits_line"] = ""
-    rendered = push_texts.render(AUTO_MODE_TEXT, **values)
+    print(f"send.py: {AUTO_MODE_TEXT} goes without its waits clause: {why}", file=sys.stderr)
     return options._replace(values=tuple(f"{key}={item}" for key, item in values.items()),
-                            text=session_prefix(rendered.session) + rendered.body)
+                            summary=rendered.title, text=session_prefix(rendered.session) + rendered.body)
 
 
 def paid_credits_values(text_id: str, values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
@@ -4824,10 +4827,11 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 
 def refusal_report(options: Options) -> rca.Report:
-    """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
+    """Give the RCA case the original commands and the reviewed waits clause."""
     values = template_values(options)
+    waits = values["waits"]
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
-                      waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
+                      waits=waits[:1].upper() + waits[1:], source=options.sender or "",
                       key=options.key or "")
 
 
@@ -5233,21 +5237,173 @@ def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -
 
 
 @dataclass(frozen=True)
-class WorkerResultReceipt:
+class WorkerResultProbe:
     marker: str
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
     worker_only: bool = False
+    before_holder: Callable[[], object] = lambda: None
 
     def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
+        from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
         from scripts.production import worker_admission
 
         backend = membership.backends.get(worker.id, staff.BACKEND_UNAVAILABLE)
         if isinstance(backend, staff.BackendUnavailable):
             raise ValueError("worker transcript backend is unavailable")
         source = worker_admission.transcript_source(worker, backend)
-        return any(isinstance(entry, str) and entry.startswith("user:\n") and self.marker in entry.splitlines()[1:]
-                   for entry in worker_admission.transcript_entries(source, set()))
+        for entry in worker_admission.transcript_entries(source, set()):
+            if not isinstance(entry, str) or not entry.startswith("user:\n"):
+                continue
+            body = entry.removeprefix("user:\n")
+            if body.lstrip().startswith(SCRIPT_ENVELOPE_START) and not body.rstrip().endswith(SCRIPT_ENVELOPE_END):
+                continue
+            if self.marker in body.splitlines():
+                return True
+        return False
+
+
+# The older message callers use this name for a transcript probe.
+WorkerResultReceipt = WorkerResultProbe
+
+
+@dataclass(frozen=True)
+class WorkerResultSubmission:
+    """Request pane input with confirmation of a new transcript occurrence."""
+
+    wait_for_idle: bool = False
+    before_input: Callable[[], object] = lambda: None
+    worker_only: bool = False
+    before_holder: Callable[[], object] = lambda: None
+
+
+class NoResultTranscript(Enum):
+    UNRECORDED = "the selected session does not have a transcript"
+
+
+def _result_transcript_source(worker: staff.StaffRow, membership: staff.StaffSnapshot
+                              ) -> Path | NoResultTranscript:
+    from scripts.production import worker_admission
+
+    backend = membership.backends.get(worker.id, staff.BACKEND_UNAVAILABLE)
+    if isinstance(backend, staff.BackendUnavailable):
+        raise ValueError("worker transcript backend is unavailable")
+    try:
+        return worker_admission.transcript_source(worker, backend)
+    except ValueError as error:
+        if str(error) != "no source transcript found":
+            raise
+        return NoResultTranscript.UNRECORDED
+
+
+def _result_transcript_cursors(source: Path, stream: str
+                               ) -> Iterator[tuple[dict[str, object], worker_panes.TranscriptCursor]]:
+    from scripts.herdr import worker_panes
+    from scripts.production import worker_admission
+
+    records = worker_admission.transcript_records(
+        source, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL)
+    for entry, cursor in worker_panes.transcript_record_cursors(records, stream):
+        if isinstance(entry, worker_admission.TornTranscriptRecord):
+            raise ValueError("worker transcript has incomplete records")
+        yield entry, cursor
+
+
+def _result_submission_boundary(worker: staff.StaffRow, membership: staff.StaffSnapshot
+                                ) -> worker_panes.TranscriptCursor | NoResultTranscript:
+    from scripts.herdr import worker_panes
+
+    source = _result_transcript_source(worker, membership)
+    if isinstance(source, NoResultTranscript):
+        return source
+    stream = worker_panes.transcript_stream(worker, source)
+    boundary = worker_panes.TranscriptCursor(stream, 0, hashlib.sha256().hexdigest())
+    for _, boundary in _result_transcript_cursors(source, stream):
+        pass
+    return boundary
+
+
+@dataclass(frozen=True)
+class WorkerResultSubmitted:
+    """The selected session records the result input after the submission boundary."""
+
+    worker: staff.StaffId
+    session: staff.StaffId
+    pane: str
+    terminal: str
+    name: str
+    cursor: worker_panes.TranscriptCursor
+    input_digest: str
+    outcome: Literal["sent"] = field(init=False, default="sent")
+
+    @property
+    def detail(self) -> str:
+        return f"worker {self.name} at {self.pane}"
+
+
+def _confirm_worker_result(worker: staff.StaffRow, pane: str, terminal: str, text: str,
+                           boundary: worker_panes.TranscriptCursor | NoResultTranscript,
+                           ) -> WorkerResultSubmitted | WorkerResultUnconfirmed:
+    from scripts.herdr import worker_panes
+    from scripts.lib.script_envelope import script_prompt
+    from scripts.production import worker_admission
+
+    membership = staff.local_snapshot()
+    current = membership.by_id(worker.id)
+    if current is None or current.current_session != worker.current_session:
+        return WorkerResultUnconfirmed("retry", "the worker session changed after submission")
+    missing = WorkerResultUnconfirmed("retry", "the worker transcript has no result receipt")
+    source = _result_transcript_source(current, membership)
+    if isinstance(source, NoResultTranscript):
+        return missing
+    stream = worker_panes.transcript_stream(current, source)
+    if isinstance(boundary, worker_panes.TranscriptCursor) and boundary.stream != stream:
+        return missing
+    beyond_boundary = isinstance(boundary, NoResultTranscript) or boundary.position == 0
+    submitted = script_prompt(text)
+    expected = "user:\n" + submitted.rstrip()
+    found: list[worker_panes.TranscriptCursor] = []
+    for entry, cursor in _result_transcript_cursors(source, stream):
+        if beyond_boundary and entry.get("isMeta") is not True:
+            if worker_admission.transcript_entry(entry, set()).rstrip() == expected:
+                found.append(cursor)
+        if cursor == boundary:
+            beyond_boundary = True
+    if len(found) != 1:
+        return missing
+    return WorkerResultSubmitted(worker.id, worker.current_session, pane, terminal, worker.name, found[0],
+                                 worker_panes.worker_input_digest(submitted))
+
+
+def worker_result_input_matches(worker: staff.StaffRow, membership: staff.StaffSnapshot, run_id: str,
+                                expected: worker_panes.TranscriptCursor, input_digest: str) -> bool:
+    from scripts.herdr import worker_panes
+    from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
+    from scripts.production import worker_admission
+
+    source = _result_transcript_source(worker, membership)
+    if isinstance(source, NoResultTranscript):
+        return False
+    stream = worker_panes.transcript_stream(worker, source)
+    if stream != expected.stream:
+        return False
+    for entry, cursor in _result_transcript_cursors(source, stream):
+        if cursor.position != expected.position:
+            continue
+        if cursor != expected or entry.get("isMeta") is True:
+            return False
+        text = worker_admission.transcript_entry(entry, set())
+        if not text.startswith("user:\n"):
+            return False
+        body = text.removeprefix("user:\n")
+        if worker_panes.worker_input_digest(body) != input_digest:
+            return False
+        body = body.strip()
+        if body.startswith(SCRIPT_ENVELOPE_START) and body.endswith(SCRIPT_ENVELOPE_END):
+            body = body.removeprefix(SCRIPT_ENVELOPE_START).removesuffix(SCRIPT_ENVELOPE_END).strip()
+        first, _, rest = body.partition("\n")
+        return first == f"Detached run: {run_id}" and bool(rest.strip())
+    return False
 
 
 class OrdinaryWorkerMessage(Enum):
@@ -5256,30 +5412,43 @@ class OrdinaryWorkerMessage(Enum):
 
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "",
-                        receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
+                        receipt: WorkerResultProbe | WorkerResultSubmission | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result:
+                        review_text: str = "", allow_holder_fallback: bool = True, skip_closed: bool = False) -> Result | BlockedWorkerResult | WorkerResultSubmitted:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
 
     holder = membership.parent_of(worker)
-    worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
+    worker_only = isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)) and receipt.worker_only
     if holder is None:
         return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
+
+    def send_to_holder(fallback_reason: str, body: str) -> Result:
+        address = f"session:{holder.current_session}"
+        options = parse(["--here", "--to", address, "--from", sender, "--timeout", str(timeout),
+                         "--text", f"Worker {worker.name}: {one_line(fallback_reason)}\n{body}"])
+        return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
             attempting_input = False
+            boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
             def require_idle() -> None:
-                nonlocal attempting_input
+                nonlocal attempting_input, boundary
                 readiness = prompt_client.readiness(state.pane)
                 if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
                     raise herdr_types.HerdrFailure("worker is not ready for input")
-                assert isinstance(receipt, WorkerResultReceipt)
+                assert isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission))
                 _ = receipt.before_input()
+                if isinstance(receipt, WorkerResultSubmission):
+                    try:
+                        boundary = _result_submission_boundary(worker, membership)
+                    except (OSError, ValueError) as error:
+                        raise herdr_types.HerdrFailure(f"worker transcript is unavailable: {error}") from error
                 attempting_input = True
 
             def check_message_status() -> None:
@@ -5289,7 +5458,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
 
             submission = herdr.TrackedPromptSubmission(check_message_status)
 
-            if isinstance(receipt, WorkerResultReceipt):
+            if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                 wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
                 can_prompt = state.status.idle or wait_for_idle
                 on_submission = require_idle
@@ -5299,11 +5468,10 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 on_submission = submission
 
             if can_prompt:
-                ordinary_address = (isinstance(receipt, OrdinaryWorkerMessage)
-                                    and not isinstance(selection, FixedStaffLookup))
-                prepared_client = None if ordinary_address else herdr.Herdr(herdr.shared_session())
+                fixed_message = isinstance(receipt, OrdinaryWorkerMessage) and isinstance(selection, FixedStaffLookup)
+                fixed_client = herdr.Herdr(herdr.shared_session()) if fixed_message else None
                 try:
-                    prompt_client = prepared_client if prepared_client is not None else herdr.Herdr(herdr.shared_session())
+                    prompt_client = fixed_client if fixed_client is not None else herdr.Herdr(herdr.shared_session())
                     if wait_for_idle:
                         _ = prompt_client.wait_turn_end(state.pane, int(timeout * 1000))
                     if isinstance(selection, FixedStaffLookup):
@@ -5322,25 +5490,26 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                                 f"worker message delivery unconfirmed: {reason}. "
                                 + "The message may already have arrived. Do not resend it.")
                     elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
-                        launch_error = error.__cause__ if isinstance(error, herdr_types.HerdrFailure) else error
-                        if (not attempting_input or isinstance(error, herdr.HerdrLaunchRefused)
-                                or isinstance(launch_error, OSError)
-                                and prepared_client is not None
-                                and cast(object, launch_error.filename) == prepared_client.binary):
+                        if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
                             return WorkerResultNotSubmitted("retry", reason)
                     else:
                         raise
-                if isinstance(receipt, WorkerResultReceipt):
+                if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
+                        if isinstance(receipt, WorkerResultSubmission):
+                            return _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
                         if receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                    except (OSError, ValueError) as error:
+                    except (OSError, ValueError, staff.StaffUnreadable) as error:
                         reason = f"worker transcript is unavailable: {error}"
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"
-                if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
-                    return Result("retry", reason)
+                if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
+                    if state.status != herdr.AgentStatus.BLOCKED or worker_only:
+                        return Result("retry", reason)
+                    if allow_holder_fallback and not isinstance(selection, FixedStaffLookup):
+                        return BlockedWorkerResult(reason, send_to_holder)
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -5353,10 +5522,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return Result("retry", reason)
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
-    address = f"session:{holder.current_session}"
-    options = parse(["--here", "--to", address, "--from", sender,
-                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
-    return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+    if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
+        _ = receipt.before_holder()
+    return send_to_holder(reason, text)
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
@@ -5654,6 +5822,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                                          sender=message.sender, timeout=options.timeout, selection=options.selection,
                                          review_text=review_text, allow_holder_fallback=not batch_only,
                                          skip_closed=options.skip_closed)
+            assert isinstance(result, Result)
         else:
             claude_started = time.monotonic()
             def relay_and_queue(relay_message: Message, timeout: float) -> Result:

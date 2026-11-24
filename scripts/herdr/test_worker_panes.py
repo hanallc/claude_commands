@@ -143,6 +143,8 @@ class PaneWorld(herdr.Herdr):
         _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
+        for name in ("detached_runs.conf", "postmaster.conf"):
+            _ = write_config_fixture(config / name)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
@@ -250,8 +252,7 @@ class PaneWorld(herdr.Herdr):
     def process_start(self, pid: int) -> str | None:
         """Read the process generation from the private stat file."""
         if pid in self.processes:
-            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                observed = process_start.process_start(pid)
+            observed = process_start.proc_table_start(pid, self.process_root)
         else:
             observed = process_start.process_start(pid)
         return observed.start if isinstance(observed, process_start.Started) else None
@@ -262,8 +263,7 @@ class PaneWorld(herdr.Herdr):
         observed_start = process_start.process_start
         def read(pid: int) -> process_start.ProcessStart:
             if pid in self.processes:
-                with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                    return observed_start(pid)
+                return process_start.proc_table_start(pid, self.process_root)
             return observed_start(pid)
         with patch.object(process_start, "process_start", side_effect=read):
             yield
@@ -383,7 +383,7 @@ class PaneWorld(herdr.Herdr):
                                          if identity.split(":p")[-1].isdigit()), default=0))
             anchor = self.locations[destination.of_pane]
             self.locations[pane] = {**anchor, "pane_id": pane, "label": destination.label,
-                                    "terminal_id": "terminal-" + pane, "focused": False}
+                                    "terminal_id": "terminal-" + pane, "focused": False, "agent_status": "idle"}
             _ = self.locations[pane].pop("agent_session", None)
             self.split_leaf(destination.of_pane, pane, destination.direction, destination.ratio)
         else:
@@ -976,8 +976,10 @@ class WorkerPaneTests(StaffTestCase):
                 write_text_atomic(prompt, "Preserve the source behavior.\n")
                 _ = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
-                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
                 before = self.staff_state()
+                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
+                if status == "canceled":
+                    self.assertEqual(self.world.closed, [*expected, (pane, "terminal-" + pane)])
                 result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                 self.assertIsInstance(result, worker_panes.Closed)
                 expected.append((pane, "terminal-" + pane))
@@ -1670,6 +1672,25 @@ class WorkerPaneTests(StaffTestCase):
                     for launch in (first_arguments, arguments):
                         self.assertEqual(launch.count("--autocompact"), 1)
                         self.assertEqual(launch[launch.index("--autocompact") + 1], "200k")
+
+    def test_parked_launch_keeps_saved_settings_and_uses_the_worker_compact_window(self) -> None:
+        _ = write_registry(self.root / "conf/models.conf", {"compact_windows": {"worker": "200k"}})
+        for family in ("claude", "codex"):
+            with self.subTest(family=family):
+                row = self.worker(f"parked-{family}", family=family)
+                parked_pass: dict[str, object] = {
+                    "status": "active",
+                    "parked_completion_id": "fixture-pass",
+                    "delivery": {"completion_id": "fixture-pass"},
+                    "parked_launch": {"thread": row.current_session, "family": family, "model": "saved-model",
+                                      "effort": "medium", "sandbox": "read-only", "permission": "acceptEdits"},
+                }
+                policy = worker_panes.parked_launch_policy(row, parked_pass)
+                assert isinstance(policy, worker_panes.LaunchPolicy)
+                self.assertEqual(policy.settings, models_registry.LaunchSettings(family, "saved-model", "medium", ""))
+                self.assertEqual((policy.sandbox, policy.permission), ("read-only", "acceptEdits"))
+                expected_window = ("--autocompact", "200k") if family == "claude" else ()
+                self.assertEqual(policy.compact_window, expected_window)
 
     def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})

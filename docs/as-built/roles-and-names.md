@@ -58,7 +58,7 @@ An addressed reviewer's lens comes from dispatch evidence.
 
 ## Why
 
-- **A merge-gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
+- **A gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
 - **Per-file kept contexts.** Global path masking would hide a returning name in a kept file.
 - **Explicit inflected forms.** A general English plural rule would match words with other meanings.
 - **No count in a plain check.** The sentence count is not a finding, and it sets a floor of about 2.5 s.
