@@ -1429,16 +1429,26 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         assert "remote_host" not in held.record
         saved = claim_state.saved_mac_repository(held.record)
         assert isinstance(saved, claim_state.MacRepositoryIdentity)
+        mirror_path = f".local/state/mac-test/mirror/{saved.mirror_name}"
+        physical = self.root / mirror_path
+        physical.mkdir(parents=True)
+        directory = physical.stat()
+        dispatched = replace(saved, dispatch={
+            "boot_id": "fixture-boot", "mirror_path": mirror_path, "home": str(self.root),
+            "physical_path": str(physical.resolve()), "device": directory.st_dev, "inode": directory.st_ino,
+        })
         identity = claim_state.claim_identity(held.record)
         request = offload.OffloadRequest(self.checkout, "hana", "test", offload.NO_RESULT_FILE, (),
             "direct", "", target="mac", admission=offload.MacClaimFromWait(waiting.pid, identity, NoOwningSession()))
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 record: claim_state.RemoteJobClaim = {**held.record, "remote_host": "old-mac", "cleanup_pending": True}
-                scope = claim_state.NO_SAVED_MAC_REPOSITORY if legacy else saved
+                scope = claim_state.NO_SAVED_MAC_REPOSITORY if legacy else dispatched
                 if legacy:
                     _ = record.pop("mac_repository")
                     record["repo_name"] = "old-scope"
+                else:
+                    record["mac_repository"] = dispatched.record()
                 mac_test.write_json(held.path, record)
                 controller = offload.ProcessController()
                 repo = eligibility.KnownRepository(saved.mirror_name, saved.key)
@@ -1454,6 +1464,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                             self.fail("The cleanup lease must be held during handoff")
                         current.mac_repository = scope
                         current.claim_identity = identity
+                        current.claim_scope_key = claim_state.claim_fence_scope_key(held.path, record)
                         return offload.TakenOverMacClaim("old-mac", 1)
                     self.assertFalse(held.path.exists())
                     self.assertIsInstance(current.claim_identity, claim_state.NoClaimIdentity)
@@ -1478,12 +1489,22 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
                     check.assert_not_called()
                     release_child.assert_not_called()
                     self.assertEqual(claim_state.read_run(held.path), record)
-                    self.assertIsInstance(offload.run_offload(controller, config, request, time.monotonic()),
-                                          offload.PassedOnMac)
-                    self.assertEqual(take.call_count, 2)
-                    check.assert_called_once_with(config, "old-mac", offload.ALL_MIRRORS if legacy else repo, "mac", 1)
-                    release_child.assert_called_once()
-                    run.assert_called_once()
+                    result = offload.run_offload(controller, config, request, time.monotonic())
+                    if legacy:
+                        self.assertIsInstance(result, offload.BusyMacDecline)
+                        take.assert_called_once()
+                        check.assert_not_called()
+                        release_child.assert_not_called()
+                        run.assert_not_called()
+                        self.assertEqual(claim_state.read_run(held.path), record)
+                    else:
+                        self.assertIsInstance(result, offload.PassedOnMac)
+                        self.assertEqual(take.call_count, 2)
+                        fence = offload.start_fence_relative(
+                            identity, "mac", scope_key=dispatched.fence_scope_key()).with_suffix(".lock")
+                        check.assert_called_once_with(config, "old-mac", repo, "mac", 1, saved=dispatched, fence=fence)
+                        release_child.assert_called_once()
+                        run.assert_called_once()
 
     def test_claim_repository_distinguishes_the_three_history_key_cases(self) -> None:
         mirror = claim_state.mac_repository_identity(str(self.checkout))

@@ -186,7 +186,7 @@ fi
 remote=${!#}
 if [[ $remote == *dispatch_start_settled=* && $remote == *"printf 'leftovers=0"* &&
       $remote != *'select_leftovers()'* ]]; then
-    /bin/bash -c "$remote"
+    /bin/bash -c $'sysctl() { printf "fixture-boot\\n"; }\n'"$remote"
     exit $?
 fi
 if [[ $remote == *sweep.sweep_workspace* && $remote != *'~/.claude/scripts/lint/lint '* ]]; then
@@ -236,6 +236,23 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
 fi
 if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'lint clippy'* ||
       $remote == *'lint mend-check'* || $remote == *'lint doc'* ]]; then
+    if [[ $remote == *'mac_dispatch='* && ${run_dispatch_reported:-1} == 1 ]]; then
+        python3 -B - "$remote" <<'PY'
+import os, shlex, sys
+from pathlib import Path
+
+words = shlex.split(sys.argv[1])
+action = words.index("mirror-use")
+mirror = Path.home() / words[words.index("--path", action) + 1]
+mirror.mkdir(parents=True, exist_ok=True)
+step = shlex.split(words[words.index("-c", action) + 1])
+assert step[:3] == ["cd", str(mirror.relative_to(Path.home())), "&&"], step[:3]
+program = step[step.index("python3") + 3]
+os.chdir(mirror)
+sys.argv = ["-c", "fixture-boot"]
+exec(program)
+PY
+    fi
     if (( hold_run )); then
         printf 'mac_exit=0\nfixture acknowledgement\n'
         printf 'started\n' > "$root/run-started"
@@ -257,7 +274,8 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
     if (( run_status_reported )); then
         printf '%s\n' "$run_status_line"
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
-        python3 - "$claim_file" <<'SETTLE_FENCE'
+        if (( ${run_fence_reported:-1} )); then
+            python3 - "$claim_file" <<'SETTLE_FENCE'
 ''' + python_tool_source(r'''
 from pathlib import Path
 import subprocess
@@ -274,6 +292,7 @@ command = offload.start_fence_command(
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
 ''') + r'''
 SETTLE_FENCE
+        fi
     fi
     exit "$run_ssh_status"
 fi

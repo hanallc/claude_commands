@@ -558,6 +558,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertEqual(
                     cleanup_arguments[:-1],
                     [
+                        *offload.MAC_DEPARTURE_SSH_OPTIONS,
                         "-o",
                         "BatchMode=yes",
                         "-o",

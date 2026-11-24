@@ -215,6 +215,15 @@ def fetch(*arguments):
     actions.append("fetch")
     return offload.Fetched(root / "fetched", 1)
 
+def dispatch_report():
+    mirror = Path.home() / controller.dispatch_mirror.path
+    mirror.mkdir(parents=True, exist_ok=True)
+    identity = mirror.stat()
+    return "mac_dispatch=" + json.dumps({
+        "boot_id": "fixture-boot", "home": str(Path.home()), "physical_path": str(mirror.resolve()),
+        "device": identity.st_dev, "inode": identity.st_ino,
+    }) + "\n"
+
 def stream(arguments, *limits):
     global remote_output, remote_status
     actions.append("run")
@@ -226,7 +235,11 @@ def stream(arguments, *limits):
         (root / "mac-loss-ready").touch()
         remote_output, remote_status = ((offload.MAC_NEXTTEST_SETUP_FAILURE + "\n", 101)
                                         if mode == "setup-failure-cleanup-timeout" else ("mac_exit=42\n", 42))
-        program = f"import os, select; print({remote_output.rstrip()!r}, flush=True); "
+        output = remote_output
+        if mode == "cleanup-stream-timeout":
+            assert "mac_dispatch=" in arguments[-1], arguments
+            output = dispatch_report() + output
+        program = f"import os, select; print({output.rstrip()!r}, flush=True); "
         if mode == "post-fetch-cleanup-timeout":
             program += "os.close(1); os.close(2); "
         program += "select.select([], [], [])"
@@ -257,6 +270,8 @@ def stream(arguments, *limits):
             assert settled.returncode == 0, settled.stderr
             wire += settled.stdout
 
+    if "mac_dispatch=" in arguments[-1]:
+        wire = dispatch_report() + wire
     remote_output, remote_status = wire, status
 
     if limits:
@@ -280,8 +295,12 @@ real_popen = subprocess.Popen
 real_fetch = offload.fetch_folder
 def commands(arguments, **options):
     if arguments[0] == "ssh":
+        if mode in ("cleanup-stream-timeout", "post-fetch-cleanup-timeout"):
+            actions.append("release-probe")
+            assert "kern.bootsessionuuid" in arguments[-1] and "kill " not in arguments[-1], arguments
+            return subprocess.CompletedProcess(arguments, 0, "leftovers=1\nrc=0\n", "")
         actions.append("cleanup")
-        if mode in ("cleanup-stream-timeout", "setup-failure-cleanup-timeout", "post-fetch-cleanup-timeout"):
+        if mode == "setup-failure-cleanup-timeout":
             raise AssertionError("A timed-out stream must not start another cleanup")
         if mode in ("lost-cleanup-timeout", "lost-authorization-reply"):
             (root / "mac-loss-ready").touch()

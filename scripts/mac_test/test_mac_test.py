@@ -14,6 +14,7 @@ import socket
 import os
 import runpy
 import select
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, final, override
 
 from scripts.build_queue import execution_identity
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -3385,7 +3386,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             self.assertEqual(transport_calls, 2)
             send.assert_called_once()
 
-    def test_idle_watcher_keeps_the_claim_and_fence_when_the_saved_host_lease_is_busy(self) -> None:
+    def test_watcher_keeps_the_claim_and_fence_when_the_saved_host_lease_is_busy(self) -> None:
         from scripts.copies import copies
         from scripts.mac_test import offload
 
@@ -3406,7 +3407,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(offload, "read_leftovers") as check, mock.patch.object(mac_test, "send_message") as send:
             _ = self.watch_once()
-        activity.assert_called_once_with(mac_test.read_config(), "claim-mac")
+        activity.assert_not_called()
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(pending.read_text(), "pending")
         check.assert_not_called()
@@ -3624,8 +3625,10 @@ fi
                 self.assertEqual(self.read_claim(), record)
                 self.assertTrue(pending.exists())
 
-                def end_work(repository: offload.MirrorScope, target: str, slot: int, *, fence: Path) -> str:
+                def end_work(repository: offload.MirrorScope, target: str, slot: int, *,
+                             dispatch: claim_state.MacDispatchRecord | None, fence: Path) -> str:
                     self.assertEqual((repository, target, slot), (offload.ALL_MIRRORS, self.paths.target, 1))
+                    self.assertIsNone(dispatch)
                     self.assertEqual(self.root / fence, fence_directory / (pending.name + ".lock"))
                     return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
 
@@ -3667,7 +3670,8 @@ fi
                 mock.patch.object(offload, "read_leftovers", return_value=observation), \
                 mock.patch.object(offload, "leftover_check_script", return_value="count all mirrors") as check:
             result = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "", remote_work=stopped)
-        check.assert_called_once_with(offload.ALL_MIRRORS, self.paths.target, 1)
+        fence = offload.start_fence_relative(identity, self.paths.target).with_suffix(".lock")
+        check.assert_called_once_with(offload.ALL_MIRRORS, self.paths.target, 1, dispatch=None, fence=fence)
         self.assertEqual(result, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
         self.assertEqual(self.read_claim(), record)
 
@@ -3762,6 +3766,185 @@ fi
 
     def read_repository_claim(self, name: str) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
+
+    def check_kept_mirror(self, outcome: Literal["empty", "busy", "ssh failure", "timeout", "probe failure",
+                                                "boot changed", "fence held", "replacement Mac", "changed root",
+                                                "physical home", "unresolved mirror", "retargeted mirror",
+                                                "replaced physical directory"]) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import offload
+        from scripts.mac_test.offload_test_commands import write_shell
+
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "hana", "hana.json", "hana").for_remote_claim()
+        boot = "31C2CDF0-B7BB-4996-A850-E5FE36B08363"
+        saved_path = offload.mac_mirror_root().relative + "/hana"
+        home = self.root
+        if outcome == "physical home":
+            physical_home = self.root / "physical-home"
+            physical_home.mkdir()
+            home = self.root / "linked-home"
+            home.symlink_to(physical_home, target_is_directory=True)
+        mirror = home / saved_path
+        if outcome == "retargeted mirror":
+            original = self.root / "original-mirror"
+            original.mkdir()
+            mirror.parent.mkdir(parents=True)
+            mirror.symlink_to(original, target_is_directory=True)
+        else:
+            mirror.mkdir(parents=True, exist_ok=True)
+        physical = mirror.resolve()
+        directory = physical.stat()
+        records = self.write_repository_claims(mac_repository={**saved.record(), "dispatch": {
+                                                   "boot_id": boot, "mirror_path": saved_path, "home": str(home),
+                                                   "physical_path": str(physical), "device": directory.st_dev,
+                                                   "inode": directory.st_ino}},
+                                               repo_name=saved.mirror_name, repo_key=saved.key,
+                                               proc_start="ended-owner", cleanup_pending=True)
+        if outcome == "changed root":
+            _ = write_config_fixture(Path(os.environ["MAC_TEST_CONFIG"]), "mirror_root=~/new-root\n")
+        if outcome == "retargeted mirror":
+            empty = self.root / "empty-mirror"
+            empty.mkdir()
+            mirror.unlink()
+            mirror.symlink_to(empty, target_is_directory=True)
+        if outcome == "replaced physical directory":
+            _ = mirror.rename(self.root / "old-mirror")
+            mirror.mkdir()
+        if outcome == "unresolved mirror":
+            mirror.rmdir()
+        path = self.paths.claims / saved.claim_file
+        claim = claim_state.read_run(path)
+        assert isinstance(claim, dict)
+        pending = claim_state.claim_pending_start(self.paths, path, claim)
+        pending.parent.mkdir(parents=True)
+        _ = pending.write_text("pending")
+        identity = claim_state.claim_identity(claim)
+        scope_key = claim_state.claim_fence_scope_key(path, claim)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac", scope_key=scope_key),
+                                              self.root)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        fence = home / offload.start_fence_relative(identity, "mac", scope_key=scope_key).with_suffix(".lock")
+        write_shell(self.root / "lsof", r"printf 'p77\0coutside worker\0\n'" if outcome == "fence held" else "exit 1\n")
+
+        def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+            self.assertIn("StrictHostKeyChecking=yes", arguments)
+            if outcome == "ssh failure":
+                return subprocess.CompletedProcess(arguments, 255, "", "private SSH failure")
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(arguments, cast(float, options["timeout"]))
+            mirror_path = (saved_path if outcome in ("busy", "changed root", "physical home")
+                           else saved_path.rsplit("/", 1)[0] + "/cargo-liner")
+            cwd = f"n{physical}" if outcome == "retargeted mirror" else f"n{home.resolve()}/{mirror_path}"
+            observed_boot = "other-boot" if outcome == "replacement Mac" else boot
+            setup = ("id() { echo 501; }\npgrep() { return 1; }\n"
+                     + f"sysctl() {{ echo {observed_boot}; }}\n"
+                     + f"lsof() {{ printf 'p42\\n%s\\n' {shlex.quote(cwd)}; }}\n")
+            if outcome == "probe failure":
+                setup += "lsof() { return 1; }\n"
+            if outcome == "boot changed":
+                setup += ('sysctl() { if [ -f "$HOME/boot-read" ]; then echo changed; '
+                          f'else touch "$HOME/boot-read"; echo {boot}; fi; }}\n')
+            if outcome == "fence held":
+                with fence.open("r") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    result = self.run_private_shell(setup + arguments[-1], self.root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("leftovers=1\nrc=0\n", result.stdout)
+                return result
+            result = self.run_private_shell(setup + arguments[-1], self.root)
+            if outcome in ("physical home", "retargeted mirror"):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("leftovers=1\nrc=0\n", result.stdout)
+            if outcome in ("unresolved mirror", "replaced physical directory"):
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+            return result
+
+        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.dict(os.environ, {"HOME": str(home), "PATH": f"{self.root}:{os.environ['PATH']}"}), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 1)), \
+             mock.patch.object(subprocess, "run", side_effect=remote) as ssh, \
+             mock.patch.object(copies, "remote_lease", wraps=copies.remote_lease) as lease, \
+             mock.patch.object(mac_test, "send_message") as send:
+            output = self.watch_once()
+        self.assertEqual(self.read_repository_claim("cargo-liner"), records["cargo-liner"])
+        if outcome == "empty":
+            self.assertFalse(path.exists())
+            self.assertFalse(pending.exists())
+            self.assertFalse(fence.exists())
+            send.assert_called_once()
+        else:
+            self.assertTrue(path.exists(), "The watcher removed the claim.")
+            self.assertEqual(self.read_repository_claim("hana"), records["hana"])
+            self.assertEqual(pending.read_text(), "pending")
+            send.assert_not_called()
+            if outcome == "fence held":
+                self.assertIn("the remote start fence is held by 77 outside worker", output)
+        ssh.assert_called_once()
+        lease.assert_called_once_with(copies.RemoteMirror("", copies.SelectedRepository("hana"),
+                                                         "claim-mac", saved_path, ""))
+
+    def test_kept_mirror_stays_when_ssh_reaches_a_replacement_mac(self) -> None:
+        self.check_kept_mirror("replacement Mac")
+
+    def test_kept_mirror_checks_the_dispatch_path_when_the_root_changes(self) -> None:
+        self.check_kept_mirror("changed root")
+
+    def test_kept_mirror_counts_work_under_the_physical_home_path(self) -> None:
+        self.check_kept_mirror("physical home")
+
+    def test_kept_mirror_stays_when_the_path_cannot_be_resolved(self) -> None:
+        self.check_kept_mirror("unresolved mirror")
+
+    def test_kept_mirror_stays_when_its_symlink_points_to_an_empty_directory(self) -> None:
+        self.check_kept_mirror("retargeted mirror")
+
+    def test_kept_mirror_stays_when_its_saved_directory_has_a_new_inode(self) -> None:
+        self.check_kept_mirror("replaced physical directory")
+
+    def test_kept_mirror_without_dispatch_identity_uses_the_idle_rule(self) -> None:
+        from scripts.copies import copies
+
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "hana", "hana.json", "hana").for_remote_claim()
+        expired = mac_test.timestamp(self.now - timedelta(minutes=20))
+        previous_record = {**saved.record(), "dispatch": {
+            "boot_id": "fixture-boot", "mirror_path": ".local/state/mac-test/mirror/hana", "home": str(self.root),
+        }}
+        records = self.write_repository_claims(mac_repository=previous_record, repo_name=saved.mirror_name,
+                                               repo_key=saved.key, proc_start="ended-owner", idle_since=expired)
+        path = self.paths.claims / saved.claim_file
+        self.assertEqual(self.read_repository_claim("hana"), records["hana"])
+        decoded = claim_state.read_run(path)
+        assert isinstance(decoded, dict)
+        self.assertEqual(claim_state.saved_mac_repository(decoded), saved)
+        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
+             mock.patch.object(mac_test, "send_message") as send:
+            _ = self.watch_once()
+        self.assertFalse(path.exists())
+        activity.assert_called_once()
+        send.assert_called_once()
+
+    def test_kept_mirror_releases_while_another_repository_runs(self) -> None:
+        self.check_kept_mirror("empty")
+
+    def test_kept_mirror_stays_when_its_process_runs(self) -> None:
+        self.check_kept_mirror("busy")
+
+    def test_kept_mirror_stays_when_ssh_fails_or_times_out(self) -> None:
+        for outcome in ("ssh failure", "timeout"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                self.paths = mac_test.StatePaths(Path(directory))
+                with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+                    self.check_kept_mirror(outcome)
+
+    def test_kept_mirror_stays_without_probe_boot_or_fence_proof(self) -> None:
+        for outcome in ("probe failure", "boot changed", "fence held"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                self.paths = mac_test.StatePaths(Path(directory))
+                with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+                    self.check_kept_mirror(outcome)
 
     def test_one_activity_check_per_host_serves_every_repository_claim(self) -> None:
         records = self.write_repository_claims()

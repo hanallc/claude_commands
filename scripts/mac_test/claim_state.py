@@ -328,6 +328,38 @@ class ResolveMacRepository:
 RESOLVE_MAC_REPOSITORY = ResolveMacRepository()
 
 
+class MacDispatchRecord(TypedDict):
+    boot_id: str
+    mirror_path: str
+    home: str
+    physical_path: str
+    device: int
+    inode: int
+
+
+def mac_dispatch_record(value: object, mirror_name: str) -> MacDispatchRecord | None:
+    if not isinstance(value, dict):
+        raise StateReadError("invalid Mac dispatch identity")
+    fields = cast(dict[str, object], value)
+    boot_id, mirror_path, home = (fields.get(field) for field in ("boot_id", "mirror_path", "home"))
+    if (not isinstance(boot_id, str) or not valid_mac_path_component(boot_id)
+            or not isinstance(mirror_path, str) or mirror_path.split("/")[-1] != mirror_name
+            or not all(valid_mac_path_component(part) for part in mirror_path.split("/"))
+            or not isinstance(home, str) or not Path(home).is_absolute()
+            or not home.isprintable() or str(Path(home)) != home or ".." in Path(home).parts):
+        raise StateReadError("invalid Mac dispatch identity")
+    if fields.keys() == {"boot_id", "mirror_path", "home"}:
+        return None
+    physical_path, device, inode = (fields.get(field) for field in ("physical_path", "device", "inode"))
+    if (not isinstance(physical_path, str) or not physical_path.startswith("/")
+            or not all(valid_mac_path_component(part) and part.isprintable() for part in physical_path[1:].split("/"))
+            or not isinstance(device, int) or isinstance(device, bool) or device < 0
+            or not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0):
+        raise StateReadError("invalid Mac dispatch mirror identity")
+    return {"boot_id": boot_id, "mirror_path": mirror_path, "home": home,
+            "physical_path": physical_path, "device": device, "inode": inode}
+
+
 class MacRepositoryRecord(TypedDict):
     key: str
     mirror_name: str
@@ -335,6 +367,7 @@ class MacRepositoryRecord(TypedDict):
     fence_directory: str
     fence_generation: NotRequired[str]
     history_key: NotRequired[str]
+    dispatch: NotRequired[MacDispatchRecord]
 
 
 @dataclass(frozen=True)
@@ -346,13 +379,14 @@ class MacMirrorIdentity:
     claim_file: str
     fence_directory: str
     fence_generation: str = field(default="", kw_only=True)
+    dispatch: MacDispatchRecord | None = field(default=None, kw_only=True)
 
     def for_slot(self, slot: int) -> Self:
         fence = mac_claim_stem(self.key, slot)
         return replace(self, claim_file=f"{fence}.json", fence_directory=fence, fence_generation="")
 
     def for_remote_claim(self) -> Self:
-        return replace(self, fence_generation=uuid4().hex)
+        return replace(self, fence_generation=uuid4().hex, dispatch=None)
 
     def fence_scope_key(self) -> str:
         """Include the generation in the key for a remote claim."""
@@ -363,6 +397,8 @@ class MacMirrorIdentity:
                                       "claim_file": self.claim_file, "fence_directory": self.fence_directory}
         if self.fence_generation:
             record["fence_generation"] = self.fence_generation
+        if self.dispatch is not None:
+            record["dispatch"] = self.dispatch
         return record
 
 
@@ -515,16 +551,17 @@ def mac_repository_record(value: object) -> MacRepositoryIdentity | CleanupOnlyM
     generation = fields.get("fence_generation", "")
     if not isinstance(generation, str) or ("fence_generation" in fields and not valid_fence_generation(generation)):
         raise StateReadError("invalid Mac fence generation")
+    dispatch = mac_dispatch_record(fields["dispatch"], mirror) if "dispatch" in fields else None
     raw_history_key = fields.get("history_key", store.UNKNOWN_IDENTITY)
     if not isinstance(raw_history_key, str):
         raise StateReadError("invalid Mac history key")
     try:
         history_key = KnownMacHistoryKey(raw_history_key)
     except UnknownMacHistoryKeyError:
-        return CleanupOnlyMacRepository(key, mirror, file, fence, fence_generation=generation)
+        return CleanupOnlyMacRepository(key, mirror, file, fence, fence_generation=generation, dispatch=dispatch)
     except ValueError as exc:
         raise StateReadError("invalid Mac history key") from exc
-    return MacRepositoryIdentity(key, mirror, file, fence, history_key, fence_generation=generation)
+    return MacRepositoryIdentity(key, mirror, file, fence, history_key, fence_generation=generation, dispatch=dispatch)
 
 
 class NoSavedMacRepository:

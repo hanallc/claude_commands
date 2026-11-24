@@ -12,7 +12,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
-    def test_cleanup_releases_its_verified_legacy_claim(self) -> None:
+    def test_cleanup_keeps_legacy_claim_without_dispatch_identity(self) -> None:
         _ = subprocess.run(
             ["git", "-C", str(self.repository), "remote", "add", "origin", "https://example.invalid/repos/hana.git"],
             check=True, capture_output=True,
@@ -25,9 +25,8 @@ class OffloadCommandTests(SeededCleanupFixture):
 
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assert_wire("declined", "busy")
-        self.assertFalse(legacy.exists())
-        cleanup, = self.leftover_events()
-        self.assertEqual(cleanup["args"][-2], "previous-mac")
+        self.assertTrue(legacy.exists())
+        self.assertEqual(self.leftover_events(), [])
 
     def test_cleanup_keeps_legacy_claim_with_relative_worktree(self) -> None:
         record = self.write_kept_claim(legacy=True)

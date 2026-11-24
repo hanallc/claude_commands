@@ -106,7 +106,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
             self.assertEqual(attempt["cleanup"], "unconfirmed")
         if mode == "post-fetch-cleanup-timeout":
             event, = self.ssh_events()
-            self.assertEqual(event["actions"][-3:], ["run", "fetch", "run"])
+            self.assertEqual(event["actions"][-4:], ["run", "fetch", "run", "release-probe"])
         controls = caller_provider_controls(self, self.admission)
         claim, = controls.claims("mac")
         identity = claim_state.claim_identity(claim.record)

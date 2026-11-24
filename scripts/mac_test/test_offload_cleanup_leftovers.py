@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import redirect_stderr
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager, redirect_stderr
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
-from typing import cast
+from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
+from scripts.copies import copies
 from scripts.mac_test import claim_state, eligibility, offload
+from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
+from scripts.mac_test.offload_test_support import FIXTURE_MIRROR_ROOT, SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
@@ -33,6 +36,107 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupSkipped()))
         self.assertIsInstance(controller.pending, offload.PendingStartOperation)
         self.assertEqual(stderr.getvalue(), "mac_test: the remote start fence is held by 2345 cargo helper\n")
+
+    def doc_with_cleanup_timeout(self, *, live_work: bool, mirror_root: str = FIXTURE_MIRROR_ROOT) -> subprocess.CompletedProcess[str]:
+        self.write_portable_workspace()
+        (Path(self.environment["HOME"]) / mirror_root / "hana").mkdir(parents=True)
+        self.fixture.update(selector_shell="sh", run_cleanup_line="", run_fence_reported=False)
+        self.sync_fixture()
+        selectors = self.stub_directory / "selectors"
+        selectors.mkdir()
+        write_shell(selectors / "pgrep", "printf '42\\n'" if live_work else "exit 1")
+        write_shell(selectors / "lsof", "printf 'p41\\nn/home/fixture\\n'")
+        write_shell(selectors / "sleep", "exit 99")
+        write_shell(selectors / "sysctl", "printf 'fixture-boot\\n'")
+        read_lines = offload.bounded_output_lines
+
+        def timeout_after_verdict(output: BinaryIO | TextIO,
+                                  remaining: Callable[[], float | None]) -> Generator[bytes]:
+            for line in read_lines(output, remaining):
+                yield line
+                if line == b"mac_exit=0\n":
+                    raise TimeoutError
+
+        with mock.patch.object(offload, "bounded_output_lines", side_effect=timeout_after_verdict):
+            result = self.command("--workspace", verb="doc", package="", runner_options=("--target", "mac"),
+                                  separate_stderr=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_wire("passed", "")
+        self.assertIn("cleanup timed out", result.stdout)
+        return result
+
+    def test_passed_doc_releases_claim_after_cleanup_stream_timeout(self) -> None:
+        _ = self.doc_with_cleanup_timeout(live_work=False)
+        self.assertFalse(self.claim_file.exists())
+        self.assertEqual(list((self.state_directory / "pending-starts").iterdir()), [])
+        proof, = self.leftover_events()
+        self.assertTrue(proof["claimed"])
+        self.assertNotIn("kill ", proof["args"][-1])
+
+    def test_passed_doc_keeps_claim_while_remote_work_remains(self) -> None:
+        result = self.doc_with_cleanup_timeout(live_work=True)
+        claim = claim_state.read_run(self.claim_file)
+        assert not isinstance(claim, claim_state.NoRun)
+        saved = claim_state.saved_mac_repository(claim)
+        assert isinstance(saved, claim_state.MacMirrorIdentity)
+        home = self.environment["HOME"]
+        mirror_path = f"{offload.mac_mirror_root().relative}/{saved.mirror_name}"
+        physical = (Path(home) / mirror_path).resolve()
+        identity = physical.stat()
+        self.assertEqual(saved.dispatch, {"boot_id": "fixture-boot", "mirror_path": mirror_path, "home": home,
+                                         "physical_path": str(physical), "device": identity.st_dev,
+                                         "inode": identity.st_ino})
+        self.assertEqual(len(list((self.state_directory / "pending-starts").iterdir())), 1)
+        proof, = self.leftover_events()
+        self.assertTrue(proof["claimed"])
+        self.assertNotIn("kill ", proof["args"][-1])
+        self.assertIn("stays busy", result.stderr)
+
+    def test_lost_link_before_dispatch_save_keeps_claim(self) -> None:
+        self.fixture.update(run_dispatch_reported=False, run_status_reported=False, run_ssh_status=255)
+        self.sync_fixture()
+
+        def empty_probe(*_args: object, **_options: object) -> offload.LeftoverObservation:
+            claim = claim_state.read_run(self.claim_file)
+            assert not isinstance(claim, claim_state.NoRun)
+            key = offload.pending_start_key(claim_state.claim_identity(claim))
+            return offload.LeftoverObservation(offload.LeftoversEnded(), f"dispatch_start_settled={key}\n")
+
+        with mock.patch.object(offload, "read_leftovers", side_effect=empty_probe) as probe:
+            result = self.command(separate_stderr=True)
+        self.assertTrue(self.claim_file.exists(), result.stdout + result.stderr)
+        self.assertEqual(len(list((self.state_directory / "pending-starts").iterdir())), 1)
+        probe.assert_not_called()
+
+    def test_root_change_after_lease_keeps_copy_command_and_probe_on_leased_path(self) -> None:
+        first = MacMirrorRoot(".local/state/mac-test/first-root")
+        second = MacMirrorRoot(".local/state/mac-test/second-root")
+        configured = first
+        lease = copies.remote_lease
+
+        @contextmanager
+        def change_root(mirror: copies.RemoteMirror) -> Generator[None]:
+            nonlocal configured
+            with lease(mirror):
+                configured = second
+                yield
+
+        with mock.patch.object(copies, "remote_lease", change_root), \
+             mock.patch.object(offload, "mac_mirror_root", side_effect=lambda: configured):
+            _ = self.doc_with_cleanup_timeout(live_work=True, mirror_root=first.relative)
+        claim = claim_state.read_run(self.claim_file)
+        assert not isinstance(claim, claim_state.NoRun)
+        saved = claim_state.saved_mac_repository(claim)
+        assert isinstance(saved, claim_state.MacMirrorIdentity) and saved.dispatch is not None
+        path = f"{first.relative}/{saved.mirror_name}"
+        self.assertEqual(saved.dispatch["mirror_path"], path)
+        copy, = self.events_for("rsync")
+        self.assertTrue(copy["args"][-1].endswith(f":{path}/"), copy["args"])
+        command, = [event["args"][-1] for event in self.events_for("ssh") if "lint doc" in event["args"][-1]]
+        self.assertIn(f"cd {path} &&", command)
+        proof, = self.leftover_events()
+        self.assertIn(path, proof["args"][-1])
+        self.assertNotIn(second.relative, proof["args"][-1])
 
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
@@ -192,10 +296,12 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assertEqual(float(self.wire_result()["seconds"]), 13.0 if outcome == "timeout" else 8.0)
 
     def test_leftover_selectors_complete_under_sh_and_zsh_before_releasing_claim(self) -> None:
+        (Path(self.environment["HOME"]) / FIXTURE_MIRROR_ROOT / "hana").mkdir(parents=True)
         selectors = self.stub_directory / "selectors"
         selectors.mkdir()
         for name in ("pgrep", "lsof", "sleep"):
             write_shell(selectors / name, SELECTOR_STUB)
+        write_shell(selectors / "sysctl", "printf 'fixture-boot\\n'")
         self.fixture["run_status_reported"] = True
         self.fixture["run_cleanup_line"] = ""
         self.config["leftover_timeout_s"] = "300"
@@ -222,7 +328,9 @@ class OffloadCommandTests(SeededCleanupFixture):
                         self.assertIn("lsof", names)
                     for call in calls:
                         if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", HANA_COMMAND_PATTERN])
+                            self.assertEqual(call["args"][:3], ["-u", str(os.getuid()), "-f"])
+                            self.assertTrue(call["args"][3].startswith("[/]"))
+                            self.assertIn("test-mirror/hana", call["args"][3])
                         if call["command"] == "lsof":
                             self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
                     answer = (self.stub_directory / "selector-answer").read_text()
