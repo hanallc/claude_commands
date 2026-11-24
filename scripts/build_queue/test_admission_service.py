@@ -65,7 +65,9 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, FixedSystemReader, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted,
+)
 
 
 def setUpModule() -> None:
@@ -1932,26 +1934,6 @@ class SwapInReadingsTests(unittest.TestCase):
                         assert isinstance(reading, records.ReadingUnavailable)
                         self.assertIn("swap-in reading unavailable", reading.reason)
                         self.assertIn(str(path), reading.reason)
-
-
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 class ReferenceActivityReader(ScopeActivityReader):

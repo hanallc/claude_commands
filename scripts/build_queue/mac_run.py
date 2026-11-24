@@ -1,12 +1,15 @@
 """Hold the repository claim for a mac-linux run."""
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, suppress
 import os
 from pathlib import Path
 import subprocess
+import sys
+from tempfile import TemporaryFile
 import time
 from uuid import uuid4
 
+from scripts.build_hold import override_guard
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib import conf
 from scripts.mac_test import claim_state, mac_test
@@ -72,8 +75,8 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         yield identity
     except BaseException as error:
         try:
-            if acquired or (claiming and _has_claim(paths, args.pid, identity)):
-                _release(paths, args.pid, identity, stop_seconds)
+            if acquired or claiming:
+                _release(paths, args.pid, identity, stop_seconds, required=acquired)
         except BaseException as release_error:
             error.add_note(f"Mac claim release failed: {release_error}")
         raise
@@ -100,23 +103,62 @@ def _has_claim(paths: claim_state.StatePaths, pid: int, identity: claim_state.Cl
     return False
 
 
-def _release(paths: claim_state.StatePaths, pid: int, identity: claim_state.ClaimIdentity, stop_seconds: float) -> None:
-    if not _has_claim(paths, pid, identity):
-        raise RuntimeError(f"{paths.target} has no matching repository claim")
+def _release(paths: claim_state.StatePaths, pid: int, identity: claim_state.ClaimIdentity, stop_seconds: float,
+             *, required: bool = True) -> None:
     deadline = time.monotonic() + stop_seconds
-    entry = Path(mac_test.__file__).resolve()
+    entry = Path(__file__).resolve()
+    python = entry.parents[1] / "lib/py"
+    command = [str(python), str(entry), paths.target, str(pid),
+               identity.claim_id, identity.episode, identity.attempt, str(deadline),
+               "required" if required else "if-present"]
     try:
-        result = subprocess.run(
-            [str(entry.parents[1] / "lib/py"), str(entry), "release", "--target", paths.target,
-             "--pid", str(pid), "--claim-id", identity.claim_id, "--episode", identity.episode,
-             "--attempt", identity.attempt, "--deadline-monotonic", str(deadline)],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-            timeout=max(0, deadline - time.monotonic()), check=False,
-        )
+        with TemporaryFile() as output, TemporaryFile() as errors:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, stop_seconds)
+            # Reserve time to reap the child within the same deadline.
+            kill_at = deadline - min(0.05, remaining / 2)
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=errors)
+            try:
+                status = child.wait(timeout=max(0, kill_at - time.monotonic()))
+            finally:
+                if child.returncode is None:
+                    child.kill()
+                    with suppress(subprocess.TimeoutExpired):
+                        _ = child.wait(timeout=max(0, deadline - time.monotonic()))
+            if status:
+                _ = errors.seek(0)
+                _ = output.seek(0)
+                diagnostic = errors.read().decode(errors="replace").strip() or output.read().decode(errors="replace").strip()
+                raise RuntimeError(diagnostic.removeprefix("cannot release: ") or
+                                   f"{paths.target} claim release exited with status {status}")
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"{paths.target} claim release deadline expired") from error
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip().removeprefix("cannot release: ") or
-                           f"{paths.target} claim release exited with status {result.returncode}")
+
+
+def _release_command(argv: Sequence[str]) -> int:
+    override_guard.refuse_overrides(Path(mac_test.__file__), "mac_test/mac_test.py")
+    target, pid_word, claim_id, episode, attempt, deadline_word, requirement = argv
+    paths = mac_test.state_paths(target)
+    pid = int(pid_word)
+    identity = claim_state.ClaimIdentity(claim_id, episode, attempt)
+    if not _has_claim(paths, pid, identity):
+        if requirement == "if-present":
+            return 0
+        print(f"{target} has no matching repository claim", file=sys.stderr)
+        return 1
+    args = mac_test.CliArguments()
+    args.target, args.pid = target, pid
+    args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
+    args.deadline_monotonic = float(deadline_word)
+    status = mac_test.command_release(args, paths)
+    if status:
+        return status
     if _has_claim(paths, pid, identity):
-        raise RuntimeError(f"{paths.target} did not release the exact repository claim")
+        print(f"{target} did not release the exact repository claim", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_release_command(sys.argv[1:]))

@@ -515,8 +515,10 @@ def retry_guest_connect[Output: (bytes, str)](
 
 
 def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                          timeout=timeout, check=False, env=guest_ssh_environment())
+    with guest_ssh_process(command) as process:
+        output, errors = process.communicate(timeout=timeout)
+    return subprocess.CompletedProcess(command, process.returncode, output.decode(errors='replace'),
+                                       errors.decode(errors='replace'))
 
 
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
@@ -624,14 +626,35 @@ print(f'armed {machine} {boot} {deadline} {os.getcwd()}', flush=True)
 
 
 def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
+    deadline = monotonic() + GUEST_KILL_GRACE_SECONDS
     while True:
         try:
             with suppress(ProcessLookupError):
                 process_group.send_process_group(process.pid, signal.SIGKILL)
-            _ = process.wait()
+            _ = process.wait(timeout=max(0, deadline - monotonic()))
             return
+        except subprocess.TimeoutExpired:
+            break
         except KeyboardInterrupt:
-            continue
+            if monotonic() >= deadline:
+                break
+    print(f'UNRESOLVED: SSH process {process.pid} did not exit after SIGKILL.', file=sys.stderr, flush=True)
+
+
+@contextmanager
+def guest_ssh_process(command: Sequence[str], *, cwd: Path | None = None, stdin: int = subprocess.DEVNULL,
+                      pass_fds: tuple[int, ...] = ()) -> Generator[subprocess.Popen[bytes]]:
+    process = subprocess.Popen(command, cwd=cwd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True, pass_fds=pass_fds, env=guest_ssh_environment())
+    try:
+        yield process
+    except BaseException:
+        stop_ssh_process(process)
+        raise
+    finally:
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
@@ -642,13 +665,8 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
     command = settings.command(guest_shell(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {arm}')
 
     def send(remaining: float) -> subprocess.CompletedProcess[bytes]:
-        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
-            try:
-                output, errors = process.communicate(timeout=min(GUEST_REF_TIMEOUT_SECONDS, remaining))
-            except BaseException:
-                stop_ssh_process(process)
-                raise
+        with guest_ssh_process(command) as process:
+            output, errors = process.communicate(timeout=min(GUEST_REF_TIMEOUT_SECONDS, remaining))
         return subprocess.CompletedProcess(command, process.returncode, output, errors)
 
     response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
@@ -1419,21 +1437,16 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
                         connect_deadline: float = math.inf) -> subprocess.CompletedProcess[bytes]:
     if monotonic() >= connect_deadline:
         raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
-    with (ExitStack() as reports,
-          subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,),
-                           env=guest_ssh_environment()) as stream):
+    with ExitStack() as reports:
         try:
-            output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch, reports,
-                                                       connect_deadline=connect_deadline)
-        except BaseException as error:
-            stop_ssh_process(stream)
-            if isinstance(error, subprocess.TimeoutExpired):
-                stderr = error.stderr if isinstance(error.stderr, bytes) else b''
-                started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
-                failure = GuestResultUnavailable if started else GuestUnavailable
-                raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
-            raise
+            with guest_ssh_process(command, cwd=repo, stdin=subprocess.PIPE, pass_fds=(link,)) as stream:
+                output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch, reports,
+                                                           connect_deadline=connect_deadline)
+        except subprocess.TimeoutExpired as error:
+            stderr = error.stderr if isinstance(error.stderr, bytes) else b''
+            started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
+            failure = GuestResultUnavailable if started else GuestUnavailable
+            raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 
 
