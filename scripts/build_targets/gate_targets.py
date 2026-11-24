@@ -36,7 +36,7 @@ def scaler_gate_exclusion(registry: conf.ConfigRead, target: target_config.Scale
     if not registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False):
         return "off"
     if not conf.read(target.settings).value("enabled", conf.on_off, default=False, recover_invalid=False):
-        return "cloud gates are off (cloud_gate.conf enabled=off)"
+        return placement.CLOUD_GATE_OFF_REASON
     return ""
 
 
