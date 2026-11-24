@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import redirect_stderr
+import io
 import json
 import os
 import subprocess
@@ -10,7 +12,7 @@ from typing import cast
 import unittest
 from unittest import mock
 from scripts.build_queue.admission_test_support import caller_admission
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import claim_state, eligibility, offload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
@@ -18,6 +20,20 @@ from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
+    def test_fence_holder_diagnostic_preserves_the_test_verdict(self) -> None:
+        controller = offload.ProcessController()
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        controller.claim_identity = identity
+        key = offload.pending_start_key(identity)
+        lines = (f"mac_exit=42\nmac_cleanup=skipped\ndispatch_start_pending={key}\n"
+                 f"dispatch_start_holder={key} 2345 cargo helper\n")
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            result = controller.stream_mac_run(["/bin/sh", "-c", 'printf "%s" "$1"', "fence", lines])
+        self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupSkipped()))
+        self.assertIsInstance(controller.pending, offload.PendingStartOperation)
+        self.assertEqual(stderr.getvalue(), "mac_test: the remote start fence is held by 2345 cargo helper\n")
+
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
         self.sync_config()

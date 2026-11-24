@@ -3489,6 +3489,113 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         send.assert_called_once()
         self.assertIn('Your Mac claim "hana tests"', cast(str, send.call_args.args[4]))
 
+    def test_release_reports_the_processes_that_hold_the_start_fence(self) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import offload
+        from scripts.mac_test.offload_test_commands import write_shell
+
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        record = self.write_claim(idle_since=expired, work_idle_since=expired)
+        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                             cast(str, record["attempt"]))
+        pending = offload.pending_start_path(self.paths.target, identity)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        lock = self.root / offload.start_fence_relative(identity, self.paths.target).with_suffix(".lock")
+        lock.parent.mkdir(parents=True)
+        write_shell(self.root / "lsof", r'''
+[[ ${!#} == "$FENCE_FILE" ]] || exit 2
+printf 'p%s\0csettler\0\np2345\0ccargo helper\0\np3456\0crustc\0\n' "$PPID"
+''')
+        args = mac_test.CliArguments()
+        args.pid = cast(int, record["pid"])
+        args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
+
+        def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+            return self.run_private_shell(arguments[-1], self.root)
+
+        def no_answer(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            return subprocess.CompletedProcess(arguments, 255, "", "")
+
+        with lock.open("w") as held, mock.patch.dict(os.environ, {
+            "PATH": f"{self.root}:{os.environ['PATH']}", "FENCE_FILE": str(lock),
+        }):
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for reason, response in (
+                ("is held by 2345 cargo helper, 3456 rustc", remote),
+                ("gave no answer", no_answer),
+            ):
+                with self.subTest(reason=reason), mock.patch.object(subprocess, "run", side_effect=response):
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr):
+                        self.assertEqual(mac_test.command_release(args, self.paths), 12)
+                    self.assertEqual(stderr.getvalue(), f"cannot release: the remote start fence {reason}\n")
+                    self.assertTrue(pending.exists())
+                    self.assertEqual(self.read_claim(), record)
+            stderr = io.StringIO()
+            with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+                 mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
+                 mock.patch.object(mac_test, "send_message") as send, \
+                 mock.patch.object(subprocess, "run", side_effect=remote), redirect_stderr(stderr):
+                _ = self.watch_once()
+            send.assert_not_called()
+            self.assertTrue(pending.exists())
+            self.assertEqual(self.read_claim(), record)
+            self.assertEqual(stderr.getvalue(),
+                             "cannot release: the remote start fence is held by 2345 cargo helper, 3456 rustc\n")
+
+    def test_stopped_release_ends_processes_that_open_the_fence_outside_the_mirror(self) -> None:
+        from scripts.copies import copies
+        from scripts.mac_test import eligibility, offload
+        from scripts.mac_test.offload_test_commands import write_shell
+
+        saved = claim_state.CleanupOnlyMacRepository("repo-key", "alpha", "alpha.json", "alpha").for_remote_claim()
+        record = self.write_claim(mac_repository=saved.record(), repo_name=saved.mirror_name, repo_key=saved.key)
+        self.paths.claims.mkdir()
+        claim_path = self.paths.run.rename(self.paths.claims / saved.claim_file)
+        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                             cast(str, record["attempt"]))
+        scope_key = saved.fence_scope_key()
+        pending = offload.pending_start_path(self.paths.target, identity, scope_key=scope_key)
+        pending.parent.mkdir(parents=True)
+        pending.touch()
+        lock = self.root / offload.start_fence_relative(identity, self.paths.target, scope_key=scope_key).with_suffix(".lock")
+        lock.parent.mkdir(parents=True)
+        lock.touch()
+        write_shell(self.root / "lsof", r'''
+if [[ ${!#} == "$FENCE_FILE" ]]; then
+    [[ -e ended ]] && exit 1
+    printf 'p2345\0coutside worker\0\n'
+else
+    [[ ${!#} == -Fpn ]] || exit 2
+    printf 'p3456\nn/elsewhere\n'
+fi
+''')
+        write_shell(self.root / "pgrep", "exit 1\n")
+        write_shell(self.root / "sleep", "exit 0\n")
+
+        def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            command = 'kill() { printf "%s\\n" "$*" >> signals; [ "$*" = "-9 2345" ] && touch ended; }\n'
+            return self.run_private_shell(command + arguments[-1], self.root)
+
+        with mock.patch.dict(os.environ, {"PATH": f"{self.root}:{os.environ['PATH']}", "FENCE_FILE": str(lock)}), \
+             mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.object(subprocess, "run", side_effect=remote):
+            stopped = mac_test.EndStoppedWork(eligibility.KnownRepository("alpha"))
+            answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
+                                                   remote_work=stopped)
+        self.assertEqual(answer, mac_test.ClaimsReleased(1, ()))
+        signals = self.root / "signals"
+        self.assertTrue(signals.exists(), "Cleanup did not send a signal to the fence holder.")
+        self.assertEqual(signals.read_text().splitlines(), ["2345", "-9 2345"])
+        self.assertFalse(claim_path.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse(pending.exists())
+
     def test_stopped_holder_release_ends_remote_work_before_the_fence_settles(self) -> None:
         from scripts.copies import copies
         from scripts.mac_test import eligibility, offload, claim_state
@@ -3517,8 +3624,9 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 self.assertEqual(self.read_claim(), record)
                 self.assertTrue(pending.exists())
 
-                def end_work(repository: offload.MirrorScope, target: str, slot: int) -> str:
+                def end_work(repository: offload.MirrorScope, target: str, slot: int, *, fence: Path) -> str:
                     self.assertEqual((repository, target, slot), (offload.ALL_MIRRORS, self.paths.target, 1))
+                    self.assertEqual(self.root / fence, fence_directory / (pending.name + ".lock"))
                     return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
 
                 def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:

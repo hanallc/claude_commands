@@ -2662,6 +2662,7 @@ def release_exact_claims(
             count_legacy = (paths.platform == "macos" and isinstance(saved, claim_state.NoSavedMacRepository)
                             and isinstance(remote_work, EndStoppedWork))
             if "remote_host" in record and (fence_pending or count_legacy):
+                scope_key = claim_state.claim_fence_scope_key(path, record)
                 if isinstance(remote_work, EndStoppedWork):
                     with nullcontext() if provider_lock_held else locked(paths.lock):
                         current = read_run(path)
@@ -2671,21 +2672,26 @@ def release_exact_claims(
                 if isinstance(remote_work, EndStoppedWork):
                     # Check stopped work before settling the fence it can hold.
                     mirror = offload.mac_cleanup_scope(saved) if paths.platform == "macos" else remote_work.repository
-                    command = offload.leftover_check_script(mirror, paths.target, record.get("slot", 0) or 1) + "\n"
+                    fence = (offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
+                             if fence_pending and paths.platform == "macos" else None)
+                    slot = record.get("slot", 0) or 1
+                    command = (offload.leftover_check_script(mirror, paths.target, slot, fence=fence) if fence is not None
+                               else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
                 else:
                     command = ""
                 if fence_pending:
                     command += offload.start_fence_command(identity, paths.target, settle=True,
-                        scope_key=claim_state.claim_fence_scope_key(path, record)) + "\n"
+                                                         scope_key=scope_key) + "\n"
                 if isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
                 observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
                                                   release_deadline=release_deadline)
+                if fence_pending:
+                    reason = offload.start_fence_reason(identity, observed.output)
+                    if reason is not None:
+                        return ClaimReleaseRefused(reason)
                 if not isinstance(observed.result, offload.LeftoversEnded):
                     return ClaimReleaseRefused("the remote work of the claim has not ended")
-                if fence_pending and ("dispatch_start_settled=" + offload.pending_start_key(identity)
-                                      not in observed.output.splitlines()):
-                    return ClaimReleaseRefused("the remote start fence remains unconfirmed")
             with nullcontext() if provider_lock_held else locked(paths.lock):
                 if isinstance(release_deadline, offload.ClaimReleaseDeadline) and release_deadline.remaining() <= 0:
                     return ClaimReleaseRefused("the claim release deadline expired")
