@@ -66,10 +66,10 @@ class PlacementFixture(AdmissionFixture):
 
     read_host_evidence: Callable[[placement.HostEvidenceKey], placement.HostEvidence]
 
-    def __init__(self) -> None:
+    def __init__(self, *, private_child_starts: bool = False) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.settings_pinned: bool = False
-        super().__init__()
+        super().__init__(private_child_starts=private_child_starts)
 
     @override
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -651,10 +651,16 @@ class CargoFolderTests(unittest.TestCase):
 
 class PlacementTests(unittest.TestCase):
     def test_scaler_reconciles_only_pending_expired_bookings_on_the_worker(self) -> None:
+        self.check_worker_reconcile(guest=False)
+
+    def test_mac_linux_reconciles_only_pending_held_attempts_on_the_worker(self) -> None:
+        self.check_worker_reconcile(guest=True)
+
+    def check_worker_reconcile(self, *, guest: bool) -> None:
         class SingleReadWorker(service.HostEvidenceWorker):
             @override
             def _read(self) -> None:
-                LauncherHangGuard("Request scaler evidence").event(self.requested)
+                LauncherHangGuard("Request settlement evidence").event(self.requested)
                 with self.lock:
                     if self.stopped.is_set():
                         return
@@ -670,15 +676,18 @@ class PlacementTests(unittest.TestCase):
                 (pending, True, True, 0)):
             with (self.subTest(result=result, supports_reconcile=supports_reconcile,
                                release_slot=release_slot),
-                  PlacementFixture() as fixture):
-                request = scaler_gate_request(fixture)
+                  PlacementFixture(private_child_starts=True) as fixture):
+                request = mac_linux_and_natedev_request(fixture) if guest else scaler_gate_request(fixture)
                 key = publish_candidate(fixture, request).key
                 assignment = assignment_for(fixture, request)
-                claim = placement.assigned_claim_reference(assignment)
-                consume = consume_permission("launch", assignment, claim)
-                self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.FirstAuthorization)
+                if guest:
+                    authorization, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                else:
+                    consume = consume_permission("launch", assignment, placement.assigned_claim_reference(assignment))
+                    authorization, = fixture.server.handle_request(consume)
+                assert isinstance(authorization, wire.FirstAuthorization), authorization
                 reading, released = threading.Event(), threading.Event()
-                guard = LauncherHangGuard("Read scaler evidence")
+                guard = LauncherHangGuard("Read settlement evidence")
                 reconcile_threads: list[threading.Thread] = []
 
                 def record_reconcile(_episode: str, _attempt: int) -> None:
@@ -692,17 +701,23 @@ class PlacementTests(unittest.TestCase):
 
                 reconcile = mock.Mock(side_effect=record_reconcile)
                 settle = mock.Mock(side_effect=read_settlement)
-                hooks = {"reconcile_expired": reconcile} if supports_reconcile else {}
-                provider = mock.Mock(spec=placement.CloudGateProvider, settlement=settle, **hooks)
-                with (mock.patch.object(service, "scaler_provider", return_value=provider),
+                reconcile_name = "reconcile_unproven" if guest else "reconcile_expired"
+                hooks = {reconcile_name: reconcile} if supports_reconcile else {}
+                provider = mock.Mock(spec=["settlement", *hooks], settlement=settle, **hooks)
+                provider_name = "mac_linux_provider" if guest else "scaler_provider"
+                with (mock.patch.object(service, provider_name, return_value=provider),
                       mock.patch.object(service, "HostEvidenceWorker", SingleReadWorker)):
                     self.assertIsInstance(fixture.server.handle_request(wire.SettlementRequest(assignment))[0], wire.Ok)
+                    if guest:
+                        _ = fixture.run_pass()
                     worker = fixture.server.host_readers[key].worker
+                    assert isinstance(worker, SingleReadWorker)
                     if release_slot:
                         try:
                             guard.event(reading)
-                            report = wire.ExecutionReport("settled", assignment, claim,
-                                execution_identity.ExecutionNotStarted(), placement.AttemptDeclined("ended"),
+                            outcome = placement.AttemptCompleted(0) if guest else placement.AttemptDeclined("ended")
+                            report = wire.ExecutionReport("settled", assignment, authorization.claim,
+                                execution_identity.ExecutionNotStarted(), outcome,
                                 placement.DispatchPathSettled())
                             _ = fixture.server.handle_request(report)
                             self.assertNotIn(assignment.episode, fixture.server.current_assignments)
@@ -717,7 +732,7 @@ class PlacementTests(unittest.TestCase):
                     self.assertEqual(reconcile_threads, [worker.thread])
 
     def test_pending_scaler_settlement_blocks_reassignment_across_restart(self) -> None:
-        with PlacementFixture() as fixture:
+        with PlacementFixture(private_child_starts=True) as fixture:
             fixture.configure(cloud_gate_slots=1)
             request = scaler_gate_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -774,7 +789,7 @@ class PlacementTests(unittest.TestCase):
                     self.assertNotIn(attempt, reader.dispatch_probes)
 
     def test_scaler_declines_wait_for_a_new_available_reading(self) -> None:
-        with PlacementFixture() as fixture:
+        with PlacementFixture(private_child_starts=True) as fixture:
             request = scaler_gate_request(fixture)
             request = replace(request, constraints=replace(request.constraints, candidates=request.constraints.candidates[:1]))
             provider = mock.Mock(spec=placement.CloudGateProvider, settlement=mock.Mock(return_value=placement.Settled()))
@@ -798,7 +813,7 @@ class PlacementTests(unittest.TestCase):
                 self.assertNotIn(replacement.attempt, attempts)
 
     def test_gate_retry_requests_each_persist_once(self) -> None:
-        with PlacementFixture() as fixture:
+        with PlacementFixture(private_child_starts=True) as fixture:
             request = scaler_gate_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
@@ -837,13 +852,22 @@ class PlacementTests(unittest.TestCase):
                 persist.assert_called_once()
 
     def test_scaler_execution_report_persists_one_transition(self) -> None:
-        with PlacementFixture() as fixture:
-            request = scaler_gate_request(fixture)
+        self.check_execution_report_persist_count(guest=False)
+
+    def test_mac_linux_execution_report_persists_one_transition(self) -> None:
+        self.check_execution_report_persist_count(guest=True)
+
+    def check_execution_report_persist_count(self, *, guest: bool) -> None:
+        with PlacementFixture(private_child_starts=True) as fixture:
+            request = mac_linux_and_natedev_request(fixture) if guest else scaler_gate_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
-            claim = placement.assigned_claim_reference(assignment)
-            self.assertIsInstance(fixture.server.handle_request(consume_permission("launch", assignment, claim))[0],
-                                  wire.FirstAuthorization)
+            if guest:
+                authorization, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+            else:
+                consume = consume_permission("launch", assignment, placement.assigned_claim_reference(assignment))
+                authorization, = fixture.server.handle_request(consume)
+            assert isinstance(authorization, wire.FirstAuthorization), authorization
             outbound, inbound = socket.socketpair()
             with outbound, inbound:
                 server = fixture.server
@@ -853,14 +877,16 @@ class PlacementTests(unittest.TestCase):
                     if persist_change:
                         server.persist()
 
+                outcome = placement.AttemptCompleted(0) if guest else placement.AttemptDeclined("ended")
                 for path in (placement.DispatchPathPending("pending"), placement.DispatchPathSettled()):
-                    report = wire.ExecutionReport("execution", assignment, claim, execution_identity.ExecutionNotStarted(),
-                                                  placement.AttemptDeclined("ended"), path, code_version="fixture-version")
+                    report = wire.ExecutionReport("execution", assignment, authorization.claim,
+                        execution_identity.ExecutionNotStarted(), outcome, path, code_version="fixture-version")
                     with (mock.patch.object(server, "_record_caller_version", side_effect=record_version),
                           mock.patch.object(server, "persist", wraps=server.persist) as persist):
                         self.assertIsInstance(server.handle_request(report, service.Connection(outbound))[0],
                                               wire.DispatchStatus)
                         persist.assert_called_once()
+                self.assertNotIn(assignment.episode, server.current_assignments)
 
     def test_gate_uses_guest_when_local_waits_and_aws_has_no_quota(self) -> None:
         for mode in ("allowed", "fixed exclusion", "Mac block"):
@@ -1801,7 +1827,11 @@ class PlacementTests(unittest.TestCase):
         # The gate consumes the launch permission. The guest stays busy past the remote start hold
         # and after copies.py ends, until the gate ends.
         hold_seconds = 120
-        with PlacementFixture() as fixture:
+        settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
+        provider = mock.Mock(spec=["settlement"], settlement=settle)
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "mac_linux_provider", return_value=provider),
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             fixture.configure(remote_start_hold_seconds=hold_seconds)
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1838,7 +1868,22 @@ class PlacementTests(unittest.TestCase):
 
             fixture.end_owner(gate_process)
             passes(1)
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), key)
+            fixture.restart()
+            evidence_key = publish_candidate(fixture, request).key
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[evidence_key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), evidence_key)
+            settle.assert_called_once_with(assignment.episode, int(assignment.attempt, 16))
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.current_assignments.get(assignment.episode), key)
+            self.assertIsInstance(fixture.server.handle_request(other)[0], wire.PlacementWait)
+            settle.return_value = placement.Settled()
+            self.assertEqual(worker.probe_next(), evidence_key)
+            _ = fixture.run_pass()
             self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+            self.assertEqual(assignment_for(fixture, other).destination, destination)
 
     def test_a_guest_gate_that_took_no_run_after_its_consume_closes_for_a_retry(self) -> None:
         # The gate ends before copies.py reports the claim failure. The last system reading can still show the gate.
@@ -1922,7 +1967,7 @@ class PlacementTests(unittest.TestCase):
     def test_guest_exit_80_waits_for_exact_settlement(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
         provider = mock.Mock(spec=["settlement"], settlement=settle)
-        with (PlacementFixture() as fixture,
+        with (PlacementFixture(private_child_starts=True) as fixture,
               mock.patch.object(service, "mac_linux_provider", create=True, return_value=provider),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             request = mac_linux_and_natedev_request(fixture)
@@ -1947,7 +1992,7 @@ class PlacementTests(unittest.TestCase):
 
     def test_worker_recovers_a_lost_guest_end_report_after_restart(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest still running"))
-        with (PlacementFixture() as fixture,
+        with (PlacementFixture(private_child_starts=True) as fixture,
               mock.patch.object(service, "mac_linux_provider", create=True, return_value=object()) as provider,
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             request = mac_linux_and_natedev_request(fixture)
@@ -1986,8 +2031,11 @@ class PlacementTests(unittest.TestCase):
             self.assertIsInstance(terminal.path, placement.DispatchPathSettled)
 
     def test_a_guest_attempt_stays_current_after_its_gate_ends_while_its_owner_lives(self) -> None:
-        # A pass that reads the ended gate and fresh guest evidence leaves the attempt to copies.py.
-        with PlacementFixture() as fixture:
+        # The coordinator can report a decline after the gate ends.
+        settle = mock.Mock(return_value=placement.Settled())
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(settlement=settle)),
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             def ended_gate() -> tuple[wire.PlacementRequest, placement.PlacementAssignment]:
                 request = mac_linux_and_natedev_request(fixture)
                 _ = publish_candidate(fixture, request)
@@ -2011,6 +2059,13 @@ class PlacementTests(unittest.TestCase):
 
             request, silent = ended_gate()
             fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+            _ = fixture.run_pass()
+            self.assertIn(silent.episode, fixture.server.current_assignments)
+            key = fixture.server.host_evidence_key(request, silent.destination)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            settle.assert_called_once_with(silent.episode, int(silent.attempt, 16))
             _ = fixture.run_pass()
             self.assertNotIn(silent.episode, fixture.server.current_assignments)
 
@@ -2100,7 +2155,7 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(refused.permission, placement.PermissionAvailable())
 
     def test_mac_linux_declines_wait_for_a_new_available_reading(self) -> None:
-        with PlacementFixture() as fixture:
+        with PlacementFixture(private_child_starts=True) as fixture:
             request = mac_linux_and_natedev_request(fixture, natedev=False)
             attempts: set[str] = set()
             for decline in range(3):
