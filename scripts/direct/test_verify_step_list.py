@@ -246,6 +246,51 @@ else:
         self.assertTrue(all(event["args"][:1] == ["metadata"] for event in self.fixture.cargo_events()))
         self.assert_removed()
 
+    def test_term_during_the_memory_poll_marks_the_wait_as_not_measured(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        waiter = root / "interrupt-poll.py"
+        _ = waiter.write_text("""\
+import os
+from pathlib import Path
+import signal
+
+directory = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).parent
+sample, = directory.glob("placement-call-*")
+elapsed = int(sample.read_text())
+owner = int(Path("poll-owner").read_text())
+assert os.getppid() == owner
+Path("poll-sample").write_text(str(elapsed))
+os.kill(owner, signal.SIGTERM)
+""")
+        self.fixture.environment.update({"BUILDLOG_OFF": "0", "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter)})
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        previous = admission.server.handle_request
+        wait = wait_reply(records.NeedsMemory())
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PrerequisiteReport):
+                return [wire.Ok()]
+            if not isinstance(request, wire.PlacementRequest):
+                return previous(request, connection)
+            _ = (root / "poll-owner").write_text(str(request.owner.pid))
+            candidates = tuple(placement.CandidateEligibility(candidate.destination, candidate.eligibility)
+                               for candidate in request.constraints.candidates)
+            return [wire.PlacementWait(request.episode, request.since, 1, candidates, wait)]
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("check", "sample", "--local", "requires Linux")
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertGreaterEqual(int((root / "poll-sample").read_text()), 0)
+        row, = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual(row["outcome"], "interrupted")
+        self.assertEqual(row["step_wait_s"], {"check": None})
+        self.assertIsNone(row["admission_wait_s"])
+        self.assertTrue(all(event["args"][:1] == ["metadata"] for event in self.fixture.cargo_events()))
+        self.assert_removed()
+
     def test_quoted_plus_is_a_routing_reason(self) -> None:
         self.prepare_repository()
         self.fixture.environment["BUILDLOG_OFF"] = "0"

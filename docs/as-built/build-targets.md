@@ -647,6 +647,8 @@ The `step_wait_s` field gives the wait for each step, including separate waits f
 Verify adds the measured wait from each completed placement call.
 A canceled episode stops accruing wait before formatting starts.
 If a placement call stops before it reports a measurement, Verify records null for the step and admission totals.
+If Verify stops during a memory poll, it also records null for the step and admission totals.
+The `hold_wait_s` field is null when the call has no valid hold sample.
 A standalone step with its own checkout slot also uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 

@@ -1268,19 +1268,24 @@ def call_waits(directory: Path, verb: str, token_wait: int) -> dict[str, object]
     """Read the wait totals before Verify removes its wait directory."""
     token_file = os.environ.get("BUILDLOG_TOKEN_WAIT_FILE", "")
     token_directory = Path(os.environ.get("BUILDLOG_TOKEN_WAIT_DIR") or directory)
+    interrupted_directory = os.environ.get("BUILDLOG_INTERRUPTED_WAIT_DIR", "")
     step_waits: dict[str, int | None] = {}
     wait_total = 0.0
-    hold_total = 0.0
+    hold_total: float | None = None
     token_total = 0
     for folder in (directory, *sorted(directory.glob("wait-*"))):
         label = verb if folder == directory else folder.name.removeprefix("wait-")
-        hold = sum(optional_nonnegative_number(line) or 0 for line in wait_lines(folder / "seconds"))
+        hold_samples = [seconds for line in wait_lines(folder / "seconds")
+                        if (seconds := optional_nonnegative_number(line)) is not None]
+        hold = sum(hold_samples)
+        if hold_samples:
+            hold_total = (hold_total or 0.0) + hold
         token_path = Path(token_file) if folder == directory and token_file else folder / "token-seconds"
         token = sum(optional_int(line) or 0 for line in wait_lines(token_path))
         if folder == token_directory:
             token += token_wait
         memory = sum(optional_int(line) or 0 for line in wait_lines(folder / "memory-seconds"))
-        measured = True
+        measured = str(folder) != interrupted_directory
         for path in folder.glob("placement-call-*"):
             if path.suffix == ".tmp":
                 continue
@@ -1294,7 +1299,6 @@ def call_waits(directory: Path, verb: str, token_wait: int) -> dict[str, object]
         if total or label != verb or not measured:
             step_waits[label] = int(total) if measured else None
         wait_total += total
-        hold_total += hold
         token_total += token
     if not step_waits:
         step_waits[verb] = 0
