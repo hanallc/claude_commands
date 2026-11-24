@@ -7225,6 +7225,65 @@ window.fetch=async(path,options={})=>{
                 self.assertEqual(answered.log[-1].source, DWIGHT.name)
                 self.assertEqual(answered.unread_since, NOW)
 
+    def test_list_question_delivery_accepts_a_keeper_folder_symlink(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        legacy_keeper = staff.StaffId("legacy-keeper")
+        for keeper in (MORTY.id, legacy_keeper):
+            folder = the_list.folder(keeper)
+            folder.parent.mkdir(parents=True, exist_ok=True)
+            external = self.root / ("external-" + keeper)
+            external.mkdir()
+            folder.symlink_to(external, target_is_directory=True)
+        for mode in ("direct", "recovery", "old recovery"):
+            with self.subTest(mode=mode):
+                keeper = MORTY.id if mode == "old recovery" else legacy_keeper
+                item = self.add("Check the linked List folder")
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                source = the_list.folder(keeper) / f"{item.id}.md"
+                if keeper != MORTY.id:
+                    _ = (the_list.folder(MORTY.id) / source.name).rename(source)
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(status.root))
+                with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+                    asked = list_page.submit(status.root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action="question",
+                        words="Which check passed?", until="")), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                claimed = delivery.job.record
+                self.assertEqual(claimed.source.path, str(source.resolve()))
+                self.assertEqual(claimed.recipient_id, DWIGHT.id)
+                path = status.path(delivery.page, delivery.row)
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                    if mode == "direct":
+                        list_page.deliver(asked)
+                    else:
+                        with status.locked():
+                            change_page.advance_question_attempt(path, claimed, replace(
+                                claimed, state=delivery_state.QuestionSendState.READY,
+                                owner=delivery_state.NoQuestionSendOwner()))
+                            if mode == "old recovery":
+                                fields = delivery_state.read_fields(path)
+                                attempt = cast(dict[str, object], fields["question_attempt"])
+                                saved_source = cast(dict[str, object], attempt["source"])
+                                _ = saved_source.pop("keeper", None)
+                                _ = path.write_text(json.dumps(fields) + "\n")
+                        _ = delivery.job.release()
+                        change_page.recover_review_messages(change_page.DeliveryStatus(status.root))
+                send.assert_called_once_with(DWIGHT.id, claimed.message, claimed.message_id)
+                delivered = change_page.read_question_attempt(path)
+                self.assertIs(delivered.state, delivery_state.QuestionSendState.SENT)
+                self.assertEqual(delivered.message_id, claimed.message_id)
+                fields = delivery_state.read_fields(path)
+                attempt = cast(dict[str, object], fields["question_attempt"])
+                saved_source = cast(dict[str, object], attempt["source"])
+                if mode == "old recovery":
+                    self.assertNotIn("keeper", saved_source)
+                else:
+                    self.assertEqual(saved_source["keeper"], keeper)
+
     def test_item_action_notices_go_to_the_keeper_when_the_producer_differs(self) -> None:
         root = self.root / "reviews"
         item = self.add("Check the notice recipient")

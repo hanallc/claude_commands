@@ -41,7 +41,7 @@ from scripts.production.issues import Issue
 from scripts.production import update_registration
 from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, staff
 from scripts.production.delivery_state import (
-    NoQuestionSendOwner, NoQuestionSendReceipt, QuestionAttempt, QuestionAttemptMissing,
+    NoSavedListKeeper, NoQuestionSendOwner, NoQuestionSendReceipt, QuestionAttempt, QuestionAttemptMissing,
     QuestionSendOwner, QuestionSendReceipt, QuestionSendState, QuestionSource,
     AnsweredQuestion as AnsweredQuestion, DeliveryIntent as DeliveryIntent, DeliverySlots as DeliverySlots,
     NoDelivery as NoDelivery, NoQuestion as NoQuestion, OpenQuestion as OpenQuestion,
@@ -410,7 +410,7 @@ class SavedQuestionDelivery:
         return ReviewPage(path, path.parent, (self.source.row,), "")
 
     def matches(self, record: QuestionAttempt) -> bool:
-        return (record.source == self.source and record.recipient_id == self.recipient
+        return (self.source.matches_attempt(record.source) and record.recipient_id == self.recipient
                 and self.matches_message(record.message))
 
     def matches_message(self, message: str) -> bool:
@@ -436,10 +436,11 @@ class QuestionDeliveryTarget:
     answer_command: str
     alert_owner: staff.StaffId | None = None
     initial_recipient: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
+    keeper: staff.StaffId | NoSavedListKeeper = NoSavedListKeeper()
 
     def saved(self, question: question_record.Question) -> SavedQuestionDelivery:
         row = f"{self.row}/{question.question_id}"
-        source = QuestionSource(str(self.path.resolve()), self.item, question.question_id, question.words, row)
+        source = QuestionSource(str(self.path.resolve()), self.item, question.question_id, question.words, row, self.keeper)
         command = self.answer_command.format(item=shlex.quote(self.item), question_id=question.question_id)
         return SavedQuestionDelivery(source, self.recipient, self.title, command, self.alert_owner)
 
@@ -450,7 +451,7 @@ def list_question_target(path: Path, item: str, number: int, title: str,
     # The command names the record's folder, so a recipient never answers a same-number record in its own folder.
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
                + f'answer {{item}} --keeper {shlex.quote(keeper)} --question {{question_id}} --text "<answer>"')
-    return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner)
+    return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner, keeper=keeper)
 
 
 def image_question_target(path: Path, image: image_store.ImageRecord) -> QuestionDeliveryTarget:
@@ -623,7 +624,7 @@ def _question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery
         except QuestionAttemptMissing:
             state = _legacy(status, page, saved, fields)
         else:
-            same_question = record.source == saved.source and record.recipient_id == saved.recipient
+            same_question = saved.source.matches_attempt(record.source) and record.recipient_id == saved.recipient
             failed = same_question and record.state is QuestionSendState.FAILED
             matches = saved.matches(record)
             state = record.state if failed or matches else QuestionSendState.UNKNOWN
@@ -659,6 +660,8 @@ def _question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery
 def publish_question_attempt(path: Path, record: QuestionAttempt) -> None:
     data = {**asdict(record), "schema": 2, "message_id": record.message_id}
     _ = data.pop("resend_requests", None)
+    if isinstance(record.source.keeper, NoSavedListKeeper):
+        _ = cast(dict[str, object], data["source"]).pop("keeper")
     if isinstance(record.owner, NoQuestionSendOwner):
         data["owner"] = None
     if isinstance(record.receipt, NoQuestionSendReceipt):
@@ -786,14 +789,33 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
 def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
     source = record.source
     path = Path(source.path)
+    keeper = source.keeper if not isinstance(source.keeper, NoSavedListKeeper) else record.recipient_id
+    listing = record_store.NumberedRecords(keeper, "list", "L", "list item", ValueError)
     try:
-        keeper, collection, _ = path.relative_to(record_store.state_root().resolve()).parts
-        listing = record_store.NumberedRecords(staff.StaffId(keeper), "list", "L", "list item", ValueError)
-        if collection == listing.collection and listing.path(source.item_id).resolve() == path:
+        if listing.path(source.item_id).resolve() == path:
             return listing
+        if isinstance(source.keeper, NoSavedListKeeper):
+            return _legacy_list_question_store(listing, source)
     except ValueError as error:
         raise StaleQuestionAttempt("The List question source is unavailable.") from error
     raise StaleQuestionAttempt("The List question source has moved.")
+
+
+def _legacy_list_question_store(listing: record_store.NumberedRecords,
+                                source: QuestionSource) -> record_store.NumberedRecords:
+    path = Path(source.path)
+    folder = path.parent
+    if folder.name == listing.collection and folder.parent.parent == record_store.state_root().resolve():
+        inferred = replace(listing, owner=staff.StaffId(folder.parent.name))
+        if inferred.path(source.item_id).resolve() == path:
+            return inferred
+    keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
+    if len(keepers) != 1:
+        raise ValueError("The List keeper is unavailable.")
+    morty = replace(listing, owner=keepers[0])
+    if morty.path(source.item_id).resolve() != path:
+        raise ValueError("The List question source has moved.")
+    return morty
 
 
 def _open_list_question(listing: record_store.NumberedRecords,
