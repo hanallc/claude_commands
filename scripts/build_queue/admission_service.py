@@ -50,7 +50,6 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import memory_trace
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import person_actions, queue_snapshot
-from scripts.build_queue.build_queue import asked_words
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
@@ -6960,7 +6959,7 @@ done
                     return []
             self.queue_changes.append(OrderedQueueChange(request, connections))
             return []
-        why = asked_words(request.why, request.actor)
+        why = person_actions.asked_words(request.why, request.actor)
         if isinstance(why, wire.Refused):
             return self._mutation_reply(request.request_id, why)
         if isinstance(request, wire.PrioritySetRequest) and request.unit.strip():
