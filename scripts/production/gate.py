@@ -81,8 +81,9 @@ from scripts.copies import copies
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-                                     gate_job_for_command, gate_job_from_process, read_step_names)
+from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS,
+                                     GATE_UNSETTLED_LAUNCH_STATUS, gate_job_for_command, gate_job_from_process,
+                                     read_step_names)
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
@@ -211,6 +212,7 @@ class HoldExemptNamedModuleMachine:
 class WholeMachine:
     """Use every CPU without shared admission, holds, or failure reruns."""
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    module_progress: Callable[[str], None] | None = None
 
 
 SHARED_MACHINE = SharedMachine()
@@ -1168,7 +1170,7 @@ def _gate_program_source() -> BinaryIO:
 
 
 # The placement belongs to this gate. A test child can run gate code, so it must not read the placement.
-_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE")
+_GATE_PLACEMENT_VARIABLES = ("BUILDLOG_PLACEMENT_FILE", "BUILDLOG_PLACEMENT_EPISODE", "BUILDLOG_PLACEMENT_SIDECAR")
 
 
 def _gate_job_environment(environment: Mapping[str, str], leases: tuple[int, ...]) -> dict[str, str]:
@@ -1771,10 +1773,17 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if isinstance(selection, AffectedSelection):
                     selected_paths = set(selection.modules)
                     modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    module_progress = machine.module_progress if isinstance(machine, WholeMachine) else None
+
+    def print_module_record(line: str) -> None:
+        print(line, flush=True)
+        if module_progress is not None:
+            module_progress(line)
+
     if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
-        print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
+        print_module_record(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs")
     if isinstance(time_limit, gate_record.ReadGateTimeLimit):
         try:
             time_limit = read_time_limit(
@@ -1910,8 +1919,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         print(f"--- {result.suite}/{result.module} exit={result.returncode} ---\n"
                               + failure_log_tail(result.output) + "\n--- end module failure ---", flush=True)
                     if not shared:
-                        print(f"{result.suite}/{result.module} exit={result.returncode} seconds={result.seconds:.2f}"
-                              + (" stopped" if result.killed_for else ""), flush=True)
+                        print_module_record(f"{result.suite}/{result.module} exit={result.returncode}"
+                                            + f" seconds={result.seconds:.2f}"
+                                            + (" stopped" if result.killed_for else ""))
                     cpu_key = f"{job.suite}/{result.module}"
                     run_cpu[cpu_key] = run_cpu.get(cpu_key, 0.0) + result.cpu_seconds
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and hold is not None and not hold.admits():
@@ -3190,14 +3200,12 @@ class GateAssignmentRefused(GateRefused):
 @contextmanager
 def gate_start_target(args: GateArguments, source: Path) -> Generator[GateTarget]:
     """Keep the queue placement for the test checkout until the suites end."""
-    targets = first_step.gate_targets(args.command)
-    request = (first_step.admitted_run(args.command, source, targets=targets) if targets
-               else first_step.admitted_run(args.command, source))
-    with request as admitted:
-        if not isinstance(admitted.grant, first_step.GatePlacement):
+    with first_step.admitted_run(args.command, source) as admitted:
+        grant = admitted.grant
+        if not isinstance(grant, first_step.GatePlacement):
             raise GateAssignmentRefused("The queue returned no gate placement")
         admitted.handoff(source)
-        yield checked_gate_target(args)
+        yield placement_target(grant.grant)
 
 
 def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> AbstractContextManager[GateTarget]:
@@ -3294,6 +3302,14 @@ class MacLinuxGateRefused(GateRefused):
     """The assigned Mac Linux guest could not complete the gate."""
 
 
+class AwsGateTookNoRun(GateRefused):
+    """The AWS gate declined before launch."""
+
+
+class AwsGateLaunchPending(GateRefused):
+    """The AWS gate launch has no settlement proof."""
+
+
 class MacLinuxTookNoRun(GateRefused):
     """The assigned Mac Linux guest took no run. The caller can place the gate again."""
 
@@ -3342,12 +3358,10 @@ def guest_has_type_tools(guest: MacLinuxGateRoute) -> bool:
         return False
 
 
-def report_mac_linux_took_no_run(reason: str, assignment: placement.PlacementAssignment) -> MacLinuxTookNoRun:
-    """Write the claim failure next to the placement file for the caller that owns the placement."""
+def write_gate_claim_failure(failure: admission_wire.ClaimFailure) -> None:
+    """Write the claim failure beside the assignment file."""
     path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
-    failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
     write_text_atomic(path.with_name(path.name + CLAIM_FAILURE_SUFFIX), admission_wire.encode_request(failure))
-    return MacLinuxTookNoRun(f"Mac Linux guest took no run: {reason}")
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -3373,8 +3387,13 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
     def run_cloud(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                              selected=selection, gate_job=gate_job, assignment=assignment)
+        try:
+            outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                                  selected=selection, gate_job=gate_job, assignment=assignment)
+        except AwsGateTookNoRun as error:
+            claim = placement.assigned_claim_reference(assignment)
+            write_gate_claim_failure(admission_wire.ClaimFailure(token_hex(16), assignment, str(error), claim))
+            raise
         if isinstance(outcome, str):
             raise GateRefused(f"AWS gate failed: {outcome}")
         return finish_remote(outcome)
@@ -3389,7 +3408,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            raise report_mac_linux_took_no_run(outcome.reason, assignment)
+            write_gate_claim_failure(admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER))
+            raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         if not outcome.passed:
             print("Mac Linux guest gate failed", file=sys.stderr, flush=True)
             if outcome.time_limit_report:
@@ -3559,9 +3579,12 @@ def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> 
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
-    except MacLinuxTookNoRun as error:
+    except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
         print(error, file=sys.stderr, flush=True)
-        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+        return GATE_PRELAUNCH_REFUSED_STATUS
+    except AwsGateLaunchPending as error:
+        print(error, file=sys.stderr, flush=True)
+        return GATE_UNSETTLED_LAUNCH_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3692,9 +3715,12 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
                 return 0
             with gate_recovery(checkout):
                 return merge_checkpoint(args, target)
-    except MacLinuxTookNoRun as error:
+    except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
         print(error, file=sys.stderr, flush=True)
-        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+        return GATE_PRELAUNCH_REFUSED_STATUS
+    except AwsGateLaunchPending as error:
+        print(error, file=sys.stderr, flush=True)
+        return GATE_UNSETTLED_LAUNCH_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

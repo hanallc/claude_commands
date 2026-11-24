@@ -9,7 +9,7 @@ import argparse
 import ast
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -36,6 +36,7 @@ from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.build_queue import execution_identity, placement
+from scripts.build_queue.placement import Available as Available, Unavailable as Unavailable
 from scripts.lib import cancellation, git_index
 from scripts.build_targets import target_config
 from scripts.buildlog import store
@@ -56,9 +57,6 @@ class CloudDeclined:
     reason: str
 
 
-# Keep the name used by the AWS off test outside this change.
-LocalFallback = CloudDeclined
-
 
 @dataclass
 class CloudAttempt:
@@ -68,7 +66,7 @@ class CloudAttempt:
     interruptions: int = 0
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     claim: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
-    service_unconfirmed: bool = False
+    booking_submitted: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,17 +111,6 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
 
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
-
-
-@dataclass(frozen=True)
-class Available:
-    """The local evidence permits the queue to offer AWS."""
-
-
-@dataclass(frozen=True)
-class Unavailable:
-    """The queue cannot offer AWS for this reading."""
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -200,6 +187,19 @@ def availability() -> Available | Unavailable:
         return Unavailable(reason) if reason else Available()
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return Unavailable('The local AWS gate evidence is unavailable')
+
+
+def settlement(episode: str, attempt: int) -> placement.Settled | placement.Pending:
+    """Read the ledger for the exact queue claim."""
+    claim_id = execution_identity.assigned_claim_id(episode, f'{attempt:032x}')
+    try:
+        book = ledger.CostLedger(target_config.ssh_target_state_directory('aws'))
+        rows = book.gate_claim_reservations(claim_id)
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+        return placement.Pending('The AWS gate ledger is unavailable')
+    if any(ledger.gate_is_open(row) for row in rows):
+        return placement.Pending('AWS launch settlement remains pending')
+    return placement.Settled()
 
 
 def cleanup_due(reservation: ledger.GateReservation, now: int) -> bool:
@@ -280,19 +280,37 @@ def launch_error_code(reason: str) -> str:
     return code[1] if code and code.lastindex else code[0] if code else ''
 
 
-def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
-    """Read module completion lines from the current box log."""
-    total = 0
-    finished: set[str] = set()
-    for line in text.splitlines():
-        start = re.fullmatch(r'Runner: (\d+) modules, whole machine, \d+ CPUs', line)
+@final
+class ModuleProgress:
+    """Keep the module total and the names of completed test modules."""
+    _header = re.compile(r'Runner: ([0-9]{1,9}) modules, whole machine, [0-9]{1,9} CPUs')
+    _result = re.compile(r'(.+) exit=-?[0-9]{1,9} seconds=[0-9]{1,12}\.[0-9]{1,9}(?: stopped)?')
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.finished: set[str] = set()
+
+    def observe(self, line: str) -> None:
+        start = self._header.fullmatch(line)
         if start:
-            total = int(start[1])
-        result = re.fullmatch(r'(\S+) exit=-?\d+ seconds=\d+\.\d+(?: stopped)?', line)
-        if result:
-            finished.add(result[1])
-    return (progress_profile.ProgressCounter('modules', min(len(finished), total), total)
-            if total else progress_profile.NoCounter('The box has no module counter yet'))
+            self.total = int(start[1])
+        else:
+            result = self._result.fullmatch(line)
+            if result and result[1] != '/'.join(gate_record.TYPE_CHECK_JOB):
+                self.finished.add(result[1])
+
+    def counter(self) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+        if not self.total:
+            return progress_profile.NoCounter('The box has no module counter yet')
+        return progress_profile.ProgressCounter('modules', min(len(self.finished), self.total), self.total)
+
+
+def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+    """Read module progress from the current box log."""
+    progress = ModuleProgress()
+    for line in text.splitlines():
+        progress.observe(line)
+    return progress.counter()
 
 
 def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_progress.CloudProgress:
@@ -947,17 +965,25 @@ class GateWorker:
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
                 return {'status': 'fallback', 'reason': 'The saved attempt has ended'}
-            if not (folder / 'launch.json').exists():
+            claim = request.get('placement_claim')
+            if claim is not None and (previous is None or previous.placement_claim != claim):
+                return {'status': 'fallback', 'reason': 'The worker has no matching placement booking'}
+            new_launch = not (folder / 'launch.json').exists()
+            if new_launch and claim is None:
                 if request.get('task') != 'paired':
                     self.charges()
                 reservation = self.book.reserve_gate(self.settings_path, gate_booking(
                     settings(), attempt, int(self.clock()), ledger.instant(request, 'expires')))
                 if isinstance(reservation, (ledger.GateCapReached, ledger.GateAttemptEnded)):
                     return {'status': 'fallback', 'reason': reservation.reason}
-                identity = process_start(os.getpid())
-                if not isinstance(identity, Started):
-                    raise ValueError('The worker has no readable process identity')
-                self.book.gate_owner(attempt, ledger.GateWorkerOwner(os.getpid(), identity.start, str(folder.resolve())))
+            identity = process_start(os.getpid())
+            if not isinstance(identity, Started):
+                raise ValueError('The worker has no readable process identity')
+            owner = ledger.GateWorkerOwner(os.getpid(), identity.start, str(folder.resolve()))
+            self.book.gate_owner(attempt, owner, now=self.clock())
+            if new_launch:
+                if claim is not None:
+                    self.charges()
                 bucket = ledger.text(deployment, 'bucket')
                 if request['source_key']:
                     self.upload(bucket, ledger.text(request, 'source_key'), folder / 'source.bundle')
@@ -965,10 +991,6 @@ class GateWorker:
                 guest = folder / 'guest.py'
                 _ = guest.write_text(gate_box.GUEST)
                 self.upload(bucket, 'requests/' + attempt + '.guest.py', guest)
-            identity = process_start(os.getpid())
-            if not isinstance(identity, Started):
-                raise ValueError('The worker has no readable process identity')
-            self.book.gate_owner(attempt, ledger.GateWorkerOwner(os.getpid(), identity.start, str(folder.resolve())))
             launched = self.launch(folder, request, deployment)
             if isinstance(launched, CloudDeclined):
                 return {'status': 'fallback', 'reason': launched.reason}
@@ -1505,12 +1527,10 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         outcome = CloudDeclined(str(error))
     except BaseException:
         if isinstance(authorization, wire.FirstAuthorization):
-            report_gate_execution(authorization, attempt, placement.AttemptCancelled('The gate caller ended'))
+            state = finish_assigned_run(authorization, attempt, placement.AttemptCancelled('The gate caller ended'))
+            if isinstance(state, placement.Pending):
+                print(state.reason, file=sys.stderr, flush=True)
         raise
-    if isinstance(authorization, wire.FirstAuthorization):
-        disposition = (placement.AttemptCompleted(int(not outcome.run.passed)) if isinstance(outcome, CloudCompleted)
-                       else placement.AttemptDeclined(outcome.reason))
-        report_gate_execution(authorization, attempt, disposition)
     if isinstance(outcome, CloudDeclined):
         if attempt.interruptions:
             outcome = CloudDeclined(f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
@@ -1522,6 +1542,15 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         except OSError as error:
             detail = ' '.join(str(error).split())
             print('Cloud gate fallback row was not written: ' + detail, file=sys.stderr, flush=True)
+    if isinstance(authorization, wire.FirstAuthorization):
+        disposition = (placement.AttemptCompleted(int(not outcome.run.passed)) if isinstance(outcome, CloudCompleted)
+                       else placement.AttemptDeclined(outcome.reason))
+        state = finish_assigned_run(authorization, attempt, disposition)
+        if isinstance(state, placement.Pending):
+            detail = f'{state.reason}. {outcome.reason}' if isinstance(outcome, CloudDeclined) else state.reason
+            raise gate.AwsGateLaunchPending(detail)
+        if isinstance(outcome, CloudDeclined) and isinstance(state, NoCloudLaunch):
+            raise gate.AwsGateTookNoRun(outcome.reason)
     return outcome
 
 
@@ -1535,6 +1564,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         return CloudDeclined(reason)
     directory = attempt.directory
     command_job = attempt.gate_job
+    claim = attempt.claim
+    assigned = isinstance(claim, placement.ProviderClaimReference)
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
@@ -1559,11 +1590,11 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             row.attempt == folder.name and not ledger.gate_is_open(row)
             for row in book.read_snapshot().gate_reservations)
         saved_request: dict[str, object] = {}
-        if same_request and (folder / 'request.json').exists():
+        if same_request and (not assigned or saved_result.get('status') == 'complete') and (folder / 'request.json').exists():
             try:
                 saved_request = read_saved_request(repo, folder / 'request.json', tree, selected)
             except IncompatibleSavedGateRequest:
-                if not settle_incompatible_attempt(folder, book, service):
+                if not assigned and not settle_incompatible_attempt(folder, book, service):
                     attempt.identifier = folder.name
                     attempt.gate_job = _saved_gate_job(previous)
                     return CloudDeclined('The incompatible cloud attempt has not ended')
@@ -1588,7 +1619,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             else:
                 attempt.identifier = folder.name
                 attempt.gate_job = _saved_gate_job(previous)
-                with cloud_reservation(repo, folder / 'reservation.cgroup', mode, gate_job=command_job) as reservation:
+                with route_reservation(repo, folder, mode, command_job, assigned=assigned) as reservation:
                     outcome = _complete_outcome(repo, folder, request, row)
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
                     return outcome
@@ -1600,6 +1631,18 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         regional = ledger.rows(deployment, 'regions')[0]
         if not regional.get('image') or not regional.get('template'):
             return CloudDeclined('image or stack is absent')
+        first: ledger.GateReservation | None = None
+        if assigned:
+            rows = book.gate_claim_reservations(claim.claim_id)
+            first = next((row for row in rows if row.attempt == claim.claim_id), None)
+            if first is None or not isinstance(first.state, ledger.GateLaunchPending):
+                return CloudDeclined('The first AWS booking is unavailable')
+            folder = root / claim.claim_id
+            same_request = False
+            ended = False
+            saved_request = {}
+            saved_result = {}
+            result_path = folder / 'outcome.json'
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
             bool(previous.get('retry_launch')) or retryable_cloud_failure(saved_result) is not RetryableCloudFailure.NONE)
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
@@ -1609,7 +1652,6 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             attempt.gate_job = _saved_gate_job(previous)
         attempt.identifier = folder.name
         folder.mkdir(parents=True, exist_ok=True)
-        sidecar = folder / 'reservation.cgroup'
         retry_launch = ledger.mapping(previous.get('retry_launch', {})) if retrying else {}
         attempt.interruptions = int(str(previous.get('spot_interruptions', 0))) if retrying else 0
         counted_interruption = str(previous.get('counted_interruption', '')) if retrying else ''
@@ -1622,7 +1664,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if retrying:
             retry_limit = min(retry_limit, int(str(previous.get('spot_retry_limit', retry_limit))))
             box_retry_limit = min(box_retry_limit, int(str(previous.get('box_retry_limit', box_retry_limit))))
-        with cloud_reservation(repo, sidecar, mode, gate_job=command_job) as reservation:
+        with route_reservation(repo, folder, mode, command_job, assigned=assigned) as reservation:
             while True:
                 state: dict[str, object] = {'attempt': folder.name, **identity,
                     'gate_job': snapshot_codec.snapshot_value(attempt.gate_job),
@@ -1649,7 +1691,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         if not isinstance(switch, AwsOn):
                             reservation.status = 0
                             return CloudDeclined(cloud_gate_off_reason(switch))
-                    command = gate_attempt_command('--worker', folder, directory, sidecar)
+                    command = gate_attempt_command('--worker', folder, directory, reservation.sidecar)
                     request = saved_request or prepare(repo, folder, mode, module_time_limit_s,
                                                        selected=selected, gate_job=attempt.gate_job)
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
@@ -1667,20 +1709,29 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         request['module_time_limit_s'] = values.whole('lifetime_minutes') * 60
                     if retry_launch:
                         request['retry_launch'] = retry_launch
-                    if isinstance(attempt.claim, placement.ProviderClaimReference):
-                        request['placement_claim'] = attempt.claim.claim_id
+                    if assigned:
+                        request['placement_claim'] = claim.claim_id
+                        if folder.name == claim.claim_id:
+                            assert first is not None
+                            request['expires'] = first.expires
                     save(folder / 'request.json', request)
                     save(folder / 'deployment.json', deployment)
-                    attempt.service_unconfirmed = True
+                    if assigned and folder.name != claim.claim_id:
+                        booked = reserve_assignment(book, values, claim, folder.name, ledger.instant(request, 'expires'))
+                        if not isinstance(booked, ledger.GateReserved) or not booked.created:
+                            return CloudDeclined(booked.reason if not isinstance(booked, ledger.GateReserved)
+                                                 else 'The retry booking already exists')
+                    attempt.booking_submitted = True
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
-                    attempt.service_unconfirmed = result.get('status') in (None, 'pending')
                     failure = retryable_cloud_failure(result)
                 if isinstance(outcome, CloudCompleted):
                     reservation.status = int(not outcome.run.passed)
                     return outcome
                 reservation.status = 0
                 if failure is RetryableCloudFailure.NONE:
+                    return outcome
+                if assigned and any(ledger.gate_is_open(row) for row in book.gate_claim_reservations(claim.claim_id)):
                     return outcome
                 if failure is RetryableCloudFailure.SPOT:
                     if counted_interruption != folder.name:
@@ -1712,6 +1763,15 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 attempt.identifier = folder.name
                 attempt.gate_job = command_job
                 folder.mkdir()
+
+
+def route_reservation(repo: Path, folder: Path, mode: gate.SuiteMode, job: StepJob | GateJobNotRecorded, *,
+                      assigned: bool) -> AbstractContextManager[CloudReservation]:
+    sidecar = folder / 'reservation.cgroup'
+    if assigned:
+        path = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR')
+        return nullcontext(CloudReservation(Path(path) if path else sidecar))
+    return cloud_reservation(repo, sidecar, mode, gate_job=job)
 
 
 def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False) -> list[str]:
@@ -1810,18 +1870,40 @@ def main() -> int:
     return 0
 
 
-def report_gate_execution(authorization: wire.FirstAuthorization, attempt: CloudAttempt,
-                          outcome: placement.AttemptCompleted | placement.AttemptDeclined | placement.AttemptCancelled) -> None:
-    """Keep a consumed assignment pending while launch evidence is open."""
+@dataclass(frozen=True)
+class NoCloudLaunch:
+    """The booked claim ended without a launch."""
+
+
+def reserve_assignment(book: ledger.CostLedger, values: conf.ConfigRead, claim: placement.ProviderClaimReference,
+                       attempt: str, expires: int) -> ledger.GateReserved | ledger.GateCapReached | ledger.GateAttemptEnded:
+    request = gate_booking(values, attempt, int(time.time()), expires)
+    return book.reserve_gate(account_settings_path(), replace(request, placement_claim=claim.claim_id))
+
+
+def finish_assigned_run(authorization: wire.FirstAuthorization, attempt: CloudAttempt,
+                        outcome: placement.AttemptCompleted | placement.AttemptDeclined | placement.AttemptCancelled
+                        ) -> NoCloudLaunch | placement.Settled | placement.Pending:
+    """Report the outcome and keep the claim while any launch is open."""
     book = ledger.CostLedger(attempt.directory)
-    pending = attempt.service_unconfirmed
-    if attempt.identifier and book.path.exists():
-        try:
-            pending = pending or any(row.attempt == attempt.identifier and ledger.gate_is_open(row)
-                                     for row in book.read_snapshot().gate_reservations)
-        except ledger.LedgerUnavailable:
-            pending = True
-    path = (placement.DispatchPathPending('AWS launch settlement remains pending') if pending
+    claim_id = authorization.claim.claim_id
+    state: NoCloudLaunch | placement.Settled | placement.Pending
+    try:
+        if not attempt.booking_submitted:
+            book.resolve_gate(claim_id, ledger.GateAbsent(int(time.time())))
+        rows = book.gate_claim_reservations(claim_id)
+        if not rows or any(ledger.gate_is_open(row) for row in rows):
+            state = placement.Pending('AWS launch settlement remains pending')
+        elif all(isinstance(row.state, ledger.GateAbsent) for row in rows):
+            state = NoCloudLaunch()
+        else:
+            state = placement.Settled()
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+        state = placement.Pending('The AWS gate ledger is unavailable')
+    if isinstance(state, NoCloudLaunch) and isinstance(outcome, placement.AttemptDeclined):
+        # The caller submits the matching ClaimFailure.
+        return state
+    path = (placement.DispatchPathPending(state.reason) if isinstance(state, placement.Pending)
             else placement.DispatchPathSettled())
     evidence = execution_identity.ExecutionEvidenceUnavailable('AWS gate attempt ' + (attempt.identifier or 'did not start'),
                                                                time.time())
@@ -1830,27 +1912,53 @@ def report_gate_execution(authorization: wire.FirstAuthorization, attempt: Cloud
             authorization.claim, evidence, outcome, path))
     except (OSError, wire.AdmissionUnavailable) as error:
         print(f'AWS gate queue report failed: {error}', file=sys.stderr, flush=True)
+    return state
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
           assignment: placement.PlacementAssignment,
           selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
           gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> gate.GateRun | str:
-    """Run the gate only after the queue authorizes this assignment."""
+    """Book the exact claim before asking the queue to authorize a launch."""
     start = process_start(os.getpid())
     if not isinstance(start, Started):
-        return 'The gate process has no live start time'
+        raise gate.AwsGateTookNoRun('The gate process has no live start time')
     holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
     claim = placement.assigned_claim_reference(assignment)
+    book = ledger.CostLedger(target_config.ssh_target_state_directory('aws'))
     try:
-        authorization = admission_client.consume_permission(
-            wire.ConsumePermission(admission_client.request_id(), assignment, claim, holder))
-    except (OSError, wire.AdmissionUnavailable) as error:
-        return f'The AWS launch permission is unavailable: {error}'
-    if not isinstance(authorization, wire.FirstAuthorization):
-        return f'The queue refused AWS launch permission: {authorization.reason}'
-    if authorization.assignment != assignment or authorization.claim != claim:
-        return 'The AWS launch permission differs from the request'
+        values = settings()
+        switch = aws_switch(values)
+        if not isinstance(switch, AwsOn):
+            raise gate.AwsGateTookNoRun(cloud_gate_off_reason(switch))
+        expires = int(time.time()) + values.whole('lifetime_minutes') * 60
+        booking = reserve_assignment(book, values, claim, claim.claim_id, expires)
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+        raise gate.AwsGateLaunchPending(f'The AWS booking is unavailable: {error}') from error
+    if isinstance(booking, ledger.GateCapReached):
+        raise gate.AwsGateTookNoRun(booking.reason)
+    if isinstance(booking, ledger.GateAttemptEnded):
+        return booking.reason
+    if not booking.created:
+        raise gate.AwsGateLaunchPending('The AWS claim already has an open booking')
+    authorized = False
+    try:
+        try:
+            authorization = admission_client.consume_permission(
+                wire.ConsumePermission(admission_client.request_id(), assignment, claim, holder))
+        except (OSError, wire.AdmissionUnavailable) as error:
+            raise gate.AwsGateTookNoRun(f'The AWS launch permission is unavailable: {error}') from error
+        if not isinstance(authorization, wire.FirstAuthorization):
+            raise gate.AwsGateTookNoRun(f'The queue refused AWS launch permission: {authorization.reason}')
+        if authorization.assignment != assignment or authorization.claim != claim:
+            raise gate.AwsGateTookNoRun('The AWS launch permission differs from the request')
+        authorized = True
+    finally:
+        if not authorized:
+            try:
+                book.resolve_gate(claim.claim_id, ledger.GateAbsent(int(time.time())))
+            except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+                raise gate.AwsGateLaunchPending(f'The AWS booking did not close: {error}') from error
     outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                   selected=selected, gate_job=gate_job, authorization=authorization)
     return outcome.reason if isinstance(outcome, CloudDeclined) else outcome.run

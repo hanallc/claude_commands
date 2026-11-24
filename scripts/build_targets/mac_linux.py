@@ -8,7 +8,8 @@ When this process ends by any signal, the link to the guest ends, and the guest 
 """
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future
 from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -20,13 +21,17 @@ import math
 from pathlib import Path
 import os
 import re
+from select import PIPE_BUF
+from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
+from threading import Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
@@ -42,7 +47,8 @@ from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, Mod
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
-    from scripts.build_queue.placement import PlacementAssignment
+    from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport
+    from scripts.build_queue.placement import PlacementAssignment, ProviderClaimReference
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
@@ -68,6 +74,7 @@ RUN_COPY = '--run-copy'
 ARM_RECORD_PREFIX = 'mac-linux-armed'
 # The guest prints this line, with the attempt, before it starts the argv of a command request.
 RUN_START = 'mac-linux run start'
+GUEST_PROGRESS = 'mac-linux progress '
 # The guest prints this line, with the attempt, to stderr when it has taken the run lock.
 RUN_LOCKED = 'mac-linux run locked'
 # The guest prints this line, with the attempt, when it refuses a command word; it starts nothing after it.
@@ -179,7 +186,8 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
 
 
-def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> None:
+def consume_launch_permission(claim: claim_state.ClaimIdentity,
+                              assignment: PlacementAssignment) -> ProviderClaimReference:
     """Consume the launch permission of the gate assignment before the guest run starts.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
@@ -203,6 +211,15 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: Plac
         raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
         raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
+    return reference
+
+
+@dataclass(frozen=True)
+class GuestGateDispatch:
+    """The guest gate holds the queue's launch permission for this claim."""
+
+    assignment: PlacementAssignment
+    claim: ProviderClaimReference
 
 
 class GuestRunRequest(TypedDict):
@@ -389,6 +406,12 @@ class GuestMain:
     commit: str
 
 
+def guest_ssh_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    _ = environment.pop('BUILDLOG_PLACEMENT_SIDECAR', None)
+    return environment
+
+
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
 if ! command -v bwrap >/dev/null 2>&1; then
@@ -399,7 +422,8 @@ if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
     reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False)
+                           errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False,
+                           env=guest_ssh_environment())
     if reply.returncode:
         raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
     commit = reply.stdout.strip()
@@ -504,7 +528,7 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
                       str(SSH_CONNECT_TIMEOUT_SECONDS)))
     command = settings.command(guest_shell(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {arm}')
     with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True) as process:
+                          stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
         try:
             output, errors = process.communicate(timeout=GUEST_REF_TIMEOUT_SECONDS)
         except BaseException:
@@ -771,7 +795,8 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
         if remaining <= 0:
             return GuestEndPending('The proof deadline expired before cleanup SSH.')
         reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False)
+                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False,
+                               env=guest_ssh_environment())
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
@@ -997,16 +1022,230 @@ def guest_link() -> Generator[int]:
         os.close(link)
 
 
-def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
-                        link: int) -> subprocess.CompletedProcess[bytes]:
-    with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,)) as stream:
+def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: float) -> DispatchStatus:
+    """Send one execution report within the queue query deadline."""
+    from scripts.build_queue import admission_protocol as wire
+
+    def remaining() -> float:
+        left = deadline - monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
+    try:
+        address = str(wire.admission_socket_path())
+        outgoing = wire.encode_request(request).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(remaining())
+            connection.connect(address)
+            connection.settimeout(remaining())
+            connection.sendall(outgoing)
+            pending = bytearray()
+            while True:
+                connection.settimeout(remaining())
+                data = connection.recv(65536)
+                if not data:
+                    raise wire.AdmissionUnavailable('the queue closed the connection')
+                if (end := data.find(b'\n')) >= 0:
+                    pending.extend(data[:end])
+                    response = wire.parse_reply(bytes(pending), request)
+                    break
+                pending.extend(data)
+    except TimeoutError as error:
+        raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s') from error
+    if isinstance(response, wire.Refused):
+        raise wire.AdmissionUnavailable(response.reason)
+    if not isinstance(response, wire.DispatchStatus):
+        raise wire.AdmissionUnavailable('invalid execution report answer')
+    return response
+
+
+def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
+                       deadline: float, timeout: float) -> None:
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+    assignment = dispatch.assignment
+    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
+    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+                                   execution_identity.ObservedExecution(execution),
+                                   code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+    response = send_guest_execution(request, deadline=deadline, timeout=timeout)
+    if (response.assignment != assignment or not isinstance(response.state, placement.CurrentAssignment)
+            or not isinstance(response.permission, placement.PermissionConsumed) or response.reason):
+        raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
+
+
+def warn_guest_report(reason: str) -> None:
+    print(f'Mac Linux guest queue report failed: {reason}', file=sys.stderr, flush=True)
+
+
+def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
+                       reports: ExitStack) -> None:
+    """Read the timeout before starting the report worker. Bound both waits."""
+    started = monotonic()
+    preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
+    ready: Future[Callable[[], None]] = Future()
+
+    def prepare() -> None:
         try:
-            output, errors = stream.communicate(bootstrap, timeout=timeout)
+            with conf.diagnostics(report=False):
+                timeout = conf.read('build_admission').number('query_timeout_seconds')
+            deadline = min(transfer_deadline, started + timeout)
+            dispatch_deadline = min(preparation_deadline, deadline)
+            if monotonic() >= dispatch_deadline:
+                raise TimeoutError('the queue report deadline expired during configuration')
+            result: Future[None] = Future()
+
+            def report() -> None:
+                try:
+                    if monotonic() >= dispatch_deadline:
+                        raise TimeoutError(f'no answer in {timeout:g} s')
+                    report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+                    if monotonic() >= deadline:
+                        raise TimeoutError(f'no answer in {timeout:g} s')
+                except Exception as error:
+                    result.set_exception(error)
+                else:
+                    result.set_result(None)
+
+            worker = Thread(target=report, daemon=True)
+            worker.start()
+        except Exception as error:
+            ready.set_exception(error)
+            return
+
+        def collect_report() -> None:
+            worker.join(timeout=max(0.0, deadline - monotonic()))
+            if not result.done():
+                raise TimeoutError(f'no answer in {timeout:g} s')
+            result.result()
+
+        ready.set_result(collect_report)
+
+    preparation = Thread(target=prepare, daemon=True)
+    try:
+        preparation.start()
+    except RuntimeError as error:
+        warn_guest_report(str(error))
+        return
+
+    def collect() -> None:
+        preparation.join(timeout=max(0.0, preparation_deadline - monotonic()))
+        if not ready.done():
+            warn_guest_report('the queue report configuration read timed out')
+            return
+        try:
+            ready.result()()
+        except Exception as error:
+            warn_guest_report(str(error) or type(error).__name__)
+
+    _ = reports.callback(collect)
+
+
+def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
+                             armed: ArmedGuestAttempt, dispatch: GuestGateDispatch,
+                             reports: ExitStack) -> tuple[bytes, bytes]:
+    """Transfer the bootstrap and read the reply, progress records, and diagnostics."""
+    from scripts.aws_target import cloud_gate
+    from scripts.build_queue import progress_profile
+
+    assert stream.stdin is not None and stream.stdout is not None and stream.stderr is not None
+    deadline = monotonic() + timeout
+    start_line = run_start_line(armed.attempt).encode()
+    progress_prefix = GUEST_PROGRESS.encode()
+    sidecar = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR', '')
+    stdout, stderr = bytearray(), bytearray()
+    reply_line = bytearray()
+    progress = cloud_gate.ModuleProgress()
+    last_counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
+    started = False
+
+    def observe_start(line: bytes) -> None:
+        nonlocal started
+        if started or line.rstrip(b'\r') != start_line:
+            return
+        started = True
+        start_guest_report(armed, dispatch, deadline, reports)
+
+    def read_reply(data: bytes) -> None:
+        nonlocal last_counter
+        *lines, tail = data.split(b'\n')
+        for line in lines:
+            reply_line.extend(line)
+            if not reply_line.startswith(progress_prefix):
+                stdout.extend(reply_line)
+                stdout.append(10)
+            elif sidecar:
+                with suppress(OSError, ValueError, RecursionError):
+                    record = cast(object, json.loads(reply_line[len(progress_prefix):]))
+                    if isinstance(record, str):
+                        progress.observe(record)
+                        counter = progress.counter()
+                        if isinstance(counter, progress_profile.ProgressCounter) and counter != last_counter:
+                            progress_profile.publish_counter(Path(sidecar), counter)
+                            last_counter = counter
+            reply_line.clear()
+        reply_line.extend(tail)
+
+    input_fd, output_fd, error_fd = stream.stdin.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
+    sent = parsed = 0
+    try:
+        with DefaultSelector() as ready:
+            if bootstrap:
+                _ = ready.register(input_fd, EVENT_WRITE)
+            else:
+                stream.stdin.close()
+            _ = ready.register(output_fd, EVENT_READ)
+            _ = ready.register(error_fd, EVENT_READ)
+            while ready.get_map():
+                left = deadline - monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(stream.args, timeout)
+                for key, _events in ready.select(left):
+                    if key.fd == input_fd:
+                        try:
+                            sent += os.write(input_fd, bootstrap[sent:sent + PIPE_BUF])
+                        except BrokenPipeError:
+                            sent = len(bootstrap)
+                        if sent == len(bootstrap):
+                            _ = ready.unregister(input_fd)
+                            stream.stdin.close()
+                        continue
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        _ = ready.unregister(key.fd)
+                        if key.fd == error_fd and parsed < len(stderr):
+                            observe_start(bytes(stderr[parsed:]))
+                    elif key.fd == output_fd:
+                        read_reply(data)
+                    else:
+                        offset = len(stderr)
+                        stderr.extend(data)
+                        while not started and (line_end := stderr.find(b'\n', offset)) >= 0:
+                            observe_start(bytes(stderr[parsed:line_end]))
+                            parsed = offset = line_end + 1
+        _ = stream.wait(timeout=max(0, deadline - monotonic()))
+    except subprocess.TimeoutExpired as error:
+        error.stdout = bytes(stdout + reply_line)
+        error.stderr = bytes(stderr)
+        raise
+    return bytes(stdout + reply_line), bytes(stderr)
+
+
+def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
+                        link: int, armed: ArmedGuestAttempt, dispatch: GuestGateDispatch
+                        ) -> subprocess.CompletedProcess[bytes]:
+    with (ExitStack() as reports,
+          subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,),
+                           env=guest_ssh_environment()) as stream):
+        try:
+            output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch, reports)
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
-                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds.') from error
+                detail = stream_diagnostic(error.stderr if isinstance(error.stderr, bytes) else b'')
+                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds: {detail}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 
@@ -1026,7 +1265,7 @@ def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
-               prefix: str, bundle: FullBundle | DeltaBundle) -> GuestReply:
+               prefix: str, bundle: FullBundle | DeltaBundle, dispatch: GuestGateDispatch) -> GuestReply:
     bootstrap = runner_bootstrap(request)
     send = bundle_send(repo, source, bundle, prefix)
     armed: ArmedGuestAttempt | None = None
@@ -1051,7 +1290,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
                                                          count=True, link=link)
                             stream = stream_guest_bundle(repo, arguments, bootstrap,
-                                                         settings.transfer_timeout_seconds, link)
+                                                         settings.transfer_timeout_seconds, link, armed, dispatch)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1073,6 +1312,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         error = end.unreachable()
         if stream is not None and stream.returncode:
             error.add_note(stream_report(stream))
+        if first_error is not None and isinstance(first_error.__cause__, subprocess.TimeoutExpired):
+            error.add_note(str(first_error))
         raise error
 
     cleanup_detail = end.cleanup_detail()
@@ -1103,8 +1344,11 @@ def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, boots
 
 def stream_report(stream: subprocess.CompletedProcess[bytes]) -> str:
     """The exit status and the last 1200 characters of the standard error of the guest stream."""
-    detail = ' '.join(stream.stderr.decode(errors='replace').split())[-1200:]
-    return f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}'
+    return f'SSH or source stream exited {stream.returncode}: {stream_diagnostic(stream.stderr)}'
+
+
+def stream_diagnostic(stderr: bytes) -> str:
+    return ' '.join(stderr.decode(errors='replace').split())[-1200:] or 'no diagnostic'
 
 
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
@@ -1137,10 +1381,11 @@ def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundl
     return DeltaBundle(guest.commit)
 
 
-def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
+def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
+                    dispatch: GuestGateDispatch) -> GuestReply:
     bundle = guest_bundle(repo, settings)
     with bundle_refs(repo, source, request['attempt']) as prefix:
-        return run_remote(repo, settings, source, request, prefix, bundle)
+        return run_remote(repo, settings, source, request, prefix, bundle, dispatch)
 
 
 @dataclass
@@ -1188,7 +1433,8 @@ class GuestCommand:
                                      link=link)
         with bootstrap.open('rb') as stdin:
             self.process = subprocess.Popen(arguments, cwd=repo, stdin=stdin, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,))
+                                            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,),
+                                            env=guest_ssh_environment())
         try:
             wait_for_start(self.process, request['attempt'])
         except BaseException as error:
@@ -1365,18 +1611,21 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
+        dispatch = None
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
-                consume_launch_permission(claim, assignment)
-                reply = transfer_source(repo, settings, source, request)
+                dispatch = GuestGateDispatch(assignment, consume_launch_permission(claim, assignment))
+                reply = transfer_source(repo, settings, source, request, dispatch)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
+            if dispatch is None:
+                raise
             request = request.copy()
             request['attempt'] = uuid4().hex
             with (mac_linux_reservation(repo, mode, gate_job),
                   bundle_refs(repo, source, request['attempt']) as prefix):
                 reply = run_remote(repo, settings, source, request, prefix,
-                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE))
+                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
@@ -1732,10 +1981,9 @@ def run_guest(request_path: Path) -> int:
 
 def run_sandboxed_gate(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str],
                        reply: int) -> int:
-    """Run the gate in the sandbox, with its standard output on standard error.
+    """Run the gate in the sandbox with its standard output on standard error.
 
-    Only the gate writes to the stream standard output, through the reply descriptor. Output of
-    dbus-run-session or of a service that it starts cannot come before the reply.
+    The gate sends progress and the result through the reply descriptor.
     """
     return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
                           stdout=sys.stderr.fileno(), check=False,
@@ -1764,11 +2012,7 @@ def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
 
 
 def run_copy(request_path: Path, reply: int) -> None:
-    """Run the candidate's gate and write one JSON result to the reply descriptor.
-
-    run_sandboxed_gate points standard output at standard error, so only the reply descriptor reaches the stream
-    standard output.
-    """
+    """Run the candidate's gate and send progress and one JSON result on the reply descriptor."""
     os.set_inheritable(reply, False)
     from scripts.copies import copies
     from scripts.lib import build_folders
@@ -1800,23 +2044,28 @@ def run_copy(request_path: Path, reply: int) -> None:
         raise GuestUnavailable('The guest checkout differs from the request.')
     selection = request['selection']
     # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
-    machine = gate.WholeMachine()
     token = copies.COMMAND_LOCKS.set(descriptors)
     # natedev reads this line: a failure before it lets natedev take the gate.
     print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
     try:
-        with build_folders.inherit_build_lock(RUN_LOCK_FD):
+        with (build_folders.inherit_build_lock(RUN_LOCK_FD),
+              os.fdopen(reply, 'w', encoding='utf-8') as output):
+            def send_progress(line: str) -> None:
+                print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
+
+            # Older gate code in a candidate checkout has no progress callback.
+            machine = (gate.WholeMachine(module_progress=send_progress)
+                       if hasattr(gate.WholeMachine, 'module_progress') else gate.WholeMachine())
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],
                                   time_limit=GateTimeLimit(request['run_time_limit_seconds']))
+            print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
+                              'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
+                  file=output)
     finally:
         copies.COMMAND_LOCKS.reset(token)
-    with os.fdopen(reply, 'w', encoding='utf-8') as output:
-        print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
-                          'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
-              file=output)
 
 
 if __name__ == '__main__':

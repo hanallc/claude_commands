@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -163,6 +163,39 @@ class DispatchPathPending:
 
 
 DispatchPathState = DispatchPathSettled | DispatchPathPending
+
+
+@dataclass(frozen=True)
+class Available:
+    """The scaler can take a gate in this pass."""
+
+
+@dataclass(frozen=True)
+class Unavailable:
+    """The scaler cannot take a gate in this pass."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class Settled:
+    """The scaler no longer holds the attempt."""
+
+
+@dataclass(frozen=True)
+class Pending:
+    """The scaler still holds the attempt."""
+    reason: str
+
+
+class CloudGateProvider(Protocol):
+    def availability(self) -> Available | Unavailable: ...
+
+    def settlement(self, episode: str, attempt: int) -> Settled | Pending: ...
+
+
+def scaler_attempt_number(attempt: str) -> int:
+    """Convert the queue's hexadecimal attempt ID to the scaler's integer ID."""
+    return int(attempt, 16)
 
 
 @dataclass(frozen=True)

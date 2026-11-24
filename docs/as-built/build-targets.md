@@ -41,6 +41,22 @@ A held target admits only work that its hold rules permit.
   Cloud gates and teardown read the AWS state folder without target registration.
   [AWS cloud gates and the former build target](builds-aws-target.md) describes that state.
 
+### Gate placement
+
+A Claude gate requests placement on every eligible target in `build_targets.conf`.
+The caller reads the targets in registry order and applies the fixed placement rules.
+It omits any target whose `enabled.<target>` switch is off.
+Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
+Standalone named module tests and nightly suites can request the same targets.
+A nested named module can use its parent reservation. Promotion without tests uses natedev.
+Hana gates have no repository default.
+
+The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
+To register a scaler, include its name in `targets` and set `kind.<name>=scaler`.
+Set `settings.<name>=cloud_gate.conf`. The scaler also requires `enabled=on` in that settings file.
+The queue checks whether the scaler is available on each placement pass.
+A scaler assignment uses a cloud slot until the queue confirms settlement.
+
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
 - `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free | Running(jobs: tuple[RunningJob, ...]) | Held(holder, reason, since, end: HoldEnd, holder_session) | Unreachable(reason) | StateUnreadable(reason)`, with `RunningJob(what, since, idle: IdleSince(when) | NotSeenIdle, holder_session)`, `holder_session: HolderSession(session_id) | NoHolderSession` (default `NO_HOLDER_SESSION`) and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`. All are frozen dataclasses.

@@ -593,6 +593,22 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
+    def test_mac_linux_assignment_requires_an_enable_key_in_the_live_registry(self) -> None:
+        configuration = Path(self.environment["CONF_DIR"])
+        registry = configuration / "build_targets.conf"
+        fallback = configuration / "repository" / registry.name
+        _ = write_config_fixture(fallback, "enabled.mac-linux=on\n")
+        _ = write_config_fixture(registry, "enabled.mac-linux=on\n")
+        _ = registry.write_text(registry.read_text().replace("enabled.mac-linux=on\n", ""))
+        target = gate.MacLinuxAssignment(self.gate_assignment("mac-linux"))
+        with (mock.patch.dict(os.environ), mock.patch.object(conf, "directory", return_value=configuration),
+              mock.patch.object(conf, "_repository_path", return_value=fallback),
+              mock.patch.object(mac_linux, "route", return_value="unexpected guest route") as guest):
+            _ = os.environ.pop("CONF_DIR", None)
+            with self.assertRaisesRegex(gate.MacLinuxGateRefused, "enabled.mac-linux=off"):
+                _ = gate.run_gate_suites(self.checkout, target=target)
+        guest.assert_not_called()
+
     def test_mac_linux_off_with_a_natedev_target_uses_natedev(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=off\n")
         result = gate.GateRun((), 2, 0, selection_certified=True)

@@ -34,9 +34,24 @@ For a run with type checks, the guest checks for `basedpyright` and `uv` before 
 If a tool is missing, the guest stops the run before a test starts.
 The guest returns the type-check result with the test results.
 The guest runner writes the `mac-linux run start` line to standard error before the gate starts its suites.
-If the guest run fails before that line, the route returns `GuestNotStarted` with the cause, and the queue gives the gate to the next named target, for example natedev.
+The caller reads guest standard error while the run is active and keeps all its bytes for the result.
+The start line for the current guest attempt triggers one execution report for its queue assignment.
+The caller limits the configuration wait to the SSH connection timeout.
+The report uses the queue query timeout from the time the caller reads the start line.
+The caller waits for the report only until its deadline.
+After a stream failure, the caller stops SSH before it collects the report.
+A report failure or timeout prints one warning and leaves the guest run active.
+If the placement caller supplies `BUILDLOG_PLACEMENT_SIDECAR`, it names the placement request's progress sidecar.
+The caller removes the sidecar variable from the guest SSH environment.
+The guest sends runner records on the reply descriptor.
+The route publishes each change to the module count.
+The count excludes type checks.
+Older guest gate code can return its result without sending progress records.
+If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
+The queue can then give the gate to the next named target.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
-Each failure with a stream status names that status and the last 1200 characters of the stream standard error.
+A stream failure reports its status and up to 1200 characters from standard error.
+A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
 

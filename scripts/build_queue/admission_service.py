@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
 from functools import cache
+from importlib import import_module
 import os
 from pathlib import Path
 import select
@@ -145,6 +146,27 @@ _PASS_PROVIDER_CONFIGURATION: ContextVar[ProviderConfiguration] = ContextVar("pa
 def _provider_configuration() -> ProviderConfiguration:
     current = _PASS_PROVIDER_CONFIGURATION.get(None)
     return ProviderConfiguration() if current is None else current
+
+
+def scaler_provider() -> placement.CloudGateProvider:
+    """Load the scaler adapter on the provider evidence worker."""
+    return cast(placement.CloudGateProvider, cast(object, import_module("scripts.aws_target.cloud_gate")))
+
+
+def scaler_availability() -> placement.AllowedHost | placement.TemporaryExclusion:
+    try:
+        result = scaler_provider().availability()
+    except AttributeError:
+        return placement.TemporaryExclusion("AWS availability is unavailable")
+    return placement.AllowedHost() if isinstance(result, placement.Available) else placement.TemporaryExclusion(result.reason)
+
+
+def scaler_settlement(episode: str, attempt: int) -> placement.DispatchPathState:
+    try:
+        result = scaler_provider().settlement(episode, attempt)
+    except AttributeError:
+        return placement.DispatchPathPending("AWS settlement is unavailable")
+    return placement.DispatchPathSettled() if isinstance(result, placement.Settled) else placement.DispatchPathPending(result.reason)
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -3095,6 +3117,16 @@ class AdmissionServer:
             self._prune_watches()
         return groups
 
+    def _cloud_slots_used(self) -> int:
+        legacy = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+        placed = sum(self.assignments[key].assignment.destination.provider == "scaler"
+                     for key in self.current_assignments.values())
+        return legacy + placed
+
+    def _cloud_slots_full(self) -> bool:
+        return (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
+                or self._cloud_slots_used() >= self.configuration.cloud_gate_slots)
+
     def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
         waiting_cloud = self._cloud_waiters()
         if not waiting_cloud and not self.pending_cloud_groups:
@@ -3105,7 +3137,7 @@ class AdmissionServer:
         disconnected = min(((pending.group.started_at, 0, key)
             for key, pending in self.pending_cloud_groups.items() if key not in groups),
             default=(float("inf"), 0, ""))
-        used = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
+        used = self._cloud_slots_used()
         started = False
         blocked = False
         position = 0
@@ -3140,7 +3172,7 @@ class AdmissionServer:
                        ) -> records.QueueRead | wire.CloudQueueRead:
         rows: list[wire.CloudRow] = []
         reservations = [record for record in self.reservations.values() if isinstance(record.place, wire.CloudPlace)]
-        used, slots = len(reservations), configuration.cloud_gate_slots
+        used, slots = self._cloud_slots_used(), configuration.cloud_gate_slots
         recorded_launch = False
         for record in reservations:
             place = record.place
@@ -3653,6 +3685,8 @@ class AdmissionServer:
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
+        if key.destination.provider in ("local", "scaler"):
+            return 0.0
         if key.destination.provider == "ssh" and key.destination.target == "mac-linux":
             from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
 
@@ -3776,9 +3810,11 @@ class AdmissionServer:
         self.host_requests[key] = request
         current = self.host_evidence(key)
         if (isinstance(current, placement.FreshHostEvidence) and current.observed_at > backoff.failed_at
-                and isinstance(current.eligibility, placement.AllowedHost)):
-            if any(saved.assignment.destination.target == "mac-linux" and saved.assignment.episode != request.episode
-                   for attempt in self.current_assignments.values() if (saved := self.assignments.get(attempt)) is not None):
+                and (isinstance(current.eligibility, placement.AllowedHost)
+                     or current.eligibility == placement.TemporaryExclusion("blocked"))):
+            if isinstance(current.eligibility, placement.AllowedHost) and any(
+                    saved.assignment.destination.target == "mac-linux" and saved.assignment.episode != request.episode
+                    for attempt in self.current_assignments.values() if (saved := self.assignments.get(attempt)) is not None):
                 return replace(current, eligibility=placement.TemporaryExclusion("busy"))
             return current
         if isinstance(self.last_usable_configuration, records.MemoryConfig):
@@ -3805,7 +3841,7 @@ class AdmissionServer:
     def _host_evidence_reader(self, key: placement.HostEvidenceKey, interval: float) -> HostEvidenceReader:
         """Keep host and dispatch readings on the same target worker."""
         if key not in self.host_readers:
-            timeout = 0.0 if key.destination.provider == "local" else self._host_probe_timeout(key)
+            timeout = self._host_probe_timeout(key)
             previous = self.host_observations.get(key)
             target = (key.destination.provider, key.destination.target)
             reader = self.host_targets.get(target)
@@ -3870,6 +3906,17 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
+        if destination.provider == "scaler":
+            from scripts.build_targets.gate_targets import scaler_enabled
+
+            registry = conf.read("build_targets")
+            targets = target_config.read_registered_targets(selected=destination.target,
+                purpose=target_config.RegistryRead.PLACEMENT, configuration=registry)
+            target = next((target for target in targets if isinstance(target, target_config.ScalerTarget)), None)
+            allowed = (target is not None and key.settings == placement.ExplicitProviderSettings(target.settings)
+                       and scaler_enabled(registry, target))
+            answer = scaler_availability() if allowed else placement.TemporaryExclusion("scaler disabled")
+            return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, answer)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
@@ -3982,11 +4029,15 @@ class AdmissionServer:
 
     def _read_mac_linux_guest(self, key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
         from scripts.build_targets import mac_linux
+        from scripts.mac_test import mac_test
 
         started_at = self.clock.now()
         backoff = mac_linux_backoff(started_at)
         if isinstance(backoff, placement.TemporaryExclusion):
             return placement.FreshHostEvidence(key, started_at, "", backoff)
+        block = mac_test.blocking_claim_block(mac_test.state_paths(), key.session)
+        if not isinstance(block, mac_test.NoMacBlock):
+            return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("blocked"))
         try:
             _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry))
         except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
@@ -4107,7 +4158,7 @@ done
                                  evidence: placement.HostEvidence | placement.EvidenceNeeded | NoSubmittedPlacementRequest) -> bool:
         """Confirm claim release under the same rules for status, replay, and settlement."""
         assignment = saved.assignment
-        if (not isinstance(saved.state, placement.CurrentAssignment)
+        if (assignment.destination.provider == "scaler" or not isinstance(saved.state, placement.CurrentAssignment)
                 or self.current_assignments.get(assignment.episode) != execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 or assignment.episode not in self.placement_requests):
             return False
@@ -4187,7 +4238,7 @@ done
 
         destination = saved.assignment.destination
         if destination.provider != "ssh":
-            return destination.provider != "local"
+            return destination.provider == "mac"
         transport = self._ssh_transport(saved)
         return transport is not None and not isinstance(
             transport, (hana_placement.HanaControlTransport, HanaGpuNextestTransport))
@@ -4215,6 +4266,8 @@ done
 
         provider = saved.provider
         from scripts.aws_target import hana_placement
+        if saved.assignment.destination.provider == "scaler":
+            return True
         if saved.assignment.destination.provider == 'ssh':
             try:
                 destination = saved.assignment.destination
@@ -4384,6 +4437,9 @@ done
                     local_holder = evidence.holder
                 permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
                              else placement.EvidenceNeeded(evidence.reason))
+                if (destination.provider == "scaler" and isinstance(permitted, placement.AllowedHost)
+                        and self._cloud_slots_full()):
+                    permitted = placement.TemporaryExclusion("cloud slots full")
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
                     from scripts.mac_test.mac_test import scopes_overlap
 
@@ -4549,7 +4605,9 @@ done
         hold = (records.RemoteStartHold(self.clock.now() + remote_start_hold_seconds)
                 if destination.provider != "local" and self._can_hold_local_place(request)
                 else records.RemoteStartHoldUnrecorded())
-        self.assignments[key] = records.SavedPlacementAssignment(assignment,
+        claim = (placement.assigned_claim_reference(assignment) if destination.provider == "scaler"
+                 else placement.NoProviderClaim())
+        self.assignments[key] = records.SavedPlacementAssignment(assignment, provider=claim,
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
         self.current_assignments[request.episode] = key
@@ -4623,7 +4681,9 @@ done
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
-            if isinstance(saved.permission, placement.PermissionConsumed):
+            if (isinstance(saved.permission, placement.PermissionConsumed)
+                    or saved.assignment.destination.provider == "scaler"
+                    and isinstance(saved.terminal_report, placement.TerminalAttemptReport)):
                 return wire.PlacementWait(request.episode, request.since, position,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
@@ -4793,9 +4853,10 @@ done
                         break
                     continue
                 if destination.provider == "scaler":
-                    continue
-                if (any(same_remote_resource(other, destination) for other in taken)
-                        or self._held_for_older(request, destination, held, holds)):
+                    if self._cloud_slots_full():
+                        continue
+                elif (any(same_remote_resource(other, destination) for other in taken)
+                      or self._held_for_older(request, destination, held, holds)):
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
@@ -4934,7 +4995,10 @@ done
                                 return self._placement_status(assignment, f'Hana admission refused: {memory.reason}')
                 except (OSError, ValueError) as error:
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
-        if isinstance(transport, hana_placement.HanaControlTransport):
+        if destination.provider == "scaler":
+            if reference != saved.provider or reference != placement.assigned_claim_reference(assignment):
+                return self._placement_status(assignment, "the exact scaler claim is not adopted")
+        elif isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.aws_target.hana_placement_adapter import read_assigned_adoption
 
             adopted = read_assigned_adoption(assignment, request.holder, transport)
@@ -4981,7 +5045,7 @@ done
         holder = saved.holder
         return (saved.assignment.destination.target == "mac-linux"
                 and isinstance(saved.permission, placement.PermissionConsumed)
-                and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
+                and isinstance(request.claim, placement.NoProviderClaim) and bool(request.reason)
                 and isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host
                 and not owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time))
 
@@ -5059,6 +5123,9 @@ done
             if self.current_assignments.get(assignment.episode) != key:
                 continue
             report = saved.terminal_report
+            if assignment.destination.provider == "scaler":
+                self._settle_scaler_attempt(saved)
+                continue
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
                     and self._settle_hana_prelaunch(saved, report)):
@@ -5104,6 +5171,36 @@ done
                 report = self._lost_report()
                 saved = replace(saved, terminal_report=report)
             self._close_for_report(saved, report)
+
+    def _settle_scaler_attempt(self, saved: records.SavedPlacementAssignment) -> None:
+        """Release the scaler slot only when the report or ledger proves settlement."""
+        assignment = saved.assignment
+        report = saved.terminal_report
+        if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled):
+            self._close_for_report(saved, report)
+            return
+        owner_live = self._placement_owner_live(assignment.owner)
+        if isinstance(report, placement.NoTerminalReport) and owner_live and not self._ended_claim_holder(saved):
+            return
+        submitted = self.placement_requests.get(assignment.episode)
+        if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
+            return
+        key = self.host_evidence_key(submitted, assignment.destination)
+        self.host_requests[key] = submitted
+        self.placement_host_keys[(submitted.episode, assignment.destination)] = key
+        reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
+        probe = DispatchEvidenceProbe(key, saved,
+            lambda: scaler_settlement(assignment.episode, placement.scaler_attempt_number(assignment.attempt)))
+        if reader.worker.dispatch_pending(probe):
+            return
+        if isinstance(report, placement.TerminalAttemptReport):
+            terminal = replace(report, path=placement.DispatchPathSettled())
+        elif owner_live:
+            terminal = self._lost_report()
+        else:
+            terminal = placement.TerminalAttemptReport(placement.AttemptCancelled("coordinator ended"),
+                placement.DispatchPathSettled(), self.clock.now())
+        self._close_for_report(replace(saved, terminal_report=terminal), terminal)
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
         outcome = report.outcome
@@ -5226,14 +5323,25 @@ done
         saved = self.assignments.get(key)
         if saved is None or saved.assignment != assignment:
             return [self._placement_status(assignment, check_lifetime=False)]
+        if (isinstance(request, wire.ExecutionReport) and assignment.destination.provider == "scaler"
+                and request.claim != saved.provider):
+            return [self._placement_status(assignment, "claim does not match the scaler assignment", check_lifetime=False)]
         if isinstance(request, wire.ClaimFailure):
+            local_decline = (assignment.destination.provider == "local"
+                             and isinstance(request.claim, placement.NoProviderClaim))
             if (self.current_assignments.get(assignment.episode) == key
-                    and (isinstance(saved.permission, placement.PermissionAvailable)
-                         or self._guest_took_no_run(saved, request))
+                    and (local_decline or isinstance(saved.permission, placement.PermissionAvailable)
+                         or self._guest_took_no_run(saved, request)
+                         or assignment.destination.provider == "scaler"
+                         and (request.claim == saved.provider or isinstance(request.claim, placement.NoProviderClaim)))
                     and isinstance(saved.state, placement.CurrentAssignment)):
                 if isinstance(saved.terminal_report, placement.TerminalAttemptReport):
                     return [self._placement_status(assignment, 'the attempt already has a terminal report', check_lifetime=False)]
-                if isinstance(request.claim, placement.ProviderClaimReference):
+                if assignment.destination.provider == "scaler" and isinstance(request.claim, placement.ProviderClaimReference):
+                    if request.claim != saved.provider:
+                        return [self._placement_status(assignment, "claim does not match the scaler assignment",
+                            check_lifetime=False)]
+                elif isinstance(request.claim, placement.ProviderClaimReference):
                     from scripts.mac_test.mac_test import scopes_overlap
 
                     destination = assignment.destination
@@ -5254,7 +5362,11 @@ done
                         self.next_pass = self.clock.monotonic()
                     else:
                         terminal = replace(terminal, path=placement.DispatchPathSettled())
-                        self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
+                        refused = replace(refused, terminal_report=terminal, retry=retry)
+                        if local_decline:
+                            self._close_for_report(refused, terminal)
+                        else:
+                            self._close_placement(refused, request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
                 or isinstance(saved.permission, placement.PermissionAvailable)
                 and (isinstance(request.outcome, BeforeLaunchRefusal)
@@ -5290,7 +5402,8 @@ done
             if (self.current_assignments.get(assignment.episode) == key
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
-                    and not isinstance(report.outcome, placement.AttemptDeclined)):
+                    and (assignment.destination.provider == "scaler"
+                         or not isinstance(report.outcome, placement.AttemptDeclined))):
                 self._close_for_report(saved, report)
             else:
                 self.persist()

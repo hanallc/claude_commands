@@ -43,6 +43,7 @@ from scripts.build_queue import execution_identity, placement
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue.test_placement import PlacementFixture, assignment_for, publish_candidate, scaler_gate_request
 from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
@@ -331,8 +332,8 @@ class FakeGateAws:
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
 
 
-def aws_gate_assignment() -> gate.AwsGateAssignment:
-    return gate.AwsGateAssignment(placement.PlacementAssignment('episode', 'attempt',
+def aws_gate_assignment(attempt: str = 'attempt') -> gate.AwsGateAssignment:
+    return gate.AwsGateAssignment(placement.PlacementAssignment('episode', attempt,
         placement.PlacementDestination('scaler', 'aws', 'fixture', WHOLE_MAC),
         execution_identity.SourceKeyKnown('tree'), placement.SubmittingOwner('fixture', 1, '1'),
         NoOwningSession(), 1.0))
@@ -347,38 +348,122 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
     deployment: dict[str, object] = {}
 
     def test_scaler_assignment_consumes_once_and_retains_pending_launch(self) -> None:
+        values = cloud_gate.settings()
+        with PlacementFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            start = process_start(os.getpid())
+            assert isinstance(start, Started)
+            owner = fixture.fixture_owner(os.getpid(), start.start)
+            request = replace(scaler_gate_request(fixture),
+                owner=placement.SubmittingOwner(fixture.server.host, owner.pid, owner.start_time),
+                run=wire.RunIdentity(owner.pid, owner.start_time))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = placement.assigned_claim_reference(assignment)
+
+            def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
+                booked, = self.book.gate_claim_reservations(claim.claim_id)
+                self.assertEqual(booked.attempt, claim.claim_id)
+                self.assertEqual(booked.placement_claim, claim.claim_id)
+                self.assertIsInstance(booked.state, ledger.GateLaunchPending)
+                reply, = fixture.server.handle_request(message)
+                assert isinstance(reply, wire.FirstAuthorization), reply
+                return reply
+
+            def launch(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
+                self.assertEqual(attempt.claim, claim)
+                attempt.identifier = claim.claim_id
+                attempt.booking_submitted = True
+                return cloud_gate.CloudDeclined('The launch reply is unavailable')
+
+            with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+                  mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+                  mock.patch.object(cloud_gate, 'settings', return_value=values),
+                  mock.patch.object(time, 'time', return_value=self.now),
+                  mock.patch.object(store, 'host_name', return_value=fixture.server.host),
+                  mock.patch.object(admission_client, 'consume_permission', side_effect=consume) as authorize,
+                  mock.patch.object(admission_client, 'report_execution') as report,
+                  mock.patch.object(cloud_gate, 'run_cloud', side_effect=launch) as start_launch,
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake AWS transport'))):
+                route = partial(cloud_gate.route, self.root, mode=gate.SuiteMode.GATE, full=False,
+                                module_time_limit_s=30, assignment=assignment)
+                with self.assertRaisesRegex(gate.AwsGateLaunchPending, 'settlement remains pending'):
+                    _ = route()
+                with self.assertRaisesRegex(gate.AwsGateLaunchPending, 'already has an open booking'):
+                    _ = route()
+                self.assertIsInstance(cloud_gate.settlement(assignment.episode, int(assignment.attempt, 16)),
+                                      placement.Pending)
+            start_launch.assert_called_once()
+            authorize.assert_called_once()
+            report.assert_called_once()
+            sent = cast(wire.ExecutionReport, report.call_args.args[0])
+            self.assertEqual(sent.assignment, assignment)
+            self.assertEqual(sent.claim, claim)
+            self.assertIsInstance(sent.path, placement.DispatchPathPending)
+            self.assertEqual(sent.outcome, placement.AttemptDeclined('The launch reply is unavailable'))
+
+    def test_confirmed_scaler_decline_closes_the_booking_without_a_terminal_report(self) -> None:
         assignment = aws_gate_assignment().assignment
         claim = placement.assigned_claim_reference(assignment)
         first = wire.FirstAuthorization(assignment, claim)
-        replay = wire.DispatchStatus(assignment, placement.CurrentAssignment(),
-                                    placement.PermissionConsumed(self.now), 'already consumed')
 
-        def launch(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
-            attempt.identifier = 'fixture-launch'
-            with self.book.transaction() as state:
-                state.gate_reservations.append(ledger.GateReservation(attempt.identifier,
-                    int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal(0)))
-            return cloud_gate.CloudDeclined('The launch reply is unavailable')
+        def decline(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
+            attempt.booking_submitted = True
+            self.book.resolve_gate(claim.claim_id, ledger.GateAbsent(int(self.now)))
+            return cloud_gate.CloudDeclined('capacity')
 
         with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
-              mock.patch.object(admission_client, 'consume_permission', side_effect=[first, replay]) as consume,
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(admission_client, 'consume_permission', return_value=first),
               mock.patch.object(admission_client, 'report_execution') as report,
-              mock.patch.object(cloud_gate, 'run_cloud', side_effect=launch) as start,
-              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake AWS transport'))):
-            route = partial(cloud_gate.route, self.root, mode=gate.SuiteMode.GATE, full=False,
-                            module_time_limit_s=30, assignment=assignment)
-            self.assertEqual(route(), 'The launch reply is unavailable')
-            self.assertEqual(route(), 'The queue refused AWS launch permission: already consumed')
-        start.assert_called_once()
-        self.assertEqual(consume.call_count, 2)
-        self.assertEqual(cast(wire.ConsumePermission, consume.call_args.args[0]).claim, claim)
-        report.assert_called_once()
-        sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertEqual(sent.assignment, assignment)
-        self.assertEqual(sent.claim, claim)
-        self.assertIsInstance(sent.path, placement.DispatchPathPending)
-        self.assertEqual(sent.outcome, placement.AttemptDeclined('The launch reply is unavailable'))
-        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+              mock.patch.object(cloud_gate, 'run_cloud', side_effect=decline),
+              self.assertRaisesRegex(gate.AwsGateTookNoRun, 'capacity')):
+            _ = cloud_gate.route(self.root, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=30,
+                                 assignment=assignment)
+        report.assert_not_called()
+        booked, = self.book.gate_claim_reservations(claim.claim_id)
+        self.assertIsInstance(booked.state, ledger.GateAbsent)
+
+    def test_scaler_permission_refusal_does_not_launch_and_closes_the_booking(self) -> None:
+        assignment = aws_gate_assignment().assignment
+        claim = placement.assigned_claim_reference(assignment)
+        refusal = wire.DispatchStatus(assignment, placement.CurrentAssignment(), placement.PermissionAvailable(), 'refused')
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(admission_client, 'consume_permission', return_value=refusal),
+              mock.patch.object(cloud_gate, 'run_cloud') as start_launch,
+              self.assertRaisesRegex(gate.AwsGateTookNoRun, 'permission: refused')):
+            _ = cloud_gate.route(self.root, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=30,
+                                 assignment=assignment)
+        start_launch.assert_not_called()
+        booked, = self.book.gate_claim_reservations(claim.claim_id)
+        self.assertIsInstance(booked.state, ledger.GateAbsent)
+
+    def test_settlement_uses_only_the_exact_claim_and_its_retries(self) -> None:
+        episode = 'episode'
+        attempt = '0000000000000000000000000000000a'
+        claim = execution_identity.assigned_claim_id(episode, attempt)
+        now = int(self.now)
+        booking = ledger.GateReservation(claim, now, now + 60, Decimal('.8'), Decimal(0), placement_claim=claim)
+        retry = replace(booking, attempt='retry', state=ledger.GateRunning('fixture-instance'))
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Settlement uses local files'))):
+            self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+            with self.book.transaction() as state:
+                state.gate_reservations.extend((booking, retry, replace(booking, attempt='unrelated', placement_claim='')))
+            before = self.book.path.read_bytes()
+            with mock.patch.object(ledger.CostLedger, 'locked_snapshot') as lock:
+                self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            lock.assert_not_called()
+            self.assertEqual(self.book.path.read_bytes(), before)
+            self.book.resolve_gate(claim, ledger.GateAbsent(now))
+            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+            self.book.resolve_gate(retry.attempt, ledger.GateTerminated(now, 'fixture-instance'))
+            self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+            _ = self.book.path.write_text('unreadable')
+            self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
 
     def test_availability_uses_only_local_evidence(self) -> None:
         directory = self.state
@@ -1665,6 +1750,27 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertIsInstance(cloud_gate.log_progress('Preparing tools\n'), progress_profile.NoCounter)
         self.assertIsInstance(cloud_gate.log_progress('Runner: 0 modules, whole machine, 32 CPUs\n'),
                               progress_profile.NoCounter)
+
+    def test_module_progress_counts_a_path_with_a_space(self) -> None:
+        log = ('Runner: 1 modules, whole machine, 16 CPUs\n'
+               + 'fixture/test_has space.py exit=0 seconds=1.00\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 1))
+
+    def test_module_progress_excludes_the_type_check(self) -> None:
+        log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+               + 'fixture/test_one.py exit=0 seconds=1.00\n'
+               + 'types/basedpyright exit=1 seconds=2.00\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 2))
+
+    def test_module_progress_ignores_malformed_numbers(self) -> None:
+        oversized = '9' * 5000
+        log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+               + f'Runner: {oversized} modules, whole machine, 16 CPUs\n'
+               + f'Runner: 1 modules, whole machine, {oversized} CPUs\n'
+               + 'fixture/test_one.py exit=0 seconds=1.00\n'
+               + f'fixture/test_two.py exit={oversized} seconds=1.00\n'
+               + 'fixture/test_three.py exit=0 seconds=unavailable\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 2))
 
     def test_each_log_download_publishes_cloud_state_and_latest_failures(self) -> None:
         self.fake.log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
@@ -3100,10 +3206,15 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                               .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
         _ = gate.checked_git(self.repo, 'add', '.')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(int(time.time()), (), 'fixture', builder_removed=True))
         for mode in gate.SuiteMode:
+            target = aws_gate_assignment(mode.value)
+            claim = placement.assigned_claim_reference(target.assignment)
+            authorization = wire.FirstAuthorization(target.assignment, claim)
+            assignment_file = self.root / 'assignment.json'
             with (self.subTest(mode=mode),
+                  mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(assignment_file)}),
                   mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No cloud service may start')) as service,
                   mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('No AWS call may start')),
                   mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
@@ -3115,10 +3226,9 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     _ = gate.run_gate_suites(self.repo, full=True, mode=mode, target=target)
                 local.assert_not_called()
                 service.assert_not_called()
-                report.assert_called_once()
-                sent = cast(wire.ExecutionReport, report.call_args.args[0])
-                self.assertEqual(sent.outcome, placement.AttemptDeclined(reason))
-                self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+                report.assert_not_called()
+                booking, = book.gate_claim_reservations(claim.claim_id)
+                self.assertIsInstance(booking.state, ledger.GateAbsent)
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['mode'], rows[-1]['reason']), (mode.value, reason))
@@ -3865,9 +3975,9 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                                kind=gate.GateJobKind.TYPE_CHECK),), 1, 0)
         finish = mock.Mock(side_effect=self._finish_gate_for_resume)
         run_cloud = partial(cloud_gate.run, service=finish)
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
         for route, types in (('saved', ()), ('fresh', ()), ('cloud and types', ('scripts',))):
+            target = aws_gate_assignment(route)
+            authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
             finish.reset_mock()
             with (self.subTest(route=route), redirect_stdout(StringIO()),
                   mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake cloud service')),
@@ -4571,25 +4681,37 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(request.owner.pid, os.getpid())
                 self.assertEqual(request.run, wire.RunIdentity(request.owner.pid, request.owner.start_time))
 
-    def test_cloud_refusal_releases_the_scaler_reservation(self) -> None:
+    def test_cloud_refusal_uses_the_assigned_slot_and_closes_the_booking(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        target = aws_gate_assignment()
+        claim = placement.assigned_claim_reference(target.assignment)
+        authorization = wire.FirstAuthorization(target.assignment, claim)
+        book = ledger.CostLedger(self.state)
+        assignment_file = self.root / 'assignment.json'
+        book.record_inventory(ledger.ResourceInventory(int(time.time()), (), 'fixture', builder_removed=True))
+
         def service(command: Sequence[str]) -> int:
-            record, = self.admission.caller_reservations().values()
-            self.assertEqual(record.need, 0)
+            self.assertTrue(self.admission.callers_released())
             folder = Path(command[command.index('--worker') + 1])
+            self.assertEqual(folder.name, claim.claim_id)
+            request = cloud_gate.read(folder / 'request.json')
+            self.assertEqual(request['placement_claim'], claim.claim_id)
+            booked, = book.gate_claim_reservations(claim.claim_id)
+            self.assertIsInstance(booked.state, ledger.GateLaunchPending)
+            book.resolve_gate(claim.claim_id, ledger.GateAbsent(int(time.time())))
             cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
             return 0
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
+
         run_cloud = partial(cloud_gate.run, service=service)
-        with (mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
+        with (mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(assignment_file)}),
+              mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
               mock.patch.object(admission_client, 'report_execution') as report,
               mock.patch.object(cloud_gate, 'run', side_effect=run_cloud),
               mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO()),
-              self.assertRaisesRegex(GateRefused, 'AWS gate failed: capacity')):
+              self.assertRaisesRegex(gate.AwsGateTookNoRun, 'capacity')):
             _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=target)
         local.assert_not_called()
-        report.assert_called_once()
+        report.assert_not_called()
         self.assertTrue(self.admission.callers_released())
 
     def test_cloud_service_error_releases_its_slot(self) -> None:

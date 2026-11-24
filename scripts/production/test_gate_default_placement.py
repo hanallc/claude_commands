@@ -13,11 +13,13 @@ from unittest import mock
 
 from scripts.aws_target import cloud_gate
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_wire as wire, execution_identity, first_step, placement
+from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, first_step, placement, queue_place
 from scripts.build_queue.admission_client import OuterReservation
+from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_targets import mac_linux
 from scripts.copies import copies
-from scripts.lib import conf, scratch
+from scripts.lib import build_folders, conf, scratch
+from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.production import gate
 from scripts.production.gate_routes import ModuleCoverage
@@ -45,7 +47,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     events.append('admit')
                     try:
                         yield mock.Mock(spec=first_step.FirstStepAdmission,
-                                        grant=mock.Mock(spec=first_step.GatePlacement))
+                                        grant=first_step.GatePlacement(placed('aws'), None))
                     finally:
                         events.append('release')
 
@@ -97,7 +99,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     calls.append('admit')
                     try:
                         yield mock.Mock(spec=first_step.FirstStepAdmission,
-                                        grant=mock.Mock(spec=first_step.GatePlacement))
+                                        grant=first_step.GatePlacement(placed('natedev'), None))
                     finally:
                         calls.append('release')
 
@@ -120,6 +122,67 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, 'gate_recovery', return_value=nullcontext())):
                     self.assertEqual(gate.main(arguments), 0)
                 self.assertEqual(calls, ['admit', 'run', 'release'])
+
+    def test_default_gate_uses_the_real_placement_request_builder(self) -> None:
+        with TemporaryDirectory() as directory:
+            repo = Path(directory)
+            settings = repo / "aws.conf"
+            _ = settings.write_text("enabled=on\n")
+            write_memory_config(repo / "build_admission.conf", **{"program_first_peak_gib.gate": "4"})
+            _ = (repo / "build_targets.conf").write_text(
+                "targets=aws\nkind.aws=scaler\nplatform.aws=linux\n" + f"settings.aws={settings.name}\n")
+
+            def place(request: wire.PlacementRequest, _reason: str) -> wire.Assignment:
+                destination, = (item.destination for item in request.constraints.candidates)
+                self.assertEqual(destination.target, "aws")
+                self.assertEqual(destination.provider, "scaler")
+                self.assertEqual(request.constraints.command, ("gate.py", "--tests-only"))
+                return wire.Assignment(placement.PlacementAssignment(request.episode, "attempt", destination,
+                    request.constraints.source_key, request.owner, request.constraints.session, request.since))
+
+            def run(_args: gate.GateArguments, _mode: gate.SuiteMode, target: gate.GateTarget) -> int:
+                assert isinstance(target, gate.AwsGateAssignment)
+                self.assertEqual(wire.read_assignment(repo / "assignment.json").assignment, target.assignment)
+                self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], target.assignment.episode)
+                return 0
+
+            with (mock.patch.dict(os.environ, {"CONF_DIR": directory, "HOME": directory,
+                                               "CLAUDE_SESSION_NAME": "gate-fixture"}, clear=True),
+                  mock.patch.object(build_folders, "repo_word", return_value="claude"),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(repo)),
+                  mock.patch.object(queue_place, "wait_for_placement", side_effect=place) as request,
+                  mock.patch.object(admission_client, "cancel_placement") as close,
+                  mock.patch.object(gate, "run_tests_only", side_effect=run)):
+                self.assertEqual(gate.main(["--tests-only"]), 0)
+            request.assert_called_once()
+            close.assert_called_once()
+
+    def test_aws_gate_exit_records_only_the_confirmed_prelaunch_decline(self) -> None:
+        assignment = placed("aws")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "assignment.json"
+            failure_path = path.with_name(path.name + CLAIM_FAILURE_SUFFIX)
+            for error, status in ((gate.AwsGateLaunchPending("launch unknown"), GATE_UNSETTLED_LAUNCH_STATUS),
+                                  (gate.AwsGateTookNoRun("capacity"), GATE_PRELAUNCH_REFUSED_STATUS)):
+                with (self.subTest(status=status),
+                      mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+                      mock.patch.object(gate, "current_gate_placement", return_value=assignment),
+                      mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
+                      mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                      mock.patch.object(copies, "source_owner", return_value=""),
+                      mock.patch.object(cloud_gate, "working_tree", return_value=("tree", set())),
+                      mock.patch.object(cloud_gate, "route", side_effect=error),
+                      mock.patch.object(gate, "run_suites") as local):
+                    self.assertEqual(gate.main(["--tests-only"]), status)
+                local.assert_not_called()
+                if status == GATE_UNSETTLED_LAUNCH_STATUS:
+                    self.assertFalse(failure_path.exists())
+                else:
+                    failure = wire.parse_request(failure_path.read_bytes())
+                    assert isinstance(failure, wire.ClaimFailure), failure
+                    self.assertEqual(failure.assignment, assignment.assignment)
+                    self.assertEqual(failure.claim, placement.assigned_claim_reference(assignment.assignment))
+                    self.assertEqual(failure.reason, "capacity")
 
     def test_wrapped_gate_reuses_the_placement_file(self) -> None:
         assignment = placed('aws')
@@ -167,7 +230,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(gate, 'outer_reservation', return_value=parent if nested else None),
                   mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, placed('aws')]),
                   mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(
-                      mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement)))) as admit,
+                      mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.GatePlacement(placed('aws'), None)))) as admit,
                   mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
                 self.assertEqual(gate.main(arguments), 0)
             self.assertEqual(admit.call_count, int(not nested))
@@ -226,7 +289,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
             command = ('gate.py', '--nightly', '--merge-branch', 'main', '--unit', 'fixture')
             args = gate.GateArguments(repo=str(repo), merge_branch='main', unit='fixture', command=command)
             assignment = placed('mac-linux')
-            admitted = mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement))
+            admitted = mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.GatePlacement(assignment, None))
             with (mock.patch.object(gate, 'nightly_git'), mock.patch.object(gate, 'checked_git', return_value='tree'),
                   mock.patch.object(gate, 'nightly_owner', return_value='fixture'),
                   mock.patch.object(copies, 'standing', return_value=nullcontext(clone)),

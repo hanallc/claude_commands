@@ -129,6 +129,13 @@ class SlotOrderTests(unittest.TestCase):
         environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
+        server = self.queue.server
+        provider_probe = server.host_probe
+
+        def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            return server.read_provider_evidence(key) if key.destination.provider == "local" else provider_probe(key)
+
+        server.host_probe = probe
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
             "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
@@ -329,7 +336,7 @@ class SlotOrderTests(unittest.TestCase):
                   side_effect=AssertionError("the pending bump gate sent a result")),
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             _ = bump_gate.run_gate(path)
-        request = next(request for request in self.requests if isinstance(request, wire.AdmitRequest))
+        request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
         self.assertEqual(request.identity.job, StepJob("test-all"))
 
     def test_bump_admission_selects_the_package_from_its_tip(self) -> None:
@@ -372,6 +379,7 @@ class SlotOrderTests(unittest.TestCase):
                         os.environ["UNIT_DETACHED_RUN"] = previous
                     else:
                         _ = os.environ.pop("UNIT_DETACHED_RUN", None)
+                    self.queue.allow_next_start()
                     command = (sys.executable, str(self.source / "gate.py"), "--tests-only")
                     with self.assertRaisesRegex(ValueError, "private command failed") if fails else nullcontext():
                         with first_step.admitted_run(command, self.source) as admitted:
@@ -394,10 +402,11 @@ class SlotOrderTests(unittest.TestCase):
             ((sys.executable, "-X", "--affected", gate, "--tests-only"), "gate"),
         ):
             with self.subTest(command=command):
+                self.queue.allow_next_start()
                 offset = len(self.requests)
                 with first_step.admitted_run(command, self.source) as admitted:
                     admitted.handoff(self.source)
-                requests = [request for request in self.requests[offset:] if isinstance(request, wire.AdmitRequest)]
+                requests = [request for request in self.requests[offset:] if isinstance(request, wire.PlacementRequest)]
                 self.assertTrue(requests)
                 self.assertEqual({request.profile.step for request in requests}, {expected})
 
@@ -633,7 +642,8 @@ placement_once
             self.waiting.clear()
             step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
             self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
-            request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+            request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest)
+                           and request.constraints.command_kind != "final")
             self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_slots.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
