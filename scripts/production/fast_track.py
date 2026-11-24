@@ -10,7 +10,7 @@ except FileNotFoundError:
 import argparse
 import ast
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import fcntl
@@ -34,10 +34,13 @@ from scripts.lib import land_main, main_push_lock
 from scripts.lib import process_group
 
 from scripts.copies import copies
-from scripts.production import checkpoint_gate
+from scripts.production import checkpoint_gate, land_runs
 from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
+
+
+GATE_CLEANUP_SECONDS = 10
 
 
 class Refused(Exception):
@@ -421,7 +424,18 @@ def mark_reviewed(unit: str, commits: list[str], review_pass: str) -> None:
 
 
 def check_command(command: list[str], repo: Path, environment: dict[str, str], deadline: float,
-                  *, empty_suite: bool = False) -> None:
+                  *, gate: bool = False) -> None:
+    recovery_directory: Path | None = None
+    if gate:
+        selected = environment.get("GATE_STATE_DIR")
+        try:
+            state = (land_runs.default_state_dir() if selected is None else Path(selected).expanduser()).resolve()
+        except land_runs.GateStateMoveRequired as error:
+            raise Refused(str(error)) from error
+        environment = {**environment, "GATE_STATE_DIR": str(state)}
+        identity = hashlib.sha256(os.fsencode(repo.resolve())).hexdigest()
+        recovery_directory = state / "active-runs" / identity
+
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise Refused("over the fast-track time limit; use the normal path")
@@ -431,20 +445,35 @@ def check_command(command: list[str], repo: Path, environment: dict[str, str], d
         try:
             _ = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as error:
-            process_group.send_process_group(process.pid, signal.SIGKILL)
-            _ = process.wait()
+            if gate:
+                # The gate stops its module groups when it gets SIGTERM.
+                with suppress(ProcessLookupError):
+                    process.terminate()
+                try:
+                    _ = process.wait(timeout=GATE_CLEANUP_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process_group.send_process_group(process.pid, signal.SIGKILL)
+                _ = process.wait()
+            if recovery_directory is not None and recovery_directory.is_dir():
+                from scripts.production import gate as gate_runner
+                from scripts.production.gate_modules import GateRefused
+
+                try:
+                    gate_runner.recover_gate_directory(recovery_directory, own_directory=recovery_directory)
+                except (OSError, GateRefused) as recovery_error:
+                    raise Refused(f"fast-track time limit; gate cleanup failed: {recovery_error}") from recovery_error
             raise Refused("over the fast-track time limit; use the normal path") from error
         _ = output.seek(0)
         text = output.read().decode(errors="replace")
     print(text, end="" if text.endswith("\n") else "\n")
-    passed = process.returncode == 0 or empty_suite and process.returncode == 5 and "Ran 0 tests" in text
-    if not passed:
+    if process.returncode != 0:
         raise Refused(f"fast check failed: {' '.join(command)}")
 
 
 def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrackLimits) -> None:
-    from scripts.production import gate
-
     deadline = time.monotonic() + config.check_time_limit_seconds
     check_paths(runner, repo, paths, config)
     python_paths = [Path(p) for p in paths if p.endswith(".py")]
@@ -457,21 +486,18 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             modules.update(p.relative_to(repo) for p in (repo / path.parent).glob(pattern))
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
-    with build_folders.tool_folder("fast-track-check") as temporary:
-        for number, module in enumerate(sorted(modules)):
-            root = temporary / str(number)
-            root.mkdir()
-            isolated = gate.test_module_environment(root, environment)
-            check_command([str(repo / "scripts/lib/py"), "-m", "unittest",
-                           ".".join(module.with_suffix("").parts)], repo, isolated, deadline, empty_suite=True)
-            for marker in (root / "build-tool-calls.jsonl", root / "live-memory-reads.jsonl"):
-                if marker.exists() and marker.stat().st_size:
-                    raise Refused(f"fast check tripwire: {marker.read_text()}")
-        for path in python_files:
-            module = ".".join(path.with_suffix("").parts)
-            if not all(part.isidentifier() for part in module.split(".")):
-                raise Refused(f"not a Python package module: {path}")
-            check_command([sys.executable, "-c", f"import {module}"], repo, environment, deadline)
+    if modules:
+        command = [str(repo / "scripts/lib/py"), str(repo / "scripts/production/gate.py"), "--tests-only"]
+        for module in sorted(modules):
+            if not module.is_relative_to("scripts") or len(module.parts) < 3:
+                raise Refused(f"test module must be in a suite folder under scripts/: {module}")
+            command.extend(("--module", module.relative_to("scripts").as_posix()))
+        check_command(command, repo, environment, deadline, gate=True)
+    for path in python_files:
+        module = ".".join(path.with_suffix("").parts)
+        if not all(part.isidentifier() for part in module.split(".")):
+            raise Refused(f"not a Python package module: {path}")
+        check_command([sys.executable, "-c", f"import {module}"], repo, environment, deadline)
 
 
 def drop_recovery_refs(runner: GitRunner, repo: Path, prefix: str) -> None:
@@ -761,7 +787,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.tool_folder("fast-track") as temporary:
         fetch_main(runner, repo, settings_read)
-        # Git edits and direct Python checks precede publication.
+        # Apply the patch and check it before publication.
         with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main"), step="fast-track") as copy:
             _ = runner.git(copy, "remote", "set-url", "origin", runner.git(repo, "remote", "get-url", "origin").strip())
             identity = commit_identity(runner, repo)

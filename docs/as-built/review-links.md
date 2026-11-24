@@ -14,7 +14,19 @@ Review links let a session on natedev or on the Mac show files to the user in a 
 | `/etc/nixos/modules/common/review-links.nix` | The shared job `nate.jobs.review-links` for both machines. |
 | `/etc/nixos/modules/linux/review-links.nix` | The natedev restart settings and the firewall line. |
 
-Run the tests from the repository root with `~/.claude/scripts/lib/py -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.12 or later.
+Run the tests through the queue from the repository root. Use Python 3.12 or later.
+
+```sh
+(
+  set --
+  for file in scripts/review_links/test_*.py; do
+    set -- "$@" --module "${file#scripts/}"
+  done
+  ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+    --repo "$PWD" --commit HEAD --apply-uncommitted "$PWD" -- \
+    scripts/lib/py scripts/production/gate.py --tests-only "$@"
+)
+```
 
 The flow:
 

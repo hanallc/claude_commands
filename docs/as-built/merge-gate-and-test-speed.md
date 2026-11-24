@@ -742,6 +742,18 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   If neither check proves a gate launch, it reads the cgroup name once.
   For a matching direct test scope, one systemd query checks for a finite runtime limit and SIGKILL.
   A process with an existing limit keeps its current folder and reads no test limit configuration.
+
+  The direct test limit covers loading and running tests. Unittest checks each direct selection before it runs.
+  If a direct selection contains more than one case from gate discovery, it exits before the first case.
+  A direct run gives its folder to children after the selection passes the case limit.
+  A child skips the case-count check while the inherited folder lease is held.
+  A Linux child that has no enforced deadline starts its own runtime limit.
+  Use the gate for larger selections.
+  On Linux, `coverage_overlap.py` and `module_cost.py` request gate admission before they start the selected modules.
+  On macOS, `coverage_overlap.py` runs without a local reservation, as the Mac gate guest does.
+  `module_cost.py` requires Linux to count processes and execs.
+  They pass the gate parent proof to each measured child. A queue refusal reports `BLOCKED`.
+
   A Linux process without a user systemd manager uses a private folder and a watchdog process for the same deadline.
   Only a proven absence selects the watchdog: no user bus, a bus socket path that does not exist, or a bus where no process owns the systemd name.
   Any other failed manager check stops the test with status 1. The test starts only after the watchdog reports that it is ready; a watchdog that does not start also stops the test with status 1.
@@ -1047,10 +1059,14 @@ It releases the lock after the local main push and before the Mac pull.
 New files can be selected.
 `copies.standing` supplies an isolated checkout of `origin/main`.
 The command applies the patch with `git apply --3way`.
-It runs the direct tests for changed Python files and imports each changed module.
-The check uses `merge_gate.test_module_environment` and its tripwires.
-An empty helper module can pass discovery; a failed package import cannot.
-The fast check uses no full gate run or queue admission.
+Fast-track selects tests for the changed Python files.
+It sends only the selected modules to the queue in one `gate.py --tests-only` call.
+The gate uses `test_module_environment` in the patch checkout and checks its tripwire markers.
+At the fast-track deadline, the gate gets 10 seconds to stop its jobs.
+Fast-track then uses gate recovery to stop any recorded groups that remain.
+An empty helper module can pass discovery.
+A failed package import stops the check.
+The fast check imports each changed Python module after the tests pass.
 `config/fast_track.conf` supplies the size, file, time, push-attempt, and refused-path limits.
 Imports of refused repository modules also refuse the fix, including indirect imports.
 
@@ -1165,7 +1181,7 @@ For script paths, the shim selects the script's checkout.
 For stdin, `-c`, and `-m`, it selects its own checkout and passes `-P` before other Python arguments.
 Outside the gate, it retains inherited Python paths after that root.
 It preserves the caller's working directory, interpreter cache, version floor, and `CLAUDE_PYTHON` override.
-`module_run.py` and `fast_track.py` load tests by package name.
+`module_run.py` loads gate tests by package name.
 The cloud guest bootstrap supplies its own root after a fresh clone.
 Blender uses its own interpreter and sets `PYTHONPATH` explicitly.
 

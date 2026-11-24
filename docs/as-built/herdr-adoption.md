@@ -383,25 +383,17 @@ Use these fixture rules on Linux and macOS:
 - Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
 - Pin the local machine in each fixture that stores staff locations on `natedev`. `HERDR_PLATFORM=linux` selects herdr process evidence, not the staff machine. A subprocess launcher uses `add_unit_test_support.LINUX_LAUNCHER_CLI`. A direct call patches the name the module imported, such as `add_showrunner.local_machine`.
 
-Run these suites on the Mac with a temporary home.
-Run the command from the root of a copy of the tree under test.
-The block removes the temporary home when the tests end:
+Run these modules through the queue from the repository root on natedev.
 
 ```sh
-(
-  set -e
-  test_home=$(mktemp -d)
-  trap 'rm -rf "$test_home"' EXIT
-  env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
-    HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
-    PYTHONDONTWRITEBYTECODE=1 ./scripts/lib/py -m unittest \
-    scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
-    scripts.agents.test_restart scripts.agents.test_account_move \
-    scripts.production.test_add_unit scripts.production.test_add_unit_accounts \
-    scripts.production.test_add_unit_resume scripts.production.test_add_unit_restore \
-    scripts.production.test_add_showrunner \
-    scripts.notify.test_push_texts
-)
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+  --repo "$PWD" --commit HEAD --apply-uncommitted "$PWD" -- \
+  scripts/lib/py scripts/production/gate.py --tests-only \
+  --module herdr/test_herdr.py --module herdr/test_herdr_sessions.py \
+  --module agents/test_restart.py --module agents/test_account_move.py \
+  --module production/test_add_unit.py --module production/test_add_unit_accounts.py \
+  --module production/test_add_unit_resume.py --module production/test_add_unit_restore.py \
+  --module production/test_add_showrunner.py --module notify/test_push_texts.py
 ```
 
 ## Invariants
@@ -519,9 +511,8 @@ Every pane keeps its shell when its agent ends.
 - `/tmp` is `/private/tmp`, so compare resolved paths.
 - Patching `sys.platform` after import does not change `herdr._PLATFORM`.
 - `test_support.py` sets the import path before importing `herdr`. Importing first breaks other suites.
-- `merge_gate.py` refuses on the Mac because `/dev/shm` is absent.
-  Run Mac suites from the clone root with `<clone>/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
-  Set no `PYTHONPATH`.
+- The gate needs `/dev/shm`. Run Mac fixture tests through the queue on natedev.
+  Use the queued command above and select each module with `--module <suite>/<test_file>.py`.
 - `list --on` runs the other machine's installed `~/.claude` code, so both machines need the promoted code before a remote list shows a change.
 
 **Trust.**
