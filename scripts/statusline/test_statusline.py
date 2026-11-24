@@ -1316,6 +1316,23 @@ class RoleTests(ConfiguredShellTests):
         assignment.publish_render(target, "fixture", fields, sources)
         self.assertFalse(target.exists())
 
+    def test_shell_rejects_a_saved_partial_action_count(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        fields = cast(dict[str, str], json.loads(lines[3]))
+        count = fields["for_you"]
+        fields["for_you"] = "1+"
+        lines[3] = json.dumps(fields)
+        _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+        launches = self.home / "python-invocations"
+        self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), 2)
+        refreshed = cast(dict[str, str], json.loads(cache.read_text(encoding="utf-8").splitlines()[3]))
+        self.assertEqual(refreshed["for_you"], count)
+
     def test_shell_invalidates_the_cache_when_a_reader_changes(self) -> None:
         render = self.cache_shell()
         expected = render(UNIT.id, "/bin/sh")
