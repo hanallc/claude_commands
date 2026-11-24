@@ -1889,7 +1889,7 @@ fi
                 environment = {key: value for key, value in os.environ.items() if key != 'BUILDLOG_PLACEMENT_SIDECAR'}
                 self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
                 ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                            errors='replace', timeout=mac_linux.GUEST_CLEANUP_TIMEOUT_SECONDS,
+                                            errors='replace', timeout=settings.unreachable_wait_seconds,
                                             check=False, env=environment)
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
