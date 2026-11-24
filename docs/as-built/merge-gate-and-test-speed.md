@@ -399,7 +399,7 @@ A direct `--affected` call prints the `copies.py run` command on standard error 
 The command uses the Git worktree root and its current `HEAD` commit.
 The inner gate command always has one `--repo '{tree}'` option for the prepared checkout.
 This option replaces any `--repo` or `--checkout` options from the direct call.
-The gate requires the handoff from `copies.py run` before it starts placement or tests.
+The gate requires a handoff from `copies.py run` or `copies.py gate-step` before it starts placement or tests.
 `./scripts/lib/py -m scripts.production.gate` accepts the same options.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
