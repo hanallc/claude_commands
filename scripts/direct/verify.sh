@@ -3660,6 +3660,10 @@ cache_lookup() {
     # Old pass records have no status line.
     if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
     [[ -n "${status_line#status=}" ]] || return 1
+    # Plain lint shares one cache key across packages.
+    if [[ "$CMD" == lint && -n "$VERIFY_PACKAGE" ]]; then
+        require_member "$VERIFY_PACKAGE"
+    fi
     LOOKUP_STATUS="${status_line#status=}"
     first_line="${record_text%%$'\n'*}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true

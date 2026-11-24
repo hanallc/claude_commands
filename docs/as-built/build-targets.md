@@ -676,6 +676,7 @@ A wall-clock jump can move a retry deadline because that offset is read once.
 A content key ignores touch-only changes.
 
 A lint key includes the compiler, mend, nightly rustfmt, clippy, and Taplo versions.
+Plain lint shares one key across packages. Verify checks a named package before it returns a cached lint result.
 Per-call version files avoid repeated probes.
 Unknown or empty tool versions prevent reuse and publication.
 `lint_code_key` covers verify.sh, the installed invoke.sh, and the selected lint configuration.
