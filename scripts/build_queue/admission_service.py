@@ -42,6 +42,7 @@ from scripts.lib.proc_text import read_proc_text
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
+from scripts.build_queue import ci_job_start
 from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
@@ -1795,7 +1796,8 @@ class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
-                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         state_dir = state_dir.resolve()
         self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
         self.writes.require()
@@ -1803,6 +1805,9 @@ class AdmissionServer:
         self.clock: Clock = clock
         self.readings: Readings = readings
         self.proc: Proc = proc
+        # An older CI front sends no job start, so the service reads it from the runner process.
+        self.job_start_reader: Callable[[wire.Owner], records.CiJobStart] = (job_start_reader if job_start_reader is not None
+            else lambda owner: ci_job_start.read_queue_job_start(owner.pid, owner.start_time, proc.path))
         self.fault: Callable[[str], None] = fault
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
@@ -5727,7 +5732,19 @@ done
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
             isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version,
-            runner=request.runner, job_start=request.job_start)
+            runner=request.runner, job_start=self._request_job_start(request))
+
+    def _request_job_start(self, request: wire.ServiceEstimateRequest) -> records.CiJobStart:
+        """Use the sent job start, or find it for a CI request from an older front that sent none.
+
+        A job start saved with the place of the same episode is kept, so a later failed read cannot drop it.
+        """
+        if isinstance(request.job_start, records.JobStart) or not request.runner:
+            return request.job_start
+        place = self.places.get(_place_key(request.owner, request.since))
+        if place is not None and place.episode == request.episode and isinstance(place.ci_job_start, records.JobStart):
+            return place.ci_job_start
+        return self.job_start_reader(request.owner)
 
     @staticmethod
     def _stored_caller(session: str, name: str, unit: str, *,

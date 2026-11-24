@@ -57,8 +57,16 @@ ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
-SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
-       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}')
+CONNECT_ATTEMPTS = 3
+# Give the guest port forward time to accept a new connection.
+CONNECT_RETRY_SECONDS = 1
+INNER_CONNECT_READY = 'mac-linux inner SSH ready'
+INNER_CONNECT_MARKER = 'mac-linux inner SSH connect failed'
+INNER_CONNECT_STATUS = 254
+GUEST_ACCEPTED = 'mac-linux command accepted'
+INNER_CONNECT_ERROR = re.compile(
+    r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
+SSH_OPTIONS = ('-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
@@ -98,8 +106,6 @@ OWNED_FOLDERS = (Path('/etc'), Path('/bin'), Path('/usr'), Path('/sbin'))
 STORE = Path('/nix/store')
 # The run sees its attempt temp folder at this path, and TMPDIR names it.
 TEMP = Path('/tmp')
-# The socket of the private sccache server of the run, in the attempt temp folder.
-SCCACHE_SOCKET = TEMP / 'sccache.sock'
 # The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
 CARGO_LOCKS = ('.package-cache', '.package-cache-mutate', '.global-cache')
 # The key of the bwrap status line that gives the exit status of the program.
@@ -155,12 +161,42 @@ class GuestSettings:
     def transfer_timeout_seconds(self) -> int:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
-    def command(self, shell: str) -> tuple[str, ...]:
-        # Each hop waits the unreachable wait for a keepalive answer, as the Mac route does. A Mac under heavy
-        # load can be slow to answer a keepalive check.
+    def command(self, shell: str, *, diagnose_connect: bool = True, budget_inner_connect: bool = False,
+                connect_timeout: int = SSH_CONNECT_TIMEOUT_SECONDS) -> tuple[str, ...]:
         mac, guest = self.ssh_hops
-        ssh = (*SSH, *eligibility.server_alive_options(self.unreachable_wait_seconds))
-        return (*ssh, mac, shlex.join((*ssh, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
+        options = (*SSH_OPTIONS, *eligibility.server_alive_options(self.unreachable_wait_seconds))
+        fixed_timeout = f'ConnectTimeout={connect_timeout}'
+        inner_timeout = '"ConnectTimeout=$guest_connect_timeout"' if budget_inner_connect else fixed_timeout
+        guest_command = shlex.join((*options, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell))))
+        guest_arguments = f'-o {inner_timeout} {guest_command}'
+        inner = f'ssh {guest_arguments}'
+        if diagnose_connect:
+            # Only the SSH client writes this log. The shell reserves one status for a verified connect failure.
+            inner = f'''log=$(mktemp "${{TMPDIR:-/tmp}}/mac-linux-ssh.XXXXXXXXXX") || exit 1
+trap 'rm -f -- "$log"' EXIT
+LC_ALL=C ssh -E "$log" {guest_arguments}
+guest_ssh_status=$?
+if [ "$guest_ssh_status" -eq 255 ] && LC_ALL=C awk '
+    {{ sub(/\\r$/, "") }}
+    NR == 1 && /^ssh: connect to host [^[:space:]]+ port [0-9]+: Connection (reset by peer|refused)$/ {{ found = 1 }}
+    END {{ exit !(NR == 1 && found) }}
+' "$log"; then
+    printf '%s\\n' {shlex.quote(INNER_CONNECT_MARKER)} >&2
+    guest_ssh_status={INNER_CONNECT_STATUS}
+elif [ "$guest_ssh_status" -eq {INNER_CONNECT_STATUS} ]; then
+    printf '%s\\n' 'The guest SSH command exited {INNER_CONNECT_STATUS}.' >&2
+    guest_ssh_status=255
+fi
+cat "$log" >&2
+exit "$guest_ssh_status"'''
+        if budget_inner_connect:
+            inner = f'''printf '%s\\n' {shlex.quote(INNER_CONNECT_READY)}
+IFS= read -r guest_connect_timeout || exit 1
+case "$guest_connect_timeout" in
+    ""|0*|*[!0-9]*) exit 1 ;;
+esac
+{inner}'''
+        return ('ssh', '-o', fixed_timeout, *options, mac, inner)
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
@@ -441,6 +477,46 @@ def guest_ssh_environment() -> dict[str, str]:
     return environment
 
 
+def inner_connect_failure[Output: (bytes, str)](
+    reply: subprocess.CompletedProcess[Output], *, bundle_stream: bool = False,
+) -> str:
+    if reply.returncode != INNER_CONNECT_STATUS or reply.stdout:
+        return ''
+    stderr = reply.stderr.decode(errors='replace') if isinstance(reply.stderr, bytes) else reply.stderr
+    if bundle_stream:
+        # Git can write this line when SSH closes the local bundle pipe.
+        stderr = ''.join(line for line in stderr.splitlines(keepends=True) if line != 'error: pack-objects died\n')
+    marker = INNER_CONNECT_MARKER + '\n'
+    diagnostic = stderr.removeprefix(marker)
+    return diagnostic.strip() if stderr != diagnostic and INNER_CONNECT_ERROR.fullmatch(diagnostic) else ''
+
+
+def retry_guest_connect[Output: (bytes, str)](
+    run: Callable[[float], subprocess.CompletedProcess[Output]], deadline: float, *, bundle_stream: bool = False,
+) -> subprocess.CompletedProcess[Output]:
+    """Retry only when the inner SSH client could not connect."""
+    diagnostic = ''
+    attempts = 0
+    while (remaining := deadline - monotonic()) > 0:
+        reply = run(remaining)
+        attempts += 1
+        diagnostic = inner_connect_failure(reply, bundle_stream=bundle_stream)
+        if not diagnostic:
+            return reply
+        if attempts == CONNECT_ATTEMPTS or deadline - monotonic() <= CONNECT_RETRY_SECONDS:
+            break
+        sleep(CONNECT_RETRY_SECONDS)
+    if not attempts:
+        raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
+    suffix = 'attempt' if attempts == 1 else 'attempts'
+    raise GuestConnectAttemptsFailed(f'{diagnostic} after {attempts} connect {suffix}')
+
+
+def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
+                          timeout=timeout, check=False, env=guest_ssh_environment())
+
+
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
 if ! command -v bwrap >/dev/null 2>&1; then
@@ -450,9 +526,9 @@ fi
 if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
-    reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False,
-                           env=guest_ssh_environment())
+    command = settings.command(shell)
+    reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
+                                monotonic() + settings.unreachable_wait_seconds)
     if reply.returncode:
         raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
     commit = reply.stdout.strip()
@@ -497,6 +573,10 @@ class ArmedGuestAttempt:
 
 class GuestTookNoRun(GuestUnavailable):
     """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
+
+
+class GuestConnectAttemptsFailed(GuestTookNoRun):
+    """The inner SSH connection failed before the guest received a command."""
 
 
 @dataclass(frozen=True)
@@ -553,20 +633,27 @@ def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
-    arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt,
-                      str(SSH_CONNECT_TIMEOUT_SECONDS)))
+    # Allow the arm reply, the full connect window, and guest lock setup.
+    window = min(GUEST_REF_TIMEOUT_SECONDS, settings.unreachable_wait_seconds)
+    window += settings.unreachable_wait_seconds + SSH_CONNECT_TIMEOUT_SECONDS
+    arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt, str(window)))
     command = settings.command(guest_shell(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {arm}')
-    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
-        try:
-            output, errors = process.communicate(timeout=GUEST_REF_TIMEOUT_SECONDS)
-        except BaseException:
-            stop_ssh_process(process)
-            raise
-    if process.returncode:
-        diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
-        raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
-    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', output)
+
+    def send(remaining: float) -> subprocess.CompletedProcess[bytes]:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
+            try:
+                output, errors = process.communicate(timeout=min(GUEST_REF_TIMEOUT_SECONDS, remaining))
+            except BaseException:
+                stop_ssh_process(process)
+                raise
+        return subprocess.CompletedProcess(command, process.returncode, output, errors)
+
+    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
+    if response.returncode:
+        diagnostic = response.stderr.decode(errors='replace').strip() or 'no diagnostic'
+        raise GuestUnavailable(f'guest arm exited {response.returncode}: {diagnostic}')
+    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', response.stdout)
     if reply is None:
         raise GuestUnavailable('the guest did not acknowledge the armed deadline')
     return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), reply[2].decode('ascii'), int(reply[3]),
@@ -814,6 +901,11 @@ class GuestEndPending:
     detail: str
 
 
+@dataclass(frozen=True)
+class GuestEndConnectPending(GuestEndPending):
+    """The inner SSH client could not connect for this proof request."""
+
+
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
                     proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
     if settings.guest_user != armed.guest_user:
@@ -821,14 +913,15 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
         return GuestEndPending(f'The guest account changed from {armed.guest_user} to {settings.guest_user}.')
     try:
         command = settings.command(cleanup_shell(settings, armed))
-        remaining = proof_deadline - monotonic()
-        if remaining <= 0:
+        now = monotonic()
+        if now >= proof_deadline:
             return GuestEndPending('The proof deadline expired before cleanup SSH.')
-        reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False,
-                               env=guest_ssh_environment())
+        reply = run_guest_ssh(command, min(GUEST_CLEANUP_TIMEOUT_SECONDS, settings.unreachable_wait_seconds,
+                                           proof_deadline - now))
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
+    if diagnostic := inner_connect_failure(reply):
+        return GuestEndConnectPending(diagnostic)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
         return GuestEndProven()
     reason = reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}'
@@ -857,6 +950,7 @@ class GuestEndWait:
     retry: bool = False
     proven: bool = False
     first_failure: str = ''
+    connect_attempts: int = 0
 
     def run(self) -> None:
         while not self.proven:
@@ -867,11 +961,18 @@ class GuestEndWait:
             if remaining <= 0:
                 return
             if self.retry:
-                sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
+                short_retry = 0 < self.connect_attempts < CONNECT_ATTEMPTS
+                pause = CONNECT_RETRY_SECONDS if short_retry else SSH_CONNECT_TIMEOUT_SECONDS
+                sleep(min(pause, remaining))
                 if monotonic() >= self.deadline:
                     return
+                if not short_retry:
+                    self.connect_attempts = 0
             self.retry = True
+            self.connect_attempts += 1
             proof = prove_guest_end(self.settings, self.armed, proof_deadline=self.deadline)
+            if not isinstance(proof, GuestEndConnectPending):
+                self.connect_attempts = 0
             if monotonic() >= self.deadline:
                 return
             if isinstance(proof, GuestEndProven):
@@ -881,9 +982,12 @@ class GuestEndWait:
 
     def unreachable(self) -> GuestEndUnproven:
         guest = self.settings.ssh_hops[-1]
-        return GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
-                                + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
-                                self.armed)
+        error = GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
+                                 + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
+                                 self.armed)
+        if self.first_failure:
+            error.add_note(f'First cleanup failure: {self.first_failure}')
+        return error
 
     def cleanup_detail(self) -> str:
         return 'Guest cleanup: ended' + (f' after {self.first_failure}' if self.first_failure else '')
@@ -1011,6 +1115,10 @@ bundle() {
 }
 send() {
     if [ -n "$count" ]; then
+        IFS= read -r guest_connect_timeout || exit 1
+        printf '%s\\n' "$guest_connect_timeout" || exit 1
+        # Keep this sender as one process until the guest accepts the command.
+        IFS= read -r upload || exit 1
         { cat && bundle; } | tee >(wc -c >&4) || exit
     else
         { cat && bundle; } || exit
@@ -1174,15 +1282,26 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     _ = reports.callback(collect)
 
 
+def ssh_connect_timeout(remaining: float) -> int:
+    # OpenSSH uses whole seconds. Use one second for the outer hop when the local deadline is shorter.
+    return max(1, min(SSH_CONNECT_TIMEOUT_SECONDS, int(remaining)))
+
+
 def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
                              armed: ArmedGuestAttempt, dispatch: GuestGateDispatch,
-                             reports: ExitStack) -> tuple[bytes, bytes]:
+                             reports: ExitStack, *, connect_deadline: float = math.inf) -> tuple[bytes, bytes]:
     """Transfer the bootstrap and read the reply, progress records, and diagnostics."""
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import progress_profile
 
     assert stream.stdin is not None and stream.stdout is not None and stream.stderr is not None
-    deadline = monotonic() + timeout
+    stream_input = stream.stdin
+    payload = bootstrap
+    connected = connect_deadline == math.inf
+    budget_sent = connected
+    deadline = monotonic() + timeout if connected else connect_deadline
+    mac_ready_line = bytearray(INNER_CONNECT_READY.encode())
+    accepted_line = f'{GUEST_ACCEPTED} {armed.attempt}'.encode()
     start_line = run_start_line(armed.attempt).encode()
     progress_prefix = GUEST_PROGRESS.encode()
     sidecar = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR', '')
@@ -1192,9 +1311,18 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
     last_counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
     started = False
 
-    def observe_start(line: bytes) -> None:
-        nonlocal started
-        if started or line.rstrip(b'\r') != start_line:
+    def observe_guest(line: bytes) -> None:
+        nonlocal connected, deadline, payload, started
+        line = line.rstrip(b'\r')
+        if not connected and budget_sent and line == accepted_line:
+            now = monotonic()
+            if now < deadline:
+                connected = True
+                deadline = now + timeout
+                payload = b'\n' + bootstrap
+                if not stream_input.closed:
+                    _ = ready.register(input_fd, EVENT_WRITE)
+        if not connected or started or line != start_line:
             return
         started = True
         start_guest_report(armed, dispatch, deadline, reports)
@@ -1204,7 +1332,10 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
         *lines, tail = data.split(b'\n')
         for line in lines:
             reply_line.extend(line)
-            if not reply_line.startswith(progress_prefix):
+            if not budget_sent and reply_line == mac_ready_line:
+                if input_fd not in ready.get_map():
+                    _ = ready.register(input_fd, EVENT_WRITE)
+            elif not reply_line.startswith(progress_prefix):
                 stdout.extend(reply_line)
                 stdout.append(10)
             elif sidecar:
@@ -1219,14 +1350,15 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
             reply_line.clear()
         reply_line.extend(tail)
 
-    input_fd, output_fd, error_fd = stream.stdin.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
+    input_fd, output_fd, error_fd = stream_input.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
     sent = parsed = 0
     try:
         with DefaultSelector() as ready:
-            if bootstrap:
-                _ = ready.register(input_fd, EVENT_WRITE)
-            else:
-                stream.stdin.close()
+            if connected:
+                if bootstrap:
+                    _ = ready.register(input_fd, EVENT_WRITE)
+                else:
+                    stream_input.close()
             _ = ready.register(output_fd, EVENT_READ)
             _ = ready.register(error_fd, EVENT_READ)
             while ready.get_map():
@@ -1235,44 +1367,63 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
                     raise subprocess.TimeoutExpired(stream.args, timeout)
                 for key, _events in ready.select(left):
                     if key.fd == input_fd:
-                        try:
-                            sent += os.write(input_fd, bootstrap[sent:sent + PIPE_BUF])
-                        except BrokenPipeError:
-                            sent = len(bootstrap)
-                        if sent == len(bootstrap):
+                        if not budget_sent:
+                            remaining = deadline - monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(stream.args, timeout)
+                            if remaining < 1:
+                                raise GuestTookNoRun('Less than one second remains for the guest SSH connection.')
+                            try:
+                                _ = os.write(input_fd, f'{ssh_connect_timeout(remaining)}\n'.encode())
+                            except BrokenPipeError:
+                                stream_input.close()
+                            budget_sent = True
                             _ = ready.unregister(input_fd)
-                            stream.stdin.close()
+                            continue
+                        try:
+                            sent += os.write(input_fd, payload[sent:sent + PIPE_BUF])
+                        except BrokenPipeError:
+                            sent = len(payload)
+                        if sent == len(payload):
+                            _ = ready.unregister(input_fd)
+                            stream_input.close()
                         continue
                     data = os.read(key.fd, 65536)
                     if not data:
                         _ = ready.unregister(key.fd)
                         if key.fd == error_fd and parsed < len(stderr):
-                            observe_start(bytes(stderr[parsed:]))
+                            observe_guest(bytes(stderr[parsed:]))
                     elif key.fd == output_fd:
                         read_reply(data)
                     else:
                         offset = len(stderr)
                         stderr.extend(data)
-                        while not started and (line_end := stderr.find(b'\n', offset)) >= 0:
-                            observe_start(bytes(stderr[parsed:line_end]))
+                        while not (connected and started) and (line_end := stderr.find(b'\n', offset)) >= 0:
+                            observe_guest(bytes(stderr[parsed:line_end]))
                             parsed = offset = line_end + 1
         _ = stream.wait(timeout=max(0, deadline - monotonic()))
     except subprocess.TimeoutExpired as error:
         error.stdout = bytes(stdout + reply_line)
         error.stderr = bytes(stderr)
+        if not connected:
+            detail = stream_diagnostic(bytes(stderr))
+            raise GuestTookNoRun(f'The guest SSH connect deadline expired before command acceptance: {detail}') from error
         raise
     return bytes(stdout + reply_line), bytes(stderr)
 
 
 def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
-                        link: int, armed: ArmedGuestAttempt, dispatch: GuestGateDispatch
-                        ) -> subprocess.CompletedProcess[bytes]:
+                        link: int, armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
+                        connect_deadline: float = math.inf) -> subprocess.CompletedProcess[bytes]:
+    if monotonic() >= connect_deadline:
+        raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
     with (ExitStack() as reports,
           subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,),
                            env=guest_ssh_environment()) as stream):
         try:
-            output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch, reports)
+            output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch, reports,
+                                                       connect_deadline=connect_deadline)
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
@@ -1288,10 +1439,11 @@ def bundle_send(repo: Path, source: CheckoutSource, bundle: FullBundle | DeltaBu
     return BundleSend('', '', BundleForm.FIRST, bundle.reason)
 
 
-def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt,
-                     prefix: str, send: BundleSend, *, count: bool, link: int) -> list[str]:
-    """The local command that sends the bootstrap and the bundle to the armed guest run, then holds the link."""
-    command = settings.command(run_shell(settings, source, bootstrap_bytes, armed))
+def stream_arguments(settings: GuestSettings, shell: str, prefix: str, send: BundleSend, *,
+                     count: bool, link: int, connect_timeout: int = SSH_CONNECT_TIMEOUT_SECONDS) -> list[str]:
+    """Send the bootstrap and bundle, then hold the link."""
+    command = settings.command(shell, diagnose_connect=count, budget_inner_connect=count,
+                               connect_timeout=connect_timeout)
     return ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, send.base, send.header,
             'count' if count else '', str(link), *command]
 
@@ -1318,11 +1470,22 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
+                        armed_for_stream = armed
                         with guest_link() as link:
-                            arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
-                                                         count=True, link=link)
-                            stream = stream_guest_bundle(repo, arguments, bootstrap,
-                                                         settings.transfer_timeout_seconds, link, armed, dispatch)
+                            acceptance = shlex.quote(f'{GUEST_ACCEPTED} {armed.attempt}')
+                            shell = f"printf '%s\\n' {acceptance} >&2\n"
+                            shell += run_shell(settings, source, len(bootstrap), armed)
+                            connect_deadline = monotonic() + settings.unreachable_wait_seconds
+
+                            def send_stream(remaining: float) -> subprocess.CompletedProcess[bytes]:
+                                arguments = stream_arguments(
+                                    settings, shell, prefix, send, count=True, link=link,
+                                    connect_timeout=ssh_connect_timeout(remaining))
+                                return stream_guest_bundle(
+                                    repo, arguments, bootstrap, settings.transfer_timeout_seconds, link,
+                                    armed_for_stream, dispatch, connect_deadline=connect_deadline)
+
+                            stream = retry_guest_connect(send_stream, connect_deadline, bundle_stream=True)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1462,8 +1625,8 @@ class GuestCommand:
         send = bundle_send(repo, source, bundle, prefix)
         self.armed = arm_guest(self.settings, request['attempt'])
         link = self.refs.enter_context(guest_link())
-        arguments = stream_arguments(self.settings, source, len(data), self.armed, prefix, send, count=False,
-                                     link=link)
+        shell = run_shell(self.settings, source, len(data), self.armed)
+        arguments = stream_arguments(self.settings, shell, prefix, send, count=False, link=link)
         with bootstrap.open('rb') as stdin:
             self.process = subprocess.Popen(arguments, cwd=repo, stdin=stdin, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,),
@@ -1875,12 +2038,10 @@ def read_paths(environment: Mapping[str, str], kept: Sequence[Path]) -> list[Pat
 
 
 def written_paths(checkout: Path, environment: Mapping[str, str]) -> list[Path]:
-    """The paths of the program environment that the run reads and writes, the checkout first: the cargo registry
-    and git folders, the cargo lock files, and the sccache folder."""
+    """Return the checkout, the Cargo registry and git folders, and the Cargo lock files."""
     home = home_folder(environment)
     cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
-    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS),
-            Path(environment.get('SCCACHE_DIR') or home / '.cache' / 'sccache')]
+    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS)]
 
 
 def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Path, read: Iterable[Path],
@@ -1902,8 +2063,11 @@ def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Pa
             if bindable(item, home, read=option == '--ro-bind'):
                 words += [option, str(item), str(item)]
     # The root of the limit is not writable, so a write to a folder that is not bound fails at once.
-    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'SCCACHE_SERVER_UDS',
-            str(SCCACHE_SOCKET), '--setenv', 'CARGO_NET_OFFLINE', 'true', '--chdir', str(checkout), '--']
+    # Empty wrapper values turn off the Cargo config wrapper.
+    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'CARGO_NET_OFFLINE', 'true',
+            '--setenv', 'RUSTC_WRAPPER', '', '--setenv', 'CARGO_BUILD_RUSTC_WRAPPER', '',
+            '--unsetenv', 'SCCACHE_DIR', '--unsetenv', 'SCCACHE_CACHE_SIZE', '--unsetenv', 'SCCACHE_SERVER_UDS',
+            '--chdir', str(checkout), '--']
 
 
 def setup_failed(status: int, status_fd: int) -> bool:
@@ -1927,9 +2091,9 @@ def limited_command(bwrap: str, status_fd: int, tmp: Path, copy: Path, environme
                     attempt: str, argv: Sequence[str]) -> list[str]:
     """The bwrap words that start the argv of a hand made run in the numbered copy under the read limit.
 
-    The program reads and writes the copy, which holds the run home and the build output, the cargo folders and
-    the sccache folder of its environment, and the attempt temp folder, which it sees as /tmp. home is the account
-    home of the guest: the limit binds no path that holds it. START_SHELL prints the start line in the limit.
+    The program writes the copy and its Cargo folders. The copy holds the run home and the build output.
+    The program sees the attempt temp folder as /tmp.
+    The limit binds no path that holds the guest account home. START_SHELL prints the start line in the limit.
     """
     write = [*written_paths(copy, environment), output_folder(copy, environment)]
     words = limit_words(bwrap, status_fd, tmp, copy, home, read_paths(environment, [tmp, copy]), write)
