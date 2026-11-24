@@ -105,7 +105,7 @@ class StaffNames:
         color = accounts.staff_role_color(member, self.colors)
         if not isinstance(color, accounts.StaffRoleColor):
             return label
-        return f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">{label}</span>'
+        return _role_span_open(color) + label + "</span>"
 
     def source(self, identity: staff.StaffId) -> str:
         """Keep a unit's parent and name separate, with their own role colors."""
@@ -116,9 +116,22 @@ class StaffNames:
         lead = self.html(parent.id, parent.name) + " · " if parent is not None else ""
         return lead + self.html(member.id, member.name)
 
+    def unit_open(self) -> str:
+        """Open the span of a unit name in the unit role color, or return "" when the setting has no valid color.
+
+        A page shows a unit in the unit color with this span also when the unit has no staff entry.
+        """
+        color = accounts.role_color("units", self.colors)
+        return _role_span_open(color) if isinstance(color, accounts.StaffRoleColor) else ""
+
     def registry(self) -> dict[str, str]:
         """Supply the same escaped name spans to pages that render in JavaScript."""
         return {alias: self.html(member.id, alias) for alias, member in self.rows.items()}
+
+
+def _role_span_open(color: accounts.StaffRoleColor) -> str:
+    """Open the span that shows a name in its role color. This is the one copy of that markup."""
+    return f'<span class="staff-name" data-color-text="{color.key}" style="color:{color.css}">'
 
 
 def read() -> StaffNames:
@@ -137,7 +150,10 @@ def script(registry: dict[str, str]) -> str:
 
 SCRIPT = r'''window.staffNames={
  values:STAFF_NAMES_DATA,
- set(values){this.values=values;},
- html(text){return this.values[text] ?? String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));},
+ unitOpen:'',
+ set(values,unitOpen=''){this.values=values;this.unitOpen=unitOpen;},
+ escape(text){return String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#x27;'}[c]));},
+ html(text){return this.values[text] ?? this.escape(text);},
+ unit(text){return this.unitOpen ? this.unitOpen+this.escape(text)+'</span>' : this.html(text);},
  parts(text){return String(text).split(' · ').map(part=>this.html(part)).join(' · ');}
 };'''

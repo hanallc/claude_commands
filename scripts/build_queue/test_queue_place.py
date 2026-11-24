@@ -25,11 +25,12 @@ from typing import Unpack, cast
 from unittest import mock
 
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
+from scripts.lib import release_waiter
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.build_queue import admission_records as records, program_start, step_estimator
+from scripts.build_queue import admission_records as records, program_start, queue_snapshot, step_estimator
 from scripts.lint import memory_admit as gate
 
 from scripts.buildlog import sample, store
@@ -394,6 +395,41 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_wait_for_placement_uses_the_timer_after_queue_json_changes(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=1)
+            request = placement_request(fixture)
+            clock = FakeClock()
+            poll_times: list[float] = []
+
+            def poll(_request: wire.PlacementRequest) -> wire.PlacementWait | client.LeftQueue:
+                poll_times.append(clock.monotonic())
+                if len(poll_times) == 1:
+                    _ = (fixture.state_dir / "queue.json").write_text("{}")
+                    now = fixture.clock.now()
+                    queue_snapshot.write_view_snapshot(fixture.state_dir, now, now, b"{}")
+                    return wire.PlacementWait(request.episode, request.since, 1, ())
+                return client.LeftQueue()
+
+            def select_or_advance(readers: list[int], writers: list[int], errors: list[int],
+                                  timeout: float) -> tuple[list[int], list[int], list[int]]:
+                ready = select.select(readers, writers, errors, 0)
+                if not any(ready):
+                    clock.sleep(timeout)
+                return ready
+
+            with mock.patch.object(queue, "time", clock), \
+                    mock.patch.object(release_waiter, "time", clock), \
+                    mock.patch.object(release_waiter, "select", select=select_or_advance), \
+                    mock.patch.object(client, "acquire_placement", side_effect=poll), \
+                    mock.patch.object(client, "cancel_placement") as cancel:
+                answer = queue.wait_for_placement(request, "caller left")
+            self.assertIsInstance(answer, client.LeftQueue)
+            self.assertEqual(poll_times, [0, 1])
+            cancel.assert_called_once()
+
     def test_detached_module_scope_stays_in_builds_slice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             builds = Path(directory) / "builds.slice"

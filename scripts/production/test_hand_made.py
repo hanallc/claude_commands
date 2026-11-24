@@ -25,13 +25,15 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import (admission_client, admission_protocol as wire, admission_records, execution_identity,
                                  placement, queue_lines, queue_place, step_estimator)
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
+from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
 from scripts.lib import build_steps, conf, models_registry, nix_env
 from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit
-from scripts.production.hand_made_route import PROGRAM_VARIABLES, Line, Machine, Placed, ProgramPlace, Refused
+from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine, MachineRun, Output, Placed, Program,
+                                                ProgramPlace, Refused)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
@@ -59,6 +61,19 @@ class FakePlace:
     def programs(self) -> list[list[str]]:
         """The program words of each start, after the words of the read limit."""
         return [argv[argv.index("--") + 1:] for argv in self.started]
+
+
+@dataclass
+class FakeGuestRun:
+    """A guest run that writes the program words as its output."""
+    program: Program
+    peak_bytes: int | None = None
+    started_at: float | None = None
+
+    def run(self, output: Output) -> int:
+        self.started_at = time.time()
+        output.write(" ".join(self.program.argv).encode() + b"\n")
+        return 0
 
 
 # The variables of a caller, such as the merge gate, that change the output folder or the compiler of a run.
@@ -433,7 +448,7 @@ class HandMadeTests(AttemptCase):
             status, errors = self.attempt(("helper",))
         # bwrap starts the program by its path, so the failed start ends the attempt with no run.
         self.assertEqual(status, hand_made.REFUSED_EXIT)
-        self.assertIn(hand_made_limit.BWRAP_FAILED.format(status=1), errors)
+        self.assertIn(mac_linux.BWRAP_FAILED.format(status=1), errors)
         self.assertEqual(self.line.place.programs(), [[str(first / "helper")]])
         self.assertFalse(mark.exists())
 
@@ -591,20 +606,30 @@ class HandMadeTests(AttemptCase):
         self.assertEqual(row["refusal"], "queue place: admission service unavailable")
         self.assertEqual(row["verdict"], "yes")
 
-    def test_the_guest_takes_no_run_until_it_has_a_read_limit(self) -> None:
-        cause = "mac-linux cannot take the run: the guest has no read limit yet"
-        status, errors = self.attempt(machines=("mac-linux",))
-        self.assertIn(cause, errors)
-        row = self.assert_no_run(status, cause)
-        self.assertEqual(row["refusal"], cause)
-        # The attempt ends at once: no model call and no queue line.
-        self.assertEqual((self.calls, self.line.requests), ([], []))
+    def test_the_guest_takes_the_run_when_the_queue_places_it_there(self) -> None:
+        taken: list[Program] = []
+
+        @contextmanager
+        def guest_route(line: Line, placed: Placed, program: Program) -> Generator[MachineRun]:
+            taken.append(program)
+            try:
+                yield FakeGuestRun(program)
+            finally:
+                line.close(placed, 0, "")
+
+        # The guest route is a fixture, and the guest refusal of this host is not read; the guest route tests
+        # run the real refusal and route.
+        self.routes["mac-linux"] = Machine(guest_route)
+        self.line.answers = [remote("mac-linux")]
         status, errors = self.attempt(machines=("natedev", "mac-linux"))
         self.assertEqual(status, 0, errors)
-        self.assertIn(f"{cause}; the run stands only in the lines of the other machines", errors)
-        self.assertEqual([request.machines for request in self.line.requests], [("natedev",)])
-        self.assertEqual(self.line.entered, ["natedev-reservation"])
-        self.assertEqual(self.rows()[-1]["machine"], "natedev")
+        self.assertNotIn("cannot take the run", errors)
+        self.assertEqual([request.machines for request in self.line.requests], [("natedev", "mac-linux")])
+        self.assertEqual([program.argv for program in taken], [(sys.executable, "check.py")])
+        self.assertEqual((self.line.entered, self.line.closed), ([], [("mac-linux", 0, "")]))
+        self.assertEqual(self.output.getvalue(), f"{sys.executable} check.py\n".encode())
+        row = self.only_row()
+        self.assertEqual((row["machine"], row["status"]), ("mac-linux", 0))
 
     def test_failed_program_status_is_the_attempt_status(self) -> None:
         status, _ = self.attempt((sys.executable, "-c", "import sys; print('out'); sys.exit(3)"))
@@ -993,6 +1018,9 @@ class ProgramFileTests(unittest.TestCase):
         self.assertEqual(self.start("cargo", "build"), self.bin / "cargo")
 
     def test_a_checkout_that_is_the_checker_repository_keeps_its_wrapper_and_is_refused(self) -> None:
+        # The limit binds no checkout that holds the home folder. A guest test copy holds its run home, so the
+        # test gives a home outside the checker.
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": "/nonexistent-home"})))
         self.cargo_on_path(hand_made.INSTALLED_WRAPPER)
         _ = self.next_cargo()
         checker = hand_made_limit.CHECKER
@@ -1208,6 +1236,7 @@ class BuildsPageTests(unittest.TestCase):
             assert isinstance(waiting, wire.PlacementWait)
             self.assertIsInstance(waiting.wait, wire.PlacementResourceWait)
             fixture.allow_next_start()
+            _ = fixture.run_pass()
             granted, = fixture.server.handle_request(request)
             assert isinstance(granted, wire.LocalPlacementGranted)
             fixture.release(granted.grant)

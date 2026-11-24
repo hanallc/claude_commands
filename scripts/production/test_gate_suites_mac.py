@@ -139,7 +139,7 @@ def queue_cancel(queue: placement_fixture.PlacementFixture, request: admission_w
     return cancelled
 
 
-def checked_target(mode: SuiteMode, gate_job: StepJob) -> str | gate.NoGateAssignment:
+def checked_target(mode: SuiteMode, gate_job: StepJob) -> gate.GateTarget:
     """Return the target of the placement that the gate checks. The check changes no queue state."""
     return gate.placement_target(gate.current_gate_placement(mode, gate_job))
 
@@ -481,7 +481,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                                        target=checked_target(SuiteMode.GATE, job))
         self.assertIs(run, result)
         guest.assert_called_once_with(self.checkout, mode=SuiteMode.GATE, full=True, module_time_limit_s=30,
-                                     selected=gate.ALL_MODULES, gate_job=job, type_dirs=("scripts",))
+                                     selected=gate.ALL_MODULES, gate_job=job, type_dirs=("scripts",),
+                                     assignment=assignment)
         self.placement_status.assert_called_once_with("episode", "attempt")
         self.cloud_route.assert_not_called()
         local.assert_not_called()
@@ -505,7 +506,39 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertIs(run, result)
         guest.assert_called_once_with(self.checkout, mode=SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
-                                     selected=TreeSelection((), tree), gate_job=job, type_dirs=("scripts",))
+                                     selected=TreeSelection((), tree), gate_job=job, type_dirs=("scripts",),
+                                     assignment=assignment)
+        self.cloud_route.assert_not_called()
+        local.assert_not_called()
+
+    @gate_suites("lib")
+    def test_mac_linux_runs_the_affected_modules_that_natedev_selects(self) -> None:
+        # The fixture's main branch has no merge gate pass, and no module declares a scan root.
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "landing_branches=fixture-landing\nscan_roots=\n")
+        self.assertTrue(gate.run_suites(self.checkout).passed, self.output.getvalue())
+        self.write(self.checkout / LIB_SECOND, (self.checkout / LIB_SECOND).read_text() + "\n# Changed test module.\n")
+        _ = self.commit(self.checkout, "change one test module")
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
+        assignment = self.gate_assignment("mac-linux")
+        path = self.write_gate_assignment(assignment)
+        self.set_placement_status(assignment, placement.CurrentAssignment())
+        tree, _ = cloud_gate.working_tree(self.checkout)
+        result = gate.GateRun((gate.GateJobResult("lib", "test_second.py", 0, 1, ""),), 1, 0)
+        job = StepJob("test-affected")
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+              mock.patch.object(mac_linux, "route", return_value=result) as guest,
+              mock.patch.object(gate, "run_suites") as local):
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, gate_job=job,
+                                       target=checked_target(SuiteMode.TARGETED, job))
+        self.assertIs(run, result)
+        guest.assert_called_once_with(self.checkout, mode=SuiteMode.TARGETED, full=False,
+                                     module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                                     selected=TreeSelection((LIB_SECOND,), tree), gate_job=job, type_dirs=(),
+                                     assignment=assignment)
+        output = self.output.getvalue()
+        self.assertEqual(output.count("affected: "), 1, output)
+        self.assertIn("affected: 1 of 2 modules (base ", output)
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
@@ -648,8 +681,7 @@ class MacGateSuitesTests(GateSuitesFixture):
               mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket),
               redirect_stderr(io.StringIO()) as errors):
             placed = gate.current_gate_placement(SuiteMode.GATE, StepJob("integrate", unit="fixture"))
-        target = gate.placement_target(placed)
-        self.assertEqual(target, "mac-linux")
+        self.assertEqual(gate.placement_target(placed), gate.MacLinuxAssignment(assignment))
         self.assertGreater(clock.monotonic(), admission_records.read_memory_config().query_timeout_seconds)
         self.assertIn("admission service not answering", errors.getvalue())
         self.assertEqual(len(transport.requests), 1)

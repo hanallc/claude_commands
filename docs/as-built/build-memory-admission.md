@@ -209,11 +209,25 @@ Saved disk exclusions remain diagnostic evidence.
 `SourceKeyUnavailable` preserves the existing copy path when neither source key is available.
 An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
-`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`wait_for_placement` polls after each configured waiting interval, which is one second by default.
+The timer controls polling even when the queue, view, hold, or release files change.
+The service publishes placement waits and grants after each pass.
+The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+Each published placement reply carries its request digest and the current input event count.
+A poll uses the published reply when the request digest and input event count both match.
+Reuse needs no pass or state write if the caller version matches.
+Readings, process exits, configuration changes and queue changes advance the count.
+The pass timer also advances the count so the next pass can read the provider journal and check deadlines.
+`Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
 The coordinator remains separate from its offload child.
 The service checks the local process tree before it accepts that child as the holder.
+When the last system reading does not show the holder, the service reads the local processes again for this check.
+It does the same when the reading shows the holder pid with another start time.
+This read of the full process table costs about 16 to 19 ms with about 1300 processes, at most once for each consume, when the last reading does not show the holder with its start time.
+For a `mac-linux` assignment, the guest probe reports no claims.
+The service accepts the consume when the holder holds the named claim in the local Mac claim state (`mac_run.claim_held`).
 Cleanup takeover supplies no launch authority.
 The first valid consumption returns `FirstAuthorization` after the state write completes.
 Every repeated consumption returns `DispatchStatus`, including a retry with a different transport request id.
@@ -242,6 +256,13 @@ A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
 The service also freed the dead copy's placement only when the claim watcher released the claim. On 2026-11-14 this held the Mac with no hana step for 16 minutes.
 Other temporary Mac refusals delay that destination for 180 seconds.
+A current `mac-linux` assignment of another episode makes the guest busy.
+The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
+A guest gate that took no run sends its claim failure after the gate process ends, and the queue closes the attempt with the guest delay.
+While `copies.py` lives, a pass that reads the ended gate does not close the attempt.
+Only `copies.py` knows if the gate took a run, so its claim failure or its end closes the attempt.
+So the claim failure finds the attempt current, and the queue places the episode only once.
+When the gate ran and ended, the attempt stays current until `copies.py` ends. Then the next pass closes it as lost with `RetryAt(now)`.
 Final command results remain terminal.
 A retry retains the episode, queue time, run place, and priority.
 Each retry receives a new attempt identity.
@@ -262,6 +283,8 @@ The adapter uses that grant without a second admission request.
 `PrerequisiteReport` updates that state separately from fixed constraints.
 Restart requires fresh token confirmation for requests that need a token.
 A placement waiter holds no cargo token.
+A step that waits for placement to choose a Mac Linux guest has the reason `MachineChoiceWait`.
+Only a queue row carries it, and the Builds and Limits pages show it as `waits for a machine choice`.
 `_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
 `verify.sh` sends `--token after-grant`: it takes the token after a local grant.
 Its first pass sends `TokenRequired(TokenReadinessUnchecked)`.
@@ -275,6 +298,28 @@ Remote rows carry execution evidence and the assigned host.
 Physical grouping includes the host, generation, PID, and start time.
 Unavailable remote identity remains uncertain.
 Remote memory remains unavailable and contributes zero to local admission accounting.
+A Mac host run shows on the Builds page as its Mac build row; the page hides its queue row, so the run shows once.
+A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
+The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
+A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
+The Builds page shows both attempts in Running with the recorded job, unit, and caller.
+The Machine cell shows one bright icon for `mac-linux` and the guest state.
+The icon uses the Mac color in light and dark modes.
+The cell shows `not confirmed` until confirmation, then `running`.
+The tooltip lists the named targets. It shows the attempt ID after confirmation.
+The memory column shows `on mac-linux`. The vCPU column shows `—`.
+The admission service reads the module counter from the current guest's placement request sidecar.
+It publishes the counter before and after the guest confirms the attempt.
+The Builds page uses the AWS counter format for Stage, Done, and the module count in the tooltip.
+Without a counter, Stage and Done show `—`.
+If a queue read fails, the page keeps the guest row from the last successful reading.
+`memory_feed.step_key` uses `mac-linux` and the consume time.
+The key stays the same when the queue confirms the attempt, so the tooltip stays open.
+The console server sends `X-Builds-Page-Version` on GET and HEAD for the published Builds page.
+The server puts the same version in the HTML. Nanosecond file times distinguish writes in the same second.
+At startup and on its timer, the page compares the HEAD version with its loaded version.
+The page checks again when the tab becomes visible. It reloads once when the versions differ.
+Manual pause and a hidden console frame stop these checks.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
 The watcher keeps result collection and loser stopping.
@@ -339,7 +384,7 @@ An explicit private sweep root selects its own `copies` folder instead of the li
 Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
-The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
+The service keeps `state.json`, `queue.json`, and `view.json` in the admission folder outside temporary build folders.
 `step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
 `tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
 
@@ -350,7 +395,7 @@ Not in this repo; listed because the code here reads it.
 | Piece | Setting |
 | --- | --- |
 | `builds.slice` (user slice, `modules/linux/development.nix`) | `MemoryMax=44G`, no `MemoryHigh`, `MemorySwapMax=4G`, `CPUWeight=20` against `app.slice`'s 100, so the sessions and their panes get the CPU first. CI's `hana.slice` sits at 5 against `user.slice`'s 100 (`modules/linux/hana-runners.nix`). Holds every recorded step's scope (`run-*.scope`), the `sccache.service` user service, and the `buildlog` unit (nightly Rust trial, `OOMScoreAdjust=200`). |
-| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. Direct cargo calls take the hold check and enter a new scope in `builds.slice`. Reserved cargo and lint steps still ask the queue. Their memory counts once as build memory through their reservations. |
+| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. A direct cargo call takes the hold check and enters a new scope in the run's own slice. A cargo call in a queued step starts at once. Its memory counts once as build memory through the step's reservation. |
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. `OOMScoreAdjust=500`, so its compiles rank with the build steps. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
@@ -381,6 +426,7 @@ An absent wait retains its run identity so it can use the run place while it exi
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
 Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
+A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
 The service retains the run's process watch between steps.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
@@ -397,12 +443,17 @@ After a restart, the service restores live run places and removes ended run plac
 Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `nateroids: nextest`.
 `snapshot_codec.row_text(owner, what)` is the one function that makes this text.
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
-On the Builds page, `rowOwner` in `memory_live.html` makes the small line under each row name. The line is empty when the row name is the owner or starts with `<owner>: `. It shows only a different fact, such as another session.
+On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start and the small line under it. A row with a unit starts with the unit.
+A unit at the row start always shows in the unit color, by its role, also when it has no staff entry. `StaffNames.unit_open` makes the opening tag of that span with `role_span_open`, the same code as `StaffNames.html`. The feed sends it as `unit_open`, and `staffNames.unit(text)` in the shared script adds the name.
+A row with no unit starts with its owner, the text before `: ` in its name. The text after `: ` goes in Step.
+An owner with a staff entry, such as a showrunner, shows in its staff color. Another owner, such as hana CI, shows in plain ink.
+A row with no unit has no small line, because the line would repeat the owner.
+A Mac row with no unit has a `started_by` field instead, so it shows in the same form as a unit row. Its owner starts the row (a staff owner, then the launcher). Its repository is the small text, and its step is in Step.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
 1. The recorded unit, then the staff unit.
 2. The staff showrunner, or the session name for a session with no production.
-3. The stored caller name, then the repository or package.
+3. The stored caller name, then the Mac launcher, then the repository or package.
 A CI row uses `hana CI` as the owner.
 A gate job that the feed cannot read shows only its owner, from `owner_name`, on a local, remote or cloud row.
 So each of these rows removes the showrunner prefix in the same way, for example `merge-gate` for `sdlc-merge-gate`.
@@ -484,6 +535,9 @@ A waiting step's hover puts each field on its own line: the wait time, the reaso
 A local step shows `natedev or Mac`, `natedev only`, or `natedev only (Mac state unknown)`.
 `MacRoutes.fit()` in `target_availability.py` gives the Mac answer, and `memory_feed.local_runs_on()` makes the line.
 AWS runs only the ~/.claude test gate. A cloud gate shows `AWS (natedev only when AWS cannot start the gate)`.
+A step with a Mac Linux guest candidate names its placement candidates in `can run on`, from `memory_feed.gate_placement_notes()`.
+A candidate with a `FixedExclusion` is not named, because placement never uses it.
+When the guest has only a `FixedExclusion`, the line uses the route fit above.
 When memory holds the first step in line, its hover adds a `First in line` table.
 The table starts at free RAM and subtracts each term that is not zero: the safety net, swap coming back, build reserved, and RAM held for other waiting steps.
 It ends with free and the need.
@@ -604,6 +658,17 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
+Each publication of the view also replaces `admission/view.json` atomically.
+The pass stores the current input event count with its placement replies before it replaces the view file.
+The file holds the publication time, `fresh_until`, and the encoded socket reply.
+`fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
+A socket `ViewRequest` returns the last published view without starting a pass.
+Consuming a Mac Linux permission advances the input event count and marks the pass stale.
+The next eligible pass publishes the guest row.
+
+The Builds feed reads `view.json` and uses its publication time as the data time.
+The page shows `Late` when the time since `fresh_until` exceeds `status.builds.age_limit_seconds` in `config/console.conf`.
+A missing or unreadable view file gives the queue read error.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
@@ -1234,7 +1299,9 @@ Non-building commands such as `metadata`, `fmt` and `tree` run immediately in Ba
 `test_cargo_wrapper.test_non_building_commands_start_with_no_python_and_no_queue_request` proves this.
 A call already in `builds.slice` runs at once, unless it runs under `builds-detached.slice`.
 Such a call comes from a queued step or an editor scope, so it has no second queue place.
-A call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
+A queued step of a detached run also runs its calls at once.
+The wrapper finds such a step when its cgroup folder equals `BUILDLOG_STEP_SCOPE`, which the step scope exports.
+Any other call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
 These building calls check `hold_applies.py` when the hold directory has an entry.
 An applicable hold refuses the command.
 Unreadable state prints a note and allows the command.
@@ -1778,7 +1845,7 @@ Measured over the 24 h after the target-first order went live (2026-10-06 16:33 
 
 ### Scratch folders (`scripts/lib/scratch.py`, `scripts/hooks/pre-tool-use-scratch-guard.py`)
 
-`scratch.conf` holds the default lifetime, visible root, hold file, repository depth, excluded folders, and random suffix length.
+`scratch.conf` holds the default lifetime, hold file, repository depth, excluded folders, and random suffix length.
 The scratch code reads those values through `scripts/lib/conf.py` when an operation needs them.
 `CONF_DIR` selects the configuration folder.
 
@@ -1786,13 +1853,12 @@ The folder audit reads clone age from `hana_instances.conf` and the Mac disk flo
 It reads its other limits and default state folder from `lint.conf` through the same reader.
 The audit and temporary sweep share `folder_remove_after_seconds`.
 The audit and repository scan share `scratch.conf` `repo_skip`.
-The audit also keeps the configured `scratch.visible_root()`.
 `rust_roots.txt` remains a list file. All moved values retain their previous defaults.
 
 Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and nothing removed them.
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
-`scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new [--task <task> | --until <when>] [--name <word>]` makes a folder and prints its path.
 `scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
 The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
@@ -1833,7 +1899,6 @@ The folder stays with its hold marked ended.
 A folder made without `--worker` uses `<scratch root>/<kind>-<name>-<word>-<6 chars>`.
 The scratch root is `build_folders.conf` `roots.scratch`: `/tmp/claude/scratch` on natedev and on the Mac.
 An `until:` task's folder is `<word>-<6 chars>`, or `scratch-<6 chars>` with no word. Its record keeps the time.
-`--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
 Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
@@ -1846,7 +1911,7 @@ Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/ses
 The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
 A `nate.jobs` job runs it on natedev and the Mac.
 It checks ~/rust, ~/rust/scratch, /tmp, /tmp/claude and `$TMPDIR`.
-In ~/rust, `config/rust_roots.txt`, `repro` and `scratch` name kept folders.
+In ~/rust, `config/rust_roots.txt` and `scratch` name kept folders.
 Every folder in ~/rust/scratch is loose.
 In temporary roots, system folders, session scratchpads, scratch roots and run roots stay.
 The audit also keeps `/tmp/codex-daemon-<uid>`, which holds sockets for running Codex processes.
@@ -2267,7 +2332,48 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 
 `queue_evidence.room_text` supplies the saved cap calculation to the Builds page and the memory report.
 The Builds page shows zero room during a shortfall and records the shortfall in the cap explanation.
-The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
+On 2026-11-21, Nate asked to “show the showrunner (in its color)” at 19:13.
+At 19:17 he changed the row start to “only show the unit (and the showrunner in small text under)”.
+The Builds page uses the same staff colors in the row and its hover.
+Rows without a unit show their plain name and leave the small text and `Step` empty.
+This includes Build tools, unowned Mac builds, compiler cache, unowned processes, and CI.
+The small text is empty when the showrunner is the same name as the unit.
+`Step` shows the step only when the feed's `title.unit` names a unit. When the step text is the unit, the feed sends an empty `title.unit`, so `Step` stays empty and the unit does not show twice.
+`queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
+For running rows, the table shows `Stage`, `Done`, `Dur`, `Verify`, `Step`, `Pid`, `Machine`, `vCPU`, and `Tokens`.
+The waiting table uses `#` and `Waiting`, and omits `Tokens`.
+The table has no `Unit` column and no `Slot` column. The feed sends no slot number; it sends only `slot_folder` and `slot_machine`, which the Disks page reads.
+On 2026-11-23, Nate asked again for the Unit column to go because the row start shows the unit.
+At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
+On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
+On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): the `Machine` column shows icons, not names.
+`MACHINE_ICONS` in `memory_live.html` gives each known machine its icon: lucide `server` for `natedev`, lucide `laptop` for `mac`, and lucide `cloud` for `aws`.
+`mac-linux` is the laptop with a 🐧 badge. `hana-aws` is the cloud with a 🌸 badge. `hana-gpu` is the cloud with a ⚡ badge.
+One hidden `<svg>` at the top of the page defines each symbol once, and each icon uses it with `<use href>`.
+The badge is CSS text from the icon's `data-badge`, so it is not page text.
+Each icon has its machine name as its accessible name (`role="img"` and `aria-label`).
+A running row's `Machine` cell shows one bright icon in a faint box: the machine that runs the step.
+The feed's `machine` field is the one source for that machine.
+The row hover says `Runs on` with that machine, and lists the other machines that the step named under `Named targets`.
+A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
+Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
+A machine with no icon shows its name as text in its machine color.
+An icon keeps the 20 px text line, so it does not make a row taller, and a row of icons never wraps.
+Waiting rows size the `Step` column, so each step shows on one line; a new waiting row can move the columns to its right.
+In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
+Each word of a waiting step with more than one word is in its own `.word` span with `white-space: nowrap`, so a word such as `cargo-style` never breaks at its hyphen.
+A legend under the table shows `Legend:`, then each of the six icons with its name.
+Each machine on the page shows in its machine color: the `Machine` icons, the legend, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
+The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
+`mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` and `hana-gpu` are AWS boxes, so they use the `aws` color.
+Every match in the map ignores case, so the hover words `Mac` and `AWS` match their machines.
+The queued heading row has no bar. When the walk has room to the right of the table, the table moves right until the heading shows in full. The label column does not get wider for the heading. The `--queue-heading-gap` CSS property holds the gap between the heading and the table, and `fitWalkDetails` reads it. With no room, the heading ends in an ellipsis and its hover gives the full text.
+`Verify` shows the Rust verify verb when the feed records a Verify call.
+`Step` shows the feed's `title.step`, which uses the build step names from `config/build_steps.conf`.
+The hover shows the starting session under `Caller` and the running row's detail under `Detail`.
+The first line of the name, the progress bar, and the first line of each column share one center line.
+The showrunner and memory amounts stay below that line.
 The first column shows `building` or `testing` from the recorded progress counter.
 A natedev row shows the stage `waiting` while its nextest step waits for test tokens; its `Done` cell shows `—`.
 The row tooltip gives the full reason, `Waiting for jobserver tokens`.
@@ -2284,13 +2390,45 @@ Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
 The table is always beside the chart, and each step uses one row at every pane width.
-In a narrow pane the table cuts long unit names to 6rem and narrows its column gaps.
+In a narrow pane the table narrows its column gaps.
 A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
-The label column is as wide as the widest running label.
-A longer queued name wraps at a space, so only its widest word counts.
+The card never scrolls down, and its axis labels fit their 16 px row.
+The table starts half the cap line and one gap past the cap, and the fit measures the table at that same place.
+The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
+When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
+A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
+A small line under a title (the showrunner or repository line, or a waiting note with the job start of a CI row) never wraps either. It ends in an ellipsis in the same way.
+The 12rem cap (9rem in a narrow pane) on the label column stays.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
-`memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage cell is cut, or the label column is wider than its labels.
+`memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.
+It also fails when a `Machine` icon has no machine color, or the `mac-linux` icon does not show the `mac` color.
+It checks the queued rows at 1440 px, at 900 px, and in a tight pane at 800 px.
+It fails when a running row does not show one bright icon with its machine name, or a waiting row does not show one dim icon for each machine that can take it.
+It also fails when a row of icons wraps, the legend does not show the six machines, a row title takes two lines, or a Step cell is cut.
+The other checks hide scrollbars. One more load at 1440 px shows them, and the proof fails when the Running and Queued scroll box shows a scrollbar or can scroll.
+`--queue-rows` also saves that card's right edge as `after-edge.png`, or `before-edge.png` for a before page.
+`checkStandingOrders` in `memory_page_proof.mjs` checks nate's standing orders for the Builds page (`docs/plans/builds-page-standing-orders.md`).
+It runs in the gate proof, and alone with `--standing-orders [page]`, which also saves `real-1440.png` and `real-900.png`.
+The optional page must be a rendered page, such as the `memory_live.html` that the proof writes in its folder. A source page does not load.
+It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue reading. It has these rows:
+1. A hyphenated unit, and a unit with no staff entry (`lfo`).
+2. Showrunner runs with no unit, one with a long step.
+3. A running and a waiting hana CI row.
+4. A Mac build, and an AWS row.
+5. A fixed Mac-only waiting row.
+6. A waiting hana CI row with a long waiting note and a job start.
+The queue-move stub gives the page a token, so the reorder handles draw.
+At 1440 px and at 900 px, dark, it fails when one of these is false:
+1. The table has no Unit and no Slot column.
+2. A unit row starts with its unit in its unit color, with the showrunner line under it. A row with no unit starts with its owner, and its title has no `: `.
+3. A showrunner's own run starts with the showrunner in the showrunner color, and has no small line.
+4. Each row title has one line, and each small line under it has one line. At 1440 px no title ends in an ellipsis. No line of a Step ends in `-`.
+5. The table text and the machine icons are in line with the first line of the row title, within 2 px.
+6. Each movable waiting row has a reorder handle, and the handle does not cover the title. A fixed row has no handle. All waiting row titles start at the same left edge.
+7. A running row shows one bright icon for its machine. A waiting row shows one dim icon for each machine that can take it. The hover names each machine.
+8. A Mac-only waiting step has no memory box, because the chart shows natedev memory.
+`test_memory_feed.PageTextTests.test_the_page_and_its_fixtures_use_only_configured_job_names` fails when `memory_live.html`, the page fixtures or the page tests show the retired job name "merge gate". Job names come from `config/build_steps.conf`.
 The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
 `cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
 `memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.
@@ -2304,7 +2442,17 @@ The recorded project directory identifies the run; a compiler's crate directory 
 The step name uses the command's package, then the repository when the command has no package.
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
-The Mac row shows the repository on its second label line.
+A Mac row with a unit starts with the unit, with the showrunner under it.
+The Mac reader records the launcher of each cargo run. It walks the parent process chain of the run and takes the first program that `queue_view.MAC_LAUNCHER_PROGRAMS` names:
+1. `claude` is a Claude session. The session id comes from the run's `CLAUDE_CODE_SESSION_ID`, then from the session marker in the copy record.
+2. `Runner.Worker` or `Runner.Listener` is hana CI. The CI origin uses the same walk.
+3. `rust-analyzer` is rust-analyzer.
+A program name can have a version suffix, such as `rust-analyzer-2026-11-02`.
+A session marker with no launcher program is a Claude session. A run with no launcher program and no marker is `terminal`.
+`memory_feed.mac_launcher_name` gives the shown launcher: the staff name of a known Claude session, `Claude session` for an unknown one, `hana CI`, `rust-analyzer` or `terminal`.
+A Mac row with no unit starts with its owner, from `owner_name`. A known staff owner comes first, then the launcher. The repository is the small text, and the step is in Step.
+The staff name shows in its staff color; the other launcher names show in plain text. The row hover names the owner in a `Started by` field.
+A reading from before the launcher field has no launcher, so its row keeps the old name that starts with the repository.
 A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
 A `user`, `hana-ci` or `unplaced` run adds that label to its name.
 The stage uses a test counter or a running test binary as evidence for `testing`.
@@ -2403,7 +2551,7 @@ Non-building calls execute the next cargo without admission.
 A direct call to a cargo executable outside this front bypasses admission.
 Calls inside the admitted child tree retain the same reservation.
 
-`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, and job.
+`ServiceEstimateRequest` carries the owner, repository, worktree, arguments, runner, job, and job start.
 The service reads configuration and history with its own account.
 It uses `step_estimator.step_estimate` with a recorded repository location.
 The service refreshes the estimate on each acquisition retry.
@@ -2452,6 +2600,30 @@ Acquisition uses named protocol timing without a local configuration read.
 The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
+
+`job_start` walks up the parent processes of the front to the `Runner.Worker` ancestor.
+The runner starts one `Runner.Worker` process for each job, so its start in `/proc/<pid>/stat` is the job start.
+`process_stat.name_and_fields` reads each process name and stat fields.
+A parent cycle in `/proc` ends the walk without a job start.
+Each building call reads its job start once, in CLOCK_BOOTTIME seconds.
+When `GITHUB_ACTIONS=true` and no `Runner.Worker` ancestor is readable, the call prints one `::warning::` line on stderr.
+
+A CI step keeps the queue place of its job start.
+GitHub counts its 6-hour limit for each job from the runner pickup, and the `Runner.Worker` start is that pickup.
+The job counts, not the workflow run.
+The front converts the job start once to the queue clock with `queue_job_start`.
+It reads the queue clock and CLOCK_BOOTTIME at the same moment and subtracts the boot age of the job start from the queue clock.
+`ServiceEstimateRequest.job_start` carries `JobStart(started_at)` or `NoJobStart`.
+An older client sends no field, and the service reads it as `NoJobStart`.
+The service copies a `JobStart` into the waiting row as `ci_job_start` and into the saved `WaiterPlace`.
+The service sets `order_since` to the earliest of the step arrival, the run place, and the job start.
+So each step of one CI job ranks at the job start, ahead of steps that arrived after the job started.
+Queue priority remains the first ordering field.
+A step with `NoJobStart` keeps its arrival place.
+`state.json` saves the job start with the waiter place, so the place survives a service restart.
+The Builds page waiting row shows `job started <time> · <age> ago` in the user zone, after any wait reason.
+Its hover shows the same time and age under `Job start`.
+The page shows no time left to the 6-hour limit; that comes with a config key for the limit.
 
 Registered process trees count through their reservations.
 The CI slice reading subtracts their swap-backed use.
