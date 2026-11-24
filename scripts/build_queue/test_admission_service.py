@@ -8806,6 +8806,35 @@ class RunPlaceTests(unittest.TestCase):
             fixture.end_run(run)
             _ = only_admitted([fixture.server.ledger[younger.episode].reply])
 
+    def test_kept_gate_rank_allows_the_hold_owner_to_start(self) -> None:
+        for gate_waits in (False, True):
+            with (self.subTest(gate_waits=gate_waits), mock.patch.object(store, "host_name", return_value="natedev"),
+                  AdmissionFixture() as fixture, fixture.loop_turn()):
+                run = fixture.run_owner()
+                _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+                directory = fixture.root / "holders"
+                directory.mkdir()
+                hold = directory / "fps-run"
+                _ = hold.write_text(json.dumps({
+                    "holder": "fps-run", "since": "2026-11-22T22:33:19+00:00", "for": "fixture",
+                    "release_eta": "unknown", "keep": []}))
+                step = fixture.request(run=run, step="gate")
+                if gate_waits:
+                    waiting, = fixture.server.handle_request(step)
+                    assert isinstance(waiting, wire.Wait)
+                    self.assertEqual(waiting.reason, records.NatedevHeld("fps-run", "fixture"))
+                fixture.allow_next_start()
+                holder = replace(fixture.request(), session=OwningSession("fps-run"))
+                grant = only_admitted(fixture.server.handle_request(holder))
+                self.assertNotIn(step.episode, fixture.server.reservations)
+                fixture.release(grant)
+                hold.unlink()
+                fixture.allow_next_start()
+                younger = fixture.request(step="gate")
+                self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
+                _ = only_admitted(fixture.server.handle_request(step))
+                self.assertNotIn(younger.episode, fixture.server.reservations)
+
     def test_ranked_gate_takes_its_next_step_at_the_repository_run_limit(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "build_admission.conf"
@@ -8823,6 +8852,11 @@ class RunPlaceTests(unittest.TestCase):
             fixture.clock.advance(60)
             waiting = fixture.request(step="gate")
             self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            occupancy = self.reading(fixture).explanation.local_occupancy
+            assert occupancy is not None
+            self.assertFalse(occupancy.reservations)
+            self.assertEqual(occupancy.verify_run_owners, {"fixture": frozenset(
+                records.run_owner(run.pid, run.start_time) for run in (first, second))})
             step = fixture.request(run=second, step="gate")
             _ = only_admitted(fixture.server.handle_request(step))
             self.assertNotIn(waiting.episode, fixture.server.reservations)
@@ -8863,7 +8897,7 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(restored.repository, "")
 
     def test_main_892cb2d74f_loads_run_place_with_new_fields(self) -> None:
-        repository = Path.home() / ".claude"
+        repository = Path(__file__).resolve().parents[2]
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
             _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)

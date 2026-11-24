@@ -1527,6 +1527,7 @@ An unreadable staff record gives no own hold key for that pass, so the step wait
 A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
 A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
 A held waiter claims no between-steps slot and gives back a slot it claimed, so that slot can expire during the hold.
+During a natedev hold, a saved gate rank keeps its place without delaying local requests that the hold allows.
 View and explain replies between passes show the holds of the last pass.
 Only an unreadable hold state gives a legacy CI request `ReadingUnavailable`, which the client refuses after its retry time.
 Other local waiters are not held while the hold state is unreadable; the enforcer stays their guard.

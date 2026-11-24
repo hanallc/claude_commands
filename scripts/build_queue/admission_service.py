@@ -1800,6 +1800,7 @@ class AdmissionServer:
         self.last_policy: records.AdmissionPolicy | NoPass = NoPass()
         # The natedev hold of each held local waiter at the last pass.
         self.local_holds: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
+        self._local_hold_in_force: bool = False
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
         self.reading_alert_delivery: ReadingAlertDelivery | NoReadingAlertDelivery = NoReadingAlertDelivery()
         self.reading_alert_needs_clear: bool = True
@@ -1956,7 +1957,8 @@ class AdmissionServer:
         return {record.reservation_id for record in self.reservations.values()}
 
     def _inputs_with_current_slots(self, inputs: records.QueueInputs,
-                                   ordered: list[tuple[Path, records.RankedWaiter]]) -> records.QueueInputs:
+                                   ordered: list[tuple[Path, records.RankedWaiter]],
+                                   limits: records.RepositoryRunLimits) -> records.QueueInputs:
         self._claim_slots(ordered)
         remaining = gate.inputs_after_reservations_end(inputs, self._live_reservation_ids())
         occupied = self._occupied_local_cargo_folders()
@@ -1971,14 +1973,15 @@ class AdmissionServer:
                 if isinstance(slot, records.ContinuationSlot) and folders.get(slot.owner) in occupied:
                     del self.slots[key]
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
-                       occupied_cargo_folders=occupied, verify_run_owners=self._verify_run_owners())
+                       occupied_cargo_folders=occupied, verify_run_owners=self._repository_run_owners(limits))
 
     def _refresh_pass_slots(self, inputs: records.QueueInputs,
-                            ordered: list[tuple[Path, records.RankedWaiter]]) -> records.QueueInputs:
+                            ordered: list[tuple[Path, records.RankedWaiter]],
+                            limits: records.RepositoryRunLimits) -> records.QueueInputs:
         waiting_owners = {records.waiter_owner(waiting.row) for waiting in self.waiters.values()}
         local_paths = {path for path, row in inputs.ordered if records.waiter_owner(row) in waiting_owners}
         inputs = replace(inputs, ordered=[(path, row) for path, row in ordered if path in local_paths])
-        return self._inputs_with_current_slots(inputs, ordered)
+        return self._inputs_with_current_slots(inputs, ordered, limits)
 
     def persist(self) -> None:
         now = self.clock.now()
@@ -2107,14 +2110,14 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _local_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
-        """Hold each local waiter that a natedev hold applies to, at each pass."""
+    def _local_hold_status(self) -> tuple[bool, dict[str, records.NatedevHeld | records.ReadingUnavailable]]:
+        """Read the natedev hold and all local waits it causes."""
         if self.host != "natedev":
-            return {}
+            return False, {}
         waiting = {episode: item for episode, item in self.waiters.items()
                    if isinstance(item.request, wire.AdmitRequest) and isinstance(item.request.place, wire.LocalPlace)}
         if not waiting:
-            return {}
+            return False, {}
         from scripts.build_hold import build_hold
         from scripts.build_targets import build_targets
 
@@ -2123,10 +2126,10 @@ class AdmissionServer:
             holds = build_hold.natedev_holds(directory)
         except OSError as error:
             # The enforcer stays the guard for other local steps while the hold state is unreadable.
-            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}")
-                    for episode, item in waiting.items() if isinstance(item.request, ServiceEstimatedAdmission)}
+            return False, {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}")
+                           for episode, item in waiting.items() if isinstance(item.request, ServiceEstimatedAdmission)}
         if not holds.in_force:
-            return {}
+            return False, {}
         reasons: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         own_keys: dict[OwningSession | NoOwningSession, str] = {}
         for episode, item in waiting.items():
@@ -2149,7 +2152,7 @@ class AdmissionServer:
             blocking = build_targets.blocking_hold(holds, own_keys[session], lineage)
             if isinstance(blocking, build_hold.Holder):
                 reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
-        return reasons
+        return True, reasons
 
     def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
         """Collect the present queue rows."""
@@ -2313,10 +2316,15 @@ class AdmissionServer:
             else:
                 del self.verify_run_slots[key]
 
-    def _verify_run_owners(self) -> dict[str, frozenset[str]]:
+    def _repository_run_owners(self, limits: records.RepositoryRunLimits) -> dict[str, frozenset[str]]:
         owners: dict[str, set[str]] = {}
         for slot in self.verify_run_slots.values():
             owners.setdefault(slot.repository, set()).add(slot.run_key)
+        for key, place in self.run_places.items():
+            if (place.move_id and place.repository
+                    and (not limits.exempt_unit or place.unit != limits.exempt_unit)
+                    and isinstance(limits.for_repository(self.host, place.repository), records.RepositoryRunLimit)):
+                owners.setdefault(place.repository, set()).add(key)
         return {repository: frozenset(runs) for repository, runs in owners.items()}
 
     def _finish_verify_grant(self, reservation: str, *, started: bool) -> None:
@@ -2427,14 +2435,12 @@ class AdmissionServer:
     def _admission_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
                         order: list[tuple[Path, records.RankedWaiter]]) -> gate.PassResult:
         """Apply the saved order of live runs to the local walk."""
-        ranked = {place.move_id: (key, place) for key, place in self.run_places.items()
-                  if place.move_id and place.repository}
+        # A held gate cannot delay a request that the natedev hold allows.
+        if self._local_hold_in_force:
+            return gate.admission_pass(inputs, inputs.now, policy)
+        ranked = {place.move_id: key for key, place in self.run_places.items() if place.move_id and place.repository}
         if not ranked:
             return gate.admission_pass(inputs, inputs.now, policy)
-        repositories: dict[str, set[str]] = {}
-        for key, place in ranked.values():
-            if not policy.repository_runs.exempt_unit or place.unit != policy.repository_runs.exempt_unit:
-                repositories.setdefault(place.repository, set()).add(key)
         active = {records.run_owner(record.run.pid, record.run.start_time)
                   for record in self.reservations.values() if isinstance(record.run, wire.RunIdentity)}
         active.update(records.run_owner(request.run.pid, request.run.start_time)
@@ -2449,9 +2455,9 @@ class AdmissionServer:
             if move_id in waiting:
                 if head is not None:
                     holds[waiting[move_id]] = head
-            elif head is None and (member := ranked.get(move_id)) is not None and member[0] not in active:
+            elif head is None and (run := ranked.get(move_id)) is not None and run not in active:
                 head = records.stored_waiter(row)
-        return gate.admission_pass(inputs, inputs.now, policy, run_ranks=gate.RunRanks(repositories, holds))
+        return gate.admission_pass(inputs, inputs.now, policy, rank_holds=holds)
 
     def _order_since(self, since: float, run: wire.RunIdentity | wire.NoRun, job_start: records.CiJobStart) -> float:
         """Rank a step at the earliest of its arrival, the first step of its run, and the start of its CI job."""
@@ -2701,7 +2707,7 @@ class AdmissionServer:
             self.progress_history.prune(now - step_estimator.HISTORY_DAYS * 86400, sweep_seconds,
                 rank=profile_rank, share_percent=profile_share)
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
-        local = self._progress_inputs(self._inputs_with_current_slots(inputs, ordered), dict(evidence.processes),
+        local = self._progress_inputs(self._inputs_with_current_slots(inputs, ordered, limits), dict(evidence.processes),
                                       config.policy, profile_rank, profile_share)
         return AdmissionPassInputs(local, ordered, full_order, ranked)
 
@@ -2976,11 +2982,12 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
-        self.local_holds = local_holds = self._local_hold_reasons()
+        self._local_hold_in_force, local_holds = self._local_hold_status()
+        self.local_holds = local_holds
         held_owners = self._held_owners()
         captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                                 self.configuration.progress_profile_sweep_seconds)
-        inputs = replace(captured.local, verify_run_owners=self._verify_run_owners())
+        inputs = captured.local
         if self.host == "natedev" and (floor := config.free_floor_gib) is not None:
             inputs = replace(inputs, build_space=self.readings.build_space(floor))
         inputs = without_owners(inputs, held_owners)
@@ -3339,7 +3346,8 @@ class AdmissionServer:
         return replace(reading, view=replace(reading.view, running=(*reading.view.running, *remote)),
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
-    def _local_occupancy(self, inputs: records.QueueInputs) -> records.LocalAdmissionOccupancy:
+    def _local_occupancy(self, inputs: records.QueueInputs,
+                         limits: records.RepositoryRunLimits) -> records.LocalAdmissionOccupancy:
         captured = {row.get("reservation_id"): row for row in inputs.reservations}
         reservations: list[records.Reservation] = []
         for record in self.reservations.values():
@@ -3354,7 +3362,7 @@ class AdmissionServer:
                     row["build_run"] = build_run
                 resolve_reservation_repository(row, record)
             reservations.append(row)
-        return records.LocalAdmissionOccupancy(tuple(reservations), self._verify_run_owners())
+        return records.LocalAdmissionOccupancy(tuple(reservations), self._repository_run_owners(limits))
 
     def _publish_replies(self, ordered: list[tuple[Path, records.RankedWaiter]]) -> None:
         if (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
@@ -3401,7 +3409,7 @@ class AdmissionServer:
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
-        occupancy = self._local_occupancy(self.last_inputs)
+        occupancy = self._local_occupancy(self.last_inputs, self.last_policy.repository_runs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
         self.published = PublishedReplies(view, explain, positions)
 
@@ -5547,7 +5555,7 @@ done
                 order = self._full_queue_order(self._ranked_waiters())
                 ordered = self._visible_queue_order(order)
                 if isinstance(self.last_policy, records.AdmissionPolicy):
-                    self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
+                    self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered, self.last_policy.repository_runs)
                     self.last_result = self._admission_pass(self.last_inputs, self.last_policy, order)
                 self.pass_stale = False
                 self._publish_replies(ordered)
@@ -5636,7 +5644,7 @@ done
                     and isinstance(self.last_policy, records.AdmissionPolicy)):
                 self._prune_runs()
                 ordered = self._queue_order()
-                self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered)
+                self.last_inputs = self._refresh_pass_slots(self.last_inputs, ordered, self.last_policy.repository_runs)
                 self.pass_stale = True
             self.next_pass = self.clock.monotonic()
             return [self.ledger[key].reply]
