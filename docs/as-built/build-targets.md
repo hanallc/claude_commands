@@ -601,9 +601,14 @@ No package selects the whole workspace.
 | `example [<package>] [--name <name>]` | Workspace or named example selection. |
 | `final [<package>] [--saved] [--tree <tree>]` | Workspace check and selected tests, or a saved-pass query. |
 | `test,lint,doc [<package>]` | Run a comma list of `test`, `lint`, and `doc` in the given order. |
+| `check + lint + test hana + test hana_diegetic + doc --mac "Mac-only docs"` | Run a step list in the given order. |
 
-A verb list accepts one optional package and no verb flags. The first failure ends the list with its status.
-On Linux, the parent initializes `BUILDLOG_RUN` once. Each verb inherits it and uses its own call record.
+A comma list accepts one optional package and no verb flags.
+A step list uses a lone `+` between `check`, `test`, `lint`, and `doc` steps.
+Each step uses its own package and flags. A routing flag applies only to its step.
+Verify checks every step's arguments before it starts the list. A usage error exits 2.
+The first failure ends either list with its status.
+On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
 Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.

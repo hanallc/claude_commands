@@ -4,10 +4,13 @@
 # Usage:
 #   verify <command> [<package>] [flags]
 #   verify test,lint,doc [<package>]
+#   verify check + lint + test <package> + doc --mac "<reason>"
 #
 # A verb list accepts test, lint, and doc once each, in any order.
 # Give one package or omit it for the workspace.
-# On Linux, the verbs share a run identity. The first failure ends the list.
+# A step list uses a lone + between check, test, lint, and doc steps.
+# Each step has its own package and flags. Verify checks all arguments first.
+# On Linux, both lists share one run identity. The first failure ends the list.
 #
 # Commands:
 #   check [<package>]      check every workspace target, test code included
@@ -426,6 +429,50 @@ parse_command_arguments() {
     ARGS=("$VERIFY_PACKAGE" ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"})
 }
 
+parse_verify_step_list() {
+    local word length=0
+    # The last separator closes the last step.
+    for word in "$@" +; do
+        if [[ "$word" == + ]]; then
+            if (( ! length )); then
+                echo 'verify.sh: a step list requires a step on each side of +.' >&2
+                exit 2
+            fi
+            VERIFY_STEP_LENGTHS+=("$length")
+            length=0
+            continue
+        fi
+        if (( ! length )); then
+            case "$word" in
+                check|test|lint|doc) ;;
+                *)
+                    printf 'verify.sh: a step list accepts only check, test, lint, and doc (%q).\n' "$word" >&2
+                    exit 2
+                    ;;
+            esac
+        fi
+        VERIFY_STEP_WORDS+=("$word")
+        length=$((length + 1))
+    done
+}
+
+VERIFY_QUERY_ARGS=("$@")
+if [[ "${1:-}" == --session-dir ]]; then
+    if [[ "${2:-}" == + ]]; then
+        echo 'verify.sh: --session-dir needs a directory before the step list.' >&2
+        exit 2
+    fi
+    VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
+fi
+VERIFY_STEP_LENGTHS=()
+VERIFY_STEP_WORDS=()
+for word in ${VERIFY_QUERY_ARGS[@]+"${VERIFY_QUERY_ARGS[@]}"}; do
+    if [[ "$word" == + ]]; then
+        parse_verify_step_list "${VERIFY_QUERY_ARGS[@]}"
+        break
+    fi
+done
+
 # Help returns before environment setup, target queries or build records.
 case "${1:-}" in
     -h|--help) usage 1; exit 0 ;;
@@ -514,8 +561,6 @@ VERIFY_TRACE_RUNNER
     chmod +x "$PY"
 fi
 # Read-only queries run before environment setup and build admission.
-VERIFY_QUERY_ARGS=("$@")
-[[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
 VERIFY_VERBS=()
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
     verify_list_verbs='test|lint|doc'
@@ -646,21 +691,27 @@ finish_verify_verb_list() {
 }
 
 run_verify_verbs() {
-    local verb status
+    local verb length offset=0 status
+    for verb in ${VERIFY_VERBS[@]+"${VERIFY_VERBS[@]}"}; do
+        VERIFY_STEP_LENGTHS+=("$(( $# + 1 ))")
+        VERIFY_STEP_WORDS+=("$verb" "$@")
+    done
     # Close the startup helper before the children open their own helpers.
     exec 70>&- 71<&-
     unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
     VERIFY_VERB_PREVIOUS_JOB=${!:-}
     trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
-    for verb in "${VERIFY_VERBS[@]}"; do
-        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 bash "$VERIFY_START_DIR/verify.sh" "$verb" "$@" <&0 &
+    for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 bash "$VERIFY_START_DIR/verify.sh" \
+            "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
         status=0
         wait "$!" || status=$?
         VERIFY_VERB_PREVIOUS_JOB=$!
         (( status == 0 )) || exit "$status"
         # A request probe prepares only the first step for its caller.
         [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || break
+        offset=$((offset + length))
         unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
         unset BUILDLOG_FIRST_STEP_EPISODE BUILDLOG_FIRST_STEP_PID
     done
@@ -1405,25 +1456,48 @@ merge_dev_features() {
     printf '%s' "$out"
 }
 
-# Optional trailing Work Order features on check and test join the repo list.
-# Any other leftover argument is a usage error. The caller sets PKG first.
+# Read the optional feature pair and prepare Cargo's flags when requested.
 FEATURE_FLAGS=()
 take_features() {
-    local features=""
-    if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" ]]; then
-        features=$2
+    local mode=$1 features
+    shift
+    REQUESTED_FEATURES=""
+    if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" && "$2" != --* ]]; then
+        REQUESTED_FEATURES=$2
         shift 2
     fi
     if [[ $# -ne 0 ]]; then
         usage
         exit 2
     fi
+    [[ "$mode" != validate ]] || return 0
+    features=$REQUESTED_FEATURES
     if [[ "$CMD" != test || "${PINNED_TARGET:-}" != hana-gpu ]]; then
         features="$(merge_dev_features "$features")"
     fi
     if [[ -n "$features" ]]; then
         FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$features")")
     fi
+}
+
+parse_check_arguments() {
+    local mode=$1 word check_args=()
+    shift
+    KEEP_GOING=()
+    for word in "$@"; do
+        if [[ "$word" == --keep-going ]]; then
+            KEEP_GOING=(--keep-going)
+        else
+            check_args+=("$word")
+        fi
+    done
+    take_features "$mode" ${check_args[@]+"${check_args[@]}"}
+}
+
+parse_lint_arguments() {
+    CHECK_LINT=0
+    if [[ "${1:-}" == --check ]]; then CHECK_LINT=1; shift; fi
+    [[ $# -eq 0 ]] || { usage; exit 2; }
 }
 
 # `build` arguments: at most one of --bin or --example, --release, and
@@ -1500,15 +1574,13 @@ print_built_binaries() {
 
 NEXTEST_ARGS=()
 compose_nextest_args() {
-    local ignored_only=0
-    set -- "${ARGS[@]}"
-    PKG="${1:-}"
-    shift
+    local mode=${1:-prepare} ignored_only=0 rest=()
+    PKG="${ARGS[0]:-}"
+    set -- "${ARGS[@]:1}"
     TARGET=""
     FILTERS=()
     # --filter, as often as named, and --features in any order; a target
     # takes no filter.
-    REST=()
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 && -n "${2:-}" ]]; then
             TARGET=$2
@@ -1521,11 +1593,12 @@ compose_nextest_args() {
             ignored_only=1
             shift 2
         else
-            REST+=("$1")
+            rest+=("$1")
             shift
         fi
     done
-    take_features ${REST[@]+"${REST[@]}"}
+    take_features "$mode" ${rest[@]+"${rest[@]}"}
+    [[ "$mode" != validate ]] || return 0
     require_member "$PKG"
     # --no-fail-fast: nextest cancels every remaining test after the first
     # failure, so one broken test silently hides the rest of the suite. A
@@ -1575,6 +1648,48 @@ compose_nextest_args() {
     fi
 }
 
+validate_verify_step_list() (
+    local length offset=0 metadata GATE_METADATA=""
+    local members=() targets=()
+    for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        set -- "${VERIFY_STEP_WORDS[@]:offset:length}"
+        CMD=$1
+        shift
+        parse_routing_arguments "$@"
+        parse_command_arguments "${ARGS[@]}"
+        case "$CMD" in
+            check) parse_check_arguments validate ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
+            test) compose_nextest_args validate ;;
+            lint) parse_lint_arguments ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
+            doc) take_features validate ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
+        esac
+        [[ -z "$VERIFY_PACKAGE" ]] || members+=("member:$VERIFY_PACKAGE")
+        if [[ -n "$PINNED_TARGET" && "$PINNED_TARGET" != natedev ]]; then
+            targets+=("$PINNED_TARGET")
+        fi
+        offset=$((offset + length))
+    done
+
+    if (( ${#targets[@]} )); then
+        "$PY" -c '
+import sys
+with open(sys.argv[1]) as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_targets import target_config
+
+try:
+    for target in sys.argv[2:]:
+        target_config.configured_ssh_target(target)
+except target_config.ConfigError as error:
+    print(f"verify.sh: {error}", file=sys.stderr)
+    sys.exit(2)
+' "$VERIFY_START_DIR/../lib/package_root.py" "${targets[@]}" || exit 2
+    fi
+    if (( ${#members[@]} )); then
+        metadata="$(read_metadata)" || exit 2
+        "$PY" "$VERIFY_METADATA_SCRIPT" "${members[@]}" <<< "$metadata" >/dev/null || exit 2
+    fi
+)
+
 # A stop during a Mac fix return leaves a record in the git folder (fix_return.py).
 # The run finishes it before any step reads the tree. Only a left record costs a Python call.
 finish_mac_fix() {
@@ -1585,6 +1700,7 @@ finish_mac_fix() {
 }
 
 VERIFY_ORIGINAL_ARGS=("$@")
+if (( ${#VERIFY_STEP_LENGTHS[@]} )); then validate_verify_step_list; fi
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
 if [[ "${1:-}" == "--session-dir" ]]; then
@@ -1635,7 +1751,7 @@ source "$VERIFY_START_DIR/../lib/buildlog_run.sh"
 buildlog_initialize_run verify_helper "$STEP_RECORD_SCRIPT"
 
 shift
-if (( ${#VERIFY_VERBS[@]} )); then
+if (( ${#VERIFY_VERBS[@]} || ${#VERIFY_STEP_LENGTHS[@]} )); then
     run_verify_verbs "$@"
     exit 0
 fi
@@ -4987,16 +5103,7 @@ run_lint_sequence() {
 case "$CMD" in
     check)
         PKG="$VERIFY_PACKAGE"
-        KEEP_GOING=()
-        CHECK_ARGS=()
-        for word in "$@"; do
-            if [[ "$word" == --keep-going ]]; then
-                KEEP_GOING=(--keep-going)
-            else
-                CHECK_ARGS+=("$word")
-            fi
-        done
-        take_features "${CHECK_ARGS[@]}"
+        parse_check_arguments prepare "$@"
         require_member "$PKG"
         run cargo check --workspace --all-targets "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
         ;;
@@ -5016,9 +5123,7 @@ case "$CMD" in
         ;;
     lint)
         PKG="$VERIFY_PACKAGE"
-        CHECK_LINT=0
-        if [[ "${1:-}" == --check ]]; then CHECK_LINT=1; shift; fi
-        [[ $# -eq 0 ]] || { usage; exit 2; }
+        parse_lint_arguments "$@"
         if [[ -n "$PKG" ]]; then require_member "$PKG"; fi
         require_taplo
         # Only mend and clippy take queue steps. Repairs reuse their positions.
@@ -5030,11 +5135,9 @@ case "$CMD" in
     doc)
         DOC_FEATURE_FLAGS=()
         DOC_FEATURES=""
-        if [[ $# -eq 2 && "$1" == --features && -n "$2" ]]; then
-            DOC_FEATURES="$(qualify_features "$VERIFY_PACKAGE" "$2")"
-        elif [[ $# -ne 0 ]]; then
-            usage
-            exit 2
+        take_features validate "$@"
+        if [[ -n "$REQUESTED_FEATURES" ]]; then
+            DOC_FEATURES="$(qualify_features "$VERIFY_PACKAGE" "$REQUESTED_FEATURES")"
         fi
         DOC_FEATURES="$(qualify_features "$VERIFY_PACKAGE" "$(merge_dev_features "$DOC_FEATURES")")"
         if [[ -n "$VERIFY_PACKAGE" ]]; then require_member "$VERIFY_PACKAGE"; fi
