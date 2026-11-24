@@ -15,9 +15,9 @@ import hmac
 import json
 import os
 import re
+import secrets
 import stat
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
@@ -28,6 +28,9 @@ from typing import Protocol, cast, final
 
 from scripts.buildlog.repository import repo_name
 from scripts.lib import conf
+from scripts.lib.atomic_file import (
+    AtomicDurabilityUnconfirmed, TEMPORARY_NAME, remove_abandoned_temporary_file, write_text_atomic,
+)
 from scripts.lib.build_folders import OWNER_MARKER
 from scripts.production import staff
 
@@ -451,6 +454,23 @@ class Tool(Enum):
 
 
 LIST_DIRECTORY = Path(".local/state/removal-lists")
+LIST_NAME_TOKEN_BYTES = 16
+LIST_NAME_TOKEN = re.compile(rf"[0-9a-f]{{{2 * LIST_NAME_TOKEN_BYTES}}}")
+LIST_TOOL_NAMES = frozenset(tool.value for tool in Tool)
+
+
+def remove_abandoned_list_staging(folder: Path) -> None:
+    """Remove staged removal lists whose writers have ended."""
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            match = TEMPORARY_NAME.fullmatch(entry.name)
+            if match is None or not match["target"].endswith(".jsonl"):
+                continue
+            tool, _, token = match["target"].removesuffix(".jsonl").rpartition("-")
+            if tool not in LIST_TOOL_NAMES or LIST_NAME_TOKEN.fullmatch(token) is None:
+                continue
+            if entry.is_file(follow_symlinks=False):
+                remove_abandoned_temporary_file(Path(entry.path), int(match["pid"]))
 
 
 class ListMode(Enum):
@@ -585,22 +605,17 @@ class RemovalList:
     def publish(self) -> Path:
         folder = Path.home() / LIST_DIRECTORY
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=folder,
-                                         prefix=f"{self.tool.value}-", suffix=".jsonl", delete=False) as output:
-            staged = Path(output.name)
-            try:
-                for row in self.rows.values():
-                    _ = output.write(row.line() + "\n")
-                output.flush()
-                os.fsync(output.fileno())
-                if self.published is ListPublication.PENDING:
-                    self.published = staged
-                else:
-                    _ = staged.replace(self.published)
-            except BaseException:
-                staged.unlink(missing_ok=True)
-                raise
-        return self.published
+        remove_abandoned_list_staging(folder)
+        path = self.published
+        if path is ListPublication.PENDING:
+            path = folder / f"{self.tool.value}-{secrets.token_hex(LIST_NAME_TOKEN_BYTES)}.jsonl"
+        try:
+            write_text_atomic(path, "".join(row.line() + "\n" for row in self.rows.values()), new_file_mode=0o600)
+        except AtomicDurabilityUnconfirmed:
+            self.published = path
+            raise
+        self.published = path
+        return path
 
     def report(self) -> None:
         path = self.publish()

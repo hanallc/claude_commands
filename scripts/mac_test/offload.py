@@ -2279,6 +2279,10 @@ class SweepFailed:
     cause: str
 
 
+MAC_FLOOR_CLEANUP_UNCONFIRMED = "Mac floor cleanup is unconfirmed"
+MAC_FLOOR_CLEANUP_RECORD = "mac_floor_cleanup=complete"
+
+
 def ensure_mac_disk_floor(
     controller: ProcessController, config: OffloadConfig | eligibility.SshProbeSettings, repository: KnownRepository,
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
@@ -2302,25 +2306,38 @@ def ensure_mac_disk_floor(
             else:
                 _ = lock.seek(0)
                 _ = lock.truncate()
-                _ = lock.write("floor sweep was interrupted")
+                _ = lock.write(f"floor sweep was interrupted. {MAC_FLOOR_CLEANUP_UNCONFIRMED}")
                 lock.flush()
                 if isinstance(config, OffloadConfig):
                     settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
                     timeout = conf.read(settings).number("floor_sweep_timeout_s")
                 else:
                     timeout = config.configuration.number("floor_sweep_timeout_s")
+                reserve = min(timeout / 2, config.connect_timeout_s + config.probe_timeout_s)
+                mac_deadline = time.time() + (timeout - reserve)
+                sweep_command = ("~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py "
+                                 + f"--mac-floor-deadline {mac_deadline} --floor-only --host mac")
+                # The dedicated terminal lets the Mac supervisor detect a closed connection.
                 result = controller.capture(
-                    [*ssh_prefix(config),
-                     "~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac"],
+                    ["ssh", "-n", "-tt", "-S", "none", *ssh_options(config), config.host, sweep_command],
                     CommandTimeLimit(timeout),
                 )
                 if isinstance(result, CommandTimedOut):
-                    cause = f"floor sweep timed out after {timeout:g} s"
+                    cause = f"floor sweep timed out after {timeout:g} s. {MAC_FLOOR_CLEANUP_UNCONFIRMED}"
                 elif isinstance(result, CommandCouldNotStart):
                     cause = "floor sweep could not start"
                 elif result.status != 0:
-                    detail = " ".join(result.stderr.split())
-                    cause = f"floor sweep exited with status {result.status}" + (f": {detail}" if detail else "")
+                    output = result.stdout.splitlines()
+                    confirmed = output[-1:] == [MAC_FLOOR_CLEANUP_RECORD]
+                    if confirmed:
+                        del output[-1]
+                    if result.status == 124:
+                        cause = "floor sweep timed out on the Mac"
+                    else:
+                        detail = " ".join("\n".join((*output, result.stderr)).split())
+                        cause = f"floor sweep exited with status {result.status}" + (f": {detail}" if detail else "")
+                    if not confirmed or result.status == 255 or result.status < 0:
+                        cause += f". {MAC_FLOOR_CLEANUP_UNCONFIRMED}"
                 else:
                     cause = "ok"
                 _ = lock.seek(0)
@@ -2329,9 +2346,9 @@ def ensure_mac_disk_floor(
                 lock.flush()
             _ = lock.seek(0)
             cause = lock.read()
-            after = probe_mac(controller, config, repository, target, slot)
             if cause != "ok":
-                return SweepFailed(cause or "floor sweep result missing")
+                return SweepFailed(cause or f"floor sweep result missing. {MAC_FLOOR_CLEANUP_UNCONFIRMED}")
+            after = probe_mac(controller, config, repository, target, slot)
             if not isinstance(after, ProbeSnapshot):
                 return SweepFailed("Mac disk reading failed after the floor sweep")
             disk = check_mac_disk_floor(after, floor)
