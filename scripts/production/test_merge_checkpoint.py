@@ -109,7 +109,8 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
                     with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
                         _ = checkpoint_gate.run_checkpoint_test_steps(
-                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
+                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log,
+                            merge_head="fixture-merge")
                     output = log.read_text()
                     initial_folder = checkout.resolve() if workspace else package.resolve()
                     expected = [f"test={initial_folder}"]
@@ -1173,6 +1174,133 @@ raise SystemExit(1)
         all_args = [arg for event in (self.events("python3") + self.events("basedpyright")) for arg in event]
         self.assertFalse(any(".venv" in arg for arg in all_args))
         self.assertIn("test: ok", result.process.stdout)
+
+    def test_red_merge_gate_uses_the_unpushed_tip_and_checks_the_base_after_rollback(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr "
+                            + "python3 scripts/production/gate.py --checkout . --tests-only`")
+        self.env["BUILDLOG_UNIT"] = "fixture-merge-unit"
+        original_tip = self.git("rev-parse", "HEAD")
+        main = self.push_main_change("src/main.txt", "new on main\n")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["cwd"], self.checkout)
+            self.assertNotIn("env", options)
+            self.assertEqual(os.environ["BUILDLOG_UNIT"], "fixture-merge-unit")
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+            self.assertEqual(command[:2], ["env", "HERDR_BIN=/nonexistent/herdr"])
+            self.assertEqual(command[4:8], ["run", "--repo", str(self.checkout), "--commit"])
+            tip = self.git("rev-parse", "HEAD")
+            self.assertEqual(command[8:15], [tip, "--", "python3", "scripts/production/gate.py",
+                                            "--checkout", "{tree}", "--tests-only"])
+            _ = self.git("merge-base", "--is-ancestor", main, tip)
+            tested.append(tip)
+            if len(tested) < 3:
+                _ = self.git("merge-base", "--is-ancestor", checkpoint, tip)
+                self.assertEqual(command[15:], [])
+                return subprocess.CompletedProcess(command, 1, "--- lib/test_fixture.py exit=1 ---\n", "")
+            self.assertEqual(command[15:], ["--module", "lib/test_fixture.py"])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint).process
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(tested), 3)
+        self.assertEqual(tested[0], tested[1])
+        self.assertNotEqual(tested[0], tested[2])
+        self.assertEqual(self.git("rev-parse", "HEAD"), original_tip)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+        self.assertIn("red: failed", result.stdout)
+
+    def test_git_push_uses_the_tested_tip_when_the_branch_moves_during_publication(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+        original_git = merge_checkpoint.git
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            tested.append(command[command.index("--commit") + 1])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if checkout == self.checkout and args[:2] == ("push", "origin"):
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit before push")
+            return original_git(checkout, *args)
+
+        with (mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)),
+              mock.patch.object(merge_checkpoint, "git", side_effect=git)):
+            result = self.run_checkpoint(checkpoint).process
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip, = tested
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tip)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit before push")
+
+    def test_base_check_keeps_an_operator_commit_when_the_gate_finishes(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        main = self.push_main_change("src/main.txt", "new on main\n")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            tip = command[command.index("--commit") + 1]
+            tested.append(tip)
+            if "--module" in command:
+                _ = self.git("merge-base", "--is-ancestor", main, tip)
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit during base check")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 1, "--- lib/test_fixture.py exit=1 ---\n", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 77, result.process.stdout + result.process.stderr)
+        self.assertEqual(len(tested), 3)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tested[-1])
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit during base check")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), result.before)
+
+    def assert_moved_merge_tip_cancels_publication(self, *, move_during_retest: bool, retest_status: int = 0) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        checkpoint = self.checkpoint()
+        original_main = self.git("rev-parse", "main", cwd=self.origin)
+        new_main = self.push_main_change("main-retest.txt", "new main\n")
+        _ = self.git("update-ref", "refs/heads/main", original_main, cwd=self.origin)
+        tested: list[str] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["cwd"], self.checkout)
+            tip = self.git("rev-parse", "HEAD")
+            self.assertIn(tip, command)
+            tested.append(tip)
+            if move_during_retest and len(tested) == 1:
+                _ = self.git("update-ref", "refs/heads/main", new_main, cwd=self.origin)
+            else:
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit during tests")
+                return subprocess.CompletedProcess(command, retest_status, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 77, result.process.stdout + result.process.stderr)
+        self.assertIn("publication cancelled because the tree changed", result.process.stdout)
+        self.assertEqual(len(tested), 2 if move_during_retest else 1)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tested[-1])
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit during tests")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), result.before)
+
+    def test_copied_gate_cancels_publication_when_the_merge_tip_moves(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=False)
+
+    def test_copied_gate_cancels_publication_when_the_retested_tip_moves(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=True)
+
+    def test_blocked_retest_keeps_an_operator_commit(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=True,
+                                                       retest_status=os.EX_TEMPFAIL)
     def test_merge_tests_that_are_not_commands_are_refused_by_name_before_the_merge(self) -> None:
         """cargo-liner wrote packages and a crate directory where the line wants commands."""
         (self.checkout / "crates/tui_pane").mkdir(parents=True)

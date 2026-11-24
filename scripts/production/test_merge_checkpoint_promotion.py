@@ -910,6 +910,25 @@ with lock.open("a") as held:
         self.assertEqual(second.process.returncode, 0, second.process.stderr + second.process.stdout)
         self.assertIn(f"promote: ok — {self.promote} already at {tip}\n", second.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
+    def test_legacy_main_push_keeps_the_tested_tip_when_the_branch_moves(self) -> None:
+        main = self.promote
+        _ = self.git("commit", "--allow-empty", "-m", "Tested commit", cwd=main)
+        tested = self.git("rev-parse", "HEAD", cwd=main)
+        production = ProductionDocument(self.doc, "example", "main", main, self.log,
+                                        ZoneInfo("America/Los_Angeles"))
+        original_git = merge_checkpoint.git
+
+        def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if checkout == main and args[:2] == ("push", "origin"):
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit before push", cwd=main)
+            return original_git(checkout, *args)
+
+        with mock.patch.object(merge_checkpoint, "git", side_effect=git):
+            self.assertEqual(merge_checkpoint.push_git(production, tested), tested)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tested)
+        self.assertEqual(self.git("rev-parse", "HEAD^", cwd=main), tested)
+        self.assertEqual(self.git("log", "-1", "--format=%s", cwd=main), "Operator commit before push")
+
     def test_git_push_merges_diverged_main_promotes_pushed_tip_and_records(self) -> None:
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()

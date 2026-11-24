@@ -133,18 +133,35 @@ def require_exact_commit(source: Path, tip: str) -> None:
                                    "specify the exact commit and retry promotion")
 
 
-def push_integration(source: Path, tip: str, branch: str) -> None:
+type PushCommand = Callable[[Path, str, str, str], str]
+
+
+def _push_exact(source: Path, tip: str, destination: str, run_push: PushCommand) -> None:
+    require_exact_commit(source, tip)
+    _ = git(source, "check-ref-format", destination)
+    _ = run_push(source, "push", "origin", f"{tip}:{destination}")
+
+
+def push_integration(source: Path, tip: str, branch: str, *, run_push: PushCommand = git) -> None:
     """Push the exact commit to a named integration branch."""
     destination = f"refs/heads/{branch.removeprefix('refs/heads/')}"
     if is_main_branch(branch):
         raise checkpoint_gate.Stop("push", "held", f"{destination} is not an integration branch",
                                    "publish through production promotion")
     try:
-        require_exact_commit(source, tip)
-        _ = git(source, "check-ref-format", destination)
-        _ = git(source, "push", "origin", f"{tip}:{destination}")
+        _push_exact(source, tip, destination, run_push)
     except checkpoint_gate.Stop as error:
         raise checkpoint_gate.Stop("push", error.state, error.detail, "repair the integration push and retry") from error
+
+
+def push_checkpoint(production: production_doc.ProductionDocument, tip: str, *, run_push: PushCommand) -> None:
+    """Push the tested SHA to the branch that accepts checkpoints."""
+    source, branch = production.checkout, production.merge_branch
+    if is_main_branch(branch) and isinstance(production.merge_checkout, production_doc.LegacyProduction):
+        with main_push_lock.main_push_lock(source):
+            _push_exact(source, tip, "refs/heads/main", run_push)
+    else:
+        push_integration(source, tip, branch, run_push=run_push)
 
 
 def publish(approval: PromotionApproval, source: Path, branch: str, tip: str,
