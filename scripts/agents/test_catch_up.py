@@ -194,6 +194,40 @@ class CatchUpTests(unittest.TestCase):
                                             "2026-11-13T22:00:00"]), 0)
         self.assertEqual(output.getvalue(), "[11-13 22:02:00]\nContinue the transfer.\n")
 
+    def test_claude_user_prompts_skip_generated_records(self) -> None:
+        teammate = '<teammate-message teammate_id="fixture">Peer message.</teammate-message>'
+        empty_paste = ('<pasted_content id="fixture">\n'
+                       + '<system-reminder>Script prompt.</system-reminder>\n'
+                       + '</pasted_content id="fixture">')
+        for name, record in (
+            ("tool source", claude_record(2, "user", "Tool message.", sourceToolAssistantUUID="fixture-assistant")),
+            ("teammate", claude_record(2, "user", teammate)),
+            ("empty paste", claude_record(2, "user", empty_paste)),
+        ):
+            with self.subTest(name=name):
+                _ = self.write(str(self.claude.parent), self.claude.name, [record])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(catch_up.main([f"session:{CLAUDE_ID}", "--user-prompts", "--near",
+                                                    "2026-11-13T22:00:00"]), 0)
+                self.assertEqual(output.getvalue(), "")
+
+    def test_codex_user_prompts_keep_typed_parts_next_to_context(self) -> None:
+        typed = "Use the original prompt."
+        for context in ("<environment_context>cwd</environment_context>",
+                        "# AGENTS.md instructions\n\n<INSTRUCTIONS>Context.</INSTRUCTIONS>"):
+            for parts in ((context, typed), (typed, context)):
+                with self.subTest(parts=parts):
+                    _ = self.write(str(self.codex.parent), self.codex.name, [
+                        codex_item(20, {"type": "message", "role": "user",
+                                        "content": [{"type": "input_text", "text": part} for part in parts]}),
+                    ])
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(catch_up.main([f"codex:{CODEX_ID}", "--user-prompts", "--near",
+                                                        "2026-11-13T21:20:00"]), 0)
+                    self.assertEqual(output.getvalue(), f"[11-13 21:20:00]\n{typed}\n")
+
     def test_user_prompts_refuse_a_bad_time(self) -> None:
         for value in ("yesterday", "2026-11-13", "2026-11-13T25:00:00Z"):
             with self.subTest(value=value):

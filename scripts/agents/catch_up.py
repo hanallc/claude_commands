@@ -19,7 +19,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 import json
@@ -33,7 +33,8 @@ from scripts.lib import conf, transcripts
 CODEX_FOLDERS = ("sessions", "archived_sessions")
 TIME_FORMAT = "%m-%d %H:%M:%S"
 GENERATED_TAGS = "|".join((
-    "system-reminder", "task-notification", "agent-message", "cross-session-message", "environment_context",
+    "system-reminder", "task-notification", "agent-message", "cross-session-message", "teammate-message",
+    "environment_context",
     "hook-output", "local-command-caveat", "local-command-stdout", "local-command-stderr",
 ))
 GENERATED_BLOCK = re.compile(rf"<(?P<tag>{GENERATED_TAGS})(?:\s[^>]*)?>.*?</(?P=tag)>", re.DOTALL)
@@ -43,6 +44,7 @@ GENERATED_PREFIXES = (
     "[SYSTEM NOTIFICATION", "Your claude.ai usage limit has reset.", "UserPromptSubmit hook ",
     "SessionStart hook ",
 )
+EMPTY_PASTE = re.compile(r'<pasted_content(?: id="(?P<id>[^"]+)")?>\s*</pasted_content(?: id="(?P=id)")?>')
 
 
 @dataclass(frozen=True)
@@ -83,21 +85,35 @@ def _parts(value: object) -> list[dict[str, object]]:
     return [_fields(part) for part in cast(list[object], value)] if isinstance(value, list) else []
 
 
-def _text(content: object, kinds: tuple[str, ...]) -> str:
+def _clean_prompt(text: str) -> str:
+    start = text.lstrip()
+    if GENERATED_START.match(start) or start.startswith(GENERATED_PREFIXES):
+        return ""
+    text = GENERATED_BLOCK.sub("", text)
+    stripped = text.strip()
+    return "" if not stripped or EMPTY_PASTE.fullmatch(stripped) else text
+
+
+def _text(content: object, kinds: tuple[str, ...], *, clean_prompt_parts: bool = False) -> str:
     """Join the text parts of one message."""
-    if isinstance(content, str):
-        return content
-    return "\n".join(text for part in _parts(content)
-                     if part.get("type") in kinds and isinstance(text := part.get("text"), str))
+    parts: Iterable[str] = (content,) if isinstance(content, str) else (
+        text for part in _parts(content)
+        if part.get("type") in kinds and isinstance(text := part.get("text"), str)
+    )
+    if clean_prompt_parts:
+        return "\n".join(text for part in parts if (text := _clean_prompt(part)))
+    return "\n".join(parts)
 
 
-def _codex_blocks(at: str, kind: object, payload: dict[str, object]) -> Iterator[Block]:
+def _codex_blocks(at: str, kind: object, payload: dict[str, object], *, user_prompts: bool) -> Iterator[Block]:
     if kind == "compacted":
         yield Block(at, "compaction", "The Codex summary is encrypted.", one_line=True)
         return
     item = payload.get("type")
-    if item == "message" and payload.get("role") in ("user", "assistant"):
-        yield Block(at, str(payload["role"]), _text(payload.get("content"), ("input_text", "output_text")))
+    role = payload.get("role")
+    if item == "message" and role in ("user", "assistant"):
+        yield Block(at, str(role), _text(payload.get("content"), ("input_text", "output_text"),
+                                        clean_prompt_parts=user_prompts and role == "user"))
     elif item in ("custom_tool_call", "function_call"):
         detail = payload.get("input", payload.get("arguments"))
         yield Block(at, f"tool {payload.get('name')}", detail if isinstance(detail, str) else "", one_line=True)
@@ -105,7 +121,7 @@ def _codex_blocks(at: str, kind: object, payload: dict[str, object]) -> Iterator
         yield Block(at, "result", _text(payload.get("output"), ("input_text", "output_text")), one_line=True)
 
 
-def _claude_blocks(at: str, record: dict[str, object]) -> Iterator[Block]:
+def _claude_blocks(at: str, record: dict[str, object], *, user_prompts: bool) -> Iterator[Block]:
     if record.get("isSidechain") or record.get("isMeta"):
         return
     content = _fields(record.get("message")).get("content")
@@ -120,7 +136,10 @@ def _claude_blocks(at: str, record: dict[str, object]) -> Iterator[Block]:
     if record.get("isCompactSummary"):
         yield Block(at, "compaction summary", _text(content, ("text",)))
         return
-    if text := _text(content, ("text",)):
+    text = _text(content, ("text",))
+    if user_prompts:
+        text = _clean_prompt(text)
+    if text:
         yield Block(at, "user", text)
     for part in _parts(content):
         if part.get("type") == "tool_result":
@@ -137,14 +156,15 @@ def record_blocks(line: bytes, *, user_prompts: bool = False) -> Iterator[Block]
     at = at if isinstance(at, str) else ""
     kind = record.get("type")
     if kind in ("response_item", "compacted"):
-        yield from _codex_blocks(at, kind, _fields(record.get("payload")))
+        yield from _codex_blocks(at, kind, _fields(record.get("payload")), user_prompts=user_prompts)
     elif kind in ("user", "assistant"):
         if user_prompts:
             content = _fields(record.get("message")).get("content")
             if (record.get("isSynthetic") or record.get("isVisibleInTranscriptOnly")
+                    or "sourceToolAssistantUUID" in record
                     or any(part.get("type") == "tool_result" for part in _parts(content))):
                 return
-        yield from _claude_blocks(at, record)
+        yield from _claude_blocks(at, record, user_prompts=user_prompts)
 
 
 def last_blocks(path: Path, count: int, window: int) -> list[Block]:
@@ -186,11 +206,7 @@ def _prompts_near(path: Path, near: datetime, minutes: int, zone: tzinfo) -> Ite
                     continue
                 if abs(at - near).total_seconds() / 60 > minutes:
                     continue
-                text = block.text.strip()
-                if GENERATED_START.match(text) or text.startswith(GENERATED_PREFIXES):
-                    continue
-                text = GENERATED_BLOCK.sub("", text).rstrip()
-                if text:
+                if text := block.text.strip():
                     yield at, text
 
 
