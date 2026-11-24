@@ -1,4 +1,7 @@
 {
+  "accounts": {
+    "login_sitting_interval_days": 25
+  },
   "aws_target": {
     "accounting_zone": 8
   },
