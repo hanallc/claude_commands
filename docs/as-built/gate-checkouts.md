@@ -154,7 +154,8 @@ A path that does not exist prints `copies: publish: <path> not built` on stderr.
 A copy failure ends the scratch folder and prints `copies: publish: <error>` on stderr.
 Publication never changes the exit status of `run`.
 After the scratch deadline, the hourly sweep lists the eligible folder for vetted manual removal.
-The scratch default task has a random suffix, so `scratch.end()` removes only this folder.
+The default scratch task has a random suffix.
+`scratch.end()` records task completion and keeps the folder for vetted manual removal.
 The folder is outside the cache root, so a unit reads it with no permission prompt.
 `/hana_shot` launches a gate build with the `published:` path as `--binary`.
 A unit never copies from a gate checkout's `target`.

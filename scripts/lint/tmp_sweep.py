@@ -66,12 +66,11 @@ Staff records each director's open run.
 A run also stays when its ownership record identifies a running director.
 The `unit_runs.director` reader resolves that owner through staff.
 A session folder stays when its name identifies a running session.
-An entry of SESSION_ENTRY_MIN_BYTES or more in
-its folders (scratchpad/, tasks/) is judged like any other: a live session
-keeps small files there that it only reads, and a read does not move mtime;
-each of those when a session record cannot be read; a scratch folder of a change review
-row, which its verdict removes (the user can take days to check a row);
-and an entry that cannot be read. The sweep does not follow links.
+The sweep checks entries of at least SESSION_ENTRY_MIN_BYTES in its scratchpad/ and tasks/ folders.
+A live session keeps smaller entries there. Reads do not change mtime.
+The sweep keeps entries when it cannot read the session record or the entry.
+A change review verdict ends the scratch task and keeps its folder for vetted manual removal.
+The sweep does not follow links.
 If neither /proc nor lsof can show which processes use an entry, the sweep keeps it.
 
 Each timed run prints the entries for review and a summary.

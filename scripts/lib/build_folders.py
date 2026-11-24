@@ -676,7 +676,10 @@ def _kept_build_copy(path: Path, directory: int | None = None) -> bool:
             and isinstance(parse_form(path), BuildCopy))
 
 
-def build_folder_state(path: Path) -> Literal["held", "free", "kept"]:
+BuildFolderState = Literal["held", "free", "kept"]
+
+
+def build_folder_state(path: Path) -> BuildFolderState:
     """Check the lock and the numbered copy keep file."""
     state = build_folder_lock.probe(path, path.parent, _probe_timing)
     if state == "free" and _kept_build_copy(path):
