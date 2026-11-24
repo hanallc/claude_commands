@@ -2976,7 +2976,8 @@ document.body.append(result);
         _ = list_page.submit(root, urlencode(self.fields(answered, "park", until=(NOW + timedelta(days=1)).isoformat())))
         markup = list_page.render(root, status=status, include_counts=False).decode()
         controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["19", "4", "2", "2", "2", "8"])
+        # A park at or after the answer reads the answer and puts item 21 in Parked.
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["19", "3", "2", "2", "2", "9"])
         probe = '''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
@@ -2984,8 +2985,8 @@ const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
  ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21],[1,3,4,6,9,11,13,15,18,19,20,21]],
- ['needs-me',[4,5,20,21],[4,20,21]],['producer-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
- ['parked',[9,10,11,12,13,14,15,18],[9,11,13,15,18]],
+ ['needs-me',[4,5,20],[4,20]],['producer-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
+ ['parked',[9,10,11,12,13,14,15,18,21],[9,11,13,15,18,21]],
 ];
 const count=button=>Number(button.dataset.filterCount);
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
