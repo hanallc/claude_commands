@@ -6005,11 +6005,16 @@ done
         settlement = journal.settle(binding.claim, holder)
         if isinstance(settlement, placement.DispatchPathPending):
             key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            settled_holder = holder
 
             def read_dispatch() -> placement.DispatchPathState:
-                if not self.closed and self.current_assignments.get(assignment.episode) == key:
-                    scaler_provider().reconcile_dispatch(binding)
-                return settlement
+                observed = journal.settle(binding.claim, settled_holder)
+                if not isinstance(observed, placement.DispatchPathPending):
+                    return placement.DispatchPathSettled()
+                reconcile = getattr(scaler_provider(), "reconcile_dispatch", None)
+                if callable(reconcile) and not self.closed and self.current_assignments.get(assignment.episode) == key:
+                    _ = cast(Callable[[aws_ledger.GateDispatchBinding], None], reconcile)(binding)
+                return observed
 
             probe = self._dispatch_settlement_probe(saved, read_dispatch)
             if probe is not None:
@@ -6020,6 +6025,9 @@ done
                 and (isinstance(report.outcome, placement.AttemptCompleted)
                      or settlement == "no launch" and isinstance(report.outcome, placement.PrelaunchRefused))):
             terminal = replace(report, path=path)
+        elif (settlement == "no launch" and isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, placement.AttemptDeclined)):
+            terminal = replace(report, outcome=placement.PrelaunchRefused(report.outcome.reason), path=path)
         else:
             terminal = placement.TerminalAttemptReport(placement.AttemptCancelled(
                 "The AWS gate ended without a verdict" if settlement == "launch ended" else "no launch"),

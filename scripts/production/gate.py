@@ -3232,8 +3232,6 @@ def gate_placement_targets(args: GateArguments, source: Path) -> tuple[str, ...]
         if "natedev" not in requested:
             raise GateAssignmentRefused(f"gate.py {flag} runs only on natedev")
         return ("natedev",)
-    if args.prepared_copy:
-        return requested
     targets = tuple(name for name in requested if name in ("natedev", "mac-linux"))
     if not targets:
         raise GateAssignmentRefused("Direct gates require natedev or mac-linux")
@@ -3245,6 +3243,9 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
     """Keep the placement for the test checkout until the suites end."""
     if not isinstance(target, NoGateAssignment):
         yield target
+        return
+    if args.prepared_copy:
+        yield "natedev"
         return
     targets = gate_placement_targets(args, source)
     if not targets:
