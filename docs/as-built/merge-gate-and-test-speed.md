@@ -58,6 +58,7 @@ The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMEN
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
 The gate checks a supplied assignment at startup.
+For `--tests-only` and `--affected` without `--module`, the assignment source key must match the resolved `--repo` checkout.
 Without a supplied assignment, the gate asks `first_step.admitted_run` to place the test checkout.
 The queue offers natedev, the Mac Linux guest and AWS according to the target configuration.
 A direct merge gate asks after it creates the merge tree. The nightly gate asks after it prepares the fetched checkout.
@@ -109,6 +110,11 @@ The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `
 `copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
 The queue also accepts the claim failure after the gate consumed the launch permission, when a new process read shows that the gate process ended.
 The new assignment goes into the same file, and the gate runs again on the assigned machine.
+A direct `--tests-only` or `--affected` gate without `--module` keeps its admission open during retries.
+It reads the current grant and checks the checkout before each attempt.
+The same retry loop handles status 79 and waits for settlement on status 80.
+It keeps the same queue episode and returns status 1 if settlement or replacement fails.
+A gate with an inherited placement returns the retry status to its wrapper.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
 If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
 A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.

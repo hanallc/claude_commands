@@ -45,7 +45,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -3205,8 +3205,11 @@ class GateAssignmentRefused(GateRefused):
 
 
 @contextmanager
-def gate_start_target(args: GateArguments, source: Path) -> Generator[GateTarget]:
-    """Keep the queue placement for the test checkout until the suites end."""
+def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> Generator[GateTarget]:
+    """Keep the placement for the final checkout until the suites end."""
+    if not isinstance(target, NoGateAssignment):
+        yield target
+        return
     with first_step.admitted_run(args.command, source) as admitted:
         grant = admitted.grant
         if not isinstance(grant, first_step.GatePlacement):
@@ -3215,18 +3218,14 @@ def gate_start_target(args: GateArguments, source: Path) -> Generator[GateTarget
         yield placement_target(grant.grant)
 
 
-def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> AbstractContextManager[GateTarget]:
-    """Request placement after the final test checkout exists."""
-    return gate_start_target(args, source) if isinstance(target, NoGateAssignment) else nullcontext(target)
-
-
 def checked_gate_target(args: GateArguments) -> GateTarget:
     """Check the assignment once, when the gate starts, before any merge, hold wait or run.
 
     A mode that cannot route takes only a natedev assignment.
     Keep the local grant through the handoff and the suite run.
     """
-    placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
+    source = Path(args.repo).expanduser().resolve() if (args.affected or args.tests_only) and not args.modules else None
+    placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job, source=source)
     target = placement_target(placed)
     flag = natedev_only_flag(args)
     if flag is not None and not isinstance(placed, NoGateAssignment) and placed.assignment.destination.target != "natedev":
@@ -3267,7 +3266,7 @@ def release_local_gate(assignment: LocalGateAssignment, status: int) -> None:
         raise GateAssignmentRefused(f"Cannot end the local gate reservation: {ended.reason}")
 
 
-def current_gate_placement(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded
+def current_gate_placement(mode: SuiteMode, gate_job: StepJob | GateJobNotRecorded, *, source: Path | None = None
                            ) -> admission_wire.Assignment | admission_wire.LocalPlacementGranted | NoGateAssignment:
     """Return the queue assignment for this gate after the queue confirms it. This changes no queue state."""
     path = os.environ.get("BUILDLOG_PLACEMENT_FILE")
@@ -3302,6 +3301,8 @@ def current_gate_placement(mode: SuiteMode, gate_job: StepJob | GateJobNotRecord
         raise GateAssignmentRefused("The queue assignment does not match the gate placement file")
     if isinstance(status.state, placement.ClosedAssignment):
         raise GateAssignmentRefused(f"The gate placement attempt is stale: {status.state.reason}")
+    if source is not None and not first_step.assignment_matches_source(saved, source):
+        raise GateAssignmentRefused("The requested source does not match the gate placement source")
     return placed
 
 
@@ -3377,7 +3378,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     mode: SuiteMode = SuiteMode.GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
                     target: GateTarget, nightly_types: bool = False, named: Sequence[str] = ()) -> GateRun:
-    """Route the whole test selection to the target that gate_start_target checked: the Mac Linux guest, AWS, or natedev."""
+    """Run the test selection on the assigned target."""
     def run_local(types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
@@ -3696,13 +3697,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
+def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
+    """Keep one admission through the direct gate and its retries."""
+    source = Path(args.repo).expanduser().resolve()
+    # A wrapper with a supplied placement owns the retry loop.
+    if args.modules or not isinstance(target, NoGateAssignment):
+        with gate_suite_target(args, source, target) as assigned:
+            return run_tests_only(args, mode, assigned)
+
+    with first_step.admitted_run(args.command, source) as admitted:
+        admitted.handoff(source)
+
+        def run() -> subprocess.CompletedProcess[str]:
+            grant = admitted.grant
+            if not isinstance(grant, first_step.GatePlacement):
+                raise GateAssignmentRefused("The queue returned no gate placement")
+            placed = grant.grant
+            if not first_step.assignment_matches_source(placed.assignment, source):
+                raise GateAssignmentRefused("The requested source does not match the gate placement source")
+            return subprocess.CompletedProcess(args.command, run_tests_only(args, mode, placement_target(placed)))
+
+        result = admitted.run_gate(run)
+        if result.stderr:
+            _ = sys.stderr.write(result.stderr)
+        if result.returncode in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
+            return 1
+        return result.returncode
+
+
 def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected:
-        with test_run_folder(), gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned:
-            return run_tests_only(args, SuiteMode.TARGETED, assigned)
+        with test_run_folder():
+            return run_direct_tests(args, SuiteMode.TARGETED, target)
     if args.tests_only:
-        with gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned:
-            return run_tests_only(args, SuiteMode.GATE, assigned)
+        return run_direct_tests(args, SuiteMode.GATE, target)
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)

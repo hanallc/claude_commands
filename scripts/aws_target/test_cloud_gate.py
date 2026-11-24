@@ -1764,6 +1764,47 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertEqual(other.state, ledger.GateRunning('i-other-live'))
                 self.assertNotIn('i-other-live', fake.terminated_instances)
 
+    def test_empty_launch_lookup_must_start_at_or_after_expiry(self) -> None:
+        worker = self.worker_with_pending_gate()
+        booking, = self.book.read_snapshot().gate_reservations
+        self.fake.has_instance = False
+        cloud_gate.save(self.folder / 'request.json', {'attempt': booking.attempt})
+        cloud_gate.save(self.folder / 'launch.json', {'region': 'fixture-region',
+                        'arguments': {'ClientToken': 'fixture-token'}})
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('Name=client-token,Values=fixture-token', arguments)
+            self.advance(1)
+            return self.fake(arguments, **options)
+
+        worker.apis.clear()
+        worker.api = AwsCli('fixture', 'fixture-region', 1, execute=transport)
+        self.advance(booking.expires - self.now - 1)
+        self.assertFalse(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertEqual(self.now, booking.expires)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        self.assertTrue(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+        self.assertEqual(len(self.fake.commands), 2)
+
+    def test_reconcile_skips_a_damaged_launch_journal_and_closes_the_other_booking(self) -> None:
+        worker = self.worker_with_pending_gate()
+        self.book.gate_owner('orphan', ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder)))
+        path = self.folder / 'launch.json'
+        _ = path.write_text('{"incomplete":')
+        self.record_running_gate('expired', 'm7a.8xlarge', 'fixture-region')
+        self.advance(1200)
+        with (mock.patch.object(cloud_gate, 'process_start', return_value=Gone()),
+              redirect_stderr(StringIO()) as errors):
+            worker.reconcile()
+        messages = errors.getvalue().splitlines()
+        self.assertEqual(len(messages), 1)
+        self.assertIn(str(path), messages[0])
+        states = {row.attempt: row.state for row in self.book.read_snapshot().gate_reservations}
+        self.assertIsInstance(states['orphan'], ledger.GateLaunchPending)
+        self.assertEqual(states['expired'], ledger.GateTerminated(int(self.now), 'i-expired'))
+        self.assertEqual(self.fake.terminated_instances, {'i-expired'})
+
     def test_reconcile_preserves_live_and_unreadable_worker_owners(self) -> None:
         worker = self.worker_with_pending_gate()
         owner = ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder))

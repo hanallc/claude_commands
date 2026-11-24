@@ -438,12 +438,17 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
     for launch in uncertain:
         try:
             found = False
+            all_lookups_after_expiry = True
             for region in launch.regions:
-                remaining = deadline - worker.clock()
+                api = worker.regional_api(region)
+                timeout = settings().number('api_timeout_s')
+                lookup_started = worker.clock()
+                remaining = deadline - lookup_started
                 if remaining <= 0:
                     raise AwsUnavailable('The gate cleanup deadline passed')
-                reply = worker.regional_api(region).call('describe-instances', '--filters', launch.filter,
-                    timeout_s=min(settings().number('api_timeout_s'), remaining))
+                reply = api.call('describe-instances', '--filters', launch.filter,
+                                 timeout_s=min(timeout, remaining))
+                all_lookups_after_expiry = all_lookups_after_expiry and lookup_started >= launch.expires
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances:
                     discovered = [GateTermination(launch.attempt, ledger.text(row, 'InstanceId'), region) for row in instances]
@@ -454,7 +459,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                     found = True
                     break
             if not found:
-                if worker.clock() < launch.expires:
+                if not launch.regions or not all_lookups_after_expiry:
                     complete = False
                 else:
                     worker.book.resolve_gate(launch.attempt, ledger.GateAbsent(int(worker.clock())))
@@ -667,8 +672,14 @@ class GateWorker:
             if isinstance(reservation.owner, ledger.GateWorkerOwner):
                 folder = Path(reservation.owner.folder)
                 launch_path = folder / 'launch.json'
-                checked = (folder / 'request.json').exists()
-                launch = read(launch_path) if launch_path.exists() else {}
+                try:
+                    with suppress(FileNotFoundError):
+                        launch = read(launch_path)
+                    checked = (folder / 'request.json').exists()
+                except (OSError, ValueError) as error:
+                    detail = ' '.join(str(error).split())
+                    print(f'Gate cleanup could not read {launch_path}: {detail}', file=sys.stderr)
+                    continue
             attempts.append(GateCleanupAttempt(reservation, launch, checked))
         _ = cleanup_attempts(attempts, self)
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_records, first_step
+from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
@@ -20,14 +20,17 @@ import subprocess
 import tempfile
 import time
 from typing import cast, final, override
-from contextlib import AbstractContextManager, contextmanager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.buildlog import treekey
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import scratch
-from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_steps import GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
@@ -64,6 +67,88 @@ class GateModuleOwnerTests(unittest.TestCase):
             child = cast(dict[str, str], start.call_args.kwargs["env"])
         self.assertEqual(child["PATH"], os.defpath)
         self.assertFalse(child.keys() & (environment.keys() - {"PATH"}))
+
+
+class DirectGatePlacementTests(unittest.TestCase):
+    def admission(self, source: Path, command: tuple[str, ...]) -> first_step.FirstStepAdmission:
+        aws = placed("aws")
+        assignment = aws.assignment
+        position = SlotQueuePosition(assignment.episode, assignment.since)
+        profile = admission_records.ProgramProfile("gate", str(source), str(source),
+            admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
+        constraints = placement.PlacementConstraints(assignment.source_key, command, str(source), "", assignment.session,
+            (placement.PlacementCandidate(assignment.destination), placement.PlacementCandidate(placed("natedev").assignment.destination)))
+        request = admission_wire.PlacementRequest(position.episode, assignment.owner, position.since, profile, constraints)
+        path = source / "assignment.json"
+        admission_client.write_assignment(path, aws)
+        return first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(aws, request), path)
+
+    def test_direct_gate_uses_the_replacement_grant_after_settlement(self) -> None:
+        for flag, mode in (("--tests-only", gate.SuiteMode.GATE), ("--affected", gate.SuiteMode.TARGETED)):
+            for blocked in (False, True):
+                with self.subTest(flag=flag, blocked=blocked), tempfile.TemporaryDirectory() as folder:
+                    source = Path(folder).resolve()
+                    arguments = (flag, "--repo", str(source))
+                    admitted = self.admission(source, ("gate.py", *arguments))
+                    original = admission_wire.read_assignment(admitted.assignment_file).assignment
+                    replacement = replace(original, attempt="replacement", destination=placed("natedev").assignment.destination)
+                    events: list[str] = []
+
+                    @contextmanager
+                    def admit(_command: Sequence[str], checkout: Path) -> Generator[first_step.FirstStepAdmission]:
+                        self.assertEqual(checkout, source)
+                        events.append("admit")
+                        try:
+                            yield admitted
+                        finally:
+                            events.append("close")
+
+                    def run(_args: gate.GateArguments, selected_mode: gate.SuiteMode, target: gate.GateTarget) -> int:
+                        self.assertIs(selected_mode, mode)
+                        self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
+                        if isinstance(target, gate.AwsGateAssignment):
+                            self.assertEqual(target.assignment, original)
+                            events.append("aws")
+                            return GATE_UNSETTLED_LAUNCH_STATUS
+                        self.assertEqual(target, "natedev")
+                        self.assertEqual(admission_wire.read_assignment(admitted.assignment_file).assignment, replacement)
+                        events.append("natedev")
+                        return 0
+
+                    def settle(request: admission_wire.SettlementRequest) -> None:
+                        self.assertEqual(request.assignment, original)
+                        events.append("settle")
+                        if blocked:
+                            raise admission_wire.AdmissionUnavailable("fixture settlement failure")
+
+                    with (mock.patch.dict(os.environ, clear=True),
+                          mock.patch.object(first_step, "admitted_run", side_effect=admit),
+                          mock.patch.object(treekey, "tree_key", return_value="fixture-source"),
+                          mock.patch.object(admission_client, "request_settlement", side_effect=settle),
+                          mock.patch.object(queue_place, "wait_for_placement", return_value=admission_wire.Assignment(replacement)),
+                          mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
+                          mock.patch.object(gate, "run_tests_only", side_effect=run),
+                          redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(gate.main(arguments), int(blocked), errors.getvalue())
+                    self.assertEqual(events, ["admit", "aws", "settle", *([] if blocked else ["natedev"]), "close"])
+                    if blocked:
+                        self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
+
+    def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder).resolve()
+            arguments = ("--tests-only", "--repo", str(source / ".." / source.name))
+            admitted = self.admission(source, ("gate.py", *arguments))
+            with (mock.patch.dict(os.environ, clear=True),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as open_admission,
+                  mock.patch.object(treekey, "tree_key", return_value="different-source") as key,
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(arguments), 1)
+            open_admission.assert_called_once_with(("gate.py", *arguments), source)
+            key.assert_called_once_with(str(source))
+            self.assertIn("source does not match", errors.getvalue())
+            run.assert_not_called()
 
 
 @final
@@ -138,7 +223,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             self.assertEqual(command[0], 'gate.py')
             self.assertEqual(source, self.checkout)
             self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
-            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.GatePlacement(assignment, None))
+            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.InheritedGatePlacement(assignment))
 
         assignment = placed('natedev')
         with (mock.patch.object(gate, "run_suites", side_effect=suites),

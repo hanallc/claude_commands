@@ -907,8 +907,13 @@ A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
 The route reports pending settlement to the queue while the launch remains uncertain.
 The stop cleanup looks up an unknown instance by client token.
+An empty lookup proves absence only if the lookup starts at or after the booking expiry.
+If the reconciler cannot read a launch journal, it prints the file path and keeps that booking open.
+It continues cleanup for the other bookings.
 The queue reads settlement for the exact claim through `settlement()`.
 The queue calls `reconcile_expired()` when it checks pending settlement.
+A direct gate that receives status 80 asks the queue for settlement before it takes a replacement in the same episode.
+If settlement or replacement fails, the direct gate reports the refusal and exits with status 1.
 This call requests the reconcile service when a booking for that claim has expired and is due for cleanup.
 The call returns before reconciliation completes.
 If the service cannot start, the call prints one warning per attempt in the queue process.
