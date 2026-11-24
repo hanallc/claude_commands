@@ -5242,24 +5242,28 @@ done
         eligibility = candidate.eligibility
         key = self.placement_host_keys.get((request.episode, destination))
         if (key is None or not isinstance(request.purpose, placement.NormalStep)
-                or destination.provider in ("local", "scaler")
-                or not (isinstance(eligibility, placement.EvidenceNeeded)
-                        or _hold_exclusion(request, destination, eligibility))):
+                or destination.provider in ("local", "scaler")):
             return None
         reader = self.host_readers.get(key)
         if reader is None:
             return None
         latest = reading if reading is not None else reader.latest
-        if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
-                and not _hold_exclusion(request, destination, latest.eligibility)):
-            return None
         pair = (request.episode, destination)
         observed_at = latest.observed_at
         start = self.placement_holds.get(pair)
         answer = observed_at if start is not None and observed_at >= start else self.placement_hold_answers.get(pair)
+        answered = answer == observed_at
+        # Keep the answer in queue order even if the reading cannot start a hold.
+        if not (answered and destination.provider == "mac"):
+            if not (isinstance(eligibility, placement.EvidenceNeeded)
+                    or _hold_exclusion(request, destination, eligibility)):
+                return None
+            if (isinstance(latest, placement.FreshHostEvidence)
+                    and not isinstance(latest.eligibility, placement.AllowedHost)
+                    and not _hold_exclusion(request, destination, latest.eligibility)):
+                return None
         if answer is not None:
             answers[pair] = answer
-        answered = answer == observed_at
         if answered and destination.provider != "mac":
             return None
         return PlacementHold(request.episode, destination, key, observed_at, answered)

@@ -3313,6 +3313,12 @@ class MacOrderTests(unittest.TestCase):
             self.assertEqual(fixture.server.placement_holds, {})
 
     def test_older_busy_requests_do_not_alternate_mac_holds(self) -> None:
+        self.assert_second_waiter_does_not_extend_the_hold("busy")
+
+    def test_a_disk_answer_ends_the_hold_without_giving_it_to_the_second_waiter(self) -> None:
+        self.assert_second_waiter_does_not_extend_the_hold("disk")
+
+    def assert_second_waiter_does_not_extend_the_hold(self, answer: MacProbeAnswer) -> None:
         with MacProbeFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
             self.configure_mac_probe(fixture)
             first = self.submit_mac_request(fixture, name="older-a", age=60, answer="busy",
@@ -3326,6 +3332,7 @@ class MacOrderTests(unittest.TestCase):
             self.assertEqual({episode for episode, _ in fixture.server.placement_holds}, {first.episode})
             worker = fixture.server.host_targets[("mac", "mac")]
             assert isinstance(worker, ManualEvidenceWorker)
+            fixture.answers[first.constraints.session] = answer
             for request in (second, first, younger):
                 fixture.clock.advance(1)
                 key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)

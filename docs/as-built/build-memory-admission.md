@@ -2814,9 +2814,11 @@ Both hosts use the visible order for normal steps.
 A request that waits only for the Mac can hold its place for one probe on a busy, blocked, backoff, or unreachable reading.
 This rule applies to the Mac-only route with configured order and to both forms of a Mac pin.
 The explicit `--mac-only` option can hold its place on a busy reading.
-Disk, off, and state readings give no hold.
+Disk, off, and state readings do not start a hold.
 For an overlapping Mac scope, the first eligible older waiter decides the hold.
-When its probe answers or reaches its time limit, a second waiter cannot extend the hold.
+A disk answer ends the first waiter's hold.
+A second waiter cannot start another hold against the same free reading.
+The same rule applies when the probe gives another answer or reaches its time limit.
 If the probe reports free before the hold check, the same pass considers that reading for the older waiter.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
