@@ -640,8 +640,8 @@ def assignment_prompt(args: Arguments, run: Path, phase: str, role: staff.Worker
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: staff.WorkerRole, paths: list[str], env: dict[str, str]) -> int:
     """Check the worker before publishing assignment files."""
-    record = staff.snapshot()
     try:
+        record = staff.snapshot()
         owner = worker_admission.parent(record, run=run)
         artifacts = staff_worker.CompletionArtifacts(owner, run)
         enrolled = artifacts.protected

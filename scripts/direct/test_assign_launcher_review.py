@@ -129,8 +129,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         begin = assign.execute_herdr
 
         def lose_staff(args: assign.Arguments, run: Path, phase: str, prompt: Path,
-                       role: str, paths: list[str], environment: dict[str, str]) -> int:
-            with patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable("private reread failure")):
+                       role: staff.WorkerRole, paths: list[str], environment: dict[str, str]) -> int:
+            with patch.object(staff, "snapshot", side_effect=staff.StaffUnreadable("private reread failure")):
                 return begin(args, run, phase, prompt, role, paths, environment)
 
         submitted = case.agent.submitted.copy()
