@@ -1070,6 +1070,34 @@ try {
               await call('Input.dispatchKeyEvent', {type:'keyDown', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
               await call('Input.dispatchKeyEvent', {type:'keyUp', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
               assert.equal(await evaluate('Boolean(tips.key())'), false, 'Escape did not close the tooltip.');
+
+              await call('Emulation.setDeviceMetricsOverride', {width:800,height:1100,deviceScaleFactor:1,mobile:false});
+              const bumpBefore = await evaluate(`(async () => {
+                setPaused(true);
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const mark = document.querySelector('#walk td.moved .move-mark');
+                mark.scrollIntoView({block:'center', inline:'nearest'});
+                mark.focus({preventScroll:true});
+                return {left:mark.getBoundingClientRect().left, key:mark.dataset.tip,
+                  open:tips.key(), tight:document.querySelector('#walk').classList.contains('tight')};
+              })()`);
+              assert.equal(bumpBefore.open, bumpBefore.key, 'Focus did not open the bump tooltip.');
+              assert.ok(bumpBefore.tight, 'The bump resize proof needs compact gaps at 800 px.');
+
+              await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+              const bumpAfter = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const mark = document.querySelector('#walk td.moved .move-mark').getBoundingClientRect();
+                const tip = document.querySelector('#tip.on > .tip').getBoundingClientRect();
+                return {left:mark.left, gap:Math.max(mark.left - tip.right, tip.left - mark.right),
+                  topDifference:tip.top - mark.top, open:tips.key(),
+                  tight:document.querySelector('#walk').classList.contains('tight')};
+              })()`);
+              assert.equal(bumpAfter.open, bumpBefore.key, 'Resize closed the bump tooltip.');
+              assert.ok(!bumpAfter.tight && Math.abs(bumpAfter.left - bumpBefore.left) > 8,
+                'Resize did not move the bump mark out of the compact layout.');
+              assert.ok(Math.abs(bumpAfter.gap - 8) <= 1 && Math.abs(bumpAfter.topDifference + 4) <= 1,
+                'The tooltip is outside the expected position beside the resized bump mark.');
             }
           } finally {
             queueFixture = null;
