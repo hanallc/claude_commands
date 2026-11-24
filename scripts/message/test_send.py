@@ -1164,12 +1164,6 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(len(error.getvalue().splitlines()), 1)
                     read.assert_not_called()
 
-    def test_review_watch_gets_a_reference_without_a_new_caller_argument(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "review_watch.acknowledge")
-        options = send.parse(["--to", "user", "--text-id", entry.id,
-                              *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))])
-        self.assertEqual(options.reference, {"kind": "review_watch"})
-
     def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")

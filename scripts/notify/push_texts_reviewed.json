@@ -1066,31 +1066,6 @@
       "time": "2026-11-22T10:01:43.412457-05:00"
     }
   },
-  "review_watch.acknowledge": {
-    "report": {
-      "objections": [
-        {
-          "quote": "merged without the extra code reviewer",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "report ready, waiting for your acknowledgment",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "acknowledge the review report",
-          "rule": "say-where-to-act"
-        },
-        {
-          "quote": "12 screen changes merged without extra review",
-          "rule": "push-title-under-45"
-        }
-      ],
-      "reviewer": "user-spec: User approved both fixed texts in decision-push-rules investigation section 4; decision-templates job 7b; reviewer: opus",
-      "sha256": "93c5a33b5c882de683cbecffb7e2ac95cd982463ab84ca7fed443cb75e640f4d",
-      "time": "2026-11-03T14:41:20.547715-05:00"
-    }
-  },
   "rust.errors": {
     "many_errors": {
       "reviewer": "opus",

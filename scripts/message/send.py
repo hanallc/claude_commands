@@ -233,7 +233,6 @@ NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with t
 # Registered pushes a session or script sends with --text-id; `send.py --help` lists them.
 SESSION_TEMPLATES = {
     "decision.choices": "a decision with structured choices and a recommendation; see review.py show decision.choices.",
-    "review_watch.acknowledge": "a reminder to acknowledge a review report; see review.py show review_watch.acknowledge.",
     AUTO_MODE_TEXT: ("auto mode refused a command; the session continues its other work. "
                      + "Send auto_mode.refused only when the refused step holds work and the user has no step for it yet. "
                      + "If the user already has one, send nothing. "

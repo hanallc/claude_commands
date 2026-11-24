@@ -132,14 +132,6 @@ ENTRIES = (
             "recommendation_reason": "The small fix removes the stall without resuming the rest of the held cable work."}),),
         purpose="A decision with structured choices and a recommendation.", session=SessionTemplate("{session}"),
         agent_written=True, expand_values=decision_values),
-    PushText("review_watch.acknowledge", "{session}", "decision", "Review report needs your acknowledgment",
-        ActionTemplate("In the {session} terminal on {machine}, acknowledge the review report."),
-        "Situation: {report}\n\nChoices:\n"
-        + "Acknowledge: You confirm that you read the report. Later build reports stop showing this reminder.\n"
-        + "Wait: The reminder remains in later build reports.\n\n"
-        + "Recommendation: Acknowledge after you read the report.",
-        (PushExample("report", {"session": "natedev", "machine": "natedev", "report": "12 of 12 phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment"}),),
-        purpose="A build report reminds you to acknowledge its review report.", session=SessionTemplate("{session}"), agent_written=True),
     PushText("mac_idle.unreachable", "Mac idle watch", "blocked", "Mac does not answer; {tests}",
         ActionTemplate("Wake the Mac or check its network."),
         "",

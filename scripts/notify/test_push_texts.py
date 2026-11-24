@@ -182,7 +182,7 @@ class PushTextTests(unittest.TestCase):
                 with self.subTest(id=entry.id, example=example.name):
                     push = push_texts.render_entry(entry, example.values)
                     text = push.message
-                    if entry.id in ("decision.choices", "review_watch.acknowledge"):
+                    if entry.id == "decision.choices":
                         self.assertLess(len(text), 1024)
                     else:
                         self.assertLess(len(text), 500)
@@ -255,14 +255,6 @@ class PushTextTests(unittest.TestCase):
                 else:
                     with self.subTest(field=field, separator=separator), self.assertRaises(ValueError):
                         _ = push_texts.render_entry(entry, entry.examples[0].values | {field: entry.examples[0].values[field] + separator})
-
-    def test_review_watch_uses_the_approved_choices_and_live_review(self) -> None:
-        push = push_texts.render("review_watch.acknowledge", session="builds", machine="Mac", report="Read the report.")
-        self.assertEqual(push.title, "Review report needs your acknowledgment")
-        self.assertEqual(push.action, ActionRequired("In the builds terminal on Mac, acknowledge the review report."))
-        self.assertEqual(push.body, "Situation: Read the report.\n\nChoices:\nAcknowledge: You confirm that you read the report. Later build reports stop showing this reminder.\nWait: The reminder remains in later build reports.\n\nRecommendation: Acknowledge after you read the report.")
-        self.assertTrue(push_texts.agent_written(push.id))
-        self.assertTrue(push_texts.approval_date(push.id))
 
     def test_ups_maintenance_alerts_keep_the_approved_text_and_nonurgent_action(self) -> None:
         cases = (
@@ -384,7 +376,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, agent_written=True)))
 
     def test_agent_written_entries_and_nate_approval_are_current(self) -> None:
-        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["decision.choices", "review_watch.acknowledge", "alert.blocked", "alert.decision", "nate.adhoc"])
+        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["decision.choices", "alert.blocked", "alert.decision", "nate.adhoc"])
         self.assertFalse(push_texts.agent_written("unknown"))
         self.assertRegex(push_texts.approval_date("nate.adhoc"), r"^\d{4}-\d{2}-\d{2}$")
 

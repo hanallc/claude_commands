@@ -25,7 +25,6 @@ from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
-from scripts.production import review_regime
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
@@ -255,8 +254,16 @@ class PushoverTests(unittest.TestCase):
             read.assert_not_called()
 
     def test_kept_questions_drop_closed_and_reopened_but_post_open_or_unreadable_records(self) -> None:
-        for status in ("closed", "reopened", "open", "missing", "unreadable"):
-            with self.subTest(status=status):
+        cases = (
+            ("closed", False),
+            ("closed", True),
+            ("reopened", False),
+            ("open", False),
+            ("missing", False),
+            ("unreadable", False),
+        )
+        for status, keep_notice in cases:
+            with self.subTest(status=status, keep_notice=keep_notice):
                 path = self.keys.parent / "question-release.md"
                 since = "2026-11-03T12:01" if status == "reopened" else "2026-11-03T12:00"
                 _ = path.write_text("---\nrecord_type: question\nstatus: " + ("closed" if status == "closed" else "open")
@@ -273,13 +280,24 @@ class PushoverTests(unittest.TestCase):
                     posted.append(data)
                     return 200, b'{"status":1}'
                 self.silence_on()
+                if keep_notice:
+                    notice: silence.KeptPush = {
+                        "source": "hana", "priority": "0", "title": "Build done", "message": "The build passed.",
+                        "detail": "", "key": "build-done", "text_id": "",
+                    }
+                    self.assertIsInstance(silence.keep_here(notice), silence.Kept)
                 self.assertIsInstance(silence.keep_here(push), silence.Kept)
                 with redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
                 self.assertEqual(silence.read_kept(), [])
                 if status in ("closed", "reopened"):
-                    self.assertEqual(posted, [])
-                    self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
+                    if keep_notice:
+                        titles = [urllib.parse.parse_qs(data.decode())["title"][0] for data in posted]
+                        self.assertEqual(titles, ["Build done"])
+                        self.assertEqual(output.getvalue().splitlines()[-1], "silence off; 1 kept push delivered; 1 dropped")
+                    else:
+                        self.assertEqual(posted, [])
+                        self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
                     row = self.log_lines()[-1]
                     self.assertEqual((row["outcome"], row["key"], row["template"], row["reference"]),
                                      ("dropped: question " + status, "question-key", "decision.choices", reference))
@@ -333,30 +351,6 @@ class PushoverTests(unittest.TestCase):
                 read.assert_not_called()
                 keys.assert_not_called()
 
-    def test_kept_review_watch_uses_acknowledged_and_release_counts_drops_separately(self) -> None:
-        for acknowledged in (None, "2026-11-03T13:00:00-05:00"):
-            with self.subTest(acknowledged=acknowledged):
-                self.silence_on()
-                watch: silence.KeptPush = {"source": "review-watch", "priority": "0", "title": "Review report",
-                    "message": "Report details", "detail": "", "key": "watch", "text_id": "review_watch.acknowledge",
-                    "reference": {"kind": "review_watch"}}
-                legacy: silence.KeptPush = {**watch, "key": "legacy", "reference": {"kind": "none"}}
-                for push in (watch, legacy):
-                    self.assertIsInstance(silence.keep_here(push), silence.Kept)
-                posted: list[bytes] = []
-                def post(_url: str, data: bytes) -> tuple[int, bytes]:
-                    posted.append(data)
-                    return 200, b'{"status":1}'
-                with (mock.patch.object(review_regime, "acknowledged", return_value=acknowledged) as read,
-                      redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
-                read.assert_called_once()
-                self.assertEqual(len(posted), 1 if acknowledged else 2)
-                self.assertIn("1 kept push delivered; 1 dropped" if acknowledged else "2 kept pushes delivered", output.getvalue())
-                self.assertEqual(silence.read_kept(), [])
-                if acknowledged:
-                    self.assertEqual(self.log_lines()[-2]["outcome"], "dropped: report acknowledged")
-
     def test_reference_survives_admission_review_and_silence_without_an_immediate_release_check(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         path = self.keys.parent / "question-admission.md"
@@ -397,21 +391,18 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
         self.assertEqual(posted, [footed(push["message"], "legacy-owner", "none (free text)")])
 
-    def test_decision_templates_review_agent_values_at_each_send(self) -> None:
-        for text_id in ("decision.choices", "review_watch.acknowledge"):
-            entry = next(entry for entry in push_texts.catalog() if entry.id == text_id)
-            argv = ["--text-id", text_id, *(item for key, value in entry.examples[0].values.items()
-                     for item in ("--value", f"{key}={value}"))]
-            if text_id == "decision.choices":
-                path = self.keys.parent / "question-example.md"
-                _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"2026-11-03T12:00"}\n---\n')
-                argv += ["--question", str(path)]
-            with (self.subTest(text_id=text_id), mock.patch.object(review, "review", side_effect=approve) as read,
-                  redirect_stdout(io.StringIO())):
-                code, form = self.run_send(argv)
-            self.assertEqual(code, 0)
-            read.assert_called_once()
-            self.assertIn(f"Template: {text_id}", form["message"][0])
+    def test_decision_template_reviews_agent_values_at_each_send(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
+        path = self.keys.parent / "question-example.md"
+        _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"2026-11-03T12:00"}\n---\n')
+        argv = ["--text-id", entry.id, "--question", str(path),
+                *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))]
+        with (mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO())):
+            code, form = self.run_send(argv)
+        self.assertEqual(code, 0)
+        read.assert_called_once()
+        self.assertIn(f"Template: {entry.id}", form["message"][0])
 
     def test_catalog_session_reaches_the_post_and_review_record(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",

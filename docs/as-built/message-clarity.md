@@ -360,7 +360,14 @@ New escalate holds retain their registered template and values.
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`.
+    The `purpose` field says when the script sends the push. It has one line of at most 72 characters.
+    The fingerprint excludes `purpose`. An edit to `purpose` keeps the approval.
+    With `header=False`, the phone shows only the title and the body.
+    `catalog()` refuses `header=False` on an entry with an action or a session.
+    `nate.adhoc` uses `header=False`. The fingerprint includes `header` only when it is False.
+    `nate.adhoc`, `alert.blocked`, `alert.decision`, and `decision.choices` have `agent_written=True`.
+    The fingerprint excludes `agent_written`. `agent_written(text_id: str) -> bool` returns False for unknown IDs.
   - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
@@ -670,7 +677,8 @@ At release, a closed question drops its push.
 An open question with a different `since` also drops its push.
 A same-minute reopening keeps `since`, so release sends the push because the question is open again.
 A missing or unreadable question record permits delivery and adds an anomaly to `pushover.jsonl`.
-A kept `review_watch.acknowledge` push drops when `review_regime.acknowledged()` reports acknowledgment.
 Legacy kept pushes without a reference still release.
 The release output counts delivered pushes and dropped pushes separately.
 Immediate delivery does not apply these release checks.
+
+The 2026-11-24 change removed the review watch and its push.
