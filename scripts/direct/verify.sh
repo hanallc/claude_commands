@@ -2318,7 +2318,7 @@ cancel_tree_run() {
     local changed_path=""
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
-    note_event cancelled "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
+    note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
     exit "$TREE_CHANGED_STATUS"
 }
 
@@ -2447,7 +2447,7 @@ doc_record() {
     doc_staged_helper record "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID"
 }
 
-# note_event OUTCOME WALL BUILD SAVED STATUS: this call's one record in
+# note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
 # the build log (see the header), the first time it is called. OUTCOME is ran,
 # failed, interrupted, cancelled, reused or replayed; an empty STATUS or BUILD is unknown.
 # record.py adds the repo, worktree, branch and commit. A record that cannot be
@@ -2458,7 +2458,7 @@ note_event() {
     CALL_NOTED=1
     collect_hold_wait
     [[ -f "${BUILDLOG_RECORD:-}" ]] || return 0
-    local outcome=$1 wall=$2 build=$3 saved=$4 status=$5 cached=0
+    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0
     if [[ -n "${CACHE_DIR}" ]]; then
         cached=1
     fi
@@ -2476,7 +2476,7 @@ note_event() {
         BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
-        verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" 0 "$wall" \
+        verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${VERIFY_PACKAGE:+"$VERIFY_PACKAGE"} ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -2538,7 +2538,7 @@ forward_mac_runner_signal() {
         exec 9>&-
         rm -f "$MAC_LOG_FILE"
     fi
-    note_event interrupted 0 "" 0 "$exit_status"
+    note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
     exit "$exit_status"
 }
 
@@ -2771,7 +2771,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then return "$runner_status"; fi
-            note_event failed 0 "" 0 "$runner_status"
+            note_event failed "${SECONDS}" 0 "" 0 "$runner_status"
             exit "$runner_status"
             ;;
         passed)
@@ -2781,7 +2781,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
-                note_event failed 0 "" 0 2
+                note_event failed "$SECONDS" 0 "" 0 2
                 exit 2
             fi
             MAC_PASSED=1
@@ -2794,7 +2794,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$selected_is_mac" == 0 ]]; then
                 record_mac_pass "$MAC_LOG_FILE" "$result_seconds"
                 echo "verify.sh: PASS on $selected_target (Linux)."
-                note_event ran 0 "" 0 0
+                note_event ran "${SECONDS}" 0 "" 0 0
                 exit 0
             fi
             finish_mac_pass "$MAC_LOG_FILE" "$result_seconds"
@@ -2812,7 +2812,7 @@ finish_mac_pass() {
     fi
     record_mac_pass "$1" "$2"
     echo "verify.sh: PASS on the Mac (macOS), so nothing ran on natedev."
-    note_event ran 0 "" 0 0
+    note_event ran "${SECONDS}" 0 "" 0 0
     exit 0
 }
 
@@ -3061,7 +3061,7 @@ pinned_target_refuse() {
     local reason=$1
     [[ "$reason" != command ]] || reason="the target cannot run this command"
     printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$reason" >&2
-    note_event failed 0 "" 0 2
+    note_event failed "$SECONDS" 0 "" 0 2
     exit 2
 }
 
@@ -3091,7 +3091,7 @@ mac_only_refuse() {
     else
         printf 'verify.sh: %s --mac refused: %s; nothing ran on natedev.\n' "$CMD" "$text" >&2
     fi
-    note_event failed 0 "" 0 2
+    note_event failed "$SECONDS" 0 "" 0 2
     exit 2
 }
 
@@ -3609,7 +3609,7 @@ finish_copy_win() {
     RUN_LOG=""
     if [[ "$COPY_MAC" == failed ]]; then
         [[ -z "$log" ]] || rm -f "$log"
-        note_event failed 0 "" 0 "$COPY_RUNNER_STATUS"
+        note_event failed "${SECONDS}" 0 "" 0 "$COPY_RUNNER_STATUS"
         exit "$COPY_RUNNER_STATUS"
     fi
     if [[ -z "$log" ]]; then
@@ -3691,7 +3691,7 @@ cache_lookup() {
     fi
     LOOKUP_STATUS="${status_line#status=}"
     first_line="${record_text%%$'\n'*}"
-    note_event "${outcome}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
+    note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
     if [[ "${FILTER_RUN}" -eq 1 ]]; then
         echo "verify.sh: ${word} (recorded), skipped — ${first_line}; the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
         return 0
@@ -3828,7 +3828,7 @@ finish_run() {
         cancelled) outcome=cancelled ;;
         error) lint_failure_is_the_tree && kind=fail ;;
     esac
-    note_event "${outcome}" "${wall}" "${build:-0}" 0 "${code}"
+    note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0 "${code}"
     if [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; then
         rm -f "${RUN_LOG}"
     fi
@@ -3876,7 +3876,7 @@ hold_interrupted() {
         collect_child "$HOLD_WAITER_PID" "$signal_name"
     fi
     interrupt_hold_wait
-    note_event interrupted 0 "" 0 "$code"
+    note_event interrupted "$SECONDS" 0 "" 0 "$code"
     exit "$code"
 }
 trap 'hold_interrupted INT 130' INT
@@ -4097,7 +4097,7 @@ token_wait_superseded() {
     trap - INT TERM HUP
     TOKEN_WAIT_S=$TOKEN_WAITED
     printf 'verify.sh: superseded by a newer %s call; this call ran nothing. Read the newer call'"'"'s result: nothing failed and nothing needs a repair.\n' "$CMD"
-    note_event superseded 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
+    note_event superseded "$SECONDS" 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
     exit "$VERIFY_SUPERSEDED_STATUS"
 }
 # A release stays visible to every shell until an acquisition succeeds.
@@ -4653,7 +4653,7 @@ verify_cleanup() {
         cancelled) outcome=cancelled ;;
         interrupted) outcome=interrupted ;;
     esac
-    note_event "${outcome}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
     apply_placement_outcome
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"

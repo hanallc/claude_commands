@@ -641,11 +641,12 @@ Both list forms keep the queue place during checkout, including for `doc`.
 The `doc` step acquires its own checkout and uses ordinary memory admission.
 It takes no memory handoff or repository slot.
 A busy Mac leaves a mend step at its existing queue rank for the next placement.
-The `wait_s` field counts time waiting for admission, routing, holds, and the Cargo token.
+The Cargo token report uses the existing `wait_s` field to locate the end of the token wait.
+The `admission_wait_s` field totals the waits for memory, routing, holds, and the Cargo token.
 The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
 Verify adds the measured wait from each completed placement call.
 A canceled episode stops accruing wait before formatting starts.
-If a placement call stops before it reports a measurement, Verify records null for the step and call totals.
+If a placement call stops before it reports a measurement, Verify records null for the step and admission totals.
 A standalone step with its own checkout slot also uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 

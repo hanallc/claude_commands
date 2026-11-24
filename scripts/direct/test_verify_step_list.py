@@ -203,7 +203,7 @@ else:
         rows = cast(list[dict[str, object]], self.fixture.call_records())
         run = next(iter(observed.values())).run
         assert isinstance(run, wire.RunIdentity)
-        self.assertEqual([(row["verb"], row["wait_s"], row["run_id"]) for row in rows],
+        self.assertEqual([(row["verb"], row["admission_wait_s"], row["run_id"]) for row in rows],
                          [("lint", 4920, f"{run.pid}:{run.start_time}"), ("test", 1290, f"{run.pid}:{run.start_time}"),
                           ("doc", 420, f"{run.pid}:{run.start_time}")])
         lint_waits = cast(dict[str, int], rows[0]["step_wait_s"])
@@ -242,7 +242,7 @@ else:
         row, = cast(list[dict[str, object]], self.fixture.call_records())
         self.assertEqual(row["outcome"], "interrupted")
         self.assertEqual(row["step_wait_s"], {"check": None})
-        self.assertIsNone(row["wait_s"])
+        self.assertIsNone(row["admission_wait_s"])
         self.assertTrue(all(event["args"][:1] == ["metadata"] for event in self.fixture.cargo_events()))
         self.assert_removed()
 

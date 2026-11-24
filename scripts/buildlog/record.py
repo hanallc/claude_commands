@@ -1298,7 +1298,7 @@ def call_waits(directory: Path, verb: str, token_wait: int) -> dict[str, object]
         token_total += token
     if not step_waits:
         step_waits[verb] = 0
-    return {"wait_s": None if None in step_waits.values() else int(wait_total),
+    return {"admission_wait_s": None if None in step_waits.values() else int(wait_total),
             "hold_wait_s": hold_total, "token_wait_s": token_total, "step_wait_s": step_waits}
 
 
