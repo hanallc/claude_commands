@@ -2562,7 +2562,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
             dispatch = progress_history.begin_dispatch(previous, slot=child.name, phase="46", role="impl",
                 worker_name=child.name, worker_id=child.id, launcher_command=["assign.sh"], prompt=prompt, kind="impl", lens="")
             self.assertEqual(shutdown.main(["restart"]), 0)
-        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)))
+        receipt.assert_called_once_with(child, progress_history.ActiveDispatch(dispatch, ("assign.sh",)), run=previous)
         send.assert_called_once_with(director.pane_id, resume_message.launcher_prompt(child.id, dispatch, ("assign.sh",)),
                                      target=str(owner.current_session))
         self.assertIn("1 of 1 sessions back", output.getvalue())
