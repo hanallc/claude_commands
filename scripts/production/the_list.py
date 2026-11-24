@@ -1875,7 +1875,7 @@ def _own_page_entry(entry: ItemChange) -> bool:
                                             or _is_feedback(entry) or is_page_request_receipt(entry))
 
 
-def _unread_changes(item: ListItem) -> Generator[ItemChange]:
+def _unread_changes(item: ListItem, *, include_park_receipts: bool = False) -> Generator[ItemChange]:
     """Give unread changes in reverse order. Exclude page feedback and its Tell state change.
 
     A read or a close ends the walk. A reopen is the last change that the walk gives.
@@ -1888,16 +1888,26 @@ def _unread_changes(item: ListItem) -> Generator[ItemChange]:
         if (isinstance(content, MarkedRead) or content == "Marked read"
                 or isinstance(content, FieldChange) and content.action == "Closed"):
             return
-        if not (_own_page_entry(change) or _is_tell_move(item.log, index)):
+        park_receipt = include_park_receipts and isinstance(content, PageRequest) and content.action == "park"
+        if park_receipt or not (_own_page_entry(change) or _is_tell_move(item.log, index)):
             yield change
         if isinstance(content, Reopened) or content == "Reopened":
             return
 
 
 def unread_answer_ids(item: ListItem) -> frozenset[str]:
-    """Find answers since the last action that cleared the item's unread state."""
-    return frozenset(change.what.question_id for change in _unread_changes(item)
-                     if isinstance(change.what, QuestionAnswered))
+    """Find unread answers after accounting for parking actions."""
+    read_times: list[datetime] = []
+    answers: set[str] = set()
+    for change in _unread_changes(item, include_park_receipts=True):
+        content = change.what
+        if isinstance(content, QuestionAnswered) and question_path.answer_is_unread(change.time, read_times):
+            answers.add(content.question_id)
+        elif (isinstance(content, FieldChange) and content.action == "Parked"
+              and content.fields.get("parked_until", NoTimestamp.UNSET) is not NoTimestamp.UNSET
+              or isinstance(content, PageRequest) and content.action == "park"):
+            read_times.append(change.time)
+    return frozenset(answers)
 
 
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,

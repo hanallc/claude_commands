@@ -108,10 +108,15 @@ def answer_log_id(question_id: str) -> str:
     return 'answer:' + question_id
 
 
-def has_unread_answer(answered_at: AnswerTime, log: tuple[ReviewLog, ...]) -> bool:
+def answer_is_unread(answered_at: AnswerTime, read_times: Iterable[datetime]) -> bool:
     """An answer is unread if no read action occurred at or after it."""
     return isinstance(answered_at, datetime) and not any(
-        event.time >= answered_at and event.words.startswith(('Marked read', 'Later until ')) for event in log)
+        read_at >= answered_at for read_at in read_times)
+
+
+def has_unread_answer(answered_at: AnswerTime, log: tuple[ReviewLog, ...]) -> bool:
+    return answer_is_unread(answered_at, (event.time for event in log
+                            if event.words.startswith(('Marked read', 'Later until '))))
 
 
 def queue(base: Queue, *, unread_answer: bool, later: bool, unread_delivery: bool = False,
