@@ -2584,10 +2584,11 @@ The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
 
-`job_start` walks up the parent processes of the front to the `Runner.Worker` ancestor.
+`ci_job_start.job_start` walks up the parent processes of a CI cargo call to the `Runner.Worker` ancestor.
 The runner starts one `Runner.Worker` process for each job, so its start in `/proc/<pid>/stat` is the job start.
 `process_stat.name_and_fields` reads each process name and stat fields.
 A parent cycle in `/proc` ends the walk without a job start.
+A parent that started after the process below it has a reused pid, so the walk ends without a job start.
 Each building call reads its job start once, in CLOCK_BOOTTIME seconds.
 When `GITHUB_ACTIONS=true` and no `Runner.Worker` ancestor is readable, the call prints one `::warning::` line on stderr.
 
@@ -2598,6 +2599,11 @@ The front converts the job start once to the queue clock with `queue_job_start`.
 It reads the queue clock and CLOCK_BOOTTIME at the same moment and subtracts the boot age of the job start from the queue clock.
 `ServiceEstimateRequest.job_start` carries `JobStart(started_at)` or `NoJobStart`.
 An older client sends no field, and the service reads it as `NoJobStart`.
+For a request with a runner and `NoJobStart`, the service first uses the job start saved with the place of the same episode.
+Without one, it reads the job start itself with `ci_job_start.read_queue_job_start` on the request pid and its start time.
+The read needs a readable `Runner.Worker` ancestor, and a request pid with another start time gives no job start.
+So a CI step that waited from an older front gets its job start when it reconnects after a service reload.
+A later failed read keeps the saved job start.
 The service copies a `JobStart` into the waiting row as `ci_job_start` and into the saved `WaiterPlace`.
 The service sets `order_since` to the earliest of the step arrival, the run place, and the job start.
 So each step of one CI job ranks at the job start, ahead of steps that arrived after the job started.
