@@ -27,12 +27,14 @@ import stat
 import subprocess
 import sys
 import tarfile
+from threading import Thread
 from time import monotonic, sleep, time
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
+from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
@@ -42,7 +44,7 @@ from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, Mod
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
-    from scripts.build_queue.placement import PlacementAssignment
+    from scripts.build_queue.placement import PlacementAssignment, ProviderClaimReference
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
@@ -178,10 +180,10 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
 
 
-def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> None:
-    """Consume the launch permission of the gate assignment before the guest run starts.
+def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> ProviderClaimReference:
+    """Consume the gate launch permission before the guest run starts.
 
-    The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
+    The gate process holds the permission until the gate ends.
     A refused consume, or a queue that does not answer, raises GuestTookNoRun: the guest starts nothing.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
@@ -202,6 +204,28 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: Plac
         raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
         raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
+    return permission.claim
+
+
+@dataclass(frozen=True)
+class GuestStartReporter:
+    """Report the start under the claim that consumed launch permission."""
+    assignment: PlacementAssignment
+    claim: ProviderClaimReference
+
+    def publish(self, payload: bytes) -> None:
+        from scripts.build_queue import admission_client, admission_protocol as wire
+
+        try:
+            fields = ledger.mapping(cast(object, json.loads(payload)))
+            folder, home = fields.get('folder'), fields.get('home')
+            if not isinstance(folder, str) or not isinstance(home, str):
+                raise ValueError('the guest start report lacks a folder or home')
+            execution = execution_identity.GuestExecution('mac-linux', self.assignment.attempt, folder, home)
+            _ = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(),
+                self.assignment, self.claim, execution_identity.ObservedExecution(execution)), wait_for_service=False)
+        except (ValueError, wire.AdmissionUnavailable) as error:
+            print(f'{TARGET}: cannot report guest start: {error}', file=sys.stderr)
 
 
 class GuestRunRequest(TypedDict):
@@ -321,6 +345,10 @@ def tree_mismatches(repo: Path, tree: str, files: Mapping[str, bytes]) -> list[s
 
 def run_start_line(attempt: str) -> str:
     return f'{RUN_START} {attempt}'
+
+
+def guest_start_line(attempt: str, folder: Path, home: Path) -> str:
+    return f'{run_start_line(attempt)} {json.dumps({"folder": str(folder), "home": str(home)})}'
 
 
 def run_locked_line(attempt: str) -> str:
@@ -996,12 +1024,44 @@ def guest_link() -> Generator[int]:
         os.close(link)
 
 
-def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
-                        link: int) -> subprocess.CompletedProcess[bytes]:
+def read_guest_diagnostics(stderr: BinaryIO, errors: bytearray, attempt: str, reporter: GuestStartReporter) -> None:
+    start = run_start_line(attempt).encode()
+    with stderr:
+        for line in stderr:
+            errors.extend(line)
+            if start and line.startswith(start + b' '):
+                payload = line[len(start) + 1:]
+                start = b''
+                try:
+                    Thread(target=reporter.publish, args=(payload,), daemon=True).start()
+                except RuntimeError:
+                    # Keep draining stderr if the publisher cannot start.
+                    pass
+            elif start and line == start + b'\n':
+                start = b''
+
+
+def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int, link: int, *,
+                        attempt: str, reporter: GuestStartReporter) -> subprocess.CompletedProcess[bytes]:
     with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,)) as stream:
+        stderr = stream.stderr
+        assert stderr is not None
+        diagnostics = bytearray()
+        deadline = monotonic() + timeout
         try:
-            output, errors = stream.communicate(bootstrap, timeout=timeout)
+            try:
+                reader = Thread(target=read_guest_diagnostics, args=(stderr, diagnostics, attempt, reporter), daemon=True)
+                reader.start()
+            except RuntimeError:
+                output, errors = stream.communicate(bootstrap, timeout=timeout)
+            else:
+                stream.stderr = None
+                output, _ = stream.communicate(bootstrap, timeout=timeout)
+                reader.join(max(0, deadline - monotonic()))
+                if reader.is_alive():
+                    raise subprocess.TimeoutExpired(command, timeout)
+                errors = bytes(diagnostics)
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
@@ -1025,7 +1085,7 @@ def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
-               prefix: str, bundle: FullBundle | DeltaBundle) -> GuestReply:
+               prefix: str, bundle: FullBundle | DeltaBundle, reporter: GuestStartReporter) -> GuestReply:
     bootstrap = runner_bootstrap(request)
     send = bundle_send(repo, source, bundle, prefix)
     armed: ArmedGuestAttempt | None = None
@@ -1050,7 +1110,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
                                                          count=True, link=link)
                             stream = stream_guest_bundle(repo, arguments, bootstrap,
-                                                         settings.transfer_timeout_seconds, link)
+                                                         settings.transfer_timeout_seconds, link,
+                                                         attempt=request['attempt'], reporter=reporter)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1136,10 +1197,11 @@ def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundl
     return DeltaBundle(guest.commit)
 
 
-def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
+def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
+                    reporter: GuestStartReporter) -> GuestReply:
     bundle = guest_bundle(repo, settings)
     with bundle_refs(repo, source, request['attempt']) as prefix:
-        return run_remote(repo, settings, source, request, prefix, bundle)
+        return run_remote(repo, settings, source, request, prefix, bundle, reporter)
 
 
 @dataclass
@@ -1364,18 +1426,20 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
+        reporter = None
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
-                consume_launch_permission(claim, assignment)
-                reply = transfer_source(repo, settings, source, request)
+                reporter = GuestStartReporter(assignment, consume_launch_permission(claim, assignment))
+                reply = transfer_source(repo, settings, source, request, reporter)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
+            assert reporter is not None
             request = request.copy()
             request['attempt'] = uuid4().hex
             with (mac_linux_reservation(repo, mode, gate_job),
                   bundle_refs(repo, source, request['attempt']) as prefix):
                 reply = run_remote(repo, settings, source, request, prefix,
-                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE))
+                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), reporter)
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
@@ -1719,6 +1783,7 @@ def run_guest(request_path: Path) -> int:
                 return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
+            environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
             reply = os.dup(1)
             try:
                 # The -c entry selects the numbered copy as the Python checkout.
@@ -1801,8 +1866,8 @@ def run_copy(request_path: Path, reply: int) -> None:
     # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
     machine = gate.WholeMachine()
     token = copies.COMMAND_LOCKS.set(descriptors)
-    # natedev reads this line: a failure before it lets natedev take the gate.
-    print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
+    home = Path(os.environ.pop('MAC_LINUX_GUEST_HOME'))
+    print(guest_start_line(request['attempt'], repo, home), file=sys.stderr, flush=True)
     try:
         with build_folders.inherit_build_lock(RUN_LOCK_FD):
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],

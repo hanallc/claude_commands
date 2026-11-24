@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from threading import Timer
+from threading import Event, Thread, Timer
 import time
 from types import CodeType
 from typing import cast, override
@@ -819,7 +819,14 @@ fi
         self.assert_guest_clean()
 
     def test_the_gate_holds_its_launch_permission_before_the_guest_starts(self) -> None:
-        result = self.route()
+        report_received = Event()
+
+        def receive_report(_request: wire.ExecutionReport, **_options: bool) -> None:
+            report_received.set()
+
+        with patch.object(admission_client, 'report_execution', side_effect=receive_report) as report_start:
+            result = self.route()
+            self.assertTrue(report_received.wait(2))
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         (request, trace, held), = self.consumed
@@ -833,7 +840,78 @@ fi
         self.assertTrue(request.claim.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
         self.assertTrue(held)
         self.assertEqual(trace, '')
+        report_start.assert_called_once()
+        reported = cast(wire.ExecutionReport, report_start.call_args.args[0])
+        self.assertEqual((reported.assignment, reported.claim), (self.placed, request.claim))
+        decoded = wire.parse_request(wire.encode_request(reported))
+        assert isinstance(decoded, wire.ExecutionReport)
+        self.assertEqual(decoded.evidence, execution_identity.ObservedExecution(execution_identity.GuestExecution(
+            mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/caller/1'), str(self.guest_home))))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def folder_reporter(self) -> mac_linux.GuestStartReporter:
+        attempt = self.placed.attempt
+        destination = self.placed.destination
+        claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                 'fixture-claim', self.placed.episode, attempt)
+        return mac_linux.GuestStartReporter(self.placed, claim)
+
+    def check_folder_report_stream(self, reporter: mac_linux.GuestStartReporter) -> None:
+        attempt = self.placed.attempt
+        marker = mac_linux.guest_start_line(attempt, self.repo, self.guest_home)
+        command = [sys.executable, '-c',
+                   "import sys; print(sys.argv[1], file=sys.stderr); sys.stderr.write('x' * 131072); print('result')",
+                   marker]
+        with mac_linux.guest_link() as link:
+            result = mac_linux.stream_guest_bundle(self.repo, command, b'', 2, link, attempt=attempt, reporter=reporter)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b'result\n')
+        self.assertEqual(result.stderr, marker.encode() + b'\n' + b'x' * 131072)
+
+    def test_a_blocked_folder_report_does_not_discard_the_completed_command(self) -> None:
+        report_started = Event()
+        release_report = Event()
+        report_finished = Event()
+
+        def publish(_reporter: mac_linux.GuestStartReporter, _payload: bytes) -> None:
+            report_started.set()
+            _ = release_report.wait()
+            report_finished.set()
+
+        try:
+            with patch.object(mac_linux.GuestStartReporter, 'publish', publish):
+                self.check_folder_report_stream(self.folder_reporter())
+                self.assertTrue(report_started.wait(2))
+                self.assertFalse(report_finished.is_set())
+        finally:
+            release_report.set()
+            if report_started.is_set():
+                self.assertTrue(report_finished.wait(2))
+
+    def test_a_folder_publisher_start_failure_preserves_the_command_output(self) -> None:
+        reporter = self.folder_reporter()
+        self.check_folder_report_thread_failure(reporter, reporter.publish)
+
+    def test_a_diagnostics_reader_start_failure_preserves_the_command_output(self) -> None:
+        self.check_folder_report_thread_failure(self.folder_reporter(), mac_linux.read_guest_diagnostics)
+
+    def check_folder_report_thread_failure(self, reporter: mac_linux.GuestStartReporter,
+                                          failing_target: Callable[..., None]) -> None:
+        start_refused = Event()
+
+        class UnavailableThread(Thread):
+            @override
+            def start(self) -> None:
+                start_refused.set()
+                raise RuntimeError('fixture thread cannot start')
+
+        def new_thread(*, target: Callable[..., None], args: tuple[object, ...], daemon: bool) -> Thread:
+            thread = UnavailableThread if target == failing_target else Thread
+            return thread(target=target, args=args, daemon=daemon)
+
+        with patch.object(mac_linux, 'Thread', side_effect=new_thread):
+            self.check_folder_report_stream(reporter)
+        self.assertTrue(start_refused.is_set())
 
     def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
         refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),
@@ -1623,8 +1701,9 @@ fi
                 events.append('released')
 
         def fail_stream(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
-                        link: int) -> subprocess.CompletedProcess[bytes]:
-            stream = stream_guest_bundle(repo, command, bootstrap, timeout, link)
+                        link: int, *, attempt: str,
+                        reporter: mac_linux.GuestStartReporter) -> subprocess.CompletedProcess[bytes]:
+            stream = stream_guest_bundle(repo, command, bootstrap, timeout, link, attempt=attempt, reporter=reporter)
             self.assertEqual(stream.returncode, 255)
             events.append('SSH failed')
             raise mac_linux.GuestUnavailable('fixture SSH failed')
