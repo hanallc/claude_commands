@@ -1024,6 +1024,8 @@ class MemoryHoverTests(unittest.TestCase):
           const tip = {
             classList: {add() {}, remove() {}, toggle() {}}, style: {setProperty() {}}, offsetWidth: 368,
             get offsetHeight() { return this.innerHTML.includes('not started') ? 180 : 614; },
+            querySelector() { return null; },
+            getBoundingClientRect() { return {width: this.offsetWidth, height: this.offsetHeight}; },
           };
           const bounds = () => {
             const top = parseFloat(tip.style.top);
