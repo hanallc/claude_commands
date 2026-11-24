@@ -220,6 +220,14 @@ def requested_model(word: str, effort: str, configuration: RegistryEditBase) -> 
     return _resolve_settings(configuration, resolver, [word, effort], word)
 
 
+def check_agent_value(registry: Path, context: str, family: Literal["claude", "codex"], value: str) -> None:
+    """Check an agent value against the given catalog with the launch validator."""
+    configuration = RegistryEditBase(*_snapshot({}, "", registry))
+    resolver = ('AGENT_FAMILY="$3"; _agents_validate_pair "$2" "$3" "$4" && '
+                'AGENT_SERVICE_TIER=""')
+    _ = _resolve_settings(configuration, resolver, [context, family, value], context)
+
+
 def _resolve_settings(configuration: LaunchModelConfiguration | RegistryEditBase, resolver: str,
                       arguments: list[str], context: str) -> LaunchSettings:
     result = subprocess.run(

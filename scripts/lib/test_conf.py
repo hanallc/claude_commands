@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import redirect_stderr
+from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum, auto
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +21,92 @@ from unittest import mock
 from scripts.lib import conf, conf_reads
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class AgentLimitCatalog(Enum):
+    STANDARD_FIXTURE = auto()
+    CLAUDE_ALIAS_COLLISION = auto()
+    REPOSITORY = auto()
+
+
+@dataclass(frozen=True)
+class AgentLimitCase:
+    family: str
+    value: str
+    refusal: str = ""
+    catalog: AgentLimitCatalog = AgentLimitCatalog.STANDARD_FIXTURE
+    comment_prefix: str = ""
+
+    def write_config(self, directory: Path) -> None:
+        catalog = directory / "models.conf"
+        if self.catalog is AgentLimitCatalog.REPOSITORY:
+            catalog.unlink(missing_ok=True)
+        elif self.catalog is AgentLimitCatalog.CLAUDE_ALIAS_COLLISION:
+            _ = catalog.write_text(CLAUDE_ALIAS_COLLISION_CATALOG, encoding="utf-8")
+        else:
+            _ = catalog.write_text(AGENT_LIMIT_CATALOG, encoding="utf-8")
+        _ = (directory / "example.conf").write_text(
+            f"{self.comment_prefix}# agent: {self.family}\nprofile={self.value}\n", encoding="utf-8",
+        )
+
+
+AGENT_LIMIT_CATALOG = """\
+[claude.agents]
+claude-fixture=low,high
+claude-fixture-alias=low,high
+
+[claude.families]
+claude-fixture-alias=claude-fixture
+
+[codex.agents]
+gpt-fixture=high
+gpt-fixture-low=low
+gpt-6.1-codex-fixture-alias=high
+
+[codex.families]
+codex-fixture-alias=gpt-fixture
+"""
+
+CLAUDE_ALIAS_COLLISION_CATALOG = """\
+[claude.agents]
+opus=high
+claude-opus-custom=low
+
+[claude.families]
+opus=claude-opus-custom
+"""
+
+
+def write_agent_limit_codex_cache(directory: Path) -> Path:
+    cache = directory / "codex-models.json"
+    _ = cache.write_text('{"models":[{"slug":"gpt-6.1-codex-fixture-alias","visibility":"list"}]}\n',
+                         encoding="utf-8")
+    return cache
+
+
+AGENT_LIMIT_CASES = (
+    AgentLimitCase("claude", "claude-fixture-alias"),
+    AgentLimitCase("codex", "gpt-fixture"),
+    AgentLimitCase("codex", "codex-fixture-alias:high"),
+    AgentLimitCase("claude", "claude-fixture:low"),
+    AgentLimitCase("claude", "missing-fixture",
+                   "ERROR: [example.profile] agent 'missing-fixture' is not allowed for family 'claude'."),
+    AgentLimitCase("codex", "codex-fixture-alias:low",
+                   "ERROR: [example.profile] effort 'low' is not allowed for agent 'gpt-6.1-codex-fixture-alias'."),
+    AgentLimitCase("claude", "claude-fixture:", "ERROR: [example.profile] effort must not be empty after ':'."),
+    AgentLimitCase("codex", "gpt-fixture:high:low",
+                   "ERROR: [example.profile] effort 'high:low' is not allowed for agent 'gpt-fixture'."),
+    AgentLimitCase("claude", "gpt-fixture",
+                   "ERROR: [example.profile] agent 'gpt-fixture' is not allowed for family 'claude'."),
+    AgentLimitCase("codex", "claude-fixture-alias",
+                   "ERROR: [example.profile] agent 'claude-fixture-alias' is not allowed for family 'codex'."),
+    AgentLimitCase("claude", "opus:high", "ERROR: [example.profile] agent 'opus' is not allowed for family 'claude'."),
+    AgentLimitCase("claude", "opus:high", catalog=AgentLimitCatalog.REPOSITORY),
+    AgentLimitCase("claude", "opus:high", catalog=AgentLimitCatalog.CLAUDE_ALIAS_COLLISION),
+    AgentLimitCase("claude", "opus:low", "ERROR: [example.profile] effort 'low' is not allowed for agent 'opus'.",
+                   catalog=AgentLimitCatalog.CLAUDE_ALIAS_COLLISION),
+    AgentLimitCase("claude", "missing-fixture", comment_prefix="\u00a0"),
+)
 
 
 class ConfTests(unittest.TestCase):
@@ -456,6 +545,22 @@ conf_reads.record('disabled')
             conf.check("example", "size", "huge")
         self.assertIn("size", str(caught.exception))
         self.assertIn(str(self.path), str(caught.exception))
+
+    def test_agent_limits_use_the_selected_catalog_and_report_the_bad_part(self) -> None:
+        cache = write_agent_limit_codex_cache(self.root)
+        self.enterContext(mock.patch.dict(os.environ, {"CODEX_MODELS_CACHE_FILE": str(cache)}))
+        for case in AGENT_LIMIT_CASES:
+            with self.subTest(case=case):
+                case.write_config(self.directory)
+                if case.refusal:
+                    expected = re.escape(case.refusal)
+                    with redirect_stderr(io.StringIO()), self.assertRaisesRegex(conf.Unusable, expected):
+                        _ = conf.read("example").text("profile")
+                    with self.assertRaisesRegex(conf.Unusable, expected):
+                        conf.check("example", "profile", case.value)
+                else:
+                    self.assertEqual(conf.read("example").text("profile"), case.value)
+                    conf.check("example", "profile", case.value)
 
     def test_bad_types_and_out_of_range_values_warn_once_and_refuse_without_history(self) -> None:
         readers: tuple[tuple[Callable[[conf.ConfigRead, str], object], str], ...] = (
