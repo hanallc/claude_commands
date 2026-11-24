@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import final, override
 from unittest.mock import patch
 
+from scripts.lib import conf
 from scripts.whoami import agent_accounts, usage_store
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -79,6 +81,9 @@ class NamedKeychainCredentialsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = self.home / ".claude/config"
+        config.mkdir(parents=True)
+        _ = shutil.copyfile(conf.test_config_path("accounts"), config / "accounts.conf")
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True))
         _ = self.enterContext(patch.object(sys, "platform", "darwin"))
         self.keychain = ServiceKeychain()

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import socket
 import subprocess
 import unittest
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import codex_daemon
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -27,6 +29,10 @@ class CodexDaemonTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
+        config = self.root / ".claude/config"
+        config.mkdir(parents=True)
+        for name in ("codex_daemon", "build_folders"):
+            _ = shutil.copyfile(conf.test_config_path(name), config / f"{name}.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
 
     def test_queue_default_uses_the_current_configured_timeout(self) -> None:

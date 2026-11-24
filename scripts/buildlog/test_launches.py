@@ -16,7 +16,7 @@ from typing import cast, override
 
 from scripts.buildlog import launches
 from scripts.buildlog.test_index import Record, point_root_at
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 ENDED = "2026-10-02T16:40:18+00:00"
@@ -101,6 +101,7 @@ class LaunchTests(unittest.TestCase):
             **os.environ,
             "BUILDLOG_DIR": str(self.root),
             "BUILDLOG_TRANSCRIPTS": str(transcripts),
+            "AWS_TARGET_CONFIG": str(conf.test_config_path("aws_target")),
         }
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:

@@ -278,7 +278,7 @@ conf_reads.record('disabled')
                 if recovery:
                     self.history()
                     self.commit("host=mac\n")
-                    self.path.unlink()
+                _ = self.path.write_bytes(b"\xff")
                 with redirect_stderr(io.StringIO()) as stderr, conf.diagnostics(report=False) as warnings:
                     if recovery:
                         self.assertEqual(conf.read("example").values(), {"host": "mac"})
@@ -829,8 +829,8 @@ def twin_faults(config: Path, twin: Callable[[str], Path]) -> list[str]:
         name = owned.name
         if not owned.is_file():
             faults.append(f"{name}: no twin: add the file to test_config/{name}")
-            continue
-        expected, actual = keys(source), keys(owned)
+        expected = keys(source)
+        actual = keys(owned) if owned.is_file() else {}
         for key in sorted(expected.keys() | actual.keys()):
             if key not in actual:
                 faults.append(f"{name}: {key}: add the key to test_config/{name}")
@@ -838,8 +838,12 @@ def twin_faults(config: Path, twin: Callable[[str], Path]) -> list[str]:
                 faults.append(f"{name}: {key}: remove the key from test_config/{name}")
             elif expected[key] != actual[key]:
                 faults.append(f"{name}: {key}: copy the limit comment to test_config/{name}")
-    faults.extend(f"{path.name}: no config/ file: remove test_config/{path.name}"
-                  for path in sorted(twin("").parent.glob("*.conf")) if path.stem not in stems)
+    for path in sorted(twin("").parent.glob("*.conf")):
+        if path.stem in stems:
+            continue
+        faults.append(f"{path.name}: no config/ file: remove test_config/{path.name}")
+        faults.extend(f"{path.name}: {key}: remove the key from test_config/{path.name}"
+                      for key in sorted(keys(path)))
     return faults
 
 
@@ -859,7 +863,9 @@ class TestOwnedConfigTests(unittest.TestCase):
             ("host key", "a=1\n# whole: 1 to 9\nb=2\nb.natedev=3\n",
              ["case.conf: b.natedev: remove the key from test_config/case.conf"]),
             ("limit", "a=1\n# whole: 1 to 8\nb=2\n", ["case.conf: b: copy the limit comment to test_config/case.conf"]),
-            ("no twin", None, ["case.conf: no twin: add the file to test_config/case.conf"]),
+            ("no twin", None, ["case.conf: no twin: add the file to test_config/case.conf",
+                               "case.conf: a: add the key to test_config/case.conf",
+                               "case.conf: b: add the key to test_config/case.conf"]),
         )
         _ = (config / "case.conf").write_text("a=0\n# whole: 1 to 9\nb=5\n", encoding="utf-8")
         for label, text, expected in rows:
@@ -870,8 +876,9 @@ class TestOwnedConfigTests(unittest.TestCase):
                     _ = twin.write_text(text, encoding="utf-8")
                 self.assertEqual(twin_faults(config, lambda stem: owned / f"{stem}.conf"), expected)
         _ = (owned / "extra.conf").write_text("a=1\n", encoding="utf-8")
-        self.assertIn("extra.conf: no config/ file: remove test_config/extra.conf",
-                      twin_faults(config, lambda stem: owned / f"{stem}.conf"))
+        faults = twin_faults(config, lambda stem: owned / f"{stem}.conf")
+        self.assertIn("extra.conf: no config/ file: remove test_config/extra.conf", faults)
+        self.assertIn("extra.conf: a: remove the key from test_config/extra.conf", faults)
 
     def test_fixture_helpers_take_values_from_the_test_owned_file(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

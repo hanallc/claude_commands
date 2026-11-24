@@ -36,7 +36,7 @@ from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine
                                                 ProgramPlace, Refused)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
+REGISTRY_TEXT = conf.test_config_path("models").read_text()
 SCRIPT = 'print("hand made ran")\n'
 YES = {"verdict": "yes", "reason": "The script only prints a line."}
 NO = {"verdict": "no", "reason": "The script removes a folder outside the checkout."}

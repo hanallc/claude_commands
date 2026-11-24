@@ -22,6 +22,7 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.whoami.note_file import note_name
 
 
@@ -99,6 +100,9 @@ class AgentNotesTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         _ = self.enterContext(scratch_accounts_config())
+        models = self.root / "models.conf"
+        _ = write_config_fixture(models)
+        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         self.job_config = self.root / "agent_notes.toml"
         _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\ncodex_interval_seconds = 1800\n")
         home_context = cast(object, self.enterContext(patch.dict(os.environ, {

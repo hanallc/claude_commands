@@ -65,7 +65,8 @@ class ClientTests(ConfiguredTestCase):
                          io.BytesIO((FIXTURES / "http_500.json").read_bytes()))
 
     def test_missing_key_explains_wrapper_without_making_a_request(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(client, "urlopen") as http:
+        with mock.patch.dict(os.environ), mock.patch.object(client, "urlopen") as http:
+            del os.environ["TYPESAFE_API_KEY"]
             with self.assertRaisesRegex(client.TypeSafeError,
                                         "^TYPESAFE_API_KEY not set: run under with-typesafe$"):
                 _ = self.call()

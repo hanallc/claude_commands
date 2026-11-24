@@ -16,7 +16,7 @@ from scripts.lint.memory_test_support import config_environment
 
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
 from scripts.buildlog.test_index import Record, call, encode, point_root_at, sample, step
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, test_hang_guard
 
 HERE = Path(__file__).parent
 CLI = HERE / "cli.py"
@@ -28,7 +28,9 @@ def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     fixture_root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(fixture_root)))
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "USER_ZONE": "America/Los_Angeles", "AWS_TARGET_CONFIG": str(conf.test_config_path("aws_target")),
+    }))
 
 
 class MemoryRecordTests(unittest.TestCase):

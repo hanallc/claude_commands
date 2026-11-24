@@ -1478,6 +1478,10 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 
     def test_color_save_validates_the_request_and_uses_this_checkouts_tune(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"CONF_DIR": temporary}):
+            _ = write_config_fixture(Path(temporary) / "machines.conf")
+            models = Path(temporary) / "models.conf"
+            _ = models.write_text("[codex.agents]\ngpt-6.2-sol=high\n")
+            self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
             _ = (Path(temporary) / "statusline.conf").write_text(
                 "account.claude1=brown\nrole.units=teal\nrole.worker=white\nlevel.ok=green\nmodel.claude-opus-5-5=#e08a5c\n")
             for key, value in (("account.unknown", "#af875f"), ("claude1", "#af875f"), ("role.units", "#af875f"),

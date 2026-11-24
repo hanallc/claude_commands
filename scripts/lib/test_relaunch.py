@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
@@ -110,6 +111,9 @@ class RelaunchTests(ShutdownTestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state = self.root / "state"
         (self.state / "relaunch").mkdir(parents=True)
+        config = self.root / ".claude/config"
+        config.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(config / "machines.conf")
 
     def start(self, child: str) -> subprocess.Popen[str]:
         process = subprocess.Popen(

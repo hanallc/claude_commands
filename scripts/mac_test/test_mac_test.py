@@ -802,7 +802,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                       self.assertRaises(conf.Unusable) as caught):
                     _ = mac_test.read_config()
                 self.assertIn(str(self.config_path), str(caught.exception))
-                self.assertIn("is missing", str(caught.exception))
+                message = "the file does not exist; add it with its keys" if missing_file else "is missing"
+                self.assertIn(message, str(caught.exception))
         empty = self.root / "no-history"
         empty.mkdir()
         with mock.patch.dict(os.environ, {"CONF_DIR": str(empty)}), redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):

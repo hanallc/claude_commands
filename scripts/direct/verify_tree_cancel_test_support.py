@@ -190,6 +190,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.control = self.root / "control"
         self.board = self.root / "board"
         self.admission = caller_admission(self, self.root, self.environment)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf")
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             if key.destination.provider == "local":

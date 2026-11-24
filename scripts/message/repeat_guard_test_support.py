@@ -74,8 +74,8 @@ def install_notice_test_config(home: Path) -> Path:
     """Give notice fixtures real settings without repository recovery."""
     config = home / ".claude/config"
     config.mkdir(parents=True, exist_ok=True)
-    source = conf.test_config_path("send")
-    _ = shutil.copyfile(source, config / "send.conf")
+    for name in ("send", "send_repeat_guard"):
+        _ = shutil.copyfile(conf.test_config_path(name), config / f"{name}.conf")
     return config
 
 

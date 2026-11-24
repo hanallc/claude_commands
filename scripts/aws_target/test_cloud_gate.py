@@ -4139,10 +4139,11 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             self.assertEqual(arguments, [sys.executable, '-m', module, *expected])
 
     def test_service_command_omits_conf_dir_without_caller_override(self) -> None:
-        configuration = cloud_gate.settings()
+        home_config = Path(os.environ['HOME']) / '.claude/config'
+        home_config.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(home_config / 'cloud_gate.conf')
         for paired in (False, True):
-            with (self.subTest(paired=paired), mock.patch.dict(os.environ),
-                  mock.patch.object(cloud_gate, 'settings', return_value=configuration)):
+            with self.subTest(paired=paired), mock.patch.dict(os.environ):
                 _ = os.environ.pop('CONF_DIR', None)
                 command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(self.root / 'trial')], 'fixture', paired=paired)
                 self.assertFalse(any(argument.startswith('--setenv=CONF_DIR=') for argument in command))

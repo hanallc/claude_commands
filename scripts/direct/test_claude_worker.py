@@ -146,7 +146,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         _, unit, _ = self.tree()
         identity = fixture_runtime_id("background-Claude-native")
         home = Path.home()
-        _ = copy_helpers(home)
+        _ = copy_helpers(home, "config")
         self.write_json(home / ".claude.json", {"oauthAccount": {"emailAddress": "fixture@example.invalid"}})
         work = self.root / "project"
         work.mkdir()
@@ -165,7 +165,11 @@ class NativeClaudeWorkerTests(StaffTestCase):
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         models = write_registry(self.root / "models.conf")
-        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
+        sync = self.root / "catalog-sync"
+        sync.touch()
+        self.enterContext(patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(models), "CODEX_CATALOG_SYNC_STATE_FILE": str(sync),
+        }))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
             "CONF_DIR": str(conf.copy_for_test(CHECKOUT / "config", self.root / "config")), "UNIT_WORKER_POLL_SECS": "0",
             "CLAUDE_BIN": str(backend), "CLAUDE_WORKER_SEND_SCRIPT": str(sender),

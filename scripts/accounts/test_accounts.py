@@ -329,7 +329,11 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
-        write_machine_config(Path(os.environ["CONF_DIR"]))
+        configuration = Path(os.environ["CONF_DIR"])
+        write_machine_config(configuration)
+        models = configuration / "models.conf"
+        _ = write_config_fixture(models)
+        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         counts_cache = session_counts_cache()
         counts_cache.parent.mkdir(parents=True, exist_ok=True)

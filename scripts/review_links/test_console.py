@@ -259,15 +259,19 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
 
     def test_repository_config_names_staff_for_every_console_page(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        path = conf.test_config_path("console")
         settings = conf.read(path).values()
         pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
         self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
         owners = {f"page.{page}.owner" for page in page_frame.OWNER_PAGES} | {"owner.default"}
         self.assertLessEqual(owners, set(settings))
+        for page in page_frame.OWNER_PAGES:
+            with self.subTest(page=page):
+                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
+        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
 
     def test_repository_config_puts_the_placement_disk_tab_last_with_the_torus_icon(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        path = conf.test_config_path("console")
         settings = conf.read(path).values()
         pages = [key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")]
         self.assertEqual(pages[-1], "placement_disk")

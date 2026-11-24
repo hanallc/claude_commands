@@ -828,6 +828,8 @@ def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log
 @contextmanager
 def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
     """Keep the test config, run roots and child processes under one private folder."""
+    from scripts.lib import conf
+
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "CONF_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
 
@@ -842,11 +844,9 @@ def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
         root = cleanup.enter_context(runner_folder(owner, "test-run-roots"))
         if isinstance(owner, GateModuleLease):
             _ = cleanup.enter_context(runner_folder(owner, "config-reads"))
-        os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-        if not os.environ.get("CONF_DIR"):
-            from scripts.lib import conf
-
-            os.environ["CONF_DIR"] = str(conf.copy_for_test(CHECKOUT / "config", root / "config"))
+        config = conf.copy_for_test(CHECKOUT / "config", root / "config")
+        os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"),
+                          CONF_DIR=str(config))
         yield root
 
 

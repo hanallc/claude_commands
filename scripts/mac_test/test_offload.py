@@ -27,7 +27,7 @@ from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
 from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment,
                                               write_config_fixture,
-                                              write_config_fault, commit_config_fixture)
+                                              commit_config_fixture)
 
 from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
 from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
@@ -778,7 +778,7 @@ class OffloadSettingsTests(unittest.TestCase):
     @mock.patch("subprocess.Popen", new=START_SUBPROCESS)
     def test_path_reader_recovers_invalid_numbers_from_its_history(self) -> None:
         commit_config_fixture(self.settings)
-        _ = write_config_fault(self.settings,
+        _ = write_config_fixture(self.settings,
             "connect_timeout_s=bad\nprobe_timeout_s=0\nunreachable_backoff_s=-1\nfree_floor_gib=nan\n")
         warning = io.StringIO()
         with redirect_stderr(warning):

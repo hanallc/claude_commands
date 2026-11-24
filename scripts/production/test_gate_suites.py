@@ -1060,8 +1060,8 @@ patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requeste
         marker = self.state / "checkout-runner"
         self.write(runner, runner.read_text().replace(
             'if __name__ == "__main__":',
-            f'Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))\n\n'
-            + 'if __name__ == "__main__":'))
+            'if __name__ == "__main__":\n'
+            + f'    from pathlib import Path\n    Path({str(marker)!r}).write_text(str(Path(__file__).resolve()))'))
         self.write(self.checkout / "checkout_identity.py", 'VALUE = "tested checkout"\n')
         self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE + '''
     def test_imports_use_the_checkout(self):

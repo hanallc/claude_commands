@@ -197,9 +197,14 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
                 else:
                     _ = config.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={damage}\n")
                 result = self.read_config(config, self.python_reader)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "650\n")
-                self.assertEqual(len(result.stderr.splitlines()), 1)
+                if damage in ("missing file", "missing key"):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("build_oom_score_adj is missing", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "650\n")
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
                 self.assertIn(str(config), result.stderr)
                 self.assertIn("build_oom_score_adj", result.stderr)
                 # A fresh private folder has no revision to recover.

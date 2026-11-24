@@ -500,8 +500,11 @@ except AssertionError:
         def owned_path(stem: str) -> Path:
             return owned / f"{stem}.conf"
 
-        sources = {path: path.read_bytes() for path in (checkout / "console.conf", owned / "console.conf")}
         fixture = root / "fixture"
+        fixture.mkdir()
+        _ = (fixture / "console.conf").write_text("page.list.owner=inherited\n")
+        sources = {path: path.read_bytes()
+                   for path in (checkout / "console.conf", owned / "console.conf", fixture / "console.conf")}
         rows: tuple[tuple[str, dict[str, str]], ...] = (("no CONF_DIR", {}), ("set CONF_DIR", {"CONF_DIR": str(fixture)}))
         for index, (label, environment) in enumerate(rows):
             with self.subTest(label), patch.object(conf, "test_config_path", side_effect=owned_path), patch.dict(os.environ):
@@ -511,15 +514,14 @@ except AssertionError:
                 module.mkdir()
                 with module_run.private_run_roots(module_run.GateModuleLease(module)) as run_root:
                     folder = Path(os.environ["CONF_DIR"])
-                    if environment:
-                        self.assertEqual(folder, fixture)
-                        self.assertFalse((run_root / "config").exists())
-                    else:
-                        self.assertEqual(folder, run_root / "config")
-                        self.assertEqual((folder / "console.conf").read_text(), "page.list.owner=test-owned\n")
-                        self.assertEqual((folder / "gate.conf").read_bytes(), (checkout / "gate.conf").read_bytes())
-                        self.assertEqual(os.readlink(folder / "merge_gate.conf"), "gate.conf")
-                        _ = (folder / "console.conf").write_text("changed\n")
+                    self.assertEqual(folder, run_root / "config")
+                    self.assertEqual((folder / "console.conf").read_text(), "page.list.owner=test-owned\n")
+                    self.assertEqual((folder / "gate.conf").read_bytes(), (checkout / "gate.conf").read_bytes())
+                    self.assertEqual(os.readlink(folder / "merge_gate.conf"), "gate.conf")
+                    _ = (folder / "console.conf").write_text("changed\n")
+                if environment:
+                    self.assertEqual(Path(os.environ["CONF_DIR"]), fixture)
+                self.assertFalse((run_root / "config").exists())
                 self.assertEqual(os.environ.get("CONF_DIR"), environment.get("CONF_DIR"))
                 self.assertEqual(list(module.iterdir()), [])
         self.assertEqual({path: path.read_bytes() for path in sources}, sources)
@@ -933,11 +935,12 @@ class ModuleRunnerTests(unittest.TestCase):
             _ = (root / "fixture_root.py").write_text("VALUE = 42\n")
             config = root / "config"
             config.mkdir()
-            for stem in ("alpha", "beta", "gamma"):
-                _ = (config / (stem + ".conf")).write_text("value=one\n")
             repository = RUNNER.parents[2]
             source = f"""import os, subprocess, sys, unittest
+from pathlib import Path
 from scripts.lib import conf
+for stem in ("alpha", "beta", "gamma"):
+    (Path(os.environ["CONF_DIR"]) / (stem + ".conf")).write_text("value=one\\n")
 conf.read('alpha').text('value')
 class Reads(unittest.TestCase):
     def test_reads(self):

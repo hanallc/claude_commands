@@ -59,7 +59,7 @@ class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture, Clau
         account = cast(dict[str, str], json.loads((self.root / "launch_environment.json").read_text()))
         with isolated_staff_file(self.root / "staff.json", {
             "CLAUDE_CONFIG_DIR": account["CLAUDE_CONFIG_DIR"] or str(self.root / ".claude"),
-        }):
+        }), patch.dict(os.environ, {"HOME": str(self.root)}):
             self.assertIsInstance(staff.local_snapshot().backends[self.recorded_worker(run, "fix").id], staff.ClaudeBackend)
 
     def test_claude_fresh_refusal_preserves_artifacts_and_opens_no_pass_or_process(self) -> None:

@@ -155,7 +155,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         config = self.root / "table-conf"
         _ = cast(object, copy_config_fixture(Path(__file__).resolve().parents[2] / 'config', config))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config), "HOME": str(self.root)}))
         _ = self.enterContext(patch("socket.gethostname", return_value="natedev"))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         from scripts.message import process_table

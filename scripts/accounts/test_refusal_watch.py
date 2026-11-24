@@ -4221,11 +4221,14 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_whole_read_observer_keeps_the_actual_configuration_file(self) -> None:
         configured = conf.read("accounts")
-        other = conf.read(conf.path("accounts"))
+        other_path = self.home / "other-accounts.conf"
+        _ = shutil.copyfile(conf.path("accounts"), other_path)
+        other = conf.read(other_path)
         with observe_whole_reads() as read:
             self.assertEqual(configured.whole("usage_stale_minutes"), other.whole("usage_stale_minutes"))
         self.assertEqual(read.call_args_list, [call(conf.path("accounts"), "usage_stale_minutes"),
-                                             call(other.source, "usage_stale_minutes")])
+                                             call(other_path, "usage_stale_minutes")])
+        self.assertNotEqual(configured.source, other.source)
 
     def test_login_renewal_uses_one_accounts_read_for_the_interval_and_probe(self) -> None:
         self.expired_login()

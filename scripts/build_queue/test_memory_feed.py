@@ -2494,6 +2494,7 @@ const refresh = createPageRefresh(tick);
                 installed = self.root / "installed" / module
                 source = Path(memory_feed.__file__).resolve().parents[1]
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                _ = shutil.copytree(conf.test_config_path("console").parent, installed / "test_config")
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
                 _ = write_config_fixture(installed / 'config/console.conf')

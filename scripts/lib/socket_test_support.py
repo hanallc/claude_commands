@@ -20,7 +20,9 @@ _swept: set[Path] = set()
 
 def socket_parent() -> Path:
     """Return the parent; the first call in a process removes the free folders killed runs left."""
-    parent = Path(conf.read_or_repository("build_folders").text("roots.system")) / PARENT
+    file = "build_folders"
+    source = conf.path(file) if os.environ.get("CONF_DIR") else conf.test_config_path(file)
+    parent = Path(conf.read(source).text("roots.system")) / PARENT
     parent.mkdir(mode=0o700, exist_ok=True)
     if parent not in _swept:
         _swept.add(parent)

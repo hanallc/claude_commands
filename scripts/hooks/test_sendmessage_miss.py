@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from contextlib import contextmanager
 from collections.abc import Generator
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.production import staff
 from scripts.message.recipient_test_support import staff_child_command
@@ -36,6 +37,10 @@ class SendMessageMissTests(unittest.TestCase):
         self.members = {}
         self.root = Path(self.enterContext(short_socket_directory()))
         self.home = self.root / ".codex2"
+        config = self.root / ".claude/config"
+        config.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(config / "machines.conf")
+        _ = write_config_fixture(config / "codex_daemon.conf")
         write_codex_account(self.root / ".codex", self.root / "agents", "codex1")
         write_codex_account(self.home, self.root / "agents", "codex2")
         (self.home / "app-server-control").mkdir()

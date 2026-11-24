@@ -316,7 +316,8 @@ class BuildBudgetTests(unittest.TestCase):
         for key, reader, fallback in readers:
             with self.subTest(key=key):
                 write_memory_config(self.config, **{key: None})
-                self.assertEqual(reader(), fallback)
+                with self.assertRaisesRegex(conf.Unusable, f"{key} is missing"):
+                    _ = reader()
                 for raw in ("abc", "-5", "nan", "inf", "0"):
                     write_memory_config(self.config, **{key: raw})
                     self.assertEqual(reader(), fallback)
@@ -6749,6 +6750,10 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
             for raw in (None, "abc", "-5", "nan", "inf", "0"):
                 with self.subTest(key=key, raw=raw):
                     self.write_config(**{key: raw})
+                    if raw is None:
+                        with self.assertRaisesRegex(conf.Unusable, f"{key} is missing"):
+                            _ = admission_records.read_memory_config()
+                        continue
                     with contextlib.redirect_stderr(io.StringIO()) as errors:
                         config = admission_records.read_memory_config()
                     self.assertEqual(config, baseline)
