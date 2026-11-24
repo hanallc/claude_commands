@@ -356,6 +356,7 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
+.walk-table tr.held .duration { max-width: var(--duration); white-space: normal; }
 .walk-table .step { width: var(--step); min-width: var(--step); }
 .walk-table td.machine > * + * { margin-left: 10px; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .tokens { font-variant-numeric: tabular-nums; }
@@ -2125,7 +2126,8 @@ function fitWalkDetails() {
     const tight = name === "step" && walk.classList.contains("tight");
     const widths = [...table.querySelectorAll(`tr > .${name}`)].map(cell => {
       context.font = canvasFont(cell);
-      const parts = tight && cell.closest("tr.wait") ? cell.textContent.split(/\s+/) : [cell.textContent];
+      const wraps = (tight && cell.closest("tr.wait")) || (name === "duration" && cell.closest("tr.held"));
+      const parts = wraps ? cell.textContent.split(/\s+/) : [cell.textContent];
       return Math.max(...parts.map(part => context.measureText(part).width)) + parseFloat(getComputedStyle(cell).paddingRight);
     });
     if (name === "duration") {
@@ -2154,7 +2156,7 @@ function fitWalkDetails() {
   const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
   // The widest row title or small line sets the label column, with the reorder handle space of its row.
   // A title never wraps; in a pane too narrow for it, it ends in an ellipsis and the row hover gives the full text.
-  const labels = [...walk.querySelectorAll(".row-label :is(.name, .owner, .wait-note)")].map(label =>
+  const labels = [...walk.querySelectorAll(".wrow:not(.held) .row-label :is(.name, .owner, .wait-note)")].map(label =>
     [label, label.textContent, parseFloat(getComputedStyle(label.closest(".row-label")).paddingInlineStart)]);
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
   context.font = canvasFont(roomHeading);

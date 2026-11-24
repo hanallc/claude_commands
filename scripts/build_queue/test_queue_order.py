@@ -624,6 +624,46 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(undone.line), [first, hidden, last, third, hidden_tail])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
 
+    def test_a_waiting_mac_linux_copy_counts_for_the_kept_place_after_a_move(self) -> None:
+        from scripts.build_queue.test_placement import mac_linux_candidate, mac_linux_fixture
+
+        with AdmissionFixture(private=True) as fixture:
+            backoff = mac_linux_fixture(fixture)
+            now = fixture.clock.now()
+            _ = backoff.write_text(str(now + 100))
+            os.utime(backoff, (now, now))
+            with patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                parent = fixture.request(run=fixture.run_owner())
+                self.assertIsInstance(fixture.server.handle_request(parent)[0], wire.Admitted)
+                fixture.free(0)
+                fixture.hold_starts()
+                copy = placement_request(fixture, since=now - 30)
+                copy = replace(copy, purpose=placement.SpeculativeCopy(parent.episode, now),
+                               constraints=replace(copy.constraints, candidates=(mac_linux_candidate(),)))
+                self.assertIsInstance(fixture.server.handle_request(copy)[0], wire.PlacementWait)
+                for since in (now - 25, now - 10):
+                    self.assertIsInstance(fixture.server.handle_request(fixture.request(since=since))[0], wire.Wait)
+                fixture.server.held_places = (records.HeldPlace("queue", "fixture", "lint", now - 20,
+                    now, now + 100, "4242-99", ("natedev",), 1, "failed"),)
+                _ = fixture.run_pass()
+                before = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+                self.assertEqual(before.view.waiting[0].pid, copy.owner.pid)
+                self.assertIsInstance(before.view.waiting[0].reason, records.MachineChoiceWait)
+                self.assertEqual(before.held_places[0].position, 3)
+                line = move_line(fixture)
+                fixed, first, second = line.members
+                self.assertFalse(fixed.movable)
+                moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                    "move-beside-copy", second.row_id, line.revision, wire.QueueDrop(first.row_id, "before")))
+                assert isinstance(moved, wire.QueueMoved)
+                self.assertEqual(moved.line.members, (fixed, second, first))
+                self.assertEqual(moved.line.members[1].kept_before, 1)
+                confirmed = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+                self.assertEqual((confirmed.view.move_line, confirmed.held_places[0].position), (moved.line, 2))
+                _ = fixture.run_pass()
+                after = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+                self.assertEqual((after.view.move_line, after.held_places), (moved.line, confirmed.held_places))
+
     def test_head_drop_goes_ahead_of_a_leading_unnamed_wait(self) -> None:
         from scripts.build_queue import memory_feed, queue_snapshot
         from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view

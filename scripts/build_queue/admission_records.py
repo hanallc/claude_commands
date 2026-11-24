@@ -1506,12 +1506,16 @@ class HeldPlace:
 
 def kept_place_order(held: tuple[HeldPlace, ...], rows: Iterable[Waiter],
                      order: Callable[[Waiter], tuple[int, float, float, int]],
+                     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY,
                      ) -> tuple[list[HeldPlace], Iterator[int]]:
     """Return the kept places and the count that ranks before each waiter."""
     if not held:
         return [], (0 for _ in rows)
-    # A kept place has normal priority and comes before a waiter at the same time.
-    ranked = sorted(((order({"pid": 0, "start_time": "", "need": 0, "since": place.since}), place)
+    entries = priority.entries if isinstance(priority, QueuePriority) else ()
+    ranks = {entry["unit"]: PriorityUnit(entry["unit"], index) for index, entry in enumerate(entries)}
+    # At the same priority and time, a kept place precedes a waiter.
+    ranked = sorted(((order(RankedWaiter(pid=0, start_time="", need=0, since=place.since,
+                                        order=ranks.get(place.unit, NormalOrder()))), place)
                      for place in held), key=lambda pair: pair[0])
     keys = [key for key, _ in ranked]
     kept = [place for _, place in ranked]
@@ -1534,7 +1538,8 @@ class QueueRead:
             yield step, order_times.get((step.pid, step.since), job_order_since(step.since, step.ci_job_start))
 
     def number_held_places(self, held: tuple[HeldPlace, ...],
-                           order: Callable[[Waiter], tuple[int, float, float, int]]) -> tuple[HeldPlace, ...]:
+                           order: Callable[[Waiter], tuple[int, float, float, int]],
+                           priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY) -> tuple[HeldPlace, ...]:
         """Insert kept places by queue rank in the published order."""
         if not held:
             return ()
@@ -1544,7 +1549,7 @@ class QueueRead:
             row = by_owner.get((step.pid, step.since), Waiter(
                 pid=step.pid, start_time="", need=step.need, since=step.since))
             rows.append({**row, "order_since": since})
-        kept, counts = kept_place_order(held, rows, order)
+        kept, counts = kept_place_order(held, rows, order, priority)
         numbered: list[HeldPlace] = []
         # The final count inserts the kept places after the last waiter.
         for preceding, count in enumerate((*counts, len(kept))):
