@@ -2189,6 +2189,55 @@ fi
         delay.assert_called_once_with(mac_linux.CONNECT_RETRY_SECONDS)
         self.assert_guest_clean('probe', 'probe')
 
+    def test_guest_lock_probe_reads_the_live_gate_and_ignores_other_locks(self) -> None:
+        settings = mac_linux.read_settings(conf.read(self.registry))
+        lock = self.run_lock()
+        manifest = lock.parent / 'mac-linux' / 'request.json'
+        attempt = 'fixture-attempt'
+        self.assertEqual(mac_linux.read_guest_run_lock(settings), mac_linux.NoGuestRunLock())
+        manifest.parent.mkdir(parents=True)
+        fixture = '''
+import os
+import subprocess
+import sys
+
+path, fd, attempt = sys.argv[1:]
+fd = int(fd)
+with open(path, 'w') as lock:
+    if lock.fileno() != fd:
+        os.dup2(lock.fileno(), fd)
+    child = 'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)'
+    subprocess.run([sys.executable, '-c', child, str(fd)], check=True, pass_fds=(fd,))
+    print(f'{os.getpgrp()} {attempt}', file=lock, flush=True)
+    print('ready', flush=True)
+    sys.stdin.read()
+'''
+        command = [sys.executable, '-c', fixture, str(lock), str(mac_linux.RUN_LOCK_FD), attempt]
+        with subprocess.Popen(command, start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as owner:
+            assert owner.stdout is not None
+            try:
+                ready, _, _ = select.select([owner.stdout], [], [], 5)
+                self.assertTrue(ready, 'the fixture did not take the guest lock')
+                self.assertEqual(owner.stdout.readline(), b'ready\n')
+                _ = manifest.write_text(json.dumps({'attempt': attempt, 'mode': 'targeted'}))
+                observed = mac_linux.read_guest_run_lock(settings)
+                assert isinstance(observed, mac_linux.GuestRunLock), observed
+                self.assertEqual((observed.pgid, observed.request_id), (owner.pid, attempt))
+                self.assertEqual(observed.state, mac_linux.GuestRunLockState.HELD_BY_GATE)
+
+                _ = manifest.write_text(json.dumps({'attempt': 'other-attempt', 'mode': 'targeted'}))
+                self.assertEqual(mac_linux.read_guest_run_lock(settings), replace(observed,
+                    state=mac_linux.GuestRunLockState.HELD))
+                _ = manifest.write_text(json.dumps({'attempt': attempt, 'argv': ['true']}))
+                self.assertEqual(mac_linux.read_guest_run_lock(settings), replace(observed,
+                    state=mac_linux.GuestRunLockState.HELD))
+            finally:
+                _ = owner.communicate(timeout=5)
+        self.assertEqual(mac_linux.read_guest_run_lock(settings), replace(observed,
+            state=mac_linux.GuestRunLockState.UNHELD))
+        self.assertEqual(lock.read_text(), f'{owner.pid} {attempt}\n')
+        self.assertEqual(self.trace.read_text().splitlines(), ['probe'] * 5)
+
     def test_arm_stays_valid_through_a_connect_retry(self) -> None:
         with (patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 1),
               patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset'})):

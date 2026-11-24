@@ -33,6 +33,7 @@ from scripts.build_queue.admission_test_support import (
     AdmissionFixture, FixedSystemReader, GIB, ObservedAdmissionServer, only_admitted,
 )
 from scripts.buildlog import store
+from scripts.build_targets import mac_linux
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
@@ -861,6 +862,95 @@ class PlacementTests(unittest.TestCase):
             closed = service.read_state(fixture.state_dir).assignments[key]
             self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
             self.assertEqual(assignment_row(closed).get("confirmed_guest_start"), expected)
+
+    def test_guest_lock_confirms_the_consumed_assignment_on_the_first_pass(self) -> None:
+        for case in ("new", "probe failed before consume"):
+            with self.subTest(case=case):
+                self._check_guest_lock_confirmation(case)
+
+    def test_guest_lock_requires_a_new_reading_of_a_live_gate_lock(self) -> None:
+        for case in ("before", "dead", "old reading", "command"):
+            with self.subTest(case=case):
+                self._check_guest_lock_confirmation(case)
+
+    def test_guest_lock_refuses_two_consumed_assignments(self) -> None:
+        self._check_guest_lock_confirmation("two assignments")
+
+    def test_guest_lock_preserves_the_caller_confirmation(self) -> None:
+        self._check_guest_lock_confirmation("caller report")
+
+    def _check_guest_lock_confirmation(self, case: str) -> None:
+        with (TemporaryDirectory() as configuration,
+              mock.patch.dict(os.environ, {"CONF_DIR": configuration}), PlacementFixture() as fixture):
+            request = mac_linux_and_natedev_request(fixture)
+            _ = mac_linux_fixture(fixture)
+            key = fixture.server.host_evidence_key(request, mac_linux_candidate().destination)
+            machine = "1" * 32
+            boot = "12345678-1234-1234-1234-123456789abc"
+            before = f"gate 123 {'a' * 32} {boot} {machine}"
+            new = f"gate 124 {'b' * 32} {boot} {machine}"
+
+            def observe(lock: str) -> placement.HostEvidence:
+                result = subprocess.CompletedProcess([], 0, lock + "\n", "")
+                with mock.patch.object(mac_linux, "run_guest_ssh", return_value=result) as probe:
+                    evidence = fixture.read_host_evidence(key)
+                probe.assert_called_once()
+                return evidence
+
+            def publish(evidence: placement.HostEvidence) -> None:
+                fixture.provider_evidence[key] = evidence
+                fixture.server.publish_host_evidence(evidence)
+
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            publish(observe(before if case == "before" else "none"))
+            if case == "probe failed before consume":
+                publish(placement.HostEvidenceUnavailable(key, fixture.clock.now(), "fixture probe failed"))
+            holder = guest_gate(fixture, assignment)
+            old_reading = observe(new)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization), granted
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            initial = fixture.server.assignments[attempt]
+            assert isinstance(initial.remote_start_hold, records.RemoteStartHold), initial
+            assert isinstance(initial.permission, placement.PermissionConsumed), initial
+            place_key, = fixture.server.places
+            self.assertTrue(fixture.server.places[place_key].move_id)
+            fixture.clock.advance(1)
+            if case == "caller report":
+                caller = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                    "mac-linux", boot, machine, assignment.attempt))
+                _ = fixture.server.handle_request(wire.ExecutionReport("guest-started", assignment, granted.claim, caller))
+                fixture.clock.advance(1)
+            if case == "two assignments":
+                other = replace(assignment, episode="other-episode", attempt="other-attempt")
+                other_key = execution_identity.attempt_key(other.episode, other.attempt)
+                fixture.server.assignments[other_key] = replace(initial, assignment=other)
+                fixture.server.current_assignments[other.episode] = other_key
+            locks = {"before": before, "dead": new.replace("gate ", "unheld ", 1),
+                     "command": new.replace("gate ", "held ", 1)}
+            publish(old_reading if case == "old reading" else observe(locks.get(case, new)))
+            _ = fixture.run_pass()
+            saved = fixture.server.assignments[attempt]
+            if case in ("before", "dead", "old reading", "command", "two assignments"):
+                self.assertEqual(saved.confirmed_guest_start, records.GuestStartNotRecorded())
+                self.assertEqual(saved.remote_start_hold, initial.remote_start_hold)
+                return
+            self.assertEqual(saved.confirmed_guest_start, records.ConfirmedGuestStart(initial.permission.consumed_at + 1))
+            self.assertEqual(saved.remote_start_hold, records.RemoteStartHoldEnded())
+            self.assertEqual(fixture.server.places[place_key].move_id, "")
+            self.assertLess(fixture.clock.now(), initial.remote_start_hold.deadline)
+            self.assertEqual(fixture.server.execution_evidence[attempt], execution_identity.ObservedExecution(
+                execution_identity.CloudExecution("mac-linux", boot, machine, assignment.attempt)))
+            for restarted in (False, True):
+                if restarted:
+                    fixture.restart()
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.assignments[attempt].confirmed_guest_start, saved.confirmed_guest_start)
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply), view
+                running, = (row for row in view.reading.view.running if row.assignment_target == "mac-linux")
+                self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
 
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
         with PlacementFixture() as fixture:

@@ -519,8 +519,7 @@ def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.Comple
                           timeout=timeout, check=False, env=guest_ssh_environment())
 
 
-def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
-    shell = guest_shell(settings) + '''
+GUEST_MAIN_PROBE = '''
 if ! command -v bwrap >/dev/null 2>&1; then
     printf 'bwrap is absent from the guest PATH.\\n' >&2
     exit 127
@@ -528,17 +527,118 @@ fi
 if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
-    command = settings.command(shell)
+
+
+def _guest_probe_output(settings: GuestSettings, shell: str, probe: str) -> str:
+    command = settings.command(guest_shell(settings) + GUEST_MAIN_PROBE + shell)
     reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
                                 monotonic() + settings.unreachable_wait_seconds)
     if reply.returncode:
-        raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
-    commit = reply.stdout.strip()
+        raise GuestUnavailable(f'guest {probe} probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
+    return reply.stdout
+
+
+def _guest_main(commit: str) -> GuestMain | EmptyGuestMain:
     if not commit:
         return EmptyGuestMain()
     if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit) is None:
         raise GuestUnavailable('the guest main probe returned an invalid commit ID')
     return GuestMain(commit)
+
+
+def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
+    return _guest_main(_guest_probe_output(settings, '', 'main').strip())
+
+
+@dataclass(frozen=True)
+class NoGuestRunLock:
+    """The guest has no recorded run lock identity."""
+
+
+class GuestRunLockState(StrEnum):
+    UNHELD = 'unheld'
+    HELD = 'held'
+    HELD_BY_GATE = 'gate'
+
+
+@dataclass(frozen=True)
+class GuestRunLock:
+    """Identify the guest run lock and what holds it."""
+
+    pgid: int
+    request_id: str
+    boot_id: str
+    machine_id: str
+    state: GuestRunLockState
+
+
+GUEST_RUN_LOCK_PROBE = '''\
+import json
+import os
+import re
+import stat
+import sys
+
+path, fd, request_path = sys.argv[1:]
+try:
+    lock = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except FileNotFoundError:
+    print('none')
+    sys.exit(0)
+file = os.fstat(lock)
+if not stat.S_ISREG(file.st_mode):
+    sys.exit('The guest run lock must be a regular file.')
+line = os.pread(lock, 256, 0)
+if not line:
+    print('none')
+    sys.exit(0)
+fields = re.fullmatch(rb'([1-9][0-9]{0,9}) ([a-z0-9-]{1,128})\\n', line)
+if fields is None or int(fields[1]) >= 2**31:
+    sys.exit('The guest run lock has an invalid identity.')
+group = int(fields[1])
+held = False
+try:
+    # The group leader inherits the same open file description as the lock command.
+    group_file = os.stat(f'/proc/{group}/fd/{fd}')
+    if os.path.samestat(file, group_file) and os.getpgid(group) == group:
+        with open(f'/proc/{group}/fdinfo/{fd}', encoding='ascii') as info:
+            held = any(re.match(r'lock:\\s+\\d+: FLOCK\\s+ADVISORY\\s+WRITE\\s', row) for row in info)
+except (FileNotFoundError, ProcessLookupError, PermissionError):
+    pass
+attempt = fields[2].decode('ascii')
+state = 'unheld'
+if held:
+    state = 'held'
+    try:
+        with open(request_path, encoding='utf-8') as source:
+            request = json.load(source)
+    except (OSError, ValueError):
+        request = None
+    if (isinstance(request, dict) and request.get('attempt') == attempt
+            and isinstance(request.get('mode'), str) and 'argv' not in request):
+        state = 'gate'
+if line != os.pread(lock, 256, 0) or not os.path.samestat(file, os.stat(path, follow_symlinks=False)):
+    sys.exit('The guest run lock changed during the probe.')
+with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as identity:
+    boot = identity.read().strip()
+with open('/etc/machine-id', encoding='ascii') as identity:
+    machine = identity.read().strip()
+print(f'{state} {group} {attempt} {boot} {machine}')
+'''
+
+
+def read_guest_run_lock(settings: GuestSettings) -> GuestRunLock | NoGuestRunLock:
+    """Read the guest main commit and run lock in one SSH probe."""
+    probe = shlex.join(('python3', '-I', '-S', '-c', GUEST_RUN_LOCK_PROBE))
+    shell = f'\nexec {probe} "$checkout/{RUN_LOCK_PATH}" {RUN_LOCK_FD} "$checkout/{BOOTSTRAP_DIR}/request.json"'
+    main, _, lock = _guest_probe_output(settings, shell, 'run lock').removesuffix('\n').rpartition('\n')
+    _ = _guest_main(main)
+    if lock == 'none':
+        return NoGuestRunLock()
+    match = re.fullmatch(r'(gate|held|unheld) ([1-9][0-9]{0,9}) ([a-z0-9-]{1,128}) ([0-9a-f-]{36}) ([0-9a-f]{32})', lock)
+    if match is None or int(match[2]) >= 2**31:
+        raise GuestUnavailable('the guest run lock probe returned an invalid identity')
+    return GuestRunLock(int(match[2]), match[3], match[4], match[5], GuestRunLockState(match[1]))
 
 
 class ArmedGuestAttemptRecord(TypedDict):

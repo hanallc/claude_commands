@@ -71,6 +71,7 @@ from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 
 if TYPE_CHECKING:
+    from scripts.build_targets import mac_linux
     from scripts.mac_test.claim_state import RemoteJobClaim
 
 
@@ -193,6 +194,13 @@ class MacLinuxReadyForProbe:
 
     registry: conf.ConfigRead
     failed_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class MacLinuxHostEvidence(placement.FreshHostEvidence):
+    """The guest lock has no queue attempt until the admission loop binds it."""
+
+    guest_lock: mac_linux.GuestRunLock | mac_linux.NoGuestRunLock
 
 
 def mac_linux_backoff(now: float) -> MacLinuxReadyForProbe | placement.TemporaryExclusion:
@@ -1829,6 +1837,7 @@ class AdmissionServer:
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
         self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
+        self.guest_start_before: dict[str, MacLinuxHostEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
         self.local_hold_holders: dict[str, placement.ResourceHolder] = {}
@@ -1840,6 +1849,7 @@ class AdmissionServer:
         self.mac_recovery_retry_at: dict[str, float] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
+        self.guest_lock_observations: dict[placement.HostEvidenceKey, MacLinuxHostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
         # Start time of each hold that keeps a remote destination for an older waiting request.
@@ -4018,8 +4028,7 @@ class AdmissionServer:
 
     def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
         self._schedule_pass()
-        self.host_observations[evidence.key] = evidence
-        self.pass_stale = True
+        self._remember_host_observation(evidence)
         reader = self.host_readers.get(evidence.key)
         if reader is not None:
             reader.publish(evidence)
@@ -4027,6 +4036,12 @@ class AdmissionServer:
             os.eventfd_write(self.reading_events, 1)
         except OSError:
             pass
+
+    def _remember_host_observation(self, evidence: placement.HostEvidence) -> None:
+        self.host_observations[evidence.key] = evidence
+        if isinstance(evidence, MacLinuxHostEvidence):
+            self.guest_lock_observations[evidence.key] = evidence
+        self.pass_stale = True
 
     def host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         reader = self.host_readers.get(key)
@@ -4046,8 +4061,7 @@ class AdmissionServer:
         for key, reader in self.host_readers.items():
             evidence = reader.latest
             if evidence != self.host_observations.get(key):
-                self.host_observations[key] = evidence
-                self.pass_stale = True
+                self._remember_host_observation(evidence)
 
     def _evidence_lifetime(self, key: placement.HostEvidenceKey) -> float:
         """Return how long one probe can take: a waiting pass plus the probe time limit."""
@@ -4331,10 +4345,10 @@ class AdmissionServer:
         if isinstance(backoff, placement.TemporaryExclusion):
             return placement.FreshHostEvidence(key, started_at, "", backoff)
         try:
-            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry))
+            guest_lock = mac_linux.read_guest_run_lock(mac_linux.read_settings(backoff.registry))
         except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
-        return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
+        return MacLinuxHostEvidence(key, started_at, "", placement.AllowedHost(), guest_lock=guest_lock)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, record: RemoteJobClaim,
@@ -4788,6 +4802,56 @@ done
             return replace(saved, remote_start_hold=records.RemoteStartHoldEnded())
         return saved
 
+    def _confirm_guest_start(self, key: str, saved: records.SavedPlacementAssignment,
+                             evidence: execution_identity.ExecutionEvidence) -> records.SavedPlacementAssignment:
+        assignment = saved.assignment
+        if (isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
+                and self.current_assignments.get(assignment.episode) == key
+                and isinstance(saved.state, placement.CurrentAssignment)
+                and isinstance(saved.permission, placement.PermissionConsumed)
+                and confirmed_guest_run(assignment, evidence) is not None):
+            saved = replace(saved, confirmed_guest_start=records.ConfirmedGuestStart(self.clock.now()))
+            self.assignments[key] = saved
+            _ = self.guest_start_before.pop(key, None)
+        return saved
+
+    def _confirm_guest_lock(self) -> None:
+        """Bind a new gate lock only when one current assignment has consumed permission."""
+        if not self.guest_start_before:
+            return
+        from scripts.build_targets import mac_linux
+
+        consumed = [(key, saved) for key in self.current_assignments.values()
+                    if (saved := self.assignments.get(key)) is not None
+                    and saved.assignment.destination.target == mac_linux.TARGET
+                    and isinstance(saved.state, placement.CurrentAssignment)
+                    and isinstance(saved.permission, placement.PermissionConsumed)]
+        if len(consumed) != 1:
+            for key, _saved in consumed:
+                _ = self.guest_start_before.pop(key, None)
+            return
+        key, saved = consumed[0]
+        before = self.guest_start_before.get(key)
+        if before is None or not isinstance(saved.permission, placement.PermissionConsumed):
+            return
+        assignment = saved.assignment
+        if self.placement_host_keys.get((assignment.episode, assignment.destination)) != before.key:
+            return
+        current = self.host_evidence(before.key)
+        if (not isinstance(current, MacLinuxHostEvidence)
+                or current.observed_at <= saved.permission.consumed_at):
+            return
+        lock = current.guest_lock
+        if not isinstance(lock, mac_linux.GuestRunLock) or lock.state is not mac_linux.GuestRunLockState.HELD_BY_GATE:
+            return
+        previous = before.guest_lock
+        if isinstance(previous, mac_linux.GuestRunLock) and (previous.pgid, previous.request_id) == (lock.pgid, lock.request_id):
+            return
+        evidence = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+            mac_linux.TARGET, lock.boot_id, lock.machine_id, assignment.attempt))
+        if self._confirm_guest_start(key, saved, evidence) is not saved:
+            self.execution_evidence[key] = evidence
+
     def _update_remote_start_hold(self, request: wire.PlacementRequest, key: str,
                                   saved: records.SavedPlacementAssignment, remote_start_hold_seconds: int) -> bool:
         if (saved.assignment.destination.provider == "local"
@@ -4828,6 +4892,8 @@ done
                                     and (pair[1].provider != "local" or pair[0] in self.waiters
                                          or pair[0] not in self.current_assignments)}
         needed = set(self.placement_host_keys.values())
+        for key in self.guest_lock_observations.keys() - needed:
+            del self.guest_lock_observations[key]
         for key in set(self.host_readers) - needed:
             reader = self.host_readers.pop(key)
             reader.worker.remove(key)
@@ -4848,6 +4914,7 @@ done
             if submitted is not None and (submitted.episode in self.current_assignments
                     or self._placement_waiting(submitted)):
                 _ = self._request_host_evidence(submitted, saved.assignment.destination, keys)
+        self._confirm_guest_lock()
         prepared: set[str] = set()
         for request in tuple(self.placement_requests.values()):
             if self.placement_requests.get(request.episode) is not request:
@@ -5314,6 +5381,13 @@ done
                        and claim.session == assignment.session and claim.host == destination.host
                        and claim.generation == evidence.generation for claim in evidence.claims):
                 return self._placement_status(assignment, "the exact claim is not adopted")
+        host_key = self.placement_host_keys.get((assignment.episode, destination))
+        if destination.target == mac_linux.TARGET and host_key is not None:
+            reader = self.host_readers.get(host_key)
+            latest = reader.latest if reader is not None else None
+            before = latest if isinstance(latest, MacLinuxHostEvidence) else self.guest_lock_observations.get(host_key)
+            if before is not None:
+                self.guest_start_before[key] = before
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
         # A speculative copy repeats a step of the run, so it is not a step of its own.
@@ -5364,6 +5438,7 @@ done
         self._schedule_pass()
         assignment = saved.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        _ = self.guest_start_before.pop(key, None)
         self._remove_waiter(self.waiters.get(assignment.episode))
         current = self.current_assignments.get(assignment.episode) == key
         request = self.placement_requests.get(assignment.episode)
@@ -5642,13 +5717,7 @@ done
             if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
                     or not isinstance(request.evidence, execution_identity.ObservedExecution)):
                 self.execution_evidence[key] = request.evidence
-            if (isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
-                    and self.current_assignments.get(assignment.episode) == key
-                    and isinstance(saved.state, placement.CurrentAssignment)
-                    and isinstance(saved.permission, placement.PermissionConsumed)
-                    and confirmed_guest_run(assignment, request.evidence) is not None):
-                saved = replace(saved, confirmed_guest_start=records.ConfirmedGuestStart(self.clock.now()))
-                self.assignments[key] = saved
+            saved = self._confirm_guest_start(key, saved, request.evidence)
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)
