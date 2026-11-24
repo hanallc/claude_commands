@@ -2405,22 +2405,15 @@ class CostLedger:
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
                 if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            reason = self._book_gate(state, settings, request)
+            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+            state.gate_reservations.append(request)
+            reason = self.reservation_cap(state, settings, request.at, costs)
+            if reason:
+                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
+                self._save(state)
+                return GateCapReached(reason)
             self._save(state)
-            return GateCapReached(reason) if reason else GateReserved(state.gate_reservations[-1])
-
-    def gate_booking_refusal(self, snapshot: LedgerEvidence, settings_path: Path, request: GateReservation) -> str:
-        """Return the spending refusal for a proposed placement without saving the booking."""
-        return self._book_gate(replace(snapshot, gate_reservations=list(snapshot.gate_reservations)),
-                               read_settings(settings_path), request)
-
-    def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
-        costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
-        state.gate_reservations.append(request)
-        reason = self.reservation_cap(state, settings, request.at, costs)
-        if reason:
-            state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
-        return reason
+            return GateReserved(state.gate_reservations[-1])
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:

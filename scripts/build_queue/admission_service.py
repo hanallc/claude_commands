@@ -17,7 +17,6 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
 from functools import cache
-from importlib import import_module
 import os
 from pathlib import Path
 import select
@@ -146,10 +145,6 @@ _PASS_PROVIDER_CONFIGURATION: ContextVar[ProviderConfiguration] = ContextVar("pa
 def _provider_configuration() -> ProviderConfiguration:
     current = _PASS_PROVIDER_CONFIGURATION.get(None)
     return ProviderConfiguration() if current is None else current
-
-
-class AwsPlacementProvider(Protocol):
-    def placement_eligibility(self) -> placement.AllowedHost | placement.TemporaryExclusion: ...
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -3658,8 +3653,6 @@ class AdmissionServer:
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
-        if key.destination.provider == "scaler":
-            return 0.0
         if key.destination.provider == "ssh" and key.destination.target == "mac-linux":
             from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
 
@@ -3877,18 +3870,6 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
-        if destination.provider == "scaler" and destination.target == "aws":
-            from scripts.build_targets.gate_targets import aws_gate_candidate
-
-            candidate = aws_gate_candidate()
-            if destination != candidate.destination or key.settings != candidate.settings:
-                answer = placement.TemporaryExclusion("AWS placement does not match the configured target")
-            elif isinstance(candidate.eligibility, placement.FixedExclusion):
-                answer = placement.TemporaryExclusion(candidate.eligibility.reason)
-            else:
-                provider = cast(AwsPlacementProvider, cast(object, import_module("scripts.aws_target.cloud_gate")))
-                answer = provider.placement_eligibility()
-            return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, answer)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
@@ -4812,12 +4793,8 @@ done
                         break
                     continue
                 if destination.provider == "scaler":
-                    if destination.target != "aws" or not isinstance(self.configuration, gate.UsableAdmissionConfiguration):
-                        continue
-                    cloud_slots = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
-                    if cloud_slots >= self.configuration.cloud_gate_slots:
-                        continue
-                elif (any(same_remote_resource(other, destination) for other in taken)
+                    continue
+                if (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
@@ -4957,10 +4934,7 @@ done
                                 return self._placement_status(assignment, f'Hana admission refused: {memory.reason}')
                 except (OSError, ValueError) as error:
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
-        if destination.provider == "scaler" and destination.target == "aws":
-            if reference != placement.assigned_claim_reference(assignment):
-                return self._placement_status(assignment, "the exact AWS claim does not match")
-        elif isinstance(transport, hana_placement.HanaControlTransport):
+        if isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.aws_target.hana_placement_adapter import read_assigned_adoption
 
             adopted = read_assigned_adoption(assignment, request.holder, transport)
@@ -5099,8 +5073,7 @@ done
                 report = replace(report, path=placement.DispatchPathSettled())
                 saved = replace(saved, terminal_report=report)
             if (isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
-                    and (not isinstance(report.outcome, placement.AttemptDeclined)
-                         or assignment.destination.provider == "scaler")):
+                    and not isinstance(report.outcome, placement.AttemptDeclined)):
                 self._close_for_report(saved, report)
                 continue
             if assignment.destination.provider == "local":
@@ -5317,8 +5290,7 @@ done
             if (self.current_assignments.get(assignment.episode) == key
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathSettled)
-                    and (not isinstance(report.outcome, placement.AttemptDeclined)
-                         or assignment.destination.provider == "scaler")):
+                    and not isinstance(report.outcome, placement.AttemptDeclined)):
                 self._close_for_report(saved, report)
             else:
                 self.persist()

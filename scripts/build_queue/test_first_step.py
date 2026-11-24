@@ -8,7 +8,6 @@ import subprocess
 import unittest
 from unittest import mock
 
-from scripts.aws_target import cloud_gate
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_records as records, execution_identity, queue_place
 from scripts.build_queue import admission_client as client, admission_protocol as wire, first_step, placement
@@ -48,7 +47,6 @@ def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "o
     _ = write_config_fixture(fixture.root / "mac_linux.conf",
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\n")
     _ = write_config_fixture(fixture.root / "hana_aws.conf", "enabled=on\n")
-    _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
     source = fixture.root / (".claude" if repository == "claude_commands" else repository)
     source.mkdir()
     for command in (("init", "-q"), ("remote", "add", "origin", f"https://example.invalid/{repository}.git")):
@@ -65,43 +63,13 @@ class FirstStepTests(unittest.TestCase):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source, requested="mac"), ("mac",))
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("mac-linux",))
 
-    def test_nightly_gate_can_place_and_authorize_the_enabled_aws_target(self) -> None:
+    def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             command = (*GATE_COMMAND[:2], "--nightly")
-            settings = fixture.root / "cloud_gate.conf"
-            _ = write_config_fixture(settings, "enabled=unknown\n")
+            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
                 self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev"))
-            _ = write_config_fixture(settings, "enabled=on\n")
-            owner = fixture.fixture_owner(os.getpid(), "123")
-
-            def grant(request: wire.PlacementRequest) -> wire.Assignment:
-                candidate, = request.constraints.candidates
-                self.assertEqual((candidate.destination.provider, candidate.destination.target), ("scaler", "aws"))
-                self.assertEqual(candidate.settings, placement.ExplicitProviderSettings(settings))
-                reading = fixture.server.read_provider_evidence(fixture.server.host_evidence_key(request, candidate.destination))
-                self.assertIsInstance(reading, placement.FreshHostEvidence)
-                fixture.server.publish_host_evidence(reading)
-                reply, = fixture.connect(request).replies()
-                assert isinstance(reply, wire.Assignment), reply
-                return reply
-
-            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
-                  mock.patch.object(cloud_gate, "availability", return_value=cloud_gate.Available()) as availability,
-                  mock.patch.object(records, "process_start_time", return_value=owner.start_time),
-                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
-                  mock.patch.object(client, "acquire_placement", side_effect=grant),
-                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok())):
-                self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev", "aws"))
-                with first_step.admitted_run(command, source, targets=("aws",)) as admitted:
-                    placed = admitted.grant
-                    assert isinstance(placed, first_step.GatePlacement)
-                    assignment = placed.grant.assignment
-                    claim = placement.assigned_claim_reference(assignment)
-                    reply, = fixture.connect(consume_permission("launch", assignment, claim)).replies()
-                    self.assertEqual(reply, wire.FirstAuthorization(assignment, claim))
-                availability.assert_called_once()
 
     def test_hana_gate_has_no_default_targets(self) -> None:
         with PlacementFixture() as fixture:

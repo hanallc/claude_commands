@@ -39,7 +39,6 @@ from scripts.aws_target.ledger_test_support import (
     override_fixture_settings, text_setting,
 )
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
-from scripts.build_queue import execution_identity, placement
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -47,7 +46,6 @@ from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import gate
-from scripts.production.gate_routes import GateResultUnknown, GateTookNoRun
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
@@ -57,9 +55,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
-from scripts.build_hold.owning_session import NoOwningSession, OwningSession, owning_session
+from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
-from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.message.unit_labels import OwnerRole, UnitLabels
 
 
@@ -332,13 +329,6 @@ class FakeGateAws:
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
 
 
-def aws_gate_assignment() -> gate.AwsGateAssignment:
-    return gate.AwsGateAssignment(placement.PlacementAssignment('episode', 'attempt',
-        placement.PlacementDestination('scaler', 'aws', 'fixture', WHOLE_MAC),
-        execution_identity.SourceKeyKnown('tree'), placement.SubmittingOwner('fixture', 1, '1'),
-        NoOwningSession(), 1.0))
-
-
 class CloudGateTests(CloudGateHangGuard, CostFixture):
     now: float = 0
     book: ledger.CostLedger = ledger.CostLedger(Path())
@@ -346,94 +336,6 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
     folder: Path = Path()
     request: dict[str, object] = {}
     deployment: dict[str, object] = {}
-
-    def test_scaler_assignment_consumes_once_and_retains_pending_launch(self) -> None:
-        assignment = aws_gate_assignment().assignment
-        claim = placement.assigned_claim_reference(assignment)
-        first = wire.FirstAuthorization(assignment, claim)
-        replay = wire.DispatchStatus(assignment, placement.CurrentAssignment(),
-                                    placement.PermissionConsumed(self.now), 'already consumed')
-
-        def launch(_repo: Path, *, attempt: cloud_gate.CloudAttempt, **_options: object) -> cloud_gate.CloudDeclined:
-            attempt.identifier = 'fixture-launch'
-            with self.book.transaction() as state:
-                state.gate_reservations.append(ledger.GateReservation(attempt.identifier,
-                    int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal(0)))
-            return cloud_gate.CloudDeclined('The launch reply is unavailable')
-
-        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
-              mock.patch.object(admission_client, 'consume_permission', side_effect=[first, replay]) as consume,
-              mock.patch.object(admission_client, 'report_execution') as report,
-              mock.patch.object(cloud_gate, 'run_cloud', side_effect=launch) as start,
-              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake AWS transport'))):
-            route = partial(cloud_gate.route, self.root, mode=gate.SuiteMode.GATE, full=False,
-                            module_time_limit_s=30, assignment=assignment)
-            with self.assertRaisesRegex(GateResultUnknown, 'The launch reply is unavailable'):
-                _ = route()
-            with self.assertRaisesRegex(GateTookNoRun, 'already consumed'):
-                _ = route()
-        start.assert_called_once()
-        self.assertEqual(consume.call_count, 2)
-        self.assertEqual(cast(wire.ConsumePermission, consume.call_args.args[0]).claim, claim)
-        report.assert_called_once()
-        sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertEqual(sent.assignment, assignment)
-        self.assertEqual(sent.claim, claim)
-        self.assertIsInstance(sent.path, placement.DispatchPathPending)
-        self.assertEqual(sent.outcome, placement.AttemptDeclined('The launch reply is unavailable'))
-        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
-
-    def test_availability_uses_only_local_evidence(self) -> None:
-        directory = self.state
-        deployment = directory / 'gate-deployment.json'
-        quotas = directory / 'spot-prices.json'
-        region = 'us-east-2'
-        row = {'region': region, 'read_at': int(self.now), 'standard_vcpus': '16', 'gpu_vcpus': '0'}
-        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
-              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
-              mock.patch.object(time, 'time', return_value=self.now),
-              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Availability uses local files'))):
-            path = self.root / 'cloud_gate.conf'
-            override_fixture_settings(path, 'enabled=off')
-            self.assertIn('off', self.unavailable_reason())
-            override_fixture_settings(path, 'enabled=on')
-            self.assertIn('image or stack is absent', self.unavailable_reason())
-            regional = {**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'fixture-image'}
-            cloud_gate.save(deployment, {**self.deployment, 'regions': [regional]})
-            self.assertIn('quota', self.unavailable_reason())
-            cloud_gate.save(quotas, {'regions': [{**row, 'read_at': 0}]})
-            self.assertIn('quota', self.unavailable_reason())
-            cloud_gate.save(quotas, {'regions': [{**row, 'standard_vcpus': '15'}]})
-            self.assertIn('quota', self.unavailable_reason())
-            cloud_gate.save(quotas, {'regions': [row]})
-            numeric_settings(self.settings, {'daily_limit_usd': '0.01'})
-            self.assertIn('daily_limit', self.unavailable_reason())
-            numeric_settings(self.settings, {'daily_limit_usd': '100', 'monthly_limit_usd': '0.01'})
-            self.assertIn('monthly_limit', self.unavailable_reason())
-            numeric_settings(self.settings, {'monthly_limit_usd': '500'})
-            with self.book.transaction() as state:
-                state.observations.clear()
-            before = self.book.path.read_bytes()
-            self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
-            self.assertEqual(self.book.path.read_bytes(), before)
-            now = int(self.now)
-            booking = cloud_gate.gate_booking(cloud_gate.settings(), 'fixture-booking', now,
-                                              now + cloud_gate.settings().whole('lifetime_minutes') * 60)
-            self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
-            self.book.resolve_gate(booking.attempt, ledger.GateAbsent(now))
-            with self.book.transaction() as state:
-                state.gate_reservations.append(ledger.GateReservation('fixture', int(self.now), int(self.now) + 1200,
-                    Decimal('.8'), Decimal(0), state=ledger.GateRunning('i-fixture'),
-                    region=region, instance_type='m7a.4xlarge'))
-            self.assertIn('quota', self.unavailable_reason())
-            self.book.resolve_gate('fixture', ledger.GateAbsent(int(self.now)))
-            self.book.record_gate_quota_refusal(ledger.SpotQuotaPool(region, ledger.SpotQuotaClass.STANDARD), self.now)
-            self.assertIn('quota', self.unavailable_reason())
-
-    def unavailable_reason(self) -> str:
-        result = cloud_gate.availability()
-        assert isinstance(result, cloud_gate.Unavailable)
-        return result.reason
 
     @override
     def setUp(self) -> None:
@@ -2468,21 +2370,23 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
         for mode, full in ((gate.SuiteMode.GATE, False), (gate.SuiteMode.TARGETED, True)):
             with (self.subTest(mode=mode, full=full),
-                  mock.patch.object(cloud_gate, 'route', return_value=remote) as run,
+                  mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
                   mock.patch.object(gate, 'run_suites') as local):
-                self.assertEqual(gate.run_gate_suites(repo, mode=mode, full=full, target=aws_gate_assignment()), remote)
+                self.assertEqual(gate.run_gate_suites(repo, mode=mode, full=full, target=gate.NO_GATE_ASSIGNMENT),
+                                 remote)
                 local.assert_not_called()
                 run.assert_called_once()
                 self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
 
-    def test_an_aws_refusal_does_not_run_the_local_runner(self) -> None:
+    def test_allowed_fallback_calls_the_original_local_runner(self) -> None:
         repo = self.gate_checkout()
-        with (mock.patch.object(cloud_gate, 'route', return_value='AWS is down'),
-              mock.patch.object(gate, 'run_suites') as local,
-              self.assertRaisesRegex(GateRefused, 'AWS is down')):
-            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED, target=aws_gate_assignment())
-        local.assert_not_called()
+        with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
+              mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
+            _ = gate.run_gate_suites(repo, full=True, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+        self.assertTrue(local.call_args.kwargs['full'])
+        self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED)
+
 
     def test_paired_result_uses_shared_worker_and_confirms_cleanup(self) -> None:
         request = self.request
@@ -3048,25 +2952,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
     modules: list[tuple[str, Path]] = []
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
 
-    def test_named_aws_gate_sends_a_subset_with_the_box_lifetime(self) -> None:
-        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
-        selected = gate.TreeSelection(('scripts/fixture/test_one.py',), cloud_gate.working_tree(self.repo)[0])
-        lifetime_s = cloud_gate.settings().whole('lifetime_minutes') * 60
-
-        def service(command: Sequence[str]) -> int:
-            folder = Path(command[command.index('--worker') + 1])
-            request = cloud_gate.read(folder / 'request.json')
-            self.assertEqual(request['modules'], list(selected.paths))
-            self.assertIs(request['named_modules'], True)
-            self.assertIs(request['split'], True)
-            self.assertEqual(request['module_time_limit_s'], lifetime_s)
-            cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'fixture'})
-            return 0
-
-        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=1,
-                                 gate_job=StepJob('test-modules', modules=1), selected=selected, service=service)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('fixture'))
-
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -3116,7 +3001,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(gate.SuiteMode.step(mode.value), mode.value)
         self.assertEqual(gate.SuiteMode.step('gpu-size-trial'), 'gpu-size-trial')
 
-    def test_unknown_checkout_modes_refuse_without_starting_the_cloud_service(self) -> None:
+    def test_unknown_checkout_modes_use_local_gate_without_starting_the_cloud_service(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         runner = self.repo / 'scripts/production/gate.py'
         source = runner.read_text()
@@ -3124,26 +3009,21 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                               .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
         _ = gate.checked_git(self.repo, 'add', '.')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
+        passed = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'OK'),), 1, 0)
         for mode in gate.SuiteMode:
             with (self.subTest(mode=mode),
                   mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No cloud service may start')) as service,
                   mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('No AWS call may start')),
-                  mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
-                  mock.patch.object(admission_client, 'report_execution') as report,
-                  mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
+                  mock.patch.object(gate, 'run_suites', return_value=passed) as local,
+                  redirect_stdout(StringIO()) as output):
                 before = len(self.fallback_rows())
-                reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
-                with self.assertRaisesRegex(GateTookNoRun, reason):
-                    _ = gate.run_gate_suites(self.repo, full=True, mode=mode, target=target)
-                local.assert_not_called()
+                outcome = gate.run_gate_suites(self.repo, full=True, mode=mode, target=gate.NO_GATE_ASSIGNMENT)
+                self.assertTrue(outcome.passed)
+                local.assert_called_once_with(self.repo, (), gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                                              source='tests-only', full=True, mode=mode)
                 service.assert_not_called()
-                report.assert_called_once()
-                sent = cast(wire.ExecutionReport, report.call_args.args[0])
-                self.assertEqual(sent.outcome, placement.PrelaunchRefused(reason))
-                self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
-                self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+                reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
+                self.assertEqual(output.getvalue(), 'Cloud gate uses natedev: ' + reason + '\n')
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['mode'], rows[-1]['reason']), (mode.value, reason))
@@ -3159,7 +3039,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                        status: int = 0, one_choice: bool = False, limit_after_first: bool = False,
                        switch_off_after_first: bool = False, crash_after: int | None = None,
                        crash_on_retry_save: bool = False,
-                       lower_limit_on_resume: bool = False) -> tuple[cloud_gate.CloudDeclined | cloud_gate.CloudCompleted,
+                       lower_limit_on_resume: bool = False) -> tuple[cloud_gate.LocalFallback | cloud_gate.CloudCompleted,
                                                                list[Path], list[FakeGateAws]]:
         values = cloud_gate.settings()
         size = values.words('instance_types')[0]
@@ -3289,8 +3169,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         retries = cloud_gate.settings().whole('spot_interruption_retries')
         expected = retries + 1
         outcome, folders, _ = self.run_spot_route(expected)
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertEqual(len(folders), expected)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         rows = self.fallback_rows()
@@ -3309,7 +3189,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(len(folders), 2)
                 reason = 'The final log upload failed' if log_error else fakes[-1].boot_error
                 fallback_reason = f'The box failure retry limit is reached: {reason}'
-                self.assertEqual(outcome, cloud_gate.CloudDeclined(fallback_reason))
+                self.assertEqual(outcome, cloud_gate.LocalFallback(fallback_reason))
                 for folder in folders:
                     self.assertEqual(cloud_gate.read(folder / 'outcome.json'), {'status': 'box-failed', 'reason': reason})
                 current = cloud_gate.read(folders[-1].parent / 'current.json')
@@ -3328,7 +3208,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
     def test_spot_interruption_without_another_choice_falls_back(self) -> None:
         outcome, folders, _ = self.run_spot_route(1, one_choice=True)
         self.assertEqual(len(folders), 1)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('Spot interruption on 1 attempts; No cloud capacity choice remains'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; No cloud capacity choice remains'))
 
     def test_zero_spot_retries_keeps_the_first_interruption_as_the_limit(self) -> None:
         path = self.root / 'cloud_gate.conf'
@@ -3336,8 +3216,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         expected = cloud_gate.settings().whole('spot_interruption_retries') + 1
         outcome, folders, _ = self.run_spot_route(expected)
         self.assertEqual(len(folders), expected)
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
 
         with self.subTest(box_failures=1, interruptions=1):
@@ -3347,7 +3227,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                        path.read_text()))
             outcome, folders, _ = fixture.run_spot_route(1, box_failures=1)
             self.assertEqual(len(folders), 2)
-            self.assertEqual(outcome, cloud_gate.CloudDeclined(
+            self.assertEqual(outcome, cloud_gate.LocalFallback(
                 'Spot interruption on 1 attempts; The Spot interruption retry limit is reached'))
             current = cloud_gate.read(folders[-1].parent / 'current.json')
             self.assertEqual(current['box_failures'], 1)
@@ -3356,7 +3236,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
     def test_spot_retry_checks_the_spend_limit_again(self) -> None:
         outcome, folders, fakes = self.run_spot_route(1, limit_after_first=True)
         self.assertEqual(len(folders), 2)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('Spot interruption on 1 attempts; daily_limit'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; daily_limit'))
         self.assertEqual(fakes[1].launches, [])
         self.assertFalse((folders[1] / 'launch.json').exists())
 
@@ -3368,11 +3248,11 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                                                  switch_off_after_first=True)
                 self.assertEqual(len(folders), 1)
                 self.assertEqual(len(fakes[0].launches), 1)
-                self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-                assert isinstance(outcome, cloud_gate.CloudDeclined)
+                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+                assert isinstance(outcome, cloud_gate.LocalFallback)
                 self.assertTrue(outcome.reason.endswith('cloud gates are off (cloud_gate.conf enabled=off)'))
 
-    def off_route_with_gate(self, start: str, service: mock.Mock) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+    def off_route_with_gate(self, start: str, service: mock.Mock) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
         """Run the route with the switch off and one open gate whose worker has the given start."""
         self.configure_gate('enabled=off')
         book = ledger.CostLedger(self.state)
@@ -3382,7 +3262,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         book.gate_owner('gate-worker', ledger.GateWorkerOwner(os.getpid(), start, str(self.root / 'gate-worker')))
         return self.off_route(service)
 
-    def off_route(self, service: mock.Mock) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+    def off_route(self, service: mock.Mock) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
         mode = gate.SuiteMode.GATE
         return cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                     service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
@@ -3392,7 +3272,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         assert isinstance(identity, Started)
         service = mock.Mock(return_value=0)
         outcome = self.off_route_with_gate(identity.start, service)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('cloud gates are off (cloud_gate.conf enabled=off)'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)'))
         service.assert_not_called()
 
     def test_switch_off_keeps_its_reason_when_the_reconcile_start_fails(self) -> None:
@@ -3403,14 +3283,14 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                    side_effect=ledger.LedgerUnavailable('fixture ledger fault')):
                 outcomes.append(self.off_route(mock.Mock(return_value=0)))
         refused.assert_called_once()
-        self.assertEqual(outcomes, [cloud_gate.CloudDeclined('cloud gates are off (cloud_gate.conf enabled=off)')] * 2)
+        self.assertEqual(outcomes, [cloud_gate.LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')] * 2)
         self.assertEqual(error.getvalue().splitlines(), ['The cloud gate reconcile did not start: fixture service refusal',
                                                          'The cloud gate reconcile did not start: fixture ledger fault'])
 
     def test_switch_off_runs_only_the_reconcile_step_for_an_open_gate(self) -> None:
         service = mock.Mock(return_value=0)
         outcome = self.off_route_with_gate('dead-worker-start', service)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('cloud gates are off (cloud_gate.conf enabled=off)'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)'))
         service.assert_called_once()
         command = cast(list[str], service.call_args.args[0])
         self.assertEqual(command[command.index('-m') + 1:command.index('-m') + 3], ['scripts.aws_target.cloud_gate', '--reconcile'])
@@ -3433,8 +3313,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         expected = retries + 1
         outcome, folders, _ = self.run_spot_route(expected, crash_after=expected)
         self.assertEqual([cloud_gate.read(folder / 'launch.json')['variant'] for folder in folders], list(range(expected)))
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         self.assertEqual(self.fallback_rows()[-1]['reason'], outcome.reason)
         service = mock.Mock(side_effect=AssertionError('The retry budget is spent'))
@@ -3452,8 +3332,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         expected = cloud_gate.settings().whole('spot_interruption_retries') + 1
         outcome, folders, _ = self.run_spot_route(expected, crash_after=1)
         self.assertEqual([cloud_gate.read(folder / 'launch.json')['variant'] for folder in folders], list(range(expected)))
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         self.assertEqual(len(self.fallback_rows()), 1)
 
@@ -3461,8 +3341,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         expected = cloud_gate.settings().whole('spot_interruption_retries') + 1
         outcome, folders, _ = self.run_spot_route(expected, crash_on_retry_save=True)
         self.assertEqual([cloud_gate.read(folder / 'launch.json')['variant'] for folder in folders], list(range(expected)))
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
 
     def test_spot_retry_checks_a_lower_limit_before_preparation_on_resume(self) -> None:
@@ -3473,7 +3353,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(cloud_gate.settings().whole('spot_interruption_retries'), interruptions - 1)
         self.assertEqual(len(folders), interruptions)
         self.assertEqual(sum(len(fake.launches) for fake in fakes), interruptions)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined(
+        self.assertEqual(outcome, cloud_gate.LocalFallback(
             f'Spot interruption on {interruptions} attempts; The Spot interruption retry limit is reached'))
         current = cloud_gate.read(folders[0].parent / 'current.json')
         pending = folders[0].parent / ledger.text(current, 'attempt')
@@ -3529,7 +3409,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             service = mock.Mock(side_effect=AssertionError('A saved result needs no service'))
             with redirect_stdout(StringIO()):
                 outcome = self._run_gate_for_resume(service)
-            self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+            self.assertIsInstance(outcome, cloud_gate.LocalFallback)
             self.assertFalse((folder / 'imported.json').exists())
             service.assert_not_called()
 
@@ -3693,7 +3573,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                         with mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as service:
                             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                                      module_time_limit_s=1800, selected=selected)
-                        self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed after the test selection'))
+                        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
                         service.assert_not_called()
                         continue
                     request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED, 1800,
@@ -3725,7 +3605,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         self.assertNotEqual(folders[0], folders[1])
         self.assertFalse(any((folder / 'outcome.json').exists() for folder in folders))
 
-    def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.CloudDeclined | cloud_gate.CloudCompleted:
+    def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
         with mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')):
             return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.GATE, full=False,
                 module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.GATE))
@@ -3787,7 +3667,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             return 0
 
         with redirect_stdout(StringIO()):
-            self.assertIsInstance(self._run_gate_for_resume(leave_incompatible_request), cloud_gate.CloudDeclined)
+            self.assertIsInstance(self._run_gate_for_resume(leave_incompatible_request), cloud_gate.LocalFallback)
         old = root / ledger.text(cloud_gate.read(current), 'attempt')
 
         def settle_or_run(command: Sequence[str]) -> int:
@@ -3813,7 +3693,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
               redirect_stdout(StringIO())):
             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                      module_time_limit_s=1800, service=settle_or_run)
-            self.assertEqual(outcome, cloud_gate.CloudDeclined('The incompatible cloud attempt has not ended'))
+            self.assertEqual(outcome, cloud_gate.LocalFallback('The incompatible cloud attempt has not ended'))
             self.assertEqual(cloud_gate.read(current)['attempt'], old.name)
             self.assertEqual(events, [('settle', old)])
             events.clear()
@@ -3853,8 +3733,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         changed.unlink()
         (self.state / 'gate-deployment.json').unlink()
         service = mock.Mock(side_effect=AssertionError('A saved result needs no service'))
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
+        local = gate.GateRun((), 1, 0, selection_certified=True)
 
         def route_changed_tree(*_arguments: object, **_options: object) -> gate.GateRun | str:
             _ = changed.write_text('temporary checkout change\n')
@@ -3866,21 +3745,18 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 changed.unlink()
 
         with (mock.patch.object(cloud_gate, 'route', side_effect=route_changed_tree),
-              mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO()),
-              self.assertRaisesRegex(GateRefused, 'AWS gate failed')):
-            _ = gate.run_gate_suites(self.repo, target=target)
+              mock.patch.object(gate, 'run_suites', return_value=local), redirect_stdout(StringIO())):
+            run = gate.run_gate_suites(self.repo, target=gate.NO_GATE_ASSIGNMENT)
 
-        local.assert_not_called()
+        self.assertIs(run, local)
         self.assertFalse((folder / 'imported.json').exists())
         service.assert_not_called()
 
         _ = changed.write_text('temporary checkout change\n')
-        with (mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
-              mock.patch.object(admission_client, 'report_execution'),
-              mock.patch.object(cloud_gate, 'service_command', side_effect=AssertionError('The result is saved')),
+        with (mock.patch.object(cloud_gate, 'service_command', side_effect=AssertionError('The result is saved')),
               mock.patch.object(gate, 'run_suites', side_effect=AssertionError('The saved result matches')),
               redirect_stdout(StringIO())):
-            run = gate.run_gate_suites(self.repo, target=target)
+            run = gate.run_gate_suites(self.repo, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(run.passed)
         self.assertTrue((folder / 'imported.json').is_file())
 
@@ -3890,23 +3766,20 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                                kind=gate.GateJobKind.TYPE_CHECK),), 1, 0)
         finish = mock.Mock(side_effect=self._finish_gate_for_resume)
         run_cloud = partial(cloud_gate.run, service=finish)
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
-        for route, types in (('saved', ()), ('fresh', ()), ('cloud and types', ('scripts',))):
+        for route, types in (('saved', ()), ('fresh', ()), ('fallback', ()), ('cloud and types', ('scripts',))):
             finish.reset_mock()
             with (self.subTest(route=route), redirect_stdout(StringIO()),
                   mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake cloud service')),
-                  mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
-                  mock.patch.object(admission_client, 'report_execution'),
-                  mock.patch.object(cloud_gate, 'run', side_effect=run_cloud),
+                  mock.patch.object(cloud_gate, 'run', side_effect=None if route == 'fallback' else run_cloud,
+                                    return_value=cloud_gate.LocalFallback('fixture fallback')),
                   mock.patch.object(gate, 'run_suites', return_value=typed) as local,
                   mock.patch.object(gate, 'finalize_gate', create=True,
                                     wraps=cast(object, getattr(gate, 'finalize_gate', None))) as finalize):
-                run = gate.run_gate_suites(self.repo, types, target=target)
+                run = gate.run_gate_suites(self.repo, types, target=gate.NO_GATE_ASSIGNMENT)
                 self.assertTrue(run.passed)
                 self.assertTrue((folder / 'imported.json').is_file())
                 self.assertEqual(finish.call_count, int(route in ('fresh', 'cloud and types')))
-                self.assertEqual(local.call_count, int(bool(types)))
+                self.assertEqual(local.call_count, int(route in ('fallback', 'cloud and types')))
                 finalize.assert_called_once()
                 self.assertIs(run, cast(object, finalize.call_args.args[-1]))
 
@@ -4001,7 +3874,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         with mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=change_head):
             outcome = self._run_gate_for_resume(service)
 
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed during the cloud attempt'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
         self.assertFalse((folder / 'imported.json').exists())
         self.assertFalse(store.host_file('aws', 0).exists())
         service.assert_not_called()
@@ -4016,7 +3889,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
         outcome = self._run_gate_for_resume(service)
 
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('The result differs from the current tree'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The result differs from the current tree'))
         self.assertFalse(store.host_file('aws', 0).exists())
         service.assert_not_called()
 
@@ -4065,7 +3938,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         with redirect_stdout(StringIO()):
             first = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                    service=service, gate_job=incoming_job)
-            self.assertEqual(first, cloud_gate.CloudDeclined('The scaler service has no final result'))
+            self.assertEqual(first, cloud_gate.LocalFallback('The scaler service has no final result'))
             fake.has_result = True
             second = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                     service=service, gate_job=replace(incoming_job, unit='other-unit'))
@@ -4123,7 +3996,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                 (job_b, 'The fixture lost its service connection')):
                 outcome = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                          service=service, gate_job=job)
-                self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
+                self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
             imported = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                       service=no_service, gate_job=job_a)
 
@@ -4171,7 +4044,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 with mock.patch.object(cloud_gate, 'prepare', side_effect=OSError('fixture preparation failed')):
                     failed = cloud_gate.run(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                             service=no_service, gate_job=job_a)
-                self.assertEqual(failed, cloud_gate.CloudDeclined('fixture preparation failed'))
+                self.assertEqual(failed, cloud_gate.LocalFallback('fixture preparation failed'))
                 no_service.assert_not_called()
                 pointer = cloud_gate.read(current)
                 folder = root / ledger.text(pointer, 'attempt')
@@ -4231,7 +4104,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             count = len(folders)
             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service, selected=stale)
-            self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed after the test selection'))
+            self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
             self.assertEqual(len(folders), count)
         reserve = cloud_gate.cloud_reservation
 
@@ -4248,7 +4121,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service,
                                      selected=gate.TreeSelection(('scripts/fixture/test_two.py',), tree))
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed after the test selection'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
         start.assert_not_called()
 
     def test_both_service_types_have_stop_cleanup(self) -> None:
@@ -4407,7 +4280,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                              module_time_limit_s=1800, service=service)
                 if changed_head:
-                    self.assertEqual(outcome, cloud_gate.CloudDeclined('The checkout changed during the cloud attempt'))
+                    self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
                     self.assertFalse(destination.exists())
                     rows = self.fallback_rows()
                     self.assertEqual(len(rows), before + 1)
@@ -4436,7 +4309,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         service = mock.Mock(side_effect=AssertionError('An absent stack needs no service'))
         outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                  module_time_limit_s=1800, service=service)
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         service.assert_not_called()
 
     def test_disabled_cloud_gate_skips_deployment_and_aws(self) -> None:
@@ -4450,7 +4323,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service)
         reason = 'cloud gates are off (cloud_gate.conf enabled=off)'
-        self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
+        self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
         lock.assert_not_called()
         deployment.assert_not_called()
         service.assert_not_called()
@@ -4463,8 +4336,8 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         mode = gate.SuiteMode.GATE
         outcome = cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                        service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
-        assert isinstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertIn("cloud_gate.conf: enabled='invalid':", outcome.reason)
         service.assert_not_called()
 
@@ -4475,7 +4348,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
               redirect_stderr(StringIO()) as errors):
             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                 module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-        self.assertEqual(outcome, cloud_gate.CloudDeclined('image or stack is absent'))
+        self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
         self.assertEqual(errors.getvalue(), 'Cloud gate fallback row was not written: fixture row write denied\n')
         append.assert_called_once()
         service.assert_not_called()
@@ -4495,7 +4368,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 service = mock.Mock(side_effect=AssertionError('No service may start'))
                 outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-                self.assertEqual(outcome, cloud_gate.CloudDeclined('image or stack is absent'))
+                self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['attempt'], rows[-1]['reason'], rows[-1]['mode']),
@@ -4516,7 +4389,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 service = mock.Mock(side_effect=AssertionError('No service may start'))
                 outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-                self.assertEqual(outcome, cloud_gate.CloudDeclined(str(error)))
+                self.assertEqual(outcome, cloud_gate.LocalFallback(str(error)))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual(rows[-1]['reason'], str(error))
@@ -4550,7 +4423,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 before = len(self.fallback_rows())
                 outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
-                self.assertEqual(outcome, cloud_gate.CloudDeclined(reason))
+                self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['attempt'], rows[-1]['reason']), (attempts[-1], reason))
@@ -4586,7 +4459,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                               (gate.SuiteMode.TARGETED, StepJob('test-all'))):
                 outcome = cloud_gate.run(self.repo, mode=mode, full=True, module_time_limit_s=1800,
                                          service=service, gate_job=job)
-                self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
                 self.assertTrue(self.admission.callers_released())
                 request = requests[-1]
                 self.assertEqual(request.place, wire.CloudPlace('aws'))
@@ -4596,7 +4469,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 self.assertEqual(request.owner.pid, os.getpid())
                 self.assertEqual(request.run, wire.RunIdentity(request.owner.pid, request.owner.start_time))
 
-    def test_cloud_refusal_releases_the_scaler_reservation(self) -> None:
+    def test_cloud_fallback_releases_before_local_memory_admission(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         def service(command: Sequence[str]) -> int:
             record, = self.admission.caller_reservations().values()
@@ -4604,17 +4477,22 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
             folder = Path(command[command.index('--worker') + 1])
             cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
             return 0
-        target = aws_gate_assignment()
-        authorization = wire.FirstAuthorization(target.assignment, placement.assigned_claim_reference(target.assignment))
-        run_cloud = partial(cloud_gate.run, service=service)
-        with (mock.patch.object(admission_client, 'consume_permission', return_value=authorization),
-              mock.patch.object(admission_client, 'report_execution') as report,
-              mock.patch.object(cloud_gate, 'run', side_effect=run_cloud),
-              mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO()),
-              self.assertRaisesRegex(GateTookNoRun, 'AWS gate took no run: capacity')):
-            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=target)
-        local.assert_not_called()
-        report.assert_called_once()
+        run = cloud_gate.run
+        def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
+                  selected: gate.AllModules | gate.TreeSelection, gate_job: StepJob | GateJobNotRecorded
+                  ) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+            return run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                       selected=selected, gate_job=gate_job, service=service)
+        def local(repo: Path, *_args: object, **_kwargs: object) -> gate.GateRun:
+            self.assertTrue(self.admission.callers_released())
+            with gate.gate_reservation(repo, self.root, gate.BuildHoldWait(), mode=gate.SuiteMode.TARGETED) as place:
+                record, = self.admission.caller_reservations().values()
+                self.assertGreater(record.need, 0)
+                place.status = 0
+            return gate.GateRun((), 0, 0)
+        with (mock.patch.object(cloud_gate, 'run', side_effect=route),
+              mock.patch.object(gate, 'run_suites', side_effect=local), redirect_stdout(StringIO())):
+            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(self.admission.callers_released())
 
     def test_cloud_service_error_releases_its_slot(self) -> None:
@@ -4626,17 +4504,17 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 service = mock.Mock(side_effect=OSError('fixture service error'))
                 outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                          module_time_limit_s=1800, service=service)
-                self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+                self.assertIsInstance(outcome, cloud_gate.LocalFallback)
                 self.assertTrue(self.admission.callers_released())
                 if tree_error:
-                    self.assertEqual(outcome, cloud_gate.CloudDeclined('fixture tree error'))
+                    self.assertEqual(outcome, cloud_gate.LocalFallback('fixture tree error'))
                     service.assert_not_called()
 
     def test_route_uses_installed_limit_and_handles_missing_results(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True, module_time_limit_s=1800,
                                  service=lambda _command: 0)
-        self.assertIsInstance(outcome, cloud_gate.CloudDeclined)
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         self.assertTrue(self.admission.callers_released())
 
         installed = self.root / '.claude/config/aws_target.conf'
@@ -4681,6 +4559,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                 with mock.patch.dict(os.environ, {'CONF_DIR': str(checkout), 'AWS_TARGET_CONFIG': str(installed)}):
                     outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                              module_time_limit_s=1800, service=service)
-                self.assertEqual(outcome, cloud_gate.CloudDeclined('daily_limit'))
+                self.assertEqual(outcome, cloud_gate.LocalFallback('daily_limit'))
                 self.assertEqual(fake.launches, [])
                 self.assertTrue(self.admission.callers_released())

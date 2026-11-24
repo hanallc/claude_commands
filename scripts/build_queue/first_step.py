@@ -223,8 +223,6 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
                   owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
-    from scripts.build_targets.gate_targets import aws_gate_candidate
-
     arguments = tuple(command)
     flag = gate_natedev_only_flag(arguments)
     if flag is not None and "natedev" not in targets:
@@ -240,12 +238,9 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     builder = client.placement_constraint_builder()
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:
-        if name == "aws":
-            named = (aws_gate_candidate(),)
-        else:
-            fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
-                Pinned(name), writes_tree=False)
-            named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)
+        fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
+            Pinned(name), writes_tree=False)
+        named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)
         if not named:
             raise FirstStepRefused(f'gate target {name} is not configured')
         candidates.extend(replace(candidate, eligibility=placement.FixedExclusion(f"{flag} runs only on natedev"))
