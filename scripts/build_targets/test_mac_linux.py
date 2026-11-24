@@ -1150,8 +1150,10 @@ fi
 
         try:
             with patch.object(mac_linux, 'send_guest_execution', publish):
+                started = time.monotonic()
                 self.check_folder_report_stream()
-                self.assertTrue(report_started.is_set())
+                self.assertLess(time.monotonic() - started, 0.5, 'The guest result waited for the report deadline.')
+                self.assertTrue(report_started.wait(2))
                 self.assertFalse(report_finished.is_set())
         finally:
             release_report.set()
@@ -1179,7 +1181,7 @@ fi
 
         with patch.object(mac_linux, 'Thread', side_effect=new_thread):
             self.check_folder_report_stream()
-        self.assertTrue(start_refused.is_set())
+            self.assertTrue(start_refused.wait(2))
 
     def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
         refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),

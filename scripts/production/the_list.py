@@ -1852,18 +1852,19 @@ def _own_page_entry(entry: ItemChange) -> bool:
 
 
 def _unread_changes(item: ListItem) -> Generator[ItemChange]:
-    """Give the changes since the last read, newest first, without nate's own page entries.
+    """Give unread changes in reverse order. Exclude page feedback and its Tell state change.
 
     A read or a close ends the walk. A reopen is the last change that the walk gives.
     """
     if not isinstance(item.unread_since, datetime):
         return
-    for change in reversed(item.log):
+    for index in range(len(item.log) - 1, -1, -1):
+        change = item.log[index]
         content = change.what
         if (isinstance(content, MarkedRead) or content == "Marked read"
                 or isinstance(content, FieldChange) and content.action == "Closed"):
             return
-        if not _own_page_entry(change):
+        if not (_own_page_entry(change) or _is_tell_move(item.log, index)):
             yield change
         if isinstance(content, Reopened) or content == "Reopened":
             return

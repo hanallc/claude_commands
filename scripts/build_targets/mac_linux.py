@@ -1126,7 +1126,7 @@ def warn_guest_report(reason: str) -> None:
 
 def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
                        reports: ExitStack, *, folder_payload: bytes) -> None:
-    """Read the timeout before starting the report worker. Bound both waits."""
+    """Start the report worker. Collect only reports from bare start lines."""
     started = monotonic()
     preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
     ready: Future[Callable[[], None]] = Future()
@@ -1149,14 +1149,23 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
                     if monotonic() >= deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
                 except Exception as error:
-                    result.set_exception(error)
+                    if folder_payload:
+                        warn_guest_report(str(error) or type(error).__name__)
+                    else:
+                        result.set_exception(error)
                 else:
                     result.set_result(None)
 
             worker = Thread(target=report, daemon=True)
             worker.start()
         except Exception as error:
-            ready.set_exception(error)
+            if folder_payload:
+                warn_guest_report(str(error) or type(error).__name__)
+            else:
+                ready.set_exception(error)
+            return
+
+        if folder_payload:
             return
 
         def collect_report() -> None:
@@ -1184,7 +1193,8 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
         except Exception as error:
             warn_guest_report(str(error) or type(error).__name__)
 
-    _ = reports.callback(collect)
+    if not folder_payload:
+        _ = reports.callback(collect)
 
 
 def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,

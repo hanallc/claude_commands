@@ -1304,6 +1304,23 @@ class TheListTests(unittest.TestCase):
                                    open_ask=bool(the_list.answerable_asks(again, staff.snapshot())))
         self.assertEqual(chip, list_page.ListChip.WORKING)
 
+    def test_go_clears_the_unread_ask_after_tell_moves_the_item(self) -> None:
+        item, _ = self.read_with_go_asks(the_list.ItemState.WAITING_FOR_NATE)
+        old_update = the_list.unread_update(item)
+        ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id, what="Merge.",
+                               why="It needs nate.", config=False, requester=MORTY.id, source="morty")
+        before_tell = the_list.load(MORTY.id, item.id)
+        _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback("tell-1", "My own words."))
+        told = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=old_update)
+        self.assertEqual(told.state, the_list.ItemState.WORKING)
+        self.assertIsInstance(told.unread_since, datetime)
+        self.assertEqual(the_list.unread_update(told), the_list.unread_update(before_tell))
+        self.assertEqual(the_list.open_asks(told), (ask,))
+
+        given = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate").item
+        self.assertEqual(the_list.open_asks(given), ())
+        self.assertEqual(given.unread_since, the_list.NoTimestamp.UNSET)
+
     def test_an_open_ask_whose_target_has_no_staff_row_does_not_hold_a_waiting_item(self) -> None:
         gone = staff.StaffId("gone-session")
         item, _ = self.read_with_go_asks(the_list.ItemState.WAITING_FOR_NATE, gone)
