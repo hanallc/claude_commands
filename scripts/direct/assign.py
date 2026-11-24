@@ -502,14 +502,14 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
     instance = uuid.uuid4()
     message = directory / f"{slot}_prompt{suffix}.{instance}.txt"
-    work_order = prompt.read_bytes()
-    content = work_order.decode("utf-8") + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    work_order = prompt.read_text(encoding="utf-8")
+    content = work_order + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
     write_text_atomic(message, content)
     try:
-        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message, len(work_order))
+        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message, len(work_order.encode("utf-8")))
     finally:
         with suppress(OSError, SystemExit, ValueError, recorder_state.OldRecorderState):
             if message.is_file() and not _prompt_adopted(run, instance):

@@ -720,16 +720,19 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assert_lock_held(pass_record.recorder_lock_path(self.session_dir))
             write_bytes(path, data, mode=mode)
 
+        order = self.prompt.read_bytes()
         for pass_status in ("active", "completed"):
             if pass_status == "completed":
                 self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
-            cases = ("intact", "missing", "changed")
+            cases = ("intact", "missing", "changed", "CRLF work order")
             for damage in (*cases, "pending completion") if pass_status == "active" else cases:
                 with self.subTest(status=pass_status, damage=damage):
                     if damage == "missing":
                         prompt.unlink()
                     elif damage == "changed":
                         write_text_atomic(prompt, "Changed prompt bytes.\n")
+                    elif damage == "CRLF work order":
+                        _ = self.prompt.write_bytes(order.replace(b"\n", b"\r\n"))
                     elif damage == "pending completion":
                         self.native.agent.complete(pane)
                         reply = pass_record.dispatch_delivery(passed).reply_file
@@ -742,6 +745,8 @@ class AssignLauncherTests(HookAssignmentFixture):
                             self.assertEqual((phase / "impl_status").read_text(), "done\n")
                         else:
                             _ = self.successful()
+                    if damage == "CRLF work order":
+                        _ = self.prompt.write_bytes(order)
                     state = read_object(self.session_dir / "progress_history_state.json")
                     saved = assign.object_map(assign.object_map(state["pass"])["impl"])
                     expected = "completed" if damage == "pending completion" else pass_status
@@ -1255,9 +1260,9 @@ class AssignLauncherTests(HookAssignmentFixture):
             return run_command(command, **options)
 
         def start_with_ticket_lock(args: pass_record.WorkerDispatchRequest,
-                              selection: pass_record.DispatchSelection | pass_record.SelectDispatchAtRecorder
-                              ) -> str:
-            instance = start_pass(args, selection)
+                                   selection: pass_record.DispatchSelection | pass_record.SelectDispatchAtRecorder,
+                                   state: dict[str, object], membership: staff.StaffSnapshot, **flags: bool) -> str:
+            instance = start_pass(args, selection, state, membership, **flags)
             if args.team_slot.startswith("style-ticket-"):
                 self.assert_lock_held(manifest.parent / "ticket-paths.lock")
             return instance
@@ -1337,10 +1342,14 @@ class AssignLauncherTests(HookAssignmentFixture):
                         elif case == widened_ticket:
                             ticket_paths = manifest.with_name("ticket-paths.txt")
                             write_text_atomic(self.paths, "\n".join([*paths, widened]) + "\n")
-                            refused = self.launch("implement", "--to", worker_name)
-                            self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stderr)
-                            self.assertEqual(manifest.read_bytes(), saved_manifest)
-                            style_plan.widen_live_dispatch(self.session_dir, "widened", (widened,))
+                            for options in ((), ("--reply-file", str(reply_file))):
+                                with self.subTest(options=options):
+                                    if options:
+                                        style_plan.widen_live_dispatch(self.session_dir, "widened", (widened,))
+                                        saved_manifest = manifest.read_bytes()
+                                    refused = self.launch("implement", "--to", worker_name, *options)
+                                    self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stderr)
+                                    self.assertEqual(manifest.read_bytes(), saved_manifest)
                             paths = ticket_paths.read_text().splitlines()
                             saved = pass_record.pass_slots(pass_record.read_state(self.session_dir))[worker_name]
                             saved_path = Path(str(saved["prompt_file"]))

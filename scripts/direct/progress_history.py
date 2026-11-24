@@ -1309,11 +1309,12 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
     request = pass_recorder.WorkerDispatchRequest(
-        session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role, launcher_pid=os.getpid(),
+        launch=pass_recorder.PassLaunchRequest(session_dir.expanduser().resolve(), phase, role, str(prompt), fix_cause, lens),
+        team_slot=slot, launcher_pid=os.getpid(),
         worker_name=worker_name, worker_id=worker_id, launcher_command=launcher_command,
-        prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
+        activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family=called.family, called_model=called.model, called_effort=called.effort,
-        fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens,
+        fix_pass=fix_pass, dispatch_kind=kind,
         new_pass_instance_id=new_pass_instance_id, assignment=assignment,
         assign_status_file=os.environ.get(ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else "",
     )
