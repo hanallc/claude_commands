@@ -154,7 +154,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], target.assignment.episode)
                 return 0
 
-            with (mock.patch.dict(os.environ, {"CONF_DIR": directory, "HOME": directory,
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"], "CONF_DIR": directory, "HOME": directory,
                                                "CLAUDE_SESSION_NAME": "gate-fixture"}, clear=True),
                   mock.patch.object(build_folders, "repo_word", return_value="claude"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(repo)),
@@ -234,7 +234,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
         arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
         parent = mock.Mock(spec=OuterReservation)
         for nested in (True, False):
-            with (self.subTest(nested=nested), mock.patch.dict(os.environ, clear=True),
+            with (self.subTest(nested=nested), mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                  mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                   mock.patch.object(gate, 'outer_reservation', return_value=parent if nested else None),
                   mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, placed('aws')]),
                   mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(
