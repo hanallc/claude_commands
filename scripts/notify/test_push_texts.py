@@ -11,15 +11,18 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Iterator
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest import mock
+from urllib.parse import parse_qs
 
-from scripts.notify import gpu_xid
-from scripts.notify import push_texts
+from scripts.lib import conf
 from scripts.message import session_send
+from scripts.notify import gpu_xid, pushover, push_texts
 from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 
@@ -175,6 +178,52 @@ class PushTextTests(unittest.TestCase):
         entries = push_texts.catalog()
         self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")
         self.assertEqual(missing_approvals(entries, push_texts.REVIEWED_FILE), [])
+
+    def test_aws_snapshot_examples_show_the_approved_title_action_and_body(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "aws.snapshot_failed")
+        action = "Action: In a terminal on natedev, run aws-deploy. It asks for your AWS admin passphrase."
+        cases = {
+            "permission": (
+                "AWS refused a price read",
+                "AWS refused the us-east-2 price read, because our AWS setup does not allow it yet. "
+                + "The command adds the permission. After 2 hours without the read, "
+                + "AWS merge tests can pick a region that costs more.",
+            ),
+            "regional_permissions": (
+                "AWS refused 2 reads",
+                "AWS refused the price read in us-east-2, because our AWS setup does not allow it yet. "
+                + "AWS refused the Standard quota read in us-west-2, because our AWS setup does not allow it yet. "
+                + "The command adds the permission. After 2 hours without the reads, "
+                + "AWS merge tests can pick a region that costs more.",
+            ),
+        }
+        self.assertEqual({example.name for example in entry.examples}, set(cases))
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                title, body = cases[example.name]
+                push = push_texts.render_entry(entry, example.values)
+                self.assertEqual(push.posted_title, title)
+                self.assertEqual(push.message, f"{action}\n{body}")
+
+    def test_aws_snapshot_phone_message_keeps_every_region_and_the_consequence(self) -> None:
+        config = Path(__file__).resolve().parents[2] / "config/cloud_gate.conf"
+        regions = conf.read(config).words("spot_candidate_regions")
+        failures = json.dumps([{"region": region, "read": "price"} for region in regions])
+        push = push_texts.render("aws.snapshot_failed", failures=failures)
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with (mock.patch.object(pushover, "read_keys", return_value={"user": "user", "token": "token"}),
+              mock.patch.object(pushover, "log"), redirect_stdout(StringIO())):
+            self.assertEqual(pushover.post_message(push.sender, "0", push.posted_title, push.message,
+                                                   Path("unused-test-keys"), post, "", text_id=push.id), 0)
+        post.assert_called_once()
+        request = parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        self.assertEqual(request["title"], [f"AWS refused {len(regions)} reads"])
+        message, = request["message"]
+        for region in regions:
+            self.assertIn(region, message)
+        self.assertTrue(message.endswith(
+            "After 2 hours without the reads, AWS merge tests can pick a region that costs more."
+            + "\n\nSent by: buildlog · Template: aws.snapshot_failed"))
 
     def test_every_catalog_example_fits_the_phone_title_and_body_limits(self) -> None:
         for entry in push_texts.catalog():

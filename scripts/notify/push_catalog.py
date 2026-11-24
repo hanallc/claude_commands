@@ -1,6 +1,8 @@
 """Script phone texts and named cases reviewed before delivery."""
+import json
 import re
 from functools import partial
+from typing import cast
 
 from scripts.notify.gpu_xid import XID_MEANINGS
 from scripts.notify.push_texts import (ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate,
@@ -33,6 +35,44 @@ def nightly_result_values(given: dict[str, str]) -> TemplateValues:
         raise ValueError(f"nightly.result: missing values {sorted(required - given.keys())}, "
                          + f"extra values {sorted(given.keys() - required)}")
     return TemplateValues({"outcome": given["outcome"]}, dict(given))
+
+
+def regional_read_refusal(read: str, regions: list[str]) -> str:
+    """Name the regions where AWS refused the same read."""
+    if len(regions) == 1:
+        return f"AWS refused the {read} read in {regions[0]}, because our AWS setup does not allow it yet."
+    region_list = ", ".join(regions[:-1]) + " and " + regions[-1]
+    return f"AWS refused the {read} reads in {region_list}, because our AWS setup does not allow them yet."
+
+
+def snapshot_failure_values(given: dict[str, str]) -> TemplateValues:
+    """Group the refused regions by read name."""
+    if given.keys() != {"failures"}:
+        raise ValueError("aws.snapshot_failed: supply only failures")
+    records = cast(object, json.loads(given["failures"]))
+    if not isinstance(records, list) or not records:
+        raise ValueError("aws.snapshot_failed: supply at least one refused read")
+    reads = cast(list[object], records)
+    regions_by_read: dict[str, list[str]] = {}
+    for record in reads:
+        if not isinstance(record, dict):
+            raise ValueError("aws.snapshot_failed: each refused read needs a region and a read name")
+        fields = cast(dict[str, object], record)
+        region, read = fields.get("region"), fields.get("read")
+        if not isinstance(region, str) or not region or not isinstance(read, str) or not read:
+            raise ValueError("aws.snapshot_failed: each refused read needs a region and a read name")
+        regions_by_read.setdefault(read, []).append(region)
+    if len(reads) == 1:
+        (read, regions), = regions_by_read.items()
+        read_summary = f"a {read} read"
+        sentences = f"AWS refused the {regions[0]} {read} read, because our AWS setup does not allow it yet."
+        consequence = "After 2 hours without the read, AWS merge tests can pick a region that costs more."
+    else:
+        read_summary = f"{len(reads)} reads"
+        sentences = " ".join(regional_read_refusal(read, regions) for read, regions in regions_by_read.items())
+        consequence = "After 2 hours without the reads, AWS merge tests can pick a region that costs more."
+    return TemplateValues({"read_summary": read_summary, "refusals": sentences, "consequence": consequence},
+                          dict(given))
 
 
 def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> TemplateValues:
@@ -72,19 +112,16 @@ ENTRIES = (
             + "claude4: Mac Tue 12-01, natedev Mon 12-14\nclaude5: Mac Wed 12-02, natedev Tue 12-15"}),
          PushExample("safety", {"accounts": "claude4: Mac Sat 11-28"})),
         purpose="The weekly sitting or safety margin requires a preventive Claude login.", header=False),
-    # These examples use regional permission errors.
-    PushText("aws.snapshot_failed", "buildlog", "note", "Cloud gates use old AWS prices",
-        ActionTemplate("To allow AWS reads, in a terminal on natedev, run ~/.claude/scripts/lib/py "
-                       + "~/.claude/scripts/aws_target/deploy.py up --approve-resources"),
-        "Cloud gates run merge tests on AWS and pick a region from hourly AWS reads.\n{failures}\n"
-        + "With old data, a gate can pick a region that costs more or is full.\n"
-        + "The command only allows these reads and costs nothing. Then the hourly refresh works. "
-        + "It needs your AWS admin passphrase.",
+    PushText("aws.snapshot_failed", "buildlog", "note", "AWS refused {read_summary}",
+        ActionTemplate("In a terminal on natedev, run aws-deploy. It asks for your AWS admin passphrase."),
+        "{refusals} The command adds the permission. {consequence}",
         (PushExample("permission", {
-            "failures": "AWS refused the us-east-2 price read."}),
+            "failures": json.dumps([{"region": "us-east-2", "read": "price"}])}),
          PushExample("regional_permissions", {
-            "failures": "AWS refused the us-east-2 price read.\nAWS refused the us-west-2 Standard quota read."})),
-        purpose="AWS denied a regional read that the gate deployment can repair."),
+            "failures": json.dumps([{"region": "us-east-2", "read": "price"},
+                                    {"region": "us-west-2", "read": "Standard quota"}])})),
+        purpose="AWS denied a regional read that the gate deployment can repair.",
+        expand_values=snapshot_failure_values),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
         "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
         + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",

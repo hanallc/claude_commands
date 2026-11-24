@@ -1178,8 +1178,8 @@ It renders the registered `aws.snapshot_failed` text and sends it through `push_
 The message key comes from the streak's start time.
 The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
-The fixed action requests `deploy.py up --workload merge-gates --approve-resources` on natedev.
-That command updates permissions but does not replace scaler credentials.
+The notice tells the user to run `aws-deploy` on natedev.
+The command updates permissions and keeps the scaler credentials.
 Credential errors, timeouts, network errors, and throttling send no phone notice.
 `deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
 The table continues to show each regional failure.

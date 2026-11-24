@@ -88,16 +88,38 @@
   },
   "aws.snapshot_failed": {
     "permission": {
-      "objections": [],
-      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
-      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
-      "time": "2026-11-14T09:44:39.593642-05:00"
+      "objections": [
+        {
+          "quote": "The command adds the permission. After 2 hours without the read, AWS merge tests can pick a region that costs more.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "AWS refused a price read",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (image 12b54537d309), 11:41 PST Nov 24: title AWS refused a price read; action run aws-deploy on natedev; After 2 hours without the read, AWS merge tests can pick a region that costs more; reviewer: claude-opus-5-5",
+      "sha256": "16f760ffdde00de936754282015392384d4d2325de4b7275044621417afe8297",
+      "time": "2026-11-24T14:42:25.775799-05:00"
     },
     "regional_permissions": {
-      "objections": [],
-      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
-      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
-      "time": "2026-11-14T09:44:48.290566-05:00"
+      "objections": [
+        {
+          "quote": "AWS refused 2 reads",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "AWS refused the Standard quota read in us-west-2, because our AWS setup does not allow it yet.",
+          "rule": "short-plain-sentences"
+        },
+        {
+          "quote": "The command adds the permission. After 2 hours without the reads, AWS merge tests can pick a region that costs more.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (image 12b54537d309), 11:41 PST Nov 24: title AWS refused a price read; action run aws-deploy on natedev; After 2 hours without the read, AWS merge tests can pick a region that costs more; reviewer: claude-opus-5-5",
+      "sha256": "16f760ffdde00de936754282015392384d4d2325de4b7275044621417afe8297",
+      "time": "2026-11-24T14:42:34.195985-05:00"
     }
   },
   "build_hold.blocking": {
