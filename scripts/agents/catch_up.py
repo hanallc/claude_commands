@@ -2,6 +2,7 @@
 """Print the last blocks of a saved Claude or Codex conversation.
 
 Usage: catch_up.py NATIVE_ID [--blocks N] [--chars N]
+       catch_up.py NATIVE_ID --user-prompts --near ISO_TIME [--minutes N]
 
 The defaults and the tool line length come from config/catch_up.conf.
 
@@ -20,7 +21,7 @@ import argparse
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, tzinfo
+from datetime import datetime, timezone, tzinfo
 import json
 from pathlib import Path
 import re
@@ -30,6 +31,18 @@ from typing import cast
 from scripts.lib import conf, transcripts
 
 CODEX_FOLDERS = ("sessions", "archived_sessions")
+TIME_FORMAT = "%m-%d %H:%M:%S"
+GENERATED_TAGS = "|".join((
+    "system-reminder", "task-notification", "agent-message", "cross-session-message", "environment_context",
+    "hook-output", "local-command-caveat", "local-command-stdout", "local-command-stderr",
+))
+GENERATED_BLOCK = re.compile(rf"<(?P<tag>{GENERATED_TAGS})(?:\s[^>]*)?>.*?</(?P=tag)>", re.DOTALL)
+GENERATED_START = re.compile(rf"^<(?:{GENERATED_TAGS})(?:\s|>)")
+GENERATED_PREFIXES = (
+    "# AGENTS.md instructions\n", "Another Claude session sent a message", "[Cross-session ",
+    "[SYSTEM NOTIFICATION", "Your claude.ai usage limit has reset.", "UserPromptSubmit hook ",
+    "SessionStart hook ",
+)
 
 
 @dataclass(frozen=True)
@@ -114,7 +127,7 @@ def _claude_blocks(at: str, record: dict[str, object]) -> Iterator[Block]:
             yield Block(at, "result", _text(part.get("content"), ("text",)), one_line=True)
 
 
-def record_blocks(line: bytes) -> Iterator[Block]:
+def record_blocks(line: bytes, *, user_prompts: bool = False) -> Iterator[Block]:
     """Read the blocks of one transcript line of either family; other lines give none."""
     try:
         record = _fields(cast(object, json.loads(line)))
@@ -126,6 +139,11 @@ def record_blocks(line: bytes) -> Iterator[Block]:
     if kind in ("response_item", "compacted"):
         yield from _codex_blocks(at, kind, _fields(record.get("payload")))
     elif kind in ("user", "assistant"):
+        if user_prompts:
+            content = _fields(record.get("message")).get("content")
+            if (record.get("isSynthetic") or record.get("isVisibleInTranscriptOnly")
+                    or any(part.get("type") == "tool_result" for part in _parts(content))):
+                return
         yield from _claude_blocks(at, record)
 
 
@@ -147,9 +165,38 @@ def last_blocks(path: Path, count: int, window: int) -> list[Block]:
             window *= 2
 
 
+def _utc_time(value: str, zone: tzinfo) -> datetime:
+    if re.search(r"[T ]\d{2}", value) is None:
+        raise ValueError("expected a date and time")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.astimezone(timezone.utc)
+
+
+def _prompts_near(path: Path, near: datetime, minutes: int, zone: tzinfo) -> Iterator[tuple[datetime, str]]:
+    with transcripts.open_transcript(path) as stream:
+        for line in stream:
+            for block in record_blocks(line, user_prompts=True):
+                if block.label != "user":
+                    continue
+                try:
+                    at = _utc_time(block.at, zone)
+                except (ValueError, OverflowError):
+                    continue
+                if abs(at - near).total_seconds() / 60 > minutes:
+                    continue
+                text = block.text.strip()
+                if GENERATED_START.match(text) or text.startswith(GENERATED_PREFIXES):
+                    continue
+                text = GENERATED_BLOCK.sub("", text).rstrip()
+                if text:
+                    yield at, text
+
+
 def render(block: Block, chars: int, tool_chars: int, zone: tzinfo) -> str:
     try:
-        shown = datetime.fromisoformat(block.at).astimezone(zone).strftime("%m-%d %H:%M:%S")
+        shown = datetime.fromisoformat(block.at).astimezone(zone).strftime(TIME_FORMAT)
     except ValueError:
         shown = block.at or "no time"
     if block.one_line:
@@ -164,18 +211,36 @@ def render(block: Block, chars: int, tool_chars: int, zone: tzinfo) -> str:
 def main(arguments: list[str] | None = None) -> int:
     from scripts.lib.user_zone import user_zone
 
-    parser = argparse.ArgumentParser(prog="catch_up.py", description="Print the last blocks of a saved conversation.")
+    parser = argparse.ArgumentParser(prog="catch_up.py", description="Read a saved conversation.")
     _ = parser.add_argument("native_id", metavar="NATIVE_ID")
     _ = parser.add_argument("--blocks", type=int, help="blocks to print (default: blocks in config/catch_up.conf)")
     _ = parser.add_argument("--chars", type=int,
                             help="characters kept in one message (default: message_chars in config/catch_up.conf)")
+    _ = parser.add_argument("--user-prompts", action="store_true", help="print only typed user prompts near a time")
+    _ = parser.add_argument("--near", metavar="ISO_TIME", help="center time for --user-prompts")
+    _ = parser.add_argument("--minutes", type=int,
+                            help="minutes on each side of --near (default: near_minutes in config/catch_up.conf)")
     options = parser.parse_args(arguments)
-    limits = conf.read("catch_up")
     native_id = cast(str, options.native_id)
     given_blocks, given_chars = cast(int | None, options.blocks), cast(int | None, options.chars)
-    blocks = limits.whole("blocks") if given_blocks is None else given_blocks
-    chars = limits.whole("message_chars") if given_chars is None else given_chars
-    if blocks < 1 or chars < 1:
+    user_prompts = cast(bool, options.user_prompts)
+    near_text, minutes = cast(str | None, options.near), cast(int | None, options.minutes)
+    near: datetime | None = None
+    zone = user_zone()
+    if user_prompts:
+        if near_text is None:
+            parser.error("--user-prompts requires --near ISO_TIME")
+        if given_blocks is not None or given_chars is not None:
+            parser.error("--blocks and --chars cannot be used with --user-prompts")
+        if minutes is not None and minutes < 0:
+            parser.error("--minutes must be zero or more")
+        try:
+            near = _utc_time(near_text, zone)
+        except (ValueError, OverflowError):
+            parser.error(f"--near requires an ISO time, for example 2026-11-24T13:30:00-08:00 (got {near_text!r})")
+    elif near_text is not None or minutes is not None:
+        parser.error("--near and --minutes require --user-prompts")
+    if (given_blocks is not None and given_blocks < 1) or (given_chars is not None and given_chars < 1):
         parser.error("--blocks and --chars must be 1 or more")
     try:
         path = find_transcript(native_id)
@@ -184,9 +249,17 @@ def main(arguments: list[str] | None = None) -> int:
     except NoSavedTranscript as error:
         print(f"catch_up.py: {error}", file=sys.stderr)
         return 1
+    limits = conf.read("catch_up")
+    if near is not None:
+        window_minutes = limits.whole("near_minutes") if minutes is None else minutes
+        for at, text in _prompts_near(path, near, window_minutes, zone):
+            shown = at.astimezone(zone).strftime(TIME_FORMAT)
+            print(f"[{shown}]\n{text}")
+        return 0
+    blocks = limits.whole("blocks") if given_blocks is None else given_blocks
+    chars = limits.whole("message_chars") if given_chars is None else given_chars
     found = last_blocks(path, blocks, limits.whole("window_bytes"))
     tool_chars = limits.whole("tool_chars")
-    zone = user_zone()
     print(f"{path}: last {len(found)} blocks, times in {zone.key}")
     for block in found:
         print(render(block, chars, tool_chars, zone))

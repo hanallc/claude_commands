@@ -415,6 +415,12 @@ A Claude compaction summary is one block. A Codex compaction summary is encrypte
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
 
+`scripts/agents/catch_up.py NATIVE_ID --user-prompts --near ISO_TIME [--minutes N]` reads typed prompts from the saved transcript.
+`near_minutes` in `config/catch_up.conf` sets the default window on each side of `ISO_TIME` to 10 minutes.
+If `ISO_TIME` has no offset, the reader uses the user's time zone.
+The reader prints each prompt in full with its time in the user's zone, in `%m-%d %H:%M:%S` format.
+It skips tool results, hook text, system reminders and messages from other sessions.
+
 ### Create a producer
 
 `agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
