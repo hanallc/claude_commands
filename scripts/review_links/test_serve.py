@@ -25,7 +25,7 @@ import time
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -44,13 +44,13 @@ from uuid import uuid4
 from scripts.aws_target import aws_page, machines_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
-from scripts.build_queue import memory_feed
+from scripts.build_queue import memory_feed, memory_files
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
-    record_store, staff, the_list, tidy_wrapped, update_registration,
+    record_store, staff, the_list, tidy_wrapped, unrouted_alert, update_registration,
 )
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
@@ -233,6 +233,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                 '--behavior', 'Each group starts at 1', '--see', 'Numbers start at 1',
                 '--link', '1'*40, '--evidence', 'The page test passes', '--completed', '2026-11-01'])
         self.assertEqual((result, errors.getvalue()), (0, ''))
+
+    @staticmethod
+    def submission_draft_folder(draft_id: str) -> Path:
+        return review_submissions._request_folder(draft_id)  # pyright: ignore[reportPrivateUsage]
 
     def new_item_http(self, body: bytes | None = None, *, query: str = '',
                       headers: dict[str, str] | None = None, finished: bool = False) -> HttpReply:
@@ -710,7 +714,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_shared_dialog_opens_from_all_ten_served_console_pages(self) -> None:
-        from scripts.build_queue import memory_files
         from scripts.disks import disks_page
         from scripts.review_links.test_new_item_dialog import DialogFixture, capture_dialogs
 
@@ -1940,6 +1943,49 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(cache.get().records, {})
             deliver.assert_not_called()
 
+        builds = self.root / "builds"
+        builds.mkdir(exist_ok=True)
+        _ = write_config_fixture(conf.path("memory_feed"), f"output_folder={builds}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.builds.owner={request.recipient_id}\n")
+        place = f"/builds/{memory_files.PAGE_NAME}?show=all"
+        capture = replace(FIXTURE_CAPTURE, place=place)
+        state = request.page_state
+        assert state is not None
+        with (patch.object(change_page, "send_to_staff") as deliver,
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(server, "launch_page_capture") as launch):
+            for choice in ("renew", "omit"):
+                with self.subTest(screenshot=choice):
+                    attempt = replace(request, page="builds", request_id="r6-" + uuid4().hex,
+                                      evidence=new_item_dialog.PageDataEvidence("Builds", (("Step", "State"),)),
+                                      page_state=replace(state, url=f"http://127.0.0.1:{self.port}{place}",
+                                                         title="Builds", include_screenshot=False, viewport=None))
+                    fields = {**asdict(attempt), "token": server.new_item_token}
+                    key = attempt.request_id + uuid4().hex
+                    expired = self.new_item_http(json.dumps({**fields, "capture_key": key}).encode(), finished=True)
+                    self.assertEqual((expired.status, json.loads(expired.body)["code"]), (409, "screenshot_expired"))
+                    if choice == "renew":
+                        key = attempt.request_id + uuid4().hex
+                        fields.update(capture_key=key, defer_capture=asdict(capture))
+                    reply = self.new_item_http(json.dumps(fields).encode(), finished=True)
+                    self.assertEqual(reply.status, 200, reply.body)
+                    result = cast(dict[str, str], json.loads(reply.body))
+                    details = review_items.submission_origin(cache.get().records[result["key"]])
+                    assert isinstance(details, new_item_dialog.ReviewSubmission)
+                    self.assertEqual((details.page, details.page_state, details.evidence, details.images),
+                                     ("builds", attempt.page_state, attempt.evidence, ()))
+                    if choice == "renew":
+                        self.assertEqual(details.capture_intent, new_item_dialog.DeferredCaptureIntent(
+                            key, attempt.request_id, capture))
+                        launch.assert_called_once_with(key, "/test/firefox", capture, queued=False)
+                    else:
+                        self.assertIs(details.capture_intent, new_item_dialog.NoDeferredCapture.ABSENT)
+                        self.assertEqual(launch.call_count, 1)
+                    retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
+                    self.assertEqual((retry.status, json.loads(retry.body)["id"]), (200, result["id"]))
+            self.assertEqual(deliver.call_count, 2)
+            self.assertEqual(len(investigation.records(request.recipient_id)), 2)
+
     def test_capture_keys_keep_ready_images_and_resume_pending_previews_after_restart(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
 
@@ -3123,14 +3169,28 @@ class ReviewLinksServerTests(unittest.TestCase):
         kinds = [kind if kind != "feedback" else new_item_dialog.SubmissionKind.INVESTIGATION
                  for kind, _, _ in new_item_dialog.KINDS]
         notices: list[staff.StaffId] = []
+        attempts: list[tuple[staff.StaffId, str]] = []
+        delivered: set[tuple[staff.StaffId, str]] = set()
+        fail_notice_for = staff.StaffId("")
 
-        def send_notice(recipient: staff.StaffRow, message: str) -> None:
+        def send_notice(recipient: staff.StaffId, sender: str, message: str, *options: str
+                        ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
             self.assertIn("Check the Scheduled item.", message)
-            notices.append(recipient.id)
+            self.assertEqual(sender, "morty")
+            self.assertEqual(options[options.index("--recipient-key") + 1], recipient)
+            attempt = recipient, options[options.index("--key") + 1]
+            attempts.append(attempt)
+            if recipient == fail_notice_for:
+                return send_result.UnconfirmedSendOutcome(), "The result is uncertain."
+            if attempt in delivered:
+                return send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("skipped", "", "")), ""
+            notices.append(recipient)
+            delivered.add(attempt)
+            return send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", "")), ""
 
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(the_list, "_send_assignment_notice", side_effect=send_notice),
+              patch.object(unrouted_alert, "message_outcome", side_effect=send_notice),
               capture_sender("send_message")):
             for page in sorted(page_frame.OWNER_PAGES):
                 options = self.new_item_http(query=f"?page={page}")
@@ -3195,18 +3255,27 @@ class ReviewLinksServerTests(unittest.TestCase):
             draft = "r6-" + uuid4().hex
             bug = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, showrunner.id), page="builds",
                           page_recipient=new_item_dialog.PageRecipient.SELECTED, request_id=draft)
-            first = self.new_item_http(self.new_item_body(bug), finished=True)
-            self.assertEqual(first.status, 200, first.body)
-            before = {item.id for item in the_list.records(morty.id)}
-            denied = self.new_item_http(json.dumps({**scheduled, "request_id": draft}).encode(), finished=True)
-            self.assertEqual((denied.status, json.loads(denied.body)["id"]), (409, json.loads(first.body)["id"]))
-            self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
-            write = serve.write_scheduled_draft
+            for kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.QUESTION,
+                         new_item_dialog.SubmissionKind.PROPOSAL):
+                for lose_directory in (False, True):
+                    with self.subTest(native_kind=kind, lose_directory=lose_directory):
+                        draft = "r6-" + uuid4().hex
+                        request = replace(bug, kind=kind, request_id=draft)
+                        first = self.new_item_http(self.new_item_body(request), finished=True)
+                        self.assertEqual(first.status, 200, first.body)
+                        if lose_directory:
+                            shutil.rmtree(self.submission_draft_folder(draft))
+                        before = {item.id for item in the_list.records(morty.id)}
+                        denied = self.new_item_http(json.dumps({**scheduled, "request_id": draft}).encode(), finished=True)
+                        self.assertEqual((denied.status, json.loads(denied.body)["id"]),
+                                         (409, json.loads(first.body)["id"]))
+                        self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
+            publish = review_submissions._publish_receipt  # pyright: ignore[reportPrivateUsage]
 
-            def fail_receipt(folder: Path, claim: serve.PendingScheduledDraft | serve.SavedScheduledDraft) -> None:
-                if isinstance(claim, serve.SavedScheduledDraft):
+            def fail_receipt(folder: Path, saved: review_submissions.FilingDestination) -> None:
+                if isinstance(saved, review_submissions.ListItemDestination):
                     raise OSError("The receipt write failed.")
-                write(folder, claim)
+                publish(folder, saved)
 
             for failure in ("List write", "receipt write"):
                 with self.subTest(failure=failure):
@@ -3215,7 +3284,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     before = {item.id for item in the_list.records(morty.id)}
                     notices.clear()
                     with (patch.object(the_list, "add", side_effect=OSError("The List write failed."))
-                          if failure == "List write" else patch.object(serve, "write_scheduled_draft", fail_receipt)):
+                          if failure == "List write" else patch.object(review_submissions, "_publish_receipt", fail_receipt)):
                         reply = self.new_item_http(body, finished=True)
                     self.assertEqual(reply.status, 503, reply.body)
                     self.assertEqual(notices, [])
@@ -3225,7 +3294,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                                      page="builds", page_recipient=new_item_dialog.PageRecipient.SELECTED,
                                      request_id=draft)
                     denied = self.new_item_http(self.new_item_body(native), finished=True)
-                    self.assertEqual((denied.status, json.loads(denied.body)["code"]), (409, "draft_pending"))
+                    conflict = cast(dict[str, object], json.loads(denied.body))
+                    if failure == "List write":
+                        self.assertEqual((denied.status, conflict["code"]), (409, "draft_pending"))
+                    else:
+                        self.assertEqual((denied.status, conflict["code"], conflict["id"]),
+                                         (409, "already_filed", next(iter(saved_before_retry))))
                     reply = self.new_item_http(body, finished=True)
                     self.assertEqual(reply.status, 200, reply.body)
                     receipt = cast(dict[str, object], json.loads(reply.body))
@@ -3235,46 +3309,107 @@ class ReviewLinksServerTests(unittest.TestCase):
                     denied = self.new_item_http(self.new_item_body(native), finished=True)
                     self.assertEqual((denied.status, json.loads(denied.body)["id"]), (409, receipt["id"]))
 
-            for words in (scheduled["words"], "Try different words after the draft directory is lost."):
-                with self.subTest(retry_words=words):
+            diagnostics = StringIO()
+            with redirect_stderr(diagnostics):
+                self.assertEqual(tuple(review_submissions.committed_page_captures()), ())
+            self.assertEqual(diagnostics.getvalue(), "")
+
+            for retry_kind in ("original", "edited", "native"):
+                with self.subTest(retry_kind=retry_kind):
                     draft = "r6-" + uuid4().hex
                     submitted = {**scheduled, "request_id": draft}
                     before = {item.id for item in the_list.records(morty.id)}
-                    with patch.object(serve, "write_scheduled_draft", fail_receipt):
+                    with patch.object(review_submissions, "_publish_receipt", fail_receipt):
                         failed = self.new_item_http(json.dumps(submitted).encode(), finished=True)
                     self.assertEqual(failed.status, 503, failed.body)
                     existing, = {item.id for item in the_list.records(morty.id)} - before
-                    shutil.rmtree(serve.submission_draft_folder(draft))
+                    shutil.rmtree(self.submission_draft_folder(draft))
                     damaged = the_list.folder(morty.id) / "L9999.md"
                     _ = damaged.write_bytes(b"\xff")
                     try:
-                        retry = self.new_item_http(json.dumps({**submitted, "words": words}).encode(), finished=True)
+                        if retry_kind == "native":
+                            retry_body = self.new_item_body(replace(bug, request_id=draft, page="list"))
+                        else:
+                            words = scheduled["words"] if retry_kind == "original" else "Try different words."
+                            retry_body = json.dumps({**submitted, "words": words}).encode()
+                        retry = self.new_item_http(retry_body, finished=True)
                     finally:
                         damaged.unlink()
                     response = cast(dict[str, object], json.loads(retry.body))
-                    self.assertEqual((retry.status, response["code"], response["id"]), (409, "already_filed", existing))
+                    self.assertEqual(response["id"], existing)
+                    if retry_kind == "original":
+                        self.assertEqual(retry.status, 200, retry.body)
+                        self.assertIn("Starts:", str(response["readback"]))
+                        self.assertIn("Producer: producer", str(response["receipt"]))
+                    else:
+                        self.assertEqual((retry.status, response["code"]), (409, "already_filed"))
                     self.assertEqual({item.id for item in the_list.records(morty.id)}, before | {existing})
 
-            with self.subTest(failure="draft parent sync"):
-                draft = "r6-" + uuid4().hex
-                body = json.dumps({**scheduled, "request_id": draft}).encode()
-                before = {item.id for item in the_list.records(morty.id)}
-                draft_parent = serve.submission_draft_folder(draft).parent
-                sync = atomic_file.sync_folder
+            for level in ("root", "draft"):
+                with self.subTest(failure=f"{level} parent sync"):
+                    draft = "r6-" + uuid4().hex
+                    body = json.dumps({**scheduled, "request_id": draft}).encode()
+                    before = {item.id for item in the_list.records(morty.id)}
+                    draft_parent = self.submission_draft_folder(draft).parent
+                    if level == "root":
+                        draft_parent = draft_parent.parent
+                    sync = atomic_file.sync_folder
 
-                def fail_parent(directory: Path) -> None:
-                    if directory == draft_parent:
-                        raise OSError("The draft parent sync failed.")
-                    sync(directory)
+                    def fail_parent(directory: Path) -> None:
+                        if directory == draft_parent:
+                            raise OSError("The draft parent sync failed.")
+                        sync(directory)
 
-                with patch.object(atomic_file, "sync_folder", fail_parent):
-                    failed = self.new_item_http(body, finished=True)
-                self.assertEqual(failed.status, 503, failed.body)
-                self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
-                retry = self.new_item_http(body, finished=True)
-                self.assertEqual(retry.status, 200, retry.body)
-                receipt = cast(dict[str, object], json.loads(retry.body))
-                self.assertEqual({item.id for item in the_list.records(morty.id)} - before, {receipt["id"]})
+                    with patch.object(atomic_file, "sync_folder", fail_parent):
+                        for _attempt in range(2):
+                            failed = self.new_item_http(body, finished=True)
+                            self.assertEqual(failed.status, 503, failed.body)
+                            self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
+                    retry = self.new_item_http(body, finished=True)
+                    self.assertEqual(retry.status, 200, retry.body)
+                    receipt = cast(dict[str, object], json.loads(retry.body))
+                    self.assertEqual({item.id for item in the_list.records(morty.id)} - before, {receipt["id"]})
+
+            write_location = review_submissions._write_location  # pyright: ignore[reportPrivateUsage]
+
+            def fail_notice_progress(path: Path, destination: review_submissions.FilingDestination
+                                     | review_submissions.ListDraftClaim | review_submissions.NativeDraftAlias) -> None:
+                if path.name == "receipt.json" and isinstance(destination, review_submissions.ListItemDestination):
+                    raise OSError("The notice progress write failed.")
+                write_location(path, destination)
+
+            for failure in ("producer", "showrunner", "receipt progress"):
+                with self.subTest(notice_failure=failure):
+                    draft = "r6-" + uuid4().hex
+                    body = json.dumps({**scheduled, "request_id": draft}).encode()
+                    recipient = producer.id if failure == "producer" else showrunner.id
+                    fail_notice_for = recipient if failure != "receipt progress" else staff.StaffId("")
+                    notices.clear()
+                    attempts.clear()
+                    with (patch.object(review_submissions, "_write_location", fail_notice_progress)
+                          if failure == "receipt progress" else nullcontext()):
+                        failed = self.new_item_http(body, finished=True)
+                    self.assertEqual(failed.status, 503, failed.body)
+                    expected = [identity for identity in (producer.id, showrunner.id) if identity != recipient]
+                    self.assertEqual(notices, expected)
+                    first_keys = dict(attempts)
+                    fail_notice_for = staff.StaffId("")
+                    attempts.clear()
+                    retry = self.new_item_http(body, finished=True)
+                    self.assertEqual(retry.status, 200, retry.body)
+                    if failure == "receipt progress":
+                        self.assertEqual([identity for identity, _key in attempts], [producer.id, showrunner.id])
+                        self.assertEqual(dict(attempts)[producer.id], first_keys[producer.id])
+                    else:
+                        self.assertEqual(attempts, [(recipient, first_keys[recipient])])
+                    self.assertCountEqual(notices, [producer.id, showrunner.id])
+                    confirmed_keys = first_keys | dict(attempts)
+                    shutil.rmtree(self.submission_draft_folder(draft))
+                    attempts.clear()
+                    recovered = self.new_item_http(body, finished=True)
+                    self.assertEqual((recovered.status, recovered.body), (200, retry.body))
+                    self.assertCountEqual(attempts, list(confirmed_keys.items()))
+                    self.assertCountEqual(notices, [producer.id, showrunner.id])
 
             members = staff.snapshot()
             before = {item.id for item in the_list.records(morty.id)}

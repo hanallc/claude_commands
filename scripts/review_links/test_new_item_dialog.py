@@ -116,6 +116,11 @@ function untilError() {
   observer.observe(dialog, {attributes:true, subtree:true});
  });
 }
+async function confirmEarlierSend() {
+ const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+ send.click();
+ return await saved;
+}
 async function sendSaved() {
  const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
  const shown = new Promise((resolve, reject) => {
@@ -448,29 +453,27 @@ async function sendSaved() {
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('Keep this draft and its image.');
    paste();
-   const preview = dialog.querySelector('[data-previews] img');
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The page Send files before the response is lost.');
    const ownerRequest = ownerPosts.findLast(post => post.request_id);
+   type('Keep this draft and its image after editing.');
    dialog.querySelector('[data-cancel]').click();
    await open();
    await whenShown(noScreenshot);
+   const preview = dialog.querySelector('[data-previews] img');
    const previewReply = await originalFetch(preview.src).catch(() => null);
-   check(textarea.value === 'Keep this draft and its image.' &&
-         dialog.querySelector('[data-previews] img') === preview && previewReply?.ok,
-         'Reopen keeps the failed page draft and its pasted image.');
-   type('Keep this draft and its image after editing.');
-   await trySend();
-   check(dialog.open && textarea.value === 'Keep this draft and its image after editing.' &&
-         error.textContent === 'This item was already filed as I2. Any change after that Send was not sent.',
-         'A changed Send reports the first ID and keeps the draft open.');
-   const changedRequest = ownerPosts.findLast(post => post.request_id);
-   check(changedRequest.page === 'builds' && changedRequest.images[0].base64_data === png &&
-         changedRequest.request_id === ownerRequest.request_id,
-         'The first retry uses the old request ID and the current evidence.');
+   check(textarea.value === ownerRequest.words && textarea.readOnly && previewReply?.ok &&
+         send.textContent === 'Retry', 'Reopen locks the submitted words and preserves the pasted image.');
+   check((await confirmEarlierSend()).detail.id === 'I2' && dialog.open &&
+         textarea.value === 'Keep this draft and its image after editing.',
+         'Retry confirms the original item and restores the edited draft.');
+   const retried = ownerPosts.findLast(post => post.request_id);
+   check(JSON.stringify(retried) === JSON.stringify(ownerRequest),
+         'Retry sends the original ID, page, and pasted image.');
    check((await sendSaved()).detail.id === 'I3' &&
-         ownerPosts.findLast(post => post.request_id).request_id !== ownerRequest.request_id,
-         'The next Send uses a new ID and files the retained draft.');
+         ownerPosts.findLast(post => post.request_id).request_id !== ownerRequest.request_id &&
+         ownerPosts.findLast(post => post.request_id).images[0].base64_data === png,
+         'The next Send uses a new ID and files the retained words and image.');
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('The first item before replacement.');
@@ -478,15 +481,18 @@ async function sendSaved() {
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The first item files before the response is lost.');
    const firstDraft = ownerPosts.at(-1);
-   dialog.querySelector('[data-cancel]').click();
-   await open();
    type('The replacement item.');
    to()[1].click();
-   await trySend();
-   check(dialog.open && textarea.value === 'The replacement item.' && to()[1].checked &&
-         error.textContent === 'This item was already filed as I4. Any change after that Send was not sent.',
-         'The notice shows the saved ID and keeps the changed words.');
-   check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The retry uses the original draft ID.');
+   dialog.querySelector('[data-cancel]').click();
+   await open();
+   check(textarea.value === firstDraft.words && textarea.readOnly && send.textContent === 'Retry' &&
+         to().find(input => input.checked).value === firstDraft.recipient_id,
+         'Reopen locks the submitted recipient and words.');
+   check((await confirmEarlierSend()).detail.id === 'I4' && dialog.open &&
+         textarea.value === 'The replacement item.' && to()[1].checked,
+         'Retry confirms the saved ID and restores the changed recipient and words.');
+   check(JSON.stringify(ownerPosts.findLast(post => post.request_id)) === JSON.stringify(firstDraft),
+         'Retry uses the original payload.');
    const replacement = (await sendSaved()).detail;
    check(replacement.id === 'I5' && ownerPosts.at(-1).request_id !== firstDraft.request_id,
          'The next Send files the changed words for the selected recipient.');
@@ -762,18 +768,29 @@ RESTORED_SEND_PROBE = r"""
  const dialog = document.querySelector('#review-new-item');
  const button = document.querySelector('[data-owner-new]');
  const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
- const kind = '__KIND__';
+ const kind = '__KIND__', scenario = '__SCENARIO__';
  const selectedKind = dialog.querySelector('[name="kind"][value="' + kind + '"]');
  const recipient = id => dialog.querySelector('[name="recipient_id"][value="' + id + '"]');
- const original = JSON.parse(sessionStorage.getItem('test-restored-send') || 'null');
+ let original = JSON.parse(sessionStorage.getItem('test-restored-send') || 'null');
  const http = window.fetch;
- let posted;
+ let posted, expired = false;
+ const captureChoice = ['renew', 'omit'].includes(scenario);
  window.fetch = async (path, options) => {
+  if (path.startsWith('/console/review/new-item?capture_key=')) {
+   return new Response(Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0)), {headers:{'Content-Type':'image/png'}});
+  }
   if (path === '/console/review/new-item' && options?.body) {
    const payload = JSON.parse(options.body);
+   if (payload.page_capture && scenario === 'reopen') return new Promise(() => {});
+   if (payload.page_capture && captureChoice) return Response.json({capture_key:payload.capture_key}, {status:202});
+   if (payload.discard_capture) return Response.json({});
    if (payload.kind === kind) {
     posted = payload;
     if (!original) throw new TypeError('The Send response was lost.');
+    if (captureChoice && !expired) {
+     expired = true;
+     return Response.json({code:'screenshot_expired', error:'The screenshot expired.'}, {status:409});
+    }
     return Response.json(kind === 'scheduled'
      ? {id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.'} : {id:'I1'});
    }
@@ -787,17 +804,21 @@ RESTORED_SEND_PROBE = r"""
    observer.observe(dialog, {attributes:true, childList:true, subtree:true});
   });
  }
+ function enter(value) {
+  words.value = value;
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+ }
  try {
   button.closest('[data-page-owner]').dataset.pageOwner = original ? 'review' : '__FIRST_PAGE__';
   button.click();
   const include = dialog.querySelector('[name="include_page"]');
-  if (!original && include.checked) include.click();
+  const withCapture = captureChoice || scenario === 'reopen';
+  if (!original && !withCapture && include.checked) include.click();
   await ready(() => !!recipient('cargo-liner') && (!original || !send.disabled));
   if (!original) {
    selectedKind.click();
    recipient('cargo-liner').click();
-   words.value = 'Check the queue. Start Mon Nov 30 09:00.';
-   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   enter('Check the queue. Start Mon Nov 30 09:00.');
    if (kind === 'bug') {
     const clipboard = new DataTransfer();
     clipboard.items.add(new File([Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0))], 'queue.png', {type:'image/png'}));
@@ -805,22 +826,33 @@ RESTORED_SEND_PROBE = r"""
     Object.defineProperty(event, 'clipboardData', {value: clipboard});
     words.dispatchEvent(event);
    }
+   if (captureChoice) await ready(() => !dialog.querySelector('[data-shot]').hidden);
+   if (scenario === 'reopen') await ready(() => !dialog.querySelector('[data-capture-slot]').hidden);
    send.click();
    await ready(() => posted && send.form.getAttribute('aria-busy') === 'false');
    if (kind === 'scheduled') {
     check(send.textContent === 'Retry' && !send.disabled && words.readOnly &&
           recipient('cargo-liner').matches(':disabled'), 'A lost Scheduled Send locks the submitted fields.');
    }
-   if (!failures.length) {
+   if (scenario === 'reopen') {
+    check(Boolean(posted.defer_capture), 'The lost Bug Send includes a deferred screenshot.');
+    original = posted;
+    enter('Keep my later edit.');
+    recipient('builds-staff').click();
+    dialog.querySelector('[data-cancel]').click();
+    button.click();
+    await ready(() => !!recipient('cargo-liner') && !send.disabled);
+   } else if (!failures.length) {
     sessionStorage.setItem('test-restored-send', JSON.stringify(posted));
     location.reload();
     return;
    }
-  } else {
+  }
+  if (original) {
    check(selectedKind.checked && recipient('cargo-liner').checked && words.value === original.words,
-         'New item restores the kind, recipient, and words on another page.');
+         'New item restores the kind, recipient, and words.');
    check(words.readOnly && selectedKind.matches(':disabled') && recipient('cargo-liner').matches(':disabled') &&
-         include.disabled && !include.checked && send.textContent === 'Retry',
+         include.disabled && include.checked === withCapture && send.textContent === 'Retry',
          'The restored draft locks the submitted fields and displays Retry.');
    if (kind === 'bug') {
     const attachment = dialog.querySelector('[data-previews] button');
@@ -828,10 +860,41 @@ RESTORED_SEND_PROBE = r"""
    }
    recipient('builds-staff').click();
    check(recipient('cargo-liner').checked, 'The submitted recipient cannot change during recovery.');
+   if (captureChoice) {
+    send.click();
+    const choices = dialog.querySelector('[data-replace-capture]');
+    await ready(() => !choices.hidden && send.form.getAttribute('aria-busy') === 'false');
+    check(JSON.stringify(posted) === JSON.stringify(original), 'Retry first sends the original payload.');
+    check(send.disabled && words.readOnly && dialog.querySelector('[data-bug-page-state]').textContent.includes(original.page_state.url),
+          'An expired screenshot pauses Retry and keeps the submitted Bug data.');
+    choices.querySelector('[data-' + scenario + '-capture]').click();
+    await ready(() => choices.hidden && !send.disabled);
+   }
    const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
    send.click();
    await saved;
-   check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original payload.');
+   if (captureChoice) {
+    const {capture_key, defer_capture, page_state, ...sent} = posted;
+    const {capture_key: previousKey, page_state: previousState, ...previous} = original;
+    check(JSON.stringify(sent) === JSON.stringify(previous) &&
+          JSON.stringify(page_state) === JSON.stringify({...previousState, include_screenshot:false}),
+          'Retry preserves the draft ID, words, images, and page data after the screenshot choice.');
+    check(scenario === 'omit' ? !capture_key && !defer_capture
+     : capture_key !== previousKey && capture_key.startsWith(original.request_id) &&
+       defer_capture.place === new URL(original.page_state.url).pathname + new URL(original.page_state.url).search,
+     'Retry uses the chosen screenshot action for the original page.');
+   } else {
+    check(JSON.stringify(posted) === JSON.stringify(original), 'Retry sends the original payload.');
+   }
+   if (scenario === 'reopen') {
+    check(dialog.open && !words.readOnly && words.value === 'Keep my later edit.' && recipient('builds-staff').checked,
+          'The later edits return in a separate draft after the receipt.');
+    const next = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+    send.click();
+    await next;
+    check(posted.request_id !== original.request_id && posted.words === 'Keep my later edit.',
+          'The later edits use a new draft ID.');
+   }
    check(!sessionStorage.getItem('console.new-item.submitted'), 'The receipt clears the submitted draft.');
   }
  } catch (error) { failures.push(String(error)); }
@@ -1577,12 +1640,18 @@ class NewItemDialogTests(unittest.TestCase):
     def test_owner_button_opens_six_types_and_selects_the_owner_from_all_recipients(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         probes = {1440: OWNER_OPTIONS_PROBE, 390: OWNER_OPTIONS_PROBE}
-        for width, kind, page in ((1280, "scheduled", "builds"), (412, "scheduled", "list"), (1152, "bug", "builds")):
-            probes[width] = RESTORED_SEND_PROBE.replace("__FIRST_PAGE__", page).replace("__KIND__", kind)
+        for width, kind, page, scenario in ((1280, "scheduled", "builds", "reload"),
+                                           (412, "scheduled", "list", "reload"),
+                                           (1152, "bug", "builds", "reload"),
+                                           (1120, "bug", "builds", "reopen"),
+                                           (1080, "bug", "builds", "renew"),
+                                           (1040, "bug", "builds", "omit")):
+            probes[width] = (RESTORED_SEND_PROBE.replace("__FIRST_PAGE__", page).replace("__KIND__", kind)
+                             .replace("__SCENARIO__", scenario))
         fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in probes}
         capture_dialogs(temporary / "options.png", fixtures,
                         pages={width: fixture_page(width, photo=False, script=probe) for width, probe in probes.items()})
-        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: []})
+        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1080: [], 1040: []})
 
     def test_render_mounts_one_dialog_with_six_types(self) -> None:
         markup = new_item_dialog.render()

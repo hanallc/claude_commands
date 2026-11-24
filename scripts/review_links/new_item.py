@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import difflib
+import hashlib
 import json
 import os
 import platform
@@ -11,7 +12,8 @@ import re
 import secrets
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time
 from enum import IntEnum, StrEnum
@@ -21,8 +23,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.lib import conf, main_publish
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list
-from scripts.review_links import for_you, new_item_dialog, review_page, review_submissions
+from scripts.message import send_result
+from scripts.production import investigation, producer_map, repeat_rule, staff, the_list, unrouted_alert
+from scripts.review_links import change_page, for_you, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
@@ -457,7 +460,7 @@ class FilingRefusal(StrEnum):
     UNAVAILABLE_PRODUCER = "unavailable producer"
 
 
-class FilingRefused(ValueError):
+class FilingRefused(new_item_dialog.SubmissionError):
     """The filing checks failed before the item was saved."""
 
     def __init__(self, reason: FilingRefusal, message: str) -> None:
@@ -510,35 +513,9 @@ class DirectScheduledFiling(StrEnum):
 
 
 @dataclass(frozen=True)
-class ScheduledListAllocation:
-    number: int
-
-
-@dataclass(frozen=True)
-class ScheduledDraftIdentity:
-    id: str
-
-    def evidence(self) -> str:
-        return f"New item draft {self.id}"
-
-    def lookup(self, keeper: staff.StaffId) -> the_list.ListItem | ScheduledListAllocation:
-        """Find the saved draft or read the next number under the List lock."""
-        list_store = cast(Callable[[staff.StaffId], record_store.NumberedRecords], getattr(the_list, "_store"))
-        evidence = self.evidence()
-        marker = evidence.encode("utf-8")
-        store = list_store(keeper)
-        with store.list_allocation():
-            for path in store.folder().iterdir():
-                if path.suffix != ".md" or not store.valid_id(path.stem):
-                    continue
-                if marker not in path.read_bytes():
-                    continue
-                item = the_list.load(keeper, path.stem)
-                added = item.log[0].what
-                if (isinstance(added, the_list.FieldChange) and added.action == "Added"
-                        and added.fields.get("evidence") == evidence):
-                    return item
-            return ScheduledListAllocation(store.next_number())
+class ScheduledDraftFiling:
+    request_id: str
+    claim: review_submissions.ListDraftClaim
 
 
 @dataclass(frozen=True)
@@ -550,18 +527,19 @@ class ScheduledFiling:
     assignment: str
     readback: tuple[str, str]
 
-    def save(self, draft: ScheduledDraftIdentity | DirectScheduledFiling = DirectScheduledFiling.CLI,
-             *, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE) -> the_list.ListItem:
+    @property
+    def title(self) -> str:
         run = self.schedule.first if isinstance(self.schedule, the_list.ScheduledSeries) else self.schedule
+        return " ".join(run.words.split())
+
+    def save(self, draft: ScheduledDraftFiling | DirectScheduledFiling = DirectScheduledFiling.CLI) -> the_list.ListItem:
         changes: the_list.ItemChanges = {
             "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
             "unit": self.member.name if self.member.kind == "unit" else "",
         }
-        if isinstance(draft, ScheduledDraftIdentity):
-            # The List saves this field in the creation log with the item.
-            changes["evidence"] = draft.evidence()
-        return the_list.add(self.keeper, " ".join(run.words.split()), owner=self.member.id, source=SOURCE,
-                            changes=changes, number=number)
+        if isinstance(draft, ScheduledDraftFiling):
+            changes["evidence"] = review_submissions.list_draft_evidence(draft.request_id, draft.claim)
+        return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes)
 
 
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot) -> ScheduledFiling:
@@ -586,6 +564,71 @@ def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff
         raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, "The start must be in the future.")
     assignment = assignment_receipt(new_item_dialog.SCHEDULED_KIND, member, mapped, members, this_session=False)
     return ScheduledFiling(keeper, member, mapped.producer.id, schedule, assignment, schedule_lines(schedule))
+
+
+def _scheduled_draft_claim(filing: ScheduledFiling, digest: str,
+                           members: staff.StaffSnapshot) -> review_submissions.ListDraftClaim:
+    notices: list[review_submissions.ListAssignmentNotice] = []
+    warning = ""
+    if filing.producer != filing.keeper:
+        producer = members.by_id(filing.producer)
+        assert producer is not None
+        showrunner = producer_map.showrunner_of(filing.member, members)
+        if showrunner.kind == "showrunner":
+            owner_text = f"Its showrunner is {showrunner.name}."
+            notices.append(review_submissions.ListAssignmentNotice(
+                producer.id, "producer", f"{filing.title}. {owner_text}"))
+            notices.append(review_submissions.ListAssignmentNotice(
+                showrunner.id, "showrunner", f"{filing.title}. {producer.name} is its producer. "
+                + f"Send design questions on this item to {producer.name}."))
+        else:
+            notices.append(review_submissions.ListAssignmentNotice(
+                producer.id, "producer", f"{filing.title}. The item has no assigned showrunner."))
+            warning = "At least one assignment notice failed. The List item is saved."
+    return review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback,
+                                             tuple(notices), warning)
+
+
+def _deliver_scheduled_notice(notice: review_submissions.ListAssignmentNotice, identity: str, key: str) -> bool:
+    number = identity.removeprefix("L")
+    if notice.role == "producer":
+        launcher = cast(str, getattr(the_list, "_LAUNCHER"))
+        options = cast(tuple[str, ...], getattr(the_list, "_PRODUCER_UPDATE_OPTIONS"))
+        update = ", ".join(f"`{option}`" for option in options)
+        message = (f"You are the producer of item {number}: {notice.text}\n"
+                   + f"Run `{launcher} list --all --latest-status` to read it. "
+                   + f"Run `{launcher} update --id {identity}` to update it. Use any of {update}.")
+    else:
+        message = f"Item {number}: {notice.text}"
+    try:
+        outcome, error = unrouted_alert.message_outcome(
+            notice.recipient, "morty", message, "--recipient-kind", notice.role,
+            *change_page.review_send_options(key, notice.recipient))
+    except (OSError, subprocess.SubprocessError, UnicodeError) as failure:
+        error = str(failure)
+    else:
+        if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in {
+                "sent", "kept", "queued", "skipped"}:
+            return True
+    print(f"new_item: {identity} notice to {notice.recipient}: {error}", file=sys.stderr)
+    return False
+
+
+def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_submissions.ListItemDestination:
+    """File a browser Schedule and recover its receipt and notices on Retry."""
+    digest = hashlib.sha256(json.dumps([request.page, request.recipient_id, request.words]).encode()).hexdigest()
+
+    @contextmanager
+    def prepare() -> Generator[tuple[review_submissions.ListDraftClaim, Callable[[], the_list.ListItem]]]:
+        with investigation.recipient_locks(request.recipient_id):
+            members = staff.snapshot()
+            owner = review_submissions.selected_recipient(request.recipient_id, members)
+            filing = prepare_scheduled(owner, request.words, members)
+            claim = _scheduled_draft_claim(filing, digest, members)
+            yield claim, lambda: filing.save(ScheduledDraftFiling(request.request_id, claim))
+
+    return review_submissions.file_list_draft(request.request_id, digest, prepare=prepare,
+                                              deliver=_deliver_scheduled_notice)
 
 
 def scheduled_notice(item: the_list.ListItem, keeper: staff.StaffId, members: staff.StaffSnapshot) -> str:
