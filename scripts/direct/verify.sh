@@ -342,7 +342,7 @@ parse_routing_arguments() {
     fi
     for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
         case "$name" in
-            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
+            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|COPIES_MIRROR_LEASE_FDS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
                 printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
                 exit 2 ;;
         esac
@@ -536,6 +536,18 @@ VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
 PY="$VERIFY_START_DIR/../lib/py"
 VERIFY_METADATA_SCRIPT="$VERIFY_START_DIR/verify_metadata.py"
 
+# Read the current workspace members for the fmt scope.
+read_metadata() {
+    if [[ -n "${GATE_METADATA:-}" ]]; then
+        printf '%s\n' "$GATE_METADATA"
+    else
+        (
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            cargo metadata --no-deps --format-version 1
+        )
+    fi
+}
+
 # Read the optional feature pair and prepare Cargo's flags when requested.
 FEATURE_FLAGS=()
 take_features() {
@@ -658,7 +670,9 @@ compose_nextest_args() {
 
 validate_verify_step_list() (
     local length offset=0 targets=()
-    export GIT_OPTIONAL_LOCKS=0
+    # Resolve the interpreter without caching its path. Keep imports read-only.
+    export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}" CLAUDE_DISABLE_DATACLASS_CODE_CACHE=1
+    export PYTHONDONTWRITEBYTECODE=1 GIT_OPTIONAL_LOCKS=0
     for length in "${VERIFY_STEP_LENGTHS[@]}"; do
         set -- "${VERIFY_STEP_WORDS[@]:offset:length}"
         CMD=$1
@@ -678,9 +692,7 @@ validate_verify_step_list() (
     done
 
     if (( ${#targets[@]} )); then
-        # Check targets without writing interpreter or import caches.
-        CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}" CLAUDE_DISABLE_DATACLASS_CODE_CACHE=1 \
-            PYTHONDONTWRITEBYTECODE=1 VERIFY_PY_HELPER=VERIFY_STEP_TARGETS "$PY" -c '
+        VERIFY_PY_HELPER=VERIFY_STEP_TARGETS "$PY" -c '
 import sys
 with open(sys.argv[1]) as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_targets import target_config
@@ -870,9 +882,8 @@ finish_verify_verb_list() {
 }
 
 run_verify_verbs() {
-    local verb length offset=0 status list_run="" step_list=0
+    local verb length offset=0 status list_run step_list=0
     if (( ${#VERIFY_STEP_LENGTHS[@]} )); then
-        list_run=${BUILDLOG_RUN:-}
         step_list=1
     fi
     for verb in ${VERIFY_VERBS[@]+"${VERIFY_VERBS[@]}"}; do
@@ -886,6 +897,9 @@ run_verify_verbs() {
     VERIFY_VERB_PREVIOUS_JOB=${!:-}
     trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
     for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        # Doc can leave its grant without a memory handoff when it takes its own slot.
+        list_run=""
+        if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
         env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
             "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
         status=0
@@ -3123,8 +3137,7 @@ placement_once() {
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
     local parent_run=${BUILDLOG_RUN:-}
-    # Plus-list steps keep their queue place even when they need a checkout.
-    # Other steps with a checkout can leave a grant without a memory handoff.
+    # The parent marker lets a list step keep its queue place during checkout.
     local BUILDLOG_RUN=$parent_run
     if [[ -n "${VERIFY_SLOT_SOURCE:-}" && "${VERIFY_STEP_LIST_RUN:-}" != "$parent_run" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
@@ -3656,6 +3669,10 @@ cache_lookup() {
     # Old pass records have no status line.
     if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
     [[ -n "${status_line#status=}" ]] || return 1
+    # Plain lint shares one cache key across packages.
+    if [[ "$CMD" == lint && -n "$VERIFY_PACKAGE" ]]; then
+        require_member "$VERIFY_PACKAGE"
+    fi
     LOOKUP_STATUS="${status_line#status=}"
     first_line="${record_text%%$'\n'*}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
@@ -5065,18 +5082,6 @@ run_lint_sequence() {
     else
         lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
     fi
-    # Read the current workspace members for the fmt scope.
-    read_metadata() {
-        if [[ -n "${GATE_METADATA:-}" ]]; then
-            printf '%s\n' "$GATE_METADATA"
-        else
-            (
-                [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
-                cargo metadata --no-deps --format-version 1
-            )
-        fi
-    }
-
     # fmt compiles nothing, so it stays on the phase's own work: this
     # package and every member that differs from HEAD once mend has run.
     # Covering them all is what lets one lint record answer for each

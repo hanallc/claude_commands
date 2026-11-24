@@ -15,6 +15,30 @@ from scripts.direct.verify_lint_scope_test_support import VERIFY
 
 
 class VerifyVerbTests(VerifyLintCacheFixture):
+    def test_cached_lint_checks_the_named_package(self) -> None:
+        cache = self.enable_cache()
+        _ = self.verify("lint")
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+        valid = self.verify("lint", "sample")
+        self.assertIn("PASS (recorded)", valid.stdout)
+
+        result = self.invoke_verify("lint", "missing", cwd=self.root)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("verify.sh: package missing not found in workspace", result.stderr.splitlines())
+        self.assertNotIn("PASS (recorded)", result.stdout)
+        self.assertEqual(self.calls("clippy"), [])
+
+    def test_cached_lint_step_checks_the_named_package(self) -> None:
+        cache = self.enable_cache()
+        _ = self.verify("lint")
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
+        result = self.invoke_verify("lint", "sample", "+", "lint", "missing", cwd=self.root)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("verify.sh: package missing not found in workspace", result.stderr.splitlines())
+        self.assertEqual(result.stdout.count("PASS (recorded)"), 1)
+        self.assertEqual(self.calls("clippy"), [])
+
     def test_help_forms_print_the_same_short_usage_with_short_lines(self) -> None:
         missing = self.invoke_verify(cwd=self.root)
         self.assertEqual(missing.returncode, 2)
