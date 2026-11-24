@@ -966,7 +966,10 @@ It also removes unpublished formatter commits.
 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
-An ancestry hold names the first unmerged commit by its short hash and subject.
+Ancestry uses each pending commit's first parent as the test merge base.
+It skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
+Ancestry holds on a root commit, a tree change, a conflict, or a configured custom merge driver.
+The hold names the first such commit by its short hash and subject.
 A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
 `test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
