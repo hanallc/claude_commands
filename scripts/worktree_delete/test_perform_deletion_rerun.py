@@ -21,7 +21,7 @@ from scripts.production.staff_test_support import fixture_member, isolated_staff
 from scripts.production.test_production_doc import enrolled_document
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -74,7 +74,7 @@ class DeletionRerunTests(unittest.TestCase):
 
         base = self.git("rev-parse", "HEAD", directory=self.repo)
         record = replace(worktrees.new_record(self.worktree, BRANCH, self.repo, base, "unit", "main"),
-                         layout=worktrees.RecordedWorktreeOutput("unit", "topic", self.output))
+                         layout=worktree_records.RecordedWorktreeOutput("unit", "topic", self.output))
         with patch.dict(os.environ, {"WORKTREES_STATE_DIR": self.environment["WORKTREES_STATE_DIR"]}):
             worktrees.write_record(record)
         self.output.mkdir(parents=True)

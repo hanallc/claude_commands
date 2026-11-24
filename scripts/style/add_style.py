@@ -22,7 +22,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import session_staff, showrunners, staff
 from scripts.lib import build_folders, git_files
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib.git_exclude import ensure_excluded, require_untracked_ignored
 from scripts.production import showrunner_tree
 from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
@@ -225,14 +225,14 @@ def _enrolled_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleChec
 def _unfinished_style_checkout(standing: NoStyleProduction) -> UnfinishedStyleCheckout | None:
     repository, name = standing.repository, standing.name
     checkout = build_folders.worktree_path(build_folders.repo_word(repository), name, worktrees.UNIT_WORKTREE_NAME)
-    branches = worktrees.worktree_branches(repository)
+    branches = worktree_records.worktree_branches(repository)
     for candidate in (checkout, checkout.with_name("production")):
         doc = candidate / "docs" / f"{name}-production.md"
         if doc.is_file():
             branch = production_field(doc.read_text().splitlines(), "Merge branch")
             return UnfinishedStyleCheckout(candidate, doc, branch)
         branch = branches.get(candidate.resolve(), "")
-        if not branch and (record := worktrees.checkout_record(candidate)) is not None:
+        if not branch and (record := worktree_records.checkout_record(candidate)) is not None:
             if Path(record.repo) == repository:
                 branch = record.branch
         if is_style_production_branch(branch, name):
@@ -297,7 +297,7 @@ def _branch_description_key(style: StyleProduction) -> str:
 
 
 def _recorded_branch_point(style: StyleProduction) -> str:
-    result = worktrees.git(style.repository, "config", "--local", "--get", _branch_description_key(style), check=False)
+    result = worktree_records.git(style.repository, "config", "--local", "--get", _branch_description_key(style), check=False)
     if result.returncode not in (0, 1):
         raise Refusal(result.stderr.strip() or f"cannot read the description for {style.merge_branch}")
     return result.stdout.rstrip("\n")
@@ -326,7 +326,7 @@ def _check_existing(style: StyleProduction) -> bool:
         if branch_point:
             _require_branch_point(style, branch_point)
         elif (style.merge_branch == style_production_branch(style.name)
-              and ((style.checkout / ".git").exists() or worktrees.checkout_record(style.checkout) is not None)):
+              and ((style.checkout / ".git").exists() or worktree_records.checkout_record(style.checkout) is not None)):
             raise Refusal(f"{style.checkout}: no recorded branch point for {style.merge_branch}")
     if (style.checkout / ".git").exists():
         common = _git(style.checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -361,7 +361,7 @@ def _enroll_legacy_bootstrap(style: StyleProduction, standing: NoStyleProduction
     require_guard_ready()
     legacy = read_new_production(style.doc, style.name)
     if (not isinstance(legacy.merge_checkout, LegacyProduction) or legacy.checkout != style.checkout
-            or legacy.doc != style.doc or not worktrees.registered_checkout(style.checkout, style.repository, style.merge_branch)):
+            or legacy.doc != style.doc or not worktree_records.registered_checkout(style.checkout, style.repository, style.merge_branch)):
         raise Refusal(f"{style.doc}: expected an unregistered style bootstrap on {style.merge_branch}")
     main = git_files.at(style.repository)
     if git_files.head(main) != git_files.OnBranch("main"):
@@ -623,7 +623,7 @@ def main(argv: list[str]) -> int:
                   if worktrees.has_branch(style.repository, style.merge_branch)
                   else build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip))
         repo_word = build_folders.repo_word(style.repository)
-        record = worktrees.checkout_record(style.checkout)
+        record = worktree_records.checkout_record(style.checkout)
         if _integration_style_branch(style.merge_branch, style.name):
             layout = (record.layout if record is not None else
                       worktrees.output_record(repo_word, style.checkout.parent.name, style.checkout.name))
@@ -667,7 +667,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
         _attach_parent(style)
         return 0
-    except (Refusal, worktrees.Refused, rules.RuleValidationError, style_ledger.LedgerError,
+    except (Refusal, worktree_records.Refused, rules.RuleValidationError, style_ledger.LedgerError,
             OSError, ValueError, sqlite3.Error) as error:
         print("add_style: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2

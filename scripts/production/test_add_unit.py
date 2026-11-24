@@ -33,7 +33,7 @@ from scripts.message import sessions
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
@@ -447,7 +447,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         worktree = self.unit_tree("alpha")
         _ = self.git("worktree", "add", "-b", "alpha-worktree", str(worktree), "build-followups")
         with patch.dict(os.environ, self.env):
-            self.assertIsNone(worktrees.checkout_record(worktree))
+            self.assertIsNone(worktree_records.checkout_record(worktree))
         return worktree
 
     def test_adopted_unit_home_can_acquire_a_phase_reservation(self) -> None:
@@ -504,8 +504,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
         with patch.dict(os.environ, self.env):
             expected = worktrees.output_record("origin", "alpha", "worktree")
-            record = worktrees.read_record(worktrees.record_file(worktree))
-        self.assertEqual((record.stage, record.layout), (worktrees.MakeStage.DONE, expected))
+            record = worktree_records.read_record(worktree_records.record_file(worktree))
+        self.assertEqual((record.stage, record.layout), (worktree_records.MakeStage.DONE, expected))
         self.assertEqual(target.readlink(), expected.output)
         # An empty output takes the earlier target by rename, so the build cache stays warm.
         self.assertEqual(expected.output.stat().st_ino, inode)
@@ -516,7 +516,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         worktree = self.unrecorded_unit_home()
         with patch.dict(os.environ, self.env):
             layout = worktrees.output_record("origin", "alpha", "worktree")
-            record_file = worktrees.record_file(worktree)
+            record_file = worktree_records.record_file(worktree)
         layout.output.parent.mkdir(parents=True)
         _ = layout.output.write_text("conflicting output\n")
         head = self.git("rev-parse", "HEAD", cwd=worktree)
@@ -532,8 +532,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         layout.output.unlink()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
-        record = worktrees.read_record(record_file)
-        self.assertEqual((record.stage, record.base, record.layout), (worktrees.MakeStage.DONE, head, layout))
+        record = worktree_records.read_record(record_file)
+        self.assertEqual((record.stage, record.base, record.layout), (worktree_records.MakeStage.DONE, head, layout))
         self.assertEqual((worktree / "target").readlink(), layout.output)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree), head)
 
@@ -547,8 +547,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
         with patch.dict(os.environ, self.env):
-            record_file = worktrees.record_file(worktree)
-        record = worktrees.read_record(record_file)
+            record_file = worktree_records.record_file(worktree)
+        record = worktree_records.read_record(record_file)
         self.assertEqual((record.base, record.branch, record.owner, record.merge_branch),
                          (head, "alpha-worktree", "alpha", "build-followups"))
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree), head)
@@ -556,7 +556,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("commit", "--allow-empty", "-m", "Later unit work", cwd=worktree)
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
-        self.assertEqual(worktrees.read_record(record_file).base, head)
+        self.assertEqual(worktree_records.read_record(record_file).base, head)
 
     def test_an_existing_config_port_conflict_refuses_before_admission_or_launch(self) -> None:
         worktree = self.unit_tree("alpha")

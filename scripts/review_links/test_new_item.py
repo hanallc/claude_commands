@@ -136,14 +136,14 @@ class NewItemTests(ServerFixture):
         self.assertEqual(code, new_item.Outcome.USAGE)
         self.assertEqual(output.splitlines(), [
             "/new_item <type> <assignee> <description> [extra, such as a time]",
-            "Types: bug, question, investigation, proposal, efficiency, feedback",
+            "Types: bug, question, investigation, proposal, efficiency, feedback, enhancement",
             "Assignee: a producer, a showrunner or a unit",
         ])
         self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
-    def test_six_types_and_each_files_as_a_server_kind(self) -> None:
+    def test_seven_types_and_each_files_as_a_server_kind(self) -> None:
         self.assertEqual([kind.value for kind in new_item.ItemType],
-                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback"])
+                         ["bug", "question", "investigation", "proposal", "efficiency", "feedback", "enhancement"])
         investigation = new_item_dialog.SubmissionKind.INVESTIGATION
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.FEEDBACK], investigation)
         self.assertEqual(new_item.FILED_KINDS[new_item.ItemType.EFFICIENCY], investigation)
@@ -154,8 +154,7 @@ class NewItemTests(ServerFixture):
                 code, output, _ = self.run_main(item_type.value.upper(), "bob", "Check the chart.")
                 self.assertEqual(code, 0)
                 self.assertEqual(output, f"{item_type.value.capitalize()} \u2192 bob. List item 3.\n")
-                self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type].value)
-                # Only efficiency files as another kind with a mark; feedback files as the window files it.
+                self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type])
                 words = "Efficiency: Check the chart." if item_type == new_item.ItemType.EFFICIENCY else "Check the chart."
                 self.assertEqual(self.server.posts[-1]["words"], words)
         with self.assertRaises(SystemExit):
@@ -339,6 +338,12 @@ class NewItemListTests(ServerFixture):
         self.assertEqual(output, "Bug \u2192 models, a unit of spacetime. Producer: dwight (from spacetime). "
                          + "Filed as I7, but no List item exists: No space left on device\n")
         self.assertEqual(self.items(), [])
+
+    def test_enhancement_with_no_producer_saves_nothing(self) -> None:
+        code, output, errors = self.run_main("enhancement", "tile", "Show the next check in the row.")
+        self.assertEqual((code, errors), (new_item.Outcome.NO_PRODUCER, ""))
+        self.assertIn("Which producer?", output)
+        self.assertEqual((self.server.reads, self.server.posts, self.items()), (0, [], []))
 
     def test_each_review_item_gets_the_next_list_number(self) -> None:
         code, output, _ = self.run_main("bug", "bob", "A waiting row has no drag grip.")
