@@ -377,7 +377,7 @@ class QueueMoveTests(unittest.TestCase):
                 self.assertEqual([entry.waiter["pid"] for entry in result.policy.walk], full[2:])
                 snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
                 assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
-                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [full[0], *full[2:]])
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], full)
                 stall = head_stall.find_stall(snapshot, snapshot.written_at, snapshot.written_at + 60, 30)
                 assert isinstance(stall, head_stall.HeadStall)
                 self.assertEqual(stall.pid, ci.owner.pid)
