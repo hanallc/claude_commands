@@ -1,6 +1,8 @@
 """Exercise the Verify step list with private routing and Cargo fixtures."""
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import subprocess
@@ -16,6 +18,22 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyStepListTests(VerifyStepRoutesFixture):
+    @contextmanager
+    def capture_placement_requests(self) -> Generator[dict[str, wire.PlacementRequest]]:
+        """Record the first placement request for each episode."""
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        previous = admission.server.handle_request
+        requests: dict[str, wire.PlacementRequest] = {}
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                _ = requests.setdefault(request.episode, request)
+            return previous(request, connection)
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            yield requests
+
     def test_steps_keep_order_arguments_and_run_identity(self) -> None:
         root = self.fixture.root
         (root / "other/src").mkdir(parents=True)
@@ -36,17 +54,7 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.fixture.environment["TEST_METADATA"] = json.dumps(metadata)
         self.fixture.environment["BUILDLOG_OFF"] = "0"
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
-        admission = caller_admission(self.fixture, root, self.fixture.environment)
-        previous = admission.server.handle_request
-        requests: dict[str, wire.PlacementRequest] = {}
-
-        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
-                   ) -> list[wire.Reply]:
-            if isinstance(request, wire.PlacementRequest):
-                _ = requests.setdefault(request.episode, request)
-            return previous(request, connection)
-
-        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+        with self.capture_placement_requests() as requests:
             result = self.run_verify(
                 "check", "sample", "--local", "requires Linux kernel", "--features", "extra", "+",
                 "lint", "--check", "+",
@@ -97,17 +105,7 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.fixture.environment.update({"BUILDLOG_OFF": "0", "COPIES_STEP_SOURCE": str(root),
                                          "COPIES_STEP_OWNER": "fixture", "COPIES_STEP_POOL": str(root)})
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
-        admission = caller_admission(self.fixture, root, self.fixture.environment)
-        previous = admission.server.handle_request
-        requests: dict[str, wire.PlacementRequest] = {}
-
-        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
-                   ) -> list[wire.Reply]:
-            if isinstance(request, wire.PlacementRequest):
-                _ = requests.setdefault(request.episode, request)
-            return previous(request, connection)
-
-        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+        with self.capture_placement_requests() as requests:
             result = self.run_verify("lint,test,doc", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = cast(list[dict[str, object]], self.fixture.call_records())

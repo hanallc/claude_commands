@@ -619,8 +619,10 @@ Verify checks the argument form of every step before it starts the list. A usage
 Each step checks its package when it runs.
 The first failure ends either list with its status.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
-Steps in a plus list keep their queue place even when they need a checkout slot.
-Other steps with a checkout slot omit the identity from placement requests and can leave a grant without a memory handoff.
+Both list forms keep the queue place during checkout for steps that share the slot.
+A `doc` step with its own slot uses `NO_RUN` in its placement request.
+A standalone step with its own checkout slot also uses `NO_RUN`.
+Steps with `NO_RUN` can leave their grants without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.
