@@ -1277,8 +1277,8 @@ raise SystemExit(1)
         _ = self.interrupt_batch_before_row(rows, beta)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), alpha)
         self.write(self.checkout, "crates/damaged/Cargo.toml", "[package]\n")
-        self.executable(self.bin / "verify.sh", STUB + '''
-Path("Cargo.toml").write_text("[package]\\n")
+        self.executable(self.bin / "verify.sh", STUB + f'''
+Path({str((self.checkout / manifest).parent)!r}, "Cargo.toml").write_text("[package]\\n")
 raise SystemExit(1)
 ''')
 
@@ -1292,6 +1292,7 @@ raise SystemExit(1)
         self.assertIn(f"phase 2 ({beta[:12]}): changed paths unknown: 'name'", notices[1])
         self.assertIn(f"phase 3 ({later[:12]}): this row's tests include no reported red step", notices[2])
         self.assertIn("rollback failed:", result.stdout)
+        self.assertIn(manifest, result.stdout.partition("rollback failed:")[2])
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
 
     def test_fetch_failure_returns_each_current_row_without_writing_results(self) -> None:
