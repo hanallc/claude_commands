@@ -123,6 +123,7 @@ When every item is done:
 ## Rules
 
 - One item at a time. Never present two items in the same turn.
+- When you ask another agent for input during an open review, tell it to answer with `send.py --urgent`. Only an urgent message arrives while the review is open.
 - **Model-level questions get model-level answers, at Step 3.5's altitude** — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Adopt the user's wording verbatim if they restate the model themselves.
 - Step 2's doc question, when asked, is a choice like any other: mark exactly one option recommended.
 - Show before and after code comparisons only when the user asks.
