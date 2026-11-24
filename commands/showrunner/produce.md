@@ -285,7 +285,7 @@ Your text to nate while he is away follows this import:
 - **Open questions.** Ask the user each question once, in full, in the reply
   where it first comes up (in idle update mode, the short form of <IdleUpdate/>), in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
-  restates the question or its choices; the full item after his yes in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
+  restates the question or its choices; the full item after he says the word in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
   production's items only; the showrunners below count theirs
   (**Nested showrunners** above).
