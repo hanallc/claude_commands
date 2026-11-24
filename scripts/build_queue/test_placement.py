@@ -2285,13 +2285,13 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(fixture.server.host_evidence_key(request, destination), before)
             read.assert_not_called()
 
-    def idle_hana(self, fixture: PlacementFixture) -> tuple[Path, wire.PlacementRequest]:
+    def idle_hana(self, fixture: PlacementFixture, *, overrides: str = "") -> tuple[Path, wire.PlacementRequest]:
         from scripts.aws_target import hana_box
         from scripts.aws_target.test_hana_box import record_lifecycle_image
 
         settings, request, _destination = self.target_settings_fixture(fixture)
         settings.unlink()
-        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n",
+        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n" + overrides,
                                  template="hana_aws")
         assert isinstance(request.profile, records.StepProfile)
         request = replace(request, profile=replace(request.profile, step="check"),
@@ -2530,7 +2530,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         from scripts.aws_target import hana_box, hana_spend
 
         with PlacementFixture() as fixture:
-            settings, request = self.idle_hana(fixture)
+            settings, request = self.idle_hana(fixture, overrides="daily_budget_usd=6\nguard_grace_seconds=60\n")
             good = settings.read_text()
             self.commit_settings(settings)
 
@@ -2715,7 +2715,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             settings, request, destination = self.target_settings_fixture(fixture)
             host = socket.gethostname().split(".", 1)[0]
             good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
-            _ = settings.write_text(good.replace("floor_sweep_timeout_s=180", "floor_sweep_timeout_s=broken"))
+            broken = "\n".join("floor_sweep_timeout_s=broken" if line.startswith("floor_sweep_timeout_s=") else line
+                               for line in good.splitlines()) + "\n"
+            _ = settings.write_text(broken)
             repository = eligibility.KnownRepository("hana")
             with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
                   mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),
