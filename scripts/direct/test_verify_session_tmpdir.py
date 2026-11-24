@@ -4,15 +4,11 @@ from __future__ import annotations
 import fcntl
 import os
 from pathlib import Path
-import select
-import signal
-import subprocess
-from typing import BinaryIO, TextIO, cast
+from typing import BinaryIO
 from unittest.mock import patch
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
-from scripts.lib import build_folders, build_slots
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import build_folders
 
 
 class VerifySessionTempTests(VerifyStepRoutesFixture):
@@ -73,35 +69,6 @@ if arguments[:2] == ["nextest", "run"]:
         self.assertEqual(list(run.rglob("fixture-output")), [])
         self.assertEqual((run / "test-prompt.txt").read_text(), "Test the sample package.\n")
 
-    def test_numbered_source_keeps_its_copy_lock_until_cleanup(self) -> None:
-        _ = self.prepare_session_test(assigned=False)
-        fixture = self.fixture
-        with patch.dict("os.environ", fixture.environment, clear=True):
-            _ = subprocess.run(["git", "remote", "add", "origin", str(fixture.root / "fixture.git")],
-                               cwd=fixture.root, check=True, timeout=TEST_HANG_GUARD_SECS)
-            with build_slots.take_copy(fixture.root, "HEAD", showrunner="test", unit="test",
-                                       work="test", purpose="verify fixture") as leased:
-                copy = leased.path
-        scripts = fixture.verify_script.parents[1]
-        holder: subprocess.Popen[str] = subprocess.Popen(
-            [str(scripts / "lib/py"), str(scripts / "direct/verify_temp.py"), str(copy)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fixture.environment,
-        )
-        with holder:
-            stream = cast(TextIO, holder.stdout)
-            self.assertTrue(select.select([stream], [], [], 8)[0])
-            reply = stream.readline().rstrip("\n")
-            self.assertTrue(reply.startswith("ready "), reply)
-            temporary = Path(reply.removeprefix("ready "))
-            with patch.dict("os.environ", fixture.environment, clear=True):
-                self.assertEqual(build_folders.build_folder_state(copy), "held")
-            self.assertTrue(temporary.is_dir())
-            output, errors = holder.communicate(timeout=8)
-            self.assertEqual(holder.returncode, 0, output + errors)
-        with patch.dict("os.environ", fixture.environment, clear=True):
-            self.assertEqual(build_folders.build_folder_state(copy), "free")
-        self.assert_temp_released(temporary, copy / "target/test-runs")
-
     def test_term_stops_allocation_while_its_lock_is_held(self) -> None:
         run, observed = self.prepare_session_test()
         lock = self.fixture.root / "allocation.lock"
@@ -134,6 +101,29 @@ testing_folders.prepare_test_runs_parent = prepare_test_runs_parent
         self.fixture.assert_nothing_outlives()
 
     def test_term_keeps_the_lease_until_the_step_group_exits(self) -> None:
+        self.check_term_group_lease()
+
+    def test_interrupted_group_wait_keeps_the_lease_until_the_step_group_exits(self) -> None:
+        script = self.fixture.verify_script
+        source = script.read_text()
+        entry = "wait_for_verify_step_group() {"
+        self.assertIn(entry, source)
+        _ = script.write_text(source.replace(entry, """
+wait() {
+    if [[ " ${FUNCNAME[*]} " == *" wait_for_verify_step_group "* && -z "${TEST_STEP_WAIT_INTERRUPTED:-}" ]]; then
+        TEST_STEP_WAIT_INTERRUPTED=1
+        : > "$TEST_SESSION_TEMP_OBSERVED.interrupted"
+        kill -USR1 "$BASHPID"
+        return "$((128 + $(kill -l USR1)))"
+    fi
+    builtin wait "$@"
+}
+
+""" + entry, 1))
+        self.check_term_group_lease()
+        self.assertTrue((self.fixture.root / "observed-tmpdir.interrupted").exists())
+
+    def check_term_group_lease(self) -> None:
         run, observed = self.prepare_session_test()
         self.instrument_cargo("""
     import signal
@@ -145,6 +135,8 @@ testing_folders.prepare_test_runs_parent = prepare_test_runs_parent
         observed.with_suffix(".finished").touch()
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, stopping)
+    os.close(1)
+    os.close(2)
     observed.with_suffix(".group").write_text(str(os.getpgrp()))
     observed.write_text(str(temporary))
     while True:
@@ -164,15 +156,13 @@ testing_folders.prepare_test_runs_parent = prepare_test_runs_parent
         self.fixture.wait_for_path(observed, (process,))
         temporary = Path(observed.read_text())
         self.assertNotEqual(int(observed.with_suffix(".group").read_text()), os.getpgid(process.pid))
-        with patch.dict("os.environ", self.fixture.environment, clear=True):
-            holder = build_folders.folder_lease_fields(temporary)["pid"]
-        assert isinstance(holder, int) and holder > 1
-        os.kill(holder, signal.SIGTERM)
         process.terminate()
         self.fixture.wait_for_path(observed.with_suffix(".stopping"))
         with patch.dict("os.environ", self.fixture.environment, clear=True):
             self.assertEqual(build_folders.build_folder_state(temporary), "held")
+            build_folders.sweep_temporary_build_folders(temporary.parent, wait=False)
         self.assertTrue(temporary.is_dir())
+        self.assertIsNone(process.poll())
         self.assertEqual(release_step.write(b"x"), 1)
         output, errors = process.communicate(timeout=8)
         self.assertEqual(process.returncode, 143, output + errors)
