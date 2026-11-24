@@ -324,6 +324,17 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
+def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
+    """Check for a direct call to the checkout's gate script."""
+    program = parse_command_program(command, keep_path=True)
+    if isinstance(program, OtherCommand) or Path(command[0]).name in {"bash", "sh"}:
+        return False
+    root = source.resolve()
+    path = root / program[0]
+    canonical = root / "scripts/production/gate.py"
+    return path == canonical and path.resolve() == canonical
+
+
 def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:

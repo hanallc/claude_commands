@@ -59,9 +59,12 @@ Target = LocalTarget | SshTarget
 
 @dataclass(frozen=True)
 class ScalerTarget:
-    """The scaler uses a separate settings file."""
+    """The registry names the scaler and its settings file."""
     name: str
     settings: Path
+
+
+RegisteredTarget = Target | ScalerTarget
 
 
 @dataclass(frozen=True)
@@ -279,7 +282,7 @@ def _registry_value[Value](config: conf.ConfigRead, key: str, convert: Callable[
         raise ConfigError(f"{key}: {error} in {config.source}") from error
 
 
-def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> Target | ScalerTarget:
+def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> RegisteredTarget:
     if purpose is RegistryRead.PLACEMENT:
         require_target_name(name)
     kind = _registry_value(config, f"kind.{name}", _target_kind, purpose)
@@ -306,7 +309,7 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
                  purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
                  ) -> tuple[Target, ...]:
-    """Read the targets used by local and SSH commands."""
+    """Read the targets that local and SSH commands can use."""
     return tuple(target for target in read_registered_targets(path, selected=selected, target_name=target_name,
         purpose=purpose, configuration=configuration) if not isinstance(target, ScalerTarget))
 
@@ -314,7 +317,8 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
 def read_registered_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
                             purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
                             configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
-                            ) -> tuple[Target | ScalerTarget, ...]:
+                            ) -> tuple[RegisteredTarget, ...]:
+    """Read the local, SSH, and scaler entries in the target registry."""
     if selected and target_name and selected != target_name:
         raise ConfigError("expected one selected target")
     selected = selected or target_name
@@ -328,14 +332,15 @@ def read_registered_targets(path: Path | None = None, *, selected: str = "", tar
         else:
             configuration = conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
-    if selected and selected not in names and selected in pinned_target_names(configuration):
-        names = (selected,)
-    targets: list[Target | ScalerTarget] = []
-    for name in names:
+    pinned = bool(selected and selected not in names and selected in pinned_target_names(configuration))
+    targets: list[RegisteredTarget] = []
+    for name in (selected,) if pinned else names:
         if selected and name != selected:
             continue
         try:
-            targets.append(_read_target(configuration, name, purpose))
+            target = _read_target(configuration, name, purpose)
+            if not (pinned and isinstance(target, ScalerTarget)):
+                targets.append(target)
         except ConfigError:
             if selected or purpose is RegistryRead.REQUIRE_SETTINGS_FILES:
                 raise
