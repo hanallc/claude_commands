@@ -642,7 +642,7 @@ def aws_gate_request(fixture: PlacementFixture, *, enabled: bool = True, daily_r
     request = placement_request(fixture)
     local = request.local
     assert isinstance(local, wire.LocalAdmissionContext)
-    sidecar = fixture.root / "progress"
+    sidecar = fixture.root / f"progress-{request.episode}"
     registry = conf.read("build_targets")
     scaler, = target_config.read_registered_targets(selected="claude-aws",
         purpose=target_config.RegistryRead.PLACEMENT, configuration=registry)
@@ -667,8 +667,7 @@ class AwsGatePlacementTests(unittest.TestCase):
     def assigned_gate(self, fixture: PlacementFixture) -> tuple[wire.PlacementRequest, placement.PlacementAssignment,
                                                                 aws_ledger.GateDispatchBinding]:
         request = aws_gate_request(fixture)
-        with mock.patch.dict(os.environ, {"AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
-            evidence = read_aws_gate_evidence(fixture, request)
+        evidence = read_aws_gate_evidence(fixture, request)
         self.assertEqual(evidence.eligibility, ALLOWED_HOST)
         assignment = assignment_for(fixture, request)
         assert isinstance(request.local, wire.LocalAdmissionContext)
@@ -681,7 +680,8 @@ class AwsGatePlacementTests(unittest.TestCase):
     def test_dead_caller_after_prelaunch_closes_without_a_launch(self) -> None:
         for consumed in (True, False):
             with self.subTest(consumed=consumed), PlacementFixture() as fixture:
-                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
                     request, assignment, binding = self.assigned_gate(fixture)
                     owner = request.owner
                     holder = placement.ClaimHolderIdentity(owner.host, owner.pid, owner.start_time)
@@ -705,7 +705,8 @@ class AwsGatePlacementTests(unittest.TestCase):
 
     def test_disabling_the_scaler_after_grant_refuses_launch_permission(self) -> None:
         with PlacementFixture() as fixture:
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
                 request, assignment, binding = self.assigned_gate(fixture)
                 holder = placement.ClaimHolderIdentity(request.owner.host, request.owner.pid, request.owner.start_time)
                 aws_ledger.GateDispatchJournal(binding.journal).begin(binding, holder)
@@ -716,19 +717,34 @@ class AwsGatePlacementTests(unittest.TestCase):
                 self.assertEqual(reply.permission, placement.PermissionAvailable())
                 self.assertIn("The AWS scaler is off", reply.reason)
 
+    def test_unused_grant_checks_the_registry_on_replay(self) -> None:
+        for change in ("disabled", "removed"):
+            with self.subTest(change=change), PlacementFixture() as fixture:
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                    request, assignment, binding = self.assigned_gate(fixture)
+                    _ = write_config_fixture(binding.registry,
+                        "enabled.claude-aws=off\n" if change == "disabled" else "targets=natedev\n")
+                    reply, = fixture.server.handle_request(request)
+                    self.assertNotIsInstance(reply, wire.Assignment)
+                    self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
     def test_caller_uses_the_queue_journal_with_a_different_aws_state_root(self) -> None:
         from scripts.aws_target import cloud_gate
 
         with PlacementFixture() as fixture:
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state")}):
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "queue-target-state"),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
                 request, assignment, binding = self.assigned_gate(fixture)
             assert isinstance(request.local, wire.LocalAdmissionContext)
             caller_root = fixture.root / "caller-target-state"
             with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(caller_root),
+                                             "AWS_TARGET_CONFIG": str(caller_root / "aws_target.conf"),
                                              "BUILDLOG_PLACEMENT_SIDECAR": request.local.sidecar}):
                 dispatch = cloud_gate.begin_assigned_gate(assignment)
             self.assertEqual(dispatch.binding, binding)
             self.assertEqual(dispatch.journal.read().binding.directory, binding.directory)
+            self.assertEqual(dispatch.binding.account_settings, fixture.root / "aws_target.conf")
             self.assertFalse(caller_root.exists())
 
 

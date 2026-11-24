@@ -195,6 +195,7 @@ class GateDispatchBinding:
     journal: Path
     directory: Path
     registry: Path
+    account_settings: Path
 
     def publish(self, path: Path) -> None:
         try:
@@ -311,6 +312,8 @@ class GateDispatchJournal:
                             state = "launch ended"
                         if reservation is None and ('arguments' in launch or 'instance' in launch):
                             return placement.DispatchPathPending(f'AWS launch {folder.name} has no confirmed end')
+                    if book.path.exists():
+                        sync_folder(book.directory)
                 write_text_atomic(self.path, _gate_dispatch_text(replace(record, state=state)))
                 return state
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -2564,9 +2567,9 @@ class CostLedger:
                 return GateCapReached(reason)
             return GateReserved(state.gate_reservations[-1])
 
-    def gate_booking_refusal(self, settings_path: Path, request: GateReservation) -> str:
+    def gate_booking_refusal(self, snapshot: LedgerEvidence, settings_path: Path, request: GateReservation) -> str:
         """Project the booking against local account evidence without changing the ledger."""
-        return self._book_gate(self.read_snapshot(), read_settings(settings_path), request)
+        return self._book_gate(snapshot, read_settings(settings_path), request)
 
     def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
         costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)

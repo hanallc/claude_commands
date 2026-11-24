@@ -42,6 +42,7 @@ from scripts.lib import conf
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.file_lock import LockResult, exclusive
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, is_test_module
@@ -1390,8 +1391,9 @@ def read_saved_request(repo: Path, path: Path, tree: str,
 def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Path,
                          directory: Path, sidecar: Path, *,
                          dispatch: AssignedCloudGate | UnassignedCloudGate = UNASSIGNED_CLOUD_GATE) -> list[str]:
+    account = dispatch.binding.account_settings if isinstance(dispatch, AssignedCloudGate) else account_settings_path()
     arguments = [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
-                 '--settings', str(account_settings_path())]
+                 '--settings', str(account)]
     if isinstance(dispatch, AssignedCloudGate):
         arguments.extend(('--placement-journal', str(dispatch.journal.path)))
     return service_command('scripts.aws_target.cloud_gate', arguments, 'cloud-gate-' + folder.name)
@@ -1508,6 +1510,55 @@ def cloud_attempt_slot(repo: Path, sidecar: Path, attempt: CloudAttempt,
     return cloud_reservation(repo, sidecar, attempt.mode, gate_job=gate_job)
 
 
+def reconcile_previous_dispatch(binding: ledger.GateDispatchBinding, service: Callable[[Sequence[str]], int]) -> bool:
+    """Use the saved journal to reconcile an ended caller's bookings."""
+    journal = ledger.GateDispatchJournal(binding.journal)
+    record = journal.read()
+    if record.binding != binding:
+        raise ledger.LedgerUnavailable('The saved AWS request names a different dispatch')
+    if journal.previous_dispatch_closed(binding):
+        return True
+    holder = record.holder
+    current = process_start(holder.pid)
+    if (holder.host != store.host_name() or isinstance(current, Unreadable)
+            or isinstance(current, Started) and current.start == holder.start_time):
+        return False
+    if not isinstance(journal.settle(binding.claim, holder), placement.DispatchPathPending):
+        return True
+    with journal.lock(wait=False) as access:
+        if access is LockResult.BUSY:
+            return False
+    book = ledger.CostLedger(binding.directory)
+    if not book.path.exists():
+        return False
+    open_attempts = {row.attempt for row in book.read_snapshot().gate_reservations if ledger.gate_is_open(row)}
+    dispatch = AssignedCloudGate(binding, holder)
+    for folder in record.folders:
+        if folder.name in open_attempts:
+            _ = service(gate_attempt_command('--cleanup', folder, binding.directory, folder / 'reservation.cgroup',
+                                             dispatch=dispatch))
+    return not isinstance(journal.settle(binding.claim, holder), placement.DispatchPathPending)
+
+
+def claim_aws_gate_request(dispatch: AssignedCloudGate, identity: dict[str, object],
+                           service: Callable[[Sequence[str]], int]) -> bool:
+    """Keep one current dispatch for this request across checkouts."""
+    key = sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    path = dispatch.journal.path.parent / f'aws-gate-request-{key}.json'
+    with exclusive(path.with_suffix('.lock'), wait=False) as access:
+        if access is LockResult.BUSY:
+            return False
+        try:
+            prior = ledger.GateDispatchBinding.read(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if prior.claim != dispatch.binding.claim and not reconcile_previous_dispatch(prior, service):
+                return False
+        save(path, ledger.mapping(snapshot_codec.snapshot_value(dispatch.binding)))
+    return True
+
+
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
@@ -1535,16 +1586,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                                       'modules': list(selected.paths) if isinstance(selected, gate.TreeSelection) else 'all',
                                       'selection_tree': selected.tree if isinstance(selected, gate.TreeSelection) else 'all'}
         if isinstance(dispatch, AssignedCloudGate):
-            request_key = sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-            current = root / f'current-{request_key}.json'
+            if not claim_aws_gate_request(dispatch, identity, service):
+                return LocalFallback('The previous AWS dispatch for this gate remains current')
+            current = root / f'{dispatch.binding.claim.claim_id}.json'
         previous = read(current) if current.exists() else {}
-        if isinstance(dispatch, AssignedCloudGate) and previous:
-            prior = cast(ledger.GateDispatchBinding, snapshot_codec.parse_snapshot_value(
-                previous['dispatch'], ledger.GateDispatchBinding))
-            if prior.claim != dispatch.binding.claim:
-                if not ledger.GateDispatchJournal(prior.journal).previous_dispatch_closed(prior):
-                    return LocalFallback('The previous AWS dispatch for this gate remains current')
-                previous = {}
         if previous.get('mode') == mode.value:
             previous['mode'] = mode.wire
         same_request = all(previous.get(key) == value for key, value in identity.items())
@@ -1591,7 +1636,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     return outcome
         if not deployment_path.exists():
             return LocalFallback('image or stack is absent')
-        home = conf.read(account_settings_path()).text('region')
+        account = dispatch.binding.account_settings if isinstance(dispatch, AssignedCloudGate) else account_settings_path()
+        home = conf.read(account).text('region')
         _ = gate_regions(home)
         deployment = gate_deployment(deployment_path, home)
         regional = ledger.rows(deployment, 'regions')[0]
@@ -1627,8 +1673,6 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     'retry_launch': retry_launch, 'spot_retry_limit': retry_limit,
                     'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
                     'box_retry_limit': box_retry_limit, 'last_box_failure': last_box_failure}
-                if isinstance(dispatch, AssignedCloudGate):
-                    state['dispatch'] = snapshot_codec.snapshot_value(dispatch.binding)
                 save(current, state)
                 result_path = folder / 'outcome.json'
                 result = read(result_path) if result_path.exists() else {}
@@ -1803,7 +1847,7 @@ def main() -> int:
         with journal.lock():
             dispatch = journal.read()
             if (dispatch.state != "prelaunch" or folder not in dispatch.folders
-                    or dispatch.binding.directory != directory):
+                    or (directory, settings_path) != (dispatch.binding.directory, dispatch.binding.account_settings)):
                 return 0
             return execute_gate_worker(folder, lambda: gate_worker(dispatch))
 

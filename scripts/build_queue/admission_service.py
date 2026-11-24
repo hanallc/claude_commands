@@ -3966,8 +3966,6 @@ class AdmissionServer:
                                else placement.FixedExclusion("The scaler differs from the configured target"))
             except conf.Unusable as error:
                 eligibility = placement.FixedExclusion(str(error))
-            if isinstance(eligibility, placement.AllowedHost):
-                eligibility = self._aws_gate_spending()
             return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
@@ -4659,27 +4657,58 @@ done
         return assignment
 
     def _aws_gate_spending(self) -> placement.AllowedHost | placement.TemporaryExclusion:
-        """Read the charge room for one AWS gate from local files."""
+        """Include grants that the worker has yet to book."""
         from scripts.aws_target import ledger as aws_ledger
         from scripts.aws_target.config import account_settings_path
 
         try:
-            book = aws_ledger.CostLedger(target_config.ssh_target_state_directory("aws"))
+            directory = target_config.ssh_target_state_directory("aws").resolve()
+            book = aws_ledger.CostLedger(directory)
+            evidence = book.read_snapshot()
+            booked = {row.attempt for row in evidence.gate_reservations if aws_ledger.gate_is_open(row)}
             values = conf.read_or_repository("cloud_gate")
             now = int(self.clock.now())
             offered = aws_ledger.gate_booking(values, "placement-preview", now, now + values.whole("lifetime_minutes") * 60)
-            reason = book.gate_booking_refusal(account_settings_path(), offered)
+            for key in self.current_assignments.values():
+                assignment = self.assignments[key].assignment
+                if assignment.destination.provider != "scaler":
+                    continue
+                binding = self._aws_gate_binding(assignment)
+                journal = aws_ledger.GateDispatchJournal(binding.journal)
+                try:
+                    record = journal.read()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if record.binding != binding:
+                        raise ValueError("The AWS journal names a different binding")
+                    if record.state != "prelaunch" or any(folder.name in booked for folder in record.folders):
+                        continue
+                evidence.gate_reservations.append(replace(offered, attempt=binding.claim.claim_id))
+            reason = book.gate_booking_refusal(evidence, account_settings_path(), offered)
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             return placement.TemporaryExclusion(f"AWS spending evidence is unavailable. {error}")
         return placement.TemporaryExclusion(reason) if reason else placement.AllowedHost()
 
     def _aws_gate_binding(self, assignment: placement.PlacementAssignment) -> aws_ledger.GateDispatchBinding:
         from scripts.aws_target import ledger as aws_ledger
+        from scripts.aws_target.config import account_settings_path
 
         claim = placement.assigned_claim_reference(assignment)
         journal = self.state_dir / f"aws-gate-{claim.claim_id}.json"
         directory = target_config.ssh_target_state_directory("aws").resolve()
-        return aws_ledger.GateDispatchBinding(claim, journal, directory, conf.path("build_targets").resolve())
+        return aws_ledger.GateDispatchBinding(claim, journal, directory, conf.path("build_targets").resolve(),
+                                               account_settings_path().resolve())
+
+    def _require_enabled_scaler(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
+                                registry: Path) -> None:
+        from scripts.build_targets.gate_targets import configured_scaler_gate
+
+        candidate = configured_scaler_gate(conf.read(registry), destination.target)
+        if not isinstance(candidate.eligibility, placement.AllowedHost):
+            raise ValueError(f"The AWS scaler is {candidate.eligibility.reason}")
+        if (candidate.destination, candidate.settings) != (destination, self._placement_settings(request, destination)):
+            raise ValueError("The AWS scaler differs from the assigned target")
 
     def _publish_aws_gate_binding(self, request: wire.PlacementRequest,
                                   assignment: placement.PlacementAssignment) -> None:
@@ -4689,6 +4718,7 @@ done
         if not isinstance(local, wire.LocalAdmissionContext) or not local.sidecar:
             raise ValueError("The AWS gate placement has no sidecar")
         binding = self._aws_gate_binding(assignment)
+        self._require_enabled_scaler(request, assignment.destination, binding.registry)
         path = aws_ledger.gate_dispatch_binding_path(Path(local.sidecar))
         self.writes.require(path)
         binding.publish(path)
@@ -4940,6 +4970,12 @@ done
                 if destination.provider == "scaler":
                     if self._cloud_slots_full():
                         continue
+                    spending = self._aws_gate_spending()
+                    if isinstance(spending, placement.TemporaryExclusion):
+                        self.placement_eligibility[request.episode] = tuple(
+                            replace(item, eligibility=spending) if item.destination == destination else item
+                            for item in self.placement_eligibility[request.episode])
+                        continue
                 elif (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
@@ -5082,17 +5118,12 @@ done
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
         if destination.provider == "scaler":
             from scripts.aws_target import ledger as aws_ledger
-            from scripts.build_targets.gate_targets import configured_scaler_gate
 
             binding = self._aws_gate_binding(assignment)
             if reference != binding.claim:
                 return self._placement_status(assignment, "the exact AWS claim does not match")
             try:
-                candidate = configured_scaler_gate(conf.read(binding.registry), destination.target)
-                if not isinstance(candidate.eligibility, placement.AllowedHost):
-                    return self._placement_status(assignment, f"The AWS scaler is {candidate.eligibility.reason}")
-                if (candidate.destination, candidate.settings) != (destination, self._placement_settings(submitted, destination)):
-                    return self._placement_status(assignment, "The AWS scaler differs from the assigned target")
+                self._require_enabled_scaler(submitted, destination, binding.registry)
                 record = aws_ledger.GateDispatchJournal(binding.journal).require_open(reference, request.holder)
                 if record.binding != binding:
                     raise ValueError("The AWS journal names a different binding")
