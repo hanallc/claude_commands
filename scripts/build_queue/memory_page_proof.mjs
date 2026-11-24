@@ -196,11 +196,12 @@ async function assertRowCenters(evaluate) {
       const key = table.dataset.tip;
       const chart = document.querySelector('.wrow[data-tip="' + key + '"]');
       const track = chart.querySelector('.track');
+      const held = key.startsWith('held:');
       const marks = Object.fromEntries([...table.cells].flatMap(cell => {
         const line = firstText(cell);
         return line ? [['column ' + cell.className, center(line)]] : [];
       }));
-      for (const [index, bar] of [...track.querySelectorAll('.b, .progress-track')].entries()) {
+      for (const [index, bar] of [...(held ? [] : track.querySelectorAll('.b, .progress-track'))].entries()) {
         marks['bar ' + index] = center(bar.getBoundingClientRect());
       }
       marks.name = center(firstText(chart.querySelector('.name')));
@@ -208,7 +209,7 @@ async function assertRowCenters(evaluate) {
         const line = firstText(element);
         return line ? [line.top] : [];
       });
-      return {key, track: center(track.getBoundingClientRect()), marks, detailTops};
+      return {key, track: held ? marks.name : center(track.getBoundingClientRect()), marks, detailTops};
     });
   })()`);
   assert.ok(rows.some(row => row.key.startsWith('row:')));
@@ -319,9 +320,15 @@ try {
   let servedReading = base;
   let currentFixture = base;
   let queueFixture = null;
-  let unnamedPlace = 0;
+  let unnamedPlace = -1;
   let confirmedQueueLine = null;
   const undoAnchors = new Map();
+  const unnamed = {row_id:'unnamed-wait'};
+  const fixtureMoveLine = reading => {
+    const members = reading.waiters.filter(row => row.move).map(row => row.move);
+    if (unnamedPlace >= 0) members.splice(unnamedPlace, 0, unnamed);
+    return {revision:reading.move_revision, members, kept_runs:[]};
+  };
   const server = createServer(async (req, res) => {
     if (req.url === '/console/builds/queue-move') {
       const json = (status, result) => {
@@ -337,10 +344,8 @@ try {
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
-      const members = ordered.map(row => row.move);
-      const unnamed = {row_id:'unnamed-wait'};
-      members.splice(unnamedPlace, 0, unnamed);
-      const line = () => ({revision:queueFixture.move_revision, members});
+      const {members} = fixtureMoveLine(queueFixture);
+      const line = () => ({revision:queueFixture.move_revision, members, kept_runs:[]});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
       const undo = request.kind === 'QueueUndoRequest';
       if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
@@ -371,7 +376,14 @@ try {
     }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
+    let reading = servedReading;
+    if (isData && reading.move_revision?.startsWith('fixture')) {
+      const move_line = fixtureMoveLine(reading);
+      const places = new Map(move_line.members.map((member, index) => [member.row_id, index + 1]));
+      reading = {...reading, move_line, waiters:reading.waiters.map(row =>
+        row.move ? {...row, place:places.get(row.move.row_id)} : row)};
+    }
+    res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
   });
   try {
@@ -645,6 +657,11 @@ try {
             machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
           reading.walk = [rust, guest, mac, ci];
           reading.waiters = [waiting];
+          if (!shootBefore) {
+            waiting.place = 2;
+            reading.held_places = [{kind:'held', key:'proof-kept', unit:'admin-console',
+              position:1, failed_step:'test affected', kept_until:'23:37 EST', targets:['natedev','hana-aws']}];
+          }
           reading.queued_priority_units = [];
           servedReading = reading;
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
@@ -662,8 +679,13 @@ try {
               const keys = [...latest.walk.map(row => 'row:' + row.key), 'wait:' + latest.waiters[0].key];
               const lines = element => Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight));
               const box = walk.closest('.card').getBoundingClientRect();
+              const keptChart = chart('held:proof-kept'), keptTable = table('held:proof-kept');
+              const scroll = walk.closest('.walk-scroll');
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
+                keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
+                  .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
+                walkOverflow:scroll.scrollWidth - scroll.clientWidth,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
                   table(key).querySelector('.step').textContent]),
                 icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
@@ -698,7 +720,12 @@ try {
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, ['natedev','mac','mac-linux','aws','hana-aws','hana-gpu'].map(name => [name, name]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
-              assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
+              if (width === 900) {
+                assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
+                assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
+              } else {
+                assert.equal(rows.tight, width === 800, `The walk at ${width} px has the wrong tight state.`);
+              }
               assert.equal(rows.waitingNameLines, 1, `The waiting unit name breaks at ${width} px.`);
               assert.deepEqual(rows.cutSteps, [], `A Step cell is cut at ${width} px.`);
               assert.deepEqual(rows.machineColors.filter(([, color, row]) => color === row).map(([name]) => name), [],
@@ -780,7 +807,7 @@ try {
       async function checkQueueDrag(navigate, evaluate, call) {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
         const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
-        unnamedPlace = 0;
+        unnamedPlace = -1;
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
           waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
             name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
@@ -851,6 +878,9 @@ try {
         await evaluate("document.querySelector('#queue-action').click(); true");
         await waitForLine('typesafe · test affected moved from 2 to 5');
         assert.deepEqual((await snapshot()).handles, units);
+        unnamedPlace = 0;
+        queueFixture.move_revision += 'head';
+        await evaluate('pageRefresh.refresh(true)');
         await evaluate(`(() => {
           const button = document.querySelector('[data-move-id="unit-board"]');
           button.focus();
@@ -860,12 +890,15 @@ try {
         })()`);
         assert.equal((await snapshot()).line, 'Place 1');
         await evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))`);
-        await waitForLine('unit-board · test affected moved from 2 to 1');
+        await waitForLine('unit-board · test affected moved from 3 to 1');
         assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
           ['unit-board', 'unnamed-wait', 'natemerge']);
         assert.deepEqual((await snapshot()).handles, ['unit-board', 'natemerge', 'aws', 'postmaster', 'typesafe']);
         await evaluate("document.querySelector('#queue-action').click(); true");
-        await waitForLine('unit-board · test affected moved from 1 to 2');
+        await waitForLine('unit-board · test affected moved from 1 to 3');
+        unnamedPlace = -1;
+        queueFixture.move_revision += 'named';
+        await evaluate('pageRefresh.refresh(true)');
         await evaluate(`(() => {
           const button = document.querySelector('[data-move-id="unit-board"]');
           button.focus();
@@ -922,7 +955,7 @@ try {
 
         queueFixture.move_revision += 'mac-only';
         queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
-          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', reason:'waiting for mac', why:'target',
+          name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', targets:['mac'], reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
           move:{row_id:'mac-only', movable:false}});
         await evaluate('pageRefresh.refresh(true)');
@@ -950,11 +983,11 @@ try {
           document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
           return true;
         })()`);
-        await waitForLine('typesafe · test affected moved from 1 to 2');
+        await waitForLine('typesafe · test affected moved from 1 to 3');
         assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
           ['unnamed-wait', 'natemerge', 'typesafe']);
         await evaluate("document.querySelector('#queue-action').click(); true");
-        await waitForLine('typesafe · test affected moved from 2 to 1');
+        await waitForLine('typesafe · test affected moved from 3 to 1');
         assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
           ['typesafe', 'unnamed-wait', 'natemerge']);
         assert.deepEqual((await snapshot()).handles.slice(0, 2), ['typesafe', 'natemerge']);
@@ -2253,6 +2286,7 @@ try {
             position:getComputedStyle(line).position});
           const good=async()=>{
             reading.read_at=now/1000;
+            reading.fresh_until=reading.read_at+ageLimit;
             window.fetch=async()=>({ok:true,json:async()=>reading});
             await refresh.refresh(); fitLabels();
           };

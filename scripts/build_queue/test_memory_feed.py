@@ -682,7 +682,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_kept_place_follows_a_ci_job_that_started_before_it(self) -> None:
         from scripts.build_queue import build_queue
 
-        with AdmissionFixture() as fixture:
+        with AdmissionFixture(private=True) as fixture:
             fixture.free(0)
             fixture.hold_starts()
             now = fixture.clock.now()

@@ -2289,7 +2289,7 @@ class AdmissionServer:
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
                            movable: set[str]) -> records.QueueMoveLine:
-        kept, counts = records.kept_place_order(self.held_places, (row for _, row in rows), gate.waiter_order)
+        kept, counts = records.kept_place_order(self.held_places, (row for _, row in rows), gate.waiter_order, self.priority)
         members: list[records.QueueMoveMember] = []
         for (_, row), count in zip(rows, counts, strict=True):
             row_id = row.get("move_id")
@@ -2297,16 +2297,21 @@ class AdmissionServer:
             members.append(records.QueueMoveMember(row_id, movable=row_id in movable, kept_before=count))
         return self._revise_move_line(tuple(members), tuple(place.failed_run for place in kept))
 
-    def _published_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]]
-                               ) -> list[tuple[Path, records.RankedWaiter]]:
+    def _hidden_speculative_waits(self) -> set[str]:
         # A speculative copy still waits for placement while its parent holds local memory.
-        hidden = {place.move_id for request in self.placement_requests.values()
-                  if isinstance(request.purpose, placement.SpeculativeCopy)
-                  and (parent := self.reservations.get(request.purpose.parent_episode)) is not None
-                  and isinstance(parent.place, wire.LocalPlace)
-                  and (place := self.places.get(_place_key(request.owner, request.since))) is not None
-                  and place.episode == request.episode}
-        return [(path, row) for path, row in ordered if row.get("move_id") not in hidden]
+        return {place.move_id for request in self.placement_requests.values()
+                if isinstance(request.purpose, placement.SpeculativeCopy)
+                and (parent := self.reservations.get(request.purpose.parent_episode)) is not None
+                and isinstance(parent.place, wire.LocalPlace)
+                and (place := self.places.get(_place_key(request.owner, request.since))) is not None
+                and place.episode == request.episode}
+
+    def _published_queue_order(self, ordered: list[tuple[Path, records.RankedWaiter]], hidden: set[str]
+                               ) -> list[tuple[Path, records.RankedWaiter]]:
+        candidates = self.last_inputs.placement_candidates if isinstance(self.last_inputs, records.QueueInputs) else {}
+        return [(path, row) for path, row in ordered if row.get("move_id") not in hidden
+                or any(candidate.destination.target == "mac-linux"
+                       for candidate in candidates.get(records.waiter_owner(row), ()))]
 
     def _revise_move_line(self, members: tuple[records.QueueMoveMember, ...],
                           kept_runs: tuple[str, ...]) -> records.QueueMoveLine:
@@ -3453,28 +3458,12 @@ class AdmissionServer:
             named = published.get((step.pid, step.since), ())
             return replace(step, placement_candidates=named) if named else step
 
-        waiting = [with_candidates(step) for step in reading.view.waiting]
-        ordered = list(reading.ordered)
-        represented = {records.waiter_owner(row) for _, row in ordered}
-        for path, row in self._queue_order():
-            owner = records.waiter_owner(row)
-            if owner in represented or not any(candidate.destination.target == "mac-linux"
-                                               for candidate in candidates.get(owner, ())):
-                continue
-            represented.add(owner)
-            waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-                row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
-                records.MachineChoiceWait(), row.get("unit", ""),
-                project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
-                route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
-                job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner],
-                what=row.get("what", "")))
-            ordered.append((path, row))
+        waiting = tuple(with_candidates(step) for step in reading.view.waiting)
         head, line = reading.explanation.head, reading.explanation.line
         if isinstance(head, records.HeadExplanation):
             head = replace(head, waiter=with_candidates(head.waiter))
         line = replace(line, steps=tuple(replace(entry, waiter=with_candidates(entry.waiter)) for entry in line.steps))
-        return replace(reading, view=replace(reading.view, waiting=tuple(waiting)), ordered=ordered,
+        return replace(reading, view=replace(reading.view, waiting=waiting),
                        explanation=replace(reading.explanation, head=head, line=line))
 
     def _local_placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
@@ -3575,7 +3564,8 @@ class AdmissionServer:
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
             return NoPass()
-        ordered = self._published_queue_order(ordered)
+        hidden = self._hidden_speculative_waits()
+        ordered = self._published_queue_order(ordered, hidden)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
         local = {path: replace(step, verify=row.get("verify", step.verify))
@@ -3592,10 +3582,20 @@ class AdmissionServer:
             owner = records.waiter_owner(row)
             positions[owner] = position
             took_place = took_places.get(owner, "")
-            if path in local:
+            row_id = row.get("move_id", "")
+            restored = row_id in hidden
+            if path in local and not restored:
                 visible.append(replace(local[path], took_place=took_place) if took_place else local[path])
                 continue
-            request = routed.get(row.get("move_id", ""))
+            if restored:
+                visible.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
+                    row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
+                    records.MachineChoiceWait(), row.get("unit", ""),
+                    project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
+                    route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
+                    job=row.get("job", GATE_JOB_NOT_RECORDED), what=row.get("what", "")))
+                continue
+            request = routed.get(row_id)
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
             targets = tuple(dict.fromkeys(item.destination.target for item in candidates
                 if item.destination.provider != "local" and not isinstance(item.eligibility, placement.FixedExclusion)))
@@ -3611,11 +3611,12 @@ class AdmissionServer:
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
                 took_place=took_place, what=row.get("what", "")))
-        move_line = self._current_move_line(ordered, self._movable_wait_ids())
-        reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible), move_line=move_line))
+        reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible)))
         reading = self._placement_reading(reading)
+        move_line = self._current_move_line(reading.ordered, self._movable_wait_ids() - hidden)
+        reading = replace(reading, view=replace(reading.view, move_line=move_line))
         reading = replace(self._cloud_reading(reading, self.configuration),
-                          held_places=reading.number_held_places(self.held_places, gate.waiter_order))
+                          held_places=reading.number_held_places(self.held_places, gate.waiter_order, self.priority))
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
         view = wire.ViewReply(replace(reading, explanation=replace(reading.explanation, local_occupancy=occupancy)))
@@ -5916,8 +5917,9 @@ done
         if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
             return [wire.Refused(self.configuration.reason)]
         full_order = self._full_queue_order(self._ranked_waiters())
-        rows = self._published_queue_order(self._visible_queue_order(full_order))
-        line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True))
+        hidden = self._hidden_speculative_waits()
+        rows = self._published_queue_order(self._visible_queue_order(full_order), hidden)
+        line = self._current_move_line(rows, self._movable_wait_ids(check_owners=True) - hidden)
         result = self._move_destination(request, line, [row.get("move_id", "") for _, row in full_order])
         if isinstance(result, wire.QueueMoveConflict):
             return self._mutation_reply(key, result)
@@ -5926,7 +5928,29 @@ done
         self.pass_stale = True
         self._schedule_pass()
         self.persist()
+        self._publish_moved_queue(line, reply.line)
         return [reply]
+
+    def _publish_moved_queue(self, previous: records.QueueMoveLine, line: records.QueueMoveLine) -> None:
+        published = self.published
+        if previous == line or not isinstance(published, PublishedReplies):
+            return
+        reading = published.view.reading
+        if reading.view.move_line != previous:
+            return
+        by_id = {row[1].get("move_id", ""): (row, step)
+                 for row, step in zip(reading.ordered, reading.view.waiting, strict=True)}
+        pairs = [by_id[member.row_id] for member in line.members]
+        ordered = [row for row, _ in pairs]
+        waiting = tuple(step for _, step in pairs)
+        reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=waiting, move_line=line))
+        reading = replace(reading,
+                          held_places=reading.number_held_places(reading.held_places, gate.waiter_order, self.priority))
+        wait_positions = {records.waiter_owner(row): position for position, (_, row) in enumerate(ordered, 1)
+                          if records.waiter_owner(row) in published.wait_positions}
+        view = wire.ViewReply(reading)
+        self._publish_replies(PublishedReplies(view, published.explain, wait_positions, published.placements,
+                                               wire.encode_reply(view).encode(), explain_bytes=published.explain_bytes))
 
     def _move_destination(self, request: wire.QueueMoveRequest | wire.QueueUndoRequest, line: records.QueueMoveLine,
                           full_order: list[str]) -> tuple[wire.QueueMoved, QueueAnchor] | wire.QueueMoveConflict:
