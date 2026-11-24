@@ -2115,15 +2115,17 @@ fi
             mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/caller/1'), str(self.guest_home))))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def check_folder_report_stream(self) -> None:
+    def check_folder_report_stream(self, *, arm_requested: bool = False) -> None:
         attempt = self.placed.attempt
         marker = mac_linux.guest_start_line(attempt, self.repo, self.guest_home)
         command = [sys.executable, '-c',
                    "import sys; print(sys.argv[1], file=sys.stderr); sys.stderr.write('x' * 131072); print('result')",
                    marker]
         armed = mac_linux.ArmedGuestAttempt(attempt, 'f' * 32, 'boot-id', 10, 'guest', str(self.repo))
+        dispatch = self.guest_dispatch()
+        dispatch.arm_requested = arm_requested
         with mac_linux.guest_link() as link:
-            result = mac_linux.stream_guest_bundle(self.repo, command, b'', 2, link, armed, self.guest_dispatch())
+            result = mac_linux.stream_guest_bundle(self.repo, command, b'', 2, link, armed, dispatch)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b'result\n')
         self.assertEqual(result.stderr, marker.encode() + b'\n' + b'x' * 131072)
@@ -2145,7 +2147,7 @@ fi
         try:
             with patch.object(mac_linux, 'send_guest_execution', publish):
                 started = time.monotonic()
-                self.check_folder_report_stream()
+                self.check_folder_report_stream(arm_requested=True)
                 self.assertLess(time.monotonic() - started, 0.5, 'The guest result waited for the report deadline.')
                 self.assertTrue(report_started.wait(2))
                 self.assertFalse(report_finished.is_set())
@@ -3544,17 +3546,35 @@ with (patch.object(conf, 'read', read_config),
     def test_bad_byte_count_before_the_start_line_took_no_run_and_after_it_refuses(self) -> None:
         attempt = 'fixture-attempt'
         send = mac_linux.BundleSend('', '', mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN)
-        for stderr, error in ((b'fixture stderr\n', mac_linux.GuestTookNoRun),
-                              (mac_linux.run_start_line(attempt).encode() + b'\nfixture stderr\n',
-                               mac_linux.GuestResultUnavailable)):
-            with self.subTest(started=error is mac_linux.GuestResultUnavailable):
-                stream = subprocess.CompletedProcess[bytes]([], 0, b'{"reply": 1}\nno count\xff\n', stderr)
+        for started, error in ((False, mac_linux.GuestTookNoRun), (True, mac_linux.GuestResultUnavailable)):
+            with self.subTest(started=started):
+                stream = subprocess.CompletedProcess[bytes]([], 0, b'{"reply": 1}\nno count\xff\n', b'fixture stderr\n')
                 with self.assertRaises(mac_linux.GuestUnavailable) as refusal:
-                    _ = mac_linux.stream_reply(stream, attempt, 10, send, 'Guest cleanup: ended.')
+                    _ = mac_linux.stream_reply(stream, attempt, 10, send, 'Guest cleanup: ended.', tests_started=started)
                 self.assertIs(type(refusal.exception), error)
                 self.assertTrue(str(refusal.exception).startswith(
                     "the guest stream gave no byte count ('no count\ufffd'); SSH or source stream exited 0: "),
                     str(refusal.exception))
+
+    def test_stream_result_uses_the_accepted_guest_start(self) -> None:
+        stream_guest_bundle = mac_linux.stream_guest_bundle
+        for folder in (False, True):
+            for status, reason in ((1, 'SSH or source stream exited 1'), (0, 'the guest stream gave no byte count')):
+                def stream_result(repo: Path, _command: list[str], _bootstrap: bytes, timeout: int,
+                                  link: int, armed: mac_linux.ArmedGuestAttempt,
+                                  dispatch: mac_linux.GuestGateDispatch,
+                                  **_timing: float) -> subprocess.CompletedProcess[bytes]:
+                    marker = (mac_linux.guest_start_line(armed.attempt, self.repo, self.guest_home) if folder
+                              else mac_linux.run_start_line(armed.attempt))
+                    program = 'import sys; print(sys.argv[1], file=sys.stderr); print("bad count"); sys.exit(int(sys.argv[2]))'
+                    return stream_guest_bundle(repo, [sys.executable, '-c', program, marker, str(status)],
+                                               b'', timeout, link, armed, dispatch)
+
+                with (self.subTest(folder=folder, status=status),
+                      patch.object(mac_linux, 'stream_guest_bundle', side_effect=stream_result)):
+                    with self.assertRaisesRegex(GateResultUnknown, reason) as raised:
+                        _ = self.route()
+                    self.assertIn('Guest cleanup: ended', str(raised.exception))
 
     def test_copy_can_retry_after_a_partial_upload(self) -> None:
         main = self.guest_home / '.claude'

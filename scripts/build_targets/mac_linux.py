@@ -287,6 +287,7 @@ class GuestGateDispatch:
     settled: bool = False
     arm_requested: bool = False
     start_folder_payload: bytes = b''
+    folder_start_reports: ExitStack = field(default_factory=ExitStack, repr=False, compare=False)
 
 
 class GuestRunRequest(TypedDict):
@@ -1705,6 +1706,7 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted 
     started = dispatch.started
     if started is None or isinstance(result, placement.NoTerminalReport):
         return
+    dispatch.folder_start_reports.close()
     assignment = dispatch.assignment
     try:
         execution = guest_start_execution(started, assignment.attempt, dispatch.start_folder_payload)
@@ -1776,9 +1778,9 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     def send(deadline: float, timeout: float) -> None:
         report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout, folder_payload=folder_payload)
 
-    # Collect the start report before the gate can report completion.
-    _start_guest_queue_report(send, transfer_deadline, reports, warn_guest_report,
-                              collect_in_background=bool(folder_payload) and not dispatch.arm_requested)
+    # A Folder report can run through stream processing and cleanup. Collect it before reporting completion.
+    _start_guest_queue_report(send, transfer_deadline, dispatch.folder_start_reports if folder_payload else reports,
+                              warn_guest_report, collect_in_background=bool(folder_payload))
 
 
 def _start_guest_queue_report(send: Callable[[float, float], None], deadline_limit: float,
@@ -1845,9 +1847,12 @@ def _start_guest_queue_report(send: Callable[[float, float], None], deadline_lim
     if collect_in_background:
         # Keep the process alive until collection finishes or reaches its deadline.
         try:
-            Thread(target=collect, daemon=False).start()
+            collector = Thread(target=collect, daemon=False)
+            collector.start()
         except RuntimeError as error:
             warn(str(error))
+        else:
+            _ = reports.callback(collector.join)
     else:
         _ = reports.callback(collect)
 
@@ -2096,15 +2101,15 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
-    return stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail)
+    return stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail,
+                        tests_started=dispatch.started == end.armed)
 
 
 def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, bootstrap_bytes: int, send: BundleSend,
-                 cleanup_detail: str) -> GuestReply:
+                 cleanup_detail: str, *, tests_started: bool) -> GuestReply:
     """The reply line and the bundle size from the output of a guest stream that ended, or the guest failure."""
     diagnostics = stream.stderr.decode(errors='replace')
     lines = diagnostics.splitlines()
-    tests_started = run_start_line(attempt) in lines
     if (stream.returncode == GUEST_NOT_LOCKED_STATUS and not tests_started
             and f'{GUEST_ACCEPTED} {attempt}' in lines and run_locked_line(attempt) not in lines):
         raise GuestNotLocked(f'{stream_report(stream)}. {cleanup_detail}')
