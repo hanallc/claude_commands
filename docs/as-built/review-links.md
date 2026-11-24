@@ -1546,7 +1546,8 @@ The recipient is the item's producer for Mark read and the record keeper for eac
 The notice saves its recipient, so a later producer change does not move a saved Mark read notice.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
-Feedback sends the user's words without changing the item state or parking time.
+Tell sends the user's words and keeps the parking time.
+Tell moves a Waiting for nate or Delivered item to Working in the same write that saves the feedback.
 Remove hides the item at once and closes it when the save succeeds.
 Park moves an item to the parked group at once.
 The item stays visible in All if it matches the other filters.

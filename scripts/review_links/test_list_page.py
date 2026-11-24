@@ -7112,6 +7112,33 @@ window.fetch=async(path,options={})=>{
                          [(the_list.MarkedRead(), the_list.PAGE_SOURCE)])
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
 
+        root = self.root / "reviews"
+        for keeper, before, after in (
+            (MORTY.id, the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.WORKING),
+            (DWIGHT.id, the_list.ItemState.DELIVERED, the_list.ItemState.WORKING),
+            (MORTY.id, the_list.ItemState.BLOCKED, the_list.ItemState.BLOCKED),
+        ):
+            with self.subTest(keeper=keeper, state=before):
+                item = self.add("Check the Tell state", before)
+                if keeper != MORTY.id:
+                    legacy = the_list.folder(keeper)
+                    legacy.mkdir(parents=True)
+                    _ = (the_list.folder(MORTY.id) / f"{item.id}.md").rename(legacy / f"{item.id}.md")
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(root))
+                body = urlencode(dict(keeper=keeper, id=item.id, request=request, token=token,
+                                      action="tell", words="Keep this state change.", until=""))
+                delivery, state = list_page.save_action(root, body, include_detail=True)
+                assert state is not None
+                saved = the_list.load(keeper, item.id)
+                self.assertIs(saved.state, after)
+                self.assertEqual((state["item_state"], state["unread"]), (after.value, "false"))
+                self.assertEqual(saved.questions, ())
+                self.assertEqual(delivery, list_page.ListFeedbackDelivery(keeper, item.id, request))
+                self.assertEqual(the_list.feedback_requests(saved)[request].words, "Keep this state change.")
+                _ = list_page.submit(root, body)
+                self.assertEqual(the_list.load(keeper, item.id), saved)
+
     def test_tell_on_a_read_item_adds_no_read_log_entry(self) -> None:
         item = self.add("An update already read")
         item = the_list.mark_read(MORTY.id, item.id, source="nate")
@@ -7253,6 +7280,51 @@ window.fetch=async(_path,options={})=>{
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
+
+        with self.subTest(action="tell", view="needs-me"):
+            item = self.add("Check the waiting result", the_list.ItemState.WAITING_FOR_NATE)
+            browser = self.chrome()
+            root = self.root / "reviews"
+            with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                  patch.object(change_page, "send_to_staff", return_value=None),
+                  serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                try:
+                    browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}#show=needs-me")
+                    result = browser.command("Runtime.evaluate", {
+                        "expression": r"""(async () => {
+ const row=document.querySelector('[data-number="ITEM_NUMBER"]');
+ const chip=document.getElementById('filter-show-needs-me');
+ const before=[row.hidden,Number(chip.dataset.filterCount)];
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('form');
+ const words=form.elements.words;
+ words.value='Use the waiting result.';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ const finished=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(form.dataset.sending) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+ });
+ form.querySelector('[value="tell"]').click();
+ if(!form.dataset.sending) throw new Error('Tell did not submit.');
+ await finished;
+ return {before,after:[row.hidden,Number(chip.dataset.filterCount),row.dataset.state],
+  sameRow:row===document.querySelector('[data-number="ITEM_NUMBER"]')};
+})()""".replace("ITEM_NUMBER", str(item.number)),
+                        "awaitPromise": True, "returnByValue": True}, browser.session)
+                    self.assertNotIn("exceptionDetails", result)
+                    value = cast(dict[str, object], result["result"])
+                    self.assertEqual(value.get("value"), {
+                        "before": [False, 1], "after": [True, 0, "Working"], "sameRow": True})
+                    self.assertIs(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
+                finally:
+                    server.shutdown()
+                    thread.join()
 
     def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
         root = self.root / "reviews"
