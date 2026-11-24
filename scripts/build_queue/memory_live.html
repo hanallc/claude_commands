@@ -1933,7 +1933,7 @@ function renderWalk(d) {
     const labels = queueRowLabels(r);
     const idleCI = r.ci && visibleDetail(r) === "idle";
     const guest = guestRow(r);
-    const target = targetCell(r.machine, undefined, r.guest_unconfirmed ? "not confirmed" : "");
+    const target = targetCell(r.machine, undefined, r.guest_unconfirmed === true ? "not confirmed" : r.guest_unconfirmed);
     cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
       r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
