@@ -2792,6 +2792,13 @@ def outside_detached_row(scope: Path, scan: OutsideQueueScan, limit: float) -> O
     return None
 
 
+def detached_command_scope(scope: Path) -> bool:
+    """Match the launcher's command scope to its run slice."""
+    match = re.fullmatch(r"detached-(?:detect|python-tests|other)-([0-9]{8}T[0-9]{6}-[0-9]+-[0-9a-f]{4})\.scope",
+                         scope.name)
+    return match is not None and scope.parent.name == f"builds-detached-{match[1].replace('-', '')}.slice"
+
+
 def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members: FeedStaff
                             ) -> list[OutsideQueueProcess]:
     """Measure command trees in agent scopes and CPU use in detached scopes."""
@@ -2804,9 +2811,8 @@ def outside_queue_processes(inputs: admission_records.QueueInputs, staff_members
     agent_scopes = sorted(path for path in tool_group_children(agents) if path.suffix == ".scope")
     detached_groups = tool_group_children(detached)
     detached_scopes = [path for path in detached_groups if path.suffix == ".scope"]
-    # Each detached run puts its command scope in a child slice.
     detached_scopes.extend(scope for run in detached_groups if run.suffix == ".slice"
-                           for scope in tool_group_children(run) if scope.suffix == ".scope")
+                           for scope in tool_group_children(run) if detached_command_scope(scope))
     if not agent_scopes and not detached_scopes:
         return []
     try:

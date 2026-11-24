@@ -372,6 +372,18 @@ class MemoryFeedTests(unittest.TestCase):
         step = admission_records.RunningStep("", "", "check", "/fixture", 0, memory, pid=8105)
         self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), rows)
 
+        dust_pid = 8108
+        proc = self.root / "proc"
+        write_process(proc, dust_pid, name="dust")
+        _ = (proc / str(dust_pid) / "cmdline").write_text("/bin/dust\0")
+        for name in ("run-r0001.scope", "detached-other-20261117T192504-3473301-5b4d.scope"):
+            with self.subTest(sibling=name):
+                sibling = run_slice / name
+                write_scope(sibling, members=(dust_pid,))
+                _ = (sibling / "cpu.stat").write_text(cpu_stat.read_text())
+                _ = (proc / str(dust_pid) / "cgroup").write_text(f"0::/{sibling.relative_to(self.root / 'cgroup')}\n")
+                self.assertEqual(memory_feed.outside_queue_processes(replace(inputs, running=(step,)), owners), rows)
+
     def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
                                 current_session=staff.StaffId("fixture-runner"))
