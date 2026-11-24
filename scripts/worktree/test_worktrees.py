@@ -18,7 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from typing import Callable, NamedTuple, TypedDict, cast, override
+from typing import Callable, ClassVar, NamedTuple, TypedDict, cast, override
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import StringIO
@@ -209,6 +209,7 @@ class EndResult(TypedDict):
 
 
 class WorktreeLifecycleTests(unittest.TestCase):
+    helper_tree: ClassVar[Path]
     root: Path = Path()
     home: Path = Path()
     origin: Path = Path()
@@ -220,6 +221,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
     environment: dict[str, str] = {}
     base: str = ""
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        home = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="worktree-helpers-"))).resolve()
+        _ = copy_helpers(home, *COPY_HELPERS, "scripts/worktree", "config")
+        cls.helper_tree = home / ".claude"
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="worktree-lifecycle-"))).resolve()
@@ -229,7 +237,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = self.enterContext(patch.object(tmp_sweep, "PROC_DIR", str(self.proc)))
         self.home = self.root / "home"
         self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
+        _ = shutil.copytree(self.helper_tree, self.home / ".claude", symlinks=True)
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"
