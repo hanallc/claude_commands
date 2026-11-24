@@ -5,8 +5,6 @@ description: Review decisions one at a time.
 Use this when the user has just received a long list — recommendations, findings, options, todos — and wants to review them deliberately one by one instead of responding to the whole wall of text.
 
 **Read `~/.claude/docs/user_facing_explanation.md` first and follow it.**
-Explain how the parts relate so the user can assess each item.
-Follow its build order, naming rules, comprehension gate, choice-line format, and steps for clarifying an item.
 
 **Read `~/.claude/docs/type_design.md` too and follow it.** When an item concerns
 types, APIs, stored state, or optional values, use that contract to evaluate the
@@ -29,7 +27,7 @@ count into Step 2 without listing the items.
 ## Step 2: Set up where decisions get recorded
 
 
-By default the review gets a transient doc: a new file at the working repo's root, excluded from git with `bash ~/.claude/scripts/exclude/exclude.sh <path>` (the scratchpad does not survive compaction), headed with today's date and where the items came from. It holds each decision and any action the decision leaves pending, and is deleted in Step 5. Create it without asking, and open the first item with one line: `N items; decisions in <path>, deleted when the review ends.` An item may also be acted on as soon as it is decided; the doc then records that it was done.
+Create a transient document at the repository root by default. Give it today's date and the source of the items. Exclude it from Git with `bash ~/.claude/scripts/exclude/exclude.sh <path>`. Record each decision and its pending actions. If you act on a decision during the review, record the action as done. Before the first item's choice line, add `N items. Decisions go in <path>. The file is temporary.`
 
 Ask first only when an obvious doc is in scope that the user did not name, a file they have been editing or named this session that the decisions belong in:
   > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / transient doc)`
@@ -90,65 +88,20 @@ For each item, in order:
 
 1. Mark the task `in_progress`.
 2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
-3. **Build a decision-ready explanation before formatting the item**, following
-   the build order and naming rules in the shared file. Two additions specific to
-   list items:
-   - Use one concrete scenario when timing, lifecycle, ownership, or state transitions create the decision.
-   - Distinguish existing behavior from proposed behavior, but do not make the user reconstruct the causal story from implementation facts.
-4. Apply the **comprehension gate** from the shared file before presenting. `elaborate` never supplies context the initial decision required.
-5. Present the item with the decision frame below.
-6. **Present the choices as an inline text line** per the shared file's Choices section — one line of message text, exactly one option marked recommended with its reason, never a survey or multiple-choice UI. Pick a choice set that fits the item (`keep / drop / modify`, `approve / reject / redirect`, …) and always include `elaborate`:
-   > `keep (recommended — survived review unchanged) / modify / drop / elaborate`
-7. **Wait for the user's response.** Do not move on until they reply.
+3. Draft the item with the shared file's **Ad hoc review items** template.
+4. If a subagent prepares the item, give it the template. Require it to pass the shared reader test before it returns the draft.
+5. Pass the shared **reader test** and **comprehension gate** before each presentation. Then show the item.
+6. **Wait for the user's response.**
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
-8. When they clearly acknowledge a terminal choice (including terse approvals such as `agreed`, `approved`, `okay`, or `continue` when unambiguous), record the decision, and any action it leaves pending, in the doc, mark the task `completed`, and move to the next item.
+7. Accept a terminal choice when the user's response is clear. Record the decision and any pending actions. Mark the task `completed` and continue to the next item.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
 After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
 Run it again when the user returns to a closed item; include that item in the count.
-
-### Decision frame
-
-Use this order by default:
-
-1. **Situation** — explain the triggering event or user task, what the system must decide, and what goes wrong if it chooses incorrectly. Start in application/user behavior, not implementation terminology.
-2. **How the choices behave** — explain every choice in terms of what happens. Introduce a type, API, or variant name only after its behavior is understood, and define it at that point. Mark every undecided name immediately as `(name TBD)`.
-3. **Concrete scenario** — when the decision involves timing, lifecycle, ownership, state, or multiple actors, walk through one short example before asking the question.
-4. **Question** — state the single decision in behavioral language. The user should not need to know the implementation names to answer it.
-5. **Recommendation** — give the recommended outcome first and connect it to the user's stated goal or the concrete failure it avoids. Name meaningful costs or restrictions.
-6. **Implementation mapping (optional)** — only after the behavior is understood, show the proposed type/API names or a small new-behavior code example when that helps record the decision precisely.
-7. **Still pending** — name only nearby decisions that could otherwise look silently decided. Say where they will be handled when known. Do not dump the full backlog.
-8. **Choices** — one plain-text line with exactly one recommendation and `elaborate`; describe behavior before labels.
-
-Example shape:
-
-```text
-### A3 — <decision title>
-
-When <triggering situation>, the application currently/proposedly ... . The
-decision matters because ... .
-
-The choices behave differently:
-- With <behavioral choice>, the system ... .
-- With <other behavioral choice>, the system ... .
-
-The question is whether ...
-
-I recommend ... because ...
-
-In the implementation, this would be named `<ProposedType>` (name TBD).
-
-Still pending:
-- ... remains for A4.
-
-approve (recommended — reason) / alternative / elaborate
-```
-
-This is a scaffold, not a demand for headings when a very small item reads more clearly in a few sentences.
 
 ## Step 5: Wrap up
 
@@ -165,12 +118,10 @@ When every item is done:
 
 ## Rules
 
-- **NEVER run the review as a survey.** No AskUserQuestion, no option chips, no questionnaire UI — for the items themselves or for any step of this workflow. Every item is a succinct summary followed by the inline choice line from Step 4. Keep the technical content, drop the widget.
 - One item at a time. Never present two items in the same turn.
 - **Model-level questions get model-level answers, at Step 3.5's altitude** — participants, what is durable versus transient, how they connect, one worked instance — and then return to the item. Adopt the user's wording verbatim if they restate the model themselves.
-- Keep the recommendation scoped to the active question. Put adjacent unresolved consequences in **Still pending** rather than deciding them implicitly.
 - Step 2's doc question, when asked, is a choice like any other: mark exactly one option recommended.
-- Avoid unsolicited before/after code comparisons. This never permits omitting the triggering situation.
+- Show before and after code comparisons only when the user asks.
 - If the user says skip, use a supported skipped/cancelled terminal status; if none exists, mark it completed with the skip noted. Then move on without arguing.
 - If they want to revisit an earlier item, jump back. Don't insist on linear order.
 - An explanation request never suspends the one-at-a-time rhythm.
