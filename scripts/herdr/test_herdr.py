@@ -5171,6 +5171,7 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("herdr_types.py"), isolated / "herdr_types.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("message_proof.py"), isolated / "message_proof.py")
         message = isolated.parent / "message"
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
