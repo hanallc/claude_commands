@@ -5,6 +5,15 @@ The checkout's `target` link points to that output folder.
 The worktree record stores the unit, short name, and output path.
 See [Build folders](build-folders.md) for the paths, name rules, and move commands.
 
+A managed unit move requires a branch and records it from the destination checkout's HEAD.
+The move journal stores this requirement for recovery.
+If a managed move stops before relocation, resume it with `worktrees.py move`.
+Migration also supports detached checkouts.
+`worktrees.py record-branch <path>` updates an existing record from the checkout's current branch.
+The command prints the old and new branch names.
+It verifies that the checkout belongs to the recorded repository.
+It refuses an unrecorded checkout or a detached HEAD.
+
 Landed cleanup reports the checkout and its assigned output for manual review.
 It keeps the worktree record until the checkout and its Git registration are absent.
 If worktree setup fails, the checkout stays for review.
