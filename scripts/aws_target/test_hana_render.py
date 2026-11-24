@@ -32,6 +32,7 @@ IMAGE_SOURCE_HASH = ROOT / 'scripts/aws_target/hana_image.sha256'
 UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
+    'build_queue/first_step.py': {'build_hold/build_hold.py'},
     'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
     'build_queue/snapshot_codec.py': {'message/unit_labels.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},

@@ -181,11 +181,13 @@ OUTSIDE_UNIT_RULES = OutsideUnitRules()
 
 @dataclass(frozen=True)
 class RunPlace:
-    """The run placement holds its identity, first owner, start time, and unit."""
+    """Keep the first place of a live run."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    move_id: str = ""
+    repository: str = ""
     unit_place: UnitPlace | OutsideUnitRules = field(default=OUTSIDE_UNIT_RULES, kw_only=True)
 
 
@@ -701,6 +703,7 @@ class ConsumePermission(CallerCode):
     claim: placement.ProviderClaimReference
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = field(
         default_factory=lambda: placement.ClaimHolderUnconfirmed("not supplied"))
+    guest_proof_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -712,6 +715,12 @@ class ExecutionReport(CallerCode):
     evidence: execution_identity.ExecutionEvidence
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
     path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
+
+
+@dataclass(frozen=True)
+class SettlementRequest:
+    """Ask the queue to confirm settlement for an exact gate attempt."""
+    assignment: placement.PlacementAssignment
 
 
 @dataclass(frozen=True)
@@ -780,7 +789,8 @@ Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest
            | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
-           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
+           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport
+           | SettlementRequest | PrerequisiteReport | CancelPlacement)
 
 Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
          | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
@@ -797,7 +807,7 @@ _REQUESTS: dict[str, type] = {
     "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
-    "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
+    "consume_permission": ConsumePermission, "execution_report": ExecutionReport, "settlement": SettlementRequest,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
     _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
@@ -812,7 +822,8 @@ REPLY_TYPES: dict[str, type] = {
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
     "local_placement_granted": LocalPlacementGranted, "placement_status": PlacementStatusReply,
 }
-_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission,
+                    ExecutionReport, SettlementRequest, PrerequisiteReport, CancelPlacement,
                     PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 
@@ -860,6 +871,8 @@ def _write_wire_record(value: object) -> object:
     # An older reader has no session field; a request with no session leaves it out.
     if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
         del record["session"]
+    if record.get("kind") == "ConsumePermission" and record.get("guest_proof_required") is False:
+        del record["guest_proof_required"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
