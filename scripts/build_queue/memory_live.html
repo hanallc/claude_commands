@@ -1930,13 +1930,10 @@ function ownerFields(row) {
   if (row.caller && row.caller !== starter) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
-function stepDisplayName(row, name = row.name) {
-  return row.kind === "repository-slot" && row.detail ? `${name} · ${row.detail}` : name;
-}
 function olderStepTitle(row) {
   if (ciRow(row)) return {unit: '', step: row.ci_label || `hana CI · ${row.detail || row.name}`};
   const unit = ownerText(row.unit);
-  const name = publicText(stepDisplayName(row) || '');
+  const name = publicText(row.name || '');
   const step = unit && name.startsWith(unit + ' ') ? name.slice(unit.length).replace(/^\s*·\s*|^\s+/, '') : name;
   return {unit, step};
 }
@@ -1982,10 +1979,9 @@ function stepTooltip(key, data) {
   const call = verify?.call || row.call;
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && !recorded(row.used) && (row.used || row.program_memory))
-    || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
+    || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
   const guest = guestRow(row);
-  const guestFields = guest ? [machineField('Runs on', row.machine),
-    field('Guest attempt', row.guest_run?.attempt || guestState(row)), ...progressRows(row, data)] : [];
+  const guestFields = guest ? [machineField('Runs on', row.machine), ...progressRows(row, data)] : [];
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && (guest || namesGuest)
     ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || ''),
@@ -2015,12 +2011,11 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(...priorityFields(row.priority_entries, row.priority_lines));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
+    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' : row.why || 'its turn'), ...routeFields(row));
     if (['build space', 'build hold'].includes(row.why)) rows.push(field('Reason', row.reason));
     if (row.order_note) rows.push(field('Order', row.order_note));
     if (row.job_start) rows.push(field('Job start', row.job_start));
-    if (!['cloud', 'repository-slot'].includes(row.kind) && row.why !== 'target') {
+    if (row.kind !== 'cloud' && row.why !== 'target') {
       const reading = data.waitReadings.get(row);
       const {head, earlier} = reading;
       if (head) {
@@ -2194,10 +2189,6 @@ function queueRowLabels(row) {
     repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const verify = row.verify?.verb || "";
-  if (!unit && row.kind === "repository-slot") {
-    const name = stepDisplayName(row);
-    return {name, step: name, verify};
-  }
   if (!unit) {
     // A row with no unit starts with its owner, the text before ": " in its name. The step goes in Step.
     // The owner has no small line: it would repeat the owner.
@@ -2207,8 +2198,7 @@ function queueRowLabels(row) {
   }
   const showrunner = ownerText(row.showrunner);
   const step = row.title?.unit ? row.title.step : "";
-  return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
-    step: row.kind === "repository-slot" ? stepDisplayName(row, step || row.name) : step, verify};
+  return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner, step, verify};
 }
 // A unit always shows in the unit color, by its role, also when it has no staff entry. Python makes the span.
 function unitName(text) {
@@ -2410,6 +2400,7 @@ function programMemoryHtml(memory, amounts) {
   programMemoryMarkup.set(memory, html);
   return html;
 }
+let displayedQueue = null;
 function pageTooltipHtml(key, data) {
   if (!key.startsWith("limit:")) {
     const queueTip = key.startsWith("held:") || key.startsWith("wait:");
@@ -3104,7 +3095,6 @@ let queueAccess = null;
 let queueDrag = null;
 let queueSending = false;
 let queueReply = null;
-let displayedQueue = null;
 let queueHighlight = "";
 let queueHighlightTimer;
 let queueAction = null;

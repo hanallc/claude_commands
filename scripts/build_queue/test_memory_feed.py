@@ -1326,9 +1326,7 @@ process.stdout.write(JSON.stringify({
                     shown_name = names[f"{kind}:{row['key']}"]
                     step = (title["step"] if row["unit"] not in ("", "—") else
                             name.partition(": ")[2])
-                    shown_step = (" ".join(f'<span class="word">{word}</span>' for word in step.split(" "))
-                                  if kind == "wait" and " " in step else step)
-                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{shown_step}</span></th>', cell)
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     if row.get("kind") == "cloud":
                         unit = units[0 if kind == "row" else 1]
                         prefix, _, step = name.partition(": ")

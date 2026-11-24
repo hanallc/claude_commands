@@ -2395,28 +2395,6 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
-    def test_repository_slot_wait_has_no_memory_group(self) -> None:
-        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
-                "waiters": [{"kind": "repository-slot", "name": "gate", "detail": "widget", "need": 0,
-                             "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"},
-                            {"kind": "repository-slot", "name": "builder: gate", "detail": "widget", "need": 0,
-                             "unit": "builder", "showrunner": "builds", "title": {"unit": "builder", "step": "gate"},
-                             "since": 101, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
-        rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-0', data)", data))
-        self.assertEqual({row["label"]: row["value"] for row in rows}["Waits for"], "build slot")
-        self.assertTrue({"Needs", "Free", "Short by"}.isdisjoint(row["label"] for row in rows))
-        markup = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
-        root = ElementTree.fromstring(f"<root>{markup}</root>")
-        self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-0']/span/span/span[@class='name']"),
-                         "gate · widget")
-        self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']"), "gate · widget")
-        self.assertEqual(rows[0]["label"], "gate · widget")
-        owned = root.find(".//div[@data-tip='wait:fixture-wait-1']/span[@class='row-label']")
-        assert owned is not None
-        self.assertEqual(owned.findtext("./span/span[@class='name']"), "builder")
-        self.assertEqual(owned.findtext("./span[@class='owner']"), "builds")
-        self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-1']/th[@class='step']"), "gate · widget")
-
     def test_heading_keeps_all_structured_priority_entries(self) -> None:
         data = {"unmatched_priority_entries": [{"unit": "research", "why": "first"},
                                                 {"unit": "cables", "why": "second"}],
@@ -2816,8 +2794,7 @@ renderWalk = reading => { painted = reading; };
         for kind, rows in (("run", payload["walk"]), ("wait", payload["waiters"])):
             for index, row in enumerate(cast(list[dict[str, object]], rows)):
                 _ = row.setdefault("key", f"fixture-{kind}-{index}")
-                if row.get("kind") != "repository-slot":
-                    _ = row.setdefault("title", {"unit": "", "step": row.get("ci_label") or row["name"]})
+                _ = row.setdefault("title", {"unit": "", "step": row.get("ci_label") or row["name"]})
                 _ = row.setdefault("unit", "")
         with tempfile.TemporaryDirectory(prefix="memory-hover-") as directory:
             script = Path(directory) / "fixture.cjs"
@@ -2961,7 +2938,8 @@ renderWalk = reading => { painted = reading; };
         self.assertIn('<dt>Because</dt><dd></dd><dd class="long">edits the merged checkout with mend and fmt</dd>',
                       grids["wait:fixture-wait-0"])
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        self.assertIn("grid-template-columns: max-content 1fr", page)
+        self.assertRegex(page, r"\.tip \{[^}]*grid-template-columns: fit-content\(44%\) minmax\(0, 1fr\)")
+        self.assertIn(".tip :is(dt, dd) { overflow-wrap: anywhere; }", page)
         self.assertRegex(page, r"\.tip dt \{[^}]*text-align: left")
         self.assertRegex(page, r"\.tip dd \{[^}]*text-align: right")
 

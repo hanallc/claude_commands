@@ -15,7 +15,7 @@ from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue.scope_activity import RunIdentity as RunIdentity
+from scripts.build_queue.execution_identity import RunIdentity as RunIdentity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
     StepJob, VerifyStep)

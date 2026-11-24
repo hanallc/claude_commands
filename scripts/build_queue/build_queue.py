@@ -83,15 +83,6 @@ def select_step(directory: Path, selector: str) -> SelectedStep | admission_reco
     return admission_records.NoWaiter()
 
 
-def asked_words(why: str | admission_protocol.WordsNotGiven, actor: str) -> str | admission_protocol.Refused:
-    """Resolve the reason before a priority change."""
-    if isinstance(why, str) and why.strip():
-        return why
-    if actor == admission_records.PLAIN_SHELL_ACTOR:
-        return admission_records.PLAIN_SHELL_WORDS
-    return admission_protocol.Refused("--words is required: pass the user's words; the queue priority did not change")
-
-
 @dataclass(frozen=True)
 class BumpCommand:
     words: list[str]
@@ -166,7 +157,7 @@ def main() -> int:
         return 3
     try:
         actor = admission_records.queue_command_actor()
-        why = asked_words(command.why, actor)
+        why = person_actions.asked_words(command.why, actor)
         if isinstance(why, admission_protocol.Refused):
             print(f"build queue: {why.reason}")
             return 3
