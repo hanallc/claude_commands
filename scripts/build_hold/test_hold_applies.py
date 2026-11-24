@@ -26,7 +26,7 @@ from scripts.build_targets import build_targets
 SCRIPT = Path(__file__).with_name("hold_applies.py")
 REFUSAL = ("natedev builds are held by builder (for app test, release eta unknown). "
            "Keep working, writes included. Use verify.sh: eligible steps go to the Mac; other steps wait. "
-           "Raw cargo and merge gates must wait for the hold to end.")
+           "Raw cargo and gate jobs must wait for the hold to end.")
 
 
 class TemporaryHoldTest(unittest.TestCase):

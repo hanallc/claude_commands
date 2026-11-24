@@ -20,7 +20,6 @@ import json
 import os
 import shlex
 import socket
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -37,6 +36,7 @@ from unittest.mock import ANY, Mock, call, patch
 from scripts.lib import conf, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
@@ -143,8 +143,8 @@ class RefusalWatchTests(unittest.TestCase):
         }, clear=True)))
         write_machine_config(Path(os.environ["CONF_DIR"]))
         for name in ("send", "postmaster", "codex_daemon", "shutdown"):
-            _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
-                             Path(os.environ["CONF_DIR"]) / f"{name}.conf")
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
+                                         Path(os.environ["CONF_DIR"]) / f"{name}.conf")
         (self.home / "notes").mkdir()
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))

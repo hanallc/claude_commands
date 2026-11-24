@@ -25,11 +25,12 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
+from scripts.lint import prebuild
 from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment,
                                               write_config_fixture,
                                               write_config_fault, commit_config_fixture)
 
-from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
+from scripts.mac_test import eligibility, fix_return, floor_claims, nextest_log, offload, claim_state
 from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_hold.owning_session import NoOwningSession
@@ -46,7 +47,7 @@ else:
     from scripts.buildlog import health as buildlog_health
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
-from scripts.lib import conf, session_folder
+from scripts.lib import conf, conf_reads, session_folder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -102,6 +103,25 @@ class GeneratedSourceTests(unittest.TestCase):
 
 
 class LintVerbTests(unittest.TestCase):
+    def test_prebuild_refuses_the_mirror_descriptor_environment_variable(self) -> None:
+        name = floor_claims.MIRROR_LEASE_FDS
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "Cargo.toml"
+            _ = manifest.write_text(f'''[workspace.metadata.dev.prebuild.fixture-artifact]
+target = "wasm32-unknown-unknown"
+env = "{name}"
+for = ["fixture"]
+''')
+            stderr = io.StringIO()
+            with mock.patch.object(prebuild, "build", return_value=1) as build, \
+                 mock.patch.object(os, "execvp") as nextest, redirect_stderr(stderr):
+                status = prebuild.main(["--manifest", str(manifest), "--", "cargo", "nextest", "run", "-p", "fixture"])
+            self.assertEqual(status, 2, stderr.getvalue())
+            self.assertEqual(stderr.getvalue(), f"prebuild: {manifest}: workspace.metadata.dev.prebuild.fixture-artifact"
+                             + f".env: the runner sets {name}.\n")
+            build.assert_not_called()
+            nextest.assert_not_called()
+
     def test_build_reports_the_cargo_target_directory_after_success(self) -> None:
         lint = Path(__file__).resolve().parents[1] / "lint" / "lint"
         with tempfile.TemporaryDirectory() as directory:
@@ -713,16 +733,23 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_explicit_mac_settings_cannot_bypass_the_nextest_summary_limit(self) -> None:
         request = offload.OffloadRequest(self.root, "hana", "log-limit", offload.NO_RESULT_FILE, (),
                                         owner="verify", holder_session="fixture-session")
-        for limit in ("", "# whole: 1..2048\n"):
+        ceiling = conf.read(nextest_log.DEFAULT_SETTINGS).whole(nextest_log.SUMMARY_BYTES)
+        larger = ceiling + 1
+        source = self.settings.read_text()
+        summary = (rf"^(?:{re.escape(conf_reads.SHIFT_MARK)}[^\n]*\n)?"
+                   + rf"# whole: [^\n]*\n{nextest_log.SUMMARY_BYTES}=[^\n]*$")
+        for limit in ("", f"# whole: 1..{larger}\n"):
             with self.subTest(limit=limit):
                 settings = self.root / "summary-limit.conf"
-                _ = settings.write_text(self.settings.read_text().replace(
-                    f"# whole: 1..1024\n{nextest_log.SUMMARY_BYTES}=1024",
-                    f"{limit}{nextest_log.SUMMARY_BYTES}=2048"))
+                contents, replacements = re.subn(summary, f"{limit}{nextest_log.SUMMARY_BYTES}={larger}",
+                                                 source, flags=re.MULTILINE)
+                self.assertEqual(replacements, 1)
+                _ = settings.write_text(contents)
                 config = eligibility.read_config(settings)
+                error = f"Summary limit must be at most {ceiling}" if limit else nextest_log.SUMMARY_BYTES
                 with (mock.patch.object(subprocess, "run", RUN_SUBPROCESS),
                       mock.patch.object(subprocess, "Popen", START_SUBPROCESS),
-                      self.assertRaisesRegex(conf.Unusable, nextest_log.SUMMARY_BYTES + "|Summary limit")):
+                      self.assertRaisesRegex(conf.Unusable, error)):
                     _ = offload.remote_test_command(config, request, HANA)
 
     def test_explicit_mac_settings_use_host_only_nextest_limits(self) -> None:
@@ -1097,6 +1124,15 @@ class BusyHolderTests(unittest.TestCase):
 
 @final
 class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
+    def test_verify_refuses_the_mirror_descriptor_environment_variable(self) -> None:
+        name = "COPIES_MIRROR_LEASE_FDS"
+        result = self.verify("test", "sample", "--mac", "fixture", "--env", name, extra={name: ""})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, f"verify.sh: --env {name}: the runner sets it, "
+                         + "or it changes what Cargo builds; it is not forwarded.\n")
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_runs(), [])
+
     def test_unreadable_history_ends_verify_without_a_retry(self) -> None:
         git = self.bin_directory / "git"
         source = git.read_text().replace("#!/bin/bash\n",
@@ -1914,6 +1950,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
         self.assertEqual(remote_words[lint_index + 1 :], ["nextest", *words])
+
+    def test_offload_refuses_the_mirror_descriptor_environment_variable(self) -> None:
+        name = "COPIES_MIRROR_LEASE_FDS"
+        self.environment[name] = ""
+        result = self.command(runner_options=("--env", name), separate_stderr=True)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, f"offload: --env {name}: the runner sets it; it is not forwarded.\n")
+        self.assertEqual(self.events_for("ssh"), [])
 
     def test_nextest_and_copy_runs_deliver_forwarded_environment_to_the_remote_command(self) -> None:
         self.environment.update({"NO_COLOR": "1", "TERM": "xterm-256color", "TERM_PROGRAM": "verify"})
