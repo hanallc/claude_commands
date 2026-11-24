@@ -369,20 +369,27 @@ class FirstStepTests(unittest.TestCase):
                                                      *targets, "--", *command]), 17)
 
     def test_nested_gate_reports_targets_to_the_parent_reservation(self) -> None:
+        from scripts.production import gate
+
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
-            script = source / "gate.py"
-            _ = script.write_text("raise SystemExit(17)\n")
-            command = ("python3", str(script), *MODULE_GATE_COMMAND[2:])
+            command = ("python3", str(source / "gate.py"), *MODULE_GATE_COMMAND[2:])
             parent = client.OuterReservation("parent", os.getpid())
-            marker = f"{parent.reservation}\t{parent.pid}\t{fixture.state_dir}\t{fixture.socket_path}"
-            with (mock.patch.dict(os.environ, {client.RESERVED_STEP_ENV: marker}),
-                  mock.patch.object(gate_targets, "outer_reservation", return_value=parent),
-                  mock.patch.object(first_step, "report_parent_gate_targets", create=True,
-                                    return_value=nullcontext()) as report):
+
+            def run(argv: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(tuple(argv), command)
+                report.assert_not_called()
+                return subprocess.CompletedProcess(argv, gate.main(argv[2:]))
+
+            with (mock.patch.object(gate_targets, "outer_reservation", return_value=parent),
+                  mock.patch.object(gate, "outer_reservation", return_value=parent),
+                  mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+                  mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
+                  mock.patch.object(gate, "run_tests_only", return_value=17),
+                  mock.patch.object(subprocess, "run", side_effect=run),
+                  mock.patch.object(first_step, "report_parent_gate_targets", return_value=nullcontext()) as report):
                 self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--", *command]), 17)
-            report.assert_called_once_with(placement.GateTargets((), (
-                ("mac-linux", gate_targets.PARENT_RESERVATION), ("aws", gate_targets.PARENT_RESERVATION))))
+            report.assert_called_once_with(parent)
 
     def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
         with PlacementFixture() as fixture:

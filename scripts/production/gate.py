@@ -3826,11 +3826,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
         target = checked_gate_target(args)
-        if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
-                and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
-            target = "natedev"
-        with (unwind_gate_on_sigterm() if args.tests_only else nullcontext()):
-            return run_gate_command(args, target)
+        with ExitStack() as scope:
+            if isinstance(target, NoGateAssignment):
+                if args.promote_only:
+                    target = "natedev"
+                elif args.modules and isinstance(parent := outer_reservation(match_cpu_pool=True), OuterReservation):
+                    scope.enter_context(first_step.report_parent_gate_targets(parent))
+                    target = "natedev"
+            with (unwind_gate_on_sigterm() if args.tests_only else nullcontext()):
+                return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
         return error.status

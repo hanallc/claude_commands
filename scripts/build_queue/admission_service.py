@@ -3023,8 +3023,6 @@ class AdmissionServer:
             self.system_reader.update(plan)
             evidence = self.system_reader.latest
         self.system_evidence = evidence
-        parent_gates = {report.reservation: report.gate_targets for connection in self.connections.values()
-                        if (report := connection.parent_gate) is not None}
         memories: list[tuple[records.Reservation, records.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
             if isinstance(record.place, wire.CloudPlace):
@@ -3046,8 +3044,6 @@ class AdmissionServer:
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
             resolve_reservation_repository(row, record)
-            if (gate_targets := parent_gates.get(record.reservation_id)) is not None:
-                row["queue_waiter"] = {**row.get("queue_waiter", record.queue_waiter), "gate_targets": gate_targets}
             lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
             unscoped_direct = (not record.sidecar and episode not in self.placement_requests
                                and episode in evidence.lifetimes)
@@ -3694,15 +3690,25 @@ class AdmissionServer:
             if (request is not None and assignment is not None
                     and assignment.assignment.destination.provider == "local"):
                 candidates[record.reservation_id] = assignment.placement_candidates or self._placement_candidate_reading(request)
-        if not candidates:
+        nested_targets = {report.reservation: report.gate_targets for connection in self.connections.values()
+                          if (report := connection.parent_gate) is not None}
+        if not candidates and not nested_targets:
             return reading
+
+        def with_targets(step: records.RunningStep, reservation: str) -> records.RunningStep:
+            if (targets := nested_targets.get(reservation)) is not None:
+                return replace(step, gate_targets=targets, placement_candidates=())
+            if named := candidates.get(reservation):
+                return replace(step, placement_candidates=named)
+            return step
+
         reservations = iter(reading.explanation.decided_from.reservations)
         running: list[records.RunningStep] = []
         explained: list[records.ExplainedRunningStep] = []
         for step, entry in zip(reading.view.running, reading.explanation.running, strict=True):
-            named = candidates.get(next(reservations).get("reservation_id", ""), ()) if gate.running_has_reservation(step) else ()
-            running.append(replace(step, placement_candidates=named) if named else step)
-            explained.append(replace(entry, step=replace(entry.step, placement_candidates=named)) if named else entry)
+            reservation = next(reservations).get("reservation_id", "") if gate.running_has_reservation(step) else ""
+            running.append(with_targets(step, reservation))
+            explained.append(replace(entry, step=with_targets(entry.step, reservation)))
         return replace(reading, view=replace(reading.view, running=tuple(running)),
                        explanation=replace(reading.explanation, running=tuple(explained)))
 

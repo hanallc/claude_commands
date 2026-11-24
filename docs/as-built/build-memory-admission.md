@@ -553,6 +553,10 @@ The feed reads the gate's target selection and the queue's eligibility for each 
 The feed keeps a busy candidate in the waiting row and shows its reason.
 The feed omits candidates with a `FixedExclusion` from the list of machines.
 A running gate shows its actual machine in the Machine column.
+A named module gate that uses a parent reservation reports `GateTargets` from the gate process.
+The parent row shows natedev while the reporting socket is open.
+The Because field shows `the gate uses its parent reservation` for Mac Linux and AWS.
+The queue restores the parent's targets and reasons when the socket closes.
 The queue groups a wait for one remote gate target with that target.
 When memory holds the first step in line, its hover adds a `First in line` table.
 The table starts at free RAM and subtracts each term that is not zero: the safety net, swap coming back, build reserved, and RAM held for other waiting steps.

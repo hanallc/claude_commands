@@ -345,13 +345,12 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> p
     if command_program(command) not in GATE_SCRIPTS:
         return placement.GateTargets((), ())
     from scripts.build_targets.gate_targets import (
-        PARENT_RESERVATION, NoEnabledTarget, caller_gate_targets, eligible_gate_targets, uses_parent_reservation,
+        NoEnabledTarget, caller_gate_targets, eligible_gate_targets, uses_parent_reservation,
     )
 
     arguments = tuple(command)
     if uses_parent_reservation(arguments):
-        return placement.GateTargets((), tuple((machine, PARENT_RESERVATION)
-            for machine in placement.GATE_MACHINES if machine != "natedev"))
+        return placement.GateTargets((), ())
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
     if names:
         return caller_gate_targets(tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip()))))
@@ -363,21 +362,22 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> p
 
 
 @contextmanager
-def report_parent_gate_targets(targets: placement.GateTargets) -> Generator[None]:
-    """Publish the gate selection while the wrapper runs under its parent."""
+def report_parent_gate_targets(parent: client.OuterReservation) -> Generator[None]:
+    """Publish the targets while the gate runs under its parent reservation."""
     from scripts.build_targets.gate_targets import PARENT_RESERVATION
 
     marker = os.environ.get(client.RESERVED_STEP_ENV, "").split("\t")
     with ExitStack() as scope:
-        if len(marker) >= 3 and any(reason == PARENT_RESERVATION for _, reason in targets.exclusions):
-            reservation, _, _, *resources = marker
+        if len(marker) >= 3 and marker[0] == parent.reservation:
+            _, _, _, *resources = marker
             path = ((resources[0] or DEFAULT_ADMISSION_SOCKET) if resources
                     else str(wire.admission_socket_path()))
             try:
                 connection = scope.enter_context(socket(AF_UNIX, SOCK_STREAM))
                 connection.settimeout(records.read_memory_config(report=False).query_timeout_seconds)
                 connection.connect(str(path))
-                request = ParentGateTargets(reservation, targets)
+                targets = placement.GateTargets((), ()).restrict(("natedev",), PARENT_RESERVATION)
+                request = ParentGateTargets(parent.reservation, targets)
                 connection.sendall(wire.encode_request(request).encode())
                 with connection.makefile("rb") as stream:
                     if not isinstance(wire.parse_reply(stream.readline()), wire.Ok):

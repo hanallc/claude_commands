@@ -2567,6 +2567,58 @@ class ReplyPublicationTests(unittest.TestCase):
             fixture.server.run_once(0)
             self.assertIsNone(selection())
 
+    def test_nested_gate_replaces_the_parent_placement_candidates_until_it_closes(self) -> None:
+        from scripts.build_queue import memory_feed
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_and_natedev_request, mac_linux_candidate, register_scaler,
+        )
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            owner = fixture.fixture_owner(os.getppid(), "123")
+            write_process(fixture.proc.path, os.getpid(), parent=owner.pid)
+            candidates = (local_candidate(fixture), mac_linux_candidate(), register_scaler(fixture))
+            request = replace(request,
+                owner=placement.SubmittingOwner(fixture.server.host, owner.pid, owner.start_time),
+                run=wire.RunIdentity(owner.pid, owner.start_time),
+                constraints=replace(request.constraints, candidates=candidates),
+                identity=replace(request.identity,
+                    gate_targets=placement.GateTargets(("natedev", "mac-linux", "claude-aws"), ())))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            key = fixture.server.current_assignments[request.episode]
+            saved = fixture.server.assignments[key]
+            parent_candidates = tuple(placement.CandidateEligibility(candidate.destination, placement.AllowedHost())
+                                      for candidate in candidates)
+            fixture.server.assignments[key] = replace(saved, placement_candidates=parent_candidates)
+            reason = "the gate uses its parent reservation"
+            targets = placement.GateTargets(("natedev",), (("mac-linux", reason), ("aws", reason)))
+
+            def row() -> records.RunningStep:
+                _ = fixture.server.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                running, = (step for step in reply.reading.view.running if step.pid == owner.pid)
+                explained, = (entry.step for entry in reply.reading.explanation.running if entry.step.pid == owner.pid)
+                self.assertEqual(running.gate_targets, explained.gate_targets)
+                self.assertEqual(running.placement_candidates, explained.placement_candidates)
+                return running
+
+            self.assertEqual(row().placement_candidates, parent_candidates)
+            peer = fixture.connect(status_wire.ParentGateTargets(granted.grant.reservation, targets))
+            self.assertEqual(peer.replies(), [wire.Ok()])
+            nested = row()
+            notes = memory_feed.gate_placement_notes(nested)
+            assert notes is not None
+            self.assertEqual(notes.get("because"), f"mac-linux: {reason} · aws: {reason}")
+            self.assertEqual(notes["targets"], ["natedev"])
+            self.assertEqual(nested.placement_candidates, ())
+            peer.close()
+            fixture.server.run_once(0)
+            restored = row()
+            self.assertEqual(restored.placement_candidates, parent_candidates)
+            self.assertEqual(restored.gate_targets, request.identity.gate_targets)
+
     def test_view_captures_granted_local_reservations_and_verify_owners(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(need=0, step="test")

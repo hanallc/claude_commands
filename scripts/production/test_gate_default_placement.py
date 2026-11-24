@@ -653,6 +653,42 @@ class GateDefaultPlacementTests(unittest.TestCase):
             if nested:
                 targets.assert_not_called()
 
+    def test_direct_named_gate_reports_its_targets_while_using_the_parent(self) -> None:
+        with AdmissionFixture() as fixture:
+            parent = OuterReservation("parent", os.getppid())
+            marker = f"{parent.reservation}\t{parent.pid}\t{fixture.state_dir}\t{fixture.socket_path}"
+            connection = mock.MagicMock()
+            send = mock.Mock()
+            connect = mock.Mock()
+            close = mock.Mock(return_value=None)
+            connection.configure_mock(**{
+                "__enter__.return_value": connection,
+                "__exit__": close,
+                "makefile.return_value": io.BytesIO(wire.encode_reply(wire.Ok()).encode()),
+                "sendall": send,
+                "connect": connect,
+            })
+            reason = "the gate uses its parent reservation"
+            request = wire.ParentGateTargets(parent.reservation,
+                placement.GateTargets(("natedev",), (("mac-linux", reason), ("aws", reason))))
+
+            def run(_args: gate.GateArguments, _mode: gate.SuiteMode, target: gate.GateTarget) -> int:
+                self.assertEqual(target, "natedev")
+                send.assert_called_once_with(wire.encode_request(request).encode())
+                close.assert_not_called()
+                return 17
+
+            with (mock.patch.dict(os.environ, {admission_client.RESERVED_STEP_ENV: marker}),
+                  mock.patch.object(gate, "outer_reservation", return_value=parent),
+                  mock.patch.object(first_step, "socket", return_value=connection),
+                  mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+                  mock.patch.object(first_step, "admitted_run") as admit,
+                  mock.patch.object(gate, "run_tests_only", side_effect=run)):
+                self.assertEqual(gate.main(["--tests-only", "--module", "fixture/test_ok.py"]), 17)
+            admit.assert_not_called()
+            connect.assert_called_once_with(str(fixture.socket_path))
+            close.assert_called_once()
+
     def test_standalone_named_gate_keeps_exit_80_when_cancel_fails(self) -> None:
         with TemporaryDirectory() as directory:
             repo = Path(directory)
