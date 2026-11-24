@@ -8,11 +8,11 @@ import unittest
 from pathlib import Path
 from typing import Literal, cast
 
+from scripts.review_links.firefox_test_support import firefox_probe_results
 from scripts.review_links import record_table, review_page
-from scripts.review_links.test_accounts_page import firefox_probe_results
 
 
-def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> list[list[str]]:
+def save_notice_failures(case: unittest.TestCase, page: bytes, action: Literal['works', 'remove']) -> list[list[str]]:
     """Check the status region during sequential and overlapping saves."""
     setup = b'''<script>
 const realFetch=fetch;
@@ -123,7 +123,7 @@ window.fetch=(path,options={})=>{
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>'''.replace('ACTION', json.dumps(action)).encode()
-    return firefox_probe_results(page.replace(b'<head>', b'<head>'+setup, 1).replace(b'</body>', probe+b'</body>'))
+    return firefox_probe_results(case, page.replace(b'<head>', b'<head>'+setup, 1).replace(b'</body>', probe+b'</body>'))
 
 
 class FilterControlTests(unittest.TestCase):

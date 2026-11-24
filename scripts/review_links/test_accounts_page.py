@@ -5,7 +5,6 @@ from scripts.lint.memory_test_support import copy_config_fixture, write_config_f
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
 import json
 import os
@@ -14,13 +13,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
 from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.review_links.firefox_test_support import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.accounts import accounts, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
@@ -195,51 +194,6 @@ MENU_PROBE = '''<script>
 })();</script>'''
 
 
-def firefox_probe_results(page: bytes) -> list[list[str]]:
-    """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
-    results: list[list[str]] = []
-    complete = threading.Event()
-
-    class BrowserProbe(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            if self.path == "/complete":
-                _ = complete.wait(TEST_HANG_GUARD_SECS)
-            elif self.path == "/":
-                _ = self.wfile.write(b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
-            else:
-                _ = self.wfile.write(page)
-
-        def do_POST(self) -> None:
-            payload = self.rfile.read(int(self.headers["Content-Length"]))
-            results.append(cast(list[str], json.loads(payload)))
-            complete.set()
-            self.send_response(204)
-            self.end_headers()
-
-        @override
-        def log_message(self, format: str, *args: object) -> None:
-            pass
-
-    with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
-        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-        thread.start()
-        try:
-            profile = Path(temporary) / "profile"
-            profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                  "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
-            if run.returncode:
-                raise AssertionError(run.stderr)
-        finally:
-            server.shutdown()
-            thread.join(TEST_HANG_GUARD_SECS)
-    return results
-
-
 class AccountsPageTests(unittest.TestCase):
     review_root: Path = Path()
 
@@ -383,7 +337,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_page_marks_old_mac_token_metadata_stale(self) -> None:
         notes = self.review_root.parent / "agents"
@@ -539,7 +493,7 @@ window.fetch=(url,options)=>options?.method==='POST'
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         page = source.replace("</head>", setup + "</head>").replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_board_draws_the_table_and_problems_without_the_upcoming_list(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
@@ -946,7 +900,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
         page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_each_table_has_its_own_default_and_focusable_sort_headers(self) -> None:
         markup = accounts_page.board(sort_reading())
@@ -1106,7 +1060,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_model_counts_show_session_names_on_hover_and_focus(self) -> None:
@@ -1189,7 +1143,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
         page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_models_table_sorts_and_previews_and_saves_a_model_color(self) -> None:
@@ -1343,7 +1297,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_each_sort_keeps_the_next_cell_with_its_role_row(self) -> None:
@@ -1418,7 +1372,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_sort_reads_saved_choices_and_handles_unavailable_storage(self) -> None:
@@ -1443,7 +1397,7 @@ try{
 realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 </script>'''.replace("EXPECTED_COLUMN", json.dumps("left" if saved == "left" and not denied else "account"))
                 page = content.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
-                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+                self.assertEqual(firefox_probe_results(self, page.encode()), [[]])
 
     def test_producer_rows_follow_existing_roles_and_show_details_once(self) -> None:
         rows = tuple(replace(status_row(label), tool=tool, roles=("producers", role), selected_roles=(role,),
@@ -1685,7 +1639,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>' + boards + probe + '</body></html>').encode()
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
     def test_clear_removes_only_the_first_group_entry_and_refuses_an_empty_group(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -1737,7 +1691,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         probe = MENU_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
         setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(initial).replace("</", "<\\/"))
         page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
     def test_page_reads_stored_status_and_holds_the_refresh_root(self) -> None:
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
@@ -2142,7 +2096,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
-        self.assertEqual(firefox_probe_results(page), [[]])
+        self.assertEqual(firefox_probe_results(self, page), [[]])
 
 
 class ConsoleThemeTests(unittest.TestCase):
