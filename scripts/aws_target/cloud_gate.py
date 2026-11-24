@@ -924,6 +924,10 @@ class GateWorker:
         interruption_confirmed = False
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
+            if isinstance(self.dispatch, ledger.GateDispatchRecord) and not (folder / 'launch.json').exists():
+                switch = self.launch_switch(request)
+                if isinstance(switch, LocalFallback):
+                    return {'status': 'fallback', 'reason': switch.reason}
             # Read the wait before any launch, so a bad value costs no box.
             unreachable_wait_s = target_config.unreachable_wait_seconds(conf.read_or_repository('build_targets'))
             self.reconcile()

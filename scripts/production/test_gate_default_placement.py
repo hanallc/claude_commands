@@ -302,7 +302,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
     def test_isolated_bootstrap_preserves_the_gate_script_and_job(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         with TemporaryDirectory() as directory:
-            tree = Path(directory)
+            tree = Path(directory).resolve()
             script = tree / "scripts/production/gate.py"
             script.parent.mkdir(parents=True)
             _ = script.write_text(dedent("""\
@@ -324,9 +324,12 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, "current_gate_placement", return_value=gate.NO_GATE_ASSIGNMENT)):
                     raise SystemExit(gate.main())
                 """))
-            result = subprocess.run([str(repository / "scripts/lib/py"), "--isolated", str(script), "--tests-only"],
-                                    cwd=tree, text=True, capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stderr)
+            for options in ((), ("-X", "-c")):
+                with self.subTest(options=options):
+                    result = subprocess.run(
+                        [str(repository / "scripts/lib/py"), "--isolated", *options, str(script), "--tests-only"],
+                        cwd=tree, text=True, capture_output=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_each_assignment_runs_its_route(self) -> None:
         result = gate.GateRun((), 1, 0, selection_certified=True)

@@ -936,7 +936,8 @@ A closed journal prevents a late worker from reserving spend or starting a box.
 Queue recovery makes no AWS call.
 A booking without a saved launch request can close while the journal lock excludes workers.
 A request has one current AWS dispatch across worktrees.
-A repeat can start cleanup of an earlier booking after the earlier caller ends.
+A repeat can start cleanup after the earlier caller ends if the queue grants a slot.
+An open booking can block the grant until the recovery fix lands.
 The repeat launches only after the ledger records the release and the journal confirms closure.
 The queue syncs the ledger directory before it records closure.
 If AWS might have accepted a launch, the worker keeps its first token until it confirms the result.
@@ -946,7 +947,8 @@ A confirmed Spot interruption before a final result starts another cloud attempt
 The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
 The route saves the interruption count and the next choice in the claim state before each retry.
-Resume restores both values, so a crash cannot reset the retry budget.
+Resume restores both values under the same claim.
+A repeat with a new claim can reset the retry budget until the recovery fix lands.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
 The final fallback row includes the interruption count when retries or capacity choices end.
