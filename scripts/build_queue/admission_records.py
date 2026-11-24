@@ -95,7 +95,7 @@ class RemoteStartHoldEnded:
 
 @dataclass(frozen=True)
 class GuestStartNotReported:
-    """The assignment has no saved guest start report."""
+    """The assignment has no saved guest execution folder."""
 
 
 @dataclass(frozen=True)

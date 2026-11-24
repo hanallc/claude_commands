@@ -905,6 +905,18 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer",
                                           "--keeper", BOB.id),
                              (1, "", f"the_list: no List folder for keeper {BOB.id}\n"))
+        legacy = self.add(changes={"producer": OTHER.id})
+        self.write_legacy_question(legacy, question_record.Question("Q1", START.isoformat(), "Which check passed?"))
+        folder = the_list.folder(BOB.id)
+        folder.mkdir(parents=True)
+        path = folder / f"{legacy.id}.md"
+        _ = (the_list.folder(MORTY.id) / path.name).rename(path)
+        before = path.read_bytes()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("answer", legacy.id, "--question", "Q1", "--text", "Answer",
+                                          "--keeper", BOB.id),
+                             (1, "", "the_list: Only the question recipient or morty can answer.\n"))
+        self.assertEqual(path.read_bytes(), before)
         self.assertEqual(the_list.records(MORTY.id), [item])
         legacy = self.legacy_item(BOB, the_list.ItemState.WORKING)
         status = change_page.DeliveryStatus(self.root / "reviews")

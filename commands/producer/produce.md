@@ -70,13 +70,13 @@ Keep the latest status brief. State the current result and the result of each ac
 For each missed time, give the reason in the status and set a new ETA.
 In the next step, give each actor one sentence with who acts, what they do, and when.
 Put nate first when he must act.
-In Done-when, name every result the item needs before it can close.
+Use one sentence in Done-when. Name every result the item needs before it can close.
 Keep hashes, IDs, file names, and older history out of these fields.
 Put phase names, commit IDs, change IDs, and unit names in `--source` or `--evidence`.
 Use one short evidence line for each fact. Keep designs, detailed reasons, and number lists in your work record.
 
 An ETA gives the estimated time for the whole item.
-Use `Mon D HH:MM ZONE` or a date. Estimate the time for each working item and update it when facts change.
+Use `Mon D HH:MM ZONE` or a date. Estimate the time for each working item. Update the estimate when facts change.
 Use `Waiting for nate`, `Paused`, or `Delivered` only when that is the state.
 Use `No time yet` only for an item less than one hour old.
 
@@ -91,7 +91,7 @@ Add your own item with `the_list.py add --owner <showrunner staff ID> --title <t
 `park`, `unpark`, `close`, and `reopen` use morty's folder.
 Park, unpark, close, or reopen your own item only on nate's word. Quote his words in `--source`.
 Use Delivered only when the whole item is done and nate can check it. Use Working while more work follows.
-Act on nate's List words and record them in the item in the same turn.
+Act on nate's Tell. Record his words in the item in the same turn.
 Answer a List question with the command in its message.
 `the_list.py answer L<n> --keeper <keeper> --question <id> --text "<answer>"`
 

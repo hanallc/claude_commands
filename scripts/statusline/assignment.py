@@ -378,7 +378,8 @@ def render_status(*, remote: bool) -> None:
         value.isascii() and (value.isalnum() or value in "-_") for value in session_id)
     sources = RenderSources()
     cacheable = bool(key and safe_session and not remote)
-    target = state_directory() / "statusline-render-v2" / f"s-{session_id}"
+    # Save renders below counts to preserve the watched state directory's modification time.
+    target = state_directory() / "counts" / "statusline-render-v2" / f"s-{session_id}"
     if cacheable:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)

@@ -51,6 +51,7 @@ from scripts.worktree.worktree_records import (
     WorktreeRecord as WorktreeRecord,
     checkout_record as checkout_record,
     main_checkout as main_checkout,
+    main_checkout_for_word as _shared_main_checkout_for_word,
     main_checkout_path,
     read_record as read_record,
     record_file as record_file,
@@ -969,12 +970,12 @@ class UnknownRepoWord(ValueError):
 
 def main_checkout_for_word(repo: str) -> Path:
     """Verify the main checkout selected by the repo word."""
-    source = main_checkout_path(repo)
-    if not (source / ".git").is_dir() or source.is_symlink() or main_checkout(source) != source.resolve():
-        raise UnknownRepoWord(f"{source}: no main checkout for {repo!r}")
-    if build_folders.repo_word(source) != repo:
-        raise UnknownRepoWord(f"{source}: the repo word {repo!r} differs from origin")
-    return source.resolve()
+    try:
+        return _shared_main_checkout_for_word(repo)
+    except (build_folders.InvalidFolderForm, conf.Unusable):
+        raise
+    except ValueError as error:
+        raise UnknownRepoWord(str(error)) from error
 
 
 @dataclass(frozen=True)

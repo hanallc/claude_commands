@@ -401,7 +401,8 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | wire.SettlementRequest | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
+           | wire.CancelPlacement | wire.SettlementRequest
+           | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
     if wait_for_service and _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)

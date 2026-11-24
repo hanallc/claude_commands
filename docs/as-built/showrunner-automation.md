@@ -646,8 +646,9 @@ Their updates use the caller's staff name as the log source.
 Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
 The CLI refuses another producer and `--number` on their `add`.
 The CLI saves new items in morty's store on the machine where it runs. Every producer runs on natedev.
-`park`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
-These commands use the `--source` words as the log source.
+`park`, `unpark`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
+These commands require `--source` and use its words as the log source.
+Close clears the parking time.
 The writer checks the assigned producer under the same lock as the save.
 Only morty can change the owner or producer of an existing item.
 Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.

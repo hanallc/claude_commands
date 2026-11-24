@@ -881,13 +881,16 @@ class MemoryFeedTests(unittest.TestCase):
                 started = execution_identity.GuestExecution("mac-linux", assignment.attempt, folder, "/home/gate-runner")
                 report = wire.ExecutionReport("guest-started", assignment, claim, execution_identity.ObservedExecution(started))
                 _ = fixture.server.handle_request(wire.parse_request(wire.encode_request(report)))
+                _ = fixture.run_pass()
                 before, = fixture.server.handle_request(wire.ViewRequest())
                 fixture.restart()
+                _ = fixture.run_pass()
                 after, = fixture.server.handle_request(wire.ViewRequest())
 
                 for read in (before, after):
                     assert isinstance(read, wire.ViewReply), read
-                    with mock.patch.object(admission_client, "view", return_value=read.reading):
+                    with mock.patch.object(queue_snapshot, "read_view_snapshot",
+                                           return_value=fixture_published_view(read.reading)):
                         page = memory_feed.reading()
                     guest_row, = (item for item in page["walk"] if item.get("machine") == "mac-linux")
                     self.assertEqual(guest_row.get("guest_run"), {"target": "mac-linux", "attempt": assignment.attempt})
@@ -3873,8 +3876,8 @@ const refresh = createPageRefresh(tick);
                     pid=admission_records.PidNotRecorded(), mac_placement=placement)
                 running = (step,) if placed else ()
                 with (mock.patch.object(staff, "snapshot", return_value=members),
-                      mock.patch.object(admission_client, "view", return_value=replace(
-                          reading, view=replace(reading.view, running=running)))):
+                      mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(
+                          replace(reading, view=replace(reading.view, running=running))))):
                     page = memory_feed.reading()
                 row, = [row for row in page["walk"] if row.get("kind") == "mac-build"]
                 self.assertEqual((row["name"], row.get("showrunner"), row["unit"]),
@@ -3885,7 +3888,7 @@ const refresh = createPageRefresh(tick);
             with closing(index.read_only()) as database:
                 database.set_trace_callback(statements.append)
                 with (mock.patch.object(staff, "snapshot", return_value=members),
-                      mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(queue_view, "read_mac_builds",
                                         return_value=queue_view.MacBuildReading(now, builds)),
                       mock.patch.object(index, "read_only", return_value=database)):
@@ -3898,7 +3901,7 @@ const refresh = createPageRefresh(tick);
             recent = replace(build, session=mirror.current_session, verify_call_id=recent_call_id)
             pending_statements: list[str] = []
             with (mock.patch.object(staff, "snapshot", return_value=members),
-                  mock.patch.object(admission_client, "view", return_value=reading),
+                  mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                   mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (recent,)))):
                 with closing(index.read_only()) as database, mock.patch.object(index, "read_only", return_value=database):
                     database.set_trace_callback(pending_statements.append)

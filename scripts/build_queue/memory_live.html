@@ -1704,9 +1704,9 @@ function placeTipAt(tip, x, y, fit, anchor) {
   if (folderTip) {
     tip.style.left = "0px";
     folderTip.style.zoom = "";
-    const width = folderTip.getBoundingClientRect().width;
-    const scale = Math.max(1, clientWidth - 2 * inset) / width;
+    const scale = Math.min(1, Math.max(1, clientWidth - 2 * inset) / folderTip.getBoundingClientRect().width);
     if (scale < 1) folderTip.style.zoom = scale;
+    folderTip.style.maxHeight = `${Math.floor(maxHeight / scale)}px`;
   }
   const {width: w, height: h} = (folderTip || tip).getBoundingClientRect();
   const rightEdge = clientWidth - w - inset;
