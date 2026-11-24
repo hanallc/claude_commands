@@ -140,14 +140,15 @@ class GroupHoldResolver(Protocol):
     def group_half_point_hold(self, group: role_map.ClaudeGroup, now: datetime) -> ResolvedHold: ...
 
 
-def account_pace(label: str, now: datetime) -> PaceEstimate | NoUsablePace:
+def account_pace(label: str, now: datetime, *,
+                 account_config: conf.ConfigRead) -> PaceEstimate | NoUsablePace:
     from scripts.whoami import run_out
 
     readings = run_out.read_readings(run_out.READINGS_LOG).get(label, [])
-    rate = run_out.weighted_rate(readings, now.timestamp())
-    if rate is None or not math.isfinite(rate) or rate <= 0:
+    rate = run_out.hourly_usage_rate(readings, now, account_config=account_config)
+    if isinstance(rate, run_out.NoUsageRate):
         return NoUsablePace()
-    return PaceEstimate(rate * 3600)
+    return PaceEstimate(rate.points_per_hour)
 
 
 def resolve_hold(mode: HoldMode, label: str, now: datetime, *,
@@ -156,7 +157,7 @@ def resolve_hold(mode: HoldMode, label: str, now: datetime, *,
         return ResolvedHold(mode.minutes, mode)
     if isinstance(account_config, UseConfiguredValue):
         account_config = conf.read("accounts")
-    pace = account_pace(label, now)
+    pace = account_pace(label, now, account_config=account_config)
     minutes = math.ceil(account_config.whole("half_point_pace_minutes") / pace.points_per_hour) if isinstance(pace, PaceEstimate) else account_config.whole("hold_default_minutes")
     return ResolvedHold(minutes, pace)
 

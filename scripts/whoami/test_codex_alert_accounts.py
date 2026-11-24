@@ -950,6 +950,16 @@ always=director
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
         self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
 
+    def test_failed_refusal_move_with_a_codex_pick_sends_no_phone_push(self) -> None:
+        old, target = self.account(1), self.account(2)
+        readings = self.readings(old, self.report(old, 0), self.report(target, 50))
+        with (patch.object(accounts, "swap", side_effect=accounts.AccountsError("fixture move failed")) as swap,
+              patch.object(quota_alert, "edit_registry", return_value="fixture switch failed")):
+            log = quota_alert.blocked([self.note(1, "active", 0)], old, self.now, codex_readings=readings)
+        self.assertEqual(swap.call_args.args[:2], ("workers", "codex2"))
+        self.assertTrue(any("fixture switch failed" in line for line in log), log)
+        self.assertEqual(self.pushes, [])
+
     def test_weekly_refusal_moves_workers_to_picked_home_and_records_request_not_confirmation(self) -> None:
         old, target = self.account(1), self.account(2)
         self.save_room(old, 0)
@@ -961,6 +971,7 @@ always=director
                 codex_readings=readings, window=refusals.KnownWindow("weekly"),
                 stopped=quota_alert.StoppedWorker("director-a", "impl"))
         fallback.assert_not_called()
+        self.assertEqual(self.pushes, [])
         self.assertEqual(self.relayed, [quota_alert.stopped_worker_relay("impl", quota_alert.WorkersMoved("codex2"))])
         swap.assert_called_once()
         self.assertEqual(swap.call_args.args[:2], ("workers", "codex2"))

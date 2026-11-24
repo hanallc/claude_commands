@@ -1040,14 +1040,15 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
 
     def test_weekly_forecast_columns_use_recent_history_for_both_tools(self) -> None:
         def history(used: float, rate: float, age_minutes: int = 0) -> list[run_out.Reading]:
-            return [run_out.Reading(AT - timedelta(minutes=age_minutes + 10 * step), used - rate * step / 6)
+            return [run_out.Reading(AT - timedelta(minutes=age_minutes + 10 * step),
+                                    used - rate * step / 6 - max(0, step - 6))
                     for step in range(12, -1, -1)]
 
         rows = (
             status_row("claude1"),
             replace(status_row("claude2"), resets_at=AT + timedelta(hours=3)),
             status_row("claude3"),
-            status_row("claude4"),
+            replace(status_row("claude4"), read_at=AT - timedelta(minutes=16)),
             replace(status_row("codex1"), tool="codex"),
             replace(status_row("codex2"), tool="codex", resets_at=accounts.StatusUnavailable()),
         )

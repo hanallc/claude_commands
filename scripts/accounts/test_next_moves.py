@@ -10,7 +10,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, test_refusal_watch as watch_tests
@@ -214,10 +214,10 @@ class NextMovesTests(unittest.TestCase):
             with (patch.object(next_moves, "account_pace", return_value=next_moves.PaceEstimate(2)) as pace,
                   patch.object(next_moves, "render_time", return_value=watch_tests.NOW)):
                 self.assertIn("else claude3, hold half a point (≈15 min)", next_moves.list_next_moves())
-                pace.assert_called_once_with("claude1", watch_tests.NOW)
+                pace.assert_called_once_with("claude1", watch_tests.NOW, account_config=ANY)
                 pace.reset_mock()
                 _ = refusal_watch.run_auto_moves(watch_tests.NOW)
-                pace.assert_called_once_with("claude1", watch_tests.NOW)
+                pace.assert_called_once_with("claude1", watch_tests.NOW, account_config=ANY)
                 _ = refusal_watch.run_auto_moves(watch_tests.NOW + timedelta(minutes=1))
                 self.assertEqual(pace.call_count, 1)
             self.assertEqual(next_moves.read_next_moves(), (entry,))
@@ -561,26 +561,27 @@ class NextMovesTests(unittest.TestCase):
         self.assertEqual(resolved, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
         reads.assert_called_once_with("accounts")
 
-    def test_half_point_duration_uses_selected_accounts_pace_in_points_per_second(self) -> None:
+    def test_half_point_duration_uses_selected_accounts_recent_rate(self) -> None:
         path = self.home / "pace.jsonl"
-        _ = path.write_text("\n".join(json.dumps({"account": label, "at": NOW.isoformat(), "remaining": left})
-                                    for label, left in (("claude1", 1), ("claude2", 80))))
-        readings = run_out.read_readings(path)
-        with (patch.object(run_out, "READINGS_LOG", path),
-              patch.object(run_out, "weighted_rate", return_value=1 / 3600) as pace):
-            resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW)
-        pace.assert_called_once_with(readings["claude1"], NOW.timestamp())
-        self.assertEqual(resolved, next_moves.ResolvedHold(30, next_moves.PaceEstimate(1)))
-        with (patch.object(run_out, "READINGS_LOG", path),
-              patch.object(run_out, "weighted_rate", return_value=0.7 / 3600)):
-            self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW).minutes, 43)
+        for recent, expected in ((1.0, 30), (0.7, 43)):
+            with self.subTest(recent=recent):
+                samples = [("claude1", age, 51 - recent * (60 - age) / 60) for age in range(60, -1, -10)]
+                samples += [("claude1", 120, 91), ("claude2", 60, 80), ("claude2", 0, 60)]
+                _ = path.write_text("\n".join(json.dumps({"account": label,
+                    "at": (NOW - timedelta(minutes=age)).isoformat(), "remaining": left})
+                    for label, age, left in samples))
+                resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW)
+                self.assertEqual(resolved.minutes, expected)
+                assert isinstance(resolved.source, next_moves.PaceEstimate)
+                self.assertAlmostEqual(resolved.source.points_per_hour, recent)
 
     def test_unusable_pace_uses_the_named_default_and_fixed_holds_do_not_read_history(self) -> None:
-        for rate in (None, 0, -1):
-            with (self.subTest(rate=rate), patch.object(run_out, "READINGS_LOG", self.home / "missing-history"),
-                  patch.object(run_out, "weighted_rate", return_value=rate)):
-                self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
-                                 next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
+                         next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        readings = [run_out.Reading(NOW - timedelta(minutes=5), 39), run_out.Reading(NOW, 40)]
+        with patch.object(run_out, "read_readings", return_value={"claude1": readings}):
+            self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
+                             next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
         with patch.object(run_out, "read_readings", side_effect=AssertionError("fixed hold read pace")):
             self.assertEqual(next_moves.resolve_hold(next_moves.FixedHold(7.5), "claude1", NOW),
                              next_moves.ResolvedHold(7.5, next_moves.FixedHold(7.5)))

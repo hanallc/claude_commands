@@ -23,7 +23,11 @@ A known recovery or reset closes it silently.
 
 Natedev sends both Claude quota pushes.
 The quota check forecasts when each in-use Claude account will run out of weekly usage.
-It divides the weekly percentage left by the recent rate and adds that duration to the reading's time.
+It divides the weekly percentage left by the hourly usage rate and adds that duration to the current time.
+The rate measures the rise and elapsed time from the window start to the latest reading.
+The setting `rate.lookback_minutes` defaults to 60 minutes.
+The latest reading must be at most 15 minutes old.
+The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
 The forecast needs a positive rate, a recent reading, and a known future reset.
 The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry.alert_hours` away.
 Scheduled moves suppress the push when they cover every group on that account.
@@ -190,7 +194,9 @@ The notice `quota.codex_workers_stay` is one line: `<account> is empty; we're in
 `<units>` is the Claude account of the units group in the role map.
 When the role map cannot be read or has no units account, the line says `the units account`.
 With credits off and a workers entry queued, the line is `<account> is empty; workers wait for their queued move`.
-When the switch to Claude fails, the notice is `quota.codex_refused`.
+A failed switch to Claude can send `quota.codex_refused`.
+The picker must find no Codex account that can take work before the sender attempts this push.
+The existing Claude hold and retry rules still apply.
 An episode saved with the older values (`reset`, `reason`, `fallback`) renders with only its account and outcome.
 Old outcome words change to the new ones: “work moves to Claude” becomes the self-actualize line, “workers wait for their next entry” becomes “workers wait for their queued move”, and “work could not move” sends `quota.codex_refused`.
 The fallback remains until that refill or the selected account recovers.

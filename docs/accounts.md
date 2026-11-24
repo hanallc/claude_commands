@@ -687,7 +687,20 @@ It holds them again when claude4 reads low, then moves them to claude2.
 Both groups can use the same account.
 The table shows `units` and `showrunners` on separate rows for that account.
 
-`--hold-minutes N` is finite and nonnegative; omitted or zero moves immediately. `--hold half-point` instead estimates the time to use another 0.5 percentage point from the selected account’s weighted pace history, including usage by other groups sharing that account. One point per hour gives 30 minutes, rounded up to whole minutes; missing, zero or negative pace uses 40 minutes. The list shows, for example, “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”. The Mac prints natedev’s rendered list using natedev’s selection and readings; `next-read` remains machine JSON.
+`--hold-minutes N` accepts a finite, nonnegative duration.
+An omitted duration or zero moves the group immediately.
+`--hold half-point` estimates the time to use another 0.5 percentage point on the selected account.
+The hold uses the same hourly rate as the Accounts page and the Claude expiry push.
+The rate includes usage from all groups on the account.
+The key `rate.lookback_minutes` in `config/accounts.conf` sets the window to 60 minutes by default.
+The rate measures the rise and elapsed time from the window start to the latest reading.
+The latest reading must be at most 15 minutes old.
+The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
+The hold uses the 40-minute default when these conditions fail or the readings show no rise.
+One point per hour gives a 30-minute hold. The estimate rounds up to whole minutes.
+The list shows “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”.
+The Mac uses the list that natedev renders from its selection and readings.
+`next-read` returns JSON.
 
 The first fresh low reading starts an aware clock and stores its resolved duration and source with `account`, `at`, `move_id` and `percent` in `refusal_watch.json`’s `auto_move_holds`. Restarts and later pace readings leave that duration fixed. A fresh high reading clears it, while stale or missing readings leave it alone. A selection change (including away and back) or percent change clears the clock. Legacy holds without a duration resolve from their entry’s fixed minutes and retain their original start time. Legacy reset progress is ignored and dropped on the next state write.
 

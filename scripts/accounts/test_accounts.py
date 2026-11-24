@@ -5846,7 +5846,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             return output
 
         with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22, seconds=1)),
-              patch.object(run_out, "weighted_rate", side_effect=AssertionError("started row read fresh pace"))):
+              patch.object(run_out, "hourly_usage_rate", side_effect=AssertionError("started row read fresh pace"))):
             code, listed, error = self.run_cli("next", "list")
             self.assertEqual((code, listed, error), (0, expected, ""))
             code, added, error = self.run_cli("next", "add", "workers", "1", "claude")

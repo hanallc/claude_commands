@@ -74,9 +74,9 @@ A measurement at or below the limit clears the crossing and permits a new notice
 
 Natedev sends the Claude low quota and expiry pushes.
 The quota check uses saved weekly readings from `~/.local/state/agent-notes/readings.jsonl`.
-It divides the remaining percentage by the weighted use rate from `run_out.py`.
-It adds that duration to the time of the reading.
-The newest reading must be within the rate code's maximum gap.
+It divides the remaining percentage by the hourly usage rate from `run_out.py`.
+It adds that duration to the current time.
+The newest saved reading must be at most 15 minutes old.
 An in-use Claude account qualifies only if the forecast falls before its weekly reset and within the configured lead time.
 The lead time check uses a strict limit.
 Both pushes use the same scheduled move coverage rule.
@@ -442,7 +442,8 @@ An unavailable target remains queued and blocks later entries.
 A changed head loses its old hold and notice state.
 `FixedHold` carries a duration; `HalfPointHold` requests a pace-based duration.
 `ResolvedHold` keeps the duration and its source.
-The half-point estimate uses the selected account's history, including other groups that share it.
+The half-point estimate uses the selected account's hourly usage rate.
+That rate includes usage by all groups that share the account.
 The default estimate is 40 minutes when no usable pace exists.
 The duration stays with the started hold rather than changing on each pass.
 
@@ -672,8 +673,14 @@ When rows for one account are next to each other, the first row shows the accoun
 When sorting separates those rows, the account details appear at the start of each group.
 An account without a role has an empty role cell.
 The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
-The page starts its forecast from the displayed weekly reading.
-It excludes history before the current weekly window or the last refill.
+The page uses the remaining quota from the displayed weekly reading.
+The forecast excludes history before the current weekly window.
+The page, expiry push, and half-point hold use the same hourly rate function.
+The key `rate.lookback_minutes` in `config/accounts.conf` sets the lookback to 60 minutes by default.
+The window ends at the current time.
+The rate measures the rise and elapsed time from the window start to the latest reading.
+The latest reading must be at most 15 minutes old.
+The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
 It shows the hourly rate for Claude and Codex when recent history gives a rate.
 If the rate is missing, both forecast cells show a dash with an explanation.
 If the quota lasts until the reset, the run-out cell shows a dash with that explanation.

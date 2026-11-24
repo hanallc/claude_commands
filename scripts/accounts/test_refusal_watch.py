@@ -581,13 +581,13 @@ class RefusalWatchTests(unittest.TestCase):
                                            next_moves.HalfPointHold(), "claude2", NOW)
         self.next_entries(entry)
         self.reading(SOURCE_LOGIN, 1)
-        with patch.object(run_out, "weighted_rate", return_value=1 / 3600):
+        with patch.object(run_out, "hourly_usage_rate", return_value=run_out.UsageRate(1)):
             self.assertEqual(self.cli()[0], 0)
         before = (self.home / ".local/state/accounts/refusal_watch.json").read_bytes()
         WatchTime.at = NOW + timedelta(minutes=18, seconds=1)
         self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
         # A new runner invocation reloads the receipt, even with a different pace.
-        with patch.object(run_out, "weighted_rate", return_value=6 / 3600) as changed_pace:
+        with patch.object(run_out, "hourly_usage_rate", return_value=run_out.UsageRate(6)) as changed_pace:
             self.assertEqual(self.cli()[0], 0)
             with (patch.object(next_moves, "render_time", return_value=WatchTime.at) as clock,
                   patch.object(refusal_watch, "_load_state", wraps=refusal_watch._load_state) as read,  # pyright: ignore[reportPrivateUsage]
@@ -714,7 +714,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.next_entries(entry)
         self.reading(SOURCE_LOGIN, 1)
         with (patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"),
-              patch.object(run_out, "weighted_rate", return_value=1 / 3600) as pace):
+              patch.object(run_out, "hourly_usage_rate", return_value=run_out.UsageRate(1)) as pace):
             self.assertEqual(self.cli()[0], 0)
         pace.assert_called_once()
         started = refusal_watch._load_state().get("auto_move_holds", {})[entry.id]  # pyright: ignore[reportPrivateUsage]
@@ -726,7 +726,7 @@ class RefusalWatchTests(unittest.TestCase):
             self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
             self.reading("main@example.invalid", 80, at=WatchTime.at)
             # Each CLI pass reloads the saved state, as a restarted runner does.
-            with patch.object(run_out, "weighted_rate", side_effect=AssertionError("started hold recalculated pace")):
+            with patch.object(run_out, "hourly_usage_rate", side_effect=AssertionError("started hold recalculated pace")):
                 code, _, error = self.cli()
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(stored_group_labels(path)["units"],
@@ -736,15 +736,19 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(next_moves.read_next_moves(), ())
 
     def test_half_point_without_positive_pace_persists_the_forty_minute_default(self) -> None:
-        for rate in (None, 0):
-            with self.subTest(rate=rate):
+        cases: tuple[list[run_out.Reading], ...] = (
+            [], [run_out.Reading(NOW - timedelta(minutes=10), 1), run_out.Reading(NOW, 1)],
+        )
+        for index, readings in enumerate(cases):
+            with self.subTest(readings=readings):
                 WatchTime.at = NOW
                 path = self.groups()
-                entry = next_moves.ClaudeGroupMove(f"default-half-{rate}", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
+                entry = next_moves.ClaudeGroupMove(f"default-half-{index}", "units", 1,
+                                                  next_moves.HalfPointHold(), "claude2", NOW)
                 self.next_entries(entry)
                 self.reading(SOURCE_LOGIN, 1)
                 with (patch.object(run_out, "READINGS_LOG", self.home / "missing-pace"),
-                      patch.object(run_out, "weighted_rate", return_value=rate)):
+                      patch.object(run_out, "read_readings", return_value={"claude1": readings})):
                     self.assertEqual(self.cli()[0], 0)
                 held = refusal_watch._load_state().get("auto_move_holds", {})[entry.id]  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(held.duration, next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
@@ -752,7 +756,7 @@ class RefusalWatchTests(unittest.TestCase):
                     WatchTime.at = NOW + timedelta(minutes=minutes)
                     self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
                     self.reading("main@example.invalid", 80, at=WatchTime.at)
-                    with patch.object(run_out, "weighted_rate", side_effect=AssertionError("default changed after start")):
+                    with patch.object(run_out, "hourly_usage_rate", side_effect=AssertionError("default changed after start")):
                         self.assertEqual(self.cli()[0], 0)
                     self.assertEqual(stored_group_labels(path)["units"], "claude1" if minutes == 39 else "claude2")
 
@@ -784,7 +788,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.next_entries(head, later)
         self.reading(SOURCE_LOGIN, 1)
         with (patch.object(run_out, "READINGS_LOG", self.home / "missing-pace"),
-              patch.object(run_out, "weighted_rate", return_value=1 / 3600)):
+              patch.object(run_out, "hourly_usage_rate", return_value=run_out.UsageRate(1))):
             self.assertEqual(self.cli()[0], 0)
             self.reading(SOURCE_LOGIN, 2)
             self.assertEqual(self.cli()[0], 0)
@@ -813,7 +817,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {later.id: old})  # pyright: ignore[reportPrivateUsage]
         self.reading(SOURCE_LOGIN, 1)
         with (patch.object(run_out, "READINGS_LOG", self.home / "missing-pace"),
-              patch.object(run_out, "weighted_rate", return_value=1 / 3600)):
+              patch.object(run_out, "hourly_usage_rate", return_value=run_out.UsageRate(1))):
             self.assertEqual(self.cli()[0], 0)
         restarted = refusal_watch._load_state().get("auto_move_holds", {})[head.id]  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(restarted.at, NOW)
