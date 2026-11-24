@@ -6,8 +6,8 @@ The scratch guard refuses most loose folders before they exist, and the hourly t
 temp leftovers that cannot hold work (tempfile folders, folders that hold only folders, verify.sh run folders, invoke.sh logs). This audit is
 the backstop for the rest: folders that can hold work. A folder is loose when it is none of these:
 
-  * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or a scratch
-    root (~/rust/repro, ~/rust/scratch);
+  * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or the scratch
+    root ~/rust/scratch;
   * in ~/rust/scratch: nothing; every folder there is loose, since scratch.py never makes one there;
   * in /tmp, /tmp/claude and $TMPDIR: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
     a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
@@ -78,7 +78,7 @@ RUST_SCRATCH_NAME = "scratch"
 TEMP_SCAN_ROOTS = (Path("/tmp"), Path("/tmp/claude"))
 KEPT_NAMES = SYSTEM_TEMP_NAMES | {
     unit_runs.RUN_ROOT.name, unit_runs.FORMER_RUN_ROOT.name, copy_record.root().name,
-    copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name, "repro",
+    copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name,
 }
 KEPT_PREFIXES = (*SYSTEM_TEMP_PREFIXES, "codex-daemon-")
 GIT_TIME_FILES = ("HEAD", "index", os.path.join("logs", "HEAD"))
@@ -220,10 +220,8 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[DiscoveredFolder]:
     """Every loose folder this user owns, before the age rule."""
-    visible_root = scratch.visible_root(scratch_settings=scratch_settings).resolve()
-
     def kept_in_rust(entry: Path) -> bool:
-        return expected is None or entry == visible_root or entry.name in expected or entry.name in KEPT_NAMES
+        return expected is None or entry.name in expected or entry.name in KEPT_NAMES
 
     verify_name = tmp_sweep.verify_temp_name()
     roots: list[tuple[Path, Callable[[Path], bool]]] = [
@@ -353,10 +351,7 @@ def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep
     if not paths:
         return tmp_sweep.ProcessUsesKnown([])
     prefixes = tuple(dict.fromkeys(str(path.parent) + os.sep for path in paths))
-    found = tmp_sweep.process_paths(proc, prefixes)
-    if isinstance(found, tmp_sweep.ProcessUsesUnavailable):
-        return tmp_sweep.lsof_paths(prefixes)
-    return found
+    return tmp_sweep.process_uses_with_lsof(proc, prefixes)
 
 
 def worktree_sources(path: Path, *,
@@ -717,13 +712,7 @@ def check_cargo_output_location(path: Path) -> None:
     if home_identity not in parents:
         return
     settings = conf.read("build_folders")
-    configured = settings.value("roots.build", str, default="", recover_invalid=False)
-    # Older configurations name the cargo directory inside the build root.
-    if configured:
-        build = Path(configured).expanduser().resolve()
-    else:
-        slot_cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser()
-        build = slot_cargo.parent.resolve()
+    build = Path(settings.text("roots.build")).expanduser().resolve()
     protected = {directory_identity(parent.stat()) for parent in (home, *home.parents)}
     try:
         build_identity = directory_identity(build.stat())

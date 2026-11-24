@@ -333,16 +333,16 @@ def write_scheduled_task_prompts(session_id: str, prompts: tuple[ScheduledTaskPr
         with tempfile.NamedTemporaryFile(
             "w",
             dir=root,
-            prefix=".scheduled-prompts-",
+            prefix=f".scheduled-prompts-{os.getppid()}-{os.getpid()}-",
             delete=False,
             encoding="utf-8",
         ) as temporary:
+            temporary_path = Path(temporary.name)
             json.dump([{"id": task.id, "prompt": task.prompt, "recurring": task.recurring}
                        for task in prompts], temporary)
             _ = temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
         os.replace(temporary_path, destination)
         temporary_path = None
     finally:

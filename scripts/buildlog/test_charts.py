@@ -128,7 +128,7 @@ class PageDataTests(ChartFixture):
         with closing(self.fixture.connection(
             fixtures.build("hana-1", 10, repo="hana", mem_wait_s=5400, peak_mem_bytes=8 * gib, duration_s=3600),
             # A verify gate copy has its own folder name and the origin of the repository it copies.
-            fixtures.build("hana-2", 90000, repo="checkout", repo_identity="https://github.com/natepiano/hana",
+            fixtures.build("hana-2", 90000, repo="checkout", repo_identity="https://github.com/hanallc/hana",
                            mem_wait_s=1800, peak_mem_bytes=10 * gib, duration_s=3600),
             fixtures.build("port", 20, repo="port", step="clippy", mem_wait_s=1800, peak_mem_bytes=30 * gib, duration_s=600),
         )):

@@ -42,7 +42,7 @@ from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_count
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+from scripts.lint.memory_test_support import fake_memory_readings, memory_gate_shell_environment, write_config_fixture
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
@@ -61,6 +61,7 @@ NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
+    "BUILDLOG_RUN",
     "BUILDLOG_LOCAL_REASON",
     "BUILDLOG_MAC_HOLDER",
     "BUILDLOG_MAC_COPY",
@@ -162,7 +163,9 @@ class RecordTests(unittest.TestCase):
         self.repo = self.base / "hana"
         _ = shutil.copytree(cls.repository_seed, self.repo)
         _ = self.admission
-        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+        # The admission thread reads os.environ from now on. A patch.dict exit empties os.environ for a moment,
+        # and the thread then reads the live builds.slice. The first patch.dict above restores this value.
+        os.environ["USER_ZONE"] = "America/Los_Angeles"
 
     @cached_property
     def admission(self) -> AdmissionFixture:
@@ -171,7 +174,7 @@ class RecordTests(unittest.TestCase):
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
             name: value
-            for name, value in os.environ.items()
+            for name, value in memory_gate_shell_environment().items()
             if name not in AMBIENT and not name.startswith("UNIT_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
@@ -207,7 +210,7 @@ class RecordTests(unittest.TestCase):
             return self.record_process(*args, cwd=cwd, extra=extra, input=input)
         module = step_context if args and args[0] == "step-context" else recorder
         arguments = list(args)
-        with mock.patch.object(recorder, "detach"), mock.patch.object(sys, "stdin", io.StringIO(input)):
+        with mock.patch.object(sys, "stdin", io.StringIO(input)):
             return invoke_cli(module, lambda: module.main(arguments), arguments,
                               self.environment(**(extra or {})), cwd or self.repo)
 
@@ -1173,6 +1176,16 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(detached["branch"], "detached")
         self.assertEqual(detached["sha"], self.git("rev-parse", "--short", "HEAD", cwd=self.repo))
 
+    def test_step_in_another_process_leaves_that_process_attached(self) -> None:
+        # verify_helper.py runs main in its long-lived process. A detach there would leave the
+        # verify.sh session and close the helper's request pipe.
+        arguments = ["step", "0", str(START), "", "0", "", "", *SWEEP]
+        with mock.patch.object(recorder, "detach") as detach, mock.patch.object(sys, "stdin", io.StringIO("")):
+            result = invoke_cli(recorder, lambda: recorder.main(arguments), arguments, self.environment(), self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detach.assert_not_called()
+        self.assertEqual(self.records()[-1]["kind"], "step")
+
     def test_manifest_path_names_the_repo(self) -> None:
         elsewhere = self.base / "elsewhere"
         elsewhere.mkdir()
@@ -1444,13 +1457,14 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
-            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": session, **board},
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "BUILDLOG_RUN": "123:456", "CLAUDE_CODE_SESSION_ID": session, **board},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
         expected: Record = {
             "kind": "call",
             "id": CALL_ID,
+            "run_id": "123:456",
             "tool": "verify.sh",
             "command": "test hana",
             "verb": "test",
@@ -1482,6 +1496,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
+        self.assertIsNone(record["run_id"])
 
     def test_call_records_cargo_token_wait_separately_from_total_wait(self) -> None:
         result = self.record(

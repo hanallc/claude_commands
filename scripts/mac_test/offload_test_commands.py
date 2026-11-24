@@ -132,10 +132,18 @@ if [[ $command == systemd-run ]]; then
     printf '\n' >> "$root/systemd-run.jsonl"
     exit 0
 fi
+claim_file=
+for saved in "$MAC_TEST_STATE_DIR/run.json" "$MAC_TEST_STATE_DIR"/claims/*.json; do
+    [[ -f $saved ]] || continue
+    if [[ -n $claim_file ]]; then
+        printf 'The command fixture has more than one saved claim.\n' >&2
+        exit 1
+    fi
+    claim_file=$saved
+done
 {
     record_command "$@"
-    claim_file=$MAC_TEST_STATE_DIR/claims/hana.json
-    if [[ -f $claim_file ]]; then
+    if [[ -n $claim_file ]]; then
         IFS= read -r -d '' claim < "$claim_file" || :
         printf ',"claimed":true,"claim":%s' "${claim//$'\n'/}"
     else
@@ -251,15 +259,18 @@ if [[ $remote == *'lint nextest'* || $remote == *'lint check'* || $remote == *'l
         if [[ -n $run_cleanup_line ]]; then printf '%s\n' "$run_cleanup_line"; fi
         python3 - "$claim_file" <<'SETTLE_FENCE'
 ''' + python_tool_source(r'''
-import json
 from pathlib import Path
 import subprocess
 import sys
 from scripts.mac_test import claim_state, offload
 path = Path(sys.argv[1])
-claim = json.loads(path.read_text())
-identity = claim_state.ClaimIdentity(claim["claim_id"], claim["episode"], claim["attempt"])
-command = offload.start_fence_command(identity, "mac", settle=True, scope_key=path.stem)
+claim = claim_state.read_run(path)
+if isinstance(claim, claim_state.NoRun):
+    raise AssertionError(f"Cannot settle a missing claim: {path}")
+command = offload.start_fence_command(
+    claim_state.claim_identity(claim), "mac", settle=True,
+    scope_key=claim_state.claim_fence_scope_key(path, claim),
+)
 raise SystemExit(subprocess.run(["/bin/bash", "-c", command], check=False).returncode)
 ''') + r'''
 SETTLE_FENCE

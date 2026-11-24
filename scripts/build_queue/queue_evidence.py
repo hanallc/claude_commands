@@ -6,7 +6,7 @@ from dataclasses import replace
 
 from scripts.build_queue.queue_lines import age
 from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
-from scripts.build_queue.snapshot_codec import public_queue_text
+from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -18,7 +18,8 @@ def step_labels(step: admission_records.WaitingStep | admission_records.RunningS
     unit = gate.queue_unit(step.unit, step.session_id, labels)
     name = public_queue_text(identity.session) if identity is not None else ""
     if not name:
-        name = admission_records.queue_caller(step.session_id, "", step.session_name, "", step.folder).name
+        # The stored name holds the owner; a folder alone does not prove a terminal.
+        name = select_queue_name(step.session_name)
     if identity is not None:
         return replace(identity, session=name, unit=unit if step.unit else identity.unit)
     return unit_labels.UnitLabels(name, unit_labels.OWNER_NOT_RECORDED,

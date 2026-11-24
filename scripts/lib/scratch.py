@@ -3,9 +3,9 @@
 
 Each folder belongs to a task. The end command keeps the folder for a manual removal list.
 
-    scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]   make one; prints its path
+    scratch.py new [--task <task> | --until <when>] [--name <word>]   make one; prints its path
     scratch.py new --worker [--name <word>]   make a worker folder under TMPDIR; prints its path
-    scratch.py adopt <path> [--task <task> | --until <when>] [--name <word>] [--visible]   move a loose folder in
+    scratch.py adopt <path> [--task <task> | --until <when>] [--name <word>]   move a loose folder in
     scratch.py hold <path> [--task <task> | --until <when>] --reason <why>   keep a folder where it is
     scratch.py release <path>    drop a hold
     scratch.py renew <path>      mark it changed
@@ -36,11 +36,10 @@ task's folder is `<word>-<suffix>`, or `scratch-<suffix>` with no word; its reco
 scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
 The holds record lists their paths, so task end can find them.
-`--visible` (rows only) puts it in VISIBLE_ROOT
-as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record.RECORD with its task, maker and
+Each folder holds copy_record.RECORD with its task, maker and
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
 open, and removes it when its until: time passes, or after 7 idle days whatever its task, since an
-ender can fail. A row's folder waits for its verdict, and VISIBLE_ROOT is never swept. A git
+ender can fail. A row's folder waits for its verdict. A git
 worktree goes through `git worktree remove`, so its source repo keeps no stale entry.
 Removal writes versioned deletion intent to `.scratch-removing-<folder>.json` beside the source.
 The intent preserves the task and source evidence across interruptions.
@@ -103,7 +102,6 @@ from scripts.lib.build_folders import (  # noqa: E402
 )
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
 HOLDS_ENV = "SCRATCH_HOLDS"
 UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
@@ -446,9 +444,16 @@ def judgment_lock(path: Path, *, scope: BusyMarkScope | BusyMarkOwnership = Busy
         yield free and idle
 
 
+class BusyMarkHeld(Exception):
+    def __init__(self, lock: Path) -> None:
+        super().__init__(str(lock))
+        self.lock: Path = lock
+
+
 @contextmanager
 def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = None,
-               wait: bool = False, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL) -> Generator[bool]:
+               wait: bool = False, scope: BusyMarkScope | BusyMarkOwnership = BusyMarkOwnership.LOCAL,
+               raise_if_held: bool = False) -> Generator[bool]:
     """Hold busy marks; optionally export live descriptors or wait for their release.
 
     Exported descriptors belong to this context. A child can retain the same
@@ -471,8 +476,11 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
             for mark, creating in marks.items():
                 if mark in scope.held:
                     continue
-                if not creating and not os.path.lexists(mark):
-                    continue
+                if not creating:
+                    try:
+                        _ = mark.lstat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
                 try:
                     fd = open_busy_mark(mark, create=False)
                 except FileNotFoundError:
@@ -485,7 +493,14 @@ def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = No
                     else:
                         created.add(mark)
                 held[mark] = fd
-                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                except BlockingIOError as error:
+                    if raise_if_held:
+                        raise BusyMarkHeld(mark) from error
+                    raise
+                if not os.path.samestat(os.fstat(fd), mark.stat(follow_symlinks=False)):
+                    raise OSError(f"{mark}: the busy mark changed")
         except OSError:
             acquired = False
         if acquired:
@@ -508,7 +523,7 @@ def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_targ
         scratch_settings = conf.read("scratch")
     if not WORD.fullmatch(owner):
         raise ScratchError(f"{owner!r}: invalid owner unit")
-    validate_phase_task(checked_task(task, False))
+    validate_phase_task(checked_task(task))
 
     def transferred(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         if not isinstance(record, copy_record.Registered):
@@ -530,7 +545,7 @@ def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_targ
 def fields_for_task(fields: dict[str, object], task: str, *, run_dir: str = "", phase_id: str = "",
                     land_target: str = "") -> dict[str, object]:
     """Replace every field whose meaning is scoped to a task, in one place."""
-    match = checked_task(task, False)
+    match = checked_task(task)
     result = {key: value for key, value in fields.items()
               if key not in ("task", "run_dir", "phase_id", "land_target", "ended", "ended_task")}
     result["task"] = task
@@ -563,7 +578,7 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
         task = fields.get("task")
         if not isinstance(task, str):
             raise ScratchError(f"{path}: record needs a task")
-        _ = checked_task(task, False)
+        _ = checked_task(task)
         if copy_record.copy_folder(path) == path.resolve() or "owner_unit" in fields:
             directory = path.stat()
             identity = record.fields.get("copy_id") if isinstance(record, copy_record.Registered) else ""
@@ -595,12 +610,6 @@ class Hold(TypedDict):
     reason: str
     made: float
     ended: float
-
-
-def visible_root(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
-    return Path(os.environ.get(VISIBLE_ROOT_ENV) or scratch_settings.text("visible_root")).expanduser()
 
 
 def random_suffix(scratch_settings: conf.ConfigRead) -> str:
@@ -650,7 +659,7 @@ def ended(task: str, now: float) -> bool:
     return isinstance(task_end(task, now), Ended)
 
 
-def checked_task(task: str, visible: bool) -> re.Match[str]:
+def checked_task(task: str) -> re.Match[str]:
     match = copy_record.TASK.fullmatch(task)
     if match is None:
         raise ScratchError(f"{task!r} is no task: use run:<id>, phase:<unit>/<phase>, gate:<id>, "
@@ -659,8 +668,6 @@ def checked_task(task: str, visible: bool) -> re.Match[str]:
         raise ScratchError(f"{task!r}: a row task is row:<showrunner>-C<n>")
     if match["kind"] == "until" and isinstance(task_end(task), Unknown):
         raise ScratchError(f"{task!r}: an until task is until:YYYY-MM-DDTHHMMZ/<id>; use --until")
-    if visible and match["kind"] != "row":
-        raise ScratchError("--visible is for a change review row's repro only")
     return match
 
 
@@ -709,21 +716,16 @@ def validate_phase_task(match: re.Match[str]) -> None:
         raise ScratchError(f"{match[0]!r}: phase {phase!r} is not in registered plan {plan}; {hint}")
 
 
-def target(task: str, word: str, visible: bool, *,
+def target(task: str, word: str, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     """The new folder's path for the task; never one that exists."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    match = checked_task(task, visible)
+    match = checked_task(task)
     validate_phase_task(match)
     if word and not WORD.fullmatch(word):
         raise ScratchError(f"{word!r}: a name is letters, digits, - and _")
-    if visible:
-        path = visible_root(scratch_settings=scratch_settings) / "-".join(part for part in (match["name"], word) if part)
-        if os.path.lexists(path):
-            raise ScratchError(f"{path} exists")
-        return path
     # The record keeps an until: task's time, so its folder name holds only the word.
     slug = "" if match["kind"] == "until" else f"{match['kind']}-{match['name'].replace('/', '-')}"
     folder = session_folder.caller_folder()
@@ -752,7 +754,7 @@ def in_session_folder(path: Path) -> bool:
 
 def held_in_session(path: Path, task: str) -> bool:
     """Whether a new folder is in a session folder and has a task that ends it there."""
-    return in_session_folder(path) and checked_task(task, False)["kind"] != "until"
+    return in_session_folder(path) and checked_task(task)["kind"] != "until"
 
 
 def index_in_session(path: Path, task: str, *,
@@ -790,7 +792,7 @@ def write_record(path: Path, task: str, now: float, *,
          "maker": maker(), "created": now, "renewed": now, "throwaway": throwaway}, task), scratch_settings=scratch_settings)
 
 
-def new(task: str = "", word: str = "", visible: bool = False, now: float | None = None, *,
+def new(task: str = "", word: str = "", now: float | None = None, *,
     throwaway: bool = False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
@@ -799,7 +801,7 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     while True:
-        path = target(task, word, visible, scratch_settings=scratch_settings)
+        path = target(task, word, scratch_settings=scratch_settings)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             path.mkdir()
@@ -857,7 +859,7 @@ def new_worker(word: str = "", *,
     return path
 
 
-def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: float | None = None, *,
+def adopt(source: Path, task: str, word: str = "", now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
     """Move a loose folder into a scratch root and record its task."""
@@ -869,7 +871,7 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
         raise ScratchError(f"{source}: use worktrees.py make <repo> <unit> <short-name> for editable work")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
-    path = target(task, word, visible, scratch_settings=scratch_settings)
+    path = target(task, word, scratch_settings=scratch_settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = shutil.move(str(source), str(path))
     write_record(path, task, moment, scratch_settings=scratch_settings)
@@ -1333,13 +1335,12 @@ def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfi
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     candidates: dict[Path, None] = {}
-    for base in (copy_record.root(), visible_root(scratch_settings=scratch_settings)):
-        try:
-            entries = sorted(base.iterdir())
-        except OSError:
-            continue
-        listed = {path for path in entries if path.is_dir()} | set(marked_folders(entries))
-        candidates.update(dict.fromkeys(sorted(listed)))
+    try:
+        entries = sorted(copy_record.root().iterdir())
+    except OSError:
+        entries = []
+    listed = {path for path in entries if path.is_dir()} | set(marked_folders(entries))
+    candidates.update(dict.fromkeys(sorted(listed)))
     candidates.update(dict.fromkeys((*copy_paths(), *pending_copy_paths(copy_record.copies_root()))))
     candidates.update(dict.fromkeys(Path(path) for path, held in holds(scratch_settings=scratch_settings).items()
                                     if held["task"].startswith("gate:worker-")))
@@ -2186,7 +2187,7 @@ def hold(path: Path, task: str, reason: str, now: float | None = None, *,
         raise ScratchError("a hold needs --reason")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
-    _ = checked_task(task, False)
+    _ = checked_task(task)
     with locked_holds(scratch_settings=scratch_settings) as found:
         found[os.path.realpath(path)] = Hold(task=task, maker=maker(), reason=reason.strip(), made=moment, ended=0.0)
         write_holds(found, scratch_settings=scratch_settings)
@@ -2594,8 +2595,29 @@ def unsaved_work(path: Path, *,
     return work.reason if isinstance(work, KeptFolder) else None
 
 
+def retained_folder_exists(path: Path) -> bool:
+    """Keep a path in the report unless lstat confirms it is absent."""
+    try:
+        _ = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+_RETAINED_TASK_FOLDER_PREFIX = "kept for a manual removal list: "
+_RETAINED_TASK_FOLDER_REASON = " (scratch, "
+
+
 def retained_task_folder_notice(path: Path, reason: str) -> str:
-    return f"kept for a manual removal list: {path} (scratch, {reason})"
+    return f"{_RETAINED_TASK_FOLDER_PREFIX}{path}{_RETAINED_TASK_FOLDER_REASON}{reason})"
+
+
+def is_retained_task_folder_notice(detail: str) -> bool:
+    """Recognize the format of a saved scratch notice."""
+    return (detail.startswith(_RETAINED_TASK_FOLDER_PREFIX)
+            and _RETAINED_TASK_FOLDER_REASON in detail and detail.endswith(")"))
 
 
 def report_retained_task_folder(path: Path, reason: str) -> None:
@@ -2624,7 +2646,7 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
     """Record task completion and keep its folders for manual removal."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    _ = checked_task(task, False)
+    _ = checked_task(task)
     kept: list[KeptFolder] = []
     moment = time.time() if now is None else now
     paths = {folder.path.resolve(): folder.path for folder in folders(scratch_settings=scratch_settings)
@@ -2643,14 +2665,16 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
             write_holds(found, scratch_settings=scratch_settings)
 
     for path in paths.values():
+        if not retained_folder_exists(path):
+            continue
         reason = "selected by the keep rule" if path in protected else f"task {task} ended"
-        if path not in protected and not path.is_symlink():
-            current = copy_record.read_record(path / copy_record.RECORD)
-            if isinstance(current, copy_record.Registered) and current.task == task:
-                try:
+        try:
+            if path not in protected and not path.is_symlink():
+                current = copy_record.read_record(path / copy_record.RECORD)
+                if isinstance(current, copy_record.Registered) and current.task == task:
                     record_task_end(path, task, moment, scratch_settings=scratch_settings)
-                except (ScratchError, OSError) as error:
-                    reason = " ".join(str(error).splitlines())
+        except (ScratchError, OSError) as error:
+            reason = " ".join(str(error).splitlines())
         report_retained_task_folder(path, reason)
         kept.append(KeptFolder(path, reason))
     return kept
@@ -2720,7 +2744,6 @@ def main(argv: list[str]) -> int:
             _ = command.add_argument("--reason", required=True)
         else:
             _ = command.add_argument("--name", default="")
-            _ = command.add_argument("--visible", action="store_true")
     for action in ("cargo-save", "cargo-clean"):
         _ = commands.add_parser(action).add_argument("path")
     _ = commands.add_parser("release").add_argument("path")
@@ -2746,14 +2769,12 @@ def main(argv: list[str]) -> int:
                 cargo_removal_mark(path).unlink(missing_ok=True)
         elif command == "new":
             if cast(bool, arguments.worker):
-                if cast(bool, arguments.visible):
-                    raise ScratchError("--worker does not take --visible")
                 print(new_worker(cast(str, arguments.name), scratch_settings=scratch_settings))
             else:
-                print(new(chosen_task(arguments), cast(str, arguments.name), cast(bool, arguments.visible), scratch_settings=scratch_settings))
+                print(new(chosen_task(arguments), cast(str, arguments.name), scratch_settings=scratch_settings))
         elif command == "adopt":
             print(adopt(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name),
-                        cast(bool, arguments.visible), scratch_settings=scratch_settings))
+                        scratch_settings=scratch_settings))
         elif command == "hold":
             path = Path(cast(str, arguments.path))
             print(f"held {os.path.realpath(path)} for {hold(path, chosen_task(arguments), cast(str, arguments.reason), scratch_settings=scratch_settings)}")

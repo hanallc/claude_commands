@@ -28,7 +28,7 @@ from typing import NotRequired, TypedDict, cast
 
 from scripts.buildlog import store
 
-REPOS = ("natepiano/hana",)
+REPOS = ("hanallc/hana",)
 PER_PAGE = 100
 REQUEST_CAP = 1000
 STOP_AGE_S = 3 * 24 * 3600

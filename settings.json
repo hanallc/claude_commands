@@ -129,12 +129,53 @@
       "Bash(git config filter.*)",
       "Bash(git config credential.*)",
       "Bash(git config url.*)",
+      "Bash(git config set core.*)",
+      "Bash(git config set alias.*)",
+      "Bash(git config set filter.*)",
+      "Bash(git config set credential.*)",
+      "Bash(git config set url.*)",
       "Bash(git config --global*)",
       "Bash(git config --system*)",
       "Bash(git config --local*)",
       "Bash(git config --worktree*)",
       "Bash(git config --file*)",
       "Bash(git config -f *)",
+      "Bash(git push*--no-v*)",
+      "Bash(git * push*--no-v*)",
+      "Bash(git -c hook.*)",
+      "Bash(git * -c hook.*)",
+      "Bash(git *--config-env*hook.*)",
+      "Bash(git config hook.*)",
+      "Bash(git config * hook.*)",
+      "Bash(git config set hook.*)",
+      "Bash(git config unset hook.*)",
+      "Bash(HOME=*git*push*)",
+      "Bash(* HOME=*git*push*)",
+      "Bash(env HOME=*git*push*)",
+      "Bash(env * HOME=*git*push*)",
+      "Bash(export HOME=*)",
+      "Bash(XDG_CONFIG_HOME=*git*push*)",
+      "Bash(* XDG_CONFIG_HOME=*git*push*)",
+      "Bash(env XDG_CONFIG_HOME=*git*push*)",
+      "Bash(env * XDG_CONFIG_HOME=*git*push*)",
+      "Bash(export XDG_CONFIG_HOME=*)",
+      "Bash(GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(* GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(env GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(env * GIT_CONFIG_GLOBAL=*git*push*)",
+      "Bash(export GIT_CONFIG_GLOBAL=*)",
+      "Bash(GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(* GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(env GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(env * GIT_CONFIG_COUNT=*git*push*)",
+      "Bash(export GIT_CONFIG_COUNT=*)",
+      "Bash(GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(* GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(env GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(env * GIT_CONFIG_PARAMETERS=*git*push*)",
+      "Bash(export GIT_CONFIG_PARAMETERS=*)",
+      "Bash(git send-pack*)",
+      "Bash(git * send-pack*)",
       "Bash(rg --pre*)",
       "Bash(rg * --pre*)",
       "Bash(gpg -d*)",
@@ -324,6 +365,16 @@
             "timeout": 120
           }
         ]
+      },
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-review-hold-send.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -497,7 +548,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 308800,
+  "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"

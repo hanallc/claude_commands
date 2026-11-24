@@ -33,8 +33,8 @@ def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
     """Read step labels from the queue fixture."""
     _ = (fixture.root / "build_steps.conf").write_text(
         "names.test-affected=test affected\n"
-        + "names.gate=merge gate\n"
-        + "prose.gate=merge gate\n"
+        + "names.gate=gate\n"
+        + "prose.gate=the gate\n"
         + "owned.test-affected={unit} targeted\n"
         + "owned.gate={unit} merge\n"
         + "owned.showrunner-gate=showrunner merge\n"
@@ -339,19 +339,64 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
                     self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
 
-    def test_mac_names_use_the_package_then_the_repository(self) -> None:
-        for command, repository, expected in (
-            ("cargo build --release -p hana", "", "hana build"),
-            ("cargo build -phana", "other", "hana build"),
-            ("cargo build --package=hana", "other", "hana build"),
-            ("cargo check --package hana", "other", "hana check"),
-            ("cargo nextest run", "cargo-liner", "cargo-liner nextest"),
-            ("cargo build", "", "build"),
-            ("", "", "cargo"),
+    def test_mac_reader_names_the_launcher_of_each_build(self) -> None:
+        # bob, 2026-11-23: a Mac build with no unit names who started it, from its parent process chain.
+        with QueueFixture(captured=False) as fixture:
+            folder = str(fixture.root)
+            for name, launcher, marker, environment, kind, session in (
+                ("claude", ("claude --resume a", "/Users/nate/.local/share/claude/versions/2.0.76"), "",
+                 {"CLAUDE_CODE_SESSION_ID": "session-a"}, queue_view.MacLauncher.CLAUDE, "session-a"),
+                ("session marker", ("-zsh", "/bin/zsh"), "session-b", {}, queue_view.MacLauncher.CLAUDE, "session-b"),
+                ("CI", ("/actions/Runner.Worker spawn", "/actions/Runner.Worker"), "", {"RUNNER_NAME": "hana-mac-1"},
+                 queue_view.MacLauncher.CI, ""),
+                ("rust-analyzer", ("/Zed/rust-analyzer-2026-11-02", "/Zed/rust-analyzer-2026-11-02"), "", {},
+                 queue_view.MacLauncher.RUST_ANALYZER, ""),
+                ("terminal", ("-zsh", "/bin/zsh"), "", {}, queue_view.MacLauncher.TERMINAL, ""),
+            ):
+                with self.subTest(name=name):
+                    command, executable = launcher
+                    processes: dict[int, dict[str, object]] = {
+                        100: {"parent": 90, "command": "cargo build -p hana", "executable": "/bin/cargo",
+                              "resident_bytes": 1234, "started_at": NOW},
+                        90: {"parent": 80, "command": "/bin/zsh -c cargo build -p hana", "executable": "/bin/zsh",
+                             "resident_bytes": 0, "started_at": NOW},
+                        80: {"parent": 70, "command": command, "executable": executable,
+                             "resident_bytes": 0, "started_at": NOW},
+                        70: {"parent": 1, "command": "/Applications/Terminal.app/Contents/MacOS/Terminal",
+                             "executable": "/Applications/Terminal.app/Contents/MacOS/Terminal",
+                             "resident_bytes": 0, "started_at": NOW},
+                    }
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
+                        f"read_processes = lambda: {processes!r}\n"
+                        + "read_captures = lambda processes: {}\n"
+                        + f"output = lambda arguments: 'p100\\nn{folder}\\n'\n"
+                        + "repository_name = lambda folder: 'hana'\n"
+                        + f"project_record = lambda folder: dict(recorded_unit='', session={marker!r}, repository='')\n"
+                        + f"process_environment = lambda pid: {environment!r}\n"
+                        + "print(json.dumps(read_builds()))")
+                    result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row, = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    _ = row.pop("progress_tail")
+                    row["counter"] = {}
+                    build = queue_view.mac_build_from_record(row)
+                    self.assertIs(build.launcher, kind)
+                    self.assertEqual(build.launcher_session, session)
+                    self.assertEqual(queue_view.mac_build_from_record(queue_view.mac_build_record(build)), build)
+
+    def test_mac_command_step_reads_the_verb_and_the_package(self) -> None:
+        for command, expected in (
+            ("cargo build --release -p hana", ("build", "hana")),
+            ("cargo build -phana", ("build", "hana")),
+            ("cargo build --package=hana", ("build", "hana")),
+            ("cargo check --package hana", ("check", "hana")),
+            ("cargo nextest run", ("nextest", "")),
+            ("cargo build", ("build", "")),
+            ("", ("", "")),
         ):
             with self.subTest(command=command):
-                self.assertEqual(queue_view.mac_step_name(queue_view.MacBuild(1, "/project", 0,
-                    command, repository)), expected)
+                self.assertEqual(queue_view.mac_command_step(queue_view.MacBuild(1, "/project", 0,
+                    command, "other")), expected)
 
     def test_mac_command_jobs_reads_all_supported_positive_values(self) -> None:
         for argument in ("--test-threads 12", "--test-threads=12", "-j12", "-j 12", "--jobs 12", "--jobs=12"):
@@ -386,7 +431,7 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(build.stage, queue_view.MacTesting(710002))
                     self.assertEqual(build.resident_bytes, 1048576)
                     self.assertEqual(build.jobs, 4)
-                    self.assertEqual(queue_view.mac_step_name(build), "hana nextest")
+                    self.assertEqual(queue_view.mac_command_step(build), ("nextest", ""))
 
 
     def test_mac_reader_finds_all_three_tile_runs_and_their_counters(self) -> None:
@@ -406,7 +451,7 @@ class MacQueueViewTests(unittest.TestCase):
                     "repo": "cargo-liner" if index == 2 else "hana" if index == 1 else ""}))
                 if index == 0:
                     _ = (folder / "Cargo.toml").write_text(
-                        '[workspace.package]\nrepository = "https://github.com/natepiano/hana"\n')
+                        '[workspace.package]\nrepository = "https://github.com/hanallc/hana"\n')
                 generation = f"fixture-{pid}"
                 log = f"run-{generation}-{pid}.log"
                 arguments = ["build", "--release", "-p", "hana"] if index == 0 else ["nextest", "run", "--test-threads", "12"]
@@ -564,7 +609,7 @@ class CloudQueueViewTests(unittest.TestCase):
         settings["owned.test-affected"] = "targeted for {unit}"
         configured = replace(model, names=type(model.names)(settings))
         self.assertEqual(configured.names.shown("test-affected"), "test affected")
-        self.assertEqual(configured.names.prose("gate"), "merge gate")
+        self.assertEqual(configured.names.prose("gate"), "the gate")
 
     def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
         fixture = self.enterContext(QueueFixture(captured=False))

@@ -4,13 +4,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
+from typing import Literal
 
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
-from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, public_queue_text, select_queue_name
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, HAND_MADE as HAND_MADE, GateJobNotRecorded, StepJob as StepJob
+from scripts.build_queue.snapshot_codec import RAW_ID
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
-from scripts.message.owner_role import OwnerRole
 
 
 @dataclass(frozen=True)
@@ -29,30 +29,6 @@ class StepNames:
 
     def prose(self, step: str) -> str:
         return self.settings.get(f"prose.{step}", self.shown(step))
-
-    def owner_template(self, step: str, unit: str, role: OwnerRole, *, ci: bool = False) -> str:
-        """Read the template for this step and owner role."""
-        if ci:
-            prefix = "owned.ci-"
-        elif role is OwnerRole.SHOWRUNNER:
-            prefix = "owned.showrunner-"
-        elif role is OwnerRole.UNIT and unit:
-            prefix = "owned."
-        else:
-            return ""
-        return self.settings.get(prefix + step, self.settings.get(prefix + "default", ""))
-
-    def for_owner(self, step: str, unit: str, role: OwnerRole, *,
-                  ci: bool = False, current_name: str = "", step_name: str = "") -> str:
-        """Use the configured owner template when its fields are usable."""
-        unit = public_queue_text(unit)
-        shown = public_queue_text(step_name or self.shown(step))
-        template = self.owner_template(step, unit, role, ci=ci)
-        label = format_queue_name(template, unit=unit, step=shown)
-        if label:
-            return label
-        owner = unit if template and role is OwnerRole.UNIT and not ci else ""
-        return select_queue_name(current_name, " ".join(part for part in (owner, shown) if part))
 
     def about(self, job: StepJob) -> str:
         """Describe the job when a template applies."""
@@ -115,10 +91,8 @@ SCRIPT_SUFFIXES = frozenset({".awk", ".bash", ".fish", ".js", ".lua", ".mjs", ".
 VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test"})
 RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
     "targeted-test", "merge-gate", "gate", "integrate", "test-all", "test-modules",
-    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote"}
-QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named"}
-SHORT_OWNER_STEPS = {"gate": "merge", "test-affected": "targeted",
-                     "merge-gate": "merge", "targeted-test": "targeted"}
+    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote", HAND_MADE.step}
+QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named", HAND_MADE.step: "hand made"}
 MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
 GATE_PROGRAMS = {
     "gate": MERGE_GATE_PROGRAMS,
@@ -127,6 +101,11 @@ GATE_PROGRAMS = {
     "targeted-test": ("targeted_test.py",),
 }
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
+# The assigned target started no tests.
+MAC_LINUX_PRELAUNCH_REFUSED_STATUS = 79
+# The assigned target could have started tests and supplied no verdict.
+GATE_RESULT_UNKNOWN_STATUS = 80
+CLAIM_FAILURE_SUFFIX = ".claim-failure"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
@@ -162,6 +141,22 @@ def _option(arguments: Sequence[str], name: str) -> str:
 
 def _count(arguments: Sequence[str], name: str) -> int:
     return sum(1 for argument in arguments if argument == name or argument.startswith(name + "="))
+
+
+def gate_natedev_only_flag(arguments: Sequence[str]) -> str | None:
+    """Return the gate option that requires natedev."""
+    if _count(arguments, "--module"):
+        return "--module"
+    if "--promote-only" in arguments:
+        return "--promote-only"
+    return None
+
+
+def gate_target_kind(target: str) -> Literal["natedev", "mac-linux", "aws"] | None:
+    """Return the route that can run an assigned gate."""
+    if target in ("natedev", "mac-linux", "aws"):
+        return target
+    return None
 
 
 # A program that runs the script named after its options.
@@ -214,9 +209,10 @@ def _verify_step(arguments: Sequence[str]) -> StepJob | OtherCommand:
 
 
 def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
-    """Find the command after the copies.py run options."""
+    """Read the command that the copies.py process supervises."""
     program = parse_command_program(argv)
-    if isinstance(program, OtherCommand) or program[0] != "copies.py" or not program[1] or program[1][0] != "run":
+    if (isinstance(program, OtherCommand) or program[0] != "copies.py"
+            or not program[1] or program[1][0] not in ("run", "gate-step")):
         return OTHER_COMMAND
     arguments = program[1]
     if "--" not in arguments:
@@ -262,7 +258,7 @@ def live_process_arguments(process: Path, start_time: str) -> list[str] | Comman
 
 
 def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
-    """Read the gate job from its process or the copies.py caller."""
+    """Read the gate job from the gate process or its copies.py supervisor."""
     expected = GATE_PROGRAMS.get(step, ())
     if not expected:
         return OTHER_COMMAND

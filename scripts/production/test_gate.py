@@ -2,23 +2,35 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, first_step
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
 import fcntl
 
 import io
+import json
 import os
 from pathlib import Path
 import re
+import signal
+import subprocess
+import tempfile
+import time
 from typing import cast, final, override
-from contextlib import AbstractContextManager, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stdout
+from collections.abc import Generator, Sequence
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.copies import copies
 from scripts.lib import scratch
+from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.lib.process_start import Gone
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -26,6 +38,33 @@ from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.test_gate_default_placement import placed
+
+
+class GateModuleOwnerTests(unittest.TestCase):
+    def test_a_module_with_no_owner_names_the_gate_module(self) -> None:
+        for inherited, owner in (({}, {"CLAUDE_SESSION_NAME": gate.GATE_MODULE_OWNER}),
+                                 ({"BUILDLOG_OWNER_STAFF_ID": "impl-id"}, {"BUILDLOG_OWNER_STAFF_ID": "impl-id"})):
+            with self.subTest(inherited=inherited), tempfile.TemporaryDirectory() as temporary:
+                environment = gate.test_module_environment(Path(temporary), {"PATH": os.defpath, **inherited})
+                self.assertEqual({name: environment[name] for name in admission_records.OWNER_VARIABLES
+                                  if environment.get(name)}, owner)
+
+    def test_gate_child_does_not_inherit_placement_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim = root / "scripts" / "lib" / "py"
+            shim.parent.mkdir(parents=True)
+            shim.touch()
+            environment = {"PATH": os.defpath, "BUILDLOG_PLACEMENT_FILE": "/fixture/placement",
+                           "BUILDLOG_PLACEMENT_EPISODE": "fixture-episode",
+                           "BUILDLOG_PLACEMENT_SIDECAR": "/fixture/placement.cgroup"}
+            with mock.patch.object(subprocess, "Popen") as start:
+                job = gate.start_gate_job("hooks", Path("test_fixture.py"), (), root, environment, root / "module.log")
+            job.output.close()
+            child = cast(dict[str, str], start.call_args.kwargs["env"])
+        self.assertEqual(child["PATH"], os.defpath)
+        self.assertFalse(child.keys() & (environment.keys() - {"PATH"}))
 
 
 @final
@@ -95,10 +134,83 @@ class MergeGateCheckpointTests(MergeGateFixture):
             observed.append(os.environ[admission_records.BUILDLOG_UNIT])
             return gate.GateRun((), 0, 0, tests_reused=True)
 
-        with mock.patch.object(gate, "run_suites", side_effect=suites):
+        @contextmanager
+        def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[object]:
+            self.assertEqual(command[0], 'gate.py')
+            self.assertEqual(source, self.checkout)
+            self.assertEqual(targets, ("natedev",))
+            self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
+            self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
+            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement))
+
+        assignment = placed('natedev')
+        with (mock.patch.object(gate, "run_suites", side_effect=suites),
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, 'admitted_run', side_effect=admit) as admitted,
+              mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment])):
             result = self.run_gate()
+        admitted.assert_called_once()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(observed, ["fixture"])
+
+    def test_the_merge_gate_and_a_tests_only_run_name_an_owner_with_no_session(self) -> None:
+        # A gate under systemd, or with no session, still names who started its queue requests.
+        observed: list[dict[str, str]] = []
+
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            observed.append({name: os.environ[name] for name in admission_records.OWNER_VARIABLES
+                             if os.environ.get(name)})
+            return gate.GateRun((), 0, 0, tests_reused=True)
+
+        self.environment.update(dict.fromkeys(admission_records.OWNER_VARIABLES, ""))
+        with mock.patch.dict(os.environ, dict.fromkeys(admission_records.OWNER_VARIABLES, "")), \
+             mock.patch.object(gate, "run_suites", side_effect=suites), \
+             mock.patch.object(admission_records, "family_owner",
+                               return_value=admission_records.OwnerNotGiven("systemd · run-p1-i2.service")):
+            merge = self.run_gate()
+            tests_only = self.run_gate("--tests-only")
+            self.assertFalse(admission_records.owner_given(os.environ))
+        self.assertEqual(merge.returncode, 0, merge.stdout + merge.stderr)
+        self.assertEqual(tests_only.returncode, 0, tests_only.stdout + tests_only.stderr)
+        self.assertEqual(observed, [{"CLAUDE_SESSION_NAME": "fixture"}, {"CLAUDE_SESSION_NAME": "verify"}])
+
+    def test_a_tests_only_run_with_a_given_owner_does_not_read_the_copy_record(self) -> None:
+        # A bad copy record never refuses a run whose caller gave an owner.
+        observed: list[dict[str, str]] = []
+
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            observed.append({name: os.environ[name] for name in admission_records.OWNER_VARIABLES
+                             if os.environ.get(name)})
+            return gate.GateRun((), 0, 0, tests_reused=True)
+
+        given = {**dict.fromkeys(admission_records.OWNER_VARIABLES, ""), "CLAUDE_SESSION_NAME": "nightly"}
+        self.environment.update(given)
+        with mock.patch.dict(os.environ, given), mock.patch.object(gate, "run_suites", side_effect=suites), \
+             mock.patch.object(copies, "source_owner", side_effect=copies.CopyError("bad copy record")):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(observed, [{"CLAUDE_SESSION_NAME": "nightly"}])
+
+    def test_a_tests_only_run_from_a_terminal_keeps_the_terminal_owner(self) -> None:
+        # The terminal family names the owner, so the copy record does not replace it.
+        observed: list[dict[str, str]] = []
+
+        def suites(_repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            observed.append({name: os.environ[name] for name in admission_records.OWNER_VARIABLES
+                             if os.environ.get(name)})
+            return gate.GateRun((), 0, 0, tests_reused=True)
+
+        unset: dict[str, str] = dict.fromkeys(admission_records.OWNER_VARIABLES, "")
+        self.environment.update(unset)
+        with mock.patch.dict(os.environ, unset), mock.patch.object(gate, "run_suites", side_effect=suites), \
+             mock.patch.object(admission_records, "family_owner", return_value=admission_records.TERMINAL_OWNER), \
+             mock.patch.object(copies, "source_owner", return_value="verify"):
+            result = self.run_gate("--tests-only")
+            owner = admission_records.request_owner("")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(observed, [{}])
+        assert isinstance(owner, admission_records.QueueCaller)
+        self.assertEqual(owner.name, "terminal")
 
     def test_checkpoint_restores_the_unit_after_success_and_failure(self) -> None:
         checkpoint = gate.merge_checkpoint
@@ -119,10 +231,10 @@ class MergeGateCheckpointTests(MergeGateFixture):
                             (gate.GateJobResult("hooks", "test_first.py", int(outcome == "red"), 0, "fixture"),),
                             0, 0, tests_reused=True)
 
-                    def merge(arguments: gate.GateArguments) -> int:
+                    def merge(arguments: gate.GateArguments, target: str | gate.NoGateAssignment) -> int:
                         self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
-                            return checkpoint(arguments)
+                            return checkpoint(arguments, target)
                         finally:
                             restored.append(os.environ.get(admission_records.BUILDLOG_UNIT))
 
@@ -220,7 +332,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     if fails:
                         raise RuntimeError("module preparation failed")
                     prepared = prepare(root, {**environment, "HERDR_BIN": "/host/herdr"})
-                    self.assertEqual(prepared["HERDR_BIN"], "/nonexistent/herdr")
+                    self.assertEqual(prepared["HERDR_BIN"], MISSING_HERDR_BIN)
                     return prepared
 
                 with mock.patch.object(gate, "test_module_environment", side_effect=prepare_module):
@@ -255,6 +367,64 @@ class MergeGateCheckpointTests(MergeGateFixture):
         timings = gate.read_measures(self.state / "runner" / "module_seconds.json")
         self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
         self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    def test_gate_uses_configured_root_when_module_folder_is_missing(self) -> None:
+        gate_root = self.fixture_root.parent
+        missing = gate_root / "missing-module"
+        with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(missing)}),
+              mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+            result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        allocate.assert_called_once_with(mock.ANY, "g", gate_root)
+        self.assert_all_modules_started()
+
+    def test_nested_gate_uses_the_inherited_module_folder_only_under_the_gate_root(self) -> None:
+        gate_root = self.fixture_root.parent
+        module = gate_root / "inherited-module"
+        module.mkdir()
+        outside = gate_root.parent / f"{gate_root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        for inherited, parent in ((module, module.resolve()), (outside, gate_root)):
+            with self.subTest(inherited=inherited.name):
+                with (mock.patch.dict(self.environment, {gate.GATE_MODULE_TEMP_DIR: str(inherited)}),
+                      mock.patch.object(gate, "gate_temporary", wraps=gate.gate_temporary) as allocate):
+                    result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                allocate.assert_called_once_with(mock.ANY, "g", parent)
+
+    @gate_suites("hooks", "message")
+    def test_gate_and_affected_module_folders_leave_room_for_unix_sockets(self) -> None:
+        prepare = gate.test_module_environment
+        gate_root = self.fixture_root.parent
+        legacy_run = Path("test-runs/test-run-abcdefgh")
+        inherited_run = gate_root / legacy_run
+        inherited_run.mkdir(parents=True)
+        deep_tmpdir = gate_root / "gate-invocation-abcdefghijklmnopqrstuvwxyz"
+        deep_tmpdir.mkdir()
+        sockets = (Path(".com.google.Chrome.123456/SingletonSocket"),
+                   Path("style-socket-abcdefgh/outside.sock"))
+        for flag in ("--tests-only", "--affected"):
+            for inherited in (gate_root, inherited_run, deep_tmpdir):
+                with self.subTest(mode=flag, inherited=inherited):
+                    job_folders: list[Path] = []
+
+                    def prepare_module(root: Path, environment: dict[str, str]) -> dict[str, str]:
+                        job_folders.append(root)
+                        return prepare(root, environment)
+
+                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                          mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
+                        result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertCountEqual([root.name for root in job_folders], ["m0001", "m0002"])
+                    for root in job_folders:
+                        self.assertEqual(root.parent.parent, gate_root)
+                        relative = root.relative_to(gate_root)
+                        for platform_root, limit in ((Path("/dev/shm"), 108), (Path("/private/tmp"), 104)):
+                            for suffix in sockets:
+                                socket_path = platform_root / relative / legacy_run / suffix
+                                self.assertLessEqual(len(os.fsencode(socket_path)) + 1, limit, str(socket_path))
 
     def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
         scripts = self.checkout / "scripts"
@@ -323,6 +493,51 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
         self.assert_not_pushed()
+
+    def test_a_mac_linux_guest_that_took_no_run_undoes_the_merge(self) -> None:
+        cause = "the guest did not arm the run: fixture SSH refused the connection"
+        with mock.patch.object(gate, "run_gate_suites",
+                               side_effect=gate.MacLinuxTookNoRun(f"Mac Linux guest took no run: {cause}")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines()[-2:],
+                         ["Merge undone. The merge was not pushed.", f"Mac Linux guest took no run: {cause}"])
+        self.assertNotIn("REFUSED", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
+
+    def test_a_mac_linux_guest_that_took_no_run_keeps_its_status_when_rollback_fails(self) -> None:
+        refusal = "Mac Linux guest took no run: fixture SSH refused the connection"
+        with (mock.patch.object(gate, "run_gate_suites", side_effect=gate.MacLinuxTookNoRun(refusal)),
+              mock.patch.object(gate, "rollback_merge", side_effect=OSError("fixture rollback failed")) as rollback):
+            result = self.run_gate()
+        rollback.assert_called_once_with(self.checkout, self.base)
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
+        self.assertIn(refusal, result.stderr)
+        self.assertIn("fixture rollback failed", result.stderr)
+        self.assertNotIn("merge undone", result.stderr)
+        self.assert_not_pushed()
+
+    def test_a_mac_linux_guest_that_took_no_run_keeps_the_recovery_record_when_save_fails(self) -> None:
+        save = gate.GateRecovery.save
+
+        def fail_cleanup_save(recovery: gate.GateRecovery) -> None:
+            if recovery.rollback_head and not recovery.rollback:
+                raise OSError("fixture recovery save failed")
+            save(recovery)
+
+        refusal = gate.MacLinuxTookNoRun("Mac Linux guest took no run: fixture SSH refused the connection")
+        with (mock.patch.object(gate, "run_gate_suites", side_effect=refusal),
+              mock.patch.object(gate.GateRecovery, "save", new=fail_cleanup_save)):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
+        self.assertIn("fixture recovery save failed", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        with mock.patch.dict(os.environ, self.environment):
+            records = list(gate.gate_run_directory(self.checkout).glob("*.json"))
+        self.assertEqual(len(records), 1, "The gate must keep the recovery record.")
+        saved = cast(dict[str, object], json.loads(records[0].read_text()))
+        self.assertEqual(saved["rollback"], self.base)
 
     def test_merge_checkout_behind_origin_is_refused(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
@@ -554,6 +769,99 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(code, 0, output.getvalue())
         self.assertIn("style sync: invalid production", output.getvalue())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
+
+
+@final
+class GateRecoveryTests(MergeGateFixture):
+    def test_recovery_skips_record_removed_during_owner_check(self) -> None:
+        directory = self.root / "recovery"
+        directory.mkdir()
+        pool = self.root / "tokens"
+        os.mkfifo(pool)
+        descriptor = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, descriptor)
+        status = os.fstat(descriptor)
+        token = gate.HeldGateToken(str(pool), status.st_dev, status.st_ino, b"t".hex())
+        recovery = gate.GateRecovery(directory / "owner.json", str(self.checkout), 5_000_001, "owner",
+                                     tokens=[token])
+        recovery.save()
+
+        def finish_owner(_pid: int) -> Gone:
+            _ = os.write(descriptor, b"t")
+            recovery.finish()
+            return Gone()
+
+        with (mock.patch.object(gate, "process_start", side_effect=finish_owner) as read_start,
+              mock.patch.dict(os.environ, self.environment)):
+            gate.recover_gate_directory(directory, own_directory=directory)
+
+        read_start.assert_called_once_with(recovery.pid)
+        self.assertFalse(recovery.path.exists())
+        self.assertEqual(os.read(descriptor, 2), b"t")
+
+    def test_tests_only_sigterm_closes_the_active_record(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        ready = self.state / "module-held"
+        with mock.patch.dict(os.environ, self.environment):
+            records = gate.gate_run_directory(self.checkout)
+        command = [*self.gate_command(), "--tests-only", "--repo", str(self.checkout),
+                   "--module", "hooks/test_first.py"]
+        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
+                self.assertTrue(ready.is_file())
+                self.assertEqual(len(list(records.glob(f"{process.pid}-*.json"))), 1)
+                process.send_signal(signal.SIGTERM)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertEqual(list(records.glob("*.json")), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            directory = gate.gate_run_directory(self.checkout)
+        directory.mkdir(parents=True)
+        unfinished = gate.GateRecovery(directory / "unfinished.json", str(self.checkout), 5_000_001, "dead-owner")
+        unfinished.save()
+        folder = self.root / "retained"
+        canary = folder / "canary"
+        self.write(canary, "fixture data")
+        finished = gate.GateRecovery(directory / "finished.json", str(self.checkout), 5_000_002, "dead-owner",
+                                     folders=[str(folder)], finished=True)
+        finished.save()
+        saved = finished.path.read_text()
+
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(directory.glob("*.json")), [finished.path])
+        self.assertEqual(finished.path.read_text(), saved)
+        self.assertEqual(canary.read_text(), "fixture data")
+        self.assertNotIn(str(folder), result.stderr)
+
+
+class LiveConfigTripwireTests(unittest.TestCase):
+    def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        job_root = root / "job"
+        job_root.mkdir()
+        marker = job_root / "live-config-writes"
+        _ = marker.write_text("/fixture/config/console.conf\n")
+        log = job_root / "output.log"
+        process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
+        job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
+                                  time.time(), log.open("w+"), log, "test_fixture.py")
+        self.addCleanup(job.output.close)
+        with mock.patch.object(gate, "kill_job_group"):
+            result = gate.finish_gate_job(job, 0)
+        self.assertTrue(result.tripwire_tripped)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("a test attempted to write live configuration at /fixture/config/console.conf", result.output)
+        self.assertFalse(job_root.exists())
 
 
 if __name__ == "__main__":

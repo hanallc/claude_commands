@@ -7,7 +7,8 @@ from scripts.lib import test_phase
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_request as decode_legacy
 
-from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.lint.memory_test_support import admission_policy_fixture, memory_gate_shell_environment
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -58,6 +59,35 @@ class ProtocolTests(unittest.TestCase):
                     self.assertNotIn("permission", encoded)
                     with self.assertRaisesRegex(ValueError, "placement requires version 3"):
                         _ = wire.encode_reply(reply, version=2)
+
+    def test_placement_status_report_parses_across_service_and_client_versions(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt,
+                                                                include_permission=True)
+            report = placement.TerminalAttemptReport(placement.PrelaunchRefused("runner"),
+                                                     placement.DispatchPathSettled(), NOW)
+            known = status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("runner"),
+                placement.NoProviderClaim(), placement.PermissionConsumed(NOW), report)
+            reply = status_wire.PlacementStatusReply(known)
+            encoded = wire.encode_reply(reply)
+            self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+            envelope = cast(dict[str, object], json.loads(encoded))
+            status = cast(dict[str, object], cast(dict[str, object], envelope["data"])["status"])
+            # An older service sends no report: the client reads no report, so Verify keeps the lost path.
+            del status["report"]
+            older_service = wire.parse_reply(json.dumps(envelope), status_request)
+            self.assertEqual(older_service,
+                             status_wire.PlacementStatusReply(replace(known, report=placement.NoTerminalReport())))
+            # An older client reads a reply with a field it does not know.
+            status["field_from_a_newer_service"] = "ignored"
+            self.assertEqual(wire.parse_reply(json.dumps(envelope), status_request), older_service)
 
     def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
         from scripts.build_queue.test_placement import placement_request
@@ -156,6 +186,19 @@ class ProtocolTests(unittest.TestCase):
                         envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
                         envelope["v"] = version
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, request))
+
+    def test_the_owning_session_survives_the_request_wire(self) -> None:
+        with AdmissionFixture() as fixture:
+            for session in (OwningSession("fps-run"), NoOwningSession(), wire.SessionNotSent()):
+                with self.subTest(session=session):
+                    request = replace(fixture.request(), session=session)
+                    self.assertEqual(wire.parse_request(wire.encode_request(request)), request)
+            older = cast(dict[str, dict[str, object]], json.loads(wire.encode_request(
+                replace(fixture.request(), session=OwningSession("fps-run")))))
+            del older["data"]["session"]
+            parsed = wire.parse_request(json.dumps(older))
+            assert isinstance(parsed, wire.AdmitRequest)
+            self.assertEqual(parsed.session, wire.SessionNotSent())
 
     def test_placement_exchanges_preserve_identity_without_replaying_authority(self) -> None:
         from scripts.build_queue.test_placement import placement_request, coordinator_holder
@@ -430,7 +473,8 @@ class ProtocolTests(unittest.TestCase):
                 _ = target.write_bytes((source / relative).read_bytes())
                 target.chmod((source / relative).stat().st_mode)
             before = wire.admission_code_version(scripts)
-            environment = {key: value for key, value in os.environ.items() if key != "BUILDLOG_ADMISSION_CODE_VERSION"}
+            environment = memory_gate_shell_environment()
+            _ = environment.pop("BUILDLOG_ADMISSION_CODE_VERSION", None)
             command = '''BUILDLOG_ADMISSION_CODE_VERSION="$("$4" "$3" code-version)" || exit 2
 export BUILDLOG_ADMISSION_CODE_VERSION
 source "$1"

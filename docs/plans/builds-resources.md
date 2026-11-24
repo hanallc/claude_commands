@@ -551,9 +551,9 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 
 #### As-built
 
-- `build_hold.py status` prints one line per pending release record, after the holder lines or `no build hold`: `release pending: <holder name>, released <HH:MM zone> - unsent: <name>, <name>; run /build:hold release to finish it` (`every session (broadcast)` for a broadcast). An unreadable record or cycle prints `release pending: <path> could not be read: <error>; /build:hold release sets it aside`.
+- `build_hold.py status` prints one line per pending release record, after the holder lines or `no build hold`: `release pending: <holder name>, released <HH:MM zone> - unsent: <name> (<n> stopped runs), <name>; run /build:hold release to finish it` (`every session (broadcast)` for a broadcast). An unreadable record or cycle prints `release pending: <path> could not be read: <error>; /build:hold release sets it aside`.
 - Status and release share `pending_release_paths()` and `read_release_intent()`. Status takes no `release_lock()`, never calls `recorded_releases()`, and changes no file.
-- `release_notices(intent)` is the one unsent reader: `CycleNoticesToSend(cycle, entries)` or the broadcast notice. The first cycle entry per session counts; a recipient is unsent when its entry is missing, `NotAttempted` or `DeliveryFailed`. A cycle id that is not the record's `cycle_id` raises `ReleaseNoticeReadError(path, reason)`.
+- `release_notices(intent)` is the one unsent reader: `CycleNoticesToSend(cycle, entries)` or the broadcast notice. The first cycle entry per session counts; a recipient is unsent when its entry is missing, `NotAttempted`, `DeliveryFailed` or `WorkerClosed`, or `RecipientGone` for a Codex session. `QueuedUnconfirmed` is not unsent. A cycle id that is not the record's `cycle_id` raises `ReleaseNoticeReadError(path, reason)`.
 - Release sets a damaged pending record or cycle aside (`set_aside_damaged_record`, `<name>.damaged-<UTC time>[-n]`) and goes on. It rebuilds a damaged or missing cycle from the intent's recipients, so the printed command works.
 
 **Files:**
@@ -899,7 +899,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 #### As-built
 
 - `shrink_floor` (`scripts/lint/sweep.py`) takes `FloorTake = Group | WholeTargetTake`. An idle target with no build-unit group is one `WholeTargetTake`: the target root and the walk's observed entries, inodes, output versions and retained paths. Orphan batches of every target go first. Then unit batches and whole takes go together in `target_last_use` order, least recently used first. A target with no unit and no use stamp uses the newest mtime of its top-level entries as its last use. The floor takes only the shortfall and never a held target.
-- A whole take uses the one deletion path: `recoverable_trim` (write-ahead intent, `sweep_trim` row) → `reclaim` → `remove`. It runs under the same target lock and rechecks as a group batch (busy, build hold, process use, cargo lock, a newer use stamp). `record_target_deletes(paths, *, known_targets=())` writes the target root to `target-deletes.json` before the markers go, so `memory_admit.py` refuses a warm promise for that target.
+- A whole take goes to `reclaim` as a group batch does, and `reclaim` lists the target folder for manual review. It runs under the same target lock and rechecks as a group batch (busy, build hold, process use, cargo lock, a newer use stamp). After an approved removal, `remove_listed_output` calls `record_target_deletes(paths, *, known_targets=())`, which writes the target root to `target-deletes.json`, so `memory_admit.py` refuses a warm promise for that target.
 - A whole take keeps the target folder and its lock files: `.claude-busy`, `LOCK_NAMES` in each build tree, and `doc/.lock`. It takes `doc/.lock` with `try_lock`. When rustdoc holds it, the target is busy for this pass.
 - A cargo target inside another target's folder, outside that target's build trees, is its own target with its own last use, busy check and batches. `TargetOwnerIndex` maps each path to its deepest target once per pass (prefix check first; `/proc` paths skip `realpath`). `build_trees`, `process_uses` and `walk` use that one owner. `busy_bytes` and `after_caches` count a nested target's bytes once.
 - `unit_hash(name) -> UnitHash | NoUnitHash` gives a linker temp `.<name>-<hash>.<pid>` in `deps/` to its unit. `copied_name`, `copied_up` and `group_roots` keep their result for every other name.
@@ -1068,7 +1068,7 @@ The phase stopped at Spec 2. The builds showrunner ruled the `ANON_SHARE` share 
 #### As-built
 
 - Hard-coded settings in this unit's files (108) are config keys read through `scripts/lib/conf.py` at use, with their old values: `hanas.conf`, `lint.conf`, `production.conf`, new `hana_shot.conf` and `scratch.conf`. `config/README.md` lists each key.
-- One key per value: `sweep.py` takes state and build-log folders from `tmp_sweep.state_dir()` and `buildlog/store.root()`; `tmp_sweep.wide_idle_seconds()` and the folder audit share `folder_remove_after_seconds`; the audit walks with `scratch.conf` `repo_skip` and keeps the configured `visible_root`; `smoke_launch.sh` reads `hana_shot.conf` `refused_port` and `host`; `mac_run.sh` reads `mac_test.conf` `connect_timeout_s`, rounded up for ssh; holder messages use the first `sweep_message_path_widths` entry; `hold_floor(floor, dry_run)` reads roots and lock from config.
+- One key per value: `sweep.py` takes state and build-log folders from `tmp_sweep.state_dir()` and `buildlog/store.root()`; `tmp_sweep.wide_idle_seconds()` and the folder audit share `folder_remove_after_seconds`; the audit walks with `scratch.conf` `repo_skip`; `smoke_launch.sh` reads `hana_shot.conf` `refused_port` and `host`; `mac_run.sh` reads `mac_test.conf` `connect_timeout_s`, rounded up for ssh; holder messages use the first `sweep_message_path_widths` entry; `hold_floor(floor, dry_run)` reads roots and lock from config.
 - Hot paths read each setting once per call (scratch repository scan, `Brp` instance, Hana polls, folder scans, dep-info scan).
 - Standalone `hana_shot.py` loads its libraries without `PYTHONPATH`. A config read failure in `scratch.holds()` keeps an active hold. `mac_run.sh` gives `scp` the raw remote path and `ssh` the quoted one.
 - Tests use `CONF_DIR`; `memory_test_support.write_config_fixture` keeps existing keys and adds the given ones.
@@ -1313,7 +1313,7 @@ A measurement script in the unit run folder splits Cargo memory waits by recorde
 
 #### As-built
 
-- `StepEvidence.arguments` (`scripts/lint/build_shape.py`) holds the decoded argv of test steps (`TEST_STEPS` = nextest, test, t). `index_step_evidence` keeps the argv and parses no test selection.
+- `StepEvidence.arguments` (`scripts/lint/build_shape.py`) holds the decoded argv of test steps (`TEST_STEPS` = nextest, test, t) and of `check` steps (since 2026-11-23). `index_step_evidence` keeps the argv and parses no test selection.
 - `history_selection(item, evidence)` (`memory_admit.py`) is the one resolver of package, scope and filters for a history row. A recorded field wins; only a missing field is parsed from `StepEvidence.arguments` through `test_selection`, once per row.
 - `expected_peak`: a full test request with a package keeps only rows whose package and scope match (test steps only).
 - `filtered_peak`: the larger of the exact-filter p90 and the package p90 from anonymous rows, then the indexed exact and package peaks × `ANON_SHARE`, then check/build peaks, the compile index and `FILTERED_FLOOR`.
@@ -1344,7 +1344,7 @@ A measurement script in the unit run folder splits Cargo memory waits by recorde
 - `FloorOutcome.assessment` holds a `tmp_sweep.SweepAssessment`. `notify_floor_problem` accepts `FloorOutcome | tmp_sweep.SweepAssessment`.
 - `send_floor_alert` returns `FloorAlertDelivery(natedev, phone)`, with one `FloorChannelOutcome` per channel (not attempted, delivered, queued or failed). `send_holder_message` is the natedev leg; it returns `FloorChannelOutcome` and logs "message to natedev ...".
 - The lock alert has one pure transition, `next_lock_alert(previous, holder, process, now)`, also used at lock acquisition. The record is written only when the state changes. An unreadable hold is `ObservedUnreadableFloorHold` or `ReportedUnreadableFloorHold`; an old `alert_delivered` true decodes as reported, false as observed. A pass that sees no holder keeps `DeliveredFloorLockAlert`, so the same holder does not alert again.
-- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, and one `roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
+- One copy of each floor rule: `class PhoneCrossing(Enum)`, `floor_record_or_new(previous, free)`, one pid check, `_command_text(bytes)`, and one `pair_roots_for` or `connected_roots_for` lookup per distinct root. `target_dirs` is one loop over a named 3-level depth.
 - `config/lint.conf` sets `sweep_scan_workers.natedev=1` and `sweep_discovery_workers=4` (the directory-search pool). The code no longer forces one scan worker.
 - A real floor pass walks each idle target once, and walks again only the targets that had deletions to compute `after_caches`.
 
@@ -1508,7 +1508,7 @@ Each estimate decodes `admission/anon_peaks.jsonl` once and asks the index once,
 - `read_estimate_history(root, host, steps, now, *, include_current_end=False) -> EstimateHistory` applies one parsed window to every tier: host, steps, `cutoff <= ended_at <= now` (`< now` unless `include_current_end`) and a positive int peak. `EstimateHistory` carries `root`, `host`, `now`, `steps`, `include_current_end` and `rows` by step.
 - `compiling_history(history)` takes only the history and joins its rows through `index_step_evidence`.
 - `expected_peak` reads once: a filtered request with a package reads `filtered_steps(step)` (`step`, `check`, `build` without repeats), others read `(step,)`. It tries `fresh_test_peak` (`ExpectedPeak | NoFreshHistory`), then `filtered_history_peak` or `full_history_peak`. No `filtered_peak` wrapper exists. `build_peaks` makes one read with `include_current_end=True`.
-- `index_step_evidence(index_path, host, steps: tuple[str, ...], call_ids: tuple[str, ...], before)` is one query over `json_each` call ids and steps with `+host=?`, so SQLite uses `steps_call`. It skips rows dated at or after `before`, keeps test arguments only for `TEST_STEPS`, and gives a `BuildShape` only to `build` rows (`NoBuildShape()` otherwise).
+- `index_step_evidence(index_path, host, steps: tuple[str, ...], call_ids: tuple[str, ...], before)` is one query over `json_each` call ids and steps with `+host=?`, so SQLite uses `steps_call`. It skips rows dated at or after `before`, keeps arguments only for `TEST_STEPS` and `check` (check since 2026-11-23), and gives a `BuildShape` only to `build` rows (`NoBuildShape()` otherwise).
 - The hana dev nextest estimate median fell from 0.462 s to 0.276 s.
 
 **Files:**
@@ -1915,7 +1915,7 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 **Approved:** builds showrunner, 2026-11-09 ("Your open nit is a wrong result: the alert can recommend a folder that holds output a build holds. Fix it now as phase 93. The recommendation must leave out held output, or name a different folder.").
 
 #### As-built
-- A non-dry floor pass computes the held paths when it notifies, in the `finally` of `_hold_floor_pass` (`scripts/lint/sweep.py`), from the final `busy` map. A held path is a target with a `busy` reason other than `NoRecordedEvidence`, a no-evidence target with an entry in `uses` or `hold_targets`, a `.claude-busy` judgment lock or a held cargo lock, and each paired root (`OUTPUT_ROOTS.get().roots_for`) of these. A live use that `shrink_floor` finds after the first scan is held.
+- A non-dry floor pass computes the held paths when it notifies, in the `finally` of `_hold_floor_pass` (`scripts/lint/sweep.py`), from the final `busy` map. A held path is a target with a `busy` reason other than `NoRecordedEvidence`, a no-evidence target with an entry in `uses` or `hold_targets`, a `.claude-busy` judgment lock or a held cargo lock. It also includes each root of the same saved mappings (`OUTPUT_ROOTS.get().pair_roots_for`) as one of these. A `PairHeld` target, held only because a pair root is in use, adds no roots. A live use that `shrink_floor` finds after the first scan is held.
 - `notify_floor_problem` receives them as `FloorOutcome.held_targets`. No caller reads held paths from the outcome that `_hold_floor` returns.
 - `folder_choices(..., held_targets=...)` marks a choice that is, contains or is inside a held path as `FolderChoiceKind.HELD_OUTPUT`. It compares resolved paths (`Path(label).expanduser().resolve()`, `is_relative_to` both ways). Held wins over `PROTECTED`. This applies to the Mac measurement and the natedev disk measurement.
 - A held folder line reads `<label>: holds <size>. A build is using output inside it; deleting it can break that build.`
@@ -2240,7 +2240,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - A missing, malformed or zone-less `createdAt` gives `CiUnknown`.
 - `config/mac_test.conf` has `ci_jobless_queued_minutes=60`. `read_config()` reads the key only when `ci_repo` is set, so the Linux and aws target configs need no new key.
 - No new `gh` call, flag, cancel call or state file.
-- Measured before the fix: run 43096016385 (natepiano/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
+- Measured before the fix: run 43096016385 (hanallc/hana `ci.yml`) was queued from 2026-11-11 20:25 UTC with no jobs, and `gh run cancel` refused it as "completed". It held hana trunk's Mac block `pending` from 2026-11-12 20:04 EST.
 
 **Files:**
 - `scripts/mac_test/mac_test.py` — `CiRun`, `ci_activity()`, `MacTestConfig.ci_jobless_queued_minutes`

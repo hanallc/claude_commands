@@ -477,6 +477,8 @@ class MergeGateFixture(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
             "GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
+            # A gate that runs as a detached run has its own slice; the fixture gate never has one.
+            "DETACHED_RUN_SLICE": "",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),
@@ -802,7 +804,7 @@ class MergeGateFixture(unittest.TestCase):
                    + f"- **Repository:** `{self.checkout}`\n- **Showrunner checkout:** `{self.checkout}`\n"
                    + "- **Merge branch:** `integration`\n")
         with isolated_staff_file(Path(self.environment["STAFF_FILE"]), self.environment):
-            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc("natedev", doc))
+            _ = fixture_member("showrunner", name="fixture-showrunner", doc=staff.LiveDoc(remote.local_machine(), doc))
         return review, doc
 
     def publish_for_promotion(self) -> gate.GateArguments:

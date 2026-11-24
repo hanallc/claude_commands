@@ -344,17 +344,17 @@ class FolderFormTests(unittest.TestCase):
                 self.assertTrue(reader.pass_fds)
             self.assertFalse(build_slots.remove_copy(record))
             envrc = copy.path / ".envrc"
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
-                             build_slots.NumberedCopyEnvrc.TRUSTED)
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             folders.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             _ = envrc.write_text("export FIXTURE=changed\n")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             envrc.unlink()
             envrc.symlink_to(self.root / ".envrc")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
@@ -452,6 +452,16 @@ class FolderFormTests(unittest.TestCase):
             path = folders.output_path("hana", "demo", "mac")
             self.assertEqual(path, self.root / "build/hana/demo/mac")
             self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
+
+    def test_ci_folders_list_only_numbered_directories_in_number_order(self) -> None:
+        self.assertEqual(folders.ci_folders("hana"), [])
+        parent = self.root / "disk/hana/ci"
+        for name in ("10", "2", "0", "03", "-1", "３", "old"):
+            (parent / name).mkdir(parents=True)
+        (parent / "4").touch()
+        (parent / "5").symlink_to(parent / "2", target_is_directory=True)
+        (parent / "6.lock").touch()
+        self.assertEqual(folders.ci_folders("hana"), [(2, parent / "2"), (10, parent / "10")])
 
     def test_paths_refuse_invalid_components_and_numbers(self) -> None:
         for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
@@ -553,7 +563,7 @@ class BuildFolderTests(unittest.TestCase):
         _ = write_config_fixture(config / "build_folders.conf",
             "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
             + "patterns.standing={repository}/{owner}-gate{suffix}\n"
-            + "patterns.mirror={repository}/{owner}-s{slot}\npatterns.target={purpose}\npatterns.shell-cache={repository}\n"
+            + "patterns.target={purpose}\n"
             + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
             + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
@@ -860,7 +870,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.addCleanup(_release_folder, held)
         _ = (held / "output").write_text("held output")
         result = self.command("remove", str(held))
-        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((result.returncode, result.stderr), (1, f"build folders: {held}: the folder lock is held\n"))
         self.assertEqual((held / "output").read_text(), "held output")
         self.assertTrue(held.with_name(held.name + ".lease.json").is_file())
         self.assertTrue(held.with_name(held.name + ".lock").is_file())
@@ -878,6 +888,21 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertFalse(local.with_name(local.name + ".lock").exists())
         with self.assertRaises(StopIteration):
             _ = folders.build_folder_lock_fd(local)
+
+    def test_cli_call_releases_the_locks_it_took_and_keeps_the_callers(self) -> None:
+        kept = folders.create_build_folder(folders.UniqueBuildFolder("kept-cli-"))
+        self.addCleanup(_release_folder, kept)
+        locks = cast(dict[int, Path], getattr(folders, "_locks"))
+        before = dict(locks)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(folders.main(["unique", "--prefix", "main-cli-"]), 0)
+        created = Path(output.getvalue().strip())
+        self.assertTrue(created.is_dir())
+        self.assertEqual(locks, before)
+        self.assertEqual(folders.build_folder_state(created), "free")
+        self.assertEqual(folders.build_folder_state(kept), "held")
+        self.assertEqual(folders.main(["remove", str(created)]), 0)
+        self.assertFalse(created.exists())
 
     def test_mkdir_collision_preserves_the_other_creators_folder(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=1,
@@ -1184,7 +1209,7 @@ def interrupt():
             assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         os.kill(os.getpid(), signal.SIGINT)
 flock, mkdir, lease, fstat, remove = fcntl.flock, os.mkdir, getattr(f, '_write_lease'), os.fstat, shutil.rmtree
-unlink, remove_folder = os.unlink, getattr(f, '_remove_folder')
+unlink, remove_folder = os.unlink, f.remove_folder
 def lock_step(fd, mode):
     result = flock(fd, mode)
     if mode == fcntl.LOCK_EX | fcntl.LOCK_NB:
@@ -1226,7 +1251,7 @@ patches = {'lock': mock.patch.object(fcntl, 'flock', side_effect=lock_step),
            'lease': mock.patch.object(f, '_write_lease', side_effect=lease_step),
            'fstat': mock.patch.object(os, 'fstat', side_effect=fstat_step),
            'publish': mock.patch.object(f, '_locks', PublishStep()),
-           'folder_removed': mock.patch.object(f, '_remove_folder', side_effect=folder_removed),
+           'folder_removed': mock.patch.object(f, 'remove_folder', side_effect=folder_removed),
            'lease_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'lock_removed': mock.patch.object(os, 'unlink', side_effect=unlink_step),
            'removal': mock.patch.object(shutil, 'rmtree', side_effect=removal_step)}
@@ -1910,7 +1935,7 @@ assert not loaded, loaded
     @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
                          "the memory filesystem is unavailable")
     def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
@@ -2125,8 +2150,8 @@ assert not loaded, loaded
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
         settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
+            path = scratch.new("gate:folder-test", "checkout", scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)
@@ -2206,7 +2231,7 @@ assert not loaded, loaded
         cases: list[tuple[folders.BuildFolderKind, str]] = [
             ("temporary", "hana-key/unit-proof-abcdef"), ("gate", "proof-abcdef"),
             ("standing", "hana-key/unit-gate"), ("editable", "hana-key-unit/proof"),
-            ("mirror", "hana-key/unit-s3"), ("target", "proof"), ("shell-cache", "hana-key"),
+            ("mirror", "hana-key/unit-s3"), ("target", "proof"),
         ]
         for kind, expected in cases:
             with self.subTest(kind=kind):
@@ -2229,10 +2254,10 @@ assert not loaded, loaded
         self.assertEqual(first.name, "unit-proof-aa")
         self.assertEqual(second.name, "unit-proof-bb")
 
-    def test_nonvisible_scratch_target_uses_the_shared_name_rule(self) -> None:
+    def test_scratch_target_uses_the_shared_name_rule(self) -> None:
         with (mock.patch.object(scratch, "validate_phase_task"),
               mock.patch.object(scratch, "build_folder_path", wraps=folders.build_folder_path) as naming):
-            path = scratch.target("gate:proof", "tree", False)
+            path = scratch.target("gate:proof", "tree")
         naming.assert_called_once()
         self.assertEqual(path.parent, copy_record.root())
         self.assertRegex(path.name, r"^gate-proof-tree-[a-z0-9]{6}$")

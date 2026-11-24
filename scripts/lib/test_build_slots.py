@@ -1,10 +1,9 @@
-"""Repository slots retain work, reuse files, and enforce their locks."""
+"""Numbered copies retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
 import fcntl
 import io
 import json
@@ -21,33 +20,24 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, copy_record, file_lock, git_rescue, scratch
 from scripts.copies import copies
-from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
+from scripts.lib import build_folders, build_slots, copy_record, file_lock, git_rescue
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class BuildSlotsTests(unittest.TestCase):
     root: Path = Path()
     source: Path = Path()
     base: str = ""
-    settings: Path = Path()
-    slot_root: Path = Path()
-    cargo_root: Path = Path()
-    machine: str = ""
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         configuration = private_slot_config(self.root, repository="widget")
-        self.settings = configuration.settings
-        self.slot_root = configuration.slots
-        self.cargo_root = configuration.cargo
-        self.machine = configuration.machine
         self.enterContext(mock.patch.dict(os.environ, configuration.environment))
         self.source = self.root / "source-folder"
         self.source.mkdir()
@@ -62,18 +52,6 @@ class BuildSlotsTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(folder), *arguments], check=True, capture_output=True,
                               text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
 
-    def take(self, commit: str = "HEAD") -> AbstractContextManager[build_slots.Slot]:
-        return build_slots.take_slot(self.source, commit, showrunner="builds", unit="queue",
-                                     work="proof", purpose="test", wait_policy=build_slots.SlotWaitPolicy.REFUSE)
-
-    def lease(self, path: Path) -> dict[str, object]:
-        return cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
-
-    def age_lease(self, path: Path) -> None:
-        record = self.lease(path)
-        record["last_use"] = (datetime.now(UTC) - timedelta(days=8)).isoformat()
-        _ = path.with_name(path.name + ".lease.json").write_text(json.dumps(record) + "\n")
-
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         checkout = Path(__file__).resolve().parents[2]
         return subprocess.run([sys.executable, "-m", "scripts.lib.build_slots", *arguments],
@@ -85,6 +63,33 @@ class BuildSlotsTests(unittest.TestCase):
         return ("run", "--source", str(self.source), "--commit", self.base,
                 "--showrunner", "builds", "--unit", unit, "--work", "proof", "--purpose", "test", "--")
 
+    def test_assigned_copy_uses_only_its_number(self) -> None:
+        def assigned():
+            return build_slots.take_copy(self.source, self.base, showrunner='builds', unit='queue',
+                work='assigned', purpose='test', selection=build_slots.ExactSlotRequest(2))
+
+        first = build_folders.copy_path('widget', 'queue', 1)
+        second = first.with_name('2')
+        with assigned() as copy:
+            self.assertEqual((copy.number, copy.path, copy.cargo_dir), (2, second, second / 'target'))
+            self.assertFalse(first.exists())
+            with self.assertRaisesRegex(BlockingIOError, 'assigned copy 2'), assigned():
+                self.fail('The assigned copy admitted another holder')
+        with assigned() as copy:
+            self.assertEqual(copy.path, second)
+        self.assertFalse(first.exists())
+
+    def take_queue_copy(self, source: Path | None = None,
+                        commit: str | None = None) -> AbstractContextManager[build_slots.LeasedCopy]:
+        return build_slots.take_copy(self.source if source is None else source, self.base if commit is None else commit,
+                                     showrunner="builds", unit="queue", work="reuse", purpose="test")
+
+    def rescue_refs(self) -> str:
+        return self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/")
+
+    def lease(self, path: Path) -> dict[str, object]:
+        return cast(dict[str, object], json.loads(path.with_name(path.name + ".lease.json").read_text()))
+
     def clone_source(self) -> tuple[Path, str]:
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
             source = copies.clone(self.source, task="gate:clone-slot")
@@ -92,24 +97,55 @@ class BuildSlotsTests(unittest.TestCase):
         commit = commit_repository(source, "unpublished clone commit")
         return source, commit
 
-    def take_clone(self, source: Path, commit: str) -> AbstractContextManager[build_slots.Slot]:
-        return build_slots.take_slot(source, commit, showrunner="builds", unit="queue", work="clone-proof",
-                                     purpose="test", wait_policy=build_slots.SlotWaitPolicy.REFUSE)
+    def commit_allow_list_ignore(self) -> None:
+        _ = (self.source / ".gitignore").write_text(
+            "*\n!.gitignore\n!*.txt\n!scripts/\n!scripts/**\n!src/\n!src/**\n**/__pycache__/\n")
+        for module in ("scripts/tool.py", "src/lib.rs"):
+            (self.source / module).parent.mkdir()
+            _ = (self.source / module).write_text("source\n")
+        self.base = commit_repository(self.source, "ignore all but the tracked paths")
 
-    def test_clone_with_an_unpushed_commit_uses_the_existing_slot(self) -> None:
-        with self.take() as first:
-            path = first.path
-        source, commit = self.clone_source()
-        with self.take_clone(source, commit) as slot:
-            self.assertEqual(slot.path, path)
-            self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
-            self.assertEqual((path / "unpublished.txt").read_text(), "only in the clone\n")
-            self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), self.base)
-            self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.source / ".git"))
+    def test_free_copy_with_only_tool_output_folders_is_taken_again(self) -> None:
+        self.commit_allow_list_ignore()
+        notices = io.StringIO()
+        _ = self.enterContext(redirect_stderr(notices))
+        output = ("__pycache__/top.pyc", "scripts/__pycache__/tool.pyc", "target/keep")
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            for name in output:
+                (path / name).parent.mkdir(exist_ok=True)
+                _ = (path / name).write_text(f"{name} output\n")
+        refs = self.rescue_refs()
+        with self.take_queue_copy() as reused:
+            self.assertEqual(reused.path, path)
+            for name in output:
+                self.assertEqual((path / name).read_text(), f"{name} output\n")
+        self.assertEqual(self.rescue_refs(), refs)
+        self.assertNotIn("untracked folders", notices.getvalue())
 
-    def test_clone_private_ref_is_removed_on_release_and_failure(self) -> None:
+    def test_free_copy_with_an_untracked_folder_is_kept(self) -> None:
+        self.commit_allow_list_ignore()
+        exclude = self.source / ".git/info/exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        with exclude.open("a") as output:
+            _ = output.write("saved/\n")
+        notices = io.StringIO()
+        _ = self.enterContext(redirect_stderr(notices))
+        for folder in ("notes", "saved", "src/target"):
+            with self.subTest(folder=folder):
+                with self.take_queue_copy() as copy:
+                    path = copy.path
+                    (path / folder).mkdir()
+                    _ = (path / folder / "draft.txt").write_text("unsaved work\n")
+                with self.take_queue_copy() as other:
+                    self.assertNotEqual(other.path, path)
+                self.assertIn(f"kept for a manual removal list: {path} (build_slots, untracked folders)",
+                              notices.getvalue())
+                self.assertEqual((path / folder / "draft.txt").read_text(), "unsaved work\n")
+
+    def test_copy_from_a_clone_removes_its_private_ref_on_release_and_failure(self) -> None:
         source, commit = self.clone_source()
-        with self.take() as first:
+        with self.take_queue_copy() as first:
             path = first.path
         reference = "refs/build-slots/"
 
@@ -121,8 +157,8 @@ class BuildSlotsTests(unittest.TestCase):
 
         for ending in ("release", "caller failure", "checkout failure", "fetch failure"):
             with self.subTest(ending=ending):
-                # Restore the slot's HEAD so every row starts from the pool's history.
-                with self.take():
+                # Restore the copy's HEAD so every row starts from the source history.
+                with self.take_queue_copy():
                     pass
                 original = cast(Callable[..., str], getattr(build_slots, "_git"))
 
@@ -137,26 +173,26 @@ class BuildSlotsTests(unittest.TestCase):
                 with mock.patch.object(build_slots, "_git", side_effect=fail_git):
                     if ending in ("checkout failure", "fetch failure"):
                         with self.assertRaisesRegex(build_slots.SlotGitFailure, "injected Git failure"):
-                            with self.take_clone(source, commit):
+                            with self.take_queue_copy(source, commit):
                                 self.fail("Git failure reached the caller")
                     elif ending == "caller failure":
                         with self.assertRaisesRegex(RuntimeError, "caller failed"):
-                            with self.take_clone(source, commit):
+                            with self.take_queue_copy(source, commit):
                                 self.assertEqual(imported_commit(), commit)
                                 raise RuntimeError("caller failed")
                     else:
-                        with self.take_clone(source, commit):
+                        with self.take_queue_copy(source, commit):
                             self.assertEqual(imported_commit(), commit)
                 self.assertEqual(self.git(self.source, "for-each-ref", reference), "")
                 self.assertEqual(build_folders.build_folder_state(path), "free")
 
-    def test_clone_without_shared_history_is_refused_after_fetch(self) -> None:
+    def test_copy_from_a_clone_without_shared_history_is_refused_after_fetch(self) -> None:
         source, _ = self.clone_source()
         _ = self.git(source, "checkout", "--orphan", "unrelated")
         _ = self.git(source, "rm", "-rf", ".")
         _ = (source / "foreign.txt").write_text("foreign history\n")
         commit = commit_repository(source, "unrelated root")
-        with self.take() as first:
+        with self.take_queue_copy() as first:
             path = first.path
         before = self.git(path, "status", "--porcelain=v2")
         original = cast(Callable[..., str], getattr(build_slots, "_git"))
@@ -177,8 +213,8 @@ class BuildSlotsTests(unittest.TestCase):
 
         with mock.patch.object(build_slots, "_git", side_effect=observe_git):
             with self.assertRaises(build_slots.SlotRepositoryMismatch):
-                with self.take_clone(source, commit):
-                    self.fail("the unrelated repository received a slot")
+                with self.take_queue_copy(source, commit):
+                    self.fail("the unrelated repository received a copy")
         self.assertEqual(fetched, [commit])
         self.assertEqual(comparisons, [("merge-base", references[0], self.base)])
         self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
@@ -186,52 +222,23 @@ class BuildSlotsTests(unittest.TestCase):
         self.assertEqual(self.git(self.source, "for-each-ref", "refs/build-slots/"), "")
         self.assertFalse((path / "foreign.txt").exists())
 
-    def test_clone_creates_a_slot_in_its_persistent_source_repository(self) -> None:
+    def test_clone_creates_a_copy_in_its_persistent_source_repository(self) -> None:
         source, commit = self.clone_source()
         session_copy = self.root / "private-session-copy"
         _ = source.rename(session_copy)
         source = session_copy
-        with self.take_clone(source, commit) as slot:
-            path = slot.path
+        with self.take_queue_copy(source, commit) as copy:
+            path = copy.path
             self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.source / ".git"))
             self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
             self.assertEqual(self.lease(path)["commit"], commit)
         self.assertEqual(self.lease(path)["commit"], commit)
         shutil.rmtree(source)
-        with self.take() as reused:
+        with self.take_queue_copy() as reused:
             self.assertEqual(reused.path, path)
             self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
 
-    def test_established_pool_owns_new_slots_from_an_unregistered_clone(self) -> None:
-        source, commit = self.clone_source()
-        (source / copy_record.RECORD).unlink()
-        with self.take() as first:
-            with self.take_clone(source, commit) as second:
-                path = second.path
-                self.assertEqual(second.number, 2)
-                self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.source / ".git"))
-                self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
-            shutil.rmtree(source)
-            with self.take() as reused:
-                self.assertEqual(reused.path, path)
-                self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
-            self.assertEqual(build_folders.build_folder_state(first.path), "held")
-
-    def test_stale_or_cyclic_copy_records_do_not_block_existing_slots(self) -> None:
-        with self.take() as first:
-            path = first.path
-        for outcome in ("stale", "cyclic"):
-            with self.subTest(outcome=outcome):
-                source, commit = self.clone_source()
-                record = source / copy_record.RECORD
-                fields = cast(dict[str, object], json.loads(record.read_text()))
-                fields["source_path"] = str(self.root / "missing" if outcome == "stale" else source)
-                _ = record.write_text(json.dumps(fields))
-                with self.take_clone(source, commit) as reused:
-                    self.assertEqual(reused.path, path)
-                    self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
-
-    def test_empty_pool_refuses_stale_or_cyclic_copy_records(self) -> None:
+    def test_copy_refuses_stale_or_cyclic_copy_records(self) -> None:
         for outcome in ("stale", "cyclic"):
             with self.subTest(outcome=outcome):
                 source, commit = self.clone_source()
@@ -241,98 +248,21 @@ class BuildSlotsTests(unittest.TestCase):
                 _ = record.write_text(json.dumps(fields))
                 reason = "no available persistent source" if outcome == "stale" else "copy sources form a cycle"
                 with self.assertRaisesRegex(build_slots.SlotGitFailure, reason):
-                    with self.take_clone(source, commit):
-                        self.fail("The invalid copy record created a slot.")
+                    with self.take_queue_copy(source, commit):
+                        self.fail("The invalid copy record created a copy.")
 
-    def test_unregistered_clone_owns_an_empty_pool(self) -> None:
-        source, commit = self.clone_source()
-        (source / copy_record.RECORD).unlink()
-        with self.take_clone(source, commit) as slot:
-            self.assertEqual(self.git(slot.path, "rev-parse", "--git-common-dir"), str(source / ".git"))
-            self.assertEqual(self.git(slot.path, "rev-parse", "HEAD"), commit)
-
-    def test_overlapping_clone_takes_keep_separate_refs_until_release(self) -> None:
-        source, commit = self.clone_source()
-        with self.take_clone(source, commit):
-            first = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/build-slots/").splitlines()
-            self.assertEqual(len(first), 1)
-            with self.take_clone(source, commit):
-                refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/build-slots/").splitlines()
-                self.assertEqual(len(refs), 2)
-                self.assertIn(first[0], refs)
-            self.assertEqual(self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/build-slots/"), first[0])
-        self.assertEqual(self.git(self.source, "for-each-ref", "refs/build-slots/"), "")
-
-    def test_lowest_free_number_grows_to_the_limit_and_reads_a_changed_limit(self) -> None:
-        with self.take() as first:
-            self.assertEqual(first.number, 1)
-            self.assertEqual(first.repository, "widget")
-            self.assertEqual(first.path, self.slot_root / "widget-slot1")
-            self.assertEqual(first.cargo_dir, self.cargo_root / "widget-slot1")
-            self.assertEqual(first.env["CARGO_BUILD_BUILD_DIR"], str(first.cargo_dir))
-            with self.take() as second:
-                self.assertEqual(second.number, 2)
-                self.assertEqual(build_folders.build_folder_state(first.path), "held")
-                self.assertEqual(build_folders.build_folder_state(second.path), "held")
-                with self.assertRaises(build_slots.SlotsFull) as raised:
-                    with self.take():
-                        self.fail("a full pool granted a slot")
-                self.assertEqual(raised.exception.repository, "widget")
-                self.assertEqual(raised.exception.machine, self.machine)
-                self.assertEqual(raised.exception.maximum, 2)
-                _ = write_config_fixture(self.settings,
-                                         f"slots.{self.machine}.widget.max=3\n")
-                with self.take() as third:
-                    self.assertEqual(third.number, 3)
-            with self.take() as reused:
-                self.assertEqual(reused.number, 2)
-        with self.take() as lowest:
-            self.assertEqual(lowest.number, 1)
-
-    def test_busy_source_allows_ready_slot_and_reports_why_creation_fails(self) -> None:
-        with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
-                                   work="proof", purpose="test", selection=build_slots.ExactSlotRequest(2)) as slot:
-            path = slot.path
-        missing = path.with_name("widget-slot1")
-        self.assertFalse(missing.exists())
-        with scratch.busy_locks(self.source, create=True) as idle:
-            self.assertTrue(idle)
-            with self.take() as reused:
-                self.assertEqual(reused.path, path)
-                with self.assertRaisesRegex(build_folders.SlotSourceBusy, "slot source is busy"), self.take():
-                    self.fail("The busy source allowed slot creation.")
-        self.assertFalse(missing.exists())
-
-    def test_exact_slot_preserves_affinity_and_refuses_without_scanning(self) -> None:
-        def exact(number: int):
-            return build_slots.take_slot(self.source, self.base, showrunner='builds', unit='queue',
-                work='assigned', purpose='test', selection=build_slots.ExactSlotRequest(number))
-
-        with exact(2) as selected:
-            self.assertEqual(selected.number, 2)
-            self.assertFalse((self.slot_root / 'widget-slot1').exists())
-            with self.assertRaises(build_slots.SlotsFull), exact(2):
-                self.fail('The assigned slot admitted another holder')
-            self.assertFalse((self.slot_root / 'widget-slot1').exists())
-            path, cargo = selected.path, selected.cargo_dir
-        with exact(2) as retained:
-            self.assertEqual((retained.path, retained.cargo_dir), (path, cargo))
-        for number in (0, 3):
-            with self.subTest(number=number), self.assertRaises(ValueError), exact(number):
-                self.fail('The request exceeded its configured pool')
-        self.assertFalse((self.slot_root / 'widget-slot3').exists())
-
-    def test_two_slots_share_one_git_config_migration(self) -> None:
+    def test_two_copies_share_one_git_config_migration(self) -> None:
         common = self.source / ".git"
         lock_path = common / "build-copy-config.lock"
         first_read, resume_first = threading.Event(), threading.Event()
         git = cast(Callable[..., str], getattr(build_slots, "_git"))
         flock = fcntl.flock
+        first_copy = build_folders.copy_path("widget", "queue", 1)
 
         def pause_after_read(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                              accepted: tuple[int, ...] = (0,)) -> str:
             result = git(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
-            if folder == self.slot_root / "widget-slot1" and arguments == ("config", "--local", "--get", "core.bare"):
+            if folder == first_copy and arguments == ("config", "--local", "--get", "core.bare"):
                 first_read.set()
                 self.assertTrue(resume_first.wait(TEST_HANG_GUARD_SECS), "The second caller did not reach the migration.")
             return result
@@ -348,9 +278,9 @@ class BuildSlotsTests(unittest.TestCase):
             flock(descriptor, mode)
 
         def take(number: int) -> Path:
-            with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
-                    work="proof", purpose="test", selection=build_slots.ExactSlotRequest(number)) as slot:
-                return slot.path
+            with build_slots.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                    work="proof", purpose="test", selection=build_slots.ExactSlotRequest(number)) as copy:
+                return copy.path
 
         with (mock.patch.object(build_slots, "_git", side_effect=pause_after_read),
               mock.patch.object(fcntl, "flock", new=observe_contention),
@@ -363,13 +293,13 @@ class BuildSlotsTests(unittest.TestCase):
                 resume_first.set()
             first_path = first.result(timeout=TEST_HANG_GUARD_SECS)
 
-        self.assertEqual((first_path, second_path), (self.slot_root / "widget-slot1", self.slot_root / "widget-slot2"))
+        self.assertEqual((first_path, second_path), (first_copy, first_copy.with_name("2")))
         self.assertEqual(self.git(self.source, "config", "--local", "--get-all", "extensions.worktreeConfig"), "true")
         self.assertNotIn("core.bare=", self.git(self.source, "config", "--local", "--list"))
         self.assertEqual(self.git(self.source, "config", "--file", str(common / "config.worktree"),
                                   "--get-all", "core.bare"), "false")
 
-    def test_git_inherits_the_shared_lock_during_worktree_config_migration(self) -> None:
+    def test_git_inherits_the_shared_lock_during_copy_config_migration(self) -> None:
         lock_path = self.source / ".git/build-copy-config.lock"
         git = cast(Callable[..., str], getattr(build_slots, "_git"))
         locked_commands: list[tuple[str, ...]] = []
@@ -387,234 +317,53 @@ class BuildSlotsTests(unittest.TestCase):
                     locked_commands.append(arguments)
             return git(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
 
-        with mock.patch.object(build_slots, "_git", side_effect=observe_git), self.take():
+        with mock.patch.object(build_slots, "_git", side_effect=observe_git), self.take_queue_copy():
             pass
 
         self.assertIn(("config", "--local", "--unset", "core.bare"), locked_commands)
         self.assertIn(("config", "--local", "extensions.worktreeConfig", "true"), locked_commands)
 
-    def test_repository_limit_uses_own_or_default_maximum_without_output(self) -> None:
-        for maximum in (1, UseDefaultMaximum()):
-            with self.subTest(maximum=maximum):
-                _ = private_slot_config(self.root, repository="widget", maximum=maximum)
-                output = io.StringIO()
-                errors = io.StringIO()
-                with redirect_stdout(output), redirect_stderr(errors):
-                    with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
-                                               work="proof", purpose="test",
-                                               report=lambda line: print(line, file=sys.stderr)) as held:
-                        self.assertEqual(held.number, 1)
-                    with self.take():
-                        with self.assertRaises(build_slots.SlotsFull) as raised:
-                            with self.take():
-                                self.fail("the maximum did not limit the pool")
-                    self.assertEqual(raised.exception.maximum, 1)
-                self.assertEqual(output.getvalue(), "")
-                self.assertEqual(errors.getvalue(), "")
-
-    def test_missing_slot_root_stops_allocation_and_sweep_until_private_settings_return(self) -> None:
-        before = self.git(self.source, "worktree", "list", "--porcelain")
-        lines = [line for line in self.settings.read_text().splitlines()
-                 if not line.startswith("roots.slots")]
-        _ = self.settings.write_text("\n".join(lines) + "\n")
-
-        with self.assertRaises(build_slots.SlotsNotConfigured):
-            with self.take():
-                self.fail("a slot was allocated without a configured root")
-
-        self.assertEqual(self.git(self.source, "worktree", "list", "--porcelain"), before)
-        self.assertFalse(self.slot_root.exists())
-        self.assertFalse(self.cargo_root.exists())
-        _ = private_slot_config(self.root, repository="widget")
-        with self.take() as slot:
-            self.assertEqual(slot.path, self.slot_root / "widget-slot1")
-
-    def test_linked_source_uses_the_same_pool_and_origin_repository_word(self) -> None:
-        with self.take() as first:
-            with build_slots.take_slot(first.path, self.base, showrunner="other", unit="unit",
-                                       work="another", purpose="check") as second:
-                self.assertEqual(second.repository, "widget")
-                self.assertEqual(second.path, self.slot_root / "widget-slot2")
-                self.assertEqual(self.git(second.path, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-                                 str(self.source / ".git"))
-
-    def test_interrupted_slot_creation_keeps_the_earlier_folder(self) -> None:
-        probe = """import os, pathlib, subprocess, sys
-from unittest import mock
-from scripts.lib import build_folders, build_slots
-source, path = map(pathlib.Path, sys.argv[1:3])
-stage = sys.argv[3]
-mkdir, run = os.mkdir, subprocess.run
-def interrupt_mkdir(name, mode=0o777, *, dir_fd=None):
-    result = mkdir(name, mode, dir_fd=dir_fd)
-    if name == path.name and dir_fd is not None:
-        os._exit(23)
-    return result
-def interrupt_checkout(argv, **options):
-    result = run(argv, **options)
-    if 'worktree' in argv and 'add' in argv:
-        os._exit(23)
-    return result
-patch = (mock.patch.object(build_folders.os, 'mkdir', side_effect=interrupt_mkdir) if stage == 'mkdir'
-         else mock.patch.object(subprocess, 'run', side_effect=interrupt_checkout))
-selection = build_slots.ExactSlotRequest(int(path.name.rsplit('slot', 1)[1]))
-with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='queue', work='proof',
-                                  purpose='test', selection=selection):
-    raise RuntimeError('the interruption did not occur')
-"""
-        checkout = Path(__file__).resolve().parents[2]
-        for number, stage in enumerate(("mkdir", "checkout"), start=1):
-            with self.subTest(stage=stage):
-                path = self.slot_root / f"widget-slot{number}"
-                result = subprocess.run([sys.executable, "-c", probe, str(self.source), str(path), stage],
-                                        cwd=checkout, env={**os.environ, "PYTHONPATH": str(checkout)},
-                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
-                if stage == "checkout":
-                    _ = (path / "recovery.txt").write_text("work before recovery\n")
-                with self.assertRaisesRegex(FileExistsError, "the slot checkout is incomplete"), build_slots.take_slot(
-                        self.source, self.base, showrunner="builds", unit="queue", work="proof", purpose="test",
-                        selection=build_slots.ExactSlotRequest(number)):
-                    self.fail("an incomplete slot was reused")
-                self.assertTrue(path.is_dir())
-                self.assertEqual(build_folders.build_folder_state(path), "free")
-                if stage == "checkout":
-                    self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
-                    self.assertEqual((path / "change.txt").read_text(), "first commit\n")
-                    self.assertEqual((path / "recovery.txt").read_text(), "work before recovery\n")
-
-    def test_source_without_origin_uses_the_main_checkout_name(self) -> None:
-        _ = self.git(self.source, "remote", "remove", "origin")
-        linked = self.root / "different-name"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.base)
-        with redirect_stdout(io.StringIO()):
-            with build_slots.take_slot(linked, self.base, showrunner="builds", unit="queue",
-                                       work="proof", purpose="test") as slot:
-                self.assertEqual(slot.repository, self.source.name)
-                self.assertEqual(slot.path, self.slot_root / f"{self.source.name}-slot1")
-
-    def test_incomplete_slot_keeps_its_private_git_repository(self) -> None:
-        path = self.slot_root / "widget-slot1"
-        path.mkdir(parents=True)
-        _ = self.git(path, "init", "-q", "-b", "saved")
-        _ = (path / "local.txt").write_text("local commit\n")
-        tip = commit_repository(path, "private commit")
-        _ = (path / "edit.txt").write_text("unfinished edit\n")
-        with self.assertRaisesRegex(FileExistsError, "the slot checkout is incomplete"):
-            with self.take():
-                self.fail("an incomplete private repository became a slot")
-        self.assertEqual(self.git(path, "rev-parse", "HEAD"), tip)
-        self.assertEqual((path / "edit.txt").read_text(), "unfinished edit\n")
-
-    def test_reuse_removes_a_stale_index_lock_and_an_external_target_link(self) -> None:
-        outside = self.root / "external-target"
-        outside.mkdir()
-        _ = (outside / "keep").write_text("external output\n")
-        for damage in ("index-lock", "target-link", "both"):
-            with self.subTest(damage=damage):
-                with self.take() as slot:
-                    path = slot.path
-                if damage in ("index-lock", "both"):
-                    directory = Path(self.git(path, "rev-parse", "--absolute-git-dir"))
-                    _ = (directory / "index.lock").write_text("interrupted Git write\n")
-                if damage in ("target-link", "both"):
-                    target = path / "target"
-                    if target.exists():
-                        shutil.rmtree(target)
-                    target.symlink_to(outside, target_is_directory=True)
-                with self.take() as reused:
-                    self.assertEqual(reused.path, path)
-                    self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
-                    self.assertFalse((path / "target").is_symlink())
-                    self.assertEqual((outside / "keep").read_text(), "external output\n")
-                    _ = (path / "target").mkdir(exist_ok=True)
-                    _ = (path / "target" / "new").write_text("slot output\n")
-                    self.assertFalse((outside / "new").exists())
-
-    def test_reset_rescues_edits_and_retains_unchanged_files_target_and_cargo(self) -> None:
-        with self.take() as first:
-            path, cargo = first.path, first.cargo_dir
-            same = (path / "same.txt").stat()
-            _ = (path / "change.txt").write_text("slot work\n")
-            _ = (path / "untracked.txt").write_text("untracked source\n")
-            (path / "target").mkdir()
-            _ = (path / "target" / "keep").write_text("target cache\n")
-            cargo.mkdir(parents=True, exist_ok=True)
-            _ = (cargo / "keep").write_text("cargo cache\n")
-        _ = (self.source / "change.txt").write_text("second commit\n")
-        second = commit_repository(self.source, "second")
-
-        with self.take(second) as reused:
-            self.assertEqual(reused.path, path)
-            current = (path / "same.txt").stat()
-            self.assertEqual((current.st_ino, current.st_mtime_ns), (same.st_ino, same.st_mtime_ns))
-            self.assertEqual((path / "change.txt").read_text(), "second commit\n")
-            self.assertFalse((path / "untracked.txt").exists())
-            self.assertEqual((path / "target/keep").read_text(), "target cache\n")
-            self.assertEqual((cargo / "keep").read_text(), "cargo cache\n")
-            self.assertEqual(self.git(path, "rev-parse", "HEAD"), second)
-            self.assertEqual(self.git(path, "branch", "--show-current"), "")
-        refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
-        self.assertEqual(len(refs), 1)
-        self.assertEqual(self.git(self.source, "show", refs[0] + ":change.txt"), "slot work")
-        self.assertEqual(self.git(self.source, "show", refs[0] + ":untracked.txt"), "untracked source")
-
-    def test_build_output_keeps_new_and_reused_slots_clean_without_a_tracked_ignore_file(self) -> None:
+    def test_build_output_keeps_new_and_reused_copies_clean_without_a_tracked_ignore_file(self) -> None:
         (self.source / ".gitignore").unlink()
         self.base = commit_repository(self.source, "no tracked ignore file")
         for use in ("new", "reused"):
-            with self.subTest(use=use), self.take() as slot:
-                target = slot.path / "target"
-                target.mkdir(exist_ok=True)
-                _ = (target / "build-output").write_text("compiled output\n")
-                self.assertEqual(self.git(slot.path, "status", "--porcelain"), "")
+            with self.subTest(use=use), self.take_queue_copy() as copy:
+                _ = (copy.cargo_dir / "build-output").write_text("compiled output\n")
+                self.assertEqual(self.git(copy.path, "status", "--porcelain"), "")
         (self.source / "target").mkdir()
         _ = (self.source / "target/build-output").write_text("source build output\n")
         self.assertEqual(self.git(self.source, "status", "--porcelain"), "?? target/")
 
-    def test_rescue_failure_preserves_source_and_cargo_and_frees_the_lock(self) -> None:
-        for action in ("reset", "recovery"):
-            with self.subTest(action=action):
-                with self.take() as slot:
-                    path, cargo = slot.path, slot.cargo_dir
-                    _ = (path / "change.txt").write_text("do not lose this edit\n")
-                    cargo.mkdir(parents=True, exist_ok=True)
-                    _ = (cargo / "keep").write_text("cached output\n")
-                self.age_lease(path)
-                if action == "recovery":
-                    lease = self.lease(path)
-                    lease["ready"] = False
-                    _ = path.with_name(path.name + ".lease.json").write_text(json.dumps(lease))
-                error = git_rescue.RescueError(("git", "update-ref"), "fixture write failure")
-                expected_error = FileExistsError if action == "recovery" else git_rescue.RescueError
-                with mock.patch.object(git_rescue, "rescue", side_effect=error) as rescue:
-                    with self.assertRaises(expected_error):
-                        with self.take():
-                            self.fail("reset continued after a failed rescue")
-                    if action == "recovery":
-                        rescue.assert_not_called()
-                self.assertEqual((path / "change.txt").read_text(), "do not lose this edit\n")
-                self.assertEqual((cargo / "keep").read_text(), "cached output\n")
-                self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
-                self.assertEqual(build_folders.build_folder_state(path), "free")
+    def test_copy_rescue_failure_preserves_source_and_output_and_frees_the_lock(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            _ = (path / "change.txt").write_text("do not lose this edit\n")
+            _ = (copy.cargo_dir / "keep").write_text("cached output\n")
+        error = git_rescue.RescueError(("git", "update-ref"), "fixture write failure")
+        with mock.patch.object(git_rescue, "rescue", side_effect=error) as rescue:
+            with self.assertRaises(git_rescue.RescueError), self.take_queue_copy():
+                self.fail("reset continued after a failed rescue")
+            rescue.assert_called_once()
+        self.assertEqual((path / "change.txt").read_text(), "do not lose this edit\n")
+        self.assertEqual((path / "target/keep").read_text(), "cached output\n")
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(build_folders.build_folder_state(path), "free")
 
-    def test_a_damaged_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
+    def test_a_damaged_copy_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
         for number, damaged in enumerate((b"damaged index\x00\xff", b"DIRC\x00\x00\x00\xff")):
             with self.subTest(index=damaged):
-                before = set(self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines())
-                with self.take() as slot:
-                    index = Path(self.git(slot.path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
-                    _ = (slot.path / "change.txt").write_text("source edit before reset\n")
-                    _ = (slot.path / "untracked.txt").write_text("untracked source\n")
-                    target = slot.path / "target"
-                    target.mkdir(exist_ok=True)
-                    _ = (target / "keep").write_text("cached build output\n")
+                before = set(self.rescue_refs().splitlines())
+                with self.take_queue_copy() as copy:
+                    index = Path(self.git(copy.path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+                    _ = (copy.path / "change.txt").write_text("source edit before reset\n")
+                    _ = (copy.path / "untracked.txt").write_text("untracked source\n")
+                    _ = (copy.cargo_dir / "keep").write_text("cached build output\n")
                     _ = index.write_bytes(damaged)
-                with self.take() as recovered:
+                with self.take_queue_copy() as recovered:
                     self.assertEqual(self.git(recovered.path, "status", "--porcelain"), "")
                     self.assertEqual((recovered.path / "change.txt").read_text(), "first commit\n")
-                    self.assertEqual((recovered.path / "target/keep").read_text(), "cached build output\n")
-                after = set(self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines())
+                    self.assertEqual((recovered.cargo_dir / "keep").read_text(), "cached build output\n")
+                after = set(self.rescue_refs().splitlines())
                 self.assertEqual(len(after - before), 1)
                 saved, = after - before
                 restored = self.root / f"restored-{number}"
@@ -625,74 +374,26 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                 self.assertEqual(len(backups), 1)
                 self.assertEqual(backups[0].read_bytes(), damaged)
 
-    def test_a_different_common_git_folder_is_refused_without_changing_the_slot(self) -> None:
-        with self.take() as first:
-            path = first.path
-        _ = self.git(self.source, "worktree", "remove", str(path))
-        other = self.root / "other-repository"
-        other.mkdir()
-        _ = self.git(other, "init", "-q", "-b", "trunk")
-        _ = (other / "foreign.txt").write_text("foreign work\n")
-        foreign = commit_repository(other, "foreign")
-        _ = self.git(other, "worktree", "add", "--detach", str(path), foreign)
-
-        with self.assertRaises(build_slots.SlotRepositoryMismatch):
-            with self.take():
-                self.fail("a slot from a different repository was reset")
-
-        self.assertEqual(self.git(path, "rev-parse", "HEAD"), foreign)
-        self.assertEqual((path / "foreign.txt").read_text(), "foreign work\n")
-        self.assertEqual(build_folders.build_folder_state(path), "free")
-
-    def test_lease_records_the_holder_and_release_time_but_does_not_hold_the_slot(self) -> None:
-        with self.take(self.base) as slot:
-            path = slot.path
-            record = self.lease(path)
-            expected: dict[str, object] = {
-                "showrunner": "builds", "unit": "queue", "work": "proof", "purpose": "test",
-                "pid": os.getpid(), "machine": self.machine, "repository": "widget",
-                "slot": 1, "commit": self.base,
-            }
-            for key, value in expected.items():
-                with self.subTest(field=key):
-                    self.assertEqual(record[key], value)
-            self.assertIsInstance(record["start_time"], str)
-            self.assertTrue(record["start_time"])
-            taken_at = datetime.fromisoformat(str(record["last_use"]))
-            self.assertEqual(taken_at.utcoffset(), timedelta(0))
-            self.age_lease(path)
-
-        released_at = datetime.fromisoformat(str(self.lease(path)["last_use"]))
-        self.assertGreaterEqual(released_at, taken_at)
-        self.assertEqual(released_at.utcoffset(), timedelta(0))
-        self.assertEqual(build_folders.build_folder_state(path), "free")
-        with self.take() as next_holder:
-            self.assertEqual(next_holder.path, path)
-
-    def test_take_deletes_oversized_output_after_rescue_and_retains_source_times(self) -> None:
-        with self.take() as slot:
-            path, cargo = slot.path, slot.cargo_dir
-            (path / "target").mkdir()
-            _ = (path / "target/final").write_bytes(b"x" * 256)
-            _ = (cargo / "intermediate").write_bytes(b"y" * 256)
+    def test_copy_size_limit_deletes_output_after_rescue_and_retains_source_times(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            _ = (copy.cargo_dir / "final").write_bytes(b"x" * 256)
             _ = (path / "change.txt").write_text("save this source\n")
             source_stat = (path / "same.txt").stat()
-        _ = write_config_fixture(self.settings,
-                                 f"# whole: 1..\nslots.{self.machine}.widget.max_bytes=64\n")
         output = io.StringIO()
-        with redirect_stdout(output), self.take() as reused:
+        with redirect_stdout(output), self.take_queue_copy() as reused:
+            build_slots.limit_copy_size(reused, 64)
             self.assertEqual(reused.path, path)
-            self.assertFalse((path / "target/final").exists())
-            self.assertFalse((cargo / "intermediate").exists())
-            self.assertTrue(cargo.is_dir())
+            self.assertFalse((reused.cargo_dir / "final").exists())
+            self.assertTrue(reused.cargo_dir.is_dir())
             current = (path / "same.txt").stat()
             self.assertEqual((current.st_ino, current.st_mtime_ns), (source_stat.st_ino, source_stat.st_mtime_ns))
             self.assertEqual((path / "change.txt").read_text(), "first commit\n")
-        refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
+        refs = self.rescue_refs().splitlines()
         self.assertEqual(len(refs), 1)
         self.assertEqual(self.git(self.source, "show", refs[0] + ":change.txt"), "save this source")
         self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertIn("widget-slot1", output.getvalue())
+        self.assertIn(str(path), output.getvalue())
 
     def test_run_gives_the_child_the_cargo_environment_and_lock_and_keeps_its_exit_code(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
@@ -750,20 +451,19 @@ print(child.pid, flush=True)
                 pass
 
     @unittest.skipUnless(sys.platform == "linux", "the Mac path runs with Linux orphan reaping")
-    def test_mac_run_stops_its_background_group_before_it_releases_the_slot(self) -> None:
+    def test_mac_run_stops_its_background_group_before_it_releases_the_copy(self) -> None:
         wrapper = """import os, pathlib, sys
 from unittest import mock
 from scripts.lib import build_folders, build_slots
 from scripts.lib.descendants import adopt_descendants
 adopt_descendants()
-with build_slots.take_slot(pathlib.Path(sys.argv[1]), sys.argv[2], showrunner='builds',
-                           unit='queue', work='proof', purpose='test') as slot:
-    descriptor = build_folders.build_folder_lock_fd(slot.path)
+with build_slots.take_copy(pathlib.Path(sys.argv[1]), sys.argv[2], showrunner='builds',
+                           unit='queue', work='proof', purpose='test') as copy:
     middle = os.fork()
     if middle == 0:
         with mock.patch.object(sys, 'platform', 'darwin'):
-            status = build_folders.run_build_command(sys.argv[3:], path=slot.path,
-                environment={**os.environ, **slot.env}, pass_fds=(descriptor,))
+            status = build_folders.run_build_command(sys.argv[3:], path=copy.path,
+                environment={**os.environ, **copy.env}, pass_fds=copy.pass_fds)
         os._exit(status)
     while True:
         reaped, status = os.wait()
@@ -797,8 +497,8 @@ print(json.dumps({'descendant': child.pid, 'group': os.getpgrp(), 'held': held})
             os.kill(int(report["descendant"]), 0)
         with self.assertRaises(ProcessLookupError):
             send_process_group(int(report["group"]), 0)
-        with self.take() as reused:
-            self.assertEqual(reused.path, self.slot_root / "widget-slot1")
+        with self.take_queue_copy() as reused:
+            self.assertEqual(reused.path, build_folders.copy_path("widget", "queue", 1))
 
     @unittest.skipUnless(sys.platform == "linux", "the test adopts the orphaned Git process")
     def test_git_keeps_the_slot_locked_after_its_caller_dies(self) -> None:

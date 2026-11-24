@@ -20,7 +20,7 @@ from unittest import mock
 from collections.abc import Sequence
 from scripts.mac_test import offload, mac_test, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
 from scripts.lib import test_hang_guard
@@ -36,7 +36,7 @@ class PendingDispatchTests(unittest.TestCase):
                 paths.directory.mkdir()
                 (root / "mac_test.conf").touch()
                 _ = (root / "build_targets.conf").write_text(
-                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE,
                     encoding="utf-8",
                 )
                 owner = process_identity.process_start(os.getpid())
@@ -192,7 +192,7 @@ class PendingDispatchTests(unittest.TestCase):
                                    "MAC_TEST_STATE_DIR": str(root / ".local/state/mac-test")}
                     _ = (root / "build_targets.conf").write_text(
                         "targets=mac,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n")
+                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                     settings = root / ("mac_test.conf" if target == "mac" else "linux_target.conf")
                     for name in ("mac_test.conf", "linux_target.conf"):
                         _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", template="mac_test")
@@ -365,14 +365,8 @@ class OffloadCommandTests(OffloadCommandFixture):
     def test_signal_during_fresh_claim_releases_without_ssh_when_check_would_omit_status(self) -> None:
         self.assert_fresh_claim_signal_releases_without_ssh("missing_status")
 
-    def test_signal_during_takeover_checks_reply_host_and_keeps_claim_when_check_fails(self) -> None:
-        self.assert_takeover_signal_checks_reply_host("ssh_error")
-
-    def test_signal_during_takeover_checks_reply_host_and_keeps_claim_when_leftovers_remain(self) -> None:
-        self.assert_takeover_signal_checks_reply_host("remaining")
-
-    def test_signal_during_takeover_checks_reply_host_and_releases_claim_when_check_is_clean(self) -> None:
-        self.assert_takeover_signal_checks_reply_host("clean")
+    def test_signal_during_takeover_keeps_claim_for_leased_cleanup_without_ssh(self) -> None:
+        self.assert_takeover_signal_keeps_claim_for_leased_cleanup("reply-mac")
 
     def test_signal_during_fresh_claim_from_process_group_preserves_reply_and_releases_without_ssh(self) -> None:
         self.set_leftover_answer("ssh_error")
@@ -392,14 +386,20 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(ssh), 1)
         self.assertEqual(ssh[0]["args"][-2], "previous-mac")
 
+    def test_signal_during_linux_takeover_checks_reply_host_and_releases_claim_when_check_is_clean(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("clean")
+
+    def test_signal_during_linux_takeover_checks_reply_host_and_keeps_claim_when_leftovers_remain(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("remaining")
+
+    def test_signal_during_linux_takeover_checks_reply_host_and_keeps_claim_when_check_fails(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("ssh_error")
+
+    def test_signal_during_linux_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("clean", reply_host="")
+
     def test_signal_during_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
-        output = self.interrupt_held_claim(takeover=True, reply_host="")
-        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim"])
-        self.assert_claim_is_kept("previous-mac")
-        self.assert_leftover_diagnostic(output, "missing_status")
-        self.assertIn("the kept claim's host could not be read", output)
-        self.assertEqual(self.events_for("ssh"), [])
-        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+        self.assert_takeover_signal_keeps_claim_for_leased_cleanup("")
 
     def test_unchanged_copy_sends_its_known_tree_key_beside_the_call_id(self) -> None:
         key = self.commit_sent_tree()
@@ -424,6 +424,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_stable_copy_sends_key()
 
     def test_copy_with_unavailable_before_key_and_known_after_key_sends_no_key(self) -> None:
+        self.remove_tree_key()
         self.assertIsNone(treekey.tree_key(str(self.repository)))
 
         def change() -> None:
@@ -449,6 +450,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_stable_copy_sends_key()
 
     def test_copy_with_both_tree_keys_unavailable_sends_no_key(self) -> None:
+        self.remove_tree_key()
         self.assertIsNone(treekey.tree_key(str(self.repository)))
         result = self.command()
         self.assertEqual(result.returncode, 0, result.stdout)
