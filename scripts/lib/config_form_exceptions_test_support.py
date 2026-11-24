@@ -476,8 +476,6 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "names.test-modules",
             "names.test-nightly",
             "names.toolchain-trial",
-            "owned.ci-default",
-            "owned.showrunner-default",
         )),
         ("buildlog", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "DISK_WALK_HOUR",

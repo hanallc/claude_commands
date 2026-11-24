@@ -9294,6 +9294,14 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertEqual(self.fixture.world.commands, before)
                 if state == "blocked":
                     self.assertIn("Worker blocked: worker is blocked", retained)
+                    marker = "Detached run: fixture"
+                    result = send.deliver_worker_text(row, staff.snapshot(), marker,
+                        sender="detached-runs", timeout=send.delivery_timeout(),
+                        receipt=send.WorkerResultReceipt(marker))
+                    self.assertEqual(result.outcome, "retry", result.detail)
+                    self.assertEqual(result.detail, "worker is blocked")
+                    self.assertEqual(self.fixture.world.commands, before)
+                    self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
                 elif state == "unknown":
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())
