@@ -536,7 +536,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
             if row is not None:
                 observed = worker_panes.observe_worker(parent.id, row, record)
                 if isinstance(observed, worker_panes.OpenWorker) and worker_panes.worker_state(observed) == "busy":
-                    locked = worker_panes.check_worker_lock(row)
+                    locked = worker_panes.check_worker_dispatch_locks(parent.id, row)
                     if isinstance(locked, worker_panes.Kept):
                         print(locked.blocker, file=sys.stderr)
                         return staff_worker.ExitCode.BUSY

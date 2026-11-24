@@ -1,6 +1,7 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -1288,6 +1289,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         for case, role, expected in (("working", "test", worker.ExitCode.BUSY),
                                      ("missing receipt", "implement", worker.ExitCode.BUSY),
                                      ("held lock with receipt", "implement", worker.ExitCode.BUSY),
+                                     ("held name lock with receipt", "implement", worker.ExitCode.BUSY),
                                      ("blocked", "test", worker.ExitCode.BLOCKED)):
             with self.subTest(state=case), ExitStack() as cleanup:
                 world.first_turn_timeout = case in ("working", "missing receipt")
@@ -1306,6 +1308,10 @@ class AssignLauncherTests(HookAssignmentFixture):
                     hold = cleanup.enter_context(worker_panes.worker_lock(self.native.fixture.parent.id,
                                                                           staff.WorkerName.parse("impl")))
                     self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                if case == "held name lock with receipt":
+                    name_lock = staff.record_path().parent / "locks" / f"{self.native.fixture.parent.id}-impl.lock"
+                    name_handle = cleanup.enter_context(name_lock.open("r"))
+                    fcntl.flock(name_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if role == "implement":
                     delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.session_dir))
                     receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id, run=self.session_dir)
@@ -1313,7 +1319,7 @@ class AssignLauncherTests(HookAssignmentFixture):
                                           else worker.DispatchSubmitted)
                 refused = self.launch(role, "--to", "impl")
                 self.assertEqual(refused.returncode, expected, refused.stdout + refused.stderr)
-                if case == "held lock with receipt":
+                if case in ("held lock with receipt", "held name lock with receipt"):
                     self.assertIn("dispatch lock is held", refused.stderr)
                 if case == "blocked":
                     self.assertIn(question, refused.stderr)

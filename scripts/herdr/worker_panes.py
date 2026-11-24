@@ -247,6 +247,10 @@ def _worker_lock_path(key: str) -> Path:
     return staff.record_path().parent / "locks" / f"{key}.lock"
 
 
+def _worker_name_lock_path(parent: StaffId, name: str) -> Path:
+    return _worker_lock_path(f"{parent}-{name}")
+
+
 @contextmanager
 def worker_id_lock(identity: StaffId, *, blocking: bool = False,
                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[None]:
@@ -298,7 +302,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
-        path = _worker_lock_path(f"{parent}-{name.value}")
+        path = _worker_name_lock_path(parent, name.value)
         path.parent.mkdir(parents=True, exist_ok=True)
         creation = operations.enter_context(path.open("a"))
         try:
@@ -866,20 +870,32 @@ class ReleasedWorkerPass(Enum):
 WorkerDispatchState = DispatchHoldsWorker | CompletedWorkerPass | ReleasedWorkerPass
 
 
+def _check_worker_lock_path(path: Path) -> CloseAllowed | Kept:
+    try:
+        with path.open("r") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return Kept("dispatch lock is held")
+    except FileNotFoundError:
+        pass
+    return CloseAllowed()
+
+
 def check_worker_lock(row: staff.StaffRow,
                       lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
-    """Check the worker lock without creating a file."""
-    if not isinstance(lock, WorkerLockHold) or not lock.owns(row):
-        path = _worker_lock_path(row.id)
-        try:
-            with path.open("r") as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return Kept("dispatch lock is held")
-        except FileNotFoundError:
-            pass
-    return CloseAllowed()
+    """Check the fixed-ID lock without creating a file."""
+    if isinstance(lock, WorkerLockHold) and lock.owns(row):
+        return CloseAllowed()
+    return _check_worker_lock_path(_worker_lock_path(row.id))
+
+
+def check_worker_dispatch_locks(parent: StaffId, row: staff.StaffRow) -> CloseAllowed | Kept:
+    """Check the name and fixed-ID locks without creating files."""
+    name_lock = _check_worker_lock_path(_worker_name_lock_path(parent, row.name))
+    if isinstance(name_lock, Kept):
+        return name_lock
+    return check_worker_lock(row)
 
 
 class RunningDetachedWorkers(Protocol):
