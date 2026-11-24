@@ -356,7 +356,7 @@ else:
             self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
             self.assertEqual(build_folders.build_folder_state(slot.path), "held")
             self.assertEqual(list((self.root / "build").glob("*/*/*.lease.json")),
-                             [build_slots.lease_path(slot.path)])
+                             [build_folders.lease_path(slot.path)])
 
     def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")
