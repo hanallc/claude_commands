@@ -2484,7 +2484,10 @@ If the page has no receiver name, the toast says "Sending."
 For an action that saves without a message, the toast says "Saved."
 The toast uses the recipient name shown when the user presses **Send**.
 If a draft can recover an earlier filing, the toast says "Sending."
-The toast appears at the bottom center of the top page. Long names wrap.
+The toast appears at the bottom right of the top window.
+It sits 24 px from the bottom and right edges. At phone widths, the right gutter is 16 px.
+Stacked toasts share the right edge. Long names wrap.
+The stack scrolls when it would extend within 24 px of the top edge.
 The toast uses the console colors.
 The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.

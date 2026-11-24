@@ -380,7 +380,85 @@ HELD_SEND_PROBE = r"""<script>
 </script>"""
 
 
+UNDO_CORNER_PROBE = r"""<script>
+(async () => {
+ const host = window.top.document;
+ const view = host.defaultView;
+ const failures = [];
+ const realFetch = window.fetch.bind(window);
+ window.fetch = async url => String(url).endsWith('/undo')
+  ? Response.json({outcome:'undone'})
+  : Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ const stack = () => host.querySelector('[data-send-undo-stack]');
+ const waitFor = ready => new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (ready()) {
+    observer.disconnect();
+    resolve();
+   }
+  });
+  observer.observe(host.body, {subtree:true,childList:true});
+ });
+ const checkCorner = parent => {
+  const label = parent === host.body ? 'page' : 'modal';
+  const gutter = __GUTTER__;
+  if (stack().parentElement !== parent) failures.push('The toast stack is outside the ' + label + '.');
+  const toasts = [...stack().children];
+  if (toasts[0].offsetWidth === toasts[1].offsetWidth)
+   failures.push('The ' + label + ' stack must show a short and a long toast.');
+  const bounds = stack().getBoundingClientRect();
+  if (bounds.top < 23)
+   failures.push('The ' + label + ' stack must leave a 24 px top inset.');
+  if (Math.abs(view.innerWidth - bounds.right - gutter) > 1 || bounds.left < gutter - 1)
+   failures.push('The ' + label + ' stack must fit inside the side gutters.');
+  const contentRight = bounds.left + stack().clientWidth;
+  for (const toast of toasts) {
+   const box = toast.getBoundingClientRect();
+   if (Math.abs(contentRight - box.right) > 1 || box.left < bounds.left - 1)
+    failures.push('The ' + label + ' toast must align with the right edge of the stack content.');
+  }
+  if (Math.abs(view.innerHeight - bounds.bottom - 24) > 1)
+   failures.push('The ' + label + ' stack must sit 24 px above the bottom.');
+  if (__SHORT__) {
+   stack().scrollTop = stack().scrollHeight;
+   if (stack().scrollTop <= 0 || Math.abs(toasts.at(-1).getBoundingClientRect().bottom - bounds.bottom) > 1)
+    failures.push('The ' + label + ' stack must scroll to the last toast.');
+   stack().scrollTop = 0;
+  }
+ };
+ try {
+  const receivers = [null, 'Name'.repeat(160)];
+  if (__SHORT__) receivers.push(...Array(4).fill('Name'.repeat(160)));
+  const shown = waitFor(() => stack()?.children.length === receivers.length);
+  const sends = receivers.map(receiver => heldFetch('/send', {method:'POST'}, receiver).catch(error => error));
+  await shown;
+  checkCorner(host.body);
+  const dialog = host.createElement('dialog');
+  host.body.append(dialog);
+  const moved = waitFor(() => stack().parentElement === dialog);
+  dialog.showModal();
+  await moved;
+  checkCorner(dialog);
+  for (const button of host.querySelectorAll('[data-send-undo] button')) button.click();
+  await Promise.all(sends);
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await realFetch('/results', {method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+
+
 class HeldSendScriptTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_the_undo_toast_uses_the_bottom_right_corner(self) -> None:
+        script = f"<script>{page_frame.HELD_SEND_SCRIPT}</script>"
+        for width, height, gutter in ((1400, 740, 24), (390, 740, 16), (360, 400, 16)):
+            with self.subTest(width=width, height=height):
+                probe = UNDO_CORNER_PROBE.replace("__GUTTER__", str(gutter)).replace("__SHORT__", json.dumps(height == 400))
+                page = f"<!doctype html><html><head></head><body>{script}{probe}</body></html>"
+                self.assertEqual(firefox_probe_results(page.encode(), window_size=(width, height)), [[]])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_the_undo_toast_fades_and_undo_stops_the_send(self) -> None:
         # The card scripts and the New item dialog can both load the script on one page.

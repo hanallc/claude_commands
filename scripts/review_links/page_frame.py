@@ -865,8 +865,10 @@ document.addEventListener('click',event=>{
 # New item and linked Review callers close their dialogs before the hold and reopen them on Undo or failure.
 # The card and dialog scripts share one definition of heldFetch and SendUndone in each frame.
 HELD_SEND_STYLE = '''
-[data-send-undo-stack]{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;
-display:grid;gap:8px;margin:0;width:max-content;max-width:calc(100vw - 32px)}
+[data-send-undo-stack]{position:fixed;right:24px;bottom:24px;z-index:2147483647;
+display:grid;justify-items:end;gap:8px;margin:0;width:max-content;max-width:calc(100% - 48px);
+max-height:calc(100% - 48px);overflow-y:auto}
+@media (max-width:560px){[data-send-undo-stack]{right:16px;max-width:calc(100% - 32px)}}
 [data-send-undo]{position:relative;display:flex;align-items:center;gap:16px;padding:10px 10px 12px 16px;
 border:1px solid var(--border,#2d3748);border-radius:8px;background:var(--nav,#141b28);color:var(--text,#e4eaf4);
 box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden;min-width:0}
