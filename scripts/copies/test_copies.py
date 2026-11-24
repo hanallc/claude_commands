@@ -23,7 +23,7 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.build_queue import slot_wait
+from scripts.build_queue import first_step, slot_wait
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
@@ -2395,6 +2395,13 @@ with patch.object(subprocess, 'run', pause_clone):
                 path, commit = lines[0].removeprefix("published: ").rsplit(" ", 1)
                 self.assertEqual(commit, self.head)
                 self.assertEqual(Path(path).read_bytes(), b"same artifact")
+
+    def test_run_refuses_a_named_gate_without_a_test_mode_before_admission(self) -> None:
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", "--module", "x"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
+        admit.assert_not_called()
 
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
