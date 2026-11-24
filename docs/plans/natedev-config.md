@@ -36,7 +36,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
   - `scripts/<area>/` — the readers that each phase moves.
   - `commands/` — `tune.md`, `default_models.md`, `build/hand_made.md`.
 - **Key files:**
-  - `scripts/lib/conf.py` — `conf.read(stem)` returns `ConfigRead` (`text`, `number`, `whole`, `words`, `values`, `origin`); limit comments (`_limits` at line 433), host overrides, Git recovery; `CONF_DIR` (line 379); `read_or_repository` (line 366); ignores `[section]` lines (line 402).
+  - `scripts/lib/conf.py` — `conf.read(stem)` returns `ConfigRead` (`text`, `number`, `whole`, `words`, `values`, `origin`, `whole_upper_bound`); limit comments (`_limits` at line 484), host overrides, Git recovery; `CONF_DIR` (`directory`, line 419); `read_or_repository` (line 408); ignores `[section]` lines (line 444).
   - `scripts/lib/conf.sh` — `conf_value <stem> <key>` (line 23); limit checks near lines 58-71.
   - `scripts/lib/conf_reads.py` — `read_text` and `CONF_READ_LOG`.
   - `scripts/lib/live_settings.py` — `write_live(stem, key, value)` (line 97) and the publish path that `/tune` uses; `editable_setting` (line 74) and `check_value_line` (line 69), the one-line value rule of every live write; `config/live_settings.conf` `readers=`.
@@ -536,58 +536,38 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - A test of the offload doc wording: it would compare constants.
 
 ### Phase 12 — AWS and review tool literals to config  · status: done
-**Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** Each `tunable` literal of the AWS and review tool batch is a commented, limit-checked key in `config/`, read at use, with the same value, and its allow list row is gone.
-
-**Spec:**
-
-0. **Names.** The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST). The batch merges with them; nate reviews the names later, and a later change is a rename.
-1. Batch folders: `scripts/aws_target`, `scripts/review_links`, `scripts/style`, `scripts/screen_record`, `scripts/shot_report`, and each folder that no other batch names.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply.
-3. The code reads the key with `conf.read(stem)` at use. Delete the constant.
-4. Values stay the same.
-5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
-7. **Saved Review items.** `read_submission()` reads saved items with the same image count and evidence limits as new submissions, so a lower `MAX_IMAGES` makes a saved two-image item fail to load. Apply the configured limits to new submissions only. Keep saved submissions readable under the limits in effect before this phase. Keep the saved JSON form. In the domain record, use `NoBugPageState` for absent page state in place of `BugPageState | None`.
-   - The same rule covers capture work accepted before a limit drops. `review_submissions.read_attached_page_screenshot()` (line 1849) applies the current image byte cap during restart recovery, and `_with_screenshot()` (line 1905) applies the current image count during attachment. A screenshot or image set that passed intake is never refused later because a limit went down. Keep a bound on each file read; add no number in code (P807 rule 7). Tests: send an item with a pending capture, lower the byte cap and the image count, then restart recovery and attachment both succeed.
-8. **Review request limits.** `scripts/review_links/serve.py` derives `MAX_NEW_ITEM_BODY` at import from three moved constants and uses it before `rfile.read(size)`. `scripts/review_links/review_submissions.py` imports three moved constants for image decoding. The dialog also sends these limits to the browser. Read one Review limit set for each request, and use it for the body size, the parse and the image decode. Cap the derived body size before the read. Render the dialog from the same keys.
-   - **Unusable limits.** `serve.py` catches `ValueError` around the New item parse and answers `Invalid New item JSON.` (line 1687). `conf.Unusable` is a `ValueError`, so a limit fault would look like a bad request. Read the limit set outside that handler. When a limit is unusable, answer 503 with a message to try again, keep the draft in the dialog, and log the key and the diagnostic on the server. Test a valid request with an unusable limit: the reply is 503, the draft stays, and the log names the key.
-9. **References.** Search `docs/` and `scripts/` for each moved name and each changed function. Update current docs, fixtures and test spies. Run every test module with a changed reference.
+- Seventeen keys replace the batch constants, with the same values and bob's working names. `cloud_gate` `gpu_size_trial.nextest_log_tail_bytes=1048576`. `review_links` `new_item.max_words_chars=40000`, `max_images=4`, `max_image_bytes=5242880`, `max_total_image_bytes=12582912`, `max_page_data_bytes=65536`, `max_page_rows=48`, `max_page_sections=16`, `max_page_section_rows=128`, `max_bug_page_state_bytes=524288`, `max_page_url_chars=8192`, and `page_capture.max_active=8`; each has `# whole: 1..<shipped value>`. `screen_record` `recording.max_bytes=500000000` and `retention.max_directory_bytes=2147483648`. `shot_report` `transcripts.parallel_scan_bytes=1000000000`. `style_ledger` `write.lock_attempts=3`. `test_times` `module_cost.output_replay_limit_bytes=1048576`. The batch rows left `scripts/lib/config_form_exceptions.py`.
+- `conf.ConfigRead.whole_upper_bound(key)` returns the upper bound of the key's `# whole:` limit line. It recovers like `value()`: the repository file with no warning, then Git history with one warning. A missing, open or inverted bound raises `conf.Unusable`. `_resolve` wraps `_resolve_setting(key, convert, ...)`; `_range_bounds` is shared with `_limits`.
+- A new Review Send uses the live values, each capped at its upper bound (`new_item_dialog.read_new_item_limits` → `NewItemLimits`, one set per request). Saved items, restart recovery (`read_attached_page_screenshot`), attachment (`_with_screenshot`) and capture recovery (`recover_page_captures`) use the upper bounds, so a lower value never hides accepted work. `NoBugPageState` replaces `BugPageState | None`.
+- `serve.py` reads the limit set before the New item parse. An unusable limit answers 503 with a retry message, keeps the draft and logs the key. The request read is capped at `body_read_bytes` (upper bounds); `check_live_body_size` refuses a new request over `body_bytes` (live) with 400 "Invalid New item request size." Both come from `_body_budget`. `ListDraftSend.check_first_send` runs the live check before the first List filing, so a matching saved retry stays exact.
+- A deferred capture whose pasted images already fill `new_item.max_images` is refused at Send. A new deferred Send reserves against the live `page_capture.max_active` (`PageCaptures.start/reserve(..., limit=)`).
+- The console unavailable view catches `conf.Unusable` from the dialog, logs `review-links New item limits: <error>` and omits the owner controls.
+- `config/build_admission.conf` has a blank line between blocks, and `build_hold.py` `RELEASE_NOTICE_RUN_LIMIT` is an `ExternalLiteral` row (argv 128 KiB).
 
 **Files:**
-- `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
-- `scripts/**/*.py` — the source files of the batch rows, and their tests
-- `config/*.conf` — the stems that get keys
-- `scripts/review_links/review_submissions.py`, `scripts/review_links/test_serve.py`, `scripts/aws_target/test_gpu_size_trial.py`
-- `docs/as-built/screen-record.md`, `docs/as-built/style-showrunner.md` — name moved constants
+- `config/cloud_gate.conf`, `config/review_links.conf`, `config/screen_record.conf`, `config/shot_report.conf`, `config/style_ledger.conf`, `config/test_times.conf`, `config/README.md` — the keys
+- `scripts/lib/conf.py` — `whole_upper_bound`, `_resolve_setting`, `_range_bounds`
+- `scripts/review_links/new_item_dialog.py` — `NewItemLimits`, `read_new_item_limits`, `_body_budget`, `read_stored_image_byte_limit`, `NoBugPageState`
+- `scripts/review_links/serve.py`, `scripts/review_links/review_submissions.py`, `scripts/review_links/console.py`, `scripts/review_links/review_page.py` — the live and upper-bound reads, the 503 and the body checks
+- `scripts/aws_target/gpu_size_trial.py`, `scripts/screen_record/screen_record.py`, `scripts/shot_report/transcripts.py`, `scripts/style/style_ledger.py`, `scripts/test_times/module_cost.py` — read at use
+- `scripts/lib/config_form_exceptions.py` — batch rows removed; `RELEASE_NOTICE_RUN_LIMIT` row
+- `docs/as-built/review-links.md`, `docs/as-built/screen-record.md`, `docs/as-built/style-showrunner.md`, `commands/screen_record.md` — the keys and the live and upper-bound rule
+- `scripts/lib/test_conf.py`, `scripts/review_links/test_serve.py`, `scripts/review_links/test_console.py`, `scripts/review_links/test_review_submissions.py`, `scripts/review_links/test_new_item_dialog.py`, `scripts/review_links/test_list_page.py`, `scripts/review_links/test_new_item.py`, `scripts/aws_target/test_gpu_size_trial.py`, `scripts/aws_target/test_aws_trial.py`, `scripts/aws_target/fixtures/cloud_gate.conf`, `scripts/screen_record/test_screen_record.py`, `scripts/shot_report/test_transcripts.py`, `scripts/shot_report/test_shot_report.py`, `scripts/style/test_style_ledger_tickets.py`, `scripts/style/ledger_test_support.py`, `scripts/test_times/test_module_cost.py`, `scripts/test_times/test_coverage_overlap.py`, `scripts/production/test_tidy_wrapped.py` — `CONF_DIR` fixtures, recovery rows and limit-drop cases
 
-**Workers:** 2 writers — split by folder.
-- `impl` — `scripts/aws_target`, `scripts/review_links` and their stems (`review_submissions.py`, `test_serve.py` and `test_gpu_size_trial.py` included); hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
-- `test` opens as impl — `scripts/style`, `scripts/screen_record`, `scripts/shot_report`, the other folders of the batch, their stems, `docs/as-built/screen-record.md` and `docs/as-built/style-showrunner.md`
+**Binds later work:** `ConfigRead.whole_upper_bound(key)` is the reader for a limit that guards saved or accepted work; a new request reads the live value.
 
-**State:** none
+**Gotchas:**
+- The limit line is the code contract for saved Review items: a lower upper bound on a `new_item.*` line can make a saved item fail to open.
+- A New item body has two budgets: the live one for a new Send and the upper-bound read cap for a saved retry.
 
-**Constraints from prior phases:**
-- Phase 3 wrote the literal inventory; each `tunable` row of batch "AWS and review tool literals to config" holds the proposed stem, key, limit line.
-- The batch rows sit in `scripts/aws_target/gpu_size_trial.py`, `scripts/review_links/new_item_dialog.py` (10 rows), `scripts/review_links/serve.py`, `scripts/screen_record/screen_record.py` (2), `scripts/shot_report/transcripts.py`, `scripts/style/style_ledger.py` and `scripts/test_times/module_cost.py`. No row is in `scripts/aws_target/config.py`, which Phase 5 changes for `AWS_TARGET_CONFIG`; this phase does not wait for Phase 5.
-- Phase 4: resolve each config path at use; a module-level path constant goes stale under a test's `CONF_DIR`.
-- Phase 10: a test spy on a changed function and current docs that named moved constants broke after the move. A size key gets an upper bound when the code passes it to a read or a slice.
-- Phase 11: a key added to an existing stem must be in every literal test fixture of that stem. `scripts/production/fixture_conf_keys.py` finds the fixtures that lack it; a test outside the batch folders can need the key.
-- Phase 11: a read in a hook, alert, request handler, `finally` block or batch loop handles `conf.Unusable` at use. It falls back to a step that needs no value, or it refuses with a logged reason. A raise must not hide other results. Forms: `context_usage.latest_reading`, `pushover.post_message`.
-
-**Acceptance gate:**
-- Each changed module's tests pass, and each test module with a changed reference passes.
-- `test_config_form.py` passes, and the allow list has no `tunable` row of this batch.
-- `scripts/production/fixture_conf_keys.py --repo <worktree> --base <phase start> --tip <candidate commit>` reports 0 missing keys. Each stem owner reads the fixtures it reports as not checked.
-- A saved two-image Review item opens after the intake image limit drops to one. Restart recovery and attachment of a pending capture succeed after the byte cap and the image count drop.
-- A valid New item request with an unusable limit gets a 503, keeps the draft, and the server log names the key.
-- An oversized request is refused before its body is read. `test_serve.py` keeps its body limit, total image limit and URL slice cases.
-- A search of `docs/` and `scripts/` finds no moved constant name outside this plan.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:**
+- Accepting a ready screenshot over a lowered live byte limit: a Send is a new submission.
+- A flat page data byte check in `read_evidence`: the gap was present before this phase; an add-on after the current plan.
+- A browser test of the 503 draft: the existing failNextSend case covers draft retention.
+- Wait limits (screen recording duration, Review capture expiry, preview wait, attachment retry) stay in code for item 277.
 
 ### Phase 13 — Production and direct literals to config  · status: todo
 **Depends on:** Phase 3
@@ -639,6 +619,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 11: a key added to an existing stem must be in every literal test fixture of that stem. `scripts/production/fixture_conf_keys.py` finds the fixtures that lack it; a test outside the batch folders can need the key.
 - Phase 11: a read in a hook, alert, notice, `finally` block or batch loop handles `conf.Unusable` at use. It falls back to a step that needs no value, or it refuses with a logged reason. A raise must not hide other results. Forms: `context_usage.latest_reading`, `pushover.post_message`.
 - Phase 11: the controller's `GuestSettings` (`scripts/build_targets/mac_linux.py` `read_settings`) owns `ssh.connect_attempts`; the candidate commit owns `gate.conf`. `runner_commit` (`mac_linux.py:345`) refuses an uncommitted change under `scripts/`, so the hand-made Mac Linux guest tests run only on a committed tree.
+- Phase 12: a limit that guards saved or accepted work reads `conf.read(stem).whole_upper_bound(key)`, the upper bound of the key's `# whole:` limit line, so a lower value never makes saved work fail. A new request reads the live value. Form: `scripts/review_links/new_item_dialog.py` `read_new_item_limits`.
 
 **Acceptance gate:**
 - Each changed module's tests pass, and each test module with a changed reference passes.
