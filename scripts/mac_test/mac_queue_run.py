@@ -27,6 +27,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import TextIO, TypedDict, cast
@@ -269,25 +270,24 @@ def shell_session() -> OwningSession | NoOwningSession:
     return OwningSession(session) if session else NoOwningSession()
 
 
-def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
+def smoke_session(placement: MacPlacement, command: list[str], cookie: str,
+                  ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
     """Run the numbered copy with the SSH input open."""
-    work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}"
-    wrapper = work + r"; printf '\nmac_exit=%s\n' $?"
+    work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} MAC_SMOKE_COOKIE={cookie} {shlex.join(command)}"
     process = ssh.enter_context(subprocess.Popen(
-        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -c " + shlex.quote(wrapper)],
+        ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -c " + shlex.quote(work)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
     _ = ssh.callback(stop_command, process)
     return process
 
 
-def read_smoke_status(process: subprocess.Popen[str]) -> tuple[str, int] | None:
+def read_smoke_completion(process: subprocess.Popen[str], cookie: str) -> bool:
     assert process.stdout is not None
     for line in cast(TextIO, process.stdout):
-        name, separator, code = line.rstrip("\n").partition("=")
-        if separator and name in ("mac_smoke_complete", "mac_exit") and code.isascii() and code.isdecimal():
-            return name, int(code)
+        if line == f"mac_smoke_complete={cookie}\n":
+            return True
         print(line, end="", flush=True)
-    return None
+    return False
 
 
 def run_smoke_work(work: str, cleanup: str) -> int:
@@ -297,14 +297,19 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     incoming = sys.stdin.fileno()
     if select.select([incoming], [], [], 0)[0]:
         return 1
+    environment = dict(os.environ)
+    cookie = environment.pop("MAC_SMOKE_COOKIE")
     checkout = Path.cwd()
     keep_file = Path(os.environ[COPY_KEEP_ENV])
     _ = keep_file.write_text("Mac smoke checkout clearance is unconfirmed.\n")
+    descriptor, token = tempfile.mkstemp(prefix=".mac-smoke-launch-", dir=checkout)
+    os.close(descriptor)
+    environment["MAC_SMOKE_LAUNCH_TOKEN"] = token
     home = Path.home()
     os.chdir(home)
     locks = tuple(int(number) for number in os.environ.get("COPIES_COMMAND_LEASE_FDS", "").split(",") if number)
     group = subprocess.Popen(["/bin/zsh", "-c", work], cwd=checkout, start_new_session=True,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, pass_fds=locks)
+                             env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, pass_fds=locks)
     assert group.stdout is not None
     output = group.stdout.fileno()
     disconnected = False
@@ -326,14 +331,15 @@ def run_smoke_work(work: str, cleanup: str) -> int:
                 process_group.send_process_group(group.pid, signal.SIGKILL)
             _ = group.wait()
         _ = group.stdout.close()
-        cleared = subprocess.run(["/bin/zsh", "-c", cleanup, "cleanup-copy", str(checkout)], cwd=home)
+        cleared = subprocess.run(["/bin/zsh", "-c", cleanup, "cleanup-copy", str(checkout)], cwd=home,
+                                 env=environment)
     if disconnected:
         return 1
     status = group.wait()
     if status < 0:
         status = 128 - status
     status = status or (cleared.returncode if cleared.returncode >= 0 else 128 - cleared.returncode)
-    print(f"\nmac_smoke_complete={status}", flush=True)
+    print(f"\nmac_smoke_complete={cookie}", flush=True)
     _ = sys.stdin.read()
     return status
 
@@ -474,13 +480,13 @@ def run_attempt(
                         if args.owned_close and not on_close:
                             raise ValueError("the run needs a close hook")
                         if mac_run:
-                            smoke = smoke_session(placement, command, ssh)
+                            cookie = uuid.uuid4().hex
+                            smoke = smoke_session(placement, command, cookie, ssh)
                             remote.state = RemoteState.LIVE
-                            if (reported := read_smoke_status(smoke)) is not None:
-                                name, status = reported
-                                smoke_complete = name == "mac_smoke_complete"
-                                if not smoke_complete:
-                                    remote.state = RemoteState.EXITED
+                            smoke_complete = read_smoke_completion(smoke, cookie)
+                            status = 0 if smoke_complete else smoke.wait()
+                            if not smoke_complete and 0 <= status < 255:
+                                remote.state = RemoteState.EXITED
                         else:
                             status = stream_remote(remote_command(placement, args.cwd, command, on_close,
                                                                   owned_close=args.owned_close), remote, ssh)
@@ -513,18 +519,20 @@ def run_attempt(
                     safe = True
                     (directory / "run.json").unlink()
             if smoke is not None:
-                assert smoke.stdin is not None
+                assert smoke.stdin is not None and smoke.stdout is not None
                 try:
                     smoke.stdin.close()
-                    if remote.state is RemoteState.EXITED:
-                        safe = True
-                    elif (reported := read_smoke_status(smoke)) is not None and reported[0] == "mac_exit":
+                    for line in cast(TextIO, smoke.stdout):
+                        print(line, end="", flush=True)
+                    # SSH sends the exit status separately from the log.
+                    ssh_status = smoke.wait()
+                    if 0 <= ssh_status < 255:
                         remote.state = RemoteState.EXITED
-                        status = status or reported[1]
+                        status = ssh_status or status
                         safe = True
                     else:
                         print("mac queue: the Mac returned no exit status", file=sys.stderr)
-                        status = status or 255
+                        status = 255
                         safe = False
                 except (OSError, ValueError) as error:
                     print(f"mac queue: the Mac smoke session did not finish: {error}", file=sys.stderr)

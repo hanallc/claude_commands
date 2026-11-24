@@ -317,8 +317,7 @@ TMPDIR cleanup at reboot removes checkouts left by killed gate processes.
 
 `copies.py` creates and refreshes mirrors for Mac, Linux, and AWS targets.
 `offload.py` requests a mirror through this API.
-`mac_run.sh` creates and registers its test clone through the same implementation.
-Neither caller has a copy-creation exception.
+`mac_run.sh` requests a numbered copy on the Mac through `copies.py run`.
 
 `remote_lease_path(mirror)` names the lease beside the mirror's registry record.
 The claim service reads `/proc/locks` once and reports held mirrors by host, path, and session.
@@ -370,11 +369,10 @@ Mac claims still use one slot.
 Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 
-After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.
-It removes the Mac's `localhost` record before the natedev record.
+`mac_run.sh` clears the numbered copy's keep file only after `stop-checkout` confirms the copy is clear.
+An old smoke run with `argv.json.state` keeps its recovery record for scratch cleanup.
 `unregister-remote` accepts only `--host` and `--path`.
 `mirror-remove` accepts `--host`; receive and use accept the command arguments.
-A failed clone cleanup keeps both records.
 A marked mirror probe starts no remote Python and skips `mirror_local_path`.
 An unmarked probe keeps the existing path check and metadata creation.
 
