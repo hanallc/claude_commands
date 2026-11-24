@@ -619,20 +619,22 @@ def record_publication_changes(production: ProductionDocument, *, report_unchang
         checkpoint_gate.report("change review", "failed", failure)
 
 
-def merge_paths(checkout: Path, base: str, tip: str) -> tuple[str, ...]:
+def merge_paths(checkout: Path, base: str, tip: str, *, include_rename_sources: bool = False) -> tuple[str, ...]:
     """The paths a merge of `tip` into `base` changes. A three-dot diff picks one merge base, so after a
     criss-cross merge it also lists paths `base` already holds; the merged tree does not. A conflicted
     merge still writes a tree, with the conflicted paths in it, and the conflicts step holds that merge."""
     tree = git(checkout, "merge-tree", "--write-tree", base, tip)
     if tree.returncode not in (0, 1):
         _ = good(tree, "scope")
-    output = good(git(checkout, "diff", "--name-only", base, tree.stdout.split("\n", 1)[0].strip()), "scope")
+    flags = ("--no-renames",) if include_rename_sources else ()
+    output = good(git(checkout, "diff", "--name-only", *flags, base, tree.stdout.split("\n", 1)[0].strip()), "scope")
     return tuple(line for line in output.splitlines() if line)
 
 
 def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
     """The paths the checkpoint changes from `base`, by default the merge branch's tip."""
-    return merge_paths(request.production.checkout, base or request.production.merge_branch, request.commit)
+    return merge_paths(request.production.checkout, base or request.production.merge_branch, request.commit,
+                       include_rename_sources=isinstance(request.kind, AsBuiltCommit))
 
 
 def _origin_merge_refs(request: MergeRequest) -> list[str]:
@@ -665,20 +667,43 @@ def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...
     return tuple(path for path in paths if path in own)
 
 
+def _as_built_folder(folder: PurePath) -> bool:
+    return folder.parts == ("docs", "as-built") or (
+        len(folder.parts) == 3 and folder.parts[0] == "docs" and folder.parts[2] == "as-built")
+
+
 def checkpoint_plan(request: MergeRequest) -> Path:
-    """Use a closing item's subject slug or retain the configured plan."""
+    """Use the deleted plan, the subject slug, or the configured plan."""
     plan = request.unit.plan
     configured_path = (plan if isinstance(plan, Path) else
                        Path("standby" if isinstance(plan, unit_config.StandbyPlan) else "permanent"))
     if isinstance(request.kind, CodeCheckpoint):
         return configured_path
-    subject = good(git(request.production.checkout, "show", "-s", "--format=%s", request.commit), "scope")
+    checkout = request.production.checkout
+    as_built = isinstance(request.kind, AsBuiltCommit)
+    if as_built:
+        commit, _, subject = good(git(checkout, "log", "--first-parent", "--no-merges", "-1",
+                                     "--format=%H%x00%s", request.commit), "scope").partition("\0")
+    else:
+        subject = good(git(checkout, "show", "-s", "--format=%s", request.commit), "scope")
+        commit = request.commit
     pattern = (r"shrink\(([^()/\\]+)\): phase \S+ — .+" if isinstance(request.kind, ShrinkCommit)
                else r"docs\(([^()/\\]+)\): as-built")
     match = re.fullmatch(pattern, subject)
-    if match and (isinstance(request.kind, AsBuiltCommit) or not isinstance(plan, Path)):
-        return Path("docs/plans") / (match[1] + ".md")
-    return configured_path.with_name(match[1] + ".md") if match else configured_path
+    if not match:
+        return configured_path
+    name = match[1] + ".md"
+    if not isinstance(plan, Path):
+        return Path("docs/plans") / name
+    folder = configured_path.parent
+    if as_built and _as_built_folder(folder):
+        folder = folder.parent if len(folder.parts) == 3 else Path("docs/plans")
+    elif as_built and configured_path.name != name:
+        deleted = good(git(checkout, "diff-tree", "--no-commit-id", "--no-renames", "--diff-filter=D",
+                           "--name-only", "-r", "-z", commit), "scope")
+        if configured_path.suffix == ".md" and configured_path.as_posix() in deleted.split("\0"):
+            return configured_path
+    return folder / name
 
 
 def _shrink_leaves_main_unchanged(request: MergeRequest) -> bool:
@@ -715,10 +740,10 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
         if unexpected or plan not in paths:
             plan_exists = bool(good(git(request.production.checkout, "ls-tree", "--name-only",
                                         request.production.merge_branch, "--", plan), "scope"))
-            if plan_exists or unexpected or any(PurePosixPath(path).parent != PurePosixPath("docs/as-built")
-                                                for path in paths):
+            if plan_exists or unexpected or any(not _as_built_folder(PurePosixPath(path).parent) for path in paths):
                 rule = (f"an as-built commit carries only docs and must change or delete {plan}; " if plan_exists
-                        else f"an as-built commit without {plan} on the merge branch allows only docs/as-built/*.md; ")
+                        else f"an as-built commit without {plan} on the merge branch allows only "
+                        + "docs/as-built/*.md or docs/<crate>/as-built/*.md; ")
                 raise checkpoint_gate.Stop("scope", "held", rule
                            + f"got {', '.join(paths)}",
                            "commit only the as-built docs" + (" and the plan's deletion" if plan_exists else "")
@@ -2067,6 +2092,7 @@ class BatchStopNotice(NamedTuple):
     request: MergeRequest
     detail: str
     message: str
+    result_status: tuple[str, str] | None = None
 
 
 class UnknownRowCommands(NamedTuple):
@@ -2125,24 +2151,33 @@ def run_batch_tests(reference: MergeRequest, paths: tuple[str, ...],
 
 def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNotice],
                       rollback: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT, *,
+                      retry_rows: tuple[MergeRequest, ...] = (),
                       record_results: bool = True) -> int:
     """Attempt rollback, send all notices, and record the results."""
     rollback_warnings: list[str] = []
+    rows: list[BatchStopNotice] = []
     if isinstance(rollback, ResetBatchCheckout) and not isinstance(stop, TestedTipMoved):
         try:
             reset_batch(rollback, rollback_warnings)
         except (checkpoint_gate.Stop, OSError, ValueError) as error:
             rollback_warnings.insert(0, f"rollback failed: {error}")
+        else:
+            detail = "The batch restored its starting tip. This row will run again when you resend the batch."
+            for request in retry_rows:
+                label = f"phase {request.phase} ({request.commit[:12]})"
+                rows.append(BatchStopNotice(request, detail, f"{label}: {detail}", ("batch", "retry")))
 
-    rows = tuple(notices)
+    rows.extend(notices)
     checkpoint_gate.report(stop.step, stop.state, stop.detail.replace("\n", "; "))
-    for request, _, message in rows:
-        print(f"send {request.unit.name}: {message}", flush=True)
+    for notice in rows:
+        print(f"send {notice.request.unit.name}: {notice.message}", flush=True)
 
     record_errors: list[str] = []
     if record_results:
-        for request, detail, _ in rows:
-            if error := land_result_error(request, landed=False, step=stop.step, state=stop.state, detail=detail):
+        for notice in rows:
+            request = notice.request
+            step, state = notice.result_status or (stop.step, stop.state)
+            if error := land_result_error(request, landed=False, step=step, state=state, detail=notice.detail):
                 record_errors.append(f"{request.unit.name} phase {request.phase}: {error}")
     for warning in rollback_warnings:
         checkpoint_gate.report("batch", "warning", warning)
@@ -2157,6 +2192,8 @@ def batch_stop_notices(requests: tuple[MergeRequest, ...], stop: checkpoint_gate
         yield from stop.notices
         return
     for index, request in enumerate(requests):
+        if held_at is not None and index < held_at:
+            continue
         label = f"phase {request.phase} ({request.commit[:12]})"
         detail = stop.detail
         if held_at is not None and index > held_at:
@@ -2254,7 +2291,9 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], log: Path,
             "run", "failed", str(error), "the showrunner will inspect the failed command")
         rollback = KEEP_BATCH_CHECKOUT if publication_started else batch_checkout
         held_at = len(items) if stop.state == "held" and len(items) < len(requests) else None
-        return finish_batch_stop(stop, batch_stop_notices(requests, stop, held_at=held_at), rollback)
+        retry_rows = requests[:held_at] if held_at is not None else ()
+        return finish_batch_stop(stop, batch_stop_notices(requests, stop, held_at=held_at), rollback,
+                                 retry_rows=retry_rows)
 
 
 def checkpoint_completed(request: MergeRequest, upstream: str) -> bool:
@@ -2324,7 +2363,12 @@ def resume_merged_items(record: BatchResumeRecord) -> tuple[tuple[MergeRequest, 
                 record.retire()
             return (), status
         except checkpoint_gate.Stop as error:
-            return (), finish_batch_stop(error, batch_stop_notices(pending_rows, error), rollback)
+            if error.step == "ancestry" and error.state == "held":
+                notices = (batch_stop_notices(pending_rows, error, held_at=pending_rows.index(request))
+                           if request in pending_rows else ())
+            else:
+                notices = batch_stop_notices(pending_rows, error)
+            return (), finish_batch_stop(error, notices, rollback)
         if resumed:
             status = resumed
             failed[request.unit.staff_id] = request

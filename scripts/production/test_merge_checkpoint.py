@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.lint.memory_test_support import copy_config_file_fixture
-from scripts.production import checkpoint_gate
+from scripts.production import checkpoint_gate, land_runs
 
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
@@ -274,6 +274,160 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     self.assertIn("docs/as-built/alpha.md", tree)
                     self.assertNotIn("docs/plans/alpha.md", tree)
                     self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
+
+    def test_as_built_scope_finds_the_deleted_crate_plan(self) -> None:
+        plan = "docs/cargo-tile/alpha.md"
+        as_built = "docs/cargo-tile/as-built/alpha.md"
+        self.write(self.unit, ".unit.toml", f'plan = "{plan}"\nresponsibilities = []\n')
+        shrink = self.checkpoint(plan, "Tile plan\n", subject="shrink(alpha): phase 2 — close the plan")
+        landed = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(landed.process.returncode, 0, landed.process.stdout + landed.process.stderr)
+        _ = self.git("rm", plan, cwd=self.unit)
+        closing = self.checkpoint(as_built, "Tile plan\n", subject="docs(alpha): as-built")
+        self.write(self.unit, ".unit.toml", f'plan = "{as_built}"\nresponsibilities = []\n')
+
+        result = self.run_checkpoint(closing, "--as-built", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertFalse((self.checkout / plan).exists())
+        self.assertEqual((self.checkout / as_built).read_text(), "Tile plan\n")
+
+    def test_as_built_scope_accepts_crate_docs_and_holds_other_docs_without_a_plan(self) -> None:
+        as_built = "docs/cargo-tile/as-built/alpha.md"
+        closing = self.checkpoint(as_built, "Tile as built\n", subject="docs(alpha): as-built")
+
+        result = self.run_checkpoint(closing, "--as-built", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertEqual((self.checkout / as_built).read_text(), "Tile as built\n")
+        outside = "docs/cargo-tile/nested/as-built/alpha.md"
+        closing = self.checkpoint(outside, "Outside the as-built folder\n", subject="docs(alpha): as-built")
+        result = self.run_checkpoint(closing, "--as-built", review=False)
+        self.assert_stopped_before_merge(result, "held", outside)
+
+    def test_as_built_scope_rejects_a_deleted_document_with_the_plan_name(self) -> None:
+        unrelated = "docs/unrelated/alpha.md"
+        code = self.checkpoint(unrelated, "Unrelated document\n")
+        landed = self.run_checkpoint(code)
+        self.assertEqual(landed.process.returncode, 0, landed.process.stdout + landed.process.stderr)
+        _ = self.git("rm", unrelated, cwd=self.unit)
+        closing = self.checkpoint("docs/other.md", "Outside the as-built folder\n", subject="docs(alpha): as-built")
+
+        result = self.run_checkpoint(closing, "--as-built", review=False)
+
+        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
+        self.assertIn("scope: held", result.process.stdout)
+        self.assertIn(unrelated, result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
+
+    def test_as_built_scope_requires_the_existing_crate_plan(self) -> None:
+        plan = "docs/cargo-tile/alpha.md"
+        as_built = "docs/cargo-tile/as-built/alpha.md"
+        self.write(self.unit, ".unit.toml", f'plan = "{plan}"\nresponsibilities = []\n')
+        shrink = self.checkpoint(plan, "Tile plan\n", subject="shrink(alpha): phase 2 — close the plan")
+        landed = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(landed.process.returncode, 0, landed.process.stdout + landed.process.stderr)
+        closing = self.checkpoint(as_built, "Tile as built\n", subject="docs(alpha): as-built")
+        self.write(self.unit, ".unit.toml", f'plan = "{as_built}"\nresponsibilities = []\n')
+
+        result = self.run_checkpoint(closing, "--as-built", review=False)
+
+        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
+        self.assert_stopped_before_merge(result, "held", f"must change or delete {plan}")
+
+    def test_resumed_main_conflict_keeps_the_batch_notice_after_tests(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        start = self.git("rev-parse", "HEAD")
+        first = self.checkpoint()
+        second = self.checkpoint("src/beta.txt", "Batch change\n")
+        batch = self.state / "batch.txt"
+        _ = batch.write_text("\n".join(shlex.join(("alpha", str(phase), commit, "--started", STARTED,
+                                                  "--scratch", str(self.state), "--delivers", DELIVERS,
+                                                  "--review-trial", TRIAL))
+                                       for phase, commit in ((2, first), (3, second))) + "\n", encoding="utf-8")
+        args = ["--production", "example", "--batch", str(batch)]
+        with (mock.patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.invoke(args)
+        _ = self.push_main_change("src/beta.txt", "Main change\n")
+        _ = self.git("update-ref", "refs/heads/main", start, cwd=self.origin)
+        self.executable(self.bin / "checkpoint-test", STUB + f'''
+import subprocess
+subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "origin", "main"],
+               check=True, timeout=TEST_HANG_GUARD_SECS)
+''')
+
+        result = self.invoke(args)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("batch: resume", result.stdout)
+        self.assertEqual(self.events("checkpoint-test"), [[]])
+        notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+        self.assertEqual(len(notices), 2, result.stdout)
+        for notice in notices:
+            self.assertIn("origin/main conflicts: src/beta.txt", notice)
+
+    def test_a_held_as_built_row_preserves_earlier_batch_results(self) -> None:
+        self.env["GATE_STATE_DIR"] = str(self.state / "gate")
+        checkpoint = self.checkpoint()
+        landed = self.run_checkpoint(checkpoint)
+        self.assertEqual(landed.process.returncode, 0, landed.process.stdout + landed.process.stderr)
+        shrink = self.checkpoint("docs/plans/alpha.md", "plan\n", subject="shrink(alpha): phase 2 — close the plan")
+        landed = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(landed.process.returncode, 0, landed.process.stdout + landed.process.stderr)
+        published = self.git("rev-parse", "production", cwd=self.origin)
+        for commit in (checkpoint, shrink):
+            self.assertEqual(self.git("merge-base", commit, published), commit)
+        closing = self.checkpoint("docs/other.md", "Outside the as-built folder\n", subject="docs(alpha): as-built")
+        batch = self.state / "batch.txt"
+        rows = [(checkpoint, ("--delivers", DELIVERS, "--review-trial", TRIAL)),
+                (shrink, ("--shrink",)), (closing, ("--as-built",))]
+        _ = batch.write_text("\n".join(shlex.join(("alpha", "2", commit, "--started", STARTED,
+                                                  "--scratch", str(self.state), *flags))
+                                       for commit, flags in rows) + "\n", encoding="utf-8")
+        result = self.invoke(["--production", "example", "--batch", str(batch)])
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("scope: held", result.stdout)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+        with mock.patch.dict(os.environ, self.env):
+            after = land_runs.last_results()
+        for commit in (checkpoint, shrink):
+            self.assertTrue(after[commit]["landed"], result.stdout)
+        self.assertEqual(after[closing]["state"], "held")
+        self.assertIn("docs/other.md", after[closing]["detail"])
+
+    def test_a_held_as_built_row_records_retry_for_rolled_back_merges(self) -> None:
+        self.env["GATE_STATE_DIR"] = str(self.state / "gate")
+        start = self.git("rev-parse", "HEAD")
+        checkpoint = self.checkpoint()
+        shrink = self.checkpoint("docs/plans/alpha.md", "plan\n", subject="shrink(alpha): phase 2 — close the plan")
+        closing = self.checkpoint("docs/other.md", "Outside the as-built folder\n", subject="docs(alpha): as-built")
+        batch = self.state / "batch.txt"
+        rows = [(checkpoint, ("--delivers", DELIVERS, "--review-trial", TRIAL)),
+                (shrink, ("--shrink",)), (closing, ("--as-built",))]
+        _ = batch.write_text("\n".join(shlex.join(("alpha", "2", commit, "--started", STARTED,
+                                                  "--scratch", str(self.state), *flags))
+                                       for commit, flags in rows) + "\n", encoding="utf-8")
+
+        result = self.invoke(["--production", "example", "--batch", str(batch)])
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertEqual(result.stdout.count("merge: ok — merged as"), 2, result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+        self.assertEqual(self.events("checkpoint-test"), [])
+        with mock.patch.dict(os.environ, self.env):
+            results = land_runs.last_results()
+        for commit in (checkpoint, shrink):
+            self.assertIn(commit, results, result.stdout)
+            self.assertFalse(results[commit]["landed"])
+            self.assertEqual(results[commit]["state"], "retry")
+            self.assertIn("will run again", results[commit]["detail"])
+            self.assertIn(f"phase 2 ({commit[:12]}): {results[commit]['detail']}", result.stdout)
+        self.assertEqual(results[closing]["state"], "held")
+        self.assertIn("docs/other.md", results[closing]["detail"])
 
     def duplicate_shrink_on_unit_branch(self) -> str:
         plan = "docs/plans/alpha.md"

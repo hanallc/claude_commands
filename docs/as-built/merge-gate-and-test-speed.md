@@ -1009,8 +1009,11 @@ Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
 Each merge retains its own review ownership and completion record.
 
-A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
-When a row holds during its checks, each later notice names the held row and says that the later row did not run.
+A hold, failure, or cancellation ends a fresh batch.
+When a row holds during its checks, only that row receives the hold reason.
+Each later notice says that the row did not run and identifies the held row.
+The hold preserves the results for earlier rows that reached origin.
+If rollback succeeds, the batch records a retry for each earlier row whose merge it undid.
 Before each gate run, record the tested tip and each row's selected commands in memory.
 For attribution, compare a merged row with its merge's first parent.
 Compare an unmerged row with the destination tip before preparation.
@@ -1036,8 +1039,14 @@ Each run starts a fresh shared test log. Tests after main moves append to the sa
 Publication rollback checks the live origin before it restores the tip.
 It also removes unpublished formatter commits.
 
-Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
-Subjects without the closing-item format retain the configured plan.
+Shrink items use their commit subject's plan slug within the configured plan folder.
+For an as-built item, read the subject of the latest non-merge commit on the first-parent history.
+If the subject gives a slug, use the exact configured Markdown plan path if that commit deletes it outside an as-built folder.
+Otherwise use `<slug>.md` in the configured plan folder.
+If the configured path is in `docs/<crate>/as-built/`, look in `docs/<crate>/`.
+If the configured path is in `docs/as-built/` or the unit has no plan file, look in `docs/plans/`.
+If the subject has no closing-item format, keep the configured plan.
+If the plan is absent on the merge branch, the commit can change only `docs/as-built/*.md` or `docs/<crate>/as-built/*.md`.
 Ancestry uses each pending commit's first parent as the test merge base.
 It skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
 Ancestry holds on a root commit, a tree change, a conflict, or a configured custom merge driver.

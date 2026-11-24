@@ -302,9 +302,14 @@ Each local Promote checkout must exist before the command pushes.
      A shrink changes the plan doc and can also change `<plan stem>-next.md`.
      A shrink with no paths in scope passes if a clean test merge leaves the fetched `origin/main` tree unchanged.
      The test merge uses the shrink's first parent as its base.
-     An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
-     The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
-     It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.
+     An as-built commit can change or delete its plan when all changed paths are Markdown.
+     Read the slug in `docs(<slug>): as-built` from the latest non-merge commit on the first-parent history.
+     If the subject has no slug, keep the configured path.
+     Use the exact configured Markdown plan path if that commit deletes it outside an as-built folder.
+     Otherwise use `<slug>.md` in the configured plan folder.
+     If the configured path is in `docs/<crate>/as-built/`, look in `docs/<crate>/`.
+     If the configured path is in `docs/as-built/` or the unit has no plan file, look in `docs/plans/`.
+     If the plan is absent on the merge branch, the commit can change only `docs/as-built/*.md` or `docs/<crate>/as-built/*.md`.
   3. *conflicts*: `merge-tree --write-tree --name-only` exit 1 is held, asking the unit to merge the merge branch and send a new hash.
   4. *other units*: overlap of this change's paths with each other unit's branch diff and its worktree's `status --short`, printed as data, never a stop.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
