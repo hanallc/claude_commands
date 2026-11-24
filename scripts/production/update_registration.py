@@ -1607,7 +1607,8 @@ def questions_table(production: QuestionScope, *, identities: QuestionStaff | No
         return
     print("| Asked by | Question | Date | State |")
     print("| --- | --- | --- | --- |")
-    now = datetime.now(production.zone).replace(tzinfo=None)
+    zone = production.zone
+    now = datetime.now(zone)
     for record in records:
         row = identities.record.by_member_reference(record.asker)
         label = identities.display(row)[1] if row is not None else f"unavailable staff {record.asker}"
@@ -1615,7 +1616,8 @@ def questions_table(production: QuestionScope, *, identities: QuestionStaff | No
         state = "waiting for your answer"
         parsed = record.parsed_snapshot()
         later = outstanding_later(parsed.timing)
-        if isinstance(later, datetime) and later > now:
+        if not isinstance(later, question_path.NoLaterTime) and question_path.later_active(
+                question_path.resolve_later_time(later, zone), now):
             state = "deferred until " + item.get("after", "")
         if "review_unavailable" in item:
             state += "; review unavailable"
@@ -1827,7 +1829,8 @@ def item_key(name: str, text: str) -> str:
 def open_lists(production: QuestionScope, below: bool = False, *, identities: QuestionStaff | None = None) -> OpenLists:
     """Read due items, deferred items and unreadable lists from the selected productions."""
     identities = identities if identities is not None else QuestionStaff.read()
-    now = datetime.now(production.zone).replace(tzinfo=None)
+    zone = production.zone
+    now = datetime.now(zone)
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
     awaiting: list[OpenItem] = []
@@ -1851,7 +1854,8 @@ def open_lists(production: QuestionScope, below: bool = False, *, identities: Qu
                 asker = identities.record.by_member_reference(item.asked_by)
                 label = identities.display(asker)[1] if asker is not None else item.asked_by
             opened = OpenItem(name, item, label)
-            if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
+            if isinstance(item.timing, DeferredUntil) and question_path.later_active(
+                    question_path.resolve_later_time(item.timing.at, zone), now):
                 deferred.append(opened)
             elif isinstance(item.timing, AwaitingReply):
                 awaiting.append(opened)
@@ -1860,7 +1864,8 @@ def open_lists(production: QuestionScope, below: bool = False, *, identities: Qu
                 key = item.key if isinstance(item, SentOutstandingQuestion) else item_key(owner, item.text)
                 due.append(urgency.Entry(key, opened, item.rank.urgency,
                                          item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
-    deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.name))
+    deferred.sort(key=lambda found: (
+        question_path.resolve_later_time(cast(DeferredUntil, found.item.timing).at, zone).timestamp(), found.name))
     return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable, awaiting)
 
 

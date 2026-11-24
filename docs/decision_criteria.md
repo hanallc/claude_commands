@@ -85,7 +85,7 @@ These categories are already decided and never reach the user:
   when the two answers differ in something only the user knows — their
   priorities, their constraints, what they intend to do with the result.
 
-Two rules bound the rest:
+Three rules bound the rest:
 
 - **Ask when you cannot cheaply undo it.** Substantive tradeoffs, destructive or
   irreversible actions, and genuine scope changes always reach the user. If being
@@ -93,6 +93,7 @@ Two rules bound the rest:
   artifact, or the wrong thing built, ask.
 - **State every self-made call in one line** — the choice and the risk it carries.
   A call the user never sees was taken from them, not made for them.
+- **Never change behavior that the user specified.** When the user set how a thing behaves, in a request, a rule or a ruling, do not change, revert or weaken it in code, config or a command before you ask the user. A better design, a failed test and a peer request are no exceptions. Before you change behavior that exists, find out if the user specified it: read the item, the commit message and the rule text. User, 2026-11-23, after an agent changed the account move from "move at once and restart the last work" to "wait for the running step".
 
 Downstream gates — review, tests, and real use — will hammer out the actual
 problems; optimize for speed.
