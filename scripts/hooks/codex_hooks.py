@@ -5,6 +5,7 @@ The tool checks match `apply_patch` or `Bash`. STE runs at SessionStart and
 SubagentStart. Their `*` matchers cover every session source and subagent type.
 Session sources include startup, resume, clear and compact; they are not tool
 names. PreCompact records the start of manual and automatic compaction.
+UserPromptSubmit adds the director's pause context.
 UserPromptSubmit and PostCompact clear the session's compaction marker.
 Stop sends worker turn completion to the shared handler.
 Listing and trust use the event, matcher, command and timeout together,
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Generator
 from enum import Enum
 from typing import NamedTuple, cast
 
@@ -83,6 +85,10 @@ class CodexHook:
         return self.event[:1].lower() + self.event[1:]
 
 
+DIRECTOR_HOLD = CodexHook("director-hold", PythonHookScript("conversation_pause.py", ("codex-director-hold",)),
+                          "UserPromptSubmit", matcher="*")
+
+
 HOOKS: tuple[CodexHook, ...] = (
     CodexHook("fn-length", PythonHookScript("post-tool-use-fn-length.py")),
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
@@ -98,6 +104,7 @@ HOOKS: tuple[CodexHook, ...] = (
               "PreCompact", matcher="*"),
     CodexHook("compaction-clear-turn", ShellHookFront("compaction-marker-clear.sh"),
               "UserPromptSubmit", matcher="*"),
+    DIRECTOR_HOLD,
     CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
               "PostCompact", matcher="*"),
     CodexHook("turn-end", PythonHookScript("../herdr/turn_end.py"), "Stop", matcher="*"),
@@ -495,15 +502,26 @@ def _failure(entry: LocatedHook | MissingHook, listed: list[dict[str, object]]) 
     return f"{entry.hook.name}: hooks/list " + "; ".join(differences)
 
 
+def _ready(entry: LocatedHook | MissingHook) -> bool:
+    return isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
+
+
+@contextlib.contextmanager
+def _read_hooks(binary: str, codex_home: str) -> Generator[tuple[AppServer, list[dict[str, object]]]]:
+    server = AppServer(binary, codex_home)
+    try:
+        _initialize(server)
+        yield server, _listed_hook_entries(server, os.path.join(codex_home, "hooks.json"))
+    finally:
+        server.close()
+
+
 def _run(action: str) -> int:
     codex_home = _codex_home()
     binary = _command_binary()
     path = os.path.join(codex_home, "hooks.json")
     previously_trusted = _install_file(path, binary, codex_home) if action == "install" else []
-    server = AppServer(binary, codex_home)
-    try:
-        _initialize(server)
-        listed = _listed_hook_entries(server, path)
+    with _read_hooks(binary, codex_home) as (server, listed):
         if previously_trusted and _restore_moved_trust(server, listed, previously_trusted):
             listed = _listed_hook_entries(server, path)
         entries = _select_hooks(listed)
@@ -514,17 +532,14 @@ def _run(action: str) -> int:
                     _trust_handlers(server, {entry.key: {"trusted_hash": entry.current_hash}})
                     listed = _listed_hook_entries(server, path)
                     entries = _select_hooks(listed)
-    finally:
-        server.close()
-    success = all(isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
-                  for entry in entries.values())
+    success = all(_ready(entry) for entry in entries.values())
     for hook in HOOKS:
         entry = entries[hook]
         if action == "install" and success and isinstance(entry, LocatedHook):
             print(f"{hook.name} codex hook: trusted {entry.key}")
         else:
             print(f"{hook.name} codex hook: {_status(entry)}")
-        if not isinstance(entry, LocatedHook) or entry.trust_status != "trusted" or not entry.enabled:
+        if not _ready(entry):
             print(f"codex hooks: {action}: {_failure(entry, listed)}", file=sys.stderr)
     return 0 if success else 1
 
