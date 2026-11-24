@@ -293,12 +293,24 @@ A Mac host run shows on the Builds page as its Mac build row; the page hides its
 A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
 The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
 A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
-The page (`guestRow` in `memory_live.html`) shows both in the running table.
-The Machine cell of a guest row shows the bright `mac-linux` icon.
-The hover of an unconfirmed row shows `Guest attempt  not confirmed`.
-`memory_feed.step_key` builds the row key from `mac-linux` and the consume time.
-The key stays the same when the queue confirms the attempt, so the hover stays open.
-The `mac-linux` icon uses the Mac color in light and dark modes.
+The Builds page shows both attempts in Running with the recorded job, unit, and caller.
+The Machine cell shows one bright icon for `mac-linux` and the guest state.
+The icon uses the Mac color in light and dark modes.
+The cell shows `not confirmed` until confirmation, then `running`.
+The tooltip lists the named targets. It shows the attempt ID after confirmation.
+The memory column shows `on mac-linux`. The vCPU column shows `—`.
+The admission service reads the module counter from the current guest's placement request sidecar.
+It publishes the counter before and after the guest confirms the attempt.
+The Builds page uses the AWS counter format for Stage, Done, and the module count in the tooltip.
+Without a counter, Stage and Done show `—`.
+If a queue read fails, the page keeps the guest row from the last successful reading.
+`memory_feed.step_key` uses `mac-linux` and the consume time.
+The key stays the same when the queue confirms the attempt, so the tooltip stays open.
+The console server sends `X-Builds-Page-Version` on GET and HEAD for the published Builds page.
+The server puts the same version in the HTML. Nanosecond file times distinguish writes in the same second.
+At startup and on its timer, the page compares the HEAD version with its loaded version.
+The page checks again when the tab becomes visible. It reloads once when the versions differ.
+Manual pause and a hidden console frame stop these checks.
 A speculative local parent retains its actual reservation.
 The queue selects the newest eligible speculative copy by call start time, then call identity.
 The watcher keeps result collection and loser stopping.
