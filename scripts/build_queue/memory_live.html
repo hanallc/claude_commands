@@ -3317,8 +3317,8 @@ function renderWalk(d) {
     const icons = machine ? machineIcon(machine, "run") : (named || []).map(name => machineIcon(name, "dim")).join("");
     return `<td class="machine">${icons || "—"}${state ? ` ${esc(state)}` : ""}</td>`;
   };
-  const stepText = (step, waiting) => waiting && (step.includes(" ") || step.includes("-"))
-    ? step.split(" ").map(word => `<span class="word">${esc(word)}</span>`).join(" ")
+  const stepText = (step, waiting) => waiting
+    ? step.split(" ").map(word => word.includes("-") ? `<span class="word">${esc(word)}</span>` : esc(word)).join(" ")
     : esc(step);
   const cells = (place, labels, duration, pid, target, vcpus, tip, className = "", done = "—", tokens = "—", move = null, actionName = "") => {
     const kept = className.startsWith("held"), waiting = kept || className.startsWith("wait");
