@@ -1157,30 +1157,24 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.phone.assert_not_called()
 
     def test_on_credits_notice_handles_a_destination_losing_room_during_the_pass(self) -> None:
-        """F009: an account disappearing between placement reads does not abort the alert."""
-        pick = accounts.pick
-        chosen = False
+        """F009: the selected account can use paid credits when the destination loses room."""
+        reason = "fixture destination lost included room"
+        self.swap.side_effect = accounts.AccountsError(reason)
 
-        def room_changes(tool: str, now: datetime, *, exclude: frozenset[str], keep: accounts.NoKeep,
-                         prefer_weekly_room: bool = False) -> accounts.PickedAccount | accounts.NoAccountWithRoom:
-            nonlocal chosen
-            self.assertEqual(tool, "codex")
-            if chosen:
-                return accounts.NoAccountWithRoom(accounts.EarliestReset(self.now + timedelta(days=2)), ())
-            chosen = True
-            first = pick("codex", now, exclude=exclude, keep=keep, prefer_weekly_room=prefer_weekly_room)
-            self.assertIsInstance(first, accounts.PickedAccount)
-            assert isinstance(first, accounts.PickedAccount)
-            self.assertGreater(first.weekly_left, 0)
-            return first
-
-        with mock.patch.object(accounts, "pick", side_effect=room_changes) as changing_pick:
+        with mock.patch.object(accounts, "pick", wraps=accounts.pick) as pick:
             _ = self.alert(spare_left=50)
-        self.assertGreaterEqual(changing_pick.call_count, 2)
-        push = self.zero_pushes()[-1]
+        pick.assert_called_once()
+        self.swap.assert_called_once_with("workers", "codex2",
+            why="codex1 weekly usage used; move to room", cause="auto", included_only=True, worker_moves="detach")
+        entries = moves.read_moves()
+        requested, = [entry for entry in entries if entry["kind"] == "requested"]
+        failed, = [entry for entry in entries if entry["kind"] == "failed"]
+        self.assertEqual((failed["move_id"], failed["reason"]), (requested["move_id"], reason))
+        push, = self.zero_pushes()
         self.assertEqual(push.id, "quota.paid_credits")
         self.assertIn("work moves to Claude", push.body)
-        self.swap.assert_not_called()
+        self.assertEqual(push.values["credits"], "6,370")
+        self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
 
     def test_zero_credits_off_prefers_weekly_room_over_a_sooner_reset_on_paid_credits(self) -> None:
         _ = self.note(1, "off")

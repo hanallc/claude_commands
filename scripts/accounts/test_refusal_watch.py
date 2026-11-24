@@ -88,6 +88,17 @@ def observe_whole_reads() -> Generator[Mock]:
         yield observed
 
 
+@contextmanager
+def expire_holder_wait_immediately() -> Generator[None]:
+    number = conf.ConfigRead.number
+
+    def read(settings: conf.ConfigRead, key: str) -> float:
+        return 0.0 if key == "move.stuck_seconds" else number(settings, key)
+
+    with patch.object(conf.ConfigRead, "number", new=read):
+        yield
+
+
 REAL_SESSION_MOVES = stop_resume.move_sessions
 # A row lock that this test process holds names this holder.
 HOLDER = f"pid {os.getpid()}: {shlex.join(sys.argv)}"
@@ -1395,7 +1406,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(stop_resume, "_retire_prompt"),
               patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
               patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning),
-              patch.object(stop_resume, "_hung_holder_seconds", return_value=0),
+              expire_holder_wait_immediately(),
               patch.object(stop_resume, "_resume_move", side_effect=resume)):
             older = accounts.move_group("showrunners", "claude3")
             assert isinstance(older, accounts.GroupMoveStarted), older
@@ -1753,7 +1764,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(inventory, "listing", return_value=[]),
               patch.object(stop_resume, "move_sessions", new=move_live_sessions),
               patch.object(stop_resume, "_stop") as stop,
-              patch.object(stop_resume, "_hung_holder_seconds", return_value=0),
+              expire_holder_wait_immediately(),
               patch.object(stop_resume, "_send_move_push") as send):
             preview = accounts.move_group("units", "claude3", dry_run=True)
             assert isinstance(preview, accounts.GroupMoveDryRun)
@@ -1798,7 +1809,7 @@ class RefusalWatchTests(unittest.TestCase):
                   patch.object(inventory, "listing", side_effect=listing),
                   patch.object(stop_resume, "move_sessions", new=move_live_sessions),
                   patch.object(stop_resume, "_prepare_move", side_effect=AssertionError("busy row entered a move")),
-                  patch.object(stop_resume, "_hung_holder_seconds", return_value=0),
+                  expire_holder_wait_immediately(),
                   patch.object(stop_resume, "_send_move_push") as send):
                 result = accounts.move_group("units", "claude3")
 

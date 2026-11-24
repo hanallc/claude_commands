@@ -25,7 +25,6 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.test_names import fixture_names
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
@@ -616,6 +615,8 @@ class LaunchSettingsTests(unittest.TestCase):
         self.assertEqual(models_registry.compact_window_arguments("producer"), [])
 
     def test_a_bad_compact_window_prints_one_anomaly_and_keeps_the_settings_json_window(self) -> None:
+        from scripts.lib.test_names import fixture_names
+
         for value in ("", "30k", "3e5", "-300000", "300000.5", "99999", "1000001", "large", "0300000"):
             with self.subTest(value=value):
                 _ = write_registry(self.path, {"compact_windows": {"producer": value}})

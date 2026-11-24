@@ -7912,6 +7912,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
     def test_workers_swap_records_producer_group_scope_and_retry_keeps_target(self) -> None:
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                            Path(os.environ["CONF_DIR"]) / "shutdown.conf")
         source, _ = self.workers_fixture()
         machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
         producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
