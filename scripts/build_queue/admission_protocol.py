@@ -90,6 +90,7 @@ from scripts.build_queue.admission_wire import (
     ClaimFailure as ClaimFailure,
     ConsumePermission as ConsumePermission,
     ExecutionReport as ExecutionReport,
+    SettlementRequest as SettlementRequest,
     PlacementWait as PlacementWait,
     PlacementResourceWait as PlacementResourceWait,
     PlacementEvidenceWait as PlacementEvidenceWait,
