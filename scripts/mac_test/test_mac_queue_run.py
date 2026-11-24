@@ -138,6 +138,24 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
     return environment
 
 
+def queue_with_ready_event(root: Path) -> Path:
+    """Run the real queue and wait for the watcher pipe in lifecycle tests."""
+    source = Path(__file__).resolve().parents[2]
+    script = root / "queue-entry.py"
+    _ = script.write_text(f"import sys\nsys.path.insert(0, {str(source)!r})\n" + r"""
+from scripts.mac_test import mac_queue_run
+
+def wait_for_ready(output, _timeout):
+    expected = b"ready\n"
+    with open(output, "rb", closefd=False) as stream:
+        return stream.readline(len(expected)) == expected
+
+mac_queue_run.watcher_ready = wait_for_ready
+raise SystemExit(mac_queue_run.main())
+""")
+    return script
+
+
 class QueueRunTests(unittest.TestCase):
     def command(self, root: Path, kind: str = "shot") -> list[str]:
         return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
@@ -614,8 +632,8 @@ raise SystemExit(mac_queue_run.main(sys.argv[2:]))
             environment = {**queue_fixture(root), "FAKE_SSH_HOLD": "1"}
             reader, writer = os.pipe()
             try:
-                command = self.command(root)
-                command[3:3] = ["--caller-fd", str(reader)]
+                command = [sys.executable, str(queue_with_ready_event(root)), "--caller-fd", str(reader),
+                           *self.command(root)[3:]]
                 with subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
                     try:
