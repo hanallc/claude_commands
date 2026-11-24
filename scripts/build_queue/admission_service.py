@@ -161,12 +161,35 @@ def scaler_availability() -> placement.AllowedHost | placement.TemporaryExclusio
     return placement.AllowedHost() if isinstance(result, placement.Available) else placement.TemporaryExclusion(result.reason)
 
 
-def scaler_settlement(episode: str, attempt: int) -> placement.DispatchPathState:
+def scaler_settlement(episode: str, attempt: int, *, clock: Clock,
+                      holds_slot: Callable[[], bool]) -> placement.DispatchPathState:
     try:
-        result = scaler_provider().settlement(episode, attempt)
+        provider = scaler_provider()
+        result = provider.settlement(episode, attempt)
     except AttributeError:
         return placement.DispatchPathPending("AWS settlement is unavailable")
-    return placement.DispatchPathSettled() if isinstance(result, placement.Settled) else placement.DispatchPathPending(result.reason)
+    if isinstance(result, placement.Pending) and holds_slot():
+        _reconcile_expired_scaler_claim(provider, episode, attempt, clock, holds_slot)
+    if isinstance(result, placement.Settled):
+        return placement.DispatchPathSettled()
+    return placement.DispatchPathPending(result.reason)
+
+
+def _reconcile_expired_scaler_claim(provider: placement.CloudGateProvider, episode: str, attempt: int,
+                                    clock: Clock, holds_slot: Callable[[], bool]) -> None:
+    from scripts.aws_target import ledger
+
+    try:
+        reconcile = cast(Callable[[str, int], None], getattr(provider, "reconcile_expired"))
+        # Pending gives the reason. The adapter's booking read supplies the expiry.
+        read_bookings = cast(Callable[[str, int], tuple[Path, tuple[ledger.GateReservation, ...]]],
+                             getattr(provider, "_claim_bookings"))
+        _, bookings = read_bookings(episode, attempt)
+    except (AttributeError, OSError, ValueError, KeyError, TypeError, ArithmeticError):
+        return
+    now = clock.now()
+    if any(row.expires <= now and ledger.gate_is_open(row) for row in bookings) and holds_slot():
+        reconcile(episode, attempt)
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -5216,8 +5239,14 @@ done
         self.host_requests[key] = submitted
         self.placement_host_keys[(submitted.episode, assignment.destination)] = key
         reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-        probe = DispatchEvidenceProbe(key, saved,
-            lambda: scaler_settlement(assignment.episode, placement.scaler_attempt_number(assignment.attempt)))
+        episode = assignment.episode
+        attempt_key = execution_identity.attempt_key(episode, assignment.attempt)
+
+        def read_dispatch() -> placement.DispatchPathState:
+            return scaler_settlement(episode, placement.scaler_attempt_number(assignment.attempt), clock=self.clock,
+                holds_slot=lambda: not self.closed and self.current_assignments.get(episode) == attempt_key)
+
+        probe = DispatchEvidenceProbe(key, saved, read_dispatch)
         if reader.worker.dispatch_pending(probe):
             return
         if isinstance(report, placement.TerminalAttemptReport):
