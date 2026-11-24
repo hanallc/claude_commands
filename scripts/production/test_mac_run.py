@@ -126,7 +126,7 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
     exit 255
 fi
 
-if [[ $remote == *mac_smoke_status=* ]]; then
+if [[ $remote == *' smoke-status '* ]]; then
     outer=("${(@Q)${(z)remote}}")
     exec "${outer[@]}"
 fi
@@ -157,7 +157,7 @@ else:
     if sys.stdin.read(1) != chr(10):
         sys.exit(1)
     (state / "input-closed").touch()
-    status_file = Path.home() / ".local/state/mac-queue/smoke" / episode / "status"
+    status_file = Path(os.environ["SCRATCH_ROOT"]) / f"mac-smoke-{episode}" / "status"
     status_file.parent.mkdir(parents=True)
     status_file.write_text("0" + chr(10))
 '
@@ -362,6 +362,7 @@ class MacRunTests(unittest.TestCase):
             "MAC_RUN_PYTHON": sys.executable,
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
         }
 
         _ = self.environment.pop("CLAUDE_PYTHON", None)
