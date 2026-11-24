@@ -3358,10 +3358,24 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual((denied.status, json.loads(denied.body)["id"]),
                                          (409, json.loads(first.body)["id"]))
                         self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
-            for recovery in ("base draft content", "base draft key"):
-                with self.subTest(native_recovery=recovery):
+            from scripts.review_links.test_review_submissions import PNG
+
+            index_folder = review_submissions._draft_index  # pyright: ignore[reportPrivateUsage]
+            sync = atomic_file.sync_folder
+            write_text = atomic_file.write_text_atomic
+            write_bytes = atomic_file.write_bytes_atomic
+            for recovery, failure in (
+                ("base draft content", ""),
+                ("base draft key", ""),
+                ("base draft content", "attachment write"),
+                ("base draft content", "native directory sync"),
+                ("base draft content", "index receipt publication"),
+                ("base draft key", "native directory sync"),
+            ):
+                with self.subTest(native_recovery=recovery, failure=failure):
                     suffix = uuid4().hex
-                    earlier = replace(bug, page="list", request_id="r2-" + suffix)
+                    images = ((new_item_dialog.PastedImage("image/png", PNG),) if failure == "attachment write" else ())
+                    earlier = replace(bug, page="list", request_id="r2-" + suffix, images=images)
                     saved = cache.create_submission(earlier).saved
                     draft = "r6-" + suffix
                     updated = replace(earlier, request_id=draft)
@@ -3373,11 +3387,48 @@ class ReviewLinksServerTests(unittest.TestCase):
                     if recovery == "base draft key":
                         folder.mkdir()
                         _ = (folder / "list-receipt-key").write_text(saved.key + "\n")
+                    with ExitStack() as faults:
+                        if failure == "attachment write":
+                            attachment, = review_submissions.image_folder(saved).glob("*/image.png")
+                            attachment.unlink()
+
+                            def fail_attachment(path: Path, data: bytes, *, mode: int | None = None) -> None:
+                                if path == attachment:
+                                    raise OSError("The attachment write failed.")
+                                write_bytes(path, data, mode=mode)
+
+                            _ = faults.enter_context(patch.object(atomic_file, "write_bytes_atomic", fail_attachment))
+                        elif failure == "native directory sync":
+                            def fail_native_sync(path: Path) -> None:
+                                if path == saved.path.parent:
+                                    raise OSError("The native directory sync failed.")
+                                sync(path)
+
+                            _ = faults.enter_context(patch.object(atomic_file, "sync_folder", fail_native_sync))
+                        elif failure == "index receipt publication":
+                            receipt = index_folder(folder) / "receipt.json"
+
+                            def fail_index_receipt(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+                                if path == receipt:
+                                    raise OSError("The index receipt write failed.")
+                                write_text(path, words, new_file_mode=new_file_mode)
+
+                            _ = faults.enter_context(patch.object(atomic_file, "write_text_atomic", fail_index_receipt))
+                        if failure:
+                            interrupted = self.new_item_http(native_body, finished=True)
+                            self.assertEqual(interrupted.status, 503, interrupted.body)
+                            conflict = self.new_item_http(scheduled_body, finished=True)
+                            result = cast(dict[str, object], json.loads(conflict.body))
+                            self.assertEqual((conflict.status, result.get("id")), (409, saved.id))
+                    if recovery == "base draft key" and not failure:
                         conflict = self.new_item_http(scheduled_body, finished=True)
                         self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, saved.id))
                     else:
                         recovered = self.new_item_http(native_body, finished=True)
                         self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
+                    if failure == "attachment write":
+                        restored, = review_submissions.image_folder(saved).glob("*/image.png")
+                        self.assertEqual(restored.read_bytes(), base64.b64decode(PNG))
                     shutil.rmtree(folder)
                     conflict = self.new_item_http(scheduled_body, finished=True)
                     self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, saved.id))
@@ -3387,7 +3438,6 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual({item.id for item in the_list.records(morty.id)}, list_before)
                     self.assertEqual([item.id for item in investigation.records(showrunner.id)], native_before)
 
-            index_folder = review_submissions._draft_index  # pyright: ignore[reportPrivateUsage]
             for kind in ("scheduled", "bug"):
                 with self.subTest(repair_missing_index=kind):
                     draft = "r6-" + uuid4().hex

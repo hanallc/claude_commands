@@ -1679,14 +1679,15 @@ def _draft_filing(folder: Path, members: staff.StaffSnapshot | None = None, *,
     except FileNotFoundError:
         return UnclaimedDraft()
     with scoped_submission(read_submission_key(key), members=members) as item:
-        return _index_recovered_native_draft(folder, item.destination)
+        _write_draft_index(folder, ClaimedDraft(item.destination))
+        return _publish_recovered_native_draft(folder, item.destination)
 
 
 def _is_earlier_native_draft(folder: Path, destination: NativeSubmissionDestination) -> bool:
     return not destination.request_id.startswith(folder.name + "-")
 
 
-def _index_recovered_native_draft(folder: Path, saved: NativeSubmissionDestination) -> FiledDraft:
+def _publish_recovered_native_draft(folder: Path, saved: NativeSubmissionDestination) -> FiledDraft:
     atomic_file.sync_folder(saved.path.parent)
     filing = FiledDraft(saved)
     _write_draft_index(folder, filing)
@@ -1708,6 +1709,8 @@ def file_list_draft(request_id: str, payload_hash: str, *,
             raise DraftPending()
         candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
         if isinstance(candidate, NativeSubmissionDestination):
+            if isinstance(filing, ClaimedDraft) and _is_earlier_native_draft(folder, candidate):
+                raise DraftAlreadyFiled(candidate.id)
             with _locked_request(candidate.address, recovered=candidate,
                                  search_owner_stores=isinstance(filing, FiledDraft)) as lookup:
                 if isinstance(lookup.native, LocatedSubmission):
@@ -1811,7 +1814,8 @@ def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on
             raise DraftAlreadyFiled(hint.id)
         raise DraftPending()
     if isinstance(hint, NativeSubmissionDestination):
-        if _is_earlier_native_draft(folder, hint):
+        earlier = _is_earlier_native_draft(folder, hint)
+        if earlier:
             if recovery:
                 yield NoNativeSubmission()
                 return
@@ -1823,13 +1827,14 @@ def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on
             return
         local = _read_location_hint(folder)
         relocated = isinstance(local, NativeSubmissionDestination) and local.owner != hint.owner
+        must_exist = earlier or isinstance(filing, FiledDraft)
         with _locked_request(hint.address, members, recovered=hint,
-                             search_owner_stores=isinstance(filing, FiledDraft) or relocated) as lookup:
+                             search_owner_stores=must_exist or relocated) as lookup:
             saved = _saved_draft(lookup)
             if saved is not None and (not recovery or saved.destination.browser_token_digest == hint.browser_token_digest):
                 yield lookup
                 return
-        if isinstance(filing, FiledDraft):
+        if must_exist:
             raise OSError(f"Cannot find the native record for request {hint.request_id}.")
     yield NoNativeSubmission()
 
@@ -1928,9 +1933,12 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                 replay = _list_draft_replay(send, capture_intent, item)
                 earlier = _is_earlier_native_draft(folder, saved)
                 receipt_folder = _request_folder(saved.request_id) if earlier else folder
-                return _complete_receipt(receipt_folder, saved, lookup.hint, item.record,
-                                         edited=earlier or not (replay.payload_matches and replay.capture_matches),
-                                         retry_uploads=replay.uploads, payload_matches=replay.payload_matches)
+                completed = _complete_receipt(receipt_folder, saved, lookup.hint, item.record,
+                                              edited=earlier or not (replay.payload_matches and replay.capture_matches),
+                                              retry_uploads=replay.uploads, payload_matches=replay.payload_matches)
+                if earlier and _read_location_hint(_draft_index(folder), receipt_only=True) != saved:
+                    _ = _publish_recovered_native_draft(folder, saved)
+                return completed
         if isinstance(capture_target, ScopedSubmissionKey):
             raise SubmissionConflict("This screenshot belongs to another item.")
         filing = send.prepare()
@@ -1942,8 +1950,10 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
 
 
-def _recover_pre_upgrade_native_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
-                                      members: staff.StaffSnapshot | None) -> SavedSubmission | None:
+def _recover_pre_upgrade_native_draft(draft_folder: Path, address: SubmissionAddress, words: str,
+                                      uploads: tuple[_ImageUpload, ...], members: staff.StaffSnapshot | None, *,
+                                      capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
+                                      ) -> SavedSubmission | None:
     """Recover a native record from the base draft format."""
     legacy_id = "r2-" + address.request_id[3:]
     fingerprint = _fingerprint([legacy_id, address.kind, words, _image_fingerprints(uploads)])
@@ -1958,8 +1968,13 @@ def _recover_pre_upgrade_native_draft(address: SubmissionAddress, words: str, up
                 if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
                     continue
                 saved = item.destination
-                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record,
-                                         edited=True, retry_uploads=uploads, payload_matches=saved.payload_hash == fingerprint)
+                _write_draft_index(draft_folder, ClaimedDraft(saved))
+                _check_capture_target(capture_target, saved)
+                completed = _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record,
+                                              edited=True, retry_uploads=uploads,
+                                              payload_matches=saved.payload_hash == fingerprint)
+                _ = _publish_recovered_native_draft(draft_folder, saved)
+                return completed
     return None
 
 
@@ -2044,10 +2059,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
     if list_draft:
-        previous = _recover_pre_upgrade_native_draft(address, words, uploads, members)
+        previous = _recover_pre_upgrade_native_draft(_request_folder(request_id), address, words, uploads, members,
+                                                    capture_target=capture_target)
         if previous is not None:
-            _check_capture_target(capture_target, previous)
-            _ = _index_recovered_native_draft(_request_folder(request_id), previous)
             return previous
     state = request.page_state
     missing_capture = capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot)
