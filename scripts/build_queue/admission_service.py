@@ -2263,13 +2263,13 @@ class AdmissionServer:
             return self.run_places.get(records.run_owner(place.run.pid, place.run.start_time))
         return None
 
-    def _waiter_order(self, row: records.RankedWaiter) -> tuple[int, float, float, int, int]:
+    def _waiter_order(self, row: records.RankedWaiter) -> tuple[int, float, float, int, float, int]:
         priority, order_since, since, pid = gate.waiter_order(row)
         place = self._waiter_run_place(row)
         if place is not None and order_since == place.since:
-            # Keep the original tie-break when a new step uses the run's rank.
-            return priority, order_since, place.since, place.first_owner.pid, pid
-        return priority, order_since, since, pid, pid
+            # Keep the run rank and order its steps by arrival time.
+            return priority, order_since, place.since, place.first_owner.pid, since, pid
+        return priority, order_since, since, pid, since, pid
 
     def _full_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
                           ) -> list[tuple[Path, records.RankedWaiter]]:
