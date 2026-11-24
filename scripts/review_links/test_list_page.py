@@ -4027,6 +4027,18 @@ window.fetch=async(_path,options={})=>{
                 for number in range(17, 21):
                     _ = the_list.add(MORTY.id, f"Edit the Tokyo series for item {number}", owner=OWNER.id, source="nate",
                                      changes={"state": the_list.ItemState.SCHEDULED, "schedule": tokyo_series})
+                for number, rule in (
+                    (21, "FREQ=WEEKLY;BYDAY=MO"),
+                    (22, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"),
+                    (23, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"),
+                    (24, "FREQ=MONTHLY;BYDAY=-1MO"),
+                    (25, "FREQ=YEARLY"),
+                    (26, "FREQ=MONTHLY;BYMONTHDAY=30"),
+                    (27, "FREQ=DAILY;UNTIL=20261130T140000Z"),
+                ):
+                    series = replace(sequence, rule=repeat_rule.parse(rule))
+                    _ = the_list.add(MORTY.id, f"Move the series for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": series})
                 evaluate(r"""
 (async () => {
  window.refreshSchedules=()=>new Promise(resolve=>{
@@ -4050,13 +4062,17 @@ window.fetch=async(_path,options={})=>{
   form.querySelector('[data-later-month-step="1"]').click();
   form.querySelector('[data-date="'+date+'"]').click();
  };
- const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,repeatZone,advanceRun=false}={})=>{
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,repeatZone,refusal,advanceRun=false}={})=>{
   let posted;
+  let sentPost=false;
   let readback;
   const send=window.fetch;
   const response=new Promise(resolve=>{
    window.fetch=async(...args)=>{
-    if(advanceRun && args[1]?.method==='POST') args[1].headers={'X-Test-Advance-Run':'1'};
+    if(args[1]?.method==='POST'){
+     sentPost=true;
+     if(advanceRun) args[1].headers={'X-Test-Advance-Run':'1'};
+    }
     const reply=await send(...args);
     if(args[1]?.method==='POST'){
      posted=new URLSearchParams(args[1].body);
@@ -4077,6 +4093,12 @@ window.fetch=async(_path,options={})=>{
    const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
    dialog.querySelector('[data-done]').click();
    await closed;
+   if(refusal){
+    window.fetch=send;
+    check(status.textContent===refusal && !sentPost && !form.querySelector('[data-later-menu]').hidden,
+     'The picker shows the refusal without sending the edit.');
+    return;
+   }
    if(rule || date) check(!status.textContent,status.textContent);
   }
   const result=await response;
@@ -4151,14 +4173,39 @@ window.fetch=async(_path,options={})=>{
   [1,'park','following',{repeat:'custom',rule:'FREQ=WEEKLY;BYDAY=TU',note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
   [16,'park',null,{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',note:'Weekly on Monday · next Nov 30 10:30 EST'}],
   [17,'park','following',{instruction:'Use the updated figures.',repeatZone:'Asia/Tokyo',
+   savedLabel:'Weekly on Tuesday',label:'Weekly on Tuesday',
    note:'Weekly on Tuesday · next Nov 30 10:30 EST'}],
   [18,'park','following',{wall:'2026-11-30T11:00',date:'2026-11-30T16:00:00.000Z',repeatZone:'Asia/Tokyo',
+   savedLabel:'Weekly on Tuesday',label:'Weekly on Tuesday',
    note:'Weekly on Tuesday · next Nov 30 11:00 EST'}],
   [19,'park','following',{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',repeatZone:'America/New_York',
    note:'Weekly on Monday · next Nov 30 10:30 EST'}],
   [20,'park','following',{wall:'2026-11-30T11:00',date:'2026-11-30T16:00:00.000Z',
    repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',repeatZone:'America/New_York',
    note:'Weekly on Monday · next Nov 30 11:00 EST'}],
+  [21,'park','following',{date:'2026-12-01T14:00:00.000Z',savedLabel:'Weekly on Monday',
+   label:'Weekly on Tuesday',rule:'FREQ=WEEKLY;BYDAY=TU',repeatZone:'America/New_York',
+   note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
+  [22,'park','following',{wall:'2026-12-07T09:00',date:'2026-12-07T14:00:00.000Z',
+   savedLabel:'Custom · Every 2 weeks on Monday',label:'Custom · Every 2 weeks on Monday',
+   note:'Every 2 weeks on Monday · next Dec 7 09:00 EST'}],
+  [23,'park','following',{date:'2026-12-01T14:00:00.000Z',
+   savedLabel:'Custom · Every 2 weeks on Monday',label:'Custom · Every 2 weeks on Monday',
+   refusal:'The start date must fall on a selected repeat day.',
+   note:'Every 2 weeks on Monday · next Nov 30 09:00 EST'}],
+  [24,'park','following',{date:'2026-12-01T14:00:00.000Z',savedLabel:'Monthly on the last Monday',
+   label:'Monthly on the first Tuesday',rule:'FREQ=MONTHLY;BYDAY=1TU',repeatZone:'America/New_York',
+   note:'Monthly on the first Tuesday · next Dec 1 09:00 EST'}],
+  [25,'park','following',{date:'2026-12-01T14:00:00.000Z',savedLabel:'Annually on November 30',
+   label:'Annually on December 1',rule:'FREQ=YEARLY',repeatZone:'America/New_York',
+   note:'Annually on December 1 · next Dec 1 09:00 EST'}],
+  [26,'park','following',{date:'2026-12-01T14:00:00.000Z',
+   savedLabel:'Custom · Monthly on day 30',label:'Custom · Monthly on day 30',
+   refusal:'The start date must match the monthly repeat day.',
+   note:'Monthly on day 30 · next Nov 30 09:00 EST'}],
+  [27,'park','following',{date:'2026-12-01T14:00:00.000Z',
+   refusal:'Choose an end date on or after the start.',
+   note:'Daily until 2026-11-30 14:00:00 UTC · next Nov 30 09:00 EST'}],
   [2,'unpark',null,{}],
   [1,'remove','this',{lost:true}],
   [1,'park','all',{repeat:'daily',rule:'FREQ=DAILY',advanceRun:true}],
@@ -4170,11 +4217,18 @@ window.fetch=async(_path,options={})=>{
   const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
   if(options.date || options.instruction || options.repeat || (action==='park' && options.advanceRun)){
    form.querySelector('[data-later-toggle]').click();
+   const select=form.querySelector('[data-repeat]');
+   if(options.savedLabel)
+    check(select.selectedOptions[0].textContent===options.savedLabel,'Repeat shows the saved rule.');
    if(options.wall){form.elements.until.value=options.wall;edit(form.elements.until);}
    else if(options.date) pickDate(form,'2026-12-01');
+   if(options.label)
+    check(select.selectedOptions[0].textContent===options.label,'Repeat shows the rule for the selected start.');
+   if(options.refusal)
+    check(form.querySelector('[data-schedule-status]').textContent===options.refusal,
+     'The picker explains the invalid start before Save.');
    if(options.instruction){words(form).value=options.instruction;edit(words(form));}
    if(options.repeat){
-    const select=form.querySelector('[data-repeat]');
     select.value=options.repeat;select.dispatchEvent(new Event('change'));
     if(options.repeat==='custom'){
      const dialog=document.querySelector('.list-schedule-dialog[open]');

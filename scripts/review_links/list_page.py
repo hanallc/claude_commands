@@ -474,8 +474,9 @@ def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
     if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
         series = schedule.series
         first = series.first.start
-        origin = first.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
+        origin = first.strftime("%Y-%m-%dT%H:%M")
         attributes += f' data-rule="{html.escape(series.rule.rrule, quote=True)}" data-repeat-start="{origin}"'
+        attributes += f' data-repeat-text="{html.escape(series.rule.describe(first), quote=True)}"'
         if isinstance(first.tzinfo, ZoneInfo):
             attributes += f' data-repeat-zone="{html.escape(first.tzinfo.key, quote=True)}"'
         else:
@@ -1806,6 +1807,9 @@ function repeatChoices(start){
 function repeatParts(rule){
  return Object.fromEntries(rule.split(';').filter(Boolean).map(part=>part.split('=')));
 }
+function repeatEndEpoch(until){
+ return Date.parse(until.replace(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/,'$1-$2-$3T$4:$5:$6Z'));
+}
 function dateInZone(zone,epoch){
  const {year,month,day}=zoneParts(zone,epoch);
  return [year,month,day].map((value,index)=>String(value).padStart(index===0 ? 4 : 2,'0')).join('-');
@@ -1839,8 +1843,7 @@ function customRepeat(parent,start,rule,zone){
  const startDate=start.date.toISOString().slice(0,10);
  endDate.value=startDate;
  if(parts.UNTIL){
-  const stamp=parts.UNTIL.replace(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/,'$1-$2-$3T$4:$5:$6Z');
-  endDate.value=dateInZone(zone,Date.parse(stamp));
+  endDate.value=dateInZone(zone,repeatEndEpoch(parts.UNTIL));
   endRadio('date').checked=true;
  }else if(parts.COUNT){
   count.value=parts.COUNT;endRadio('count').checked=true;
@@ -1951,7 +1954,7 @@ function bindScheduleFields(form,until,zone,draft,edit){
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[for="'+select.id+'"]');
- const {start='',rule='',repeatStart,repeatZone,repeatOffset,revision}=panel.dataset;
+ const {start='',rule='',repeatStart,repeatText,repeatZone,repeatOffset,revision}=panel.dataset;
  const number=Number(panel.dataset.run || 0);
  const savedWords=words.value;
  const currentDraft=draft?.revision===revision && draft.number===number ? draft : undefined;
@@ -1959,35 +1962,76 @@ function bindScheduleFields(form,until,zone,draft,edit){
  words.value=currentDraft?.words ?? savedWords;
  let pickerUntil=until.value,editedUntil=currentDraft?.until;
  const draftUntil=()=>until.value===pickerUntil ? editedUntil : until.value;
- let choice=currentDraft?.repeat?.choice,customRule=currentDraft?.repeat?.rule ?? rule;
+ const startChanged=()=>!start || (draftUntil()!==undefined && start!==until.value);
+ const initialDay=scheduleDate(start)?.date.getTime();
+ const savedChoices=repeatStart ? repeatChoices(scheduleDate(repeatStart)) : {};
+ const savedPreset=Object.keys(savedChoices).find(key=>savedChoices[key][1]===rule);
+ let choice=currentDraft?.repeat?.choice ?? (savedPreset || (rule==='FREQ=WEEKLY' ? 'weekly' : rule ? 'custom' : 'none'));
+ let customRule=currentDraft?.repeat?.rule ?? rule;
  let repeatEdited=Boolean(currentDraft?.repeat);
  const preset=(at,value)=>repeatChoices(at)[value]?.[1];
+ const datePreset=()=>['weekly','monthly','yearly'].includes(choice);
+ const savedOption=new Option(repeatText,'saved');
+ savedOption.disabled=true;
+ const customOption=select.querySelector('[value=custom]');
+ function repeatChange(at){
+  if(!at) return undefined;
+  const candidate=choice==='custom' ? customRule : preset(at,choice);
+  const dateRuleChanged=datePreset() && repeatChoices(at)[choice][0]!==repeatText;
+  if(repeatEdited){
+   if(candidate!==rule || (rule && repeatZone!==zone) || dateRuleChanged) return candidate;
+  }else if(dateRuleChanged && startChanged() && at.date.getTime()!==initialDay){
+   return candidate;
+  }
+ }
+ function repeatStartError(repeat,changedStart){
+  if(!changedStart && repeat===undefined) return '';
+  const nextRule=repeatParts(repeat ?? rule);
+  if(!nextRule.BYDAY && !nextRule.BYMONTHDAY && !nextRule.UNTIL) return '';
+  const epoch=dateTimeDraftEpoch(zone,changedStart ? until.value : start);
+  if(!Number.isFinite(epoch)) return '';
+  if(nextRule.UNTIL && epoch>repeatEndEpoch(nextRule.UNTIL))
+   return 'Choose an end date on or after the start.';
+  const day=repeat!==undefined ? dateInZone(zone,epoch)
+   : repeatZone ? dateInZone(repeatZone,epoch)
+   : new Date(epoch+Number(repeatOffset)*1000).toISOString().slice(0,10);
+  const at=scheduleDate(day+'T00:00');
+  if(nextRule.FREQ==='WEEKLY' && nextRule.BYDAY && !nextRule.BYDAY.split(',').includes(at.weekday))
+   return 'The start date must fall on a selected repeat day.';
+  if(nextRule.FREQ==='MONTHLY'){
+   const ordinal=nextRule.BYDAY?.startsWith('-') ? at.ordinal : Math.ceil(at.day/7);
+   if((nextRule.BYMONTHDAY && Number(nextRule.BYMONTHDAY)!==at.day) ||
+      (nextRule.BYDAY && nextRule.BYDAY!==ordinal+at.weekday))
+    return 'The start date must match the monthly repeat day.';
+  }
+  return '';
+ }
  function update(){
   const at=scheduleDate(until.value);
   select.hidden=label.hidden=!words.value.trim() || !at;
   custom.hidden=select.hidden || choice!=='custom';
+  const repeat=repeatChange(at);
+  status.textContent=select.hidden ? '' : repeatStartError(repeat,startChanged());
   if(!at) return;
   const choices=repeatChoices(at);
   for(const [value,[label]] of Object.entries(choices)) select.querySelector('[value='+value+']').textContent=label;
-  if(choice===undefined){
-   const savedChoices=repeatStart ? repeatChoices(scheduleDate(repeatStart)) : choices;
-   choice=Object.keys(savedChoices).find(key=>savedChoices[key][1]===rule) ?? 'custom';
-   if(choice==='custom' && rule==='FREQ=WEEKLY') choice='weekly';
-  }
-  select.value=choice;
-  custom.hidden=select.hidden || choice!=='custom';
+  customOption.textContent=choice==='custom' && rule && customRule===rule ? 'Custom · '+repeatText : 'Custom…';
+  const showSaved=datePreset() && repeat===undefined && choices[choice][0]!==repeatText;
+  if(showSaved) select.prepend(savedOption);
+  else savedOption.remove();
+  select.value=showSaved ? 'saved' : choice;
   select.querySelector('[value=weekdays]').disabled=['SU','SA'].includes(at.weekday) && choice!=='weekdays';
  }
  update();
  words.addEventListener('input',()=>{
-  status.textContent='';update();edit();
+  update();edit();
   const summary=menu.querySelector('[data-later-summary]');
   summary.textContent=summary.textContent.replace(/^(Starts|Parks until) /,words.value.trim() ? 'Starts ' : 'Parks until ');
  });
  until.addEventListener('input',event=>{
   if(event.detail?.edited!==false && until.value!==pickerUntil) editedUntil=until.value;
   pickerUntil=until.value;
-  status.textContent='';update();
+  update();
  });
  const openCustom=async()=>{
   const at=scheduleDate(until.value);
@@ -2015,36 +2059,23 @@ function bindScheduleFields(form,until,zone,draft,edit){
   },
   retainDate:()=>{pickerUntil=editedUntil=until.value;},
   data:(action)=>{
-   const text=words.value.trim(),at=scheduleDate(until.value);
-   const startChanged=!start || (draftUntil()!==undefined && start!==until.value);
-   const base={number,revision,scope:'',repeat:undefined,words:text,startChanged};
-   if(action!=='schedule' || !repeatEdited) return base;
-   const repeat=choice==='custom' ? customRule : at ? preset(at,choice) : '';
-   const sameRule=repeat===rule && (!rule || repeatZone===zone);
-   return {...base,repeat:sameRule ? undefined : repeat};
+   const repeat=action==='schedule' ? repeatChange(scheduleDate(until.value)) : undefined;
+   return {number,revision,scope:'',repeat,words:words.value.trim(),startChanged:startChanged()};
   },
   applySeriesRepeat:data=>{
-   if(data.scope==='this' || (!data.startChanged && data.repeat===undefined)) return true;
-   const nextRule=repeatParts(data.repeat ?? rule);
-   if(nextRule.FREQ!=='WEEKLY' || !nextRule.BYDAY) return true;
-   const epoch=dateTimeDraftEpoch(zone,data.startChanged ? until.value : start);
-   if(!Number.isFinite(epoch)) return true;
-   const day=data.repeat!==undefined ? dateInZone(zone,epoch)
-    : repeatZone ? dateInZone(repeatZone,epoch)
-    : new Date(epoch+Number(repeatOffset)*1000).toISOString().slice(0,10);
-   const weekday=weekdays[new Date(day+'T00:00:00Z').getUTCDay()];
-   if(!nextRule.BYDAY.split(',').includes(weekday)){
-    status.textContent='The start date must fall on a selected repeat day.';
-    return false;
+   if(data.scope==='this'){
+    data.repeat=undefined;
+    return true;
    }
-   return true;
+   status.textContent=repeatStartError(data.repeat,data.startChanged);
+   return !status.textContent;
   },
   scheduled:!!(start || rule),
   repeating:!!rule,
   words:()=>words.value.trim(),
   scope:(action,data)=>chooseScheduleScope(menu.hidden ? form : menu,
    {number,removing:action==='remove',parking:action==='park' || action==='park-until-delivered',
-    changingRule:action==='schedule' && data.repeat!==undefined}),
+    changingRule:action==='schedule' && repeatEdited && data.repeat!==undefined}),
   showError:message=>{status.textContent=message;},
  };
 }
