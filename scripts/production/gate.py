@@ -602,7 +602,8 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
     with tempfile.TemporaryFile(mode="w+", errors="replace") as stdout, \
             tempfile.TemporaryFile(mode="w+", errors="replace") as stderr:
         try:
-            child = start_recorded_gate_child(arguments, repo, stdout=stdout, stderr=stderr, register=register)
+            child = start_recorded_gate_child(arguments, repo, stdout=stdout, stderr=stderr, register=register,
+                                              descriptors=copies.COMMAND_LOCKS.get())
             returncode = child.wait(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired as error:
             raise GateRecoveryUnresolved(f"the rollback command exceeded its deadline: {shlex.join(arguments)}") from error
@@ -647,17 +648,16 @@ def finish_command_group(process: subprocess.Popen[str], deadline: float | None)
 
 
 def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
-                                     stdout: int | TextIO, stderr: int | TextIO,
+                                     stdout: int | TextIO | None, stderr: int | TextIO | None,
                                      register: Callable[[subprocess.Popen[str]], Child],
+                                     descriptors: tuple[int, ...],
                                      environment: dict[str, str] | None = None, suite: bool = False,
-                                     descriptors: tuple[int, ...] | None = None) -> Child:
-    """Publish the process group and register the child before it runs."""
+                                     stdin: int | None = subprocess.DEVNULL) -> Child:
+    """Register a suite or recovery child before its command starts."""
     recovery = ACTIVE_GATE_RECOVERY.get()
     with ExitStack() as closer:
         writer: int | None = None
-        if descriptors is None:
-            descriptors = copies.COMMAND_LOCKS.get()
-        if isinstance(recovery, GateRecovery):
+        if suite or isinstance(recovery, GateRecovery):
             reader, writer = os.pipe()
             _ = closer.callback(os.close, reader)
             _ = closer.callback(os.close, writer)
@@ -668,7 +668,7 @@ def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
             if not suite:
                 arguments = [sys.executable, "-I", "-S", "-c", GATE_START_PERMISSION
                              + "os.execvp(sys.argv[1], sys.argv[1:])", *arguments]
-        process = subprocess.Popen(arguments, cwd=repo, env=environment, stdin=subprocess.DEVNULL,
+        process = subprocess.Popen(arguments, cwd=repo, env=environment, stdin=stdin,
                                    stdout=stdout, stderr=stderr, text=True, errors="replace",
                                    start_new_session=True, pass_fds=descriptors)
         child = register(process)

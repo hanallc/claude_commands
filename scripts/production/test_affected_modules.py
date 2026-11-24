@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import io
@@ -115,22 +116,39 @@ class AffectedModulesTests(unittest.TestCase):
         self.record_history(earlier, run, aborted, affected_run)
         self.add_test("checks/test_new.py", "VALUE = 1\n")
         self.write("config/limits.conf", "value=two\n")
+
+        buildlog = store.root()
+        snapshot = gate_record.latest_module_reads_path("natedev")
+        opened_history: list[Path] = []
+        open_path = cast(Callable[..., object], Path.open)
+
+        def track_open(path: Path, *args: object, **kwargs: object) -> object:
+            if path.is_relative_to(buildlog):
+                opened_history.append(path)
+            return open_path(path, *args, **kwargs)
+
         with (mock.patch.object(affected, "latest_module_reads", wraps=affected.latest_module_reads) as reads,
+              mock.patch.object(Path, "open", autospec=True, side_effect=track_open),
               mock.patch.object(index, "update", side_effect=AssertionError("updated the index")),
               mock.patch.object(index, "read_only", side_effect=AssertionError("opened the index")),
               mock.patch.object(index, "update_lock", side_effect=AssertionError("locked the index")),
               mock.patch.object(sqlite3, "connect", side_effect=AssertionError("opened SQLite"))):
             selected = self.selection()
-        self.assertEqual(reads.call_count, 1)
+            reads.assert_called_once_with()
+            self.assertEqual(opened_history, [snapshot])
+            with mock.patch.object(affected, "latest_module_reads", side_effect=PermissionError("unreadable read history")):
+                result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
+            self.write("config/limits.conf", "value=one\n")
+            (self.repo / "scripts/checks/test_new.py").unlink()
+            reads.reset_mock()
+            opened_history.clear()
+            clean = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
+            reads.assert_called_once_with()
+            self.assertEqual(opened_history, [snapshot])
         self.assertEqual({path.name for path in selected.modules}, {"test_runtime.py", "test_named.py", "test_new.py", "test_missing.py"})
-        with mock.patch.object(affected, "latest_module_reads", side_effect=PermissionError("unreadable read history")):
-            result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo))
         self.assertIsInstance(result, affected.FullSuite)
         assert isinstance(result, affected.FullSuite)
         self.assertIn("unreadable read history", result.reason)
-        self.write("config/limits.conf", "value=one\n")
-        (self.repo / "scripts/checks/test_new.py").unlink()
-        clean = affected.select_affected(self.repo, self.base, self.modules[:-1], set())
         self.assertEqual(clean, affected.AffectedSelection(self.base, (), ()))
 
     def test_config_selection_skips_a_newer_full_gate_without_config_records(self) -> None:
@@ -464,6 +482,12 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(result, affected.FullSuite("local module read snapshot unavailable"))
 
     def test_missing_empty_or_corrupt_local_snapshot_requests_every_module(self) -> None:
+        class LocalPathsSelected(Exception):
+            pass
+
+        gate_config = ".git/test-config/gate.conf"
+        self.write(gate_config, (self.repo / gate_config).read_text() + "# whole: 0..\nmemory_stop_reruns=0\n")
+        self.write("scripts/test_times/module_run.py", "")
         self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
         self.certify()
         self.record_history(self.config_gate({}), host="Mac")
@@ -488,11 +512,23 @@ class AffectedModulesTests(unittest.TestCase):
                       mock.patch.object(gate, "gate_state_dir", return_value=self.cache_dir()),
                       mock.patch.object(cloud_gate, "working_tree", return_value=("tree", {"docs/guide.md"})),
                       mock.patch.object(cloud_gate, "route", return_value=cloud_result) as route,
+                      mock.patch.object(gate, "recover_gate_runs"),
+                      mock.patch.object(gate, "merge_gate_governor_gib", return_value=4.0),
+                      mock.patch.object(gate, "_gate_job_parent", return_value=self.repo / ".git"),
+                      mock.patch.object(gate.BuildHoldWait, "wait_until_free"),
+                      mock.patch.object(gate, "read_time_limit", side_effect=LocalPathsSelected) as limit,
                       redirect_stdout(io.StringIO())):
                     self.assertEqual(gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED,
                                                           target=target), cloud_result)
-                selection = cast(gate.TreeSelection, route.call_args.kwargs["selected"])
-                self.assertEqual(set(selection.paths), expected)
+                    selection = cast(gate.TreeSelection, route.call_args.kwargs["selected"])
+                    self.assertCountEqual(selection.paths, expected)
+                    route.reset_mock()
+                    with self.assertRaises(LocalPathsSelected):
+                        _ = gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED,
+                                                 target=gate.NO_GATE_ASSIGNMENT)
+                    route.assert_not_called()
+                    self.assertEqual(limit.call_count, 1)
+                    self.assertCountEqual(cast(list[str], limit.call_args.args[1]), expected)
 
     def test_mac_snapshot_adds_a_module_to_natedev_selection(self) -> None:
         self.add_test("checks/test_local.py", "VALUE = 1\n")
@@ -829,7 +865,8 @@ class AffectedModulesTests(unittest.TestCase):
         self.add_test("checks/test_limits.py", "from scripts.component import reader\n")
         self.add_test("checks/test_content.py", "VALUE = 1\n")
         self.add_test("checks/test_named.py", "# test_config/limits.conf\n")
-        readers = ("test_limits.py", "test_content.py", "test_named.py")
+        readers = tuple(self.repo / "scripts/checks" / name
+                        for name in ("test_limits.py", "test_content.py", "test_named.py"))
         rows = (("config", "limits", readers), ("config", "unrelated", ()),
                 ("test_config", "limits", readers), ("test_config", "unrelated", ()))
         for folder, stem, expected in rows:
@@ -843,7 +880,7 @@ class AffectedModulesTests(unittest.TestCase):
                 self.record_history(run)
                 self.write(f"{folder}/{stem}.conf", "amount=2\n")
                 _ = self.commit()
-                self.assertEqual(tuple(path.name for path in self.selection().modules), expected)
+                self.assertEqual(self.selection().modules, expected)
 
     def test_test_owned_configuration_changes_select_the_same_scanners(self) -> None:
         self.add_test("checks/test_static.py", "from pathlib import Path\n"

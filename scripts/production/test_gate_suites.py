@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
+from scripts.buildlog import store
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records, placement
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
@@ -1227,6 +1228,7 @@ class ChildImports(unittest.TestCase):
         caller_log = self.root / "caller-buildlog"
         self.write(caller_log / "keep", "caller log")
         self.environment["BUILDLOG_DIR"] = str(caller_log)
+        began = time.time()
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = [cast(dict[str, str], json.loads(line))
@@ -1236,9 +1238,19 @@ class ChildImports(unittest.TestCase):
         for row in rows:
             self.assertTrue(Path(row["buildlog"]).is_relative_to(row["tmpdir"]))
             self.assertFalse(Path(row["tmpdir"]).exists())
+        host = store.host_name()
+        months = {store.month(began), store.month(time.time())}
+        monthly_logs = [caller_log / host / f"{month}.jsonl" for month in months
+                        if (caller_log / host / f"{month}.jsonl").is_file()]
+        self.assertEqual(len(monthly_logs), 1)
+        snapshot = caller_log / host / gate_record.LATEST_MODULE_READS_NAME
+        self.assertEqual({path for path in caller_log.rglob("*") if path.is_file()}, {
+            caller_log / "keep", *monthly_logs,
+            caller_log / "recent-gate-times.json", caller_log / "recent-gate-times.lock",
+            snapshot, snapshot.with_suffix(".lock"),
+        })
         gate_records = [cast(dict[str, object], json.loads(line))
-                        for path in caller_log.glob("*/*.jsonl")
-                        for line in path.read_text().splitlines()]
+                        for line in monthly_logs[0].read_text().splitlines()]
         self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
         self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])

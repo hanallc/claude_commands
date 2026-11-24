@@ -203,7 +203,7 @@ def run_child() -> subprocess.CompletedProcess[str]:
 
 class CoverageOverlapTests(unittest.TestCase):
     @contextmanager
-    def fixture_command(self, sources: dict[str, str], *, macos: bool = False
+    def fixture_command(self, sources: dict[str, str], *, macos: bool = False, macos_startup: str = ""
                         ) -> Generator[tuple[subprocess.CompletedProcess[str], Path]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -245,7 +245,8 @@ class CoverageOverlapTests(unittest.TestCase):
                 hooks.mkdir()
                 # Load the host's proxy and time zone settings before simulating macOS.
                 _ = (hooks / "sitecustomize.py").write_text(
-                    "import urllib.request\nimport zoneinfo\nimport sys\nsys.platform = 'darwin'\n")
+                    "import urllib.request\nimport zoneinfo\nimport sys\nsys.platform = 'darwin'\n"
+                    + textwrap.dedent(macos_startup))
                 result = subprocess.run(
                     command, cwd=root, env={**env, "TMPDIR": str(root),
                                             "PYTHONPATH": str(hooks), "ADMISSION_SOCKET": str(root / "no-queue"),
@@ -318,6 +319,37 @@ class StopCoverage(unittest.TestCase):
                     self.fail("The coverage child still owns the lock")
             self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
 
+    def test_macos_coverage_refuses_child_start_on_sigterm_before_registration(self) -> None:
+        startup = '''
+import os
+from pathlib import Path
+import signal
+import subprocess
+
+if sys.argv[1:2] == ["--measurement-child"]:
+    Path("child-ran").touch()
+
+class CancelOnStart(subprocess.Popen):
+    def __init__(self, arguments, *args, **kwargs):
+        super().__init__(arguments, *args, **kwargs)
+        if isinstance(arguments, list) and "--measurement-child" in arguments:
+            assert os.getpgid(self.pid) == self.pid
+            Path("group-started").touch()
+            signal.raise_signal(signal.SIGTERM)
+
+subprocess.Popen = CancelOnStart
+'''
+        with self.fixture_command({"scripts/fixture/test_start.py": '''
+import unittest
+
+class Child(unittest.TestCase):
+    def test_start(self) -> None:
+        pass
+'''}, macos=True, macos_startup=startup) as (result, output):
+            self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+            self.assertTrue((output.parent / "group-started").is_file(), result.stdout + result.stderr)
+            self.assertFalse((output.parent / "child-ran").exists(), result.stdout + result.stderr)
+
     def run_fixture(self, sources: dict[str, str]) -> FixtureCoverage:
         with self.fixture_command(sources) as (result, output):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -328,7 +360,8 @@ class StopCoverage(unittest.TestCase):
         self.assertNotEqual(first["id"], second["id"])
         self.assertGreater(first["seconds"], 0.0, first["id"])
         self.assertGreater(second["seconds"], 0.0, second["id"])
-        candidate, kept = sorted((first, second), key=lambda row: (-row["seconds"], row["id"]))
+        first_loses_tie = first["seconds"] == second["seconds"] and first["id"] < second["id"]
+        candidate, kept = (first, second) if first["seconds"] > second["seconds"] or first_loses_tie else (second, first)
         self.assertTrue(candidate["candidate"], candidate["id"])
         self.assertEqual(candidate["covered_by"], [kept["id"]])
         self.assertFalse(kept["candidate"], kept["id"])
@@ -390,17 +423,25 @@ class Unique(unittest.TestCase):
 
     def test_equal_tests_remove_only_the_slower_test(self) -> None:
         fixture = self.run_fixture({"scripts/fixture/test_equal.py": PRELUDE + '''
+from types import SimpleNamespace
+from unittest import mock
+
 class Equal(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        times = iter((0.0, 1.0, 1.0, 3.0))
+        cls.enterClassContext(mock.patch("unittest.case.time", SimpleNamespace(perf_counter=times.__next__)))
+
     def test_fast(self) -> None:
         self.assertEqual(left(), "left")
 
     def test_slow(self) -> None:
-        slow()
         self.assertEqual(left(), "left")
 '''})
         fast = fixture.row("test_fast")
         slow = fixture.row("test_slow")
         self.assertEqual((fast["line_count"], slow["line_count"]), (1, 1))
+        self.assertGreater(slow["seconds"], fast["seconds"])
         self.assert_slower_candidate(fast, slow)
 
     def test_kept_tests_can_cover_a_candidate_together(self) -> None:

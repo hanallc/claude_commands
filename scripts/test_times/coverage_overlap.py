@@ -37,8 +37,8 @@ from scripts.lib.terminal_cells import print_table, seconds
 from scripts.buildlog import treekey
 from scripts.production.gate_modules import discover_test_modules
 from scripts.production.gate import (
-    SUITE_BOOTSTRAP, RunningGateJob, kill_job_group, stop_gate_jobs, test_module_environment,
-    unwind_gate_on_sigterm,
+    SUITE_BOOTSTRAP, RunningGateJob, kill_job_group, start_recorded_gate_child, stop_gate_jobs,
+    test_module_environment, unwind_gate_on_sigterm,
 )
 from scripts.test_times.measurement_gate import MeasurementBlocked, measurement_child, measurement_place
 from scripts.test_times.module_run import (
@@ -349,18 +349,24 @@ def main(argv: list[str]) -> int:
             child, fds = measurement_child(place, environment, (build_folders.build_folder_lock_fd(root),))
             program = Path(__file__).resolve()
             command = [sys.executable, "-c", SUITE_BOOTSTRAP, sys.executable, str(program), "--measurement-child", *argv]
-            job: RunningGateJob | None = None
-            try:
-                process = subprocess.Popen(command, env=child, pass_fds=fds, start_new_session=True, text=True)
+            running: list[RunningGateJob] = []
+
+            def register(process: subprocess.Popen[str]) -> RunningGateJob:
                 job = RunningGateJob("coverage", program, process, time.monotonic(), time.time(),
                                      sys.stdout, Path(os.devnull), program.stem)
-                status = process.wait()
+                running.append(job)
+                return job
+
+            try:
+                job = start_recorded_gate_child(command, Path.cwd(), stdin=None, stdout=None, stderr=None,
+                                                register=register, descriptors=fds, environment=child, suite=True)
+                status = job.process.wait()
             except BaseException:
-                if job is not None:
+                if running:
                     if place is None:
-                        kill_job_group(job)
+                        kill_job_group(running[0])
                     else:
-                        stop_gate_jobs([job])
+                        stop_gate_jobs(running)
                 raise
             if place is not None:
                 place.status = status
