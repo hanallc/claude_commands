@@ -1467,7 +1467,7 @@ fi
         assert key is not None
         started = process_start.process_start(os.getpid())
         assert isinstance(started, process_start.Started)
-        owner = replace(self.placed.owner, pid=os.getpid(), start_time=started.start)
+        owner = replace(self.placed.owner, host=store.host_name(), pid=os.getpid(), start_time=started.start)
         guest = replace(self.placed, owner=owner, attempt=f'{46:032x}', source_key=execution_identity.SourceKeyKnown(key))
         local = replace(guest, attempt=f'{47:032x}', destination=replace(
             guest.destination, provider='local', target='natedev', host='natedev'))
