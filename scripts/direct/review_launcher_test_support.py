@@ -17,7 +17,7 @@ from typing import TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, communicate_launcher, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -123,9 +123,9 @@ class ReviewLauncherFixture(LauncherFixture):
         self.prepare_project(
             "feature/review", "review_prompt.md", "Review the diff.\n",
             (
-                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
+                "unit_progress_interval_seconds=180",
+                "unit_compact_above_tokens=100000",
+                "routing_from_round=4", "astra_after_failed_fixes=2",
                 "",
             ), MODELS_REGISTRY,
         )
@@ -177,7 +177,7 @@ class ReviewLauncherFixture(LauncherFixture):
                          self.root / "scripts/production/fast_track.py")
         config = self.root / "config"
         config.mkdir(exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
+        _ = copy_config_file_fixture(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
         for name in ("review.sh", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")

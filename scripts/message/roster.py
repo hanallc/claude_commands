@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, fields, replace
+from enum import Enum
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -29,7 +30,7 @@ from scripts.message import codex_daemon  # noqa: E402
 from scripts.message import process_table  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff, session_staff
-from scripts.production.production_doc import Refusal as ProductionDocumentRefused
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, Refusal as ProductionDocumentRefused
 from scripts.accounts import role_map
 if TYPE_CHECKING:
     from scripts.accounts.role_map import role_map_command
@@ -187,6 +188,11 @@ class CannotReceiveMessages:
 MessageReach = Messageable | CannotReceiveMessages
 
 
+class WorkerClosure(Enum):
+    UNCONFIRMED = "unconfirmed"
+    CONFIRMED = "confirmed"
+
+
 @dataclass(frozen=True)
 class AssignmentUnrecorded:
     """A legacy worker record has no assignment field."""
@@ -288,6 +294,7 @@ class RosterEntry:
     daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
     pane: HerdrPlace | NoHerdrPane = NoHerdrPane()
     registry_name: RegistryName | NoRegistryName = NoRegistryName()
+    worker_closure: WorkerClosure = WorkerClosure.UNCONFIRMED
 
 
 @dataclass(frozen=True)
@@ -396,6 +403,10 @@ def shown_name(entry: RosterEntry) -> ShownName:
                      UnitPart(unit) if unit else NoUnit(), job, address or entry.name,
                      entry.registry_name if entry.kind == "claude" and entry.role == "freestanding"
                      else NoRegistryName())
+
+
+class UnreadableSessionRecordProblem(str):
+    """The diagnostic for a session record that the registry could not read."""
 
 
 @dataclass(frozen=True)
@@ -601,9 +612,15 @@ class RosterSnapshot:
     result: Roster
 
     def encode(self) -> str:
+        # Older peers accept extra snapshot keys but reject extra entry keys.
+        closed_workers = [index for index, entry in enumerate(self.result.entries) if is_closed_worker(entry)]
+        unreadable_records = [index for index, problem in enumerate(self.result.problems)
+                              if isinstance(problem, UnreadableSessionRecordProblem)]
         return json.dumps({"tag": "RosterSnapshot", "entries": [
             _snapshot_entry(entry) for entry in self.result.entries
         ], "problems": self.result.problems,
+            **({"closed_workers": closed_workers} if closed_workers else {}),
+            **({"unreadable_session_record_problems": unreadable_records} if unreadable_records else {}),
             **({"warnings": self.result.warnings} if self.result.warnings else {})})
 
     @classmethod
@@ -617,10 +634,32 @@ class RosterSnapshot:
         raw_problems = cast(list[object], problems)
         if not all(isinstance(problem, str) for problem in raw_problems):
             raise ValueError("snapshot problems must be strings")
+        decoded_problems = cast(list[str], raw_problems)
+        unreadable_records = values.get("unreadable_session_record_problems", [])
+        if not isinstance(unreadable_records, list):
+            raise ValueError("snapshot unreadable session record problems must be a list")
+        for index in cast(list[object], unreadable_records):
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(decoded_problems):
+                raise ValueError("snapshot unreadable session record problem index is invalid")
+            decoded_problems[index] = UnreadableSessionRecordProblem(decoded_problems[index])
         if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in cast(list[object], warnings)):
             raise ValueError("snapshot warnings must be strings")
-        return cls(Roster([_decode_entry(entry) for entry in cast(list[object], entries)],
-                          cast(list[str], raw_problems), cast(list[str], warnings)))
+        rows = [_decode_entry(entry) for entry in cast(list[object], entries)]
+        closed_workers = values.get("closed_workers", [])
+        if not isinstance(closed_workers, list):
+            raise ValueError("snapshot closed workers must be a list")
+        for index in cast(list[object], closed_workers):
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(rows):
+                raise ValueError("snapshot closed worker index is invalid")
+            row = rows[index]
+            if row.role != "worker" or not isinstance(row.reach, CannotReceiveMessages):
+                raise ValueError("snapshot closure requires an unreachable worker")
+            rows[index] = replace(row, worker_closure=WorkerClosure.CONFIRMED)
+        return cls(Roster(rows, decoded_problems, cast(list[str], warnings)))
+
+
+def is_closed_worker(entry: RosterEntry) -> bool:
+    return entry.role == "worker" and entry.worker_closure is WorkerClosure.CONFIRMED
 
 
 def cannot_receive_message_text(entry: RosterEntry) -> str:
@@ -1258,14 +1297,20 @@ def _unit_workers(
                     existing = claude_entries.get(row.current_session)
                     if (isinstance(state, worker_panes.OpenWorker)
                             and not isinstance(backend, staff.CodexBackend) and existing is not None):
-                        entries.append(replace(existing, role="worker", director=director, showrunner=showrunner))
+                        paths = worker_panes.enrolled_worker_owner(parent)
+                        cwd = str(paths.main) if isinstance(paths, EnrolledPaths) else existing.cwd
+                        entries.append(replace(existing, role="worker", director=director, showrunner=showrunner, cwd=cwd))
                         continue
+                    closure = WorkerClosure.UNCONFIRMED
                     if isinstance(state, worker_panes.OpenWorker):
                         status = f"{state.status}; pane {state.pane}"
                         reach: MessageReach = Messageable(f"worker:{parent.name}/{row.name}")
+                    elif isinstance(state, worker_panes.ClosedWorker):
+                        closure = WorkerClosure.CONFIRMED
+                        status = "closed"
+                        reach = CannotReceiveMessages(status)
                     else:
                         status = (f"stopped; pane {state.pane}" if isinstance(state, worker_panes.StoppedWorker) else
-                                  "closed" if isinstance(state, worker_panes.ClosedWorker) else
                                   f"unknown; pane {state.pane}: {state.reason}" if isinstance(state, worker_panes.ProcessUnknownWorker) else
                                   f"incomplete: {state.reason}")
                         reach = CannotReceiveMessages(status)
@@ -1277,14 +1322,15 @@ def _unit_workers(
                     entries.append(RosterEntry(
                         machine=machine, kind="codex" if isinstance(backend, staff.CodexBackend) else "claude",
                         role="worker", name=row.name, status=status, reach=reach,
-                        cwd=str(session_staff.worker_directory(membership, row.id)),
+                        worker_closure=closure,
+                        cwd=str(worker_panes.worker_directory(membership, row.id)),
                         showrunner=showrunner, director=director,
                         assignment=assignment,
                         thread=CodexThread(row.current_session) if isinstance(backend, staff.CodexBackend) else NoCodexThread(),
                         session=ClaudeSession(row.current_session) if isinstance(backend, staff.ClaudeBackend) else NoClaudeSession(),
                         account=_codex_home_account(backend.codex_home) if isinstance(backend, staff.CodexBackend)
                         else AccountUnread("worker account not read")))
-    except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused) as error:
+    except (OSError, ValueError, herdr_types.HerdrFailure, ProductionDocumentRefused, ProductionPathsError) as error:
         _problem(problems, "pane workers", error)
     # Blind review rows have no native address and cannot identify either participant.
     if isinstance(participants, MessageParticipants):
@@ -1440,8 +1486,10 @@ def _read_local_roster(environment: Mapping[str, str], *, membership: staff.Staf
     machine = machine_name()
     directory = sessions.sessions_dir()
     for path in registry.unreadable:
-        reason = f"cannot list {path}" if path == directory else f"cannot read {path}"
-        _problem(problems, "Claude session records", reason)
+        if path == directory:
+            _problem(problems, "Claude session records", f"cannot list {path}")
+        else:
+            problems.append(UnreadableSessionRecordProblem(f"Claude session records: cannot read {path}"))
     newest: dict[str, SessionRecord] = {}
     for record in sessions.running_records(registry):
         _ = newest.setdefault(record["sessionId"], record)
@@ -1583,8 +1631,10 @@ def peer_snapshot(environment: Mapping[str, str],
     except (ValueError, TypeError):
         detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
         return PeerNotReached(host, detail[0] if detail else "invalid roster snapshot")
-    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems],
-                  [f"{host}: {warning}" for warning in result.warnings])
+    problems = [UnreadableSessionRecordProblem(f"{host}: {problem}")
+                if isinstance(problem, UnreadableSessionRecordProblem) else f"{host}: {problem}"
+                for problem in result.problems]
+    return Roster(result.entries, problems, [f"{host}: {warning}" for warning in result.warnings])
 
 
 def peer_roster(environment: Mapping[str, str],

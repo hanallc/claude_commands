@@ -18,7 +18,9 @@ description: Read agent message rules and delivery.
   Without a staff match, a unique registry name selects a live freestanding Claude session.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
 - When `review_hold=on`, a local Claude session receives a held messages file when the review ends, with a short notice that names it. Do not send kept messages again.
-- A hold ends when the review ends, or after `review_hold_idle_minutes` (`config/send.conf`) without a user prompt.
+- A hold ends when the review ends, or after `review_hold_idle_minutes` (`config/send.conf`) with no user prompt.
+  Each user prompt restarts that time.
+  The next user prompt after an idle end starts the hold again while the review has open items.
 - Use `send.py --urgent` for urgent messages. It delivers during an open review.
   Use it when Nate must act before a merge, a loss of data, or a stall.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.

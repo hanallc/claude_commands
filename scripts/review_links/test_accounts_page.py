@@ -25,7 +25,8 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.review_links import accounts_page, console_theme, page_frame, serve
+from scripts.production import staff
+from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
 from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
@@ -360,6 +361,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
         login = "warning-fixture@example.invalid"
         marker = b'data-quota-level="warning" data-quota-account="claude4"'
         resets_at = datetime.now(timezone.utc) + timedelta(days=1)
+        warning = accounts_page.quota_alert_settings().warning
 
         def render_fixture() -> accounts_page.AccountsRender:
             return accounts_page.AccountsRender(accounts_page.page(), .5, time.time())
@@ -377,13 +379,13 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
               patch.object(accounts_page, "render_with_facts", side_effect=render_fixture)):
             create_claude_account("claude4", login)
             self.assertTrue(usage_store.store_file().is_relative_to(home))
-            stored_room(login, 11, resets_at)
+            stored_room(login, warning + 1, resets_at)
             self.assertFalse(marker in cache.get())
             self.assertEqual(accounts_page.nav_quota(self.review_root)["level"], accounts_page.QuotaLevel.NONE)
 
-            stored_room(login, 10, resets_at)
+            stored_room(login, warning, resets_at)
             self.assertEqual(accounts_page.nav_quota(self.review_root),
-                             {"level": accounts_page.QuotaLevel.WARNING, "name": "Warning: 10% left"})
+                             {"level": accounts_page.QuotaLevel.WARNING, "name": f"Warning: {warning}% left"})
             reply = cache.get()
             with cache.condition:
                 self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
@@ -394,11 +396,14 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
         path = accounts_page.quota_state(self.review_root)
         path.parent.mkdir(parents=True)
         _ = path.write_text(json.dumps({"claude1": {"level": "urgent", "reset": reset.isoformat()}}), encoding="utf-8")
-        cases = ((reset - timedelta(microseconds=526917), 4, False),
-                 (reset + timedelta(seconds=3599), 4, False),
-                 (reset + timedelta(hours=1), 4, True),
+        settings = conf.read(Path(os.environ["CONF_DIR"]) / "review_links.conf")
+        urgent = settings.whole("accounts_quota_urgent_percent")
+        window = timedelta(seconds=settings.whole("accounts_quota_same_window_seconds"))
+        cases = ((reset - timedelta(microseconds=526917), urgent, False),
+                 (reset + window - timedelta(seconds=1), urgent, False),
+                 (reset + window, urgent, True),
                  (reset + timedelta(days=7), 100, False),
-                 (reset + timedelta(days=7), 4, True))
+                 (reset + timedelta(days=7), urgent, True))
         for observed_reset, left, shows_icon in cases:
             with self.subTest(reset=observed_reset, left=left):
                 row = replace(status_row("claude1"), resets_at=observed_reset, weekly_left_percent=left)
@@ -428,8 +433,10 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                     self.assertNotIn('data-quota-account="claude1"', content)
 
     def test_weekly_quota_icons_follow_the_config_and_skip_missing_readings(self) -> None:
-        cases = ((11, ""), (10, "Warning: 10% left"), (6, "Warning: 6% left"),
-                 (5, "Urgent: 5% left"), (0, "Urgent: 0% left"), (accounts.StatusUnavailable(), ""))
+        settings = accounts_page.quota_alert_settings()
+        warning, urgent = settings.warning, settings.urgent
+        cases = ((warning + 1, ""), (warning, f"Warning: {warning}% left"), (urgent + 1, f"Warning: {urgent + 1}% left"),
+                 (urgent, f"Urgent: {urgent}% left"), (0, "Urgent: 0% left"), (accounts.StatusUnavailable(), ""))
         quota_rows = tuple(replace(status_row(label), tool="codex" if label.startswith("codex") else "claude",
                                    weekly_left_percent=left)
                            for label, (left, _) in zip(("claude1", "claude2", "codex1", "claude3", "codex2", "claude4"),
@@ -448,10 +455,11 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                     else:
                         self.assertIsNone(button)
             _ = write_config_fixture(conf.path("review_links"),
-                                     "accounts_quota_warning_percent=12\naccounts_quota_urgent_percent=6\n")
+                                     f"accounts_quota_warning_percent={warning + 1}\n"
+                                     + f"accounts_quota_urgent_percent={urgent + 1}\n")
             changed = accounts_page.page().decode()
-            self.assertIn('aria-label="Warning: 11% left"', changed)
-            self.assertIn('aria-label="Urgent: 6% left"', changed)
+            self.assertIn(f'aria-label="Warning: {warning + 1}% left"', changed)
+            self.assertIn(f'aria-label="Urgent: {urgent + 1}% left"', changed)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_quota_panel_closes_and_clear_preserves_the_percentage_color(self) -> None:
@@ -1794,6 +1802,42 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with (patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired((), 30)),
               self.assertRaisesRegex(OSError, "took longer than 30 s")):
             _ = accounts_page.render()
+
+    def test_new_item_opens_above_the_color_picker_and_its_screenshot_shows_the_picker(self) -> None:
+        from scripts.review_links.test_page_frame import PAGE_OWNER, WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest("Chrome or Firefox is required for the window rule.")
+        reading = accounts.StatusReading((status_row("claude1"), status_row("claude2")), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,))
+        markup = page_frame.with_owner(rendered, "accounts", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)),
+                                       new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const popup=document.querySelector('[data-color-picker]');
+  document.querySelector('[data-color-key="account.claude1"]').click();
+  await until(()=>popup.open,'the color picker');
+  await painted();
+  check(pressNewItem('over the color picker')!==null,'The press reaches New item.');
+  const capture=await newItemOver(popup,'the color picker');
+  const address=location.pathname+location.search+location.hash;
+  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent('color:account.claude1'),
+   'The screenshot address names the open color picker: '+capture.place);
+  await closeNewItem(popup,'the color picker');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-color-picker]')?.open===true,'the color picker');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = markup.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({"/console/accounts.html": page}, "/console/accounts.html", browser),
+                                 [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from scripts.direct import pass_record as pass_recorder
 from scripts.lib.fixture_test_support import set_up_fixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 import sys
 from pathlib import Path
@@ -8136,7 +8136,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                                    return_value=stop_results.ResumePending(worker.id, target, "destination is not ready")) as stop,
                       patch.object(pane_moves, "preview_worker", return_value=pane_moves.WorkerResume(
                           worker_panes.StoppedWorker(worker, "fixture-pane", "fixture-terminal"),
-                          "impl", "codex1"))):
+                          "impl", "codex1", worker_panes.LaunchPolicy(
+                              models_registry.LaunchSettings("codex", "fixture-model", "medium", ""),
+                              "workspace-write", "")))):
                     code, stdout, stderr = self.run_cli("swap", "workers", target, *([] if shared else ["--dry-run"]))
                 self.assertEqual((code, stderr), (1 if shared else 0, ""))
                 if shared:
@@ -8446,18 +8448,21 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.world.add(self.owner, "w1:p0")
         config = self.root / "conf"
         config.mkdir()
-        _ = (config / "accounts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
-        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                                               + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                                               + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
-                                               + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
-                                               + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                     config / "accounts.conf")
+        for name in ("detached_runs.conf", "postmaster.conf"):
+            _ = write_config_fixture(config / name)
+        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nworker_split_ratio=0.667\n"
+                                               + "# whole: 1..\nunit_compact_above_tokens=43000\n"
+                                               + "# range: 1..1800\nworker_compact_seconds=300\n"
+                                               + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
+                                               + "# range: 1..600\npane_agent_start_seconds=90\n")
+        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=5\n# whole: 1..300\nmove_stop_margin_seconds=10\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
             "UNIT_RUN_DIR": str(self.run_dir), "XDG_STATE_HOME": str(self.root / "state"),
+            "HERDR_PLATFORM": "linux", "HERDR_PROC": str(self.world.process_root),
         })))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
@@ -8886,18 +8891,71 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def test_idle_worker_with_a_live_run_resumes_and_receives_its_result_on_the_target(self) -> None:
         from scripts.agents import detached_runs
+        from scripts.direct import progress_history
         from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.lib.test_models_registry import write_registry
         from scripts.message import send, send_budget
+        from scripts.production import worker
 
-        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
-        for family in families:
-            with self.subTest(family=family):
-                row = self.worker("live-" + family, family=family)
+        cases: tuple[tuple[str, Literal["claude", "codex"]], ...] = (
+            ("live-claude", "claude"), ("live-codex", "codex"), ("parked", "claude"),
+            ("parked-launch-unavailable", "claude"))
+        for name, family in cases:
+            with self.subTest(case=name):
+                row = self.worker(name, family=family)
                 row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
+                run_record = self.run_dir / f"detached_runs/{row.name}.json"
+                saved_options = ["--model", "opus", "--permission-mode", "bypassPermissions", "--effort", "high"]
+                if name.startswith("parked"):
+                    self.dispatch(row)
+                    pane = next(pane for pane, process in self.world.foreground.items()
+                                if self.world.processes[process[0]].current_identity == row.current_session)
+                    self.world.foreground[pane][2].extend(saved_options)
                 with live_detached_run(self.run_dir, row):
+                    if name.startswith("parked"):
+                        passed = worker_panes.worker_pass(row, self.run_dir)
+                        instance = str(passed["instance_id"])
+                        delivery = progress_history.dispatch_delivery(passed)
+                        live = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        live["pane_dispatch_id"] = instance
+                        atomic_file.write_text_atomic(run_record, json.dumps(live))
+                        worker_name = staff.WorkerName.parse(name)
+                        with worker_panes.worker_lock(self.owner.id, worker_name) as hold:
+                            assert isinstance(hold, worker_panes.WorkerLockHold)
+                            receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id,
+                                                              run=self.run_dir, require_transcript=True)
+                            assert isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.can_park
+                            park = worker_panes.ParkWaitingPass(self.run_dir, instance, delivery.completion_id)
+                            closed = worker.park_waiting_worker(row, hold, park, delivery, receipt)
+                        self.assertIsInstance(closed, worker_panes.Closed)
+                        _ = write_registry(self.root / "conf/models.conf",
+                                           {"direct.claude": {"impl": "sonnet:low"}}, update=True)
+                    if name == "parked-launch-unavailable":
+                        state_path = self.run_dir / unit_runs.STATE_FILE
+                        state = cast(dict[str, object], json.loads(state_path.read_text()))
+                        saved = cast(dict[str, dict[str, object]], state["pass"])[name]
+                        del saved["parked_launch"]
+                        atomic_file.write_text_atomic(state_path, json.dumps(state))
+                        membership = staff.snapshot()
+                        before = len(self.world.stops), len(self.world.launches), moves.read_moves()
+                        preview = pane_moves.preview_worker(row, membership, "claude2", "quota", self.run_dir)
+                        moved = pane_moves.move_worker(row, membership, "claude2", "quota", self.run_dir)
+                        self.assertEqual(preview, accounts.SessionMoveRefused(
+                            row.id, "anomaly: worker launch settings are unreadable: the parked worker launch is unavailable"))
+                        self.assertEqual(moved, preview)
+                        self.assertEqual((len(self.world.stops), len(self.world.launches), moves.read_moves()), before)
+                        continue
                     context = detached_runs.resume_context(self.run_dir / "detached_runs", row.name)
                     moved = self.move(family + "2", why="quota")
                     self.assertEqual(moved.returncode, 0, moved.stderr)
+                    if name == "parked":
+                        self.assertIsInstance(self.world.launches[-1], herdr.SplitPane)
+                        kind, arguments, _ = self.world.requests[-1]
+                        self.assertEqual(kind, "claude")
+                        self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                        model = arguments.index("--model")
+                        self.assertEqual(arguments[model:model + len(saved_options)], saved_options)
+                        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["instance_id"], "dispatch-" + name)
                     prompt = next(command[-1] for command in reversed(self.world.commands)
                                   if command[:2] == ("agent", "prompt"))
                     self.assertIn(context, prompt)
@@ -8907,8 +8965,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
                                      str(self.account_home(family + "2")))
                     self.assertEqual(accounts.detached_move_context(str(row.id)), context)
 
-                record = cast(detached_runs.RunRecord, json.loads(
-                    (self.run_dir / f"detached_runs/{row.name}.json").read_text()))
+                record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
                 record.update(session_dir=str(self.run_dir), label="fixture gate", done_message_file="")
                 atomic_file.write_text_atomic(Path(record["log"]), "The detached check passed.\n")
 
@@ -8929,7 +8986,23 @@ class PaneWorkerMoveTests(unittest.TestCase):
                       patch.object(send, "deliver_worker_text", side_effect=deliver) as delivery,
                       patch.object(send_budget, "seconds", return_value=1),
                       patch.object(detached_runs, "result_text", return_value="The detached check passed.")):
-                    self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+                    result = detached_runs.CompletedCommand(0)
+                    if name == "parked":
+                        # The supervisor parks the result; the turn-end replay resumes the worker under its lock.
+                        record.update(status="finished")
+                        atomic_file.write_text_atomic(run_record, json.dumps(record))
+                        self.assertEqual(detached_runs.deliver(record, result), detached_runs.PARKED_WORKER_RESULT)
+                        with worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(name)) as hold:
+                            assert isinstance(hold, worker_panes.WorkerLockHold)
+                            held = hold
+                            _ = detached_runs.submit_finished_worker_result(
+                                self.run_dir, row, worker_input=detached_runs.WorkerResultInput.TYPE,
+                                resume_parked=lambda: worker.restore_parked_worker(row, self.owner.id, held),
+                                input_lock=held)
+                        parked_record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        self.assertIn("sent", parked_record.get("delivery", ""))
+                    else:
+                        self.assertIn("sent", detached_runs.deliver(record, result))
                 delivery.assert_called_once()
                 result_prompt = next(command[-1] for command in reversed(self.world.commands)
                                      if command[:2] == ("agent", "prompt"))
@@ -8994,8 +9067,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         row = self.worker("w74", live=False)
         self.dispatch(row)
-        atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     self.root / "conf/shutdown.conf")
         pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
         result_path = self.run_dir / f"detached_runs/{row.name}.json"
@@ -10559,8 +10632,8 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def test_account_colors_share_config_with_json_board_and_terminal_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
-            _ = (config.parent / "accounts.conf").write_bytes(
-                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+            _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                         config.parent / "accounts.conf")
             for setting, css, escape in (
                 ("brown", "#af875f", "\x1b[38;5;137m"),
                 ("magenta", "#800080", "\x1b[35m"),

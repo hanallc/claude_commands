@@ -10,10 +10,12 @@ import shutil
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime
 from typing import IO, cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.production import session_staff, staff, showrunners
 from scripts.production.production_doc import read_production
@@ -607,17 +609,21 @@ class QuestionIdentityTests(RegistrationFixture):
         self.file_question()
         owner = staff.by_id(self.asker_id)
         assert owner is not None and isinstance(owner.parent, staff.ReportsTo)
-        _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
-        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
-            production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                                                  showrunners.owner_for("example"))
-            errors = io.StringIO()
-            with redirect_stderr(errors):
-                self.assertEqual(showrunner_footer.open_questions([production]), 0)
-            self.assertIn("questions: unavailable", errors.getvalue())
-            self.assertEqual(registration.read_open_items(self.outstanding()), [])
-            self.assertIn(self.doc, footer_counts.sources(self.doc))
-        refused = self.run_command("ask", "--text", "Choose the compiler", "--ask", "Use it?")
+        parent = owner.parent.id
+        record = staff.snapshot()
+        rows = tuple(replace(row, doc=staff.LiveDoc("macbook", self.doc)) if row.id == parent else row
+                     for row in record.rows)
+        with staff.supplied_snapshot(replace(record, rows=rows)):
+            with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+                production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
+                                                      showrunners.owner_for("example"))
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    self.assertEqual(showrunner_footer.open_questions([production]), 0)
+                self.assertIn("questions: unavailable", errors.getvalue())
+                self.assertEqual(registration.read_open_items(self.outstanding()), [])
+                self.assertIn(self.doc, footer_counts.sources(self.doc))
+            refused = self.run_command("ask", "--text", "Choose the compiler", "--ask", "Use it?")
         self.assertEqual(refused.returncode, 2)
         self.assertIn("no showrunner staff row", refused.stdout + refused.stderr)
 
@@ -786,6 +792,25 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(self.store_snapshot(), before)
 
+    def test_native_next_releases_a_question_in_the_repeated_dst_hour(self) -> None:
+        self.file_question()
+        state = self.question_state([{"text": "Choose the layout", "after": "2026-11-01T01:45"}])
+        deferred = self.run_command("questions", "--state", str(state))
+        self.assertEqual(deferred.returncode, 0, deferred.stdout + deferred.stderr)
+        zone = ZoneInfo("America/Los_Angeles")
+        for fold, next_text, table_state in (
+                (0, "no question is open", "deferred until 2026-11-01T01:45"),
+                (1, "Keep the layout?", "waiting for your answer")):
+            now = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=fold)
+            clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
+            with self.subTest(fold=fold), mock.patch.object(registration, "datetime", clock):
+                following = self.run_command("next")
+                self.assertEqual(following.returncode, 0, following.stdout + following.stderr)
+                self.assertIn(next_text, following.stdout)
+                table = self.run_command("questions-table")
+                self.assertEqual(table.returncode, 0, table.stdout + table.stderr)
+                self.assertIn(table_state, table.stdout)
+
     def test_question_review_and_defer_keep_the_fixed_asker(self) -> None:
         held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
         with mock.patch.object(review, "review_question", return_value=held):
@@ -852,6 +877,12 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(item.reason, "offline")
         self.assertEqual(item.timing, registration.DeferredUntil(datetime(2099, 1, 2, 8)))
         self.assertEqual(item.rank.follows, "Earlier choice")
+
+        path = self.outstanding()
+        for invalid in ("2099-02-29T08:00", "2099-01-02T24:00"):
+            with self.subTest(after=invalid):
+                with self.assertRaisesRegex(registration.InputError, r"\[0\]\.after: expected a valid YYYY-MM-DDTHH:MM"):
+                    _ = registration.parse_outstanding_entries([{**legacy, "after": invalid}], path)
 
 
 if __name__ == "__main__":

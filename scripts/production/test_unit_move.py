@@ -35,6 +35,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.herdr import herdr
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.worktree import worktrees
 
 
 def setUpModule() -> None:
@@ -105,8 +106,8 @@ class AddUnitResumeFolderTests(AddUnitTestCase):
 
 
 class UnitFolderMoveTests(FolderRenameFixture):
-    def move_folder(self) -> subprocess.CompletedProcess[str]:
-        arguments = ["move-folder", "--unit", str(self.owner.id), "--to", str(self.destination)]
+    def move_folder(self, destination: Path | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = ["move-folder", "--unit", str(self.owner.id), "--to", str(destination or self.destination)]
         return invoke_cli(unit_move, lambda: unit_move.main(arguments), arguments, dict(os.environ), self.checkout)
 
     def assert_moved(self, backend: FolderSessionFixture) -> None:
@@ -130,6 +131,61 @@ class UnitFolderMoveTests(FolderRenameFixture):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "unchanged\n", ""))
         self.assertEqual(file_versions(self.root), before)
         self.assertEqual((backend.starts, backend.stops), (starts, stops))
+
+    def managed_destination(self) -> Path:
+        root = self.root / "worktrees"
+        build = self.root / "build"
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+            f"roots.workspace={root}\nroots.build={build}\nroots.build.natedev={build}\n")
+        return build_folders.worktree_path(build_folders.repo_word(self.source), self.old_name, "edit")
+
+    def test_move_folder_records_the_destination_branch(self) -> None:
+        destination = self.managed_destination()
+        backend = FolderSessionFixture(self.owner, live=False)
+        with mock.patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktree-state")}), backend.installed():
+            prior = worktrees.new_record(self.source, "", self.checkout, self.git("rev-parse", "HEAD", cwd=self.source),
+                                         str(self.owner.id), "main")
+            worktrees.write_record(prior)
+            result = self.move_folder(destination)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            moved = worktrees.checkout_record(destination)
+            self.assertIsNotNone(moved)
+            assert moved is not None
+            expected = self.git("symbolic-ref", "--short", "HEAD", cwd=destination)
+            self.assertEqual(moved.branch, expected)
+            self.assertEqual(moved.owner, prior.owner)
+            self.assertEqual(moved.merge_branch, prior.merge_branch)
+            self.assertIsNone(worktrees.checkout_record(self.source))
+
+    def test_move_folder_without_a_record_allows_phase_reservation(self) -> None:
+        from scripts.direct import phase_reservation
+
+        destination = self.managed_destination()
+        main = self.home / "rust" / build_folders.repo_word(self.source)
+        _ = self.checkout.rename(main)
+        self.checkout: Path = main
+        _ = self.git("worktree", "repair", str(self.source))
+        owner = self.owner
+        backend = FolderSessionFixture(owner, live=False)
+        with mock.patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktree-state")}), backend.installed():
+            self.assertIsNone(worktrees.checkout_record(self.source))
+            result = self.move_folder(destination)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            moved = staff.by_id(owner.id)
+            assert moved is not None and isinstance(moved.worktree, staff.PresentWorktree)
+            self.assertEqual(moved.worktree.path, destination)
+            phase_reservation._require_model_worktree(moved.worktree.path, moved.name)  # pyright: ignore[reportPrivateUsage]
+
+    def test_move_folder_refuses_a_detached_checkout(self) -> None:
+        destination = self.managed_destination()
+        _ = self.git("switch", "--detach", cwd=self.source)
+        backend = FolderSessionFixture(self.owner, live=False)
+        with backend.installed():
+            result = self.move_folder(destination)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("the checkout has no branch (detached HEAD)", result.stderr)
+        self.assertTrue(self.source.is_dir())
+        self.assertFalse(destination.exists())
 
     def test_move_processes_inside_keeps_only_the_directors_pane_ancestors(self) -> None:
         shell, wrapper, director, child, other_shell, above_pane = 998030, 998040, 998041, 998042, 998050, 998020
@@ -1484,6 +1540,20 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         self.assertEqual(staff.by_id(renamed.id), renamed)
         self.assertEqual(file_versions(self.root), before)
 
+    def test_completed_rename_clears_for_an_unrecorded_detached_checkout(self) -> None:
+        _ = self.git("switch", "--detach", cwd=self.source)
+        with mock.patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktree-state")}):
+            pending = unit_move.prepare_rename(self.owner, self.destination, unit_move.KeepBranch.CURRENT, self.new_name)
+            renamed = staff.rename(self.owner.id, self.new_name)
+            _ = self.git("worktree", "move", str(self.source), str(self.destination))
+            moved = staff.set_worktree(renamed.id, staff.PresentWorktree(remote.local_machine(), self.destination),
+                                       expected=renamed.worktree)
+
+            self.assertTrue(unit_move.finish_rename(moved, pending))
+            self.assertIsNone(unit_move.pending_rename(moved.id))
+            self.assertIsNone(worktrees.checkout_record(self.destination))
+            self.assertEqual(self.git("branch", "--show-current", cwd=self.destination), "")
+
     def test_completed_rename_clears_after_the_checkout_is_removed(self) -> None:
         from scripts.agents import shutdown
 
@@ -1495,11 +1565,16 @@ class FolderBranchRecoveryTests(FolderRenameFixture):
         removed = staff.set_worktree(renamed.id, staff.RemovedWorktree(
             remote.local_machine(), self.destination, staff.ParkedBranch(target_branch)), expected=renamed.worktree)
         _ = self.git("worktree", "remove", str(self.destination))
+        _ = self.git("switch", "--detach")
+        owner_record = worktrees.new_record(self.checkout, "main", self.checkout, self.git("rev-parse", "HEAD"), "", "")
         arguments = ["rename", str(removed.id), self.new_name]
-        with (mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
+        with (mock.patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktree-state")}),
+              mock.patch.object(shutdown, "rename_repair_displays", return_value=False),
               mock.patch.object(unit_move, "move_idle_folder", wraps=unit_move.move_idle_folder) as move):
+            worktrees.write_record(owner_record)
             result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                                 dict(os.environ), self.checkout)
+            self.assertEqual(worktrees.checkout_record(self.checkout), owner_record)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done\n", ""))
         self.assertEqual(staff.by_id(removed.id), removed)
         self.assertIsNone(unit_move.pending_rename(removed.id))
@@ -1737,7 +1812,7 @@ class FolderRenameConfigTests(FolderRenameFixture):
 
         for configured, remaining, expected in ((37, 100, 37), (11, 100, 11), (11, 4, 4)):
             with self.subTest(configured=configured, remaining=remaining):
-                _ = write_config_fixture(self.configuration, f"RENAME_COMMAND_TIMEOUT_SECONDS={configured}\n")
+                _ = write_config_fixture(self.configuration, f"rename_command_timeout_seconds={configured}\n")
                 response = subprocess.CompletedProcess(["git"], 0, "kept\n", "")
                 with (mock.patch.object(time, "monotonic", return_value=100),
                       worker_lifecycle.operation_deadline(deadline=100 + remaining),
@@ -1753,8 +1828,8 @@ class FolderRenameConfigTests(FolderRenameFixture):
         for running in (False, True):
             for limit, poll in ((3, 1), (2, 0.5)):
                 with self.subTest(running=running, limit=limit, poll=poll):
-                    key = "RENAME_LIVE_WAIT_SECONDS" if running else "RENAME_RUN_STOP_WAIT_SECONDS"
-                    _ = write_config_fixture(self.configuration, f"{key}={limit}\nRENAME_POLL_SECONDS={poll}\n")
+                    key = "rename_live_wait_seconds" if running else "rename_run_stop_wait_seconds"
+                    _ = write_config_fixture(self.configuration, f"{key}={limit}\nrename_poll_seconds={poll}\n")
                     clock = [100.0]
                     delays: list[float] = []
                     def sleep(seconds: float) -> None:
@@ -1777,7 +1852,7 @@ class FolderRenameConfigTests(FolderRenameFixture):
 
         wait_for_rows = cast(Callable[..., bool], getattr(moving, "_wait_folder_rows"))
         _ = write_config_fixture(self.configuration,
-            "RENAME_LIVE_WAIT_SECONDS=20\nRENAME_RUN_STOP_WAIT_SECONDS=20\nRENAME_POLL_SECONDS=10\n")
+            "rename_live_wait_seconds=20\nrename_run_stop_wait_seconds=20\nrename_poll_seconds=10\n")
         for running in (False, True):
             with self.subTest(running=running):
                 clock = [100.0]
@@ -1823,7 +1898,9 @@ class FolderMoveReviewTests(FolderRenameFixture):
         from scripts.production.staff_test_support import fixture_member
 
         parent = fixture_member("showrunner", name="receiving")
-        production = Production(self.checkout / "receiving-production.md", "receiving", "main",
+        document = self.checkout / "receiving-production.md"
+        _ = document.write_text("# Receiving production\n")
+        production = Production(document, "receiving", "main",
                                 self.checkout, self.checkout / "production.log", ZoneInfo("UTC"), parent)
         request = transfer_unit.UnitTransfer(self.owner, parent, production, "source")
         lock = self.staff_file.parent / "rows" / f"{self.owner.id}.lock"
@@ -1890,7 +1967,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
         from scripts.lint.memory_test_support import write_config_fixture
         from scripts.agents import shutdown
 
-        _ = write_config_fixture(self.configuration, "RENAME_LIVE_WAIT_SECONDS=0.01\nRENAME_POLL_SECONDS=0.001\n")
+        _ = write_config_fixture(self.configuration, "rename_live_wait_seconds=0.01\nrename_poll_seconds=0.001\n")
         restore = self.enterContext(saved_fixture(self.root))
         for state in ("idle", "native director and MCP", "native director and MCP with worker",
                       "native director and MCP with worker caller", "native director and MCP with worker identity unknown"):

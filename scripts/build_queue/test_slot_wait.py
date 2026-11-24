@@ -5,8 +5,8 @@ import subprocess
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, slot_wait
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue import admission_client, admission_protocol as wire, slot_wait
+from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 from scripts.lib.build_steps import RECORDED_STEP_NAMES
 
 
@@ -50,6 +50,16 @@ class QueueRowNameTests(unittest.TestCase):
 
 
 class RepositorySlotWaitTests(unittest.TestCase):
+    def test_expired_request_names_the_lower_case_capacity_key(self) -> None:
+        clock = FakeClock()
+        identity = wire.Identity("fixture-session", "fixture check", "check", "/fixture")
+        request = wire.RepositorySlotRequest("fixture", wire.Owner(1, "fixture"), clock.now(),
+            "widget", "Mixed-Host.local", "/fixture/copies", 1, clock.now(), identity)
+        with mock.patch.object(admission_client, "CLOCK", clock):
+            reply = admission_client.repository_slot(request)
+        self.assertEqual(reply, wire.RepositorySlotExpired(
+            "slots: wait ended for widget; held slots: widget-slot1; maximum 1 (slots.mixed-host.widget.max)"))
+
     def test_retired_capacity_request_never_waits_or_reserves_memory(self) -> None:
         fixture = self.enterContext(AdmissionFixture())
         original = fixture.request()

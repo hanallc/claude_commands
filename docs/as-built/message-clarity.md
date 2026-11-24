@@ -48,6 +48,9 @@ The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
 `send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
+The hold ends when the review ends (count 0), or after `review_hold_idle_minutes` with no user prompt.
+Each user prompt restarts that time.
+The next user prompt after an idle end delivers the held messages and starts the hold again while the review has open items.
 A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
 Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
 Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
@@ -69,6 +72,7 @@ The hook works only after its `PreToolUse` entry is in `settings.json`.
 
 When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
 The block tells Claude Code to omit the original prompt text.
+A release batch passes an open hold: a line that starts with this session's held messages notice marks it.
 The session-start hook preserves the state and pending messages while the review hold is open.
 It delivers pending messages after the hold ends.
 
@@ -390,7 +394,7 @@ New escalate holds retain their registered template and values.
   - `texts --ask --id X` saves one request per pane under `text-asks` in the notify state folder.
     The command saves the request before it shows the examples. If the save fails, the command clears the request for the pane.
   - `text_asks.answer()` accepts a typed approval from the focused pane and session that made the request.
-    The request expires after `TEXT_ASK_MINUTES`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
+    The request expires after `text_ask_minutes`. The prompt must start with yes, go, ok, approve or approved and contain no negation.
     The function refuses approval after a script sends printable keys to the pane during the request or within one request time limit before it.
     The function deletes the request before it saves the user's exact words under `text-approvals`.
     The prompt hook still needs to call this function before it can record live approvals.
@@ -554,7 +558,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 | `questions/<digest>.json` | Held registration questions |
 | `template-fixes/`, `template-fix-errors.jsonl` | Daily template-fix stamps and errors |
 
-- `config/notify.conf` holds `REVIEW_TIMEOUT_SECONDS=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
+- `config/notify.conf` holds `review_timeout_seconds=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
 - Worker agents are called "workers", not "seats". Worker naming and its migration are in `docs/as-built/long-lived-workers.md` and `docs/accounts.md`, not here.
 
 ## Invariants
@@ -577,7 +581,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 ## Calibration and gotchas
 
-**Time limits** (R = `REVIEW_TIMEOUT_SECONDS`, default 60; P = `pushover.TIMEOUT_S`, 15), all from `review.delivery_waits()`:
+**Time limits** (R = `review_timeout_seconds`, default 60; P = `pushover.TIMEOUT_S`, 15), all from `review.delivery_waits()`:
 
 | Helper | Formula | At R=60 |
 | --- | --- | --- |

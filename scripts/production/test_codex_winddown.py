@@ -33,6 +33,7 @@ from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.herdr import herdr, worker_panes
 from scripts.message import process_table, roster
 from scripts.message.process_table import Process
@@ -515,7 +516,7 @@ class CountTests(unittest.TestCase):
                   mock.patch.object(codex_winddown, "NOTIFIER", SCRIPT.parents[1] / "message/notifier.sh"),
                   mock.patch.object(codex_winddown, "STATE", state),
                   mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(state / "notifier"),
-                                               "__ETC_ZSHENV_SOURCED": "1"})):
+                                               **fixture_zsh_environment()})):
                 self.assertTrue(codex_winddown.start_count(owner))
                 instance = state / "notifier" / codex_winddown.instance_name(owner.id)
                 conf = dict(line.split("=", 1) for line in (instance / "conf").read_text().splitlines())

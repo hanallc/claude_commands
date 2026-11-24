@@ -112,6 +112,15 @@ def _key_warning(source: Path, key: str, reason: str, bad: str,
     _warning(f"warning: {reason}", report=report)
 
 
+class InvalidKey(Exception):
+    """The requested configuration key contains an uppercase letter."""
+
+
+def _require_lower_case(key: str) -> None:
+    if key != key.lower():
+        raise InvalidKey(f"configuration key {key!r} must be lower case")
+
+
 class Unusable(ValueError):
     """The named configuration key has no usable value."""
 
@@ -122,6 +131,13 @@ class Setting:
     value: str
     limit: str
     line: int
+
+
+@dataclass(frozen=True)
+class _ShiftedSetting(Setting):
+    """A test fixture setting carries its committed value."""
+
+    origin: conf_reads.ShiftedConfigKey
 
 
 Result = TypeVar("Result")
@@ -163,6 +179,16 @@ class UseConfiguredValue(Enum):
     CURRENT = "current configuration"
 
 
+class HostOverride(Enum):
+    """Tell whether a `<key>.<host>` key for the reading host replaces the key.
+
+    IGNORED fits a key whose last part names something other than the reading host, such as a watched machine.
+    """
+
+    APPLIES = "the reading host key replaces the key"
+    IGNORED = "the key is read as written"
+
+
 @dataclass(frozen=True)
 class ConfigRead:
     """Keep one live file read for the settings used in one pass."""
@@ -175,18 +201,22 @@ class ConfigRead:
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-                 recover_invalid: bool = True, use_file_limits: bool = True
+                 recover_invalid: bool = True, use_file_limits: bool = True,
+                 host_override: HostOverride = HostOverride.APPLIES
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
+        _require_lower_case(key)
         bad = "<missing>"
 
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
             try:
-                setting = _setting(settings, key)
+                setting = _setting(settings, key, host_override)
             except _MissingKey:
                 if isinstance(default, UseConfiguredValue):
                     raise
                 return default, None
+            if isinstance(setting, _ShiftedSetting):
+                setting.origin.record()
             bad = setting.value
             if not use_file_limits:
                 return convert(setting.value), setting.value
@@ -210,7 +240,7 @@ class ConfigRead:
             repository = _repository_path(self.file)
             if repository != self.source:
                 try:
-                    value, _ = read_key(_parse(repository.read_text(encoding="utf-8")))
+                    value, _ = read_key(_read_settings(repository.read_text(encoding="utf-8"), repository))
                     return RecoveredValue(value, reason)
                 except (OSError, UnicodeError, ValueError, ArithmeticError):
                     pass
@@ -218,13 +248,13 @@ class ConfigRead:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
         if use_file_limits and isinstance(self.settings, dict):
-            current = self.settings.get(self.effective_key(key))
+            current = self.settings.get(self.effective_key(key) if host_override is HostOverride.APPLIES else key)
             if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
             try:
-                value, raw_value = read_key(_parse(committed))
+                value, raw_value = read_key(_read_settings(committed, self.source))
             except (ValueError, ArithmeticError):
                 continue
             if not current_limit:
@@ -247,10 +277,10 @@ class ConfigRead:
 
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-              recover_invalid: bool = True) -> Result:
+              recover_invalid: bool = True, host_override: HostOverride = HostOverride.APPLIES) -> Result:
         """Read one key with a domain conversion and an optional default."""
         result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
-                               recover_invalid=recover_invalid)
+                               recover_invalid=recover_invalid, host_override=host_override)
         if isinstance(result, UnavailableValue):
             raise Unusable(f"{result.reason}; no usable committed value" if recover_invalid else result.reason)
         return result.value
@@ -261,8 +291,9 @@ class ConfigRead:
 
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
+        _require_lower_case(key)
         if isinstance(self.settings, dict):
-            return effective_key(self.settings, key, host_name=_local_host_name())
+            return _effective_key(self.settings, key, local_host_key_name())
         return key
 
     def number(self, key: str) -> float:
@@ -276,12 +307,15 @@ class ConfigRead:
 
     def values(self, *keys: str, host_only_prefix: str = "") -> dict[str, str]:
         """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""
+        for key in keys:
+            _require_lower_case(key)
+        _require_lower_case(host_only_prefix)
         settings = self.settings
         if isinstance(settings, _UnreadableFile):
             settings = self._recover_file(settings)
         selected = dict.fromkeys(keys or settings)
         if host_only_prefix:
-            suffix = f".{_local_host_name()}"
+            suffix = f".{local_host_key_name()}"
             for key in settings:
                 if key.startswith(host_only_prefix) and key.endswith(suffix):
                     selected[key.removesuffix(suffix)] = None
@@ -291,6 +325,8 @@ class ConfigRead:
                 setting = _setting(settings, key)
             except _MissingKey:
                 continue
+            if isinstance(setting, _ShiftedSetting):
+                setting.origin.record()
             if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
                 result[key] = setting.value
                 continue
@@ -304,12 +340,13 @@ class ConfigRead:
     def _recover_file(self, fault: _UnreadableFile) -> dict[str, Setting]:
         if fault.missing and self.repository_allowed and isinstance(self.file, str):
             try:
-                return _parse(_repository_path(self.file).read_text(encoding="utf-8"))
+                repository = _repository_path(self.file)
+                return _read_settings(repository.read_text(encoding="utf-8"), repository)
             except (OSError, UnicodeError):
                 pass
         for contents in _committed_files(self.source):
             _warning(f"warning: {self.source}: keys: {fault.reason}")
-            return _parse(contents)
+            return _read_settings(contents, self.source)
         _warning(f"warning: {self.source}: keys: {fault.reason}")
         raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
 
@@ -355,7 +392,7 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
     except (OSError, UnicodeError) as error:
         return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)),
                           repository_allowed, stamp)
-    return ConfigRead(file, source, _parse(contents), repository_allowed, stamp)
+    return ConfigRead(file, source, _read_settings(contents, source), repository_allowed, stamp)
 
 
 def read_or_repository(stem: str) -> ConfigRead:
@@ -398,24 +435,49 @@ def _parse(source: str) -> dict[str, Setting]:
     return settings
 
 
+def _read_settings(contents: str, source: Path) -> dict[str, Setting]:
+    """Attach shift marks to actual settings only when a test traces reads."""
+    settings = _parse(contents)
+    if conf_reads.shift_reads_enabled():
+        for shift in conf_reads.shifted_values(contents):
+            setting = settings.get(shift.key)
+            if setting is not None and setting.line == shift.line:
+                origin = conf_reads.ShiftedConfigKey(source.name, shift)
+                settings[shift.key] = _ShiftedSetting(setting.value, setting.limit, setting.line, origin)
+    return settings
+
+
 def settings(source: str) -> dict[str, Setting]:
     """Return each stored key of a config text, with its first value and line."""
     return _parse(source)
 
 
-def _local_host_name() -> str:
-    return socket.gethostname().partition(".")[0]
+def host_key_name(host_name: str) -> str:
+    """Return the lower-case short host name for configuration keys."""
+    return host_name.partition(".")[0].lower()
+
+
+def local_host_key_name() -> str:
+    """Return the local host name for configuration keys."""
+    return host_key_name(socket.gethostname())
 
 
 def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> str:
     """Select the override for the specified short host name when it exists."""
-    candidate = f"{key}.{host_name}"
+    _require_lower_case(key)
+    return _effective_key(settings, key, host_key_name(host_name))
+
+
+def _effective_key(settings: dict[str, Setting], key: str, host: str) -> str:
+    candidate = f"{key}.{host}"
     return candidate if candidate in settings else key
 
 
-def _setting(settings: dict[str, Setting], key: str) -> Setting:
+def _setting(settings: dict[str, Setting], key: str, host_override: HostOverride = HostOverride.APPLIES) -> Setting:
     try:
-        return settings[effective_key(settings, key, host_name=_local_host_name())]
+        if host_override is HostOverride.IGNORED:
+            return settings[key]
+        return settings[_effective_key(settings, key, local_host_key_name())]
     except KeyError:
         raise _MissingKey("key is missing") from None
 
@@ -514,6 +576,7 @@ def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
 
 def effective_line(file: str | Path, key: str) -> tuple[int, str]:
     """Return the effective source line index and its value without a write."""
+    _require_lower_case(key)
     source = path(file)
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
@@ -530,13 +593,13 @@ def known_host_names() -> frozenset[str]:
     except FileNotFoundError:
         machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
     aliases = machines.get("aliases")
-    hosts = {_local_host_name().casefold()}
+    hosts = {local_host_key_name()}
     if aliases is not None:
         for alias in aliases.value.split():
-            hosts.add(alias.casefold())
+            hosts.add(host_key_name(alias))
             names = machines.get(f"{alias}.hosts")
             if names is not None:
-                hosts.update(name.partition(".")[0].casefold() for name in names.value.split())
+                hosts.update(host_key_name(name) for name in names.value.split())
     return frozenset(hosts)
 
 
@@ -568,6 +631,7 @@ def host_override(file: str | Path, settings: dict[str, Setting], key: str) -> s
 
 def editable_line(file: str | Path, key: str) -> tuple[int, str]:
     """Return an exact stored key's line and value when no host override exists."""
+    _require_lower_case(key)
     source = path(file)
     try:
         settings = _parse(source.read_text(encoding="utf-8"))
@@ -585,6 +649,7 @@ def editable_line(file: str | Path, key: str) -> tuple[int, str]:
 
 
 def check(file: str | Path, key: str, value: str) -> None:
+    _require_lower_case(key)
     source = path(file)
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
@@ -599,8 +664,9 @@ def main(arguments: list[str] | None = None) -> int:
         print("usage: conf.py get FILE KEY", file=sys.stderr)
         return 2
     try:
+        _require_lower_case(args[2])
         print(read(args[1]).text(args[2]))
-    except Unusable as error:
+    except (InvalidKey, Unusable) as error:
         print(str(error), file=sys.stderr)
         return 2
     return 0

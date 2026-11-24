@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from http.client import HTTPConnection
@@ -24,9 +24,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 from scripts.agents import remote
 from scripts.lib import file_lock
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import branch_page, change_page, page_frame, serve
+from scripts.review_links.server_test_support import started_review_server
 
 
 class BranchForm(HTMLParser):
@@ -82,8 +85,11 @@ class ScratchBranches:
 
 @contextmanager
 def scratch_branches() -> Generator[ScratchBranches, None, None]:
-    with tempfile.TemporaryDirectory(prefix="branch-page-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="branch-page-test-") as temporary, ExitStack() as stack:
         root = Path(temporary)
+        stack.enter_context(patch.dict(os.environ, {
+            **fixture_git_environment(root), "GIT_ALLOW_PROTOCOL": "file",
+        }, clear=True))
         repository, origin = root / "repository", root / "origin.git"
         repository.mkdir()
         history = root / "history"
@@ -207,7 +213,7 @@ class BranchPageTests(unittest.TestCase):
         self.assertIn('Unit: nate — not active', body)
 
     def test_lists_only_merged_recorded_natedev_unit_branches_and_checks_each_row(self) -> None:
-        for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main"):
+        for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main", "enrolled"):
             with self.subTest(live_directory=live_directory), scratch_branches() as fixture:
                 if live_directory in ("missing", "pruned", "newest-run", "unrecorded"):
                     shutil.rmtree(fixture.live_worktree)
@@ -237,6 +243,25 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("-C", str(clone), "merge", "--no-ff", "TEST-merged", "-m", "Merge new branch commit")
                     fixture.merges["TEST-merged"] = fixture.command("-C", str(clone), "rev-parse", "HEAD")
                     _ = fixture.command("-C", str(clone), "push", "origin", "main", "TEST-merged")
+                if live_directory == "enrolled":
+                    integration = fixture.root / "integration"
+                    _ = fixture.command("worktree", "add", str(integration), "TEST-production")
+                    pointer = fixture.repository / "docs/plans/former-production.md"
+                    live_doc = pointer.with_name("former-production-live.md")
+                    unit_table = pointer.read_text(encoding="utf-8").split("## Units", 1)[1]
+                    _ = live_doc.write_text(
+                        f"- **Repository:** `{fixture.repository}`\n- **Merge branch:** `TEST-production`\n"
+                        + f"- **Merge checkout:** `{fixture.repository}`\n- **Showrunner checkout:** `{integration}`\n"
+                        + f"- **Log:** `production.log`\n\n## Units{unit_table}", encoding="utf-8")
+                    _ = pointer.write_text(f"Moved to staff {fixture.publisher}.\n", encoding="utf-8")
+                    _ = fixture.command("commit", "-am", "Point to the live production")
+                    _ = fixture.command("push", "origin", "main")
+                    rows = [replace(row, doc=staff.LiveDoc("natedev", live_doc)) if row.id == fixture.publisher else row
+                            for row in staff.snapshot().rows]
+                    _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}),
+                                                      encoding="utf-8")
+                    self.assertIn("TEST-production", fixture.remote_names())
+                    self.assertNotIn("TEST-production", {row.name for row in fixture.listing().rows})
                 rows = fixture.rows()
                 expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback",
                             "TEST-history-only", "TEST-active<&"}
@@ -307,7 +332,7 @@ class BranchPageTests(unittest.TestCase):
                             self.assertIn(f'Merged into main: {dated_row.merge[:12]} · {merge_markup}', dated_content)
 
     def test_delete_reports_each_result_and_keeps_unchecked_branches(self) -> None:
-        for state in ("unchanged", "advanced"):
+        for state in ("unchanged", "advanced", "registered after page"):
             with self.subTest(state=state), scratch_branches() as fixture:
                 hook = fixture.origin / "hooks" / "update"
                 _ = hook.write_text('#!/bin/sh\nif [ "$1" = refs/heads/TEST-rejected ]; then\n'
@@ -318,14 +343,26 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("checkout", "TEST-merged")
                     _ = fixture.command("commit", "--allow-empty", "-m", "New work after publication")
                     _ = fixture.command("push", "origin", "TEST-merged")
+                if state == "registered after page":
+                    document = fixture.root / "late-production.md"
+                    _ = document.write_text("- **Merge branch:** TEST-merged\n")
+                    _ = fixture_member("showrunner", name="late-production",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
                 before = fixture.remote_names()
                 deletion = branch_page.submit(page, urlencode({"token": page.token,
                                                               "branch": ["TEST-rejected", "TEST-merged", "TEST-legacy"]}, doseq=True))
                 results = branch_page.delete_selected(deletion)
                 self.assertEqual([result.name for result in results], ["TEST-rejected", "TEST-merged", "TEST-legacy"])
                 self.assertIn("TEST deletion refused", results[0].message)
-                self.assertEqual([result.message for result in results[1:]], ["deleted", "deleted"])
-                self.assertEqual(fixture.remote_names(), before - {"TEST-merged", "TEST-legacy"})
+                if state == "advanced":
+                    self.assertIn("branch moved", results[1].message)
+                elif state == "registered after page":
+                    self.assertIn("production merge branch", results[1].message)
+                else:
+                    self.assertEqual(results[1].message, "deleted")
+                self.assertEqual(results[2].message, "deleted")
+                removed = {"TEST-merged", "TEST-legacy"} if state == "unchanged" else {"TEST-legacy"}
+                self.assertEqual(fixture.remote_names(), before - removed)
                 no_owner_page = fixture.page()
                 no_owner_rows = [row.name for row in no_owner_page.rows
                                  if isinstance(row, branch_page.MergedUnownedBranch)]
@@ -446,7 +483,7 @@ class BranchPageTests(unittest.TestCase):
             _ = self.enterContext(patch.object(change_page, "send_to_staff", side_effect=receive))
             _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
             address = serve.tailscale_ip()
-            with serve.ReviewLinksServer((address, 0), root) as server:
+            with started_review_server((address, 0), root) as server:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
                 thread.start()
                 try:
@@ -493,7 +530,7 @@ class BranchPageTests(unittest.TestCase):
                         with patch.object(serve, "loaded_module_stamps",
                                           return_value={Path(serve.__file__): serve.ModuleStampUnavailable.UNREADABLE}):
                             server.next_code_check = 0
-                            server.service_actions()
+                            serve.ReviewLinksServer.service_actions(server)
                         self.assertEqual(server.module_stamps, stamps)
                     identity, sender, message = messages.get(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(completed.get(timeout=TEST_HANG_GUARD_SECS), page.folder)

@@ -34,40 +34,40 @@ ASSIGN = ROOT / "scripts/direct/assign.sh"
 ASSIGNMENT_SETTINGS = {
     "direct": """\
 # whole: 1..
-MIN_REPAIR_BUDGET=3
+min_repair_budget=3
 # range: 5e-324..
-REPAIR_ROUNDS_PER_FINDING=0.5
+repair_rounds_per_finding=0.5
 # whole: 1..
-RUNAWAY_ROUNDS=5
+runaway_rounds=5
 # whole: 1..
-MAX_FIX_ATTEMPTS=2
+max_fix_attempts=2
 # whole: 1..
-MAX_REOPENS=2
+max_reopens=2
 # whole: 1..
-STALLED_ROUNDS=4
+stalled_rounds=4
 # whole: 1..
-MAX_CONSECUTIVE_SAME_KIND_PASSES=4
+max_consecutive_same_kind_passes=4
 # whole: 1..
-MAX_REVIEW_CANCELLATIONS=1
+max_review_cancellations=1
 # whole: 1..
-UNIT_COMPACT_ABOVE_TOKENS=200000
+unit_compact_above_tokens=200000
 # whole: 1..
-ROUTING_FROM_ROUND=4
+routing_from_round=4
 # whole: 1..
-ASTRA_AFTER_FAILED_FIXES=2
+astra_after_failed_fixes=2
 # range: 0.1..0.9
-WORKER_SPLIT_RATIO=0.667
-WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+worker_split_ratio=0.667
+worker_first_turn_text=Reply with ready. Do not use tools.
 # range: 1..600
-WORKER_FIRST_TURN_SECONDS=120
+worker_first_turn_seconds=120
 # range: 1..600
-WORKER_SETTLE_SECONDS=30
+worker_settle_seconds=30
 # range: 1..1800
-WORKER_COMPACT_SECONDS=300
+worker_compact_seconds=300
 # range: 1..600
-PANE_AGENT_START_SECONDS=90
+pane_agent_start_seconds=90
 # range: 0.01..600
-WORKER_PUBLISH_LOCK_SECONDS=15
+worker_publish_lock_seconds=15
 """,
     "build_folders": """\
 # whole: 1..
@@ -122,11 +122,11 @@ remote_transport_seconds=30
 """,
     "staff": """\
 # range: 0.001..
-OPERATION_LOCK_SECONDS=30
+operation_lock_seconds=30
 # range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/productions
+remote_seconds=20
+producer_workspace=producers
+producer_folder_root=~/productions
 """,
     "copies": """\
 remote_registry=~/.local/state/copies/remote-mirrors

@@ -26,7 +26,7 @@ window.fetch=(path,options={})=>{
   return new Promise(()=>{});
  }
  return new Promise((resolve,reject)=>{
-  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
+  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({headers:new Headers(),ok:true,json:async()=>({
    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
   })});
  });
@@ -215,7 +215,7 @@ const rows=[
  {key:'other/C9',state:'Done',type:'change',owner:'two',parked:'false'},
 ].map((data,index)=>{
  const detail=element(),toggle=element(),row=element();
- const dataset={...data,id:data.key,hiddenUntil:data.parked==='true' ? Date.now()+60000 : 0,
+ const dataset={...data,id:data.key,unreadAnswer:false,hiddenUntil:data.parked==='true' ? Date.now()+60000 : 0,
   order:String(index),sortValues:'[]',title:'fixture',number:data.key.toLowerCase()};
  return {...element(),dataset,
   querySelector:selector=>selector==='[data-detail]' ? detail : selector==='.list-toggle' ? toggle : row};
@@ -237,7 +237,7 @@ const reviewPlace=()=>{},loadBodies=()=>{},rememberItem=()=>{};
 const createTable=createRecordTable;
 {
 const createRecordTable=options=>createTable({...options,entries:undefined,mount:undefined});
-''' + table_script + r'''
+''' + review_page.REVIEW_QUEUE_SCRIPT + table_script + r'''
 view.place();view.apply(false);
 if(parkOpenCard){
  view.opened.add('sdlc/C1830');view.apply(false);

@@ -30,7 +30,7 @@ class BoardStartTests(unittest.TestCase):
             _ = shutil.copy2(SCRIPTS / "direct" / "file_lock.sh", direct / "file_lock.sh")
             for name in ("conf.sh", "conf_record.sh", "py"):
                 _ = shutil.copy2(SCRIPTS / "lib" / name, library / name)
-            commands = ["bash", "date", "mkdir", "uname"]
+            commands = ["bash", "date", "mkdir", "tr", "uname"]
             if start != "path":
                 commands.append("readlink")
             for command in commands:

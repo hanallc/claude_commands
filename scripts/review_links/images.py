@@ -197,6 +197,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     names = staff_names.for_page(names, members)
     member = members.by_id(staff.StaffId(record["owner"]))
     shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
+    receiver = f' data-send-receiver="{html.escape(name, quote=True)}"' if member is not None else ""
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
@@ -204,7 +205,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
     returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
-            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
+            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{receiver}>'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{shown_owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
@@ -397,9 +398,9 @@ STYLE = """<style>[hidden]{display:none!important}
 @media (max-width:480px){[data-image-form] .review-actions button{font-size:15px;padding:6px 8px}}
 [data-image-layout]{display:grid;grid-template-columns:max-content minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;
-top:calc(var(--page-heading-space,0px) + var(--page-heading-height,0px) + var(--page-status-height,0px) + 16px);
-max-height:calc(100vh - 32px - var(--page-status-height,0px) - var(--page-heading-space,0px)
-- var(--page-heading-height,0px));overflow:auto;display:grid;
+top:calc(var(--page-actions-space,0px) + var(--page-actions-height,0px) + var(--page-status-height,0px) + 16px);
+max-height:calc(100vh - 32px - var(--page-status-height,0px) - var(--page-actions-space,0px)
+- var(--page-actions-height,0px));overflow:auto;display:grid;
 grid-template-columns:repeat(3,max-content);font-size:14px;border:1px solid #8886;border-radius:8px;white-space:nowrap}
 [data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;cursor:pointer;
 color:inherit;text-decoration:none;overflow-wrap:anywhere}
@@ -486,7 +487,7 @@ function bind(root) {
     sending++;
     try {
       if (!question) await motion.removeCard(card, apply);
-      const response = await fetch(location.pathname, {method: 'POST', body});
+      const response = await heldFetch(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
@@ -501,8 +502,10 @@ function bind(root) {
     } catch (error) {
       postFailed = true;
       if (!question) home.insertBefore(card, next?.parentNode === home ? next : null);
-      status.textContent = 'Not sent: ' + error.message;
+      const undone = error instanceof SendUndone;
+      status.textContent = undone ? error.message : 'Not sent: ' + error.message;
       apply();
+      if (undone) form.elements.feedback.focus();
     } finally {
       sending--;
       setCardSubmitting(form, false);

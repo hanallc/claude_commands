@@ -61,6 +61,7 @@ NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
+    "BUILDLOG_RUN",
     "BUILDLOG_LOCAL_REASON",
     "BUILDLOG_MAC_HOLDER",
     "BUILDLOG_MAC_COPY",
@@ -246,7 +247,7 @@ class RecordTests(unittest.TestCase):
 
     def test_local_and_hana_nextest_steps_classify_fast_passes_without_timing_rows(self) -> None:
         config = Path(os.environ["CONF_DIR"])
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", "nextest_slow_test_s=1.0")
         output = ("PASS [ 0.010s] hana::bin/hana tests::fast\n"
                   + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
         handoff = self.base / "nextest.log"
@@ -273,7 +274,7 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
 
     def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "nextest_slow_test_s=1.0")
         output = ("PASS [ 0.010s] hana tests::forged\n"
                   + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
         for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),
@@ -1456,13 +1457,14 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
-            extra={"BUILDLOG_CALL_ID": CALL_ID, "CLAUDE_CODE_SESSION_ID": session, **board},
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "BUILDLOG_RUN": "123:456", "CLAUDE_CODE_SESSION_ID": session, **board},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
         expected: Record = {
             "kind": "call",
             "id": CALL_ID,
+            "run_id": "123:456",
             "tool": "verify.sh",
             "command": "test hana",
             "verb": "test",
@@ -1494,6 +1496,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual((record["verb"], record["package"], record["status"], record["build_s"]), ("final", "workspace", None, None))
         self.assertIs(record["cached"], False)
         self.assertNotEqual(record["id"], CALL_ID)
+        self.assertIsNone(record["run_id"])
 
     def test_call_records_cargo_token_wait_separately_from_total_wait(self) -> None:
         result = self.record(

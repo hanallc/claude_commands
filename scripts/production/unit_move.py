@@ -79,7 +79,7 @@ class PathMove(NamedTuple):
 
 def git(checkout: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True,
-                            text=True, check=False, timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS"))
+                            text=True, check=False, timeout=_move_timeout("rename_command_timeout_seconds"))
     _check_move_deadline()
     if result.returncode:
         raise RenameRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
@@ -128,33 +128,6 @@ def branch_tip(checkout: Path, branch: str) -> str:
 def remote_tip(checkout: Path, branch: str) -> str:
     listed = git(checkout, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
     return listed.split("\t", 1)[0] if listed else ""
-
-
-def delete_remote_branch(checkout: Path, branch: str, tip: str) -> None:
-    remote = remote_tip(checkout, branch)
-    if remote:
-        if remote != tip:
-            try:
-                _ = git(checkout, "merge-base", "--is-ancestor", remote, tip)
-            except RenameRefused as error:
-                raise RenameRefused(f"origin branch {branch} has history outside the preserved tip") from error
-        # The lease deletes only the tip just checked: a push that lands meanwhile keeps the branch.
-        _ = git(checkout, "push", f"--force-with-lease=refs/heads/{branch}:{remote}", "origin", "--delete", branch)
-
-
-def delete_local_branch(checkout: Path, branch: str, tip: str) -> None:
-    local = branch_tip(checkout, branch)
-    if local:
-        if local != tip:
-            raise RenameRefused(f"branch {branch} moved during the rename")
-        _ = git(checkout, "update-ref", "-d", f"refs/heads/{branch}", tip)
-        _ = subprocess.run(["git", "-C", str(checkout), "config", "--remove-section", f"branch.{branch}"],
-                           capture_output=True, check=False)
-
-
-def delete_branch(checkout: Path, branch: str, tip: str) -> None:
-    delete_remote_branch(checkout, branch, tip)
-    delete_local_branch(checkout, branch, tip)
 
 
 def check_tip(checkout: Path, branch: str, tip: str) -> None:
@@ -536,12 +509,19 @@ def finish_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
         _ = staff.set_worktree(row.id, replace(row.worktree, branch=staff.ParkedBranch(pending.branch)),
                               expected=row.worktree)
     if pending.destination.is_dir():
-        module = import_module("scripts.worktree.worktrees")
-        sync_branch = cast(Callable[[Path], None], module.sync_worktree_branch)
-        sync_branch(pending.destination)
+        _sync_worktree_branch(pending.destination, pending.branch)
     rename_move_path(row.id).unlink()
     return True
 
+
+def _owner_git_checkout(doc: staff.LiveDoc | staff.WrappedDoc) -> Path:
+    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+
+    try:
+        paths = resolve_production_paths(doc.path)
+    except ProductionPathsError as error:
+        raise RenameRefused(str(error)) from error
+    return paths.integration if isinstance(paths, EnrolledPaths) else doc.path.parent
 
 def continue_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
     """Keep the old unit allocation lock until the rename record is cleared."""
@@ -569,7 +549,7 @@ def _finish_rename_push(record: staff.StaffSnapshot, row: staff.StaffRow,
             if (owner is None or not isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
                     or owner.doc.machine != remote.local_machine()):
                 raise RenameRefused("the owner's repository is unavailable")
-            checkout = owner.doc.path.parent
+            checkout = _owner_git_checkout(owner.doc)
         tip = branch_tip(checkout, pending.branch)
         if not tip:
             raise RenameRefused("the local destination branch is unavailable")
@@ -598,7 +578,7 @@ def _move_timeout(key: str) -> float:
 
 def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[staff.StaffId], *, running: bool) -> bool:
     """Accept observations only within the configured operation limit."""
-    key = "RENAME_LIVE_WAIT_SECONDS" if running else "RENAME_RUN_STOP_WAIT_SECONDS"
+    key = "rename_live_wait_seconds" if running else "rename_run_stop_wait_seconds"
     try:
         deadline = min(worker_lifecycle.effective_deadline(), time.monotonic() + _move_timeout(key))
     except worker_lifecycle.OperationDeadlineExpired:
@@ -615,7 +595,7 @@ def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[sta
             settled = wanted <= live if running else wanted.isdisjoint(live)
             if settled:
                 return True
-            poll = _move_timeout("RENAME_POLL_SECONDS")
+            poll = _move_timeout("rename_poll_seconds")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
@@ -634,7 +614,7 @@ def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destin
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
-        repository = checkout_folders(owner.doc.path.parent).common_dir
+        repository = checkout_folders(_owner_git_checkout(owner.doc)).common_dir
         target = checkout_folders(destination)
         identity = target.git_dir / "locked"
         return (repository == target.common_dir and identity.parent.parent == repository / "worktrees"
@@ -654,7 +634,7 @@ def move_checkout(record: staff.StaffSnapshot, row: staff.StaffRow) -> Path:
     if (owner is not None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
             and owner.doc.machine == remote.local_machine()):
         found = [Path(line.removeprefix("worktree ")).resolve()
-                 for line in git(owner.doc.path.parent, "worktree", "list", "--porcelain").splitlines()
+                 for line in git(_owner_git_checkout(owner.doc), "worktree", "list", "--porcelain").splitlines()
                  if line.startswith("worktree ")]
         matching = [path for path in found if _recoverable_folder(record, row, path)]
         if len(matching) == 1:
@@ -994,7 +974,7 @@ def move_idle_folder(
 ) -> bool:
     """Move the folder and branch without changes to the session."""
     destination = destination.expanduser().resolve()
-    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS")),
+    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("rename_command_timeout_seconds")),
           staff.row_operation(str(unit)), ExitStack() as move_locks):
         _check_move_deadline()
         record = staff.snapshot()
@@ -1063,7 +1043,7 @@ def move_idle_folder(
             if pending is not None:
                 _finish_rename_push(record, row, pending, folder)
             elif isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
             return False
         restart = import_module("scripts.agents.restart")
         live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
@@ -1093,7 +1073,7 @@ def move_idle_folder(
             if pending is not None:
                 _finish_rename_push(record, row, pending, folder)
             elif isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
             push_finished = True
         finally:
             if isinstance(managed, LegacyWorktreeDestination) and not old.exists() and destination.exists():
@@ -1110,6 +1090,17 @@ def move_idle_folder(
         return _unlock_move(folder, unit) or changed
 
 
+def _sync_worktree_branch(checkout: Path, branch: str) -> None:
+    module = import_module("scripts.worktree.worktrees")
+    sync_branch = cast(Callable[[Path, str], None], module.sync_worktree_branch)
+    sync_branch(checkout, branch)
+
+
+def _sync_and_push_moved_branch(checkout: Path, branch: str) -> None:
+    _sync_worktree_branch(checkout, branch)
+    _push_moved_branch(checkout, branch)
+
+
 def _push_moved_branch(checkout: Path, branch: str) -> None:
     upstream = git(checkout, "for-each-ref", "--format=%(upstream:short)", f"refs/heads/{branch}")
     if upstream != f"origin/{branch}" or remote_tip(checkout, branch) != branch_tip(checkout, branch):
@@ -1119,7 +1110,7 @@ def _push_moved_branch(checkout: Path, branch: str) -> None:
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Defer running work, then move the idle worktree and resume the director."""
     destination = destination.expanduser().resolve()
-    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS")),
+    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("rename_command_timeout_seconds")),
           staff.row_operation(str(unit)), ExitStack() as locks):
         _check_move_deadline()
         record = staff.snapshot()
@@ -1158,12 +1149,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         current_branch = checked_out_branch(folder)
         move_source = source != destination if isinstance(managed, ManagedWorktreeDestination) else folder != destination
         move_complete = not move_source and old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
+        if isinstance(managed, ManagedWorktreeDestination) and not current_branch and not move_complete:
+            raise RenameRefused(f"{folder}: the checkout has no branch (detached HEAD)")
         apply_move = (prepare_checkout_move(source, folder, destination, managed)
                       if move_source else NoCheckoutMove.STAYS)
         if move_complete:
             if not move_locked(unit, folder):
                 if isinstance(branch, str):
-                    _push_moved_branch(folder, branch)
+                    _sync_and_push_moved_branch(folder, branch)
                 return False
         members = [row, *record.find(kind="worker", parent=row.id)]
         for member in members[1:]:
@@ -1194,7 +1187,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         if move_complete:
             if isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
             _ = _unlock_move(folder, unit)
             return True
         changed = False
@@ -1216,7 +1209,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         try:
             if move_source:
                 move_lock_created = _lock_move(folder, unit)
-            stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
+            stop_deadline = time.monotonic() + _move_timeout("rename_run_stop_wait_seconds")
             with worker_lifecycle.operation_deadline(deadline=stop_deadline):
                 for member in members:
                     if member.id in live:
@@ -1247,7 +1240,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 _ = git(folder, "branch", "-m", branch)
                 changed = True
             if isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
         finally:
             if isinstance(managed, LegacyWorktreeDestination) and not old.exists() and destination.exists():
                 folder = destination
@@ -1277,7 +1270,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                     _ = _unlock_move(folder, unit)
             finally:
                 try:
-                    start_deadline = time.monotonic() + _move_timeout("RENAME_LIVE_WAIT_SECONDS")
+                    start_deadline = time.monotonic() + _move_timeout("rename_live_wait_seconds")
                     with worker_lifecycle.operation_deadline(deadline=start_deadline):
                         still_live = observe()
                         for member in members:

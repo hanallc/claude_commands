@@ -243,7 +243,7 @@ Reconciliation processes predecessors first.
 The ledger repeats the disjoint-footprint proof inside the assignment transaction.
 Widening, finding follow or replace, base or tip changes, and checkpoint writes revalidate the footprints under the same write lock.
 A conflict or unreadable footprint cancels the write. Resume and the gate recheck before publishing
-work. Merge checks again, including after the predecessor has merged. These
+work. The ledger checks again at merge time, including after the predecessor merges. These
 checks include both bases and checkpoints, the live unit and style tips, and
 the tickets' actual committed paths, so later references and unplanned edits
 cannot bypass the original check. An existing overlapping pair waits for
@@ -257,12 +257,14 @@ Standing plans carry `> **Standing:** style_plan.py` and live under
 and checkpoint and shrink never commit or shrink them. Keep production
 instructions and plans out of `docs/style/` and `docs/<member>/style/`, which
 `rules.load_rules` reads as local rules.
-`add_unit.py` launches a standing plan from the showrunner checkout and copies
-it into the unit worktree, where the unit's copy is its own. Refill, ticket
-phases and pinned rule files live in that unit copy; the showrunner copy is
-only the first-launch template. Edit a launched unit's copy for changes meant
-for it. Checkpoint stages only code paths and never the plan or anything under
-`docs/style-production/`; standing plans skip shrink and every closing gate.
+`add_unit.py` copies the standing plan from the integration checkout into the unit worktree.
+The unit owns its copy. Refill, ticket phases, and pinned rule files use that copy.
+Edit that copy to change a launched unit's plan.
+Read production policy from the live staff document.
+Publish code through the integration checkout.
+Use item 143 test copies for verification.
+Checkpoint stages only code paths. It excludes the plan and `docs/style-production/`.
+Standing plans skip shrink and the closing gates.
 Run refill at startup, after restart or compaction, and after each ticket.
 Use `style_plan.py checkpoint` under <StyleCheckpoint/> in `docs/direct/style_unit.md`.
 It gates and publishes one ticket, records its checkpoint and confirms reservation release before another publication.
@@ -286,7 +288,7 @@ contains main nor is its ancestor, a rename or copy anywhere in the range, or
 an unknown crate for a selected file holds refill closed. The pushed tip is `origin/<branch point>`, or the
 local branch when the repository has no `origin`. The checkouts share one
 repository, so the local branch can hold a parent merge whose gate is still
-running. Reconcile and the hand-off merge check read the same pushed tip.
+running. Reconcile and handoff verification read the same pushed tip.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before

@@ -34,6 +34,7 @@ from typing import cast
 from scripts.build_queue import progress_profile
 from scripts.lib import conf, process_start
 from scripts.lint import nextest_budget as budget
+from scripts.mac_test import floor_claims
 
 # `cargo nextest run` options that only change how tests run or report: the runner,
 # stress and reporter options of `cargo nextest run --help`. nextest refuses some of
@@ -161,7 +162,8 @@ def exit_status(returncode: int) -> int:
 
 def run_child(argv: Sequence[str], *, environment: Mapping[str, str] = os.environ) -> int:
     """Run one child in this process group, and end when it ends."""
-    return exit_status(subprocess.run(argv, check=False, env=environment).returncode)
+    return exit_status(subprocess.run(argv, check=False, env=environment,
+                                      pass_fds=floor_claims.inherited_mirror_descriptors()).returncode)
 
 
 @dataclass(frozen=True)
@@ -177,7 +179,8 @@ class UnavailableTestCount:
 def selected_test_count(run: SizedTestRun) -> SelectedTestCount | UnavailableTestCount:
     """Count tests whose nextest filter result is a match."""
     try:
-        result = subprocess.run(run.list_selected(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+        result = subprocess.run(run.list_selected(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                pass_fds=floor_claims.inherited_mirror_descriptors(), check=True)
         summary = cast(object, json.loads(result.stdout))
     except subprocess.CalledProcessError as error:
         return UnavailableTestCount(f"nextest list exited {exit_status(error.returncode)}")

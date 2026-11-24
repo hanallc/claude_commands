@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 
-from scripts.production import add_unit, completion_receipt, staff, staff_sources, unit_config, worker
+from scripts.production import add_unit, completion_receipt, session_staff, staff, staff_sources, unit_config, worker
 from scripts.herdr import herdr_types
 from scripts.agents import remote, stop_resume
 from scripts.agents import worker_lifecycle
@@ -102,12 +102,6 @@ def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path, *,
         raise Refusal(f"{unit}'s worktree {worktree} has uncommitted work; it checkpoints first")
 
 
-def _committed(doc: Path) -> None:
-    tracked = _git(doc.parent, "ls-files", "--error-unmatch", "--", doc.name)
-    if tracked.returncode != 0 or _git(doc.parent, "status", "--porcelain", "--", doc.name).stdout.strip():
-        raise Refusal(f"{doc} is not committed; the unit commits it first")
-
-
 def check_director(name: str, marked: unit_lookup.LabeledSession, claude: unit_lookup.LiveClaude,
                    worktree: Path, *, skip_path: Path | CheckAllFiles = CHECK_ALL_FILES) -> None:
     """Require an idle director and no uncommitted work outside the skipped path."""
@@ -144,6 +138,9 @@ def checked(name: str, child_name: str, doc: Path, *,
         claude = unit_lookup.LiveClaude(fields["session"], fields["session_id"], fields["socket"], int(fields["pid"]))
         marked = unit_lookup.LabeledSession(name, claude, herdr.HerdrPlace(fields["session"], fields["pane"]))
         return Promotion(name, parent, child, marked, claude, worktree, add_unit.saved_unit_type(fields))
+    from scripts.production.production_lifecycle import require_new_document
+
+    require_new_document(child)
     try:
         selected = staff_sources.member(staff_sources.UnitMember(parent.name, name), record)
         if isinstance(selected, staff_sources.NoSuchMember):
@@ -159,7 +156,6 @@ def checked(name: str, child_name: str, doc: Path, *,
         raise Refusal(f"{name} has no live session under {parent.name}")
     claude = marked.claude
     check_director(name, marked, claude, worktree)
-    _committed(child.doc)
     # Only the unit's herdr tab will end before the same-named destination starts.
     directory = showrunner_account_directory()
     ending = add_showrunner.EndingUnitTab(marked.place.pane)
@@ -370,8 +366,9 @@ def _main(argv: list[str]) -> int:
         return 2
     unit = promotion.unit
     if cast(bool, args.check):
+        directory = session_staff.production_session_directory(promotion.child.doc, promotion.worktree)
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
-              + f"{promotion.child.name} in {promotion.worktree} under {promotion.parent.name}, and preserve its native row; {moved}")
+              + f"{promotion.child.name} in {directory} under {promotion.parent.name}, and preserve its native row; {moved}")
         return 0
     parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.name), record)
     parent_row = parent_member.row if isinstance(parent_member, staff_sources.MemberFound) else None

@@ -127,6 +127,7 @@ Codex rows:
 - `Roster(entries, problems, warnings)`; `RosterScope = ThisMachine | AllMachines`; `roster(environment, scope) -> Roster` (scope required). Unreadable durable-role records are warnings: they preserve the readable rows and do not make recipient discovery incomplete. Other source failures remain problems. `diagnostics` combines problems and labelled warnings for display.
 - `SenderIdentity = CodexThread | ClaudeSession | NoSession` from `sender_identity(environment)`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`. `is_sender(entry, identity)` matches a Codex row's `thread` or any row's `session`; `NoSession` matches nothing.
 - `is_top_level(entry)`: a Claude row that is not a worker and not a unit director `UnderShowrunner`.
+- `is_closed_worker(entry)` identifies worker rows whose pane observation confirmed closure.
 - `cannot_receive_message_text(entry)`: the one refusal text for `send.py` and `broadcast.py`, `<name> cannot take messages (<reason>)` plus a tail: a worker `UnderDirector` gets `; contact its unit director <name> or wait`, a worker with `NoDirector` none, a socketless Claude session `; wait for it to open its messaging socket, then read the roster again and send again`.
 
 ### Unit labels (`roster.py`)
@@ -244,8 +245,8 @@ An in-flight notice blocks a second notice for one send budget.
 A worker's owner is its director.
 Other staff senders use their first showrunner ancestor.
 The notice addresses a staff owner by its staff id, so two units with one name stay distinct.
-Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `UNIT_ANOMALIES_TO` from `production.conf`.
-Staff senders without a parent also use `UNIT_ANOMALIES_TO`.
+Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `unit_anomalies_to` from `production.conf`.
+Staff senders without a parent also use `unit_anomalies_to`.
 The detector sends notices as `send.py` and ignores failures from that sender.
 Detector errors print one stderr line and preserve the failed send's result.
 
@@ -558,10 +559,12 @@ broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--producti
 
 `BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
 The group type stays separate from the roster's `Role` because flags overlap.
+Every group excludes closed workers before delivery and empty-group checks.
+The roster keeps these rows for direct sends and other readers.
 
 | Flag | Members |
 |---|---|
-| `--all` | every row |
+| `--all` | every eligible row |
 | `--showrunners` | role `showrunner` |
 | `--units` | every unit director; after `--production <showrunner name or session: address>`, unit directors whose `UnderShowrunner.address` matches that showrunner |
 | `--agents` | every worker and freestanding session, Claude and Codex |
@@ -572,7 +575,11 @@ The group type stays separate from the roster's `Role` because flags overlap.
 - `RunsProduction`, `DirectsUnit`, `ProductionWithoutRunningShowrunner` and `NoDirector` rows join no unit worker group.
 - A row several flags select gets one delivery, carrying the last selecting flag's text, so a role flag after `--all` keeps its own text.
 - Each message is `<text>`, a blank line, and the closing line `Sent directly to <groups> on <machine> and <other machine>; do not pass it on.` (`on this machine` under `--here`).
-- Delivery is `send.py --to <address> --from <sender> --here --text ...` per `Messageable` row, 24 at once (`AT_ONCE`), never with action flags. A recipient gone since the roster read is a failed delivery here. A `CannotReceiveMessages` row prints `send.py`'s refusal line and is neither sent nor a failure.
+- Broadcast runs `send.py --to <address> --from <sender> --here --text ...` for each selected `Messageable` row.
+  It runs up to 24 sends at a time (`AT_ONCE`) without action flags.
+  If a recipient disappears after the roster read, the delivery fails on that machine.
+  Each selected `CannotReceiveMessages` row prints the refusal from `send.py`.
+  These refusals do not affect the sent count or the exit status.
 - Without `--here`, `ssh <other machine> env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID [BROADCAST_SEND=...] BROADCAST_CLOSING_MACHINES=... broadcast.py --here --from <sender> <same groups>` runs in parallel (120 s timeout); its lines print under `<host>: `. The replay spells an all-workers group `--all-workers` (accepted by `main`, absent from `USAGE`) so it does not inherit an earlier `--of`. ssh exit 255, a timeout, or a nonzero exit with no `NOT sent` line yields `<host>: NOT sent: <why>`.
 - `--of` is resolved once across both machines before any delivery: one director gives its machine and address; several give exit 2 with `<target> matches more than one unit director:` and their addresses; none gives `unknown unit <target>; known units:`. If the other machine is not reached, `--of` sends nothing: one `NOT sent` line, exit 1. `--of` without a following `--workers` is a usage error.
 - `--production` resolves a showrunner's staff name or session address across both machines before delivery.

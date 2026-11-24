@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from scripts.agents.test_support import write_machine_config
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 from scripts.agents import remote
 from scripts.herdr import herdr_types
@@ -130,7 +130,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
         case.setUp()
         world = ProducerAdmissionWorld(case, kind)
         staff_configuration = case.root / "configuration/staff.conf"
-        _ = write_config_fixture(staff_configuration, f"PRODUCER_FOLDER_ROOT={world.folder.parent}\n")
+        _ = write_config_fixture(staff_configuration, f"producer_folder_root={world.folder.parent}\n")
         configuration = case.root / "configuration/models.conf"
         _ = write_registry(configuration, {"producers": {"dwight": kind + (":opus:high" if kind == "claude" else ":gpt-test:high")}}, update=True)
         result = case.client.result
@@ -240,8 +240,8 @@ class WorkerResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
-        atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     case.fixture.root / "conf/shutdown.conf")
         opened = case.opened()
         _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -309,6 +309,41 @@ class StopResumeTests(unittest.TestCase):
             assert isinstance(exited, staff.Exited)
             self.assertEqual(exited.why, "keep stopped")
             self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+
+    def test_stop_selects_a_worker_by_its_unit_path(self) -> None:
+        hana = fixture_member("showrunner", name="hana")
+        assembly = fixture_member("unit", name="assembly", parent=hana.id)
+        worker = fixture_member("worker", name="fix2", parent=assembly.id)
+        _ = fixture_member("worker", name="fix2", parent=fixture_member("unit", name="cables", parent=hana.id).id)
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(worker.current_session)) as stop,
+              patch.object(stop_resume, "stop_unit_workers", return_value=[]) as stop_workers):
+            for path in ("assembly/fix2", "hana/assembly/fix2"):
+                with self.subTest(path=path), redirect_stdout(io.StringIO()):
+                    self.assertEqual(shutdown.main(["stop", path]), 0)
+                    self.assertEqual(stop.call_args.args, (str(worker.id),))
+            stop_workers.assert_not_called()
+            with self.subTest(path="hana/assembly"), redirect_stdout(io.StringIO()):
+                self.assertEqual(shutdown.main(["stop", "hana/assembly"]), 0)
+                self.assertEqual(stop_workers.call_args.args[0], assembly.id)
+                self.assertEqual(stop.call_args.args, (str(assembly.id),))
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["stop", "--dry-run", "assembly/fix2"]), 0)
+            self.assertEqual(output.getvalue(), "fix2: would stop\n")
+            stop.reset_mock()
+            other = fixture_member("unit", name="assembly", parent=fixture_member("showrunner", name="cad").id)
+            _ = fixture_member("worker", name="fix2", parent=other.id)
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(shutdown.main(["stop", "assembly/fix2"]), 2)
+            self.assertEqual(errors.getvalue(), "shutdown: StaffRefused: assembly/fix2: several staff rows match: "
+                             + "cad/assembly/fix2, hana/assembly/fix2; use the full path or the staff id\n")
+            stop.assert_not_called()
+
+    def test_stop_gives_a_path_with_no_staff_row_to_the_session_stop(self) -> None:
+        """A native session name can contain a slash, such as review/x."""
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning("review/x")) as stop,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["stop", "review/x"]), 0)
+        self.assertEqual(stop.call_args.args, ("review/x",))
 
     def test_remote_producer_exit_stops_on_mac_and_saves_the_hold(self) -> None:
         row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree("mac", self.root))
@@ -1071,17 +1106,17 @@ class StopResumeTests(unittest.TestCase):
     def test_shutdown_uses_committed_values_and_keeps_the_recovery_warning(self) -> None:
         config = self.root / "committed-config"
         path = config / "shutdown.conf"
-        atomic_file.write_text_atomic(path, "# range: 5e-324..\nSTOP_GRACE_SECONDS=.2\n# range: 5e-324..\nKILL_GRACE_SECONDS=.3\n")
+        atomic_file.write_text_atomic(path, "# range: 5e-324..\nstop_grace_seconds=.2\n# range: 5e-324..\nkill_grace_seconds=.3\n")
         for args in (("init", "-q"), ("add", "shutdown.conf"),
                      ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "settings")):
             _ = subprocess.run(["git", "-C", str(config), *args], capture_output=True, check=True)
-        atomic_file.write_text_atomic(path, "# range: 5e-324..\nSTOP_GRACE_SECONDS=bad\n# range: 5e-324..\nKILL_GRACE_SECONDS=.3\n")
+        atomic_file.write_text_atomic(path, "# range: 5e-324..\nstop_grace_seconds=bad\n# range: 5e-324..\nkill_grace_seconds=.3\n")
         self.process.side_effect = self.alive_until_kill
         self.live.return_value = sessions.LiveSessionProcess(123)
         with patch.dict(os.environ, {"CONF_DIR": str(config)}), redirect_stderr(io.StringIO()) as warnings:
             result = stop_resume.stop(self.entry["session_id"])
         self.assertIsInstance(result, stop_resume.Stopped)
-        self.assertIn("STOP_GRACE_SECONDS='bad'", warnings.getvalue())
+        self.assertIn("stop_grace_seconds='bad'", warnings.getvalue())
         self.assertAlmostEqual(self.clock.elapsed, .2)
 
     def test_worker_stops_share_the_outer_deadline_concurrently(self) -> None:
@@ -1090,7 +1125,7 @@ class StopResumeTests(unittest.TestCase):
                                    current_session=staff.StaffId(f"native-{i}")) for i in range(3))
         states = [worker_panes.OpenWorker(row, row.name, row.name, herdr.AgentStatus.WORKING) for row in rows]
         config = self.root / "config"
-        atomic_file.write_text_atomic(config / "shutdown.conf", "# range: 5e-324..\nSTOP_GRACE_SECONDS=.25\n# range: 5e-324..\nKILL_GRACE_SECONDS=.5\n")
+        atomic_file.write_text_atomic(config / "shutdown.conf", "# range: 5e-324..\nstop_grace_seconds=.25\n# range: 5e-324..\nkill_grace_seconds=.5\n")
         joined = Barrier(3)
         def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
             del row, client
@@ -1116,7 +1151,7 @@ class StopResumeTests(unittest.TestCase):
             self.clock.elapsed = 0
             config = self.root / "config"
             atomic_file.write_text_atomic(config / "shutdown.conf",
-                f"# range: 5e-324..\nSTOP_GRACE_SECONDS={stop_grace}\n# range: 5e-324..\nKILL_GRACE_SECONDS={kill_grace}\n")
+                f"# range: 5e-324..\nstop_grace_seconds={stop_grace}\n# range: 5e-324..\nkill_grace_seconds={kill_grace}\n")
             def read(identity: str, _kind: str = "") -> herdr.LiveConversation:
                 self.advance(10)
                 _ = joined.wait(timeout=5)
@@ -1210,14 +1245,17 @@ class StopResumeTests(unittest.TestCase):
 
     def test_unusable_shutdown_values_send_no_signal_or_start(self) -> None:
         config = self.root / "config"
-        for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS"):
-            values = {name: "1" for name in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "START_SECONDS", "STAY_SECONDS")}
+        for key in ("stop_grace_seconds", "kill_grace_seconds", "start_seconds", "stay_seconds"):
+            values = {name: "1" for name in ("stop_grace_seconds", "kill_grace_seconds", "start_seconds", "stay_seconds")}
             values[key] = "0"
             atomic_file.write_text_atomic(config / "shutdown.conf", "\n".join(f"# range: 5e-324..\n{name}={value}" for name, value in values.items()))
             with (self.subTest(key=key), patch.dict(os.environ, {"CONF_DIR": str(config)}),
                   patch.object(stop_resume, "_signal_process") as send,
                   patch.object(stop_resume, "_start_session") as start):
-                result = stop_resume.stop(self.entry["session_id"]) if "GRACE" in key else stop_resume.resume(self.entry["session_id"])
+                if key.endswith("_grace_seconds"):
+                    result = stop_resume.stop(self.entry["session_id"])
+                else:
+                    result = stop_resume.resume(self.entry["session_id"])
             self.assertIsInstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed))
             self.assertIn(key, str(result))
             self.assertIn(str(config / "shutdown.conf"), str(result))
@@ -2683,8 +2721,8 @@ class StopResumeTests(unittest.TestCase):
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         write_machine_config(configuration)
-        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
-        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\nSTOP_GRACE_SECONDS=2\n")
+        _ = write_config_fixture(configuration / "staff.conf", "producer_workspace=producers\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "start_seconds=20\nstop_grace_seconds=2\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "alpha": "claude:opus:max", "renamed-alpha": "claude:opus:max",
             "TEST-account-home": "claude:opus:max", "row-name": "claude:opus:max",
@@ -3139,7 +3177,7 @@ class StopResumeTests(unittest.TestCase):
         ancestry = herdr.ProcessAncestry({holder: shell}, {shell: 34816, holder: 34816})
         shell_process = herdr.HerdrProcess(shell, place, {"CLAUDE_CODE_SESSION_ID": row.current_session},
                                           "zsh", str(self.root), ancestry)
-        _ = write_config_fixture(self.root / "configuration/shutdown.conf", "HOLDER_EXIT_SECONDS=.25\n")
+        _ = write_config_fixture(self.root / "configuration/shutdown.conf", "holder_exit_seconds=.25\n")
         for command, runs_agent, exits_after_wait, expected_wait in (
                 ("node", True, False, 0.0),
                 ("python3", False, False, 0.25),
@@ -3219,8 +3257,8 @@ class StopResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
-        atomic_file.write_text_atomic(case.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     case.root / "conf/shutdown.conf")
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
                           current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
@@ -4967,7 +5005,7 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.resume("alpha", why="maintenance")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         self.assertGreater(observed.call_count, 1)
-        self.assertEqual(self.clock.elapsed, conf.read("shutdown").number("START_SECONDS"))
+        self.assertEqual(self.clock.elapsed, conf.read("shutdown").number("start_seconds"))
         self.assertEqual(self.client.prompts, [])
         self.assertEqual(errors.getvalue().splitlines(), [
             f"{self.entry['session_id']}: prompt identity anomaly: registry unavailable"])
@@ -5207,7 +5245,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
-        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
+        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("stay_seconds"))
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         arguments = cast(list[str], self.detach.call_args.args[0])
         self.assertEqual(arguments[:3], ["stay", "--session", "019b3a40-4250-7000-8000-000000000102"])
@@ -5231,7 +5269,7 @@ class StopResumeTests(unittest.TestCase):
             result, log = self.run_stay_child()
         self.assertEqual(result, 1)
         self.assertIn("stopped 0.6 s", log)
-        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("STAY_SECONDS"))
+        self.assertLess(self.clock.elapsed, conf.read("shutdown").number("stay_seconds"))
         push.assert_called_once()
         self.assertTrue(cast(str, push.call_args.args[1]).startswith("resume-ended:"))
         self.start.assert_not_called()
@@ -6121,7 +6159,7 @@ class StopResumeTests(unittest.TestCase):
 
         def send(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[command.index("--repeat-minutes") + 1],
-                             str(conf.read("shutdown").whole("MOVE_ALERT_REPEAT_MINUTES")))
+                             str(conf.read("shutdown").whole("move_alert_repeat_minutes")))
             action = next(argument.removeprefix("action=") for argument in command if argument.startswith("action="))
             self.assertLessEqual(len(action), pushover.ACTION_TEXT_MAX)
             key = command[command.index("--key") + 1]
@@ -6635,7 +6673,7 @@ class MoveNowTests(unittest.TestCase):
         configuration = self.root / "config"
         environment = config_environment(configuration)
         environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN=MISSING_HERDR_BIN)
-        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_STOP_MARGIN_SECONDS=3\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "move_stop_margin_seconds=3\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         self.moved = []

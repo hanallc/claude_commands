@@ -124,7 +124,7 @@ class CloudPlace:
     group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP
 
 
-def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]:
+def cloud_queue_time(place: CloudPlace, since: float) -> tuple[float, int, str]:
     """Use the trial start time for grouped requests."""
     if isinstance(group := place.group, CloudGroup):
         return group.started_at, 0, group.key
@@ -132,12 +132,63 @@ def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]
 
 
 @dataclass(frozen=True)
+class NoFirstStatus:
+    """The first step of the run has sent no release status."""
+
+
+NO_FIRST_STATUS = NoFirstStatus()
+
+
+@dataclass(frozen=True)
+class NotReplaced:
+    """No newer run of the unit took the place of this run."""
+
+
+NOT_REPLACED = NotReplaced()
+
+# The kind of run whose place a new run took: a run that failed (rule 20), or a run that waited (rule 13).
+TookPlace = Literal["", "failed", "waiting"]
+
+
+@dataclass(frozen=True)
+class UnitPlace:
+    """The run's place in the line of its unit and repository, which rules 13 and 20 use."""
+    repository: str
+    # The job of the run's first request; records.place_kind matches it.
+    job: str
+    machines: tuple[str, ...] = ()
+    # Granted reservations; a new grant of the first step, after a token gap, does not count again.
+    reservations: int = 0
+    first_step: str = ""
+    first_status: int | NoFirstStatus = NO_FIRST_STATUS
+    # A step that runs test binaries got a grant. After that, a failed step holds no place.
+    tests_started: bool = False
+    # The step key of the latest step that failed before the tests started; "" when no step failed.
+    failed_step: str = ""
+    # How many times a place of a failed run moved to a newer run of the unit.
+    replaces: int = 0
+    replaced_by: RunIdentity | NotReplaced = NOT_REPLACED
+    took_place: TookPlace = ""
+
+
+@dataclass(frozen=True)
+class OutsideUnitRules:
+    """Rules 13 and 20 do not apply: the run has no unit, or its unit is exempt."""
+
+
+OUTSIDE_UNIT_RULES = OutsideUnitRules()
+
+
+@dataclass(frozen=True)
 class RunPlace:
-    """The run placement holds its identity, first owner, start time, and unit."""
+    """Keep the first place of a live run."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    move_id: str = ""
+    repository: str = ""
+    unit_place: UnitPlace | OutsideUnitRules = field(default=OUTSIDE_UNIT_RULES, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -279,12 +330,17 @@ class LaunchRequest(CallerCode):
     profile: records.StepProfile | records.ProgramProfile
 
 
+ReleaseEnding = Literal["result", "handed_off"]
+
+
 @dataclass(frozen=True)
 class ReleaseRequest(CallerCode):
     """The request releases a reservation with its final status."""
     request_id: str
     reservation: str
     status: int
+    # "handed_off": the grant only held the place until the command sent its own first step.
+    ending: ReleaseEnding = "result"
 
 
 @dataclass(frozen=True)
@@ -481,6 +537,7 @@ class Refused:
 
 
 PLACEMENT_REQUEST_MISSING_REASON = "placement request is missing"
+REPLACED_REASON = "a newer run of this unit took its place"
 
 
 @dataclass(frozen=True)
@@ -646,6 +703,7 @@ class ConsumePermission(CallerCode):
     claim: placement.ProviderClaimReference
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = field(
         default_factory=lambda: placement.ClaimHolderUnconfirmed("not supplied"))
+    guest_proof_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -657,6 +715,12 @@ class ExecutionReport(CallerCode):
     evidence: execution_identity.ExecutionEvidence
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
     path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
+
+
+@dataclass(frozen=True)
+class SettlementRequest:
+    """Ask the queue to confirm settlement for an exact gate attempt."""
+    assignment: placement.PlacementAssignment
 
 
 @dataclass(frozen=True)
@@ -725,7 +789,8 @@ Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest
            | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
-           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
+           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport
+           | SettlementRequest | PrerequisiteReport | CancelPlacement)
 
 Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
          | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
@@ -742,7 +807,7 @@ _REQUESTS: dict[str, type] = {
     "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
-    "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
+    "consume_permission": ConsumePermission, "execution_report": ExecutionReport, "settlement": SettlementRequest,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
     _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
@@ -757,7 +822,8 @@ REPLY_TYPES: dict[str, type] = {
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
     "local_placement_granted": LocalPlacementGranted, "placement_status": PlacementStatusReply,
 }
-_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission,
+                    ExecutionReport, SettlementRequest, PrerequisiteReport, CancelPlacement,
                     PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 
@@ -805,6 +871,8 @@ def _write_wire_record(value: object) -> object:
     # An older reader has no session field; a request with no session leaves it out.
     if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
         del record["session"]
+    if record.get("kind") == "ConsumePermission" and record.get("guest_proof_required") is False:
+        del record["guest_proof_required"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
@@ -970,6 +1038,6 @@ def write_assignment(path: Path, reply: Assignment | LocalPlacementGranted) -> N
 
 # JSON escapes one character into at most six ASCII bytes; include the newline.
 CLEANUP_REQUEST_MAX_BYTES = max(len(encode_request(ReleaseRequest(
-    "\0" * CLEANUP_STRING_MAX, "\0" * CLEANUP_STRING_MAX, status,
+    "\0" * CLEANUP_STRING_MAX, "\0" * CLEANUP_STRING_MAX, status, "handed_off",
     code_version="\0" * CLEANUP_STRING_MAX)).encode())
     for status in (CLEANUP_STATUS_MIN, CLEANUP_STATUS_MAX))

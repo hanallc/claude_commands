@@ -1701,6 +1701,10 @@ class PaneEvidenceRun:
     lock: RLock = field(default_factory=RLock)
 
 
+class RestorePaneEvidenceRun(PaneEvidenceRun):
+    """Retain classified uncertainty for the duration of a worker restore."""
+
+
 _pane_evidence_run: ContextVar[PaneEvidenceRun | ScanAtUse] = ContextVar(
     "pane_evidence_run", default=_SCAN_AT_USE)
 
@@ -1716,6 +1720,27 @@ def pane_evidence_run() -> Generator[None]:
         yield
     finally:
         _pane_evidence_run.reset(token)
+
+
+@contextmanager
+def restore_pane_evidence_run() -> Generator[None]:
+    """Keep restore evidence in its own scope."""
+    token = _pane_evidence_run.set(RestorePaneEvidenceRun())
+    try:
+        yield
+    finally:
+        _pane_evidence_run.reset(token)
+
+
+def refresh_restore_pane_evidence() -> None:
+    """Keep only classified uncertainty for identified terminals until restore ends."""
+    run = _pane_evidence_run.get()
+    if isinstance(run, RestorePaneEvidenceRun):
+        with run.lock:
+            for key, evidence in tuple(run.sessions.items()):
+                if not key[2] or not isinstance(evidence, PaneSessionsUnknown):
+                    del run.sessions[key]
+            run.shell_processes.clear()
 
 
 @dataclass
@@ -1899,8 +1924,7 @@ class Herdr:
         run = _pane_evidence_run.get()
         if isinstance(run, PaneEvidenceRun):
             with run.lock:
-                panes = [pane for pane in panes if
-                         (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", ""))) not in run.sessions]
+                panes = [pane for pane in panes if self._pane_evidence_key(pane) not in run.sessions]
         def read(pane: str) -> tuple[str, dict[str, object]]:
             try:
                 return pane, self.socket_request("pane.process_info", pane_id=pane)
@@ -2025,7 +2049,7 @@ class Herdr:
         created = self.created_workspaces.get(space)
         if created is not None and any(item.get("workspace_id") == created for item in self.listed("workspace")):
             return created
-        producer_space = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+        producer_space = conf.read_or_repository("staff").text("producer_workspace")
         if space == producer_space:
             return next((json_text(item.get("workspace_id"), "herdr workspace id")
                          for item in self.listed("workspace") if item.get("label") == space), None)
@@ -2051,7 +2075,7 @@ class Herdr:
                                   json_text(matches[0].get("workspace_id"), "herdr workspace id"))
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
-            key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
+            key = self._pane_evidence_key(pane)
             with run.lock:
                 pid = run.shell_processes.get(key)
             if pid is None:
@@ -2258,7 +2282,7 @@ class Herdr:
         """Wait for the own pane to reach the shell; refuse the start when the time passes first."""
         identity = json_text(pane.get("pane_id"), "pane id")
         if not isinstance(self.pane_activity(identity), PaneAtShell):
-            limit = conf.read("shutdown").number("OWN_PANE_SHELL_SECONDS")
+            limit = conf.read("shutdown").number("own_pane_shell_seconds")
             if not self._shell_within(identity, limit):
                 raise OwnPaneNotAtShell(member.name, str(member.current_session), identity, limit)
         return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
@@ -2354,14 +2378,13 @@ class Herdr:
                 return False
             saved = saved_layout(self.session)
             reorder = False
-            record = _tab_staff()
             owner: staff.StaffRow | None = None
-            if tab and saved["workspaces"]:
+            if tab and (pending := {entry["staff_id"] for space in saved["workspaces"] for entry in space["tabs"]
+                                    if entry.get("sort_after_rename")}):
+                record = _tab_staff()
                 scan = self.scan_row_panes(record, self.listed("pane"))
                 owner = _tab_members(record, scan).get(str(row.get("tab_id", "")))
-                reorder = any(entry.get("sort_after_rename")
-                    and owner is not None and entry["staff_id"] == owner.id
-                    for space in saved["workspaces"] for entry in space["tabs"])
+                reorder = owner is not None and owner.id in pending
             changed = self._retitle(row, title, tab=tab)
             if not changed and not reorder:
                 return False
@@ -2390,8 +2413,12 @@ class Herdr:
         except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
             return set()
 
+    def _pane_evidence_key(self, pane: dict[str, object]) -> tuple[str, str, str]:
+        terminal = pane.get("terminal_id")
+        return self.session, str(pane.get("pane_id", "")), terminal if isinstance(terminal, str) else ""
+
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
-        key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
+        key = self._pane_evidence_key(pane)
         with run.lock:
             if key in run.sessions:
                 return run.sessions[key]
@@ -2437,8 +2464,16 @@ class Herdr:
                                        if isinstance(sessions, _PaneProcessNotFound)})
         for pane, sessions in observations:
             if isinstance(sessions, _PaneProcessNotFound):
-                sessions = (PaneSessionsChanging("pane closed during scan") if str(pane.get("pane_id", "")) in closed
-                            else PaneSessionsUnknown(sessions.reason))
+                key = self._pane_evidence_key(pane)
+                if key[1] in closed:
+                    sessions = PaneSessionsChanging("pane closed during scan")
+                else:
+                    uncertain = PaneSessionsUnknown(sessions.reason)
+                    if isinstance(run, RestorePaneEvidenceRun):
+                        with run.lock:
+                            if run.sessions.get(key) is sessions:
+                                run.sessions[key] = uncertain
+                    sessions = uncertain
             if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
                 reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
@@ -3488,10 +3523,18 @@ class Herdr:
             if not check_target(target, action="keys", place=HerdrPlace(self.session, pane), text=expected,
                                 pane_info=self.pane_row(pane), client=self):
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
-            self._send_keys(pane, key)
+            try:
+                self._send_keys(pane, key)
+            except HerdrCommandNotStarted as error:
+                if index == 0:
+                    raise
+                raise HerdrFailure(f"{pane}: the answer may be partly typed: {error}") from error
             if index == 0:
                 script_prompts.record(pane, text)
-                _ = self.run("pane", "send-text", pane, text)
+                try:
+                    _ = self.run("pane", "send-text", pane, text)
+                except HerdrCommandNotStarted as error:
+                    raise HerdrFailure(f"{pane}: the answer selection key was sent: {error}") from error
 
     def _send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
@@ -3992,7 +4035,7 @@ def _claude_start_in_progress(pid: int, shell: int, foreground: int) -> bool:
                 return False
             uptime = float((proc_root() / "uptime").read_text().split(maxsplit=1)[0])
             age = uptime - started / os.sysconf("SC_CLK_TCK")
-        return 0 <= age < conf.read("shutdown").number("START_SECONDS")
+        return 0 <= age < conf.read("shutdown").number("start_seconds")
     except (HerdrFailure, OSError, ValueError, IndexError):
         return False
 
@@ -4715,7 +4758,7 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
 def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
     """Select the configured producer workspace or the owner's workspace."""
     if isinstance(row, staff.StaffRow) and row.kind == "producer":
-        return conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+        return conf.read_or_repository("staff").text("producer_workspace")
     while isinstance(row, staff.StaffRow):
         if row.kind == "showrunner":
             return row.name

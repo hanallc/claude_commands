@@ -3,6 +3,14 @@
 #
 # Usage:
 #   verify <command> [<package>] [flags]
+#   verify test,lint,doc [<package>]
+#   verify check + lint + test <package> + doc --mac "<reason>"
+#
+# A verb list accepts test, lint, and doc once each, in any order.
+# Give one package or omit it for the workspace.
+# A lone + separates check, test, lint, and doc steps unless it is a flag value.
+# Each step has its own package and flags. Verify checks all arguments first.
+# On Linux, both lists share one run identity. The first failure ends the list.
 #
 # Commands:
 #   check [<package>]      check every workspace target, test code included
@@ -334,7 +342,7 @@ parse_routing_arguments() {
     fi
     for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
         case "$name" in
-            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
+            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|COPIES_MIRROR_LEASE_FDS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
                 printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
                 exit 2 ;;
         esac
@@ -372,6 +380,14 @@ parse_routing_arguments() {
     export BUILDLOG_PINNED_TARGET="$PINNED_TARGET"
 }
 
+
+verify_option_takes_value() {
+    case "$1" in
+        --tree|--test|--name|--run-ignored|--features|--filter|--bin|--example|--target|--env|--fetch|--mac|--local)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # Parse the package separately from flags and their values.
 parse_command_arguments() {
@@ -421,6 +437,56 @@ parse_command_arguments() {
     ARGS=("$VERIFY_PACKAGE" ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"})
 }
 
+parse_verify_step_list() {
+    local word length=0 value_pending=0
+    local verbs=()
+    for word; do
+        if (( value_pending )); then
+            value_pending=0
+        elif [[ "$word" == + ]]; then
+            VERIFY_STEP_LENGTHS+=("$length")
+            length=0
+            continue
+        elif (( ! length )); then
+            verbs+=("$word")
+        elif verify_option_takes_value "$word"; then
+            value_pending=1
+        fi
+        VERIFY_STEP_WORDS+=("$word")
+        length=$((length + 1))
+    done
+    if (( ! ${#VERIFY_STEP_LENGTHS[@]} )); then
+        VERIFY_STEP_WORDS=()
+        return 0
+    fi
+    VERIFY_STEP_LENGTHS+=("$length")
+    for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        if (( ! length )); then
+            echo 'verify.sh: a step list requires a step on each side of +.' >&2
+            exit 2
+        fi
+    done
+    for word in "${verbs[@]}"; do
+        case "$word" in
+            check|test|lint|doc) ;;
+            *)
+                printf 'verify.sh: a step list accepts only check, test, lint, and doc (%q).\n' "$word" >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+VERIFY_QUERY_ARGS=("$@")
+if [[ "${1:-}" == --session-dir ]]; then
+    VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
+fi
+VERIFY_STEP_LENGTHS=()
+VERIFY_STEP_WORDS=()
+if [[ "${VERIFY_QUERY_ARGS[0]:-}" != *,* || ${#VERIFY_QUERY_ARGS[@]} -gt 2 ]]; then
+    parse_verify_step_list "${VERIFY_QUERY_ARGS[@]}"
+fi
+
 # Help returns before environment setup, target queries or build records.
 case "${1:-}" in
     -h|--help) usage 1; exit 0 ;;
@@ -436,6 +502,26 @@ case "${1:-}" in
         ;;
 esac
 
+VERIFY_VERBS=()
+if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
+    verify_list_verbs='test|lint|doc'
+    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^($verify_list_verbs)(,($verify_list_verbs))+$ ||
+            ${#VERIFY_QUERY_ARGS[@]} -gt 2 || "${VERIFY_QUERY_ARGS[1]:-}" == -* ||
+            "${VERIFY_QUERY_ARGS[1]:-}" == + ]]; then
+        echo 'verify.sh: a verb list accepts only test, lint, doc and one optional package. Use commas between verbs.' >&2
+        exit 2
+    fi
+    IFS=, read -r -a VERIFY_VERBS <<< "${VERIFY_QUERY_ARGS[0]}"
+    seen_verbs=,
+    for verb in "${VERIFY_VERBS[@]}"; do
+        if [[ "$seen_verbs" == *",$verb,"* ]]; then
+            printf 'verify.sh: repeated verb: %s\n' "$verb" >&2
+            exit 2
+        fi
+        seen_verbs+="$verb,"
+    done
+fi
+
 # Save exported values before script variables replace caller names.
 # The --env rule refuses the VERIFY_ prefix. env -0 works in every bash build;
 # a bash built without programmable completion has no compgen.
@@ -444,12 +530,187 @@ while IFS= read -r -d '' VERIFY_ENV_ENTRY; do
     case "$VERIFY_ENV_ENTRY" in VERIFY_*) continue ;; esac
     VERIFY_CALL_ENVIRONMENT+=("$VERIFY_ENV_ENTRY")
 done < <(env -0)
-# Trace the helper in its interpreter. CPU time excludes child processes.
-# The normal path starts no extra interpreter.
 VERIFY_START_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$VERIFY_START_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_START_DIR=.
 VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
 PY="$VERIFY_START_DIR/../lib/py"
+VERIFY_METADATA_SCRIPT="$VERIFY_START_DIR/verify_metadata.py"
+
+# Read the current workspace members for the fmt scope.
+read_metadata() {
+    if [[ -n "${GATE_METADATA:-}" ]]; then
+        printf '%s\n' "$GATE_METADATA"
+    else
+        (
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            cargo metadata --no-deps --format-version 1
+        )
+    fi
+}
+
+# Read the optional feature pair and prepare Cargo's flags when requested.
+FEATURE_FLAGS=()
+take_features() {
+    local mode=$1 features
+    shift
+    REQUESTED_FEATURES=""
+    if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" && "$2" != --* ]]; then
+        REQUESTED_FEATURES=$2
+        shift 2
+    fi
+    if [[ $# -ne 0 ]]; then
+        usage
+        exit 2
+    fi
+    [[ "$mode" != validate ]] || return 0
+    features=$REQUESTED_FEATURES
+    if [[ "$CMD" != test || "${PINNED_TARGET:-}" != hana-gpu ]]; then
+        features="$(merge_dev_features "$features")"
+    fi
+    if [[ -n "$features" ]]; then
+        FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$features")")
+    fi
+}
+
+parse_check_arguments() {
+    local mode=$1 word check_args=()
+    shift
+    KEEP_GOING=()
+    for word in "$@"; do
+        if [[ "$word" == --keep-going ]]; then
+            KEEP_GOING=(--keep-going)
+        else
+            check_args+=("$word")
+        fi
+    done
+    take_features "$mode" ${check_args[@]+"${check_args[@]}"}
+}
+
+parse_lint_arguments() {
+    CHECK_LINT=0
+    if [[ "${1:-}" == --check ]]; then CHECK_LINT=1; shift; fi
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+}
+
+NEXTEST_ARGS=()
+compose_nextest_args() {
+    local mode=${1:-prepare} ignored_only=0 rest=()
+    PKG="${ARGS[0]:-}"
+    set -- "${ARGS[@]:1}"
+    TARGET=""
+    FILTERS=()
+    # --filter, as often as named, and --features in any order; a target
+    # takes no filter.
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 && -n "${2:-}" ]]; then
+            TARGET=$2
+            shift 2
+        elif [[ "$1" == "--filter" && -z "$TARGET" \
+              && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
+            FILTERS+=("$2")
+            shift 2
+        elif [[ "$1" == --run-ignored && "${2:-}" == only && -z "$TARGET" ]]; then
+            ignored_only=1
+            shift 2
+        else
+            rest+=("$1")
+            shift
+        fi
+    done
+    take_features "$mode" ${rest[@]+"${rest[@]}"}
+    [[ "$mode" != validate ]] || return 0
+    require_member "$PKG"
+    # --no-fail-fast: nextest cancels every remaining test after the first
+    # failure, so one broken test silently hides the rest of the suite. A
+    # phase gate has to report the whole result, not the first stop.
+    # Keep workspace feature resolution; -E runs only this package's tests.
+    if [[ ${#FILTERS[@]} -gt 0 ]]; then
+        # Any of the names: & binds tighter than |, so a union of two or
+        # more goes in parentheses.
+        FILTER="test(${FILTERS[0]})"
+        for name in "${FILTERS[@]:1}"; do
+            FILTER+=" | test($name)"
+        done
+        if [[ ${#FILTERS[@]} -gt 1 ]]; then
+            FILTER="($FILTER)"
+        fi
+        TEST_FILTER="${PKG:+package($PKG) & }$FILTER"
+    elif [[ -n "$TARGET" ]]; then
+        # Integration test target names are unique across the workspace,
+        # so --test builds just that binary, under the workspace's
+        # feature resolution.
+        NEXTEST_ARGS=(--no-fail-fast --workspace --test "$TARGET")
+        if [[ -n "$PKG" ]]; then NEXTEST_ARGS+=(-E "package($PKG)"); fi
+        NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
+        return
+    else
+        TEST_FILTER="${PKG:+package($PKG)}"
+    fi
+    # Build only the targets this package's tests live in
+    # (verify_metadata.py): --lib, which cannot be narrowed to one member
+    # under --workspace and is left out for a package without a lib,
+    # and the package's own bins and test-enabled targets. --bins
+    # --tests linked every member's test executables, 78 in hana, to
+    # run one package's; this links 4 (2026-10-04). The integration
+    # tests stay in so a phase runs the package's integration tests
+    # alongside its unit tests. The lint half's clippy checks all
+    # workspace targets with all features.
+    take_test_targets
+    NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}")
+    if [[ -n "$TEST_FILTER" ]]; then NEXTEST_ARGS+=(-E "$TEST_FILTER"); fi
+    NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
+    if [[ "$ignored_only" == 1 ]]; then
+        NEXTEST_ARGS+=(--run-ignored only)
+    fi
+    # Filters and ignored-test selections must match tests.
+    if [[ ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 ]]; then
+        NEXTEST_ARGS+=(--no-tests=warn)
+    fi
+}
+
+validate_verify_step_list() (
+    local length offset=0 targets=()
+    # Resolve the interpreter without caching its path. Keep imports read-only.
+    export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}" CLAUDE_DISABLE_DATACLASS_CODE_CACHE=1
+    export PYTHONDONTWRITEBYTECODE=1 GIT_OPTIONAL_LOCKS=0
+    for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        set -- "${VERIFY_STEP_WORDS[@]:offset:length}"
+        CMD=$1
+        shift
+        parse_routing_arguments "$@"
+        parse_command_arguments "${ARGS[@]}"
+        case "$CMD" in
+            check) parse_check_arguments validate ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
+            test) compose_nextest_args validate ;;
+            lint) parse_lint_arguments ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
+            doc) take_features validate ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
+        esac
+        if [[ -n "$PINNED_TARGET" && "$PINNED_TARGET" != natedev ]]; then
+            targets+=("$PINNED_TARGET")
+        fi
+        offset=$((offset + length))
+    done
+
+    if (( ${#targets[@]} )); then
+        VERIFY_PY_HELPER=VERIFY_STEP_TARGETS "$PY" -c '
+import sys
+with open(sys.argv[1]) as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_targets import target_config
+
+try:
+    for target in sys.argv[2:]:
+        target_config.configured_ssh_target(target)
+except target_config.ConfigError as error:
+    print(f"verify.sh: {error}", file=sys.stderr)
+    sys.exit(2)
+' "$VERIFY_START_DIR/../lib/package_root.py" "${targets[@]}" || exit 2
+    fi
+)
+
+if (( ${#VERIFY_STEP_LENGTHS[@]} )); then validate_verify_step_list; fi
+
+# Trace the helper in its interpreter. CPU time excludes child processes.
+# The normal path starts no extra interpreter.
 if [[ -n "${VERIFY_PY_TRACE:-}" ]]; then
     if [[ "$VERIFY_PY_TRACE" != /* ]]; then export VERIFY_PY_TRACE="$PWD/$VERIFY_PY_TRACE"; fi
     export VERIFY_TRACE_REAL_PY="$PY"
@@ -509,8 +770,6 @@ VERIFY_TRACE_RUNNER
     chmod +x "$PY"
 fi
 # Read-only queries run before environment setup and build admission.
-VERIFY_QUERY_ARGS=("$@")
-[[ "${VERIFY_QUERY_ARGS[0]:-}" != --session-dir ]] || VERIFY_QUERY_ARGS=("${VERIFY_QUERY_ARGS[@]:2}")
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final-pass ]]; then
     command_help final >&2
     exit 2
@@ -545,6 +804,9 @@ if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" ]] &&
 fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
+    if [[ -f "$VERIFY_REPO_ROOT/scripts/copies/copies.py" ]]; then
+        printf '%s\n' 'claude_commands: run tests with copies.py --affected or --module' >&2
+    fi
     exit 2
 fi
 # Create the inherited temporary parent before environment commands use it.
@@ -607,6 +869,56 @@ remove_tool_folder() {
     verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$folder" || status=$?
     (( status <= 2 )) || printf 'verify.sh: cleanup failed: %s (status %s)\n' "$what" "$status" >&2
     return 0
+}
+
+# shellcheck disable=SC2329 # The EXIT trap calls this function.
+finish_verify_verb_list() {
+    local status=$1 child=${!:-}
+    # Use the interrupted status when Bash reports no signal status to EXIT.
+    if (( status == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then status=128; fi
+    if [[ -n "$child" && "$child" != "$VERIFY_VERB_PREVIOUS_JOB" ]]; then collect_child "$child" TERM; fi
+    finish_verify_run "$status"
+    exit "$status"
+}
+
+run_verify_verbs() {
+    local verb length offset=0 status list_run step_list=0
+    if (( ${#VERIFY_STEP_LENGTHS[@]} )); then
+        step_list=1
+    fi
+    for verb in ${VERIFY_VERBS[@]+"${VERIFY_VERBS[@]}"}; do
+        VERIFY_STEP_LENGTHS+=("$(( $# + 1 ))")
+        VERIFY_STEP_WORDS+=("$verb" "$@")
+    done
+    # Close the startup helper before the children open their own helpers.
+    exec 70>&- 71<&-
+    unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
+    [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
+    VERIFY_VERB_PREVIOUS_JOB=${!:-}
+    trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
+    for length in "${VERIFY_STEP_LENGTHS[@]}"; do
+        # Doc can leave its grant without a memory handoff when it takes its own slot.
+        list_run=""
+        if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
+        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
+            "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
+        status=0
+        wait "$!" || status=$?
+        VERIFY_VERB_PREVIOUS_JOB=$!
+        if (( step_list )); then
+            {
+                printf 'verify.sh: step result:'
+                printf ' %q' "${VERIFY_STEP_WORDS[@]:offset:length}"
+                printf ' exit=%d\n' "$status"
+            } >&2
+        fi
+        (( status == 0 )) || exit "$status"
+        # A request probe prepares only the first step for its caller.
+        [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || break
+        offset=$((offset + length))
+        unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
+        unset BUILDLOG_FIRST_STEP_EPISODE BUILDLOG_FIRST_STEP_PID
+    done
 }
 
 # One parent-owned helper serves command substitutions and cleanup traps.
@@ -782,7 +1094,6 @@ if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" || "${COPIES_STEP_SOU
     BUILDLOG_SYNC=1
 fi
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
-VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
 finish_verify_run() {
     if [[ -n "$FINAL_PASS_START" ]]; then
@@ -1166,20 +1477,6 @@ print("\n".join(sorted(changed)))
 # an unrelated member's folder is not keyed on it.
 TREE_WATCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tree_watch.py"
 
-# The compile covers the workspace, so a misspelled package would otherwise
-# pass check and lint silently and leave nextest with an empty filter. Fail it
-# as a usage error instead.
-read_metadata() {
-    if [[ -n "${GATE_METADATA:-}" ]]; then
-        printf '%s\n' "$GATE_METADATA"
-    else
-        (
-            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
-            cargo metadata --no-deps --format-version 1
-        )
-    fi
-}
-
 set_gate_metadata() {
     export BUILDLOG_OUTPUT_ROOTS=""
     GATE_METADATA="$(
@@ -1348,27 +1645,6 @@ merge_dev_features() {
     printf '%s' "$out"
 }
 
-# Optional trailing Work Order features on check and test join the repo list.
-# Any other leftover argument is a usage error. The caller sets PKG first.
-FEATURE_FLAGS=()
-take_features() {
-    local features=""
-    if [[ $# -gt 0 && "$1" == "--features" && -n "${2:-}" ]]; then
-        features=$2
-        shift 2
-    fi
-    if [[ $# -ne 0 ]]; then
-        usage
-        exit 2
-    fi
-    if [[ "$CMD" != test || "${PINNED_TARGET:-}" != hana-gpu ]]; then
-        features="$(merge_dev_features "$features")"
-    fi
-    if [[ -n "$features" ]]; then
-        FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$features")")
-    fi
-}
-
 # `build` arguments: at most one of --bin or --example, --release, and
 # --features in any order. An example's required features join the list.
 BUILD_ARGS=()
@@ -1441,83 +1717,6 @@ print_built_binaries() {
     done
 }
 
-NEXTEST_ARGS=()
-compose_nextest_args() {
-    local ignored_only=0
-    set -- "${ARGS[@]}"
-    PKG="${1:-}"
-    shift
-    TARGET=""
-    FILTERS=()
-    # --filter, as often as named, and --features in any order; a target
-    # takes no filter.
-    REST=()
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == --test && -z "$TARGET" && ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 && -n "${2:-}" ]]; then
-            TARGET=$2
-            shift 2
-        elif [[ "$1" == "--filter" && -z "$TARGET" \
-              && "${2:-}" =~ ^[A-Za-z0-9_:]+$ ]]; then
-            FILTERS+=("$2")
-            shift 2
-        elif [[ "$1" == --run-ignored && "${2:-}" == only && -z "$TARGET" ]]; then
-            ignored_only=1
-            shift 2
-        else
-            REST+=("$1")
-            shift
-        fi
-    done
-    take_features ${REST[@]+"${REST[@]}"}
-    require_member "$PKG"
-    # --no-fail-fast: nextest cancels every remaining test after the first
-    # failure, so one broken test silently hides the rest of the suite. A
-    # phase gate has to report the whole result, not the first stop.
-    # Keep workspace feature resolution; -E runs only this package's tests.
-    if [[ ${#FILTERS[@]} -gt 0 ]]; then
-        # Any of the names: & binds tighter than |, so a union of two or
-        # more goes in parentheses.
-        FILTER="test(${FILTERS[0]})"
-        for name in "${FILTERS[@]:1}"; do
-            FILTER+=" | test($name)"
-        done
-        if [[ ${#FILTERS[@]} -gt 1 ]]; then
-            FILTER="($FILTER)"
-        fi
-        TEST_FILTER="${PKG:+package($PKG) & }$FILTER"
-    elif [[ -n "$TARGET" ]]; then
-        # Integration test target names are unique across the workspace,
-        # so --test builds just that binary, under the workspace's
-        # feature resolution.
-        NEXTEST_ARGS=(--no-fail-fast --workspace --test "$TARGET")
-        if [[ -n "$PKG" ]]; then NEXTEST_ARGS+=(-E "package($PKG)"); fi
-        NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
-        return
-    else
-        TEST_FILTER="${PKG:+package($PKG)}"
-    fi
-    # Build only the targets this package's tests live in
-    # (verify_metadata.py): --lib, which cannot be narrowed to one member
-    # under --workspace and is left out for a package without a lib,
-    # and the package's own bins and test-enabled targets. --bins
-    # --tests linked every member's test executables, 78 in hana, to
-    # run one package's; this links 4 (2026-10-04). The integration
-    # tests stay in so a phase runs the package's integration tests
-    # alongside its unit tests. The lint half's clippy checks all
-    # workspace targets with all features.
-    take_test_targets
-    NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}")
-    if [[ -n "$TEST_FILTER" ]]; then NEXTEST_ARGS+=(-E "$TEST_FILTER"); fi
-    NEXTEST_ARGS+=("${FEATURE_FLAGS[@]}")
-    if [[ "$ignored_only" == 1 ]]; then
-        NEXTEST_ARGS+=(--run-ignored only)
-    fi
-    # Filters and ignored-test selections must match tests.
-    if [[ ${#FILTERS[@]} -eq 0 && "$ignored_only" == 0 ]]; then
-        NEXTEST_ARGS+=(--no-tests=warn)
-    fi
-}
-
 # A stop during a Mac fix return leaves a record in the git folder (fix_return.py).
 # The run finishes it before any step reads the tree. Only a left record costs a Python call.
 finish_mac_fix() {
@@ -1545,6 +1744,7 @@ fi
 CMD="${1:-}"
 case "$CMD" in
     check|test|lint|doc|build|example|final|example-test) ;;
+    *,*) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -1572,14 +1772,15 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != 
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
-if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
-    BUILDLOG_RUN_START="$(verify_helper "$STEP_RECORD_SCRIPT" start "$$")"
-    if [[ -n "$BUILDLOG_RUN_START" ]]; then
-        export BUILDLOG_RUN="$$:$BUILDLOG_RUN_START"
-    fi
-fi
+# shellcheck source=/dev/null
+source "$VERIFY_START_DIR/../lib/buildlog_run.sh"
+buildlog_initialize_run verify_helper "$STEP_RECORD_SCRIPT"
 
 shift
+if (( ${#VERIFY_VERBS[@]} || ${#VERIFY_STEP_LENGTHS[@]} )); then
+    run_verify_verbs "$@"
+    exit 0
+fi
 if [[ "$CMD" == example-test ]]; then
     echo 'verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).' >&2
     exit 2
@@ -2344,7 +2545,7 @@ try_mac_test() {
     LAST_TARGET_OUTCOME="" LAST_TARGET_REASON=""
     selected_target=$(target_for_settings "$1")
     if [[ "$(target_platform "$selected_target")" == macos ]]; then selected_is_mac=1; fi
-    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
+    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh "$selected_target"; fi
     MAC_PASSED=0
     local caller_traps
     caller_traps="$(trap -p INT TERM HUP)"
@@ -2519,7 +2720,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=runner
         if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else
             BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
-            step_state waiting_ssh
+            step_state waiting_ssh "$selected_target"
         fi
         return
     fi
@@ -2552,7 +2753,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 echo 'verify.sh: the Mac does not answer; stop and submit again' >&2
                 exit 2
             fi
-            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
+            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh "$selected_target"; fi
             return
             ;;
         failed|prelaunch_failed)
@@ -2936,9 +3137,9 @@ placement_once() {
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
     local parent_run=${BUILDLOG_RUN:-}
-    # A step with its own slot can leave its grant without a memory handoff.
+    # The parent marker lets a list step keep its queue place during checkout.
     local BUILDLOG_RUN=$parent_run
-    if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]]; then BUILDLOG_RUN=""; fi
+    if [[ -n "${VERIFY_SLOT_SOURCE:-}" && "${VERIFY_STEP_LIST_RUN:-}" != "$parent_run" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
@@ -3468,6 +3669,10 @@ cache_lookup() {
     # Old pass records have no status line.
     if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
     [[ -n "${status_line#status=}" ]] || return 1
+    # Plain lint shares one cache key across packages.
+    if [[ "$CMD" == lint && -n "$VERIFY_PACKAGE" ]]; then
+        require_member "$VERIFY_PACKAGE"
+    fi
     LOOKUP_STATUS="${status_line#status=}"
     first_line="${record_text%%$'\n'*}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
@@ -3708,8 +3913,8 @@ TOKEN_WAITER_PID=""
 TOKEN_WAIT_HOLD_CHECK=""
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)" || exit 2
+TOKEN_HOLD_S="$(conf_value direct verify_token_hold_seconds)" || exit 2
+TOKEN_RENEW_S="$(conf_value direct verify_token_renew_seconds)" || exit 2
 TOKEN_RENEW_S=$(awk -v interval="$TOKEN_RENEW_S" -v hold="$TOKEN_HOLD_S" \
     'BEGIN { if (interval > hold / 3) interval = hold / 3; print interval }')
 token_wait_clock() {
@@ -4928,16 +5133,7 @@ run_lint_sequence() {
 case "$CMD" in
     check)
         PKG="$VERIFY_PACKAGE"
-        KEEP_GOING=()
-        CHECK_ARGS=()
-        for word in "$@"; do
-            if [[ "$word" == --keep-going ]]; then
-                KEEP_GOING=(--keep-going)
-            else
-                CHECK_ARGS+=("$word")
-            fi
-        done
-        take_features "${CHECK_ARGS[@]}"
+        parse_check_arguments prepare "$@"
         require_member "$PKG"
         run cargo check --workspace --all-targets "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
         ;;
@@ -4957,9 +5153,7 @@ case "$CMD" in
         ;;
     lint)
         PKG="$VERIFY_PACKAGE"
-        CHECK_LINT=0
-        if [[ "${1:-}" == --check ]]; then CHECK_LINT=1; shift; fi
-        [[ $# -eq 0 ]] || { usage; exit 2; }
+        parse_lint_arguments "$@"
         if [[ -n "$PKG" ]]; then require_member "$PKG"; fi
         require_taplo
         # Only mend and clippy take queue steps. Repairs reuse their positions.
@@ -4971,11 +5165,9 @@ case "$CMD" in
     doc)
         DOC_FEATURE_FLAGS=()
         DOC_FEATURES=""
-        if [[ $# -eq 2 && "$1" == --features && -n "$2" ]]; then
-            DOC_FEATURES="$(qualify_features "$VERIFY_PACKAGE" "$2")"
-        elif [[ $# -ne 0 ]]; then
-            usage
-            exit 2
+        take_features validate "$@"
+        if [[ -n "$REQUESTED_FEATURES" ]]; then
+            DOC_FEATURES="$(qualify_features "$VERIFY_PACKAGE" "$REQUESTED_FEATURES")"
         fi
         DOC_FEATURES="$(qualify_features "$VERIFY_PACKAGE" "$(merge_dev_features "$DOC_FEATURES")")"
         if [[ -n "$VERIFY_PACKAGE" ]]; then require_member "$VERIFY_PACKAGE"; fi

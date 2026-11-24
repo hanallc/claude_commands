@@ -191,6 +191,12 @@ class HelperLifelineTests(unittest.TestCase):
                     stream.close()
 
 
+def exported_step_scopes(pid: int) -> list[str]:
+    """Each BUILDLOG_STEP_SCOPE value in the environment of the live process pid."""
+    return [entry.removeprefix(gate.STEP_SCOPE_ENTRY).decode()
+            for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if entry.startswith(gate.STEP_SCOPE_ENTRY)]
+
+
 def private_slice_name() -> str:
     """Name a private test slice after the test process that owns it."""
     return f"{PRIVATE_SLICE_PREFIX}{os.getpid()}_{time.monotonic_ns()}.slice"
@@ -618,6 +624,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(child.stdout.readline(), b"ready\n")
                     scope = Path(place.sidecar.read_text().strip())
                     self.assertIn(child.pid, gate.scope_members(scope))
+                    # No reservation pays for the editor scope, so the editor does not name it to its cargo calls.
+                    self.assertNotIn(str(scope), exported_step_scopes(child.pid))
                     self.assertFalse(fixture.admission.server.reservations)
                     place.observe(2 * GIB, 2 * GIB)
                     self.assertEqual(place.peak_bytes, 2 * GIB)
@@ -772,7 +780,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if not stopped.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("the sampler barrier exceeded its test deadline")
 
-            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                              ending: wire.ReleaseEnding = "result") -> None:
                 if fork_during_scope_read:
                     self.assertTrue(raced_scope_read, "cleanup did not read the scope before release")
                     scope_pids = {int(pid) for procs in Path(scope_name).rglob("cgroup.procs")
@@ -781,7 +790,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if descendant_descriptor >= 0:
                     self.assertTrue(select.select([descendant_descriptor], [], [], 0)[0],
                                     "the reservation ended while its detached descendant still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
 
             def fork_and_exit() -> None:
                 nonlocal descendant, descendant_descriptor
@@ -905,13 +914,14 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
             release = client.release
 
-            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                      ending: wire.ReleaseEnding = "result") -> None:
                 self.assertEqual(len(fixture.children), 1)
                 child = fixture.children[0]
                 self.assertIsNotNone(child.returncode)
                 with self.assertRaises(ChildProcessError):
                     _ = os.waitpid(child.pid, os.WNOHANG)
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
 
             with mock.patch.object(client, "release", side_effect=release_after_reaping) as released:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
@@ -926,9 +936,10 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
             release = client.release
-            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                   ending: wire.ReleaseEnding = "result") -> None:
                 self.assertIsNotNone(child.poll(), "reservation released while its program still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
             with mock.patch.object(client, "release", side_effect=release_after_stop) as released:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
                     child = fixture.start_blocked(place)
@@ -971,10 +982,11 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if current == 3 * GIB:
                     sampled.set()
 
-            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                              ending: wire.ReleaseEnding = "result") -> None:
                 self.assertTrue(select.select([descriptor], [], [], 0)[0],
                                 "reservation released while its descendant still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
 
             try:
                 with mock.patch.object(client, "release", side_effect=release_after_descendant_exit) as released, \
@@ -1732,6 +1744,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     directory = Path(Path(row["sidecar"]).read_text().strip())
                     self.assertTrue(directory.is_relative_to("/sys/fs/cgroup"))
                     self.assertIn(fixture.private_slice, directory.parts)
+                    # The program names its own scope, in the form the cargo wrapper compares with its cgroup.
+                    cgroup = next(line[3:] for line in Path(f"/proc/{child.pid}/cgroup").read_text().splitlines()
+                                  if line.startswith("0::"))
+                    named = exported_step_scopes(child.pid)
+                    self.assertEqual(named, [f"/sys/fs/cgroup{cgroup}"])
+                    self.assertEqual(Path(named[0]), directory)
                     self.assertIsInstance(gate.reservation_lifetime(row, True), gate.PopulatedStepScope)
                     self.assertEqual(int(place.path.with_suffix(".max").read_text()), 3 * GIB)
                     self.assertIsNone(child.poll())
@@ -1761,7 +1779,7 @@ class HeldReservationTests(unittest.TestCase):
                             raise RuntimeError("holder failed")
                 except RuntimeError:
                     self.assertTrue(failure)
-                release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing)
+                release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing, "result")
 
     def test_release_runs_when_the_wait_message_fails(self) -> None:
         with (mock.patch.object(client, "admit", return_value=self.grant),
@@ -1770,7 +1788,7 @@ class HeldReservationTests(unittest.TestCase):
               self.assertRaisesRegex(BrokenPipeError, "closed pipe")):
             with queue.held_reservation(self.step_request()):
                 self.fail("the holder ran after the wait message failed")
-        release.assert_called_once_with("reservation-1", 1, self.grant.cleanup_timing)
+        release.assert_called_once_with("reservation-1", 1, self.grant.cleanup_timing, "result")
 
     def test_refusal_and_queue_exit_raise_before_any_release(self) -> None:
         replies: tuple[tuple[wire.Refused | client.LeftQueue, str], ...] = (
@@ -1796,7 +1814,7 @@ class HeldReservationTests(unittest.TestCase):
                 held.status = 0
         service_admit.assert_called_once()
         self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY))
-        release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing)
+        release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing, "result")
 
 
 QUEUE_ENTRY_CALLS = frozenset({"admit", "launch", "service_admit", "release", "wait_for_admission", "wait_for_launch"})
