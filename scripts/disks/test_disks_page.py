@@ -24,6 +24,7 @@ from scripts.disks import disks_page
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
+from scripts.lib.process_group import run_process_group
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -719,11 +720,11 @@ async function checkSessionLayout() {
                         profile = Path(directory) / f"profile-{width}"
                         profile.mkdir()
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
+                        done = run_process_group(
                             ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                              "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
                              f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                            timeout=45)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:
