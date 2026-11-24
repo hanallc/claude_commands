@@ -184,7 +184,7 @@ def confirmed_guest_run(assignment: placement.PlacementAssignment,
     matches = (identity.host == destination.host and identity.pid > 0 and bool(identity.start_time)
                if isinstance(identity, execution_identity.ProcessExecution)
                else (identity.target, identity.attempt) == (destination.target, assignment.attempt))
-    return {"target": "mac-linux", "attempt": assignment.attempt} if matches else None
+    return {"target": destination.target, "attempt": assignment.attempt} if matches else None
 
 
 @dataclass(frozen=True)
@@ -3538,6 +3538,9 @@ class AdmissionServer:
             consumed = (current and self.current_assignments.get(assignment.episode) == key
                         and isinstance(saved.permission, placement.PermissionConsumed))
             confirmed = confirmed_guest_run(assignment, evidence) if consumed else None
+            if (consumed and assignment.destination.target == "mac-linux"
+                    and isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)):
+                confirmed = records.ConfirmedGuestRun(target=assignment.destination.target, attempt=assignment.attempt)
             local = request.local
             counter = (progress.read_counter(Path(local.sidecar))
                        if guest and consumed and isinstance(local, wire.LocalAdmissionContext) and local.sidecar
@@ -4794,7 +4797,8 @@ done
             evidence = self.execution_evidence.get(key)
             host_key = self.placement_host_keys.get((request.episode, saved.assignment.destination))
             host_evidence = self.host_evidence(host_key) if host_key is not None else None
-            if (isinstance(evidence, execution_identity.ObservedExecution)
+            if (isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+                    or isinstance(evidence, execution_identity.ObservedExecution)
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
                             for reference, execution in host_evidence.executions)):
@@ -5638,6 +5642,13 @@ done
             if (assignment.destination.target != "mac-linux" or isinstance(saved.permission, placement.PermissionConsumed)
                     or not isinstance(request.evidence, execution_identity.ObservedExecution)):
                 self.execution_evidence[key] = request.evidence
+            if (isinstance(saved.confirmed_guest_start, records.GuestStartNotRecorded)
+                    and self.current_assignments.get(assignment.episode) == key
+                    and isinstance(saved.state, placement.CurrentAssignment)
+                    and isinstance(saved.permission, placement.PermissionConsumed)
+                    and confirmed_guest_run(assignment, request.evidence) is not None):
+                saved = replace(saved, confirmed_guest_start=records.ConfirmedGuestStart(self.clock.now()))
+                self.assignments[key] = saved
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, BeforeLaunchRefusal)
