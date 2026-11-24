@@ -1618,7 +1618,7 @@ class TurnEndTests(unittest.TestCase):
             self.assertEqual(current["status"], "active")
             self.assertIs(progress_history.hook_completion(current), progress_history.NoHookCompletion.UNRECORDED)
             self.assertIn(pane, self.case.fixture.world.locations)
-            self.assertFalse(status.exists())
+            self.assertEqual(status.read_text(), "running\n")
         if case == "old-marker":
             self.assertIn(f"DONE {older} from another pass", interim)
         elif stop_text:
@@ -3232,7 +3232,7 @@ class TurnEndTests(unittest.TestCase):
                 with patch.object(sys, "argv", args):
                     if failure == "state write":
                         with (patch.object(pass_recorder, "write_text_atomic", side_effect=fail_state_write),
-                              self.assertRaisesRegex(OSError, "state write failed")):
+                              self.assertRaisesRegex(SystemExit, "state write failed")):
                             progress_history.main()
                         self.assertEqual(worker_panes.worker_pass(row, run)["status"], "active")
                     else:

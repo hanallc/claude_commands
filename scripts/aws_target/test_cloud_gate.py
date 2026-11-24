@@ -4045,6 +4045,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                           redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
                         for patch in (mock.patch.object(gate, 'BuildHoldWait'),
                                       mock.patch.object(gate, 'fetch_branches'),
+                                      mock.patch.object(gate, 'gate_production', return_value=repo),
                                       mock.patch.object(gate, 'change_review_list', return_value=(repo, None)),
                                       mock.patch.object(change_review, 'missing', return_value=[]),
                                       mock.patch.object(change_review, 'unit_producer', return_value=None),

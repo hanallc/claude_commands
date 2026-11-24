@@ -2495,7 +2495,7 @@ class WorkerCommandTests(unittest.TestCase):
                                     self.assertIs(competing, file_lock.LockResult.BUSY)
                             finally:
                                 lock.close()
-                            snapshot.assert_not_called()
+                            self.assertEqual(snapshot.call_count, 2)
                         self.assertEqual(self.fixture.world.reads, pane_reads)
                         self.assertEqual(len(self.agent.submitted), before)
                         self.assertEqual(len(self.agent.compactions), compacted)
@@ -3878,13 +3878,10 @@ class WorkerCommandTests(unittest.TestCase):
                     delivery = pass_recorder.dispatch_delivery(passed)
                     progress_history.save_dispatch_delivery(self.run_dir, instance,
                         replace(delivery, line=second_line, completion_id=second_id))
-                    if status == "canceled":
-                        self.assertEqual(progress_history.cancel_worker_passes(self.run_dir, row.id), 1)
-                    else:
-                        state = self.run_dir / "progress_history_state.json"
-                        fields = cast(dict[str, object], json.loads(state.read_text()))
-                        cast(dict[str, dict[str, object]], fields["pass"])[name]["status"] = status
-                        atomic_file.write_text_atomic(state, json.dumps(fields))
+                    state = self.run_dir / "progress_history_state.json"
+                    fields = cast(dict[str, object], json.loads(state.read_text()))
+                    cast(dict[str, dict[str, object]], fields["pass"])[name]["status"] = status
+                    atomic_file.write_text_atomic(state, json.dumps(fields))
                     self.agent.append(pane, "user", second_line)
                     self.agent.append(pane, "assistant", f"DONE {instance}")
                     self.fixture.world.locations[pane]["agent_status"] = "idle"

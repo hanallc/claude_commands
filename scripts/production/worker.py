@@ -733,8 +733,11 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                 saved = _read_pass_done(done_path, passed.get("instance_id"), dispatch_id)
     late_result_ids = other_pass_results = NO_RESULT_IDS
     if stopped:
-        deliveries, other_passes = detached_runs.worker_results(directory, row, since=0,
-                                                               pane_dispatch_id=pane_pass.instance_id)
+        legacy = pane_pass.results
+        include_legacy = isinstance(legacy, progress_history.LegacyResultsForStoppedPass)
+        since = legacy.pass_started_at if include_legacy else 0
+        deliveries, other_passes = detached_runs.worker_results(directory, row, since=since,
+            pane_dispatch_id=pane_pass.instance_id, include_legacy_pass=include_legacy)
         late_result_ids = frozenset(deliveries)
         other_pass_results = frozenset(other_passes)
     else:
@@ -756,7 +759,10 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             detached_runs.live_runs(directory, row.name, identity=row.id))
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
         instance = pane_pass.instance_id
-        live = [record for record in live if record.get("pane_dispatch_id") == instance]
+        if isinstance(pane_pass.results, progress_history.LegacyResultsForStoppedPass):
+            live = [record for record in live if not detached_runs.result_is_from_another_pass(record, instance)]
+        else:
+            live = [record for record in live if record.get("pane_dispatch_id") == instance]
     else:
         if isinstance(pane_pass, worker_panes.PassDetachedResults):
             since, instance = pane_pass.started_at, pane_pass.instance_id
