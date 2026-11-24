@@ -31,7 +31,6 @@ RETENTION_DAYS = "nextest_failure_log_days"
 TAIL_BYTES = "nextest_failure_tail_bytes"
 SUMMARY_BYTES = "nextest_failure_summary_bytes"
 DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "config/mac_test.conf"
-SUMMARY_SCAN_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -126,9 +125,10 @@ def replay_log(log: BinaryIO, path: Path, status: int, limits: NextestOutputLimi
             if log.read(1) != b"\n":
                 _ = output.write(b"\n")
     if status:
+        scan_bytes = conf.read("mac_test").whole("nextest.summary_scan_bytes")
         _ = log.seek(0)
         summary = b""
-        for line in parse.bounded_displayed_lines(log, SUMMARY_SCAN_BYTES):
+        for line in parse.bounded_displayed_lines(log, scan_bytes):
             if parse.SUMMARY.match(line):
                 summary = line.encode()[:limits.summary_bytes]
         if summary:
@@ -163,7 +163,7 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
             replay_log(log, path, status, limits, output)
             if status == 0:
                 path.unlink()
-        except OSError as error:
+        except (OSError, conf.Unusable) as error:
             print(f"mac_test: cannot replay the nextest log: {error}", file=sys.stderr)
     return 128 - status if status < 0 else status
 

@@ -342,7 +342,7 @@ class MomentTests(unittest.TestCase):
         )) as connection:
             ids = moments.hana_step_ids(connection, START, END)
             rates = moments.window_rates(connection, START, END)
-            groups = report.profile_step_durations(connection, START, END, hana_only=True)
+            groups = report.profile_step_durations(connection, START, END, report.RebuildClasses.read(), hana_only=True)
         self.assertEqual(ids, frozenset({"direct-offset", "call-offset"}))
         self.assertEqual(rates.totals["nextest"], 2)
         self.assertAlmostEqual(rates.totals["run_hours_hana"], 0.05)

@@ -19,7 +19,8 @@ from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
 from scripts.buildlog import cli, mac_idle, machine_facts, sample
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
+from scripts.lib import conf
+from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, write_config_fixture
 
 GIB = records.GIB
 NOW = 1_800_000_000.0
@@ -59,6 +60,11 @@ def compiler_service(*jobs: records.CompilerJob,
 
 STALLED = snapshot([waiter(NOW - 3 * 3600)], (holder(NOW - 3 * 3600),
     compiler_service(source=COMPILER_SCOPE)))
+
+
+def write_tail_limit(folder: Path, bytes_to_scan: int) -> None:
+    _ = write_config_fixture(folder / "build_admission.conf",
+                             f"# whole: 1..\nhead_stall.times_tail_bytes={bytes_to_scan}\n")
 
 
 class FindStallTests(unittest.TestCase):
@@ -103,6 +109,9 @@ class FindStallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             paths = head_stall.StallPaths(root, root / "stall.json")
+            config = root / "config"
+            write_tail_limit(config, 1024)
+            self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
             builds = root / "builds.slice"
             cache = builds / "sccache.service"
             cache.mkdir(parents=True)
@@ -153,7 +162,7 @@ class FindStallTests(unittest.TestCase):
                 with self.subTest(name=name):
                     queue = snapshot([waiter(NOW - 3600)], (first, second_holder, *service))
                     write_queue_snapshot(paths.admission, queue.inputs, queue.policy)
-                    stall = head_stall.current_stall(paths, NOW, LIMIT, 120)
+                    stall = head_stall.current_stall(paths, NOW)
                     assert isinstance(stall, head_stall.HeadStall)
                     self.assertEqual(head_stall.builds_text(stall).splitlines()[2:-1], [
                         *header,
@@ -223,14 +232,21 @@ class FindStallTests(unittest.TestCase):
 class LastAdmissionTests(unittest.TestCase):
     def test_reads_the_newest_admitted_row_with_need_and_skips_other_rows(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
-            times = Path(folder) / "queue_times.jsonl"
+            root = Path(folder)
+            times = root / "queue_times.jsonl"
             rows = [{"kind": "admitted", "admitted_at": NOW - 600, "need": GIB},
                     {"kind": "admitted", "admitted_at": NOW - 60, "need": GIB},
                     {"kind": "admitted", "admitted_at": NOW - 30, "need": 0},
                     {"kind": "released", "at": NOW}]
-            _ = times.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows) + "{broken\n")
-            self.assertEqual(head_stall.last_admission(times), NOW - 60)
-            self.assertEqual(head_stall.last_admission(Path(folder) / "missing.jsonl"), 0.0)
+            lines = [json.dumps(row, separators=(",", ":")) + "\n" for row in rows] + ["{broken\n"]
+            _ = times.write_text("".join(lines))
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(root)}):
+                for suffix, expected in ((lines, NOW - 60), (lines[2:], 0.0)):
+                    with self.subTest(expected=expected):
+                        write_tail_limit(root, len("".join(suffix).encode()))
+                        settings = conf.read("build_admission")
+                        self.assertEqual(head_stall.last_admission(times, settings), expected)
+                self.assertEqual(head_stall.last_admission(root / "missing.jsonl", conf.read("build_admission")), 0.0)
 
 
 class WatchTests(unittest.TestCase):
@@ -242,8 +258,9 @@ class WatchTests(unittest.TestCase):
         folder = self.enterContext(tempfile.TemporaryDirectory())
         self.paths = head_stall.StallPaths(Path(folder) / "admission", Path(folder) / "head_stall.json")
         self.paths.admission.mkdir()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(Path(folder) / "config"))))
-        _ = self.enterContext(mock.patch.object(head_stall, "configured_limits", return_value=(LIMIT, 120.0)))
+        config = Path(folder) / "config"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(config))))
+        write_tail_limit(config, 1024)
         self.sent = []
 
     def run_send(self, result: bool) -> Callable[[list[str], str], bool]:

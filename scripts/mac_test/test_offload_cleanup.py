@@ -21,7 +21,9 @@ from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
 )
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS
+from scripts.lint.memory_test_support import (
+    UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture,
+)
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, removal_guard, test_hang_guard
@@ -168,6 +170,10 @@ class MacCleanupProtocolTests(unittest.TestCase):
 
 
     def test_nextest_summary_scan_bounds_long_lines(self) -> None:
+        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scan_bytes = 96
+        _ = write_config_fixture(config / "mac_test.conf", f"nextest.summary_scan_bytes={scan_bytes}\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
         summary = b"Summary [0.1s] 1 test run: 1 failed, "
         noise = b"x" * (64 * 1024)
         fake_summary = b"Summary [0.2s] 1 test run: 1 passed"
@@ -189,6 +195,7 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 for call in readline.call_args_list:
                     (size,) = cast(tuple[int], call.args)
                     self.assertTrue(0 < size < len(noise))
+                    self.assertLessEqual(size, scan_bytes)
                 self.assertEqual(output.getvalue(),
                                  b"mac_test: full nextest log: log\nmac_test: tail fragment: end\n"
                                  + (expected + b"\n" if expected else b""))
@@ -208,7 +215,8 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         configuration.mkdir()
         _ = (configuration / "build_targets.conf").write_text(MAC_TARGET_CONFIG)
         mac_settings = configuration / "mac_test.conf"
-        _ = mac_settings.write_text("mirror_root=~/.local/state/mac-test/mirror\n" + nextest_settings())
+        _ = write_config_fixture(mac_settings, "mirror_root=~/.local/state/mac-test/mirror\n"
+                                 + nextest_settings() + "nextest.summary_scan_bytes=96\n")
         _ = (configuration / "lint.conf").write_text(LINT_TRIM_CONFIG)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", mac_settings)))

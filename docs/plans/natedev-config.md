@@ -474,7 +474,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
-### Phase 10 — Build tool literals to config  · status: todo
+### Phase 10 — Build tool literals to config  · status: done
 **Depends on:** Phase 3
 
 #### Work Order

@@ -36,8 +36,13 @@ from scripts.buildlog.test_holds import timed_hold_events, write_holder, write_m
 from scripts.buildlog.test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 from scripts.buildlog.test_record_rerun import refresh_machine_health
 from scripts.buildlog.test_memory_window import isolated_journal, configured_host_cli, configured_local_host
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 HISTORY_STAMP = "2026-09-30T12:00:00Z"
+
+
+def write_edited_crate_maximum(folder: Path, maximum: int) -> None:
+    _ = write_config_fixture(folder / "buildlog.conf", f"report.edited_crate_max_crates={maximum}\n")
 
 
 def table_cells(heading: str, rows: list[str]) -> list[dict[str, str]]:
@@ -70,7 +75,9 @@ class ReportSpeedTests(unittest.TestCase):
         _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(temporary / "config"))))
+        config = temporary / "config"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, mac_natedev_environment(config))))
+        write_edited_crate_maximum(config, 3)
 
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
@@ -210,6 +217,7 @@ class ReportTests(unittest.TestCase):
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **mac_natedev_environment(Path(temporary))}))
+        write_edited_crate_maximum(Path(temporary), 3)
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
@@ -1201,7 +1209,10 @@ class ReportTests(unittest.TestCase):
                 self.assertTrue(any(line.startswith(f"| {label} | 1 |") for line in section), section)
                 self.assertTrue(any(line.startswith(f"| {other_label} | 0 |") for line in section), section)
                 with closing(index.read_only()) as connection:
-                    groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+                    groups = report.profile_step_durations(
+                        connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC),
+                        report.RebuildClasses.read(),
+                    )
                 self.assertEqual(groups[("nextest", "verify", label)], [20.0])
                 self.assertNotIn(("nextest", "verify", other_label), groups)
 
@@ -1223,7 +1234,10 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| first build here (1–49 crates) | 0 | — | — | — | — | — |", section)
         self.assertIn("| hana | 1 | 10.0 s | 10.0 s | 10.0 s |", section)
         with closing(index.read_only()) as connection:
-            groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+            groups = report.profile_step_durations(
+                connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC),
+                report.RebuildClasses.read(),
+            )
         self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
         self.assertNotIn(("nextest", "verify", "first build here (1–49 crates)"), groups)
 
@@ -1238,22 +1252,37 @@ class ReportTests(unittest.TestCase):
             self.root / "natedev" / "2026-10.jsonl",
             cargo_build("warm-edited", caller="verify", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(warm)"]),
             cargo_build("warm-cascade", caller="verify", crates_compiled=4, duration_s=40.0, finished_s=20.0,
-                        argv=["cargo", "nextest", "run", "--workspace", "--tests"]),
+                        argv=["cargo", "nextest", "run", "--workspace", "--tests", "-E", "package(warm-cascade)"]),
             cargo_build("first-edited", caller="verify", target_dir="/fresh/one", duration_s=338.0, finished_s=300.0,
                         argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(first)"]),
             cargo_build("first-cascade", caller="verify", target_dir="/fresh/two", crates_compiled=4, duration_s=711.0, finished_s=700.0),
         )
-        section = self.rebuilds_lines()
-        for prefix in ("| edited crate (1–3 crates) | 1 |", "| cascade (4–49 crates) | 1 |", "| first build here (1–49 crates) | 2 |"):
-            self.assertTrue(any(line.startswith(prefix) for line in section), section)
-        title = section.index("Edited-crate rebuilds by package (nextest):")
-        packages = [line for line in section[title + 1:] if line.startswith("|")]
-        self.assertEqual(packages[2:], ["| warm | 1 | 10.0 s | 10.0 s | 10.0 s |"])
-        with closing(index.read_only()) as connection:
-            groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
-        self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
-        self.assertEqual(groups[("nextest", "verify", "cascade (4–49 crates)")], [40.0])
-        self.assertCountEqual(groups[("nextest", "verify", "first build here (1–49 crates)")], [338.0, 711.0])
+        for maximum, edited_label, cascade_label, edited_times, cascade_times in (
+            (3, "edited crate (1–3 crates)", "cascade (4–49 crates)", [20.0], [40.0]),
+            (4, "edited crate (1–4 crates)", "cascade (5–49 crates)", [20.0, 40.0], []),
+        ):
+            with self.subTest(maximum=maximum):
+                write_edited_crate_maximum(Path(os.environ["CONF_DIR"]), maximum)
+                section = self.rebuilds_lines()
+                for prefix in (f"| {edited_label} | {len(edited_times)} |",
+                               f"| {cascade_label} | {len(cascade_times)} |", "| first build here (1–49 crates) | 2 |"):
+                    self.assertTrue(any(line.startswith(prefix) for line in section), section)
+                title = section.index("Edited-crate rebuilds by package (nextest):")
+                packages = [line for line in section[title + 1:] if line.startswith("|")][2:]
+                expected_packages = ["| warm | 1 | 10.0 s | 10.0 s | 10.0 s |"]
+                if maximum == 4:
+                    expected_packages.insert(0, "| warm-cascade | 1 | 20.0 s | 20.0 s | 20.0 s |")
+                self.assertEqual(packages, expected_packages)
+                self.assertTrue(any(line.startswith(f"Source: warm nextest steps that compiled 1–{maximum} crates")
+                                    for line in section), section)
+                with closing(index.read_only()) as connection:
+                    groups = report.profile_step_durations(
+                        connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC),
+                        report.RebuildClasses.read(),
+                    )
+                self.assertCountEqual(groups[("nextest", "verify", edited_label)], edited_times)
+                self.assertEqual(groups.get(("nextest", "verify", cascade_label), []), cascade_times)
+                self.assertCountEqual(groups[("nextest", "verify", "first build here (1–49 crates)")], [338.0, 711.0])
 
     def test_unfinished_and_future_items_cannot_complete_the_historical_union(self) -> None:
         prefix = ["cargo", "nextest", "run", "--workspace"]
@@ -3338,7 +3367,11 @@ class PowerProfileTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
         point_root_at(self, self.root)
         self.addCleanup(time.tzset)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"})))
+        config = self.root.parent / "config"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(config), "TZ": "UTC", "USER_ZONE": "UTC",
+        })))
+        write_edited_crate_maximum(config, 3)
         # These fixtures exercise build/profile comparisons. Memory moments
         # have independent fixtures and must not change the profile assertions.
         _ = cast(object, self.enterContext(mock.patch.object(moments, "MOMENTS", tuple(

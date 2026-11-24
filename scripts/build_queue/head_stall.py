@@ -23,7 +23,6 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import memory_admit as gate
 
 SENDER = "head-stall watch"
-TIMES_TAIL_BYTES = 1 << 20
 PROC = gate.PROC
 
 type AlertRecipient = Literal["builds", "bob"]
@@ -93,13 +92,7 @@ def default_paths() -> StallPaths:
     return StallPaths(store.root() / "admission", store.root() / "head_stall.json")
 
 
-def configured_limits() -> tuple[float, float]:
-    """The stall limit and the oldest usable snapshot age, in seconds."""
-    settings = conf.read("build_admission")
-    return settings.number("head_stall_alert_minutes") * 60, settings.number("silence_seconds")
-
-
-def last_admission(times: Path) -> float:
+def last_admission(times: Path, settings: conf.ConfigRead) -> float:
     """The newest admitted time of a step with memory need in the tail of queue_times.jsonl; 0 when none.
 
     A merge gate or targeted test is admitted with zero need every few minutes; it frees nothing for the head.
@@ -107,7 +100,7 @@ def last_admission(times: Path) -> float:
     try:
         with times.open("rb") as stream:
             size = stream.seek(0, 2)
-            _ = stream.seek(max(0, size - TIMES_TAIL_BYTES))
+            _ = stream.seek(max(0, size - settings.whole("head_stall.times_tail_bytes")))
             lines = stream.read().decode(errors="replace").splitlines()
     except OSError:
         return 0.0
@@ -185,11 +178,15 @@ def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: floa
                      head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running), disk_hold)
 
 
-def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) -> HeadStall | NoStall:
+def current_stall(paths: StallPaths, now: float) -> HeadStall | NoStall:
+    settings = conf.read("build_admission")
+    limit = settings.number("head_stall_alert_minutes") * 60
+    freshest = settings.number("silence_seconds")
     snapshot = read_queue_snapshot(paths.admission)
     if not isinstance(snapshot, QueueSnapshot) or now - snapshot.written_at > freshest:
         return NoStall()
-    return find_stall(snapshot, last_admission(paths.admission / "queue_times.jsonl"), now, limit)
+    admitted = last_admission(paths.admission / "queue_times.jsonl", settings)
+    return find_stall(snapshot, admitted, now, limit)
 
 
 def _folder_name(folder: str) -> str:
@@ -285,8 +282,7 @@ def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[st
 
 def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bool] = _run) -> HeadStall | NoStall:
     """Alert once for each stall. A new step start permits another alert."""
-    limit, freshest = configured_limits()
-    stall = current_stall(paths, now, limit, freshest)
+    stall = current_stall(paths, now)
     if isinstance(stall, HeadStall):
         send_alert(stall, paths.state, now, run)
     return stall

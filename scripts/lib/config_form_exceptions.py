@@ -169,7 +169,6 @@ VARIABLE_EXCEPTIONS: tuple[VariableException, ...] = (
     VariableException("CODEX_CONFIG_FILE", "not a config file", ExceptionLifetime.PERMANENT),
 )
 
-_BUILD_TOOL_BATCH = RemoveInPhase("Build tool literals to config")
 _MESSAGE_BATCH = RemoveInPhase("Message and notice literals to config")
 _PRODUCTION_BATCH = RemoveInPhase("Production and direct literals to config")
 _AWS_REVIEW_BATCH = RemoveInPhase("AWS and review tool literals to config")
@@ -247,17 +246,9 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "scripts/build_queue/admission_wire.py", "CLEANUP_STATUS_MAX",
         "The cleanup protocol stores status in a signed 64-bit range.",
     ),
-    TunableLiteral(
-        "scripts/build_queue/head_stall.py", "TIMES_TAIL_BYTES", "1 << 20",
-        "build_admission", "head_stall.times_tail_bytes", "# whole: 1..", _BUILD_TOOL_BATCH,
-    ),
     InternalLiteral(
         "scripts/build_queue/memory_feed.py", "PROCESS_DEPTH_LIMIT",
         "Bound the process walk that collects memory readings.",
-    ),
-    TunableLiteral(
-        "scripts/buildlog/disk.py", "MIN_OUTSIDE_DIRECTORY_BYTES", "1 << 30",
-        "buildlog", "disk.min_outside_directory_bytes", "# whole: 1..", _BUILD_TOOL_BATCH,
     ),
     InternalLiteral(
         "scripts/buildlog/index.py", "MARK_BYTES",
@@ -266,10 +257,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/buildlog/launches.py", "MARK_BYTES",
         "Use a fixed sample for the saved launch scan cursor.",
-    ),
-    TunableLiteral(
-        "scripts/buildlog/report.py", "EDITED_CRATE_MAX_CRATES", "3",
-        "buildlog", "report.edited_crate_max_crates", "# whole: 1..", _BUILD_TOOL_BATCH,
     ),
     TunableLiteral(
         "scripts/direct/plan_history.py", "RATE_FACTOR_LIMIT", "2.0",
@@ -290,10 +277,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     InternalLiteral(
         "scripts/lib/python_startup/sitecustomize.py", "_GATE_ENVIRONMENT_LIMIT",
         "Bound environment reads during Python startup.",
-    ),
-    TunableLiteral(
-        "scripts/mac_test/nextest_log.py", "SUMMARY_SCAN_BYTES", "8192",
-        "mac_test", "nextest.summary_scan_bytes", "# whole: 1..", _BUILD_TOOL_BATCH,
     ),
     ExternalLiteral(
         "scripts/message/postmaster.py", "MAX_SAFE_INTEGER",
