@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
 from scripts.lib import urgency
+from scripts.lib import user_zone as user_zone_config
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
@@ -31,7 +32,8 @@ from scripts.production.proposal_issue import DeclinedDecision, InProgress, deci
 from scripts.production.proposal_issue import REVIEW_MARK_FIELD, review_log, review_mark
 from scripts.production.production_doc import production_field, Refusal
 from scripts.for_you.action import ActionStore
-from scripts.review_links import efficiency_reviews, for_you, new_item_dialog, review_events, review_later, review_submissions
+from scripts.review_links.question_path import NoLaterTime as NoLaterTime
+from scripts.review_links import question_path, efficiency_reviews, for_you, new_item_dialog, review_events, review_later, review_submissions
 from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
@@ -88,7 +90,8 @@ class ReviewSourceStamps(list[Path]):
 
 @contextmanager
 def guard_source(path: Path, sources: list[Path] | None, *,
-                 skip: tuple[type[Exception], ...] = (), entry: str = '') -> Generator[None]:
+                 skip: tuple[type[Exception], ...] = (), entry: str = '',
+                 change_list: bool = False) -> Generator[None]:
     """Track the source and isolate read failures during Review scans."""
     if isinstance(sources, ReviewSourceStamps):
         sources.append(path)
@@ -98,6 +101,10 @@ def guard_source(path: Path, sources: list[Path] | None, *,
         source = error.path if isinstance(error, change_routing.ProductionPathUnreadable) else path
         if isinstance(sources, ReviewSourceStamps):
             sources.skipped(source, entry, error)
+        elif change_list and isinstance(error, (change_review.ChangeReviewError, OSError, UnicodeError)):
+            if sources is not None:
+                raise ValueError(str(error)) from error
+            print(f'change review: {path}: {error}', file=sys.stderr)
         elif isinstance(error, skip) or sources is None and isinstance(error, (OSError, UnicodeError)):
             label = f'{source} ({entry})' if entry else str(source)
             logging.getLogger(__name__).warning('Review source %s: %s', label, error)
@@ -144,6 +151,12 @@ PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "s
                                    REVIEW_MARK_FIELD))
 # Approve and Decline close the item; Send feedback closes it; Ask question returns it.
 DECISION_ACTIONS = ('approve', 'decline', 'feedback', 'question')
+QUEUE_BY_STATE = {
+    ReviewState.OPEN: question_path.Queue.NEEDS_ME,
+    ReviewState.WAITING: question_path.Queue.WAITING_FOR_ANSWER,
+    ReviewState.VALIDATING: question_path.Queue.VALIDATING,
+    ReviewState.DONE: question_path.Queue.DONE,
+}
 
 
 def selected_states(show: str) -> tuple[ReviewState, ...]:
@@ -152,14 +165,13 @@ def selected_states(show: str) -> tuple[ReviewState, ...]:
         return REVIEW_STATES
     if show == 'active':
         return (ReviewState.OPEN, ReviewState.VALIDATING, ReviewState.WAITING)
-    if show in ('open', 'For you', 'for-you', 'for you'):
-        return (ReviewState.OPEN,)
+    if open_view(show):
+        return (ReviewState.OPEN, ReviewState.VALIDATING)
     return (ReviewState(show),)
 
 
-@dataclass(frozen=True)
-class NoLaterTime:
-    """The record has no date that hides it."""
+def open_view(show: str) -> bool:
+    return show in ('open', 'Open', 'For you', 'for-you', 'for you')
 
 
 @dataclass(frozen=True)
@@ -219,11 +231,11 @@ def validation_recipients(fields: object) -> tuple[staff.StaffId, ...]:
         saved, dict) else ()
 
 
-def handoff_time(fields: object) -> datetime | None:
-    """Read the saved handoff time."""
-    saved = cast(dict[str, object], fields).get('handed_at') if isinstance(fields, dict) else None
+def delivery_time(fields: object, field: str) -> datetime | None:
+    """Read a saved time from the delivery record."""
+    saved = cast(dict[str, object], fields).get(field) if isinstance(fields, dict) else None
     try:
-        return moment(saved) if isinstance(saved, str) else None
+        return datetime.fromisoformat(saved) if isinstance(saved, str) else None
     except ValueError:
         return None
 
@@ -283,6 +295,10 @@ type ReviewSource = (ChangeSource | QuestionSource | UnownedQuestionSource | Inv
                      | ProposalSource | ProposalLedgerSource | EfficiencySource | ForYouSource)
 
 
+class AnswerTimeFromLog(StrEnum):
+    USE_LOG = 'use log'
+
+
 @dataclass(frozen=True)
 class ReviewItem:
     key: str
@@ -305,13 +321,36 @@ class ReviewItem:
     text: str = ''
     waiting_why: str = ''
     response: review_submissions.QuestionResponse | None = None
+    answer_time: question_path.AnswerTime | AnswerTimeFromLog = AnswerTimeFromLog.USE_LOG
+    body_answer_events: frozenset[int] = frozenset()
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
-        return self.state == ReviewState.OPEN and not self.hidden_until(now)
+        return self.queue_at(now) is question_path.Queue.NEEDS_ME
 
     def hidden_until(self, now: datetime) -> bool:
-        return not isinstance(self.times.later, NoLaterTime) and self.times.later > now
+        return self.queue_at(now) is question_path.Queue.LATER
+
+    def queue_at(self, now: datetime) -> question_path.Queue:
+        return question_path.queue(QUEUE_BY_STATE[self.state], unread_answer=self.unread_answer,
+                                   later=question_path.later_active(self.times.later, now))
+
+    @property
+    def unread_answer(self) -> bool:
+        if self.state not in (ReviewState.OPEN, ReviewState.VALIDATING):
+            return False
+        time = self.answer_time
+        if time is AnswerTimeFromLog.USE_LOG:
+            time = question_path.answer_time(question_path.NO_ANSWER_TIME, self.log)
+        return question_path.has_unread_answer(time, self.log)
+
+    @property
+    def answer_read_event(self) -> str:
+        if isinstance(self.source, ChangeSource):
+            answer = self.source.slots.question
+            if isinstance(answer, delivery_state.AnsweredQuestion):
+                return 'Marked read: ' + answer.question_id
+        return 'Marked read'
 
 
 def source_path(item: ReviewItem) -> Path:
@@ -357,14 +396,19 @@ type ReviewSelection = ExactReviewRecord | AllReviewRecords
 ALL_RECORDS = AllReviewRecords()
 
 
-def moment(value: str) -> datetime:
+def moment(value: str, zone: ZoneInfo | None = None) -> datetime:
     """Read stored times in the user's zone when the store has no zone."""
     parsed = datetime.fromisoformat(value)
-    return aware(parsed, user_zone())
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=zone or user_zone())
 
 
 def aware(value: datetime, zone: ZoneInfo) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=zone)
+
+
+def dated_review_log(text: str, zone: ZoneInfo) -> tuple[ReviewLog, ...]:
+    return tuple(replace(event, time=aware(event.time, zone)) if event.time.tzinfo is None else event
+                 for event in review_events.decode(text))
 
 
 def normalize_times(item: ReviewItem, zone: ZoneInfo) -> ReviewItem:
@@ -397,15 +441,16 @@ def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
     return member.name if member is not None else str(identity)
 
 
-def for_you_item(row: for_you.ForYouRow, members: staff.StaffSnapshot) -> ReviewItem:
+def for_you_item(row: for_you.ForYouRow, members: staff.StaffSnapshot, *, zone: ZoneInfo | None = None) -> ReviewItem:
     """Place one action in the shared Review table."""
     requester = row.requester_reference or row.requested_by
     member = members.by_member_reference(requester) if requester else None
     owner = member.id if member is not None else staff.StaffId(row.requested_by or 'Not recorded')
     state = {'open': ReviewState.OPEN, 'done': ReviewState.DONE,
              'withdrawn': ReviewState.DONE, 'unknown': ReviewState.WAITING}[row.status]
-    filed = moment(row.created_at) if row.created_at else datetime.fromtimestamp(0, user_zone())
-    updated = moment(row.updated_at) if row.updated_at else filed
+    zone = zone or user_zone()
+    filed = moment(row.created_at, zone) if row.created_at else datetime.fromtimestamp(0, zone)
+    updated = moment(row.updated_at, zone) if row.updated_at else filed
     actions = ('done',) if row.status == 'open' and row.completion == 'manual' else ()
     identity = row.key[:15] if row.kind == 'action' else row.key
     return ReviewItem(row.key, identity, ReviewType.FOR_YOU, owner, owner, row.title, state,
@@ -454,8 +499,10 @@ def validation_log_label(words: str, validator: str) -> str:
 
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
                 members: staff.StaffSnapshot, queue: str, current: Path,
-                slots: delivery_state.DeliverySlots, *, handed_at: datetime | None = None,
-                validator: staff.StaffId | None = None) -> ReviewItem:
+                slots: delivery_state.DeliverySlots, *, zone: ZoneInfo, handed_at: datetime | None = None,
+                validator: staff.StaffId | None = None,
+                answered_at: question_path.AnswerTime = question_path.NO_ANSWER_TIME,
+                sources: list[Path] | None = None) -> ReviewItem:
     """Project a change once for the page, counts and queue."""
     prefix = path.stem.removeprefix(change_review.PREFIX)
     routed = assignment.owner
@@ -464,10 +511,14 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     state = change_state(row, slots)
     identity = (validator or staff.StaffId('')) if state == ReviewState.VALIDATING else routed_id
     source = staff.StaffId(row.get('Producer', '') or routed_id)
-    entry = change_review.row_entries([row])[0]
-    filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
+    entry = change_review.row_entries([row], sources=sources)[0]
+    if handed_at is not None:
+        handed_at = aware(handed_at, zone)
+    if isinstance(answered_at, datetime):
+        answered_at = aware(answered_at, zone)
+    filed = entry.since.replace(tzinfo=zone) if entry.since is not None else datetime(1970, 1, 1, tzinfo=zone)
     logs = [ReviewLog(filed, name(source, members), 'Filed for your check')]
-    saved_log = review_events.decode(row.get('Review log', ''))
+    saved_log = dated_review_log(row.get('Review log', ''), zone)
     words = {entry.words.casefold() for entry in saved_log}
     validating = state == ReviewState.VALIDATING
     validator_name = name(identity, members) if validating else ''
@@ -476,41 +527,81 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     if slots.validation_requested and validation_at is None:
         logs.append(ReviewLog(filed, 'nate', validation_log_label('validate', validator_name)))
     request = slots.question
-    exchange: set[str] = set()
-    if isinstance(request, (OpenFeedback, CompletedFeedback)):
-        if not any(entry.matches_feedback(request.question_id, request.text) for entry in saved_log):
-            logs.append(ReviewLog(filed, 'nate', 'feedback: ' + request.text, request.question_id))
-    elif isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)):
-        event = 'Question: ' + request.text
-        exchange.add(event.casefold())
-        if event.casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', validation_log_label(event, validator_name) if validating else event))
-    if isinstance(request, delivery_state.AnsweredQuestion):
-        answer = 'Answer: ' + request.answer
-        validation_answer = validating and not isinstance(request, CompletedFeedback)
-        if validation_answer:
-            exchange.add(answer.casefold())
-        if answer.casefold() not in words:
-            logs.append(ReviewLog(filed, name(identity, members),
-                                  validation_log_label(answer, validator_name) if validation_answer else answer))
+    status_time = question_path.answer_time(answered_at, saved_log)
+    question_at = -1
+    answer_at = -1
+    validation_exchanges: set[str] = set()
+    body_answer_events: set[int] = set()
+    if isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)):
+        feedback = isinstance(request, (OpenFeedback, CompletedFeedback))
+        prompt = ('feedback: ' if feedback else 'Question: ') + request.text
+        question_at = next((index for index, event in enumerate(saved_log)
+                            if event.words.casefold().startswith('feedback: ' if feedback else 'question: ')
+                            and event.feedback_request_id == request.question_id), -1)
+        # Keep the legacy display when the log has no exchange ID.
+        if feedback:
+            legacy_prompt = any(not event.feedback_request_id and event.matches_feedback(request.question_id, request.text)
+                                for event in saved_log)
+        else:
+            legacy_prompt = any(not event.feedback_request_id and event.words.casefold() == prompt.casefold()
+                                for event in saved_log)
+            validation_exchanges.add(prompt.casefold())
+        if question_at < 0 and not legacy_prompt:
+            logs.append(ReviewLog(filed, 'nate', validation_log_label(prompt, validator_name)
+                                  if validating and not feedback else prompt, request.question_id))
+
+        if isinstance(request, delivery_state.AnsweredQuestion):
+            answer = 'Answer: ' + request.answer
+            answer_at = next((index for index in range(len(saved_log) - 1, -1, -1)
+                              if saved_log[index].words.startswith('Answer: ') and saved_log[index].feedback_request_id
+                              in (request.question_id, question_path.answer_log_id(request.question_id))), -1)
+            legacy_answer = any(not event.feedback_request_id and event.words.casefold() == answer.casefold()
+                                for event in saved_log)
+            if not feedback:
+                validation_exchanges.add(answer.casefold())
+            if answer_at < 0 and not legacy_answer:
+                if not validating or not feedback:
+                    body_answer_events.add(len(logs))
+                logs.append(ReviewLog(answered_at if isinstance(answered_at, datetime) else filed,
+                                      name(identity, members), validation_log_label(answer, validator_name)
+                                      if validating and not feedback else answer,
+                                      question_path.answer_log_id(request.question_id)))
+    if validating and isinstance(status_time, datetime):
+        boundary_times = [] if handed_at is None else [handed_at]
+        if validation_at is not None:
+            boundary_times.append(saved_log[validation_at].time)
+        if question_at >= 0:
+            boundary_times.append(saved_log[question_at].time)
+        elif isinstance(request, delivery_state.AnsweredQuestion):
+            boundary_times.extend(event.time for event in saved_log if not event.feedback_request_id
+                                  and event.words.casefold().startswith('question: '))
+        if isinstance(request, delivery_state.OpenQuestion) or any(
+                status_time.timestamp() <= stamp.timestamp() for stamp in boundary_times):
+            status_time = question_path.NO_ANSWER_TIME
     if row.get('Verdict') and row['Verdict'].casefold() not in words and not any(
             entry.words.startswith('feedback sent:') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', row['Verdict']))
     for index, event in enumerate(saved_log):
-        during_validation = index >= validation_at if validation_at is not None else event.words.casefold() in exchange
+        if (index == answer_at and isinstance(request, delivery_state.AnsweredQuestion)
+                and event.words == 'Answer: ' + request.answer and (not validating or not isinstance(request, CompletedFeedback))):
+            body_answer_events.add(len(logs))
+        legacy_validation = not event.feedback_request_id and (
+            index >= validation_at if validation_at is not None else event.words.casefold() in validation_exchanges)
+        during_validation = index in (validation_at, question_at, answer_at) or legacy_validation
         logs.append(replace(event, words=validation_log_label(event.words, validator_name))
                     if validating and during_validation else event)
     shown = change_review.display_id(row, routed.tab)
     after = entry.after if '/' in entry.after else prefix+'/'+entry.after if entry.after else ''
     local = path.absolute() == current.absolute()
     return ReviewItem(prefix+'/'+row['#'], shown, ReviewType.CHANGE, identity, source,
-        row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
+        row['Change'], state, ReviewTimes(filed, max(event.time for event in logs)), tuple(logs),
         ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN
         else ('question',) if state == ReviewState.VALIDATING and identity else (),
         ChangeSource(path, row, assignment, slots, handed_at), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
-        review_events.waiting_why(slots.waiting_why))
+        review_events.waiting_why(slots.waiting_why), answer_time=status_time,
+        body_answer_events=frozenset(body_answer_events))
 
 
 def change_queue_name(doc: Path, members: staff.StaffSnapshot, current: Path, below: bool = False) -> str:
@@ -521,35 +612,33 @@ def change_queue_name(doc: Path, members: staff.StaffSnapshot, current: Path, be
     return urgency.scope_queue(queue, below)
 
 
-def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | None = None,
+def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, document: Path | None = None,
                  below: bool = False, sources: list[Path] | None = None,
                  states: tuple[ReviewState, ...] = REVIEW_STATES,
                  owner_options: dict[staff.StaffId, str] | None = None,
                  selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
+    paths: list[Path]
+    folder = change_review.lists_directory() if document is None else change_review.lists_directory(sources=sources)
+    scope_queue: tuple[str, Path] | None = None
+    delivery_names: set[str] | None = None
     if document is not None:
         current = change_review.scope_list(document, record=members, sources=sources)
         queue = change_queue_name(document, members, current, below)
-        routed = (change_review.routed_review_entries(current,document,below,record=members,sources=sources) if below else
-                  change_review.routed_review_entries(current,document,record=members,sources=sources) if sources is not None else
-                  change_review.routed_review_entries(current,document,record=members))
-        scoped: list[ReviewItem] = []
-        for listing, owner, row in routed:
-            if ReviewState.OPEN not in states:
-                continue
-            path = change_routing.delivery_path(root, listing.path, row['#'])
-            with guard_source(path, sources, entry=row['#']):
-                slots = read_change_delivery(path, sources=sources)
-                scoped.append(change_item(listing.path, row, change_routing.ChangeAssignment(owner, document),
-                                         members, queue, current, slots))
-        return scoped
-    folder = change_review.lists_directory()
-    if isinstance(selection, ExactReviewRecord):
+        delivery_names = {path.name for path in source_paths(root, '.review-link-delivery-*', sources=sources)}
+        listed = change_review.scope_lists(current, document, below, record=members, sources=sources)
+        others = source_paths(folder, change_review.PREFIX+'*.md', sources=sources)
+        paths = list(dict.fromkeys([*(listing.path.absolute() for listing in listed),
+                                    *(path.absolute() for path in others)]))
+        scope_queue = queue, current
+        if sources is not None:
+            sources.append(document)
+    elif isinstance(selection, ExactReviewRecord):
         paths = [selection.path]
     else:
-        paths = source_paths(folder, change_review.PREFIX+'*.md', sources=sources)
+        paths = sorted(source_paths(folder, change_review.PREFIX+'*.md', sources=sources))
     snapshots: dict[Path, change_review.ReviewListSnapshot] = {}
-    for path in sorted(paths):
-        with guard_source(path, sources):
+    for path in paths:
+        with guard_source(path, sources, change_list=document is not None):
             if sources is not None:
                 sources.append(path)
             snapshots[path] = change_review.review_snapshot(path, include_reviewed=ReviewState.DONE in states,
@@ -573,63 +662,119 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                     owner = next((member for member in members.rows if member.name == tab), None)
                     identity = owner.id if owner is not None else staff.StaffId(tab)
                     owner_options[identity] = name(identity, members)
-        for row in (*snapshot.pending, *snapshot.reviewed):
-            key = path.stem.removeprefix(change_review.PREFIX)+'/'+row['#']
-            if not selection.includes(path, key):
-                continue
-            delivery_path = change_routing.delivery_path(root, path, row['#'])
-            with guard_source(delivery_path, sources, entry=row['#']):
-                if row.get('Verdict') and ReviewState.DONE not in states:
+        list_items: list[ReviewItem] = []
+        with guard_source(path, sources, change_list=document is not None):
+            for row in (*snapshot.pending, *snapshot.reviewed):
+                key = path.stem.removeprefix(change_review.PREFIX)+'/'+row['#']
+                if not selection.includes(path, key):
                     continue
-                if not row.get('Verdict') and states == (ReviewState.DONE,):
-                    continue
-                fields = _read_change_delivery_fields(delivery_path, sources)
-                slots = decode_change_delivery(fields)
-                state = change_state(row, slots)
-                if state not in states:
-                    continue
-                assignment = routing.owner_and_production(path, row)
-                tab = assignment.owner.tab
-                doc = routing.production(tab)
-                queue_source = (tab, path if doc is None else doc)
-                if queue_source not in queues:
-                    current = change_review.scope_list(doc, record=members, sources=sources) if doc is not None else path
-                    queue = change_queue_name(doc, members, current) if doc is not None else change_review.queue(path)
-                    queues[queue_source] = queue, current
-                queue, current = queues[queue_source]
-                recipients = validation_recipients(fields) if state == ReviewState.VALIDATING else ()
-                validator = recipients[0] if recipients else None
-                found.append(change_item(path, row, assignment, members, queue, current, slots,
-                                         handed_at=handoff_time(fields) if state == ReviewState.VALIDATING else None,
-                                         validator=validator))
+                delivery_path = change_routing.delivery_path(root, path, row['#'])
+                with guard_source(delivery_path, sources, entry=row['#']):
+                    if row.get('Verdict') and ReviewState.DONE not in states:
+                        continue
+                    if not row.get('Verdict') and states == (ReviewState.DONE,):
+                        continue
+                    fields = (_read_change_delivery_fields(delivery_path, sources)
+                              if delivery_names is None or delivery_path.name in delivery_names else None)
+                    slots = decode_change_delivery(fields)
+                    state = change_state(row, slots)
+                    if state not in states:
+                        continue
+                    assignment = routing.owner_and_production(path, row)
+                    if scope_queue is None:
+                        tab = assignment.owner.tab
+                        doc = routing.production(tab)
+                        queue_source = (tab, path if doc is None else doc)
+                        if queue_source not in queues:
+                            current = change_review.scope_list(doc, record=members, sources=sources) if doc is not None else path
+                            queue = change_queue_name(doc, members, current) if doc is not None else change_review.queue(path)
+                            queues[queue_source] = queue, current
+                        queue, current = queues[queue_source]
+                    else:
+                        queue, current = scope_queue
+                    recipients = validation_recipients(fields) if state == ReviewState.VALIDATING else ()
+                    validator = recipients[0] if recipients else None
+                    handed_at = delivery_time(fields, 'handed_at')
+                    answered_at = delivery_time(fields, 'answered_at') or question_path.NO_ANSWER_TIME
+                    list_items.append(change_item(path, row, assignment, members, queue, current, slots,
+                                                  zone=zone, handed_at=handed_at, validator=validator, answered_at=answered_at,
+                                                  sources=sources if document is not None else None))
+            found.extend(list_items)
     return found
 
 
 def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
-                  unowned: bool = False) -> ReviewItem:
+                  unowned: bool = False, zone: ZoneInfo | None = None) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
-    parsed = update_registration.parse_outstanding_entries([fields], path)[0]
-    filed = moment(fields['since'])
-    entry = update_registration.question_entry(owner, fields, path)
+    parsed = record.parsed_snapshot()
+    zone = zone or user_zone()
+    filed = aware(parsed.since, zone)
+    entry = update_registration.ranked_question_entry(owner, fields, parsed)
     asker = staff.StaffId(fields.get('asked_by', ''))
     state = question_state(record)
-    after = fields.get('after','')
-    later = moment(after) if after else NoLaterTime()
-    saved_log = review_events.decode(fields.get('review_log', ''))
-    response = review_submissions.question_response(record, saved_log)
-    logs = [ReviewLog(filed, name(asker, members), 'Asked') if response is None
-            else ReviewLog(filed, 'you', 'Asked from New item')]
-    words = {entry.words.casefold() for entry in saved_log}
-    for position, exchange in enumerate(fields.get('followups', [])):
-        if (response is None or position != 0) and not any(
-                (prefix+exchange['followup']).casefold() in words for prefix in ('question: ','followup: ')):
-            logs.append(ReviewLog(filed,'nate',exchange['followup']))
-        if ('Answer: '+exchange['reply']).casefold() not in words:
-            logs.append(ReviewLog(filed,name(asker,members),exchange['reply']))
-    if 'followup' in fields and not any((prefix+fields['followup']['text']).casefold() in words
-                                      for prefix in ('question: ','followup: ')):
-        logs.append(ReviewLog(moment(fields['followup']['sent']), 'nate', fields['followup']['text']))
+    local_later = update_registration.outstanding_later(parsed.timing)
+    later = aware(local_later, zone) if isinstance(local_later, datetime) else local_later
+    saved_log = dated_review_log(fields.get('review_log', ''), zone)
+    exchanges = fields.get('followups', [])
+    asker_name = name(asker, members)
+    raw_positions = fields.get('reply_log_positions', {})
+    positions = {index: position for index in range(len(exchanges))
+                 if 0 <= (position := raw_positions.get(str(index), -1)) < len(saved_log)
+                 and saved_log[position].words.startswith('Answer: ')}
+    positioned = set(positions.values())
+    named_answers = {event.feedback_request_id.removeprefix('answer:'): index
+                     for index, event in enumerate(saved_log)
+                     if event.feedback_request_id and event.words.startswith('Answer: ') and index not in positioned}
+    for index, exchange in enumerate(exchanges):
+        identifier = exchange.get('question_id', '')
+        if index not in positions and identifier in named_answers:
+            positions[index] = named_answers[identifier]
+    legacy_response = ('review_submission' in fields and 'followup' not in fields and bool(exchanges)
+                       and len(exchanges) - 1 not in positions and not exchanges[-1].get('question_id'))
+    linked_answers = set(positions.values())
+    legacy_events = {index: event for index, event in enumerate(saved_log)
+                     if index not in linked_answers and (legacy_response or not event.feedback_request_id)}
+    # Keep the legacy display when an event has no link to an exchange.
+    response = review_submissions.question_response(record, tuple(legacy_events.values()))
+    logs = [ReviewLog(filed, asker_name, 'Asked') if response is None else ReviewLog(filed, 'you', 'Asked from New item')]
+    legacy_words = {event.words.casefold() for event in legacy_events.values()}
+    prompt_prefixes = ('question: ', 'followup: ')
+    named_prompts = {event.feedback_request_id for event in saved_log
+                     if event.words.casefold().startswith(prompt_prefixes) and event.feedback_request_id}
+    body_answer_events: set[int] = set()
+    body_log_positions: set[int] = set()
+    for index, exchange in enumerate(exchanges):
+        if (response is None or index != 0) and exchange.get('question_id', '') not in named_prompts and not any(
+                (prefix + exchange['followup']).casefold() in legacy_words for prefix in prompt_prefixes):
+            logs.append(ReviewLog(filed, 'nate', exchange['followup']))
+        in_body = response is None or index == len(exchanges) - 1
+        answer = 'Answer: ' + exchange['reply']
+        if index in positions:
+            position = positions[index]
+            event = saved_log[position]
+            if in_body and event.words == answer:
+                body_log_positions.add(position)
+                if response is not None:
+                    response = replace(response, answered_at=event.time)
+        elif answer.casefold() not in legacy_words:
+            if in_body:
+                body_answer_events.add(len(logs))
+            stamp = exchange.get('replied_at')
+            logs.append(ReviewLog(moment(stamp, zone) if stamp is not None else filed, asker_name, exchange['reply']))
+    if response is not None and len(exchanges) - 1 not in positions:
+        body_log_positions.update(index for index, event in legacy_events.items()
+                                  if event.time == response.answered_at and event.who == owner
+                                  and event.words == 'Answer: ' + response.answer)
+    if isinstance(parsed.timing, update_registration.AwaitingReply) and 'followup' in fields:
+        prompt = fields['followup']['text']
+        encoded_prompts = {prefix + prompt.casefold() for prefix in prompt_prefixes}
+        if not any(event.words.casefold() in encoded_prompts for event in saved_log):
+            logs.append(ReviewLog(aware(parsed.timing.sent, zone), 'nate', prompt))
+    body_answer_events.update(len(logs) + position for position in body_log_positions)
     logs.extend(saved_log)
+    saved_answer_time = fields.get('answered_at')
+    status_time = question_path.answer_time(
+        moment(saved_answer_time, zone) if saved_answer_time is not None else question_path.NO_ANSWER_TIME, saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
     key = 'question/'+owner+'/'+path.name
     review_id = fields.get('review_id', path.stem)
@@ -638,10 +783,10 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     kind = ReviewType.QUESTION if response is None else ReviewType.RESPONSE
     actions = ('answer', 'feedback', 'question') if response is None else ('read', 'question')
     return ReviewItem(key, identity, kind, owner, asker, fields['text'], state,
-        ReviewTimes(filed, logs[-1].time, later), tuple(logs),
+        ReviewTimes(filed, max(event.time for event in logs), later), tuple(logs),
         actions if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
-        review_events.waiting_why(fields.get('waiting_why', '')), response)
+        review_events.waiting_why(fields.get('waiting_why', '')), response, status_time, frozenset(body_answer_events))
 
 
 def store_paths(folders: tuple[Path, ...], sources: list[Path] | None) -> Iterator[Path]:
@@ -663,7 +808,7 @@ def snapshot_store_paths(folder: Path, sources: ReviewSourceStamps) -> Iterator[
         yield from sources.record_files(archive, recursive=True)
 
 
-def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
+def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *, zone: ZoneInfo,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
                    include_unowned: bool = True,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
@@ -689,7 +834,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
         if question_state(record) not in states or not selection.includes(
                 record.path, 'question/'+record.owner+'/'+record.path.name):
             return
-        item = question_item(record, members, unowned=unowned)
+        item = question_item(record, members, unowned=unowned, zone=zone)
         if item.type in kinds:
             found.append(item)
 
@@ -751,7 +896,8 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                         states: tuple[ReviewState, ...] = REVIEW_STATES,
                         kinds: tuple[ReviewType, ...] = INVESTIGATION_TYPES,
                         owner_options: dict[staff.StaffId, str] | None = None,
-                        selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
+                        selection: ReviewSelection = ALL_RECORDS, zone: ZoneInfo | None = None) -> list[ReviewItem]:
+    zone = zone or user_zone()
     root = investigation.state_root()
     selected = owners
     with guard_source(root, sources):
@@ -786,7 +932,7 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                         for owner in (record.source_owner, owner_for(identity, members)):
                             owner_options[owner] = name(owner, members)
                     if investigation_state(record) in states:
-                        found.append(investigation_item(record, members, path))
+                        found.append(investigation_item(record, members, path, zone=zone))
     return found
 
 
@@ -794,14 +940,17 @@ def investigation_type(record: investigation.Investigation) -> ReviewType:
     return ReviewType.BUG if record.kind == investigation.InvestigationKind.BUG else ReviewType.INVESTIGATION
 
 
-def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path) -> ReviewItem:
-    filed = moment(record.filed)
+def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path, *,
+                       zone: ZoneInfo | None = None) -> ReviewItem:
+    zone = zone or user_zone()
+    filed = moment(record.filed, zone)
+    answered_at = moment(record.answered, zone) if record.answered else question_path.NO_ANSWER_TIME
     logs = [ReviewLog(filed, name(record.owner, members), 'Filed')]
-    if record.answered and not any(entry.words.startswith('Answer: ') for entry in record.log):
-        logs.append(ReviewLog(moment(record.answered), name(record.owner, members), 'Answer ready'))
+    if isinstance(answered_at, datetime) and not any(entry.words.startswith('Answer: ') for entry in record.log):
+        logs.append(ReviewLog(answered_at, name(record.owner, members), 'Answer ready'))
     if record.read and not any(entry.words.startswith(('Marked read','feedback sent:')) for entry in record.log):
-        logs.append(ReviewLog(moment(record.read), 'nate', 'Marked read'))
-    logs.extend(record.log)
+        logs.append(ReviewLog(moment(record.read, zone), 'nate', 'Marked read'))
+    logs.extend(replace(event, time=aware(event.time, zone)) if event.time.tzinfo is None else event for event in record.log)
     state = investigation_state(record)
     owner = owner_for(record.owner, members)
     key = 'investigation/'+record.owner+'/'+record.id
@@ -811,7 +960,8 @@ def investigation_item(record: investigation.Investigation, members: staff.Staff
         ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record, path),
         queue='investigation-'+owner, queue_key=key,
         text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer,
-        waiting_why=review_events.waiting_why(record.waiting_why))
+        waiting_why=review_events.waiting_why(record.waiting_why),
+        answer_time=question_path.answer_time(answered_at, tuple(logs)))
 
 
 def proposal_state(issue: Issue) -> ReviewState:
@@ -859,18 +1009,18 @@ def proposal_prerequisite(path: Path, dependency: str, eligible: Callable[[Path]
 
 
 def issue_item(issue: Issue, owner: staff.StaffId, members: staff.StaffSnapshot, *,
-               sources: list[Path] | None = None, prerequisite: Callable[[Path, str], str] | None = None) -> ReviewItem:
+               zone: ZoneInfo, sources: list[Path] | None = None, prerequisite: Callable[[Path, str], str] | None = None) -> ReviewItem:
     """Project a proposal for the Review index and its body."""
     issue = Issue(proposal_path(issue.path), issue.fields)
     row = proposals_table.issue_row(issue, members, sources=sources)
     key = 'proposal/'+str(issue.path)
     if not isinstance(row.progress, proposal_issue.AwaitingApproval):
-        filed = moment(issue.value('date_created') or '1970-01-01')
+        filed = moment(issue.value('date_created') or '1970-01-01', zone)
         return proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by') or owner),
                              issue.path.stem, filed, members)
     after = prerequisite(issue.path, row.entry.after) if prerequisite is not None and row.entry.after else ''
     entry = replace(row.entry, after=after)
-    filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
+    filed = aware(entry.since, zone) if entry.since is not None else datetime(1970, 1, 1, tzinfo=zone)
     return proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by')), issue.path.stem, filed,
                          members, entry, 'proposal-'+owner)
 
@@ -881,7 +1031,7 @@ def submission_item(saved: review_submissions.SavedSubmission, members: staff.St
     if isinstance(record, update_registration.QuestionRecord):
         return question_item(record, members)
     if isinstance(record, Issue):
-        return issue_item(record, saved.owner, members, sources=[])
+        return issue_item(record, saved.owner, members, zone=user_zone(), sources=[])
     return investigation_item(record, members, saved.path)
 
 
@@ -938,7 +1088,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    owner_options: dict[staff.StaffId, str] | None = None,
                    include_registered: bool = False,
-                   selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
+                   selection: ReviewSelection = ALL_RECORDS, zone: ZoneInfo | None = None) -> list[ReviewItem]:
+    zone = zone or user_zone()
     found: dict[str, ReviewItem] = {}
     scopes: dict[Path | staff.StaffId, staff.StaffId] = {}
     exact = isinstance(selection, ExactReviewRecord)
@@ -1027,7 +1178,7 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                                                           retained_prerequisite, sources)
                     matching = references[scope].get(dependency, set())
                     return proposal_prerequisite(path, dependency, matching.__contains__, matching)
-                item = issue_item(issue, owner, members, sources=sources, prerequisite=prerequisite)
+                item = issue_item(issue, owner, members, zone=zone, sources=sources, prerequisite=prerequisite)
                 if item.state in states:
                     found[item.key] = item
         if not isinstance(scope, Path) or exact and (owner != selection.owner or selection.key == 'proposal/'+str(selection.path)):
@@ -1044,7 +1195,7 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                         since = proposals_table.day(row.date, sources=sources)
                         entry = urgency.Entry(f"{proposals_table.BACKLOG_KEY}{path}: {row.proposal}", row,
                                               since=since, value=(proposals_table.UNSCORED,))
-                        filed = since.replace(tzinfo=user_zone()) if since is not None else moment('1970-01-01')
+                        filed = aware(since, zone) if since is not None else datetime(1970, 1, 1, tzinfo=zone)
                         key = 'proposal/'+entry.key
                         if ReviewState.OPEN in states and selection.includes(path, key) and key not in found:
                             found[key] = ReviewItem(key,row.proposal,ReviewType.PROPOSAL,owner,owner,row.proposal,
@@ -1094,7 +1245,7 @@ def production_efficiency_ledgers(members: staff.StaffSnapshot, documents: tuple
         yield path, owner
 
 
-def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
+def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *, zone: ZoneInfo,
                      sources: list[Path] | None = None,
                      states: tuple[ReviewState, ...] = REVIEW_STATES,
                      owner_options: dict[staff.StaffId, str] | None = None,
@@ -1128,7 +1279,7 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
                         review = reviews.get(identity, efficiency_reviews.EfficiencyReview())
                         if efficiency_state(line.partition(' — ')[2], review) not in states:
                             continue
-                        item = efficiency_item(path, index, line, review, owner, members)
+                        item = efficiency_item(path, index, line, review, owner, members, zone)
                         if owner_options is not None:
                             owner_options[owner] = name(owner,members)
                         found.append(item)
@@ -1136,16 +1287,18 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
 
 
 def efficiency_item(path: Path, index: int, line: str, review: efficiency_reviews.EfficiencyReview,
-                    owner: staff.StaffId, members: staff.StaffSnapshot) -> ReviewItem:
+                    owner: staff.StaffId, members: staff.StaffSnapshot, zone: ZoneInfo) -> ReviewItem:
     head, _, result = line.partition(' — ')
     state = efficiency_state(result, review)
-    filed = moment(head[2:12])
+    filed = moment(head[2:12], zone)
     candidates_found = candidates.entries([head+' — proposed'])
     entry = candidates_found[0] if candidates_found else urgency.Entry(head,line)
     candidate = candidates_found[0].item if candidates_found else None
     who = staff.StaffId(candidate.by if candidate is not None else '')
     key = f'efficiency/{path}/{index}'
-    logs = (ReviewLog(filed,name(owner,members),result), *review.log)
+    logs = (ReviewLog(filed, name(owner, members), result),
+            *(replace(event, time=aware(event.time, zone)) if event.time.tzinfo is None else event
+              for event in review.log))
     return ReviewItem(key,name(owner,members)+f'/E{index+1}',ReviewType.EFFICIENCY,owner,who,
         head[13:],state,ReviewTimes(filed,logs[-1].time),logs,
         DECISION_ACTIONS if state != ReviewState.DONE else (),
@@ -1180,7 +1333,7 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
         return read_sent_proposal(selection, source.record, members)
     kinds = QUESTION_TYPES if item.type in QUESTION_TYPES else (item.type,)
     try:
-        records = project(root, members, kinds, REVIEW_STATES, None, [], selection)
+        records = project(root, members, kinds, REVIEW_STATES, None, [], selection, user_zone())
     except FileNotFoundError:
         records = []
     for record in records:
@@ -1208,8 +1361,9 @@ def read_sent_proposal(selection: ExactReviewRecord, previous: Issue, members: s
         proposers = {owner, *(member.id for member in members.find(kind='unit', parent=owner))}
         return read_proposal_prerequisite(path, dependency, owner, proposers, selection.prerequisite, sources)
 
-    item, = with_later([issue_item(issue, owner, members, sources=sources, prerequisite=prerequisite)], sources)
-    return normalize_times(item, user_zone())
+    zone = user_zone()
+    item, = with_later([issue_item(issue, owner, members, zone=zone, sources=sources, prerequisite=prerequisite)], sources, zone=zone)
+    return normalize_times(item, zone)
 
 
 def entry(item: ReviewItem) -> urgency.Entry[ReviewItem]:
@@ -1217,9 +1371,8 @@ def entry(item: ReviewItem) -> urgency.Entry[ReviewItem]:
     return urgency.Entry(item.queue_key,item,item.urgency,item.times.filed,item.value,item.queue_after)
 
 
-def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[ReviewItem]:
+def ordered(items: list[ReviewItem], sources: list[Path] | None, zone: ZoneInfo) -> list[ReviewItem]:
     """Apply queue pins and moves before combining the records."""
-    zone = user_zone()
     states: dict[str, urgency.QueueState] = {}
     for queue in dict.fromkeys(name for item in items for name in (item.queue, 'next-'+item.owner)):
         with guard_source(urgency.queue_state_path(queue), sources):
@@ -1267,33 +1420,38 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None) -> list[ReviewItem]:
+         sources: list[Path] | None = None, zone: ZoneInfo | None = None) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
-    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS)
+    zone = zone or user_zone()
+    items = project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, zone)
+    if open_view(show):
+        now = datetime.now(zone)
+        return [item for item in items if item.for_you(now)]
+    return items
 
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
-            selection: ReviewSelection) -> list[ReviewItem]:
+            selection: ReviewSelection, zone: ZoneInfo) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
     documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
                                     if (doc := record_store.local_document(member)) is not None))
     items: list[ReviewItem] = []
     question_kinds = tuple(kind for kind in kinds if kind in QUESTION_TYPES)
     if question_kinds:
-        items.extend(question_items(members,documents,states=states,kinds=question_kinds,owner_options=owner_options,
+        items.extend(question_items(members,documents,zone=zone,states=states,kinds=question_kinds,owner_options=owner_options,
                                    sources=sources,selection=selection))
     if ReviewType.CHANGE in kinds:
-        items.extend(change_items(root,members,states=states,owner_options=owner_options,sources=sources,selection=selection))
+        items.extend(change_items(root,members,zone=zone,states=states,owner_options=owner_options,sources=sources,selection=selection))
     reports = tuple(kind for kind in kinds if kind in INVESTIGATION_TYPES)
     if reports:
-        items.extend(investigation_items(members,states=states,kinds=reports,owner_options=owner_options,sources=sources,selection=selection))
+        items.extend(investigation_items(members,zone=zone,states=states,kinds=reports,owner_options=owner_options,sources=sources,selection=selection))
     if ReviewType.PROPOSAL in kinds:
-        items.extend(proposal_items(members,documents,states=states,owner_options=owner_options,sources=sources,include_registered=True,selection=selection))
+        items.extend(proposal_items(members,documents,zone=zone,states=states,owner_options=owner_options,sources=sources,include_registered=True,selection=selection))
     if ReviewType.EFFICIENCY in kinds:
-        items.extend(efficiency_items(members,documents,states=states,owner_options=owner_options,sources=sources,selection=selection))
-    return ordered(with_later(items,sources), sources)
+        items.extend(efficiency_items(members,documents,zone=zone,states=states,owner_options=owner_options,sources=sources,selection=selection))
+    return ordered(with_later(items, sources, zone=zone), sources, zone)
 
 
 def read_open(root: Path) -> list[ReviewItem]:
@@ -1301,7 +1459,8 @@ def read_open(root: Path) -> list[ReviewItem]:
     return read(root, show='open')
 
 
-def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> list[ReviewItem]:
+def with_later(items: list[ReviewItem], sources: list[Path] | None = None, *,
+               zone: ZoneInfo | None = None) -> list[ReviewItem]:
     if not items:
         return []
     selected = {item.key for item in items}
@@ -1315,7 +1474,7 @@ def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> li
             raise error
 
     try:
-        times = review_later.times(sources, skipped=skip_time if sources is not None else None)
+        times = review_later.times(sources, zone=zone, skipped=skip_time if sources is not None else None)
     except (OSError, UnicodeError) as error:
         if sources is not None:
             raise
@@ -1328,14 +1487,17 @@ def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> li
 
 def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
               below: bool = False, sources: list[Path] | None = None,
-              own: list[Issue] | None = None, show: str = 'all') -> list[ReviewItem]:
-    return with_later(_read_kind(kind,scope,members,below=below,sources=sources,own=own,states=selected_states(show)),sources)
+              own: list[Issue] | None = None, show: str = 'all', zone: ZoneInfo | None = None) -> list[ReviewItem]:
+    zone = zone or user_zone()
+    items = _read_kind(kind, scope, members, below=below, sources=sources, own=own,
+                       states=selected_states(show), zone=zone)
+    return with_later([normalize_times(item, zone) for item in items], sources, zone=zone)
 
 
 def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
               below: bool = False, sources: list[Path] | None = None,
               own: list[Issue] | None = None,
-              states: tuple[ReviewState, ...] = REVIEW_STATES) -> list[ReviewItem]:
+              states: tuple[ReviewState, ...] = REVIEW_STATES, zone: ZoneInfo) -> list[ReviewItem]:
     """Read the selected store into ReviewItem records for all consumers."""
     if isinstance(scope,staff.StaffRow):
         if kind in (ReviewType.CHANGE, ReviewType.PROPOSAL, ReviewType.EFFICIENCY):
@@ -1348,30 +1510,37 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
     if kind in QUESTION_TYPES:
         owners = (scope,) if isinstance(scope,staff.StaffRow) else tuple(member for member in members.rows
             if member.kind == 'showrunner' and isinstance(member.doc,(staff.LiveDoc,staff.WrappedDoc)) and member.doc.path in documents)
-        return question_items(members,documents,owners=owners,sources=sources,include_unowned=False,states=states,
+        return question_items(members,documents,zone=zone,owners=owners,sources=sources,include_unowned=False,states=states,
                               kinds=QUESTION_TYPES if kind == ReviewType.QUESTION else (kind,))
     if kind in INVESTIGATION_TYPES:
         owners_ids = tuple(member.id for doc in documents for member in
             (unit_lookup.doc_owner(doc,members),*unit_lookup.doc_units(doc,members))) if documents else (cast(staff.StaffRow,owner).id,)
-        return investigation_items(members,owners=owners_ids,sources=sources,states=states,
+        return investigation_items(members,zone=zone,owners=owners_ids,sources=sources,states=states,
                                    kinds=INVESTIGATION_TYPES if kind == ReviewType.INVESTIGATION else (kind,))
     if kind == ReviewType.PROPOSAL:
-        return proposal_items(members,documents,sources=sources,own=own,states=states)
+        return proposal_items(members,documents,zone=zone,sources=sources,own=own,states=states)
     if kind == ReviewType.EFFICIENCY:
-        return efficiency_items(members,documents,sources=sources,states=states)
+        return efficiency_items(members,documents,zone=zone,sources=sources,states=states)
     assert isinstance(scope,Path)
     root = change_routing.review_root() if sources is None else change_routing.review_root(sources=sources)
-    items = change_items(root,members,document=scope,below=below,sources=sources,states=states)
+    items = change_items(root,members,zone=zone,document=scope,below=below,sources=sources,states=states)
     tabs = change_review.review_scope(scope,below,members)
     return [item for item in items if isinstance(item.source,ChangeSource) and
-            (item.source.assignment.owner.tab in tabs or isinstance(item.source.assignment.owner,change_routing.UnroutedChange))]
+            (change_scope_tab(item, members) in tabs or isinstance(item.source.assignment.owner,change_routing.UnroutedChange))]
+
+
+def change_scope_tab(item: ReviewItem, members: staff.StaffSnapshot) -> str:
+    assert isinstance(item.source, ChangeSource)
+    validator = members.by_id(item.owner) if item.state == ReviewState.VALIDATING and item.owner else None
+    return validator.name if validator is not None else item.source.assignment.owner.tab
 
 
 def change_counts(doc: Path, record: staff.StaffSnapshot, *, source: str = '',
                   sources: list[Path] | None = None) -> tuple[int,int]:
     try:
-        items = read_kind(ReviewType.CHANGE,doc,record,sources=sources,show='open')
-        now = datetime.now(user_zone())
+        zone = user_zone()
+        now = datetime.now(zone)
+        items = read_kind(ReviewType.CHANGE,doc,record,sources=sources,show='open',zone=zone)
         return (sum(item.for_you(now) and not isinstance(item.source.assignment.owner,change_routing.UnroutedChange)
                     and (not source or item.source_unit == source) for item in items if isinstance(item.source,ChangeSource)),
                 0 if source else sum(item.for_you(now) and isinstance(item.source.assignment.owner,change_routing.UnroutedChange)
@@ -1391,8 +1560,9 @@ def change_counts(doc: Path, record: staff.StaffSnapshot, *, source: str = '',
 def proposals(doc: Path, *, source: str = '', sources: list[Path] | None = None, own: list[Issue] | None = None,
               record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
-    return sum(item.for_you(datetime.now(user_zone())) and (not source or item.source_unit == source)
-               for item in read_kind(ReviewType.PROPOSAL,doc,record,sources=sources,own=own,show=ReviewState.OPEN))
+    zone = user_zone()
+    items = read_kind(ReviewType.PROPOSAL, doc, record, sources=sources, own=own, show=ReviewState.OPEN, zone=zone)
+    return count_items(items, datetime.now(zone), source)
 
 
 def open_efficiency(line: str, *, source: str = '') -> bool:
@@ -1406,8 +1576,9 @@ def efficiency(doc: Path, *, source: str = '', sources: list[Path] | None = None
                record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     try:
-        return sum(item.for_you(datetime.now(user_zone())) and (not source or item.source_unit == source)
-                   for item in read_kind(ReviewType.EFFICIENCY,doc,record,sources=sources,show=ReviewState.OPEN))
+        zone = user_zone()
+        items = read_kind(ReviewType.EFFICIENCY, doc, record, sources=sources, show=ReviewState.OPEN, zone=zone)
+        return count_items(items, datetime.now(zone), source)
     except (OSError,UnicodeError):
         if sources is not None:
             raise
@@ -1415,16 +1586,21 @@ def efficiency(doc: Path, *, source: str = '', sources: list[Path] | None = None
 
 
 def investigations(doc: Path, record: staff.StaffSnapshot, *, source: str = '', sources: list[Path] | None = None) -> int:
+    zone = user_zone()
     try:
-        items = read_kind(ReviewType.INVESTIGATION,doc,record,sources=sources,show='open')
+        items = read_kind(ReviewType.INVESTIGATION,doc,record,sources=sources,show='open',zone=zone)
     except staff.StaffUnreadable:
         return 0
-    return count_items(items,datetime.now(user_zone()),source)
+    return count_items(items,datetime.now(zone),source)
 
 
-def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
+def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
                     source: str = '') -> tuple[int,str]:
-    items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open')
+    """Count Questions in the same zone as Review and /next."""
+    if sources is not None:
+        sources.append(Path(user_zone_config.CONF))
+    zone = user_zone()
+    items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
     now = datetime.now(zone)
     afters = [item.times.later for item in items if not isinstance(item.times.later,NoLaterTime) and item.times.later > now]
     return (sum(item.for_you(now) and (not source or item.source_unit == source) for item in items),
@@ -1432,13 +1608,15 @@ def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionS
 
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:
-    items = with_later(investigation_items(staff.snapshot(),owners=(owner,),sources=sources,states=(ReviewState.OPEN,)),sources)
-    return sum(item.for_you(datetime.now(user_zone())) for item in items)
+    zone = user_zone()
+    items = investigation_items(staff.snapshot(), owners=(owner,), sources=sources, states=(ReviewState.OPEN,), zone=zone)
+    return count_items(with_later(items, sources, zone=zone), datetime.now(zone))
 
 
 def next_queue(kind: str, scope: Path | staff.StaffRow, below: bool, members: staff.StaffSnapshot) -> tuple[str,list[urgency.Entry[str]]]:
-    items = read_kind(ReviewType(kind),scope,members,below=below,show='open')
-    now = datetime.now(user_zone())
+    zone = user_zone()
+    items = read_kind(ReviewType(kind),scope,members,below=below,show='open',zone=zone)
+    now = datetime.now(zone)
     selected = [item for item in items if item.for_you(now) and not
                 (isinstance(item.source,ChangeSource) and isinstance(item.source.assignment.owner,change_routing.UnroutedChange))]
     if isinstance(scope, staff.StaffRow) and kind in ('change', 'proposal', 'efficiency'):
