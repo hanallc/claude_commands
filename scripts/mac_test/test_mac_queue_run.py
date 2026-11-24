@@ -801,15 +801,17 @@ else:
     def test_smoke_cleanup_runs_before_ssh_input_closes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            fake_ssh = SSH.replace('print(f"mac_exit={status}", flush=True)', """
-if "smoke-work" in args[-1] and "mac_group=" not in args[-1]:
-    cookie = shlex.split(args[-1])[1].removeprefix("MAC_SMOKE_COOKIE=")
-    print(f"mac_smoke_complete={cookie}", flush=True)
-    _ = sys.stdin.read()
+            environment = queue_fixture(root, """
+import os, shlex, subprocess, sys
+from pathlib import Path
+root = Path(os.environ["FAKE_QUEUE_STATE"])
+subprocess.run(shlex.split(sys.argv[-1]), cwd=root / "checkout", check=False)
 (root / "input_closed").touch()
-raise SystemExit(status)
+raise SystemExit(0)
 """)
-            environment = queue_fixture(root, fake_ssh)
+            (root / "checkout").mkdir()
+            environment["COPIES_KEEP_FILE"] = str(root / "copy.keep")
+            environment["SMOKE_WORKER"] = str(Path(mac_queue_run.__file__).resolve())
             callback = root / "mac_run.sh"
             write_stdlib_tool(callback, """
 import json, os, sys
@@ -817,9 +819,13 @@ from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
 phase, argv_file = sys.argv[1:3]
 if phase == "prepare":
-    Path(argv_file).write_text(json.dumps(["smoke-work"]))
+    cleanup = 'touch "$FAKE_QUEUE_STATE/remote_cleanup"; exit "$FAKE_MAC_STATUS"'
+    Path(argv_file).write_text(json.dumps([
+        sys.executable, os.environ["SMOKE_WORKER"], "smoke-work", "true", cleanup,
+    ]))
 else:
-    assert not (root / "input_closed").exists(), "SSH closed before cleanup"
+    assert (root / "remote_cleanup").exists(), "Local cleanup started before remote cleanup"
+    assert not (root / "input_closed").exists(), "SSH closed before local cleanup"
     (root / "cleanup").touch()
 """)
             command = self.command(root, "run")
@@ -827,18 +833,24 @@ else:
             command[command.index("--lifecycle-script") + 1:command.index("--lifecycle-script") + 1] = [
                 str(callback), "--",
             ]
-            result = subprocess.run(command, env=environment, capture_output=True, text=True,
-                                    timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue((root / "cleanup").exists())
-            self.assertTrue((root / "input_closed").exists())
+            for status in (0, 4):
+                with self.subTest(status=status):
+                    (root / "input_closed").unlink(missing_ok=True)
+                    (root / "cleanup").unlink(missing_ok=True)
+                    (root / "remote_cleanup").unlink(missing_ok=True)
+                    result = subprocess.run(command, env={**environment, "FAKE_MAC_STATUS": str(status)},
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assertTrue((root / "cleanup").exists())
+                    self.assertTrue((root / "input_closed").exists())
 
-    def test_smoke_log_cannot_supply_the_ssh_exit_status(self) -> None:
+    def test_smoke_uses_the_remote_status_when_tailscale_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = queue_fixture(root, """\
-import os, shlex, sys
-os.execv("/bin/zsh", shlex.split(sys.argv[-1]))
+            environment = queue_fixture(root, """
+import shlex, subprocess, sys
+subprocess.run(shlex.split(sys.argv[-1]), check=False)
+raise SystemExit(0)
 """)
             callback = root / "mac_run.sh"
             write_stdlib_tool(callback, """
@@ -855,35 +867,111 @@ if sys.argv[1] == "prepare":
             self.assertIn("mac_exit=0", result.stdout.splitlines())
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
 
-    def test_ended_smoke_keeps_the_legacy_scratch_record(self) -> None:
+    def test_smoke_rejects_missing_or_invalid_final_status_when_ssh_exits_zero(self) -> None:
+        for frame in ("missing", "ready-without-status", "wrong-token", "malformed", "out-of-range", "followed-by-output"):
+            with self.subTest(frame=frame), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root, """
+import os, shlex, sys
+frame = os.environ["FAKE_SMOKE_FRAME"]
+work = shlex.split(sys.argv[-1])[2]
+cookie = shlex.split(work.splitlines()[0])[1].removeprefix("MAC_SMOKE_COOKIE=")
+print("Mac output")
+if frame == "ready-without-status":
+    print(f"mac_smoke_complete={cookie}")
+elif frame != "missing":
+    token = "another-run" if frame == "wrong-token" else cookie
+    status = {"malformed": "void", "out-of-range": "256"}.get(frame, "0")
+    print(f"mac_smoke_complete={token}:{status}")
+if frame == "followed-by-output":
+    print("more output")
+""")
+                callback = root / "mac_run.sh"
+                write_stdlib_tool(callback, """
+import sys
+from pathlib import Path
+if sys.argv[1] == "prepare":
+    Path(sys.argv[2]).write_text('["true"]')
+""")
+                command = self.command(root, "run")
+                command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
+                result = subprocess.run(command, env={**environment, "FAKE_SMOKE_FRAME": frame},
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
+                self.assertIn("no valid final status", result.stderr)
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+                self.assertEqual(len(list((root / mac_queue_run.RUNS).glob("*/run.json"))), 1)
+
+    def test_ended_smoke_retires_the_legacy_scratch_record_after_cleanup(self) -> None:
+        self.check_legacy_scratch_cleanup(clear=True)
+
+    def test_ended_smoke_keeps_the_legacy_scratch_record_when_cleanup_fails(self) -> None:
+        self.check_legacy_scratch_cleanup(clear=False)
+
+    def check_legacy_scratch_cleanup(self, *, clear: bool) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = queue_fixture(root)
+            environment = queue_fixture(root, SSH.replace(
+                '(root / "remote").write_text(json.dumps(args))',
+                """
+if "stop-checkout" in sys.argv[-1]:
+    (root / "legacy-host").write_text(sys.argv[-2])
+    subprocess.run(["/bin/zsh", "-c", sys.argv[-1]], check=False)
+    raise SystemExit(0)
+(root / "remote").write_text(json.dumps(args))
+""").replace("import json,", "import subprocess, json,"))
             directory = root / mac_queue_run.RUNS / "legacy"
             directory.mkdir(parents=True)
             (directory / "lock").touch()
             state = directory / "argv.json.state"
-            bundle = root / "legacy.bundle"
+            bundle = root / "legacy bundle"
             bundle.touch()
-            old_state = f"clone=/old/checkout\nclone_task=gate:mac-run-fixture\nbundle={bundle}\n"
+            checkout = root / "old checkout"
+            task = "gate:mac-run-fixture"
+            old_state = f"clone={shlex.quote(str(checkout))}\nclone_task={task}\nbundle={shlex.quote(str(bundle))}\n"
             _ = state.write_text(old_state)
             receipt = root / mac_queue_run.RECEIPTS / "legacy.json"
             receipt.parent.mkdir(parents=True)
             receipt.touch()
             record = directory / "run.json"
             _ = record.write_text(json.dumps({"lifecycle_script": "missing/mac_run.sh",
-                                             "arguments": [], "host": "fake-mac"}))
+                                             "arguments": [], "host": "saved-mac"}))
             installed = root / ".claude" / mac_queue_run.MAC_RUN_SCRIPT
             installed.parent.mkdir(parents=True)
             _ = shutil.copy2(Path(__file__).resolve().parents[2] / mac_queue_run.MAC_RUN_SCRIPT, installed)
-            result = subprocess.run(self.command(root), env=environment, capture_output=True, text=True,
-                                    timeout=TEST_HANG_GUARD_SECS)
+            py = installed.parents[1] / "lib/py"
+            py.parent.mkdir()
+            write_stdlib_tool(py, """
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["FAKE_QUEUE_STATE"])
+with (root / "legacy-actions").open("a") as stream:
+    print(json.dumps([Path(sys.argv[1]).name, *sys.argv[2:]]), file=stream)
+if sys.argv[2] == "stop-checkout":
+    print("hana-instances: checkout clear")
+    sys.exit(int(os.environ["FAKE_STOP_CHECKOUT_STATUS"]))
+""")
+            result = subprocess.run(self.command(root),
+                                    env={**environment, "FAKE_STOP_CHECKOUT_STATUS": str(int(not clear))},
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue(record.exists(), result.stdout + result.stderr)
-            self.assertEqual(state.read_text(), old_state)
-            self.assertTrue(receipt.exists())
-            self.assertTrue(bundle.exists())
-            self.assertIn(str(state), result.stderr)
+            self.assertEqual(record.exists(), not clear, result.stdout + result.stderr)
+            self.assertEqual(receipt.exists(), not clear)
+            self.assertEqual(bundle.exists(), not clear)
+            self.assertTrue((root / "legacy-host").exists(), result.stdout + result.stderr)
+            self.assertEqual((root / "legacy-host").read_text(), "saved-mac")
+            actions = [cast(list[str], json.loads(line)) for line in (root / "legacy-actions").read_text().splitlines()]
+            expected = [["hana_instances.py", "stop-checkout", str(checkout)]]
+            if clear:
+                expected.extend([
+                    ["scratch.py", "end", "--task", task],
+                    ["copies.py", "unregister-remote", "--host", "localhost", "--path", str(checkout)],
+                    ["copies.py", "unregister-remote", "--host", "saved-mac", "--path", str(checkout)],
+                ])
+            else:
+                self.assertEqual(state.read_text(), old_state)
+                self.assertIn("scratch cleanup unconfirmed", result.stderr)
+            self.assertEqual(actions, expected)
 
     def test_smoke_worker_checks_outside_the_copy_and_waits_for_ssh_eof(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

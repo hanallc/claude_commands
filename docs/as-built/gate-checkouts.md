@@ -370,7 +370,8 @@ Offload records use `owning_session.owning_session()` before the shell session f
 Busy refusals can therefore name the unit director's session.
 
 `mac_run.sh` clears the numbered copy's keep file only after `stop-checkout` confirms the copy is clear.
-An old smoke run with `argv.json.state` keeps its recovery record for scratch cleanup.
+The queue retries scratch cleanup for an old smoke run with `argv.json.state`.
+It keeps the run record and receipt if cleanup fails.
 `unregister-remote` accepts only `--host` and `--path`.
 `mirror-remove` accepts `--host`; receive and use accept the command arguments.
 A marked mirror probe starts no remote Python and skips `mirror_local_path`.

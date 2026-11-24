@@ -273,7 +273,10 @@ def shell_session() -> OwningSession | NoOwningSession:
 def smoke_session(placement: MacPlacement, command: list[str], cookie: str,
                   ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
     """Run the numbered copy with the SSH input open."""
-    work = f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} MAC_SMOKE_COOKIE={cookie} {shlex.join(command)}"
+    work = (
+        f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} MAC_SMOKE_COOKIE={cookie} {shlex.join(command)}\n"
+        f"printf '\\nmac_smoke_complete={cookie}:%s\\n' \"$?\""
+    )
     process = ssh.enter_context(subprocess.Popen(
         ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -c " + shlex.quote(work)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
@@ -281,13 +284,22 @@ def smoke_session(placement: MacPlacement, command: list[str], cookie: str,
     return process
 
 
-def read_smoke_completion(process: subprocess.Popen[str], cookie: str) -> bool:
-    assert process.stdout is not None
-    for line in cast(TextIO, process.stdout):
-        if line == f"mac_smoke_complete={cookie}\n":
-            return True
-        print(line, end="", flush=True)
-    return False
+def read_smoke_output(output: TextIO, cookie: str, *, until_ready: bool) -> tuple[bool, int | None]:
+    """Stream the log and accept the status only on the last line."""
+    ready = f"mac_smoke_complete={cookie}\n"
+    prefix = f"mac_smoke_complete={cookie}:"
+    last = ""
+    for line in output:
+        if until_ready and line == ready:
+            return True, None
+        if not line.startswith(prefix):
+            print(line, end="", flush=True)
+        last = line
+    if last.startswith(prefix) and last.endswith("\n"):
+        status = last[len(prefix):-1]
+        if 1 <= len(status) <= 3 and status.isascii() and status.isdecimal() and int(status) <= 255:
+            return False, int(status)
+    return False, None
 
 
 def run_smoke_work(work: str, cleanup: str) -> int:
@@ -413,8 +425,11 @@ def run_attempt(
         callback_environment = dict(os.environ)
         cleanup_leased = False
         mac_run = args.is_mac_run
+        cookie = uuid.uuid4().hex if mac_run else ""
         smoke: subprocess.Popen[str] | None = None
-        smoke_complete = False
+        smoke_ready = False
+        smoke_status: int | None = None
+        cleaned = False
         try:
             while True:
                 code, output, errors = capture_command(admission_command() + placement_arguments(episode, since, pid,
@@ -480,12 +495,14 @@ def run_attempt(
                         if args.owned_close and not on_close:
                             raise ValueError("the run needs a close hook")
                         if mac_run:
-                            cookie = uuid.uuid4().hex
                             smoke = smoke_session(placement, command, cookie, ssh)
                             remote.state = RemoteState.LIVE
-                            smoke_complete = read_smoke_completion(smoke, cookie)
-                            status = 0 if smoke_complete else smoke.wait()
-                            if not smoke_complete and 0 <= status < 255:
+                            assert smoke.stdout is not None
+                            smoke_ready, smoke_status = read_smoke_output(cast(TextIO, smoke.stdout), cookie, until_ready=True)
+                            if smoke_ready:
+                                status = 0
+                            elif smoke_status is not None:
+                                status = smoke_status
                                 remote.state = RemoteState.EXITED
                         else:
                             status = stream_remote(remote_command(placement, args.cwd, command, on_close,
@@ -497,7 +514,7 @@ def run_attempt(
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
-            safe = remote.state != RemoteState.LIVE or smoke_complete
+            safe = remote.state != RemoteState.LIVE or smoke_ready
             if not safe and not args.owned_close and not mac_run:
                 ssh.close()
                 try:
@@ -517,27 +534,28 @@ def run_attempt(
                         safe = False
                 else:
                     safe = True
-                    (directory / "run.json").unlink()
+                    cleaned = True
             if smoke is not None:
                 assert smoke.stdin is not None and smoke.stdout is not None
                 try:
                     smoke.stdin.close()
-                    for line in cast(TextIO, smoke.stdout):
-                        print(line, end="", flush=True)
-                    # SSH sends the exit status separately from the log.
-                    ssh_status = smoke.wait()
-                    if 0 <= ssh_status < 255:
-                        remote.state = RemoteState.EXITED
-                        status = ssh_status or status
-                        safe = True
-                    else:
-                        print("mac queue: the Mac returned no exit status", file=sys.stderr)
+                    if smoke_ready:
+                        _, smoke_status = read_smoke_output(cast(TextIO, smoke.stdout), cookie, until_ready=False)
+                    _ = smoke.wait()
+                    if smoke_status is None:
+                        print("mac queue: the Mac returned no valid final status", file=sys.stderr)
                         status = 255
                         safe = False
+                    else:
+                        remote.state = RemoteState.EXITED
+                        status = smoke_status or status
+                        safe = True
                 except (OSError, ValueError) as error:
                     print(f"mac queue: the Mac smoke session did not finish: {error}", file=sys.stderr)
                     status = status or 2
                     safe = False
+            if cleaned and safe:
+                (directory / "run.json").unlink()
             ssh.close()
             mirror.close()
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.

@@ -26,10 +26,38 @@ if [[ $1 == prepare || $1 == cleanup ]]; then
   argv_file=$2
   shift 2
 fi
+cleanup_legacy_scratch() {
+  local state=$1 host=${MAC_QUEUE_HOST:?}
+  local clone clone_arg clone_task bundle confirmation remote
+  [[ -f $state && ! -h $state ]] && source "$state" || {
+    print -u2 -r -- "mac_run: cannot read scratch state $state"
+    return 4
+  }
+  if [[ ! -v clone || ! -v clone_task || ! -v bundle || ( -n $clone && ( $clone != /* || -z $clone_task ) ) ]]; then
+    print -u2 -r -- "mac_run: invalid scratch state $state"
+    return 4
+  fi
+  if [[ -n $clone ]]; then
+    clone_arg=${(q)clone}
+    remote="
+      out=\$(~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg 2>&1) &&
+      [[ \${out##*\$'\n'} == 'hana-instances: checkout clear' ]] &&
+      ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task ${(q)clone_task} >&2 &&
+      ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg >&2 &&
+      print -r -- 'mac_run: scratch cleanup complete' || { print -u2 -r -- "\$out"; exit 4; }"
+    if ! confirmation=$(ssh -o BatchMode=yes "$host" "/bin/zsh -c ${(q)remote}") ||
+       [[ $confirmation != 'mac_run: scratch cleanup complete' ]]; then
+      print -u2 -r -- "mac_run: scratch cleanup unconfirmed for $clone"
+      return 4
+    fi
+    "$lib/py" "$lib/../copies/copies.py" unregister-remote --host "$host" --path "$clone" || return 4
+  fi
+  [[ -z $bundle ]] || rm -f -- "$bundle" || return 4
+}
 if [[ $callback_mode == cleanup ]]; then
   if [[ -e $argv_file.state || -h $argv_file.state ]]; then
-    print -u2 -r -- "mac_run: legacy scratch cleanup required for $argv_file.state"
-    exit 4
+    cleanup_legacy_scratch "$argv_file.state"
+    exit $?
   fi
   if [[ -r $argv_file.bundle ]]; then
     bundle=$(< "$argv_file.bundle")

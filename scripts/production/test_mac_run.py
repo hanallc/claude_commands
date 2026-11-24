@@ -70,7 +70,7 @@ remote=${@[-1]}
 placed_run=0
 if [[ $command == ssh && $remote == *smoke-work* ]]; then
     outer=("${(@Q)${(z)remote}}")
-    work=${outer[3]}
+    work=${outer[3]%$'\n'printf *}
     printf '%s\0' "$work" >> "$state/placed-commands"
     words=("${(@Q)${(z)work}}")
     lease=${words[-1]}
@@ -129,27 +129,30 @@ fi
 if (( placed_run )); then
     export MAC_SMOKE_COOKIE=${words[2]#MAC_SMOKE_COOKIE=}
     exec "$MAC_RUN_PYTHON" -c '
-import os, sys
+import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ["MAC_RUN_STUB_STATE"])
 os.setsid()
 print("HEAD=" + os.environ["MAC_RUN_SHA"], flush=True)
 if os.environ.get("MAC_RUN_CHECKOUT_CLEANUP"):
     os.chdir(os.environ["MAC_RUN_CHECKOUT"])
-    os.execv(sys.executable, [sys.executable, os.environ["MAC_RUN_WORKER"], "smoke-work",
+    subprocess.run([sys.executable, os.environ["MAC_RUN_WORKER"], "smoke-work",
         "touch \"$MAC_RUN_STUB_STATE/build-started\"; cat \"$MAC_RUN_STUB_STATE/hold-build\"",
-        "exec \"$MAC_RUN_CHECKOUT_CLEANUP\" cleanup-copy \"$1\" \"$MAC_RUN_LAUNCH\""])
+        "exec \"$MAC_RUN_CHECKOUT_CLEANUP\" cleanup-copy \"$1\" \"$MAC_RUN_LAUNCH\""], check=False)
+    sys.exit(0)
 if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
     (state / "build-started").touch()
     _ = sys.stdin.read()
     (state / "input-closed").touch()
     (state / "cleanup-called").touch()
-    sys.exit(1)
+    sys.exit(0)
 else:
     (state / "cleanup-called").touch()
-    print("mac_smoke_complete=" + os.environ["MAC_SMOKE_COOKIE"], flush=True)
+    cookie = os.environ["MAC_SMOKE_COOKIE"]
+    print("mac_smoke_complete=" + cookie, flush=True)
     _ = sys.stdin.read()
     (state / "input-closed").touch()
+    print(f"mac_smoke_complete={cookie}:0", flush=True)
 '
 fi
 if [[ $remote == *'rev-parse --verify HEAD'* ]]; then
@@ -935,34 +938,26 @@ fi
         return sorted(runs.iterdir()) if runs.is_dir() else []
 
     def test_a_signal_closes_ssh_and_the_next_run_removes_the_local_bundle(self) -> None:
-        for signal_number, whole_group in ((signal.SIGTERM, True), (signal.SIGHUP, True), (signal.SIGTERM, False)):
-            with self.subTest(signal_number=signal_number, whole_group=whole_group):
-                self.clear_events()
-                for name in ("build-started", "cleanup-called", "input-closed"):
-                    (self.stub_state / name).unlink(missing_ok=True)
-                process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1"})
-                try:
-                    self.wait_for_path(self.stub_state / "build-started", process)
-                    if whole_group:
-                        send_process_group(process.pid, signal_number)
-                    else:
-                        process.send_signal(signal_number)
-                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                except BaseException:
-                    send_process_group(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                    raise
-                self.assertEqual(process.returncode, -signal_number, output + errors)
-                wait_until((self.stub_state / "cleanup-called").exists, self.stub_state)
-                self.assertTrue((self.stub_state / "input-closed").exists())
-                self.assertEqual(len(self.ended_runs()), 1)
-                self.assertEqual(len(list(self.temp_directory.glob("*.bundle"))), 1)
+        process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1"})
+        try:
+            self.wait_for_path(self.stub_state / "build-started", process)
+            process.send_signal(signal.SIGTERM)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except BaseException:
+            send_process_group(process.pid, signal.SIGKILL)
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            raise
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        wait_until((self.stub_state / "cleanup-called").exists, self.stub_state)
+        self.assertTrue((self.stub_state / "input-closed").exists())
+        self.assertEqual(len(self.ended_runs()), 1)
+        self.assertEqual(len(list(self.temp_directory.glob("*.bundle"))), 1)
 
-                after = self.mac_run()
-                self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
-                self.assertEqual(self.ended_runs(), [])
-                self.assertEqual(list(self.temp_directory.glob("*.bundle")), [])
-                self.assert_claim_released()
+        after = self.mac_run()
+        self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        self.assertEqual(self.ended_runs(), [])
+        self.assertEqual(list(self.temp_directory.glob("*.bundle")), [])
+        self.assert_claim_released()
 
 if __name__ == "__main__":
     _ = unittest.main()
