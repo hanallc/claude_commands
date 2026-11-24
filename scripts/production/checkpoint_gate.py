@@ -18,7 +18,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import showrunners, staff
@@ -286,8 +286,9 @@ def stop_test_without_result(step: CheckpointTestStep, result: subprocess.Comple
     if result.returncode == TREE_CHANGED_STATUS:
         raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
-    if result.returncode == MAC_LINUX_PRELAUNCH_REFUSED_STATUS and command_program(step.command) in GATE_SCRIPTS:
-        raise Stop("test", "blocked", f"{step.label} could not complete placement. Log {log}",
+    if (result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
+            and command_program(step.command) in GATE_SCRIPTS):
+        raise Stop("test", "blocked", f"{step.label} ended with gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
 
 

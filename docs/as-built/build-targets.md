@@ -46,8 +46,8 @@ A held target admits only work that its hold rules permit.
 A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
 The caller checks the targets in `targets` in the order the file lists them.
 It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-The current rules permit natedev and mac-linux for a full gate.
-Named module tests, nightly gates, and promotion without tests use natedev.
+The current rules permit natedev and `mac-linux` for a full gate and for nightly suites.
+Named module tests and promotion without tests use natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 Hana gates have no repository default.
 The Builds page shows both candidates while a gate with both targets waits or runs.
@@ -150,8 +150,8 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   The release intent keeps each cycle holder's name, purpose, and start time for broadcasts and cycle recovery.
   An old release intent without cycle holders still names its one holder.
   Release does not wait for an answer or an allocation.
-  The result names failed or unconfirmed deliveries:
-  `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
+  The result names each gone session once: `Not reached, tell them yourself: <name> (session gone)`.
+  It names each session with unsent notices once: `Release notices still pending for <name>, ...`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
 
 ### Where a job runs: `scripts/direct/verify.sh`
@@ -330,6 +330,11 @@ A shortfall selects logical units by their bytes on that filesystem, in target l
 Each selected unit includes its intermediate files and copied artifacts on both filesystems.
 Only bytes freed on the selected filesystem reduce its shortfall.
 A held checkout protects both output roots.
+A process use or build hold on one output root counts as a use of the other roots of that root's own saved mappings (`pair_roots_for`).
+A target is held (`PairHeld`) when a root of its own mappings is in use. A held target makes no other root held.
+A lock or a live use that the take finds on a held target replaces the hold, and the target is then in use.
+Example: the mappings are (one, shared), (two, shared) and (two, three), and a process uses one. One and shared are in use, two is held, and three is free.
+The closure of the mappings (`connected_roots_for`) has five uses: scan clusters, batch order, group last use, the CI exclusion and the filesystem floor's target list.
 The take checks both roots' processes, Cargo locks, use stamps, and observed output before deletion.
 The take records both roots in `target-deletes.json` before it removes any output.
 A saved trim intent retains the paired paths after an interruption.

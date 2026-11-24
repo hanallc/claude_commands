@@ -308,7 +308,7 @@ def run_mac_pull(command: str, *, ssh_program: str,
 def queue_path() -> Path:
     state = os.environ.get("ZONE_STATE") or str(
         Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "zone")
-    return Path(state) / "mac.json"
+    return Path(state).absolute() / "mac.json"
 
 
 def queue_bytes(path: Path) -> bytes:

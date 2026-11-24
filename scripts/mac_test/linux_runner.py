@@ -76,7 +76,7 @@ def slot_boot(lease: SlotRun, current_boot: str, *, require_boot_identity: bool 
 class LeasedSlotExecution:
     """Execute with the maker's held slot and its Cargo environment."""
 
-    slot: build_slots.Slot | build_slots.LeasedCopy
+    slot: build_slots.LeasedCopy
     descriptors: tuple[int, ...]
 
 

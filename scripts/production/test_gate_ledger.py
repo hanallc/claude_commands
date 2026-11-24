@@ -323,7 +323,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertTrue(self.fixture_root.is_relative_to(Path("/tmp").resolve()))
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue((self.state / "build-targets/aws/cloud-gate-launches.jsonl").is_file())
+        self.assertFalse((self.state / "build-targets/aws/cloud-gate-launches.jsonl").exists())
         self.assert_all_modules_started()
         record, = self.pass_records()
         self.assertEqual(record["tree"], self.git(self.checkout, "rev-parse", "HEAD^{tree}"))
@@ -576,7 +576,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         for red in (True, False):
             with self.subTest(red=red):
                 def suite_run(repo: Path, type_dirs: tuple[str, ...], *, module_time_limit_s: float,
-                              full: bool) -> gate.GateRun:
+                              full: bool, **_options: object) -> gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git").is_file())
                     self.assertEqual(gate.checked_git(repo, "rev-parse", "HEAD"), self.checkpoint)
@@ -591,7 +591,7 @@ class MergeGateLedgerTests(MergeGateFixture):
 
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(gate, "run_suites", side_effect=suite_run), \
+                        mock.patch.object(gate, "run_gate_suites", side_effect=suite_run), \
                         mock.patch.object(gate, "tell_nightly_red", return_value=gate.NightlyNoticeUnreceived()) as notice, \
                         mock.patch.object(gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
                     code = gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration",

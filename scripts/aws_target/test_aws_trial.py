@@ -391,9 +391,12 @@ class PairedTrialTests(CostFixture):
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
         copy_test_runner(self.repo)
-        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
-                         'scripts/aws_target/__init__.py', 'scripts/build_queue/admission_jobs.py',
-                         'scripts/production/gate_routes.py', 'scripts/test_times/gate_record.py'):
+        for relative in ('scripts/aws_target/__init__.py', 'scripts/aws_target/gate_box.py',
+                         'scripts/build_queue/admission_jobs.py', 'scripts/build_queue/snapshot_codec.py',
+                         'scripts/buildlog/parse.py', 'scripts/lib/build_steps.py',
+                         'scripts/lib/proc_text.py', 'scripts/lib/process_group.py',
+                         'scripts/production/gate_modules.py', 'scripts/production/gate_routes.py',
+                         'scripts/test_times/gate_record.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
@@ -983,7 +986,8 @@ print('200', end='')
         curl.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)
         trace = self.root / 'trace.jsonl'
-        result = subprocess.run([sys.executable, str(box / 'guest.py')], capture_output=True, text=True,
+        # The guest selects the candidate checkout after it clones the source.
+        result = subprocess.run([sys.executable, '-E', str(box / 'guest.py')], capture_output=True, text=True,
             timeout=guest_deadline_s + guest_delivery_margin_s,
             env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'HOME': str(box)})
