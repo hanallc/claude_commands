@@ -139,16 +139,18 @@ class GateDefaultPlacementTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             repo = root / "unit's worktree"
-            repo.mkdir()
+            nested = repo / "scripts" / "example"
+            nested.mkdir(parents=True)
             environment = fixture_git_environment(root)
             _ = subprocess.run(["git", "init", "-q", str(repo)], env=environment, check=True,
                                capture_output=True, timeout=TEST_HANG_GUARD_SECS)
             commit = commit_repository(repo, "Unit fixture", allow_empty=True, env=environment)
             environment["BUILDLOG_PREPARED_COPY"] = str(repo)
             _ = environment.pop(copies.PREPARED_GATE_FD, None)
-            for module in ((), ("--module", "fixture/test_ok.py", f"--checkout={repo}")):
-                arguments = ["--affected", *module]
-                with (self.subTest(arguments=arguments), chdir(repo),
+            for cwd, options in ((repo, ()), (nested, ()),
+                                 (repo, ("--module", "fixture/test_ok.py", f"--checkout={nested}"))):
+                arguments = ["--affected", *options]
+                with (self.subTest(cwd=cwd, arguments=arguments), chdir(cwd),
                       mock.patch.dict(os.environ, environment, clear=True),
                       mock.patch.object(gate, "gate_start_target") as place,
                       mock.patch.object(gate, "run_gate_command") as run,
@@ -156,9 +158,9 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     self.assertEqual(gate.main(arguments), 1)
                 command, = errors.getvalue().splitlines()
                 self.assertEqual(shlex.split(command), [
-                    "python3", "~/.claude/scripts/copies/copies.py", "run", "--repo", str(repo),
+                    "~/.claude/scripts/lib/py", "~/.claude/scripts/copies/copies.py", "run", "--repo", str(repo),
                     "--commit", commit, "--", "./scripts/lib/py", "scripts/production/gate.py",
-                    *arguments, *(["--repo", "{tree}"] if module else [])])
+                    *arguments, *(["--repo", "{tree}"] if options else [])])
                 place.assert_not_called()
                 run.assert_not_called()
 
@@ -168,7 +170,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
             source, tree = root / "unit", root / "numbered copy"
             arguments = ["--affected", "--checkout", str(source), "--full"]
             commit = "a" * 40
-            with (mock.patch.dict(os.environ, clear=True), mock.patch.object(gate, "checked_git", return_value=commit),
+            with (mock.patch.dict(os.environ, clear=True),
+                  mock.patch.object(gate, "checked_git", side_effect=(str(source), commit)),
                   redirect_stderr(StringIO()) as errors):
                 self.assertEqual(gate.main(arguments), 1)
             copy_command = shlex.split(errors.getvalue())[2:]

@@ -807,7 +807,7 @@ fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
     if [[ -f "$VERIFY_REPO_ROOT/scripts/copies/copies.py" ]]; then
-        printf '%s\n' 'claude_commands: run tests with copies.py --affected or --module' >&2
+        printf '%s\n' 'claude_commands: From the worktree root, run ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected' >&2
     fi
     exit 2
 fi

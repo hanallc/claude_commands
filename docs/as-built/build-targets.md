@@ -644,17 +644,18 @@ Call records use the package name or `workspace`.
 
 After help and saved-pass query exits, verify reads the Git top level.
 If the root has no `Cargo.toml`, Verify prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` on stderr and exits 2.
-If the root has `scripts/copies/copies.py`, Verify also prints `claude_commands: run tests with copies.py --affected or --module` on stderr.
+If the root has `scripts/copies/copies.py`, Verify also prints the command below on stderr.
 This refusal precedes environment setup and Cargo calls.
 
 Run affected tests from a `claude_commands` checkout through `copies.py run`.
-A direct `gate.py --affected` call prints the command with the checkout path and its current `HEAD` commit.
+A direct `gate.py --affected` call prints the command with the Git worktree root and its current `HEAD` commit.
 The gate exits with status 1 before it requests placement.
 
-For a run from the source checkout, use:
+Run this command from the worktree root.
 
 ```sh
-python3 ~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+  --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 Add `--module <module>` after `--affected` to select a module.

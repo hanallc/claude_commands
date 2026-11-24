@@ -3715,7 +3715,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.affected and not args.prepared_copy:
             try:
-                repo = Path(args.repo).expanduser().resolve()
+                checkout = Path(args.repo).expanduser().resolve()
+                repo = Path(checked_git(checkout, "rev-parse", "--show-toplevel"))
                 commit = checked_git(repo, "rev-parse", "--verify", "HEAD")
             except (GateRefused, OSError, RuntimeError) as error:
                 raise GateRefused(" ".join(str(error).splitlines())) from error
@@ -3727,7 +3728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command.extend(("--repo", "{tree}"))
             # Keep newlines in quoted arguments on one shell command line.
             words = shlex.join(command).replace("\n", "'$'\\n''")
-            print(f"python3 ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
+            print(f"~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
             return 1
         target = gate_start_target(args, args.command)
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules

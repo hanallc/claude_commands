@@ -366,10 +366,10 @@ It tests all modules before it pushes the merge.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 Run a unit's targeted tests with `copies.py run` and `scripts/production/gate.py --affected`.
 A direct `--affected` call prints the `copies.py run` command on standard error and exits with status 1.
-The command selects the source checkout's current `HEAD` commit.
+The command uses the Git worktree root and its current `HEAD` commit.
 When the call includes `--repo` or `--checkout`, the command adds `--repo '{tree}'` for the prepared checkout.
 The gate requires the handoff from `copies.py run` before it starts placement or tests.
-`python3 -m scripts.production.gate` accepts the same options.
+`./scripts/lib/py -m scripts.production.gate` accepts the same options.
 The former `merge_gate.py` and `targeted_test.py` entry points remain available until their removal.
 `build_steps.command_job` reads these command forms for the memory feed and copy lease names.
 It names integration, promotion, nightly tests, all tests, affected tests, or selected modules from the arguments.
@@ -446,10 +446,11 @@ Cleanup stops the confirmed groups and removes the journal, even when the tempor
 The receipt stays with a retained checkout.
 See [Mac gate cleanup](mac-test-offload.md#mac-gate-cleanup) for the queue callbacks.
 
-### Targeted tests: `scripts/production/targeted_test.py`
+### Targeted tests
 
-The entry has its own parser and description.
-It shares the suite arguments, signal wrapper, copy lock, and suite runner with `merge_gate.py`.
+Run `gate.py --affected` through `copies.py run` from the unit worktree root.
+Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+`scripts/production/targeted_test.py` passes its arguments to `gate.py --affected`.
 `SuiteMode.TARGETED` enables selection and takes the `test-affected` admission step.
 `SuiteMode.GATE` runs all modules and takes the `gate` step.
 Both modes accept `--full` because existing repository callers use it.
