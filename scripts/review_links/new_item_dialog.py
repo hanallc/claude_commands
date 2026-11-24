@@ -1563,7 +1563,9 @@ SCRIPT = r'''(() => {
    const draft = JSON.parse(stored);
    if (typeof draft?.id !== 'string' || !browserDraftId.test(draft.id)) return null;
    const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
-   return {id: draft.id, recipient, awaitingSend: draft.awaitingSend};
+   const editKey = typeof draft.editKey === 'string' && draft.editKey.startsWith('native-list-edit:')
+    ? draft.editKey : undefined;
+   return {id: draft.id, recipient, awaitingSend: draft.awaitingSend, editKey};
   } catch (_) { return null; }
  }
 
@@ -1574,9 +1576,11 @@ SCRIPT = r'''(() => {
  function storeListDraft() {
   if (ownerPage !== 'list' || !draftId || isEditingLater() || separateFromNativeDraft || !sendNotice.hidden) return;
   try {
+   const stored = storedListDraft();
    sessionStorage.setItem(listSendKey, JSON.stringify({
     id: draftId, recipient: selectedRecipient,
-    awaitingSend: awaitingNativeRecovery ? undefined : awaitingEarlierSend
+    awaitingSend: awaitingNativeRecovery ? undefined : awaitingEarlierSend,
+    editKey: stored?.id === draftId ? stored.editKey : undefined
    }));
   } catch (_) {}
  }
@@ -1594,10 +1598,6 @@ SCRIPT = r'''(() => {
    transaction.oncomplete = () => resolve(request.result);
    transaction.onabort = () => reject(transaction.error);
   }));
- }
-
- function nativeListEditKey(id) {
-  return 'native-list-edit:' + id;
  }
 
  async function storeSubmittedDraft(draft) {
@@ -1642,14 +1642,7 @@ SCRIPT = r'''(() => {
  function finishDraft() {
   clearSubmittedDraft();
   if (ownerPage === 'list' && !separateFromNativeDraft) {
-   const stored = storedListDraft();
-   if (isShippedListDraft(stored) && stored.id === draftId) {
-    const key = nativeListEditKey(stored.id);
-    if (sessionStorage.getItem(key)) {
-     sessionStorage.removeItem(key);
-     void draftTransaction('readwrite', store => store.delete(key)).catch(() => {});
-    }
-   }
+   // A copied tab can still have a pointer to the saved edit.
    try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
   draftId = undefined;
@@ -1738,9 +1731,14 @@ SCRIPT = r'''(() => {
   setSending(true);
   try {
    const files = await Promise.all(edit.files.map(pastedData));
-   const key = nativeListEditKey(edit.id);
-   await draftTransaction('readwrite', store => store.put({...edit, files}, key));
-   sessionStorage.setItem(key, edit.id);
+   const editKey = 'native-list-edit:' + randomNonce();
+   await draftTransaction('readwrite', store => store.add({...edit, files}, editKey));
+   try {
+    sessionStorage.setItem(listSendKey, JSON.stringify({id: edit.id, recipient: edit.recipient, editKey}));
+   } catch (failure) {
+    void draftTransaction('readwrite', store => store.delete(editKey)).catch(() => {});
+    throw failure;
+   }
    return true;
   } catch (_) {
    setError('Could not keep the native draft. Try again.');
@@ -1890,15 +1888,13 @@ SCRIPT = r'''(() => {
   if (!keepDraft || !submittedDraft) pageContext = collectPageContext();
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId) {
-   const stored = storedListDraft();
-   if (stored) {
-    draftId = stored.id;
-    selectedRecipient = stored.recipient;
-    // The shipped List dialog stores no Send state.
-    awaitingNativeRecovery = isShippedListDraft(stored);
-    awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
-   }
+  const stored = ownerPage === 'list' ? storedListDraft() : null;
+  if (stored && !draftId) {
+   draftId = stored.id;
+   selectedRecipient = stored.recipient;
+   // The shipped List dialog stores no Send state.
+   awaitingNativeRecovery = isShippedListDraft(stored);
+   awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
   }
   const newDraft = !keepDraft && !draftId;
   if (newDraft) selectedRecipient = '';
@@ -1930,18 +1926,15 @@ SCRIPT = r'''(() => {
    const original = restored?.payload;
    if (original) {
     showSubmittedDraft(restored);
-   } else if (!keepDraft && awaitingNativeRecovery) {
-    const key = nativeListEditKey(draftId);
-    if (sessionStorage.getItem(key)) {
-     setSending(true);
-     try {
-      const edit = await draftTransaction('readonly', store => store.get(key));
-      if (controller.signal.aborted) return;
-      if (!edit) throw new Error('Could not restore the native draft.');
-      showEdit({...edit, files: decodePastedFiles(edit.files)});
-     } finally {
-      setSending(false);
-     }
+   } else if (!keepDraft && awaitingNativeRecovery && stored?.editKey) {
+    setSending(true);
+    try {
+     const edit = await draftTransaction('readonly', store => store.get(stored.editKey));
+     if (controller.signal.aborted) return;
+     if (!edit) throw new Error('Could not restore the native draft.');
+     showEdit({...edit, files: decodePastedFiles(edit.files)});
+    } finally {
+     setSending(false);
     }
    }
    const data = await loadOptions(controller.signal);
