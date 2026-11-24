@@ -41,10 +41,10 @@ from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
-from scripts.review_links import question_record
+from scripts.review_links import page_version, question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.test_accounts_page import firefox_probe_results, newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
@@ -1503,6 +1503,55 @@ window.fetch=(url,options)=>{
         index = page.split('<script type="application/json" data-review-index>', 1)[1].split('</script>', 1)[0]
         self.assertEqual(next(entry['id'] for entry in unpack_index(index) if entry['key']==key), 'page-owner/Q1')
         self.assertIn('"review_id": "Q1"', path.read_text())
+
+    def test_script_version_hashes_the_fixed_shell_that_a_refresh_never_reads(self) -> None:
+        page = review_page.render(self.root).decode()
+        for part in review_page.SHELL_PARTS:
+            self.assertIn(part, page)
+        # A shell part that leaves the hash fails here, so a shell change always reloads an open page.
+        self.assertEqual(review_page.SCRIPT_VERSION, page_version.script_version(
+            change_page.DOCUMENT_ASSETS, record_table.STYLE, record_table.DATE_TIME_STYLE, review_page.STYLE,
+            review_page.CARD_REQUEST_SCRIPT, *review_page.SHELL_PARTS, review_page.SCRIPT))
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'page-owner/C{number}', id=f'page-owner/C{number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 46)]
+        with patch.object(review_items, 'read', return_value=records):
+            markup = browser_markup(self.root)
+        self.assertEqual(markup.count(f'data-script-version="{review_page.SCRIPT_VERSION}"'), 1)
+        # Review reads the snapshot version as JSON, so the newer script version comes in that answer.
+        newer = r"""(url,options)=>{
+ const query=new URL(url,location.href).searchParams;
+ if(!query.has('version') || query.has('index') || query.has('body')) return undefined;
+ return Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,
+  script:'newer-script',facts:pageRefreshFacts()}));
+}"""
+        # The rows are drawn in a window after load, so the scroll place must outlast that first draw.
+        place = r"""scrollTo({top:1200,behavior:'instant'});await new Promise(resolve=>setTimeout(resolve,200));
+  const row=[...document.querySelectorAll('[data-review] [data-list-item]')].find(row=>row.getBoundingClientRect().top>0);
+  row.querySelector('.list-toggle').click();await readyReviewCard(row);"""
+        words = "recordDetails(row).querySelector('[data-review-form]').elements.feedback"
+        toggle = "row.querySelector('.list-toggle').click();"
+        closed = "check(!recordIsOpen(row),'the item closes');"
+        opened = "!!document.querySelector('[data-review] .list-toggle[aria-expanded=\"true\"]')"
+        with self.subTest(hold='the words of an open item'):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=opened, start=f"type({words},'typed words');",
+                end=f"type({words},'');"), [[]])
+        with self.subTest(hold='none, for the words of a closed item'):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, holds=False, start=f"type({words},'typed words');" + toggle + closed),
+                [[]])
+        with self.subTest(hold='an Ask save that never answers'):
+            # The item closes while the save runs, so only the save holds the reload.
+            short = markup.replace('data-request-timeout-seconds="15"', 'data-request-timeout-seconds="5"', 1)
+            self.assertNotEqual(short, markup)
+            save = (f"type({words},'Which check passed?');const form={words}.form;"
+                    + "form.requestSubmit(form.querySelector('[value=\"question\"]'));" + toggle + closed)
+            self.assertEqual(newer_script_reload_results(
+                short, newer=newer, place=place, start=save, saves=True), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_ask_keeps_later_edits_and_ignores_a_response_after_reopen(self) -> None:

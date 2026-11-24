@@ -23,7 +23,8 @@ from scripts.production import change_review, change_routing, next_item, staff, 
 from scripts.production.production_doc import Production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_page, console, new_item_dialog, page_frame, question_record, review_events, review_items, staff_names
+from scripts.review_links import change_page, console, new_item_dialog, page_frame, page_version, question_record, review_events
+from scripts.review_links import review_items, staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -572,6 +573,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     settings = conf.read("review_links")
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
+    request_timeout = settings.whole("page_request_timeout_seconds")
     card_motion = page_frame.CardMotion.read(settings)
     prepared = prepare(browser, status, settings=settings)
     names_read = staff_names.read()
@@ -586,9 +588,9 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}"{names_read.style(name)} value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows, names_read) for item in prepared.questions))
-    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review")
+    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review", SCRIPT_VERSION)
                + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}"'
-               + f' data-script="{SCRIPT_VERSION}" {card_motion.attributes()}>'
+               + f' data-request-timeout-seconds="{request_timeout}" {card_motion.attributes()}>'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
@@ -964,7 +966,7 @@ async function save(row,form,outcome){
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
  if(early) moveOn('Saving review.');
  try{
-  const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
+  const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'},signal:pageRequestSignal()});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
   state.textContent=reply.answer ? 'Saved: '+reply.answer :
@@ -977,16 +979,18 @@ async function save(row,form,outcome){
   else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
  }catch(error){
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
-  row.dataset.saveState='failed'; state.textContent='Not saved: '+reason;
+  const unknown=saveTimeoutWords(error);
+  row.dataset.saveState='failed'; state.textContent=unknown || 'Not saved: '+reason;
   if(early){
    row.dataset.pending='true';form.hidden=false;show();
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   saveNotice.replaceChildren('Not saved: '+row.dataset.shown+'. '+reason+' It is back in the list. ',open);
+   saveNotice.replaceChildren((unknown ? row.dataset.shown+': '+unknown : 'Not saved: '+row.dataset.shown+'. '+reason)
+    +' It is back in the list. ',open);
    saveNotice.hidden=false;
   }
  }finally{
-  form.dataset.saving='false';activeSaves--;
+  form.dataset.saving='false';activeSaves--;pageRefresh.changed();
   // Read after the save, so an older response cannot restore the saved item.
   if(saved){await motion.settled();heldPage=null;newestRequest++;pageRefresh.refresh(true);}
   else applyHeldPage();
@@ -996,12 +1000,14 @@ function detailKey(detail){
  const owner=detail.closest('[data-key]');
  return owner?.dataset.key+'/'+[...owner.querySelectorAll('details')].indexOf(detail);
 }
+// A draft can wait on a card that is not shown, so this counts every form that is not done.
+function holdsText(){
+ return [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden);
+}
 function applyHeldPage(){
- if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
+ if(!heldPage || activeSaves || holdsText()) return;
  const fresh=heldPage;heldPage=null;
  if(fresh.outerHTML===shownPage) return;
- // A page from an older server script cannot bind the new rows, so it loads again.
- if(fresh.dataset.script!==content.dataset.script){location.reload();return;}
  const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
  const left=scrollX,top=scrollY,focused=document.activeElement;
  const controlId=focused===runnerMenu ? focused.id : '';
@@ -1036,16 +1042,16 @@ async function refreshPage(supersede=false,current=()=>true){
   const page=new DOMParser().parseFromString(await response.text(),'text/html');
   const fresh=page.querySelector('[data-review-content]');
   if(request!==newestRequest || !current()) return;
+  const newer=reloadForNewScript(page,()=>activeSaves>0);if(newer) return newer;
   if(!fresh) throw new Error('The page has no review list.');
   heldPage=fresh;applyHeldPage();return pageRefreshFacts(page);
  }finally{if(request===newestRequest) activeLoads=false;}
 }
 const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds,()=>
- activeSaves ? 'An answer is saving.' : [...content.querySelectorAll('textarea,input[type=text]')]
-  .some(field=>field.value!=='' && !field.closest('form')?.hidden) ? 'You have text in a field.' : '');
+ activeSaves ? 'An answer is saving.' : holdsText() ? 'You have text in a field.' : '');
 document.addEventListener('input',()=>{applyHeldPage();pageRefresh.changed();});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();
 '''
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
-                                          + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, PAGE_STYLE, SCRIPT, page_frame.COPY_BUTTON)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

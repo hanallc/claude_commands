@@ -107,6 +107,16 @@ NO_SESSION_FILTER: frozenset[str] = frozenset()
 REFUSAL_AT = NOW - timedelta(seconds=1)
 WEEKLY_RESET = NOW + timedelta(days=2)
 FIVE_HOUR_RESET = NOW + timedelta(hours=3)
+# The defect entry: 2026-11-24T17:00:00+00:00.
+FABLE_RESETS_AT = 1795539600
+FABLE_LIMIT_TEXT = "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."
+CLAUDE_FAMILIES = frozenset({"fable", "opus", "sonnet", "haiku"})
+
+
+def assistant_entry(model: str) -> dict[str, object]:
+    """A real assistant transcript entry from one model."""
+    content: list[object] = []
+    return {"type": "assistant", "message": {"model": model, "content": content}}
 
 
 class WatchTime(datetime):
@@ -1465,6 +1475,22 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(plan, refusal_watch.CompletionPlan(NOW, {"showrunners": refusal_watch.PlannedCompletion(
             "claude3", "by hand", "complete showrunners move to claude3", NOW - timedelta(minutes=5))}))
 
+    def test_completion_plan_drops_only_the_group_whose_family_the_target_refused(self) -> None:
+        self.write_models()
+        path = self.groups()
+        _ = path.write_text(json.dumps({"units": self.selection("claude3"), "showrunners": self.selection("claude3"),
+                                        "producers": self.selection("claude3")}))
+        refusals.write_refusal(refusals.AccountRefusal("claude", TARGET_LOGIN, refusals.KnownWindow("weekly"),
+            refusals.KnownReset(NOW + timedelta(days=2)), REFUSAL_AT, refusals.ModelFamily("fable")))
+
+        _ = refusal_watch.run(NOW, recover_units=False)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(accounts.main(["completion-plan-read"]), 0)
+
+        plan = refusal_watch.decode_completion_plan(output.getvalue())
+        self.assertEqual(sorted(plan.groups), ["showrunners", "units"])
+
     def test_plan_save_errors_do_not_stop_the_natedev_pass(self) -> None:
         path = self.groups()
         _ = path.write_text(json.dumps({"units": self.selection("claude1"), "showrunners": self.selection("claude3")}))
@@ -2672,6 +2698,174 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(role_map.recorded_auto_moves(accounts.roles_history_file()),
                          role_map.RecordedAutoMoves(frozenset({"producers-low"})))
 
+    def family_transcript(self, identity: str, *entries: Mapping[str, object]) -> Path:
+        path = self.home / ".claude/projects/fixture" / f"{identity}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+        return path
+
+    @staticmethod
+    def family_refusal_entry(*, at: datetime = REFUSAL_AT, entry_id: str = "family-refusal",
+                             resets_at: int | None = FABLE_RESETS_AT,
+                             limit: str = "seven_day_overage_included", text: str = FABLE_LIMIT_TEXT,
+                             field: Literal["apiErrorParams", "quotaLimits"] = "apiErrorParams") -> dict[str, object]:
+        info: dict[str, object] = {"status": "rejected", "rateLimitType": limit,
+                                   "overageStatus": "rejected", "overageDisabledReason": "org_level_disabled",
+                                   "isUsingOverage": False}
+        if resets_at is not None:
+            info["resetsAt"] = resets_at
+        return {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+                "apiError": "model_requires_usage_credits", "timestamp": at.isoformat(), "uuid": entry_id,
+                field: {"rate_limit_info": info} if field == "apiErrorParams" else info,
+                "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}}
+
+    def write_models(self) -> None:
+        registry = self.home / ".claude/config/models.conf"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        _ = registry.write_text("\n".join((
+            "[claude.families]", *(f"{name}={name}" for name in sorted(CLAUDE_FAMILIES)), "",
+            "[producers]", "brain=claude:fable:high", "morty=claude:fable:high", "",
+            "[production.claude]", "director=opus:xhigh", "showrunner=opus:high", "")))
+
+    def test_fable_overage_refusal_entry_gives_a_fable_family_refusal_with_its_reset(self) -> None:
+        self.write_models()
+        _ = self.family_transcript("fable", assistant_entry("claude-fable-5-2"), self.family_refusal_entry())
+        refusal = refusal_watch.transcript_refusal("fable")
+        assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+        self.assertEqual(refusal.family, refusals.ModelFamily("fable"))
+        self.assertEqual(refusal.window, refusals.KnownWindow("weekly"))
+        self.assertEqual(refusal.reset, refusals.KnownReset(datetime(2026, 11, 24, 17, tzinfo=timezone.utc)))
+
+    def test_family_limit_text_names_the_family_without_a_prior_model_and_all_models_otherwise(self) -> None:
+        unknown: Callable[[], refusals.ModelFamily | refusals.UnknownFamily] = lambda: refusals.UNKNOWN_FAMILY
+        for text, expected in ((FABLE_LIMIT_TEXT, refusals.ModelFamily("fable")),
+                               ("You've hit your usage limit.", refusals.ALL_MODELS)):
+            with self.subTest(text=text):
+                refusal = refusal_watch.claude_entry_refusal(self.family_refusal_entry(text=text), unknown, CLAUDE_FAMILIES)
+                assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+                self.assertEqual((refusal.family, refusal.window), (expected, refusals.KnownWindow("weekly")))
+
+    def test_refusal_text_family_wins_over_the_prior_model(self) -> None:
+        # A Fable session switched with /model opus; its next request was refused for Opus.
+        refusal = refusal_watch.claude_entry_refusal(self.family_refusal_entry(text="You've reached your Opus limit."),
+                                                     lambda: refusals.ModelFamily("fable"), CLAUDE_FAMILIES)
+        assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+        self.assertEqual((refusal.family, refusal.session_family), (refusals.ModelFamily("opus"), refusals.ModelFamily("opus")))
+
+    def test_names_outside_the_registry_families_give_all_model_refusals(self) -> None:
+        fable: Callable[[], refusals.ModelFamily | refusals.UnknownFamily] = lambda: refusals.ModelFamily("fable")
+        unknown: Callable[[], refusals.ModelFamily | refusals.UnknownFamily] = lambda: refusals.UNKNOWN_FAMILY
+        for limit, text, prior in (("seven_day_cowork", "You've reached your Cowork limit.", fable),
+                                   ("seven_day_overage_included", "You've reached your Cowork limit.", unknown)):
+            with self.subTest(limit=limit):
+                refusal = refusal_watch.claude_entry_refusal(self.family_refusal_entry(limit=limit, text=text),
+                                                             prior, CLAUDE_FAMILIES)
+                assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+                self.assertEqual((refusal.family, refusal.window), (refusals.ALL_MODELS, refusals.KnownWindow("weekly")))
+
+    def test_seven_day_opus_limit_gives_an_opus_family_refusal(self) -> None:
+        for field in ("apiErrorParams", "quotaLimits"):
+            with self.subTest(field=field):
+                refusal = refusal_watch.claude_entry_refusal(self.family_refusal_entry(
+                    limit="seven_day_opus", text="You've reached your Opus limit.", field=field),
+                    lambda: refusals.ModelFamily("fable"), CLAUDE_FAMILIES)
+                assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+                self.assertEqual(refusal.family, refusals.ModelFamily("opus"))
+                self.assertEqual(refusal.reset, refusals.KnownReset(datetime(2026, 11, 24, 17, tzinfo=timezone.utc)))
+
+    def test_prior_assistant_model_decides_the_overage_family_when_the_text_names_none(self) -> None:
+        self.write_models()
+        requested: dict[str, object] = {"type": "assistant", "requestedModel": "claude-sonnet-5-5", "message": {"content": []}}
+        for prior, expected in ((assistant_entry("claude-opus-5-5"), "opus"), (requested, "sonnet")):
+            with self.subTest(expected=expected):
+                _ = self.family_transcript("prior", assistant_entry("claude-fable-5-2"), prior,
+                                           self.family_refusal_entry(text="You've hit your limit."))
+                refusal = refusal_watch.transcript_refusal("prior")
+                assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+                self.assertEqual(refusal.family, refusals.ModelFamily(expected))
+
+    def test_newest_real_model_outside_the_registry_gives_an_all_model_overage_refusal(self) -> None:
+        self.write_models()
+        _ = self.family_transcript("newmodel", assistant_entry("claude-fable-5-2"), assistant_entry("claude-mythos-1-0"),
+                                   self.family_refusal_entry(text="You've hit your limit."))
+        refusal = refusal_watch.transcript_refusal("newmodel")
+        assert isinstance(refusal, refusal_watch.TranscriptRefusal)
+        self.assertEqual((refusal.family, refusal.session_family), (refusals.ALL_MODELS, refusals.UNKNOWN_FAMILY))
+
+    def test_transcript_without_a_refusal_never_reads_the_model_registry(self) -> None:
+        _ = self.family_transcript("working", assistant_entry("claude-fable-5-2"))
+        with patch.object(refusals, "claude_families", side_effect=AssertionError("registry read")) as read:
+            self.assertEqual(refusal_watch.transcript_refusal("working"), refusal_watch.NoSessionRefusal())
+        read.assert_not_called()
+
+    def test_family_refusal_without_a_reset_never_takes_the_reading_reset(self) -> None:
+        self.write_models()
+        _ = self.groups()
+        _ = self.owner("opus-session")
+        _ = self.family_transcript("opus-session", assistant_entry("claude-opus-5-5"), self.family_refusal_entry(
+            resets_at=None, limit="seven_day_opus", text="You've reached your Opus limit."))
+        _ = self.cli()
+        stored = refusals.load()[f"claude:{SOURCE_LOGIN}:opus"]
+        self.assertEqual((stored.window, stored.reset), (refusals.KnownWindow("weekly"), refusals.NoResetKnown()))
+
+    def test_ungrouped_fable_session_skips_a_fable_refused_account(self) -> None:
+        self.write_models()
+        _ = self.groups()
+        _ = self.owner("solo")
+        _ = self.family_transcript("solo", assistant_entry("claude-fable-5-2"), self.family_refusal_entry())
+        # claude2 resets first, so only its Fable refusal keeps the Fable session off it.
+        self.reading("main@example.invalid", 80, reset=NOW + timedelta(days=1))
+        self.reading(TARGET_LOGIN, 50, reset=NOW + timedelta(days=5))
+        for login, family in (("main@example.invalid", "fable"), (TARGET_LOGIN, "opus")):
+            refusals.write_refusal(refusals.AccountRefusal("claude", login, refusals.KnownWindow("weekly"),
+                refusals.KnownReset(NOW + timedelta(days=2)), REFUSAL_AT - timedelta(hours=1), refusals.ModelFamily(family)))
+        _ = self.cli()
+        self.assertEqual([(move.session_id, move.target) for move in self.moves.calls], [("solo", "claude3")])
+
+    def test_group_member_on_another_family_places_the_group_with_an_unknown_family(self) -> None:
+        self.write_models()
+        _ = self.groups()
+        _ = self.owner("opus-unit", host="unit")
+        _ = self.owner("fable-unit", host="unit")
+        for model in ("opus", "fable"):
+            _ = self.family_transcript(f"{model}-unit", assistant_entry(f"claude-{model}-5-5"), self.family_refusal_entry(
+                entry_id=f"{model}-weekly", limit="seven_day", text="weekly limit"))
+        families: list[refusals.ModelFamily | refusals.UnknownFamily] = []
+        original = accounts.placement
+
+        def place(group: accounts.ClaudeGroup, now: datetime, *, exclude: frozenset[str] = NO_SESSION_FILTER,
+                  reading_age_minutes: int | accounts.ConfiguredReadingAge,
+                  family: refusals.ModelFamily | refusals.UnknownFamily) -> accounts.GroupPlacement:
+            families.append(family)
+            return original(group, now, exclude=exclude, reading_age_minutes=reading_age_minutes, family=family)
+
+        self.assertEqual(accounts.group_family("units"), refusals.ModelFamily("opus"))
+        with patch.object(accounts, "placement", side_effect=place):
+            _ = self.cli()
+        self.assertEqual(families, [refusals.UNKNOWN_FAMILY])
+
+    def test_producers_next_move_skips_a_fable_refused_account_and_showrunners_next_move_uses_it(self) -> None:
+        self.write_models()
+        path = self.home / ".local/state/accounts/groups.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": "claude1", "showrunners": "claude1", "producers": "claude1"}))
+        producer = self.owner("producer")
+        runner = self.owner("runner", host="herdr")
+        self.reading(SOURCE_LOGIN, 1)
+        refusals.write_refusal(refusals.AccountRefusal("claude", "main@example.invalid", refusals.KnownWindow("weekly"),
+            refusals.KnownReset(NOW + timedelta(days=2)), REFUSAL_AT, refusals.ModelFamily("fable")))
+        self.next_entries(self.low_rule("producers-low", group="producers"),
+                          self.low_rule("showrunners-low", group="showrunners"))
+        members: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = {"units": [],
+            "showrunners": [accounts.LiveGroupMember(runner["session_id"], runner["name"], "showrunners", accounts.account_dir("claude1"))],
+            "producers": [accounts.LiveGroupMember(producer["session_id"], producer["name"], "producers", accounts.account_dir("claude1"))]}
+        with patch.object(accounts, "live_group_members", return_value=members):
+            _ = self.cli()
+        self.assertEqual(stored_group_labels(path), {"units": "claude1", "showrunners": "claude2", "producers": "claude1"})
+        self.assertEqual(self.moves.calls, [MoveCall("runner", "claude2", "auto: showrunners-low")])
+        self.assertEqual(next_moves.read_next_moves(), (self.low_rule("producers-low", group="producers"),))
+        self.assertIn("unresolved refusal", self.head_deliveries[-1][0].text)
+
     def test_automatic_low_rule_requires_a_fresh_source_reading(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
@@ -2879,9 +3073,10 @@ class RefusalWatchTests(unittest.TestCase):
         original = accounts.placement
 
         def place(group: accounts.ClaudeGroup, now: datetime, *, exclude: frozenset[str] = NO_SESSION_FILTER,
-                  reading_age_minutes: int | accounts.ConfiguredReadingAge) -> accounts.GroupPlacement:
+                  reading_age_minutes: int | accounts.ConfiguredReadingAge,
+                  family: refusals.ModelFamily | refusals.UnknownFamily) -> accounts.GroupPlacement:
             events.append("placement")
-            return original(group, now, exclude=exclude, reading_age_minutes=reading_age_minutes)
+            return original(group, now, exclude=exclude, reading_age_minutes=reading_age_minutes, family=family)
 
         with patch.object(accounts, "placement", side_effect=place):
             _ = refusal_watch.run(NOW, refresh_usage=lambda: events.append("fresh usage"))

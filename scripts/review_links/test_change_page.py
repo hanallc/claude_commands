@@ -34,6 +34,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
+from scripts.review_links.test_accounts_page import newer_script_reload_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -3273,8 +3274,8 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
                 self.assertIn('data-card-fade-out-ms="365" data-card-fade-in-ms="725"', content)
                 # An open page reloads, not updates, when the server's page script is newer than its own.
-                self.assertIn(f'data-script="{change_browser.SCRIPT_VERSION}"', content)
-                self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
+                self.assertIn(f'data-script-version="{change_browser.SCRIPT_VERSION}"', content)
+                self.assertNotIn('data-script=', content)
         for interval in ("4", "301", "nan"):
             with self.subTest(page_refresh_seconds=interval, range="invalid"):
                 _ = write_config_fixture(settings, f"page_refresh_seconds={interval}\n")
@@ -3758,9 +3759,10 @@ class ChangePageTests(unittest.TestCase):
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
                          "row.dataset.key===current?.dataset.key", "ordered.slice(previous+1)"):
                 self.assertIn(rule, body)
-            # The one full reload is for a page whose script is older than the server's.
-            self.assertEqual(body.count('location.reload'), 1)
-            self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
+            # Only the shared script reloads: reloadForNewScript, and reloadWhenHoldEnds after a held reload.
+            self.assertEqual(page_frame.REFRESH_SCRIPT.count('location.reload'), 2)
+            self.assertEqual(body.count('location.reload'), 2)
+            self.assertIn('const newer=reloadForNewScript(page,()=>activeSaves>0);', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)
             self.assertIn("activeLoads=true", body)
@@ -3807,6 +3809,49 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('<dt>kind:</dt><dd>See in action</dd>', details)
             self.assertNotIn('<dt>time:</dt>', details)
             self.assertNotIn('<details', card)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(self.temporary / "config/review_links.conf", "page_request_timeout_seconds=5\n")
+        for text in ("First question", "Second question", "Third question"):
+            _ = self.file_user_question(text, question="Pick one.\n\nChoices:\n1. Compact\n2. Wide")
+        _, _, body = self.browser("questions")
+        self.assertEqual(body.count(f'data-script-version="{change_browser.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(body.replace(change_browser.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        second = "[...document.querySelectorAll('section[data-key]')][1].dataset.key"
+        placed = f"document.querySelector('section[data-key]:not([hidden])')?.dataset.key==={second}"
+        # The card switch fades out the old card first, so the probe waits until the second card shows.
+        place = (f"location.hash=new URLSearchParams({{showrunner:'',row:{second}}});"
+                 + f"check(await until(()=>{placed}),'the second card shows');scrollTo({{top:120,behavior:'instant'}});")
+        field = "document.querySelector('section[data-key]:not([hidden]) textarea')"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, start=f"type({field},'typed words');",
+                end=f"type({field},'');"), [[]])
+        with self.subTest(hold="none, for a draft on a card that is not shown"):
+            # The page keeps its own data refresh for this draft, but the draft does not hold a reload.
+            first = "document.querySelector('section[data-key]').querySelector('textarea')"
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, holds=False,
+                start=f"check({first}.closest('section').hidden,'the draft card is not shown');type({first},'typed words');"),
+                [[]])
+        with self.subTest(hold="a selection that a hidden element ends"):
+            # The selection holds while it shows. When its element hides, the page reloads with no refresh call.
+            selected = ("const shown=document.querySelector('section[data-key]:not([hidden])');"
+                        + "const words=[...shown.querySelectorAll('*')].find(node=>node instanceof HTMLElement && !node.children.length"
+                        + " && node.textContent.trim() && node.getClientRects().length && !node.closest('form'));"
+                        + "getSelection().selectAllChildren(words);check(!getSelection().isCollapsed,'the probe selects text');")
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, start=selected,
+                end="words.hidden=true;check(getSelection().getRangeAt(0).getClientRects().length===0,"
+                    + "'the selection does not show');"), [[]])
+        with self.subTest(hold="a Skip save that never answers"):
+            save = ("const form=document.querySelector('section[data-key]:not([hidden]) form');"
+                    + "form.requestSubmit(form.querySelector('[value=\"skip\"]'));")
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, start=save, saves=True), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_skip_save_and_empty_states_in_the_browser(self) -> None:

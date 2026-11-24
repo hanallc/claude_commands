@@ -182,8 +182,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
-    """Build the title and refresh status."""
+def title(text: str, page: str, version: str = "") -> str:
+    """Build the title and refresh status; `version` comes from `script_version`."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -196,7 +196,8 @@ def title(text: str, page: str) -> str:
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
-            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
+            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" '
+            + (f'data-script-version="{version}" ' if version else '') + 'data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
             + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
@@ -223,7 +224,61 @@ CONSOLE_READY_SCRIPT = """(() => {
 })();"""
 
 
-REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
+# A save that ends by its timeout can still finish on the server, so its words do not say that it failed.
+# The card frame has no refresh script, so it passes its own seconds.
+SAVE_TIMEOUT_SCRIPT = r'''function saveTimeoutWords(error,seconds=pageRequestSeconds()){
+ return error?.name==='TimeoutError' ? 'No answer in '+seconds+' s. The save can still finish.' : '';
+}
+'''
+REFRESH_SCRIPT = r'''// Only what the user can see now holds a script reload: a field with unsaved text, an open dialog, menu or picker, or a selection.
+function pageHoldsInput(){
+ const shown=node=>node.checkVisibility ? node.checkVisibility() : node.getClientRects().length>0;
+ if([...document.querySelectorAll('dialog[open],[role=dialog],[role=menu]')].some(shown)) return true;
+ // A selection in a hidden row or a closed dialog has no client rects, so it does not hold the reload.
+ const selection=getSelection();
+ if(selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).getClientRects().length) return true;
+ // The address restores a [data-reload-safe] field after a short wait, so its text is a draft only while it has focus.
+ const draft=field=>!field.hasAttribute('data-reload-safe') || field===document.activeElement && document.hasFocus();
+ return [...document.querySelectorAll('textarea,input:is([type=text],[type=search],[type=url],[type=email],[type=number],:not([type]))')]
+  .some(field=>shown(field) && field.value!==field.defaultValue && draft(field));
+}
+// A fragment from a changed page script can need a newer script than this page runs.
+// Each page refresh calls this first, before any page early return.
+// `page` is the fetched page, or the script version that a JSON read names (none from an older server).
+// `held` is the page's own hold, such as a save in flight; pageHoldsInput always adds the visible edit.
+// Returns refresh facts when the fresh page has another script version, else null.
+// A held reload returns only the busy reason, so the status keeps the data and answer times it has.
+// The page keeps the held reload and loads the newer page as soon as the hold ends.
+let pageReloadHeld=null,pageReloadListening=false;
+function reloadForNewScript(page,held=()=>false){
+ const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
+ const fresh=page instanceof Document ? version(page) : page,own=version(document);
+ if(!fresh || !own || fresh===own){pageReloadHeld=null;return null;}
+ if(held() || pageHoldsInput()){pageReloadHeld=held;listenForHoldEnd();return {busy:'A newer page loads when your edit ends.'};}
+ location.reload();
+ return pageRefreshFacts();
+}
+// The 1 s status clock, an edit, a dialog close, a selection change and each save end call this.
+function reloadWhenHoldEnds(){
+ if(pageReloadHeld && !pageReloadHeld() && !pageHoldsInput()){pageReloadHeld=null;location.reload();}
+}
+// The first held reload adds these listeners, so the script has no top-level page effects.
+// The bubble phase lets the page's own handlers run first. A close event does not bubble, so its check waits one task.
+function listenForHoldEnd(){
+ if(pageReloadListening) return;
+ pageReloadListening=true;
+ for(const name of ['input','change','selectionchange']) document.addEventListener(name,reloadWhenHoldEnds);
+ document.addEventListener('close',()=>setTimeout(reloadWhenHoldEnds,0),true);
+}
+function pageRequestSeconds(){
+ return Number(document.querySelector('[data-request-timeout-seconds]')?.dataset.requestTimeoutSeconds);
+}
+// A save fetch ends after the page_request_timeout_seconds that the page writes in data-request-timeout-seconds.
+// So a save in flight holds a script reload for a limited time.
+function pageRequestSignal(){
+ return AbortSignal.timeout(pageRequestSeconds()*1000);
+}
+''' + SAVE_TIMEOUT_SCRIPT + r'''function pageRefreshFacts(page=document){
  const line=page.querySelector('[data-page-status]');
  if(!line || !line.dataset.readAt) throw new Error('The page has no data time.');
  return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
@@ -245,7 +300,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};
  const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- let last=null,failure='',reading=false,busy='';
+ let last=null,failure='',reading=false,busy='',heldBeforeData='';
  let request=0,active=false,started=0,pending=null,timer,clock,delay;
  let trip=null,state='',nextAt=0;
  const duration=value=>Number(value)<10 ? Number(value).toFixed(2) : Number(value).toFixed(0);
@@ -255,14 +310,15 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
   // An on-demand page can report a server answer separately from the data time.
   const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : busy || last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late'
+   : busy || last?.busy || heldBeforeData ? 'Paused' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
   if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
   const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
   part('age',last ? age<60 ? age+' s ago' : Math.floor(age/60)+' min ago' : '');
-  const why=next==='Paused' ? reason || busy || last?.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  const why=next==='Paused' ? busy || last?.busy || heldBeforeData || reason : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
   part('reason',why);
   const timings=last && !why;
   const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
@@ -274,10 +330,17 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function failed(error,own){if(own===request){failure=error.message || 'The read failed.';reading=false;draw();}}
  async function present(value,began,own,initial=false){
   try{
+  // A busy answer without data keeps the shown data and counts as an answer now, as setStatus does.
+  // A page hold does not keep it back, because it has no new data. Before the first data, it shows only its reason.
+  const status=value.readAt===undefined;
+  if(status){
+   if(!last){heldBeforeData=value.busy;failure='';reading=false;draw();return;}
+   value={...last,busy:value.busy,answeredAt:Date.now()/1000};
+  }else heldBeforeData='';
   if(!Number.isFinite(value.readAt) || !Number.isFinite(value.renderSeconds)) throw new Error('The data has no render time.');
   if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;
-  if(held()){pending={value,began,own};draw();return;}
+  if(held() && !status){pending={value,began,own};draw();return;}
   last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;
   trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
   }catch(error){failed(error,own);}
@@ -304,6 +367,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   draw();
  }
  function changed(){
+  reloadWhenHoldEnds();
   if(pending && !held()){const value=pending;pending=null;void present(value.value,value.began,value.own);}
   draw();
  }

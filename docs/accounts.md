@@ -454,7 +454,7 @@ The ranking chooses the soonest weekly reset, then the most weekly allowance lef
 A caller can keep the current account while it has room.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py placement --explain` to see each account's readings and selection reason.
 
-Claude accounts have room until they have an unresolved provider refusal. Without an account move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with an account move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
+Claude accounts have room until they have an unresolved provider refusal for the work's model family. A model family refusal (for example Fable) blocks only work of that family; work of an unknown family treats it as a block. The producers use their family from `[producers]` in `config/models.conf`; unit directors and showrunners use `[production.claude]`. Without an account move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with an account move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 
 natedev holds the one role map for both machines: Claude groups in `~/.local/state/accounts/groups.json`, workers in `~/.claude/config/accounts.json`, and changes in `~/.local/state/accounts/roles.jsonl`. All readers and writers use `read_role_map()` / `write_role_map(change)`. On the Mac, writes run through `ssh natedev` and preserve the reason, cause and move id; failed writes refuse without changing local selections. Reads fetch the map once per command and save `~/.local/state/accounts/role_map_cache.json`. When natedev is unreachable, a cached map prints `role map from <time in the user's zone>; natedev unreachable`; without a usable cache the command refuses. No machine selects a substitute account.
 
@@ -701,7 +701,7 @@ Each refusal-watch pass starts a quiet probe session for each local noted Claude
 
 Account launches and renewal probes find Claude on PATH, then in `~/.local/bin`, and start its full path, including terminal relaunches; Codex account launches use the same search.
 
-Entries require fresh readings, room above the first entry's threshold, and no unresolved target quota refusal.
+Entries require fresh readings, room above the first entry's threshold, and no unresolved target quota refusal for the group's model family.
 A group that already moved this pass waits.
 Recording the group choice removes its entry under the log lock.
 Recorded `auto: <id>` history prevents a repeated move after an interrupted queue write.

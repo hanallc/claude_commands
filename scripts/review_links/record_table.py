@@ -79,10 +79,10 @@ def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_cla
 
 
 def words_box(element_id: str, placeholder: str) -> str:
-    """Render the words box for the filters."""
+    """Render the words box for the filters; the address keeps its words, so a script reload needs no hold."""
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
-    return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
+    return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words data-reload-safe'
             + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
             + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
