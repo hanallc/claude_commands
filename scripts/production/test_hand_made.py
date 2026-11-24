@@ -27,8 +27,9 @@ from scripts.build_queue import (admission_client, admission_protocol as wire, a
 from scripts.build_queue.queue_place import HeldReservation, PopenArguments, QueuePlaceRefused
 from scripts.build_targets import mac_linux
 from scripts.buildlog import record, treekey
-from scripts.lib import build_steps, conf, models_registry, nix_env
+from scripts.lib import build_steps, conf, conf_reads, models_registry, nix_env
 from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
+from scripts.lint.memory_test_support import shifted_config_lines
 from scripts.notify import review
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.production import hand_made, hand_made_limit
@@ -36,7 +37,15 @@ from scripts.production.hand_made_route import (PROGRAM_VARIABLES, Line, Machine
                                                 ProgramPlace, Refused)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-REGISTRY_TEXT = (REPOSITORY / "config/models.conf").read_text()
+REGISTRY_TEXT = """\
+[cli.hand_made]
+claude.model=opus:high
+claude.role=units
+# range: 5e-324..
+check_time_limit_seconds=90
+# whole: 1..
+max_script_bytes=65536
+"""
 SCRIPT = 'print("hand made ran")\n'
 YES = {"verdict": "yes", "reason": "The script only prints a line."}
 NO = {"verdict": "no", "reason": "The script removes a folder outside the checkout."}
@@ -1135,8 +1144,28 @@ class ProgramFileTests(unittest.TestCase):
 @final
 class SettingsTests(unittest.TestCase):
     def test_repository_registry_section_has_the_four_keys(self) -> None:
+        text = models_registry.registry_text(REPOSITORY / "config/models.conf")
+        section = models_registry.parse_registry(text)[hand_made.SECTION]
+        self.assertEqual(set(section), {"claude.model", "claude.role", "check_time_limit_seconds", "max_script_bytes"})
+
+    def test_read_settings_uses_the_pinned_registry(self) -> None:
         self.assertEqual(hand_made.read_settings(REGISTRY_TEXT),
                          hand_made.CheckSettings("opus", "high", "units", 90.0, 65536))
+
+    def test_read_settings_records_both_shifted_values(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        registry = root / "models.conf"
+        _ = registry.write_text("\n".join(shifted_config_lines(REGISTRY_TEXT)) + "\n", encoding="utf-8")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
+        log = root / "shifts.log"
+        self.addCleanup(conf_reads.set_shift_read_log, conf_reads.set_shift_read_log(str(log)))
+
+        self.assertEqual(hand_made.read_settings(models_registry.registry_text()),
+                         hand_made.CheckSettings("opus", "high", "units", 112.5, 65537))
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), [
+            "models.conf:check_time_limit_seconds: 90 -> 112.50",
+            "models.conf:max_script_bytes: 65536 -> 65537",
+        ])
 
     def test_bad_settings_are_refusals(self) -> None:
         cases = {
