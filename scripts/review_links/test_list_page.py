@@ -7136,6 +7136,8 @@ window.fetch=async(path,options={})=>{
                     item = the_list.load(MORTY.id, item.id)
                     feedback = the_list.feedback_requests(item)[fields["request"]]
                     self.assertEqual(feedback.words, words)
+                    if action == "park":
+                        self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
                     if action == "tell":
                         self.assertEqual(item.log[-1].what, the_list.MarkedRead())
                     self.assertEqual(item.log[-2 if action == "tell" else -1].what, feedback)
@@ -7159,7 +7161,7 @@ window.fetch=async(path,options={})=>{
                     list_page.deliver(list_page.submit(root, urlencode(fields)))
                     self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
             self.assertEqual(item.state, the_list.ItemState.CLOSED)
-            self.assertEqual(item.parked_until, the_list.time_value("2026-12-03"))
+            self.assertIs(item.parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual((item.title, item.owner, item.next_step), (initial.title, initial.owner, initial.next_step))
             _ = the_list.reopen(MORTY.id, item.id, source="morty")
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")

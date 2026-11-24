@@ -1570,14 +1570,15 @@ def unread_delivery(item: ListItem) -> bool:
 
 
 def unpark(keeper: staff.StaffId, identity: str, *, source: str,
-           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListEdit:
+           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+           assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     """Clear an active parking time and save its notice in the same write."""
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if not parking_active(item.parked_until, moment):
             return item
         _open(item)
         return replace(item, parked_until=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, Unparked(), source, page_action=notice)
+    return _change(keeper, identity, edit, Unparked(), source, page_action=notice, assigned_to=assigned_to)
 
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
@@ -1593,7 +1594,7 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
         closed_questions = tuple(ItemChange(moment, QuestionClosed(question), source)
                                  for question in item.questions if question.answer is None)
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
-                       questions=answered, log=(*item.log, *closed_questions))
+                       parked_until=NoTimestamp.UNSET, questions=answered, log=(*item.log, *closed_questions))
     return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
                    unread=False, page_action=notice, assigned_to=assigned_to).item
 
@@ -2127,7 +2128,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
     _ = answer.add_argument("--keeper", type=staff.StaffId,
                             help="the staff ID of the record keeper (defaults to your staff ID)")
-    for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
+    for name in ("add", "update", "park", "unpark", "close", "reopen", "mark-read",
+                 "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
             _ = command.add_argument("--source", required=name != "update")
@@ -2219,7 +2221,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
-        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close", "reopen"):
+        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "unpark", "close", "reopen"):
             raise ListError(f"only morty can run {name}")
         assert source is not None
         if name == "clean-evidence":
@@ -2275,6 +2277,8 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "park":
             _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source,
                      assigned_to=assigned_to)
+        elif name == "unpark":
+            _ = unpark(keeper, cast(str, args.id), source=source, assigned_to=assigned_to)
         elif name == "close":
             _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source, assigned_to=assigned_to)
         elif name == "reopen":
