@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
+from scripts.lib import build_folders, build_slots, cancellation, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -2675,8 +2675,9 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                         pipes.close()
                         return subprocess.CompletedProcess(arguments, child.wait())
                     except BaseException:
-                        child.kill()
-                        _ = child.wait()
+                        with cancellation.defer_cleanup_signals():
+                            child.kill()
+                            _ = child.wait()
                         raise
 
         if isinstance(prepared, AdmittedCommandCopy):

@@ -183,6 +183,24 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.write(self.checkout / mac_gate.MODULE_LIST,
                    mac_gate.MODULE_LIST_HEADER + "".join(path + "\n" for path in paths))
 
+    def commit_one_affected_module(self, path: str) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "landing_branches=fixture-landing\nscan_roots=\n")
+        baseline = gate.run_suites(self.checkout)
+        self.assertTrue(baseline.passed, self.output.getvalue())
+        record, = self.pass_records()
+        self.assertEqual(record["kind"], "full")
+        self.assertEqual(record["commit"], self.git(self.checkout, "rev-parse", "HEAD"))
+        self.clear_gate_events()
+        module = self.checkout / path
+        self.write(module, module.read_text() + "\n# Change one test module.\n")
+        _ = self.commit(self.checkout, "Change one test module")
+
+    def assert_modules_started(self, *paths: str) -> None:
+        starts = [f"scripts/{row['suite']}/{row['module']}" for row in self.module_events()
+                  if row["event"] == "start"]
+        self.assertCountEqual(starts, paths)
+
     def assert_targeted_cloud_selection(
         self, *paths: str, gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
     ) -> None:
@@ -882,6 +900,7 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("lib")
     def test_unassigned_merge_gate_cli_runs_all_modules_locally(self) -> None:
         self.exclude_modules(LIB_FIRST)
+        self.commit_one_affected_module(LIB_FIRST)
         script = str(gate.__file__)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
@@ -891,7 +910,7 @@ class MacGateSuitesTests(GateSuitesFixture):
               self.assertRaises(SystemExit) as exited):
             _ = runpy.run_path(script, run_name="__main__")
         self.assertEqual(exited.exception.code, 0, self.output.getvalue())
-        self.assert_all_modules_started()
+        self.assert_modules_started(LIB_FIRST, LIB_SECOND)
         load_mac.assert_not_called()
         guest.assert_not_called()
         self.cloud_route.assert_not_called()
@@ -899,12 +918,13 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("lib")
     def test_unassigned_targeted_test_cli_runs_the_whole_selection_locally(self) -> None:
         self.exclude_modules(LIB_FIRST)
+        self.commit_one_affected_module(LIB_FIRST)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_linux, "route") as guest):
             status = targeted_test.main(["--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())
-        self.assert_all_modules_started()
+        self.assert_modules_started(LIB_FIRST)
         guest.assert_not_called()
         self.cloud_route.assert_not_called()
 
@@ -947,10 +967,11 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("hooks", "lib")
     def test_unassigned_full_targeted_gate_runs_all_modules_locally(self) -> None:
         self.exclude_modules(HOOKS)
+        self.commit_one_affected_module(LIB_FIRST)
         with mock.patch.object(mac_linux, "route") as guest:
             run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, full=True, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(run.passed, self.output.getvalue())
-        self.assert_all_modules_started()
+        self.assert_modules_started(HOOKS, LIB_FIRST, LIB_SECOND)
         guest.assert_not_called()
         self.cloud_route.assert_not_called()
 

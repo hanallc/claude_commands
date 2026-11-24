@@ -166,7 +166,7 @@ class CopyGateRetryTests(unittest.TestCase):
     @contextmanager
     def assigned_aws_gate(self, command: tuple[str, ...]) -> Generator[None]:
         script = self.tree / "scripts/production/gate.py"
-        script.parent.mkdir(parents=True)
+        script.parent.mkdir(parents=True, exist_ok=True)
         _ = script.write_text(dedent("""\
             import os
             import signal
@@ -206,18 +206,40 @@ class CopyGateRetryTests(unittest.TestCase):
         cancel.assert_called_once()
 
     def test_interrupt_reaps_the_gate_before_cancelling_placement(self) -> None:
+        for during in ("kill", "wait"):
+            with self.subTest(during=during):
+                self.assert_interrupt_reaps_the_gate(during)
+
+    def assert_interrupt_reaps_the_gate(self, during: str) -> None:
         command = (sys.executable, "scripts/production/gate.py", "--wait")
+        kill = subprocess.Popen[str].kill
         wait = subprocess.Popen[str].wait
         launched: list[subprocess.Popen[str]] = []
+        second_interrupts: list[str] = []
+        cleanup_steps: list[str] = []
+
+        def interrupt_cleanup(operation: str) -> None:
+            if operation == during:
+                second_interrupts.append(operation)
+                signal.raise_signal(signal.SIGINT)
+
+        def interrupt_kill(process: subprocess.Popen[str]) -> None:
+            interrupt_cleanup("kill")
+            kill(process)
+            cleanup_steps.append("kill")
 
         def interrupt_wait(process: subprocess.Popen[str], timeout: float | None = None) -> int:
             if not launched:
                 launched.append(process)
                 raise KeyboardInterrupt
-            return wait(process, timeout=timeout)
+            interrupt_cleanup("wait")
+            status = wait(process, timeout=timeout)
+            cleanup_steps.append("wait")
+            return status
 
         def cancel_after_exit(_request: wire.CancelPlacement) -> wire.Ok:
             child, = launched
+            self.assertEqual(cleanup_steps, ["kill", "wait"])
             self.assertEqual(child.returncode, -signal.SIGKILL)
             with self.assertRaises(ChildProcessError):
                 _ = os.waitpid(child.pid, os.WNOHANG)
@@ -225,15 +247,17 @@ class CopyGateRetryTests(unittest.TestCase):
 
         try:
             with (self.assigned_aws_gate(command),
+                  mock.patch.object(subprocess.Popen, "kill", interrupt_kill),
                   mock.patch.object(subprocess.Popen, "wait", interrupt_wait),
                   mock.patch.object(client, "cancel_placement", side_effect=cancel_after_exit) as cancel,
                   self.assertRaises(KeyboardInterrupt)):
                 _ = copies.main(["run", "--repo", str(self.root), "--commit", "HEAD", "--targets", "aws",
                                  "--", *command])
             cancel.assert_called_once()
+            self.assertEqual(second_interrupts, [during])
         finally:
             for child in launched:
-                child.kill()
+                kill(child)
                 _ = wait(child, timeout=3)
 
     def test_non_gate_runs_once_without_admission(self) -> None:
