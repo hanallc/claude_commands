@@ -54,6 +54,7 @@ from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 from scripts.build_hold import override_guard
 from scripts.production import staff
+from scripts.production.gate_routes import SuiteMode
 
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
@@ -148,14 +149,20 @@ def _provider_configuration() -> ProviderConfiguration:
     return ProviderConfiguration() if current is None else current
 
 
-def scaler_provider() -> placement.CloudGateProvider:
+class CloudGateProvider(Protocol):
+    def availability(self, *, mode: SuiteMode) -> placement.Available | placement.Unavailable: ...
+
+    def settlement(self, episode: str, attempt: int) -> placement.Settled | placement.Pending: ...
+
+
+def scaler_provider() -> CloudGateProvider:
     """Load the scaler adapter on the provider evidence worker."""
-    return cast(placement.CloudGateProvider, cast(object, import_module("scripts.aws_target.cloud_gate")))
+    return cast(CloudGateProvider, cast(object, import_module("scripts.aws_target.cloud_gate")))
 
 
-def scaler_availability() -> placement.AllowedHost | placement.TemporaryExclusion:
+def scaler_availability(mode: SuiteMode) -> placement.AllowedHost | placement.TemporaryExclusion:
     try:
-        result = scaler_provider().availability()
+        result = scaler_provider().availability(mode=mode)
     except AttributeError:
         return placement.TemporaryExclusion("AWS availability is unavailable")
     return placement.AllowedHost() if isinstance(result, placement.Available) else placement.TemporaryExclusion(result.reason)
@@ -3960,7 +3967,8 @@ class AdmissionServer:
             target = next((target for target in targets if isinstance(target, target_config.ScalerTarget)), None)
             allowed = (target is not None and key.settings == placement.ExplicitProviderSettings(target.settings)
                        and scaler_enabled(registry, target))
-            answer = scaler_availability() if allowed else placement.TemporaryExclusion("scaler disabled")
+            mode = SuiteMode.TARGETED if SuiteMode.step(key.step) == SuiteMode.TARGETED.value else SuiteMode.GATE
+            answer = scaler_availability(mode) if allowed else placement.TemporaryExclusion("scaler disabled")
             return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, answer)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
@@ -6518,12 +6526,13 @@ def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> Ser
     raw_state = cast(dict[str, object], json.loads(text))
     check_placement_shape(raw_state)
     state = wire.parse_record(text, ServiceState)
-    for episode, key in state.current_assignments.items():
+    for episode, key in tuple(state.current_assignments.items()):
         saved = state.assignments.get(key)
-        if saved is None:
-            raise ValueError("current placement index refers to a missing assignment")
-        if saved.assignment.episode != episode:
-            raise ValueError("current placement index refers to another episode")
+        if saved is None or saved.assignment.episode != episode:
+            del state.current_assignments[episode]
+            print(f"memory admission: removed invalid index entry for episode {episode!r} with key {key!r}",
+                  file=sys.stderr)
+            continue
         report = saved.terminal_report
         if (is_mac_linux_guest(saved.assignment.destination) and isinstance(saved.permission, placement.PermissionAvailable)
                 and isinstance(report, placement.TerminalAttemptReport) and report.outcome == GUEST_SETTLEMENT_REQUESTED):

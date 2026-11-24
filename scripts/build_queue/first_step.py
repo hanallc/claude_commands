@@ -64,8 +64,12 @@ class InheritedGatePlacement:
 GatePlacement = OwnedGatePlacement | InheritedGatePlacement
 
 
-def close_unsettled_gate(cleanup: Callable[[], None]) -> None:
-    """Log a cleanup error after an unsettled gate."""
+def is_gate_placement_exit(status: int) -> bool:
+    return status in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS)
+
+
+def close_gate_preserving_status(cleanup: Callable[[], None]) -> None:
+    """Log cleanup errors after a gate placement exit."""
     try:
         cleanup()
     except Exception as error:
@@ -79,7 +83,7 @@ class FirstStepAdmission:
     queue_position: SlotQueuePosition
     grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment | GatePlacement | HandedOff
     assignment_file: Path
-    unsettled: bool = field(default=False, init=False)
+    preserve_exit_status: bool = field(default=False, init=False)
 
     def handoff(self, tree: Path) -> None:
         """End preparation or pass the assignment to the command."""
@@ -126,7 +130,7 @@ class FirstStepAdmission:
         grant = self.grant
         result = (run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
                   if isinstance(grant, OwnedGatePlacement) else run())
-        self.unsettled = result.returncode == GATE_UNSETTLED_LAUNCH_STATUS
+        self.preserve_exit_status = is_gate_placement_exit(result.returncode)
         return result
 
     def close(self) -> None:
@@ -238,20 +242,21 @@ def run_gate_with_placement(
     """
     while True:
         result = run()
-        if result.returncode not in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
+        if not is_gate_placement_exit(result.returncode):
             return result
         try:
             previous = read_assignment(assignment_file).assignment
             if not assignment_matches_request(previous, request):
                 raise wire.AdmissionUnavailable('the gate assignment does not match the request')
+            destination = previous.destination
+            mac_linux = destination.provider == 'ssh' and destination.target == 'mac-linux'
             retry_notice = ''
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
                 refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
-                destination = previous.destination
                 waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
-                    destination.provider == 'scaler' or (destination.provider == 'ssh' and destination.target == 'mac-linux'
-                        and isinstance(settled.permission, placement.PermissionConsumed)))
+                    destination.provider == 'scaler' or
+                    (mac_linux and isinstance(settled.permission, placement.PermissionConsumed)))
                 if (settled.assignment != refusal.assignment
                         or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                         or not isinstance(settled.retry, placement.RetryAt)
@@ -262,6 +267,9 @@ def run_gate_with_placement(
                                 + 'Received a replacement assignment.')
             else:
                 client.request_settlement(wire.SettlementRequest(previous))
+                waiting_for_settlement = True
+            if mac_linux and waiting_for_settlement:
+                print(f'waiting for Mac Linux to confirm the end of attempt {previous.attempt}', flush=True)
             place_again(request)
             replacement = read_assignment(assignment_file).assignment
             if (not assignment_matches_request(replacement, request)
@@ -460,9 +468,9 @@ def admitted_run(command: Sequence[str], source: Path, *,
                     client.write_assignment(assignment_file, grant)
                 yield admitted
             finally:
-                if admitted.unsettled:
-                    close_unsettled_gate(admitted.close)
-                    close_unsettled_gate(cleanup.close)
+                if admitted.preserve_exit_status:
+                    close_gate_preserving_status(admitted.close)
+                    close_gate_preserving_status(cleanup.close)
                 else:
                     admitted.close()
     except wire.AdmissionUnavailable as error:

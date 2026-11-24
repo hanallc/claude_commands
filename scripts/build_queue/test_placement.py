@@ -36,6 +36,7 @@ from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 from scripts.lint import memory_admit as gate
+from scripts.production.gate_routes import SuiteMode
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -650,10 +651,56 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
-    def test_saved_placement_rejects_missing_assignment(self) -> None:
-        state = service.ServiceState({}, {}, {}, records.ReadyToStart(), current_assignments={"episode": "attempt"})
-        with self.assertRaisesRegex(ValueError, "missing assignment"):
-            _ = service.parse_service_state(wire.encode_record(state))
+    def test_startup_drops_invalid_current_assignments(self) -> None:
+        with PlacementFixture(private_child_starts=True) as fixture:
+            request = scaler_gate_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            closed = replace(assignment, attempt="older-attempt")
+            closed_key = execution_identity.attempt_key(closed.episode, closed.attempt)
+            state = service.read_state(fixture.state_dir)
+            state.assignments[closed_key] = records.SavedPlacementAssignment(closed, placement.ClosedAssignment("completed"))
+            missing_key = execution_identity.attempt_key("missing-episode", "c")
+            invalid = {"missing-episode": missing_key, "wrong-episode": key}
+            damaged = replace(state, current_assignments={**state.current_assignments, **invalid})
+            path = fixture.state_dir / "state.json"
+            _ = path.write_text(wire.encode_record(damaged))
+            with redirect_stderr(io.StringIO()) as warnings:
+                fixture.restart()
+            repairs = [line for line in warnings.getvalue().splitlines() if "removed invalid index entry" in line]
+            self.assertEqual(len(repairs), len(invalid))
+            for episode, bad_key in invalid.items():
+                self.assertTrue(any(episode in line and bad_key in line for line in repairs), repairs)
+            self.assertTrue(fixture.socket_path.is_socket())
+            self.assertEqual(fixture.server.current_assignments, state.current_assignments)
+            self.assertEqual(fixture.server.assignments, state.assignments)
+            saved = wire.parse_record(path.read_text(), service.ServiceState)
+            self.assertEqual(saved.current_assignments, state.current_assignments)
+            self.assertEqual(saved.assignments, state.assignments)
+
+    def test_scaler_availability_uses_the_requested_gate_mode(self) -> None:
+        for mode, flag in ((SuiteMode.TARGETED, "--affected"), (SuiteMode.GATE, "--tests-only")):
+            with self.subTest(mode=mode), PlacementFixture() as fixture:
+                fixture.configure(cloud_gate_slots=1)
+                request = scaler_gate_request(fixture)
+                candidate = request.constraints.candidates[0]
+                peak = request.profile.peak.bytes
+                profile = records.ProgramProfile(mode.value, request.profile.repo, request.profile.worktree,
+                    records.HistoryPeakSizing(peak, records.FirstProgramPeak(peak), fixture.clock.now()))
+                request = replace(request, profile=profile, constraints=replace(request.constraints,
+                    command=("gate.py", flag), candidates=(candidate,)))
+                availability = mock.Mock(return_value=placement.Available())
+                provider = mock.Mock(spec=service.CloudGateProvider, availability=availability)
+                fixture.server.host_probe = fixture.read_host_evidence
+                with (mock.patch.object(service, "scaler_provider", return_value=provider),
+                      mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                    self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+                    worker = fixture.server.host_targets[("scaler", candidate.destination.target)]
+                    assert isinstance(worker, ManualEvidenceWorker)
+                    _ = worker.probe_next()
+                    availability.assert_called_once_with(mode=mode)
+                    self.assertEqual(assignment_for(fixture, request).destination, candidate.destination)
 
     def test_scaler_reconciles_only_pending_expired_bookings_on_the_worker(self) -> None:
         self.check_worker_reconcile(guest=False)
@@ -796,7 +843,7 @@ class PlacementTests(unittest.TestCase):
             consume = consume_permission("launch", assignment, claim)
             self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.FirstAuthorization)
             settle = mock.Mock(return_value=placement.Pending("launch unknown"))
-            provider = mock.Mock(spec=placement.CloudGateProvider, settlement=settle)
+            provider = mock.Mock(spec=service.CloudGateProvider, settlement=settle)
             pending_read, settled_read = threading.Event(), threading.Event()
             attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             run_probe = cast(Callable[[service.HostEvidenceWorker, placement.HostEvidenceKey, object], bool],
@@ -847,7 +894,7 @@ class PlacementTests(unittest.TestCase):
         with PlacementFixture(private_child_starts=True) as fixture:
             request = scaler_gate_request(fixture)
             request = replace(request, constraints=replace(request.constraints, candidates=request.constraints.candidates[:1]))
-            provider = mock.Mock(spec=placement.CloudGateProvider, settlement=mock.Mock(return_value=placement.Settled()))
+            provider = mock.Mock(spec=service.CloudGateProvider, settlement=mock.Mock(return_value=placement.Settled()))
             with (mock.patch.object(service, "scaler_provider", return_value=provider),
                   mock.patch.object(service.HostEvidenceWorker, "dispatch_pending",
                                     autospec=True, side_effect=dispatch_probe_pending)):
@@ -952,7 +999,7 @@ class PlacementTests(unittest.TestCase):
                     guest = replace(guest, eligibility=placement.FixedExclusion("repo"))
                 request = replace(request, constraints=replace(request.constraints, candidates=(cloud, guest, local)))
                 no_quota = placement.TemporaryExclusion("no quota")
-                provider = mock.Mock(spec=placement.CloudGateProvider,
+                provider = mock.Mock(spec=service.CloudGateProvider,
                     availability=mock.Mock(return_value=placement.Unavailable(no_quota.reason)))
                 with mock.patch.object(service, "scaler_provider", return_value=provider):
                     key = fixture.server.host_evidence_key(request, cloud.destination)
@@ -1008,7 +1055,7 @@ class PlacementTests(unittest.TestCase):
             report = wire.ExecutionReport("launch-unknown", assignment, claim, execution_identity.ExecutionNotStarted(),
                 placement.AttemptDeclined("launch unknown"), pending)
             settle = mock.Mock(return_value=placement.Pending(pending.reason))
-            provider = mock.Mock(spec=placement.CloudGateProvider, settlement=settle)
+            provider = mock.Mock(spec=service.CloudGateProvider, settlement=settle)
             with (mock.patch.object(service, "scaler_provider", return_value=provider),
                   mock.patch.object(service.HostEvidenceWorker, "dispatch_pending",
                       autospec=True, side_effect=dispatch_probe_pending)):
@@ -1655,7 +1702,9 @@ class PlacementTests(unittest.TestCase):
         hold_seconds = 600
         deadline_cases = ("deadline with a newer slot", "deadline with no initial claim")
         for ending in (*deadline_cases, "lost local eligibility", "cancelled assignment"):
-            with self.subTest(ending=ending), PlacementFixture() as fixture:
+            with (self.subTest(ending=ending), PlacementFixture(private_child_starts=True) as fixture,
+                  mock.patch.object(records, "process_start_time", side_effect=AssertionError("live start time read"))):
+                _ = fixture.fixture_owner(os.getpid(), "1")
                 fixture.configure(remote_start_hold_seconds=hold_seconds)
                 run = fixture.run_owner()
                 head = replace(placement_request(fixture, since=fixture.clock.now() - 60), run=run)

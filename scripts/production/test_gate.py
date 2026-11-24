@@ -135,11 +135,19 @@ class DirectGatePlacementTests(unittest.TestCase):
                         if blocked:
                             raise admission_wire.AdmissionUnavailable("fixture settlement failure")
 
+                    @contextmanager
+                    def test_folder() -> Generator[None]:
+                        try:
+                            yield
+                        finally:
+                            if blocked:
+                                raise OSError("fixture test folder cleanup failed")
+
                     with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
                           mock.patch.object(first_step, "admitted_run", side_effect=admit),
                           mock.patch.object(admission_client, "request_settlement", side_effect=settle),
                           mock.patch.object(queue_place, "wait_for_placement", return_value=admission_wire.Assignment(replacement)),
-                          mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
+                          mock.patch.object(gate, "test_run_folder", side_effect=test_folder),
                           mock.patch.object(gate, "run_tests_only", side_effect=run),
                           redirect_stderr(io.StringIO()) as errors):
                         expected = GATE_UNSETTLED_LAUNCH_STATUS if blocked else 0
@@ -147,6 +155,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                     self.assertEqual(events, ["admit", "aws", "settle", *([] if blocked else ["natedev"]), "close"])
                     if blocked:
                         self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
+                        if flag == "--affected":
+                            self.assertIn("Gate cleanup failed. fixture test folder cleanup failed", errors.getvalue())
 
     def test_unproven_guest_end_requests_settlement_through_run_gate(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

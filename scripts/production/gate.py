@@ -3730,7 +3730,7 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
             assigned = assigned_target()
             admitted.handoff(source)
             status = run_tests_only(args, mode, assigned)
-            admitted.unsettled = status == GATE_UNSETTLED_LAUNCH_STATUS
+            admitted.preserve_exit_status = first_step.is_gate_placement_exit(status)
             return status
 
         admitted.handoff(source)
@@ -3748,8 +3748,12 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
 
 def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected:
-        with test_run_folder():
-            return run_direct_tests(args, SuiteMode.TARGETED, target)
+        with ExitStack() as cleanup:
+            _ = cleanup.enter_context(test_run_folder())
+            status = run_direct_tests(args, SuiteMode.TARGETED, target)
+            if first_step.is_gate_placement_exit(status):
+                first_step.close_gate_preserving_status(cleanup.close)
+            return status
     if args.tests_only:
         return run_direct_tests(args, SuiteMode.GATE, target)
     try:

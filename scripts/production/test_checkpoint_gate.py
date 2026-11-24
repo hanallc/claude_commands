@@ -23,7 +23,7 @@ from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_placement import PlacementFixture
 from scripts.copies import copies
 from scripts.lib import build_folders, process_stat
-from scripts.lib.build_steps import GATE_UNSETTLED_LAUNCH_STATUS, gate_job_from_process
+from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, gate_job_from_process
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.production import checkpoint_gate
@@ -226,7 +226,13 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         fixture.report_failure.return_value = admission_wire.DispatchStatus(fixture.guest,
             placement.CurrentAssignment(), placement.PermissionConsumed(12.0), retry=placement.RetryAt(13.0))
         run = mock.Mock(side_effect=[fixture.refuse_guest(), subprocess.CompletedProcess(COMMAND, 0, "", "")])
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()) as output:
+            def replace_assignment(request: admission_wire.PlacementRequest) -> None:
+                self.assertIn(f"waiting for Mac Linux to confirm the end of attempt {fixture.guest.attempt}\n",
+                              output.getvalue())
+                fixture.install_local_assignment(request)
+
+            fixture.place_again.side_effect = replace_assignment
             detail = fixture.run_step(run)
         self.assertEqual(detail, fixture.step.label)
         self.assertEqual(run.call_count, 2)
@@ -261,6 +267,50 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertEqual(stopped.exception.state, "blocked")
         self.assertIn("settlement", stopped.exception.detail)
         run.assert_called_once_with(COMMAND, fixture.step.folder)
+
+    def test_queue_loss_during_replacement_preserves_exit_79(self) -> None:
+        fixture = GatePlacementFixture(self)
+        fixture.report_failure.return_value = admission_wire.DispatchStatus(fixture.guest,
+            placement.CurrentAssignment(), placement.PermissionConsumed(12.0), retry=placement.RetryAt(13.0))
+
+        @contextmanager
+        def tool_folder(_tool: str) -> Generator[Path]:
+            try:
+                yield fixture.step.folder
+            finally:
+                raise OSError("fixture folder cleanup failed")
+
+        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()) as errors:
+                code = copies.main(["gate-step", "--repo", str(folder), "--", *command])
+            self.assertEqual(code, GATE_PRELAUNCH_REFUSED_STATUS, errors.getvalue())
+            return subprocess.CompletedProcess(command, code, "", errors.getvalue())
+
+        unavailable = admission_wire.AdmissionUnavailable("fixture socket is gone")
+        with (PlacementFixture(), mock.patch.dict(os.environ),
+              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "_gate_request", return_value=fixture.request),
+              mock.patch.object(admission_records, "process_start_time", return_value="456"),
+              mock.patch.object(build_folders, "tool_folder", side_effect=tool_folder),
+              mock.patch.object(admission_client, "_connect", side_effect=FileNotFoundError("fixture socket is gone")),
+              mock.patch.object(admission_client, "acquire_placement",
+                  side_effect=[admission_wire.Assignment(fixture.guest), unavailable]) as acquire,
+              mock.patch.object(subprocess, "run", return_value=fixture.refuse_guest()) as invoked,
+              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run) as runner,
+              redirect_stdout(io.StringIO())):
+            _ = os.environ.pop("BUILDLOG_PLACEMENT_FILE", None)
+            with self.assertRaises(checkpoint_gate.Stop) as stopped:
+                _ = checkpoint_gate.run_test_steps(fixture.production, [fixture.step], frozenset(), frozenset(), fixture.log)
+        self.assertEqual(stopped.exception.state, "blocked")
+        fixture.report_failure.assert_called_once_with(fixture.refusal)
+        self.assertEqual(acquire.call_args_list, [mock.call(fixture.request)] * 2)
+        invoked.assert_called_once()
+        runner.assert_called_once_with(COMMAND, fixture.step.folder)
+        output = fixture.log.read_text()
+        self.assertIn("Gate cleanup failed. no socket", output)
+        self.assertIn("Gate cleanup failed. fixture folder cleanup failed", output)
+        self.assertIn("merge_test_1_EXIT=79", output)
+        self.assertNotIn("RERUN", output)
 
     def test_queue_loss_after_guest_exit_80_preserves_checkpoint_settlement(self) -> None:
         fixture = GatePlacementFixture(self)
