@@ -44,6 +44,7 @@ except FileNotFoundError:
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -61,7 +62,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
-from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID
+from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_PREFIX, remaining_credit_accounts
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -74,6 +75,9 @@ LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
 TOKEN_ALERT_IDS = token_expiry.ALERT_IDS | {token_expiry.LEGACY_MAC_EXPIRY_ID}
 TOKEN_APPROVAL_REQUIRED = "Token alert template needs current approval"
+PAID_CREDIT_TEXT_IDS = frozenset({"quota.paid_credits", "quota.paid_credits_queued"})
+PAID_CREDIT_ACCOUNT = re.compile(r"codex[1-9][0-9]*")
+PAID_CREDIT_DETAIL_PREFIX = "paid-credit account="
 RETRY_S = 300
 EXPIRE_S = 10800
 TITLE_MAX = 250
@@ -231,6 +235,7 @@ class Arguments(TypedDict):
     title: str
     message: str
     text_id: str
+    paid_credit_account: str
     session: NotificationSession
     header: bool
     due: str
@@ -368,6 +373,7 @@ def parse(argv: list[str]) -> Arguments | None:
         "title": positionals[0],
         "message": positionals[1],
         "text_id": text_id,
+        "paid_credit_account": values.get("account", "") if text_id in PAID_CREDIT_TEXT_IDS else "",
         "header": header,
     }
 
@@ -501,7 +507,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             completion: review.ClaimDelivery = review.ClaimCancelled()
         else:
             completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header,
-                                    key=key, text_id=arguments["text_id"], silence_policy=arguments["silence_policy"]))
+                                    key=key, text_id=arguments["text_id"], silence_policy=arguments["silence_policy"],
+                                    paid_credit_account=arguments["paid_credit_account"]))
         if isinstance(completion, review.ClaimCancelled):
             review.log_review(draft, outcome, detail="claim cancelled before posting", text_id=arguments["text_id"])
             print("pushover: replaced: a newer version replaced this push; nothing was sent")
@@ -509,7 +516,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         code = completion.code if isinstance(completion, review.ClaimFailed) else 0
     else:
         code = deliver(version, keys_file, post, detail=detail, header=header, key=key, text_id=arguments["text_id"],
-                       silence_policy=arguments["silence_policy"])
+                       silence_policy=arguments["silence_policy"], paid_credit_account=arguments["paid_credit_account"])
     delivery = review.Sent(version) if code == 0 else review.NotSent()
     review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
     if code == 0 and send_anyway:
@@ -560,7 +567,8 @@ def via_natedev(arguments: Sequence[str], text: str, asker: AskNatedev, *,
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "", text_id: str = "",
             asker: AskNatedev = ask_natedev,
-            silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE) -> int:
+            silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE,
+            paid_credit_account: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
@@ -571,6 +579,9 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
     priority = decision_priority.priority(need, draft.due)
     message = posted_message(draft.action, draft.body, draft.session, header=header)
+    if text_id in PAID_CREDIT_TEXT_IDS and PAID_CREDIT_ACCOUNT.fullmatch(paid_credit_account):
+        # Save the account even if the title is too short to show it.
+        detail = f"{PAID_CREDIT_DETAIL_PREFIX}{paid_credit_account}\n{detail}"
     push: silence.KeptPush = {"source": source, "priority": priority, "title": title,
                               "message": message, "detail": detail, "key": key, "text_id": text_id,
                               "due": draft.due, "need": need, "reference": draft.reference}
@@ -582,10 +593,19 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     return deliver_here(push, keys_file, post)
 
 
+def paid_credit_details(push: silence.KeptPush) -> tuple[str, str]:
+    """Return the log detail and the saved paid-credit account."""
+    detail = push["detail"]
+    if push["text_id"] in PAID_CREDIT_TEXT_IDS and detail.startswith(PAID_CREDIT_DETAIL_PREFIX):
+        account, _, detail = detail.removeprefix(PAID_CREDIT_DETAIL_PREFIX).partition("\n")
+        return detail, account
+    return detail, ""
+
+
 def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
-    detail = push["detail"]
+    detail, _ = paid_credit_details(push)
     if push["text_id"] == "quota.claude_expiry" or push["text_id"] in TOKEN_ALERT_IDS:
         if silence.active():
             return refuse(source, priority, title, message, "silence is active")
@@ -596,6 +616,29 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
             print(f"pushover: kept: silence {kept.until}")
             return 0
     return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
+
+
+def refresh_paid_credit_action(push: silence.KeptPush, account: str) -> str:
+    """Use the live account list for a paid-credit push released from silence."""
+    message = push["message"]
+    prefix = "Action: " + PAID_CREDIT_ACTION_PREFIX
+    if push["text_id"] not in PAID_CREDIT_TEXT_IDS or not message.startswith(prefix):
+        return message
+    # Earlier kept pushes saved the rendered title and action.
+    account = account or push["title"].partition(" ")[0]
+    try:
+        if not PAID_CREDIT_ACCOUNT.fullmatch(account):
+            raise ValueError("account missing from the kept push")
+        from scripts.whoami.agent_accounts import codex_credit_accounts
+
+        accounts = remaining_credit_accounts(account, codex_credit_accounts())
+    except (OSError, ValueError) as error:
+        log(push["source"], push["priority"], push["title"], message,
+            f"anomaly: kept paid-credit action uses the saved account list: {error}",
+            key=push["key"], template=push["text_id"])
+        return message
+    _, newline, body = message.partition("\n")
+    return f"{prefix}{accounts}{newline}{body}"
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
@@ -624,10 +667,12 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
         return push_reference.KeptPushDropped()
-    detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
+    detail, account = paid_credit_details(push)
+    detail = f"kept during silence, {detail}" if detail else "kept during silence"
+    message = refresh_paid_credit_action(push, account)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
-    return post_message(push["source"], priority, push["title"], push["message"], keys_file, post, detail,
+    return post_message(push["source"], priority, push["title"], message, keys_file, post, detail,
                         push["key"], push["text_id"])
 
 

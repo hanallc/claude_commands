@@ -614,175 +614,179 @@
     "uncovered_empty": {
       "objections": [
         {
-          "quote": "claude4",
+          "quote": "claude4 has 0% left with no move",
           "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Set a move on the Accounts page",
-          "rule": "say-where-to-act"
         },
         {
           "quote": "claude4 has 0% left with no move",
           "rule": "what-happened-why-what-you-do"
         },
         {
-          "quote": "Set a move on the Accounts page",
-          "rule": "first-150-stand-alone"
+          "quote": "/agents move <group> <account>",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: nate typed in the accounts pane on 2026-11-22: approve push texts quota.codex_next_move, quota.codex_workers_stay and quota.claude_next_move; reviewer: claude-opus-5-5",
-      "sha256": "6e831e4c8c459814dc5c4c101b94f77c3867acc112ad0b0c9edfd7da136974e8",
-      "time": "2026-11-22T21:28:57.191610-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:13 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "a79d00c93d90f5a53a37f91f4fb597351ec09110c636bcba9e1da98df0b1835e",
+      "time": "2026-11-24T14:20:13.250560-05:00"
     },
     "uncovered_low": {
       "objections": [
         {
           "quote": "claude3 has 2% left with no move",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "claude3 has 2% left with no move",
           "rule": "what-happened-why-what-you-do"
         },
         {
-          "quote": "Set a move on the Accounts page",
-          "rule": "say-where-to-act"
+          "quote": "/agents move <group> <account>",
+          "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Set a move on the Accounts page",
-          "rule": "before-and-after"
-        },
-        {
-          "quote": "Set a move on the Accounts page",
-          "rule": "first-150-stand-alone"
+          "quote": "<group> <account>",
+          "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: nate typed in the accounts pane on 2026-11-22: approve push texts quota.codex_next_move, quota.codex_workers_stay and quota.claude_next_move; reviewer: claude-opus-5-5",
-      "sha256": "6e831e4c8c459814dc5c4c101b94f77c3867acc112ad0b0c9edfd7da136974e8",
-      "time": "2026-11-22T21:28:49.158224-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:13 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "a79d00c93d90f5a53a37f91f4fb597351ec09110c636bcba9e1da98df0b1835e",
+      "time": "2026-11-24T14:20:05.106741-05:00"
     }
   },
   "quota.codex_credits_forecast": {
     "codex_one": {
       "objections": [
         {
-          "quote": "Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 AST. When credits run out, workers move to codex2 (97% weekly usage left).",
+          "quote": "6,370 credits left; they run out about Fri 13:05.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex1: paid credits until Fri 13:05 AST",
-          "rule": "title-names-the-stake"
+          "quote": "Fri 13:05",
+          "rule": "times-carry-zone"
         },
         {
-          "quote": "Fri 2026-10-16 13:05 AST",
-          "rule": "times-carry-zone"
+          "quote": "codex1",
+          "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:40:05.384571-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:20:22.121474-05:00"
     },
     "codex_two": {
       "objections": [
         {
-          "quote": "When credits run out, workers move to codex1 and spend its own paid credits.",
+          "quote": "2,114 credits left; they run out about Fri 12:51.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex2: paid credits until Fri 12:51 AST",
-          "rule": "title-names-the-stake"
+          "quote": "Fri 12:51",
+          "rule": "times-carry-zone"
         },
         {
-          "quote": "last until about Fri 2026-10-16 12:51 AST",
-          "rule": "times-carry-zone"
+          "quote": "codex2 is running on paid credits",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "2,114 credits left; they run out about Fri 12:51.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:40:15.596550-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:20:29.093981-05:00"
     },
     "queued": {
       "objections": [
         {
-          "quote": "When credits run out, workers wait for the account move you queued.",
-          "rule": "push-only-what-the-user-must-do"
+          "quote": "codex1 is running on paid credits",
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "codex1: paid credits until Fri 13:05 AST",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Fri 2026-10-16 13:05 AST",
+          "quote": "they run out about Fri 13:05",
           "rule": "times-carry-zone"
+        },
+        {
+          "quote": "6,370 credits left; they run out about Fri 13:05.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "6,370 credits left; they run out about Fri 13:05.",
+          "rule": "push-only-what-the-user-must-do"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:41:03.144212-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:21:13.386840-05:00"
     },
     "unknown_balance": {
       "objections": [
         {
-          "quote": "When credits run out, workers move to codex2 (97% weekly usage left).",
-          "rule": "push-only-what-the-user-must-do"
+          "quote": "codex1 is running on paid credits",
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "codex1: paid credits run-out unknown",
-          "rule": "title-names-the-stake"
+          "quote": "No credit balance; the run-out time is unknown.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "No credit balance; the run-out time is unknown.",
+          "rule": "push-only-what-the-user-must-do"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:40:41.369421-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:20:55.642136-05:00"
     },
     "unknown_use": {
       "objections": [
         {
-          "quote": "Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.",
+          "quote": "2,114 credits left; the run-out time is unknown.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex2: paid credits run-out unknown",
-          "rule": "title-names-the-stake"
+          "quote": "codex2 is running on paid credits",
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.",
-          "rule": "short-plain-sentences"
+          "quote": "2,114 credits left; the run-out time is unknown.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:40:52.986779-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:21:04.692122-05:00"
     },
     "unlimited": {
       "objections": [
         {
-          "quote": "Codex account codex1 has unlimited paid credits; its coding workers remain on paid usage with no credit limit.",
-          "rule": "push-only-what-the-user-must-do"
+          "quote": "codex1 is running on paid credits",
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "codex1: paid credits have no limit",
-          "rule": "title-names-the-stake"
+          "quote": "Paid credits have no limit.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Paid credits have no limit.",
+          "rule": "push-only-what-the-user-must-do"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:40:30.684456-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:20:45.212171-05:00"
     },
     "zero_use": {
       "objections": [
         {
-          "quote": "Workers on Codex account codex1 used no credits in the last hour; 6,370 paid credits left.",
+          "quote": "6,370 credits left; none used in the last hour.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex1: paid credits use is zero",
-          "rule": "title-names-the-stake"
+          "quote": "codex1 is running on paid credits",
+          "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
-      "time": "2026-10-25T13:40:22.868084-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2473a6c8560b49e5a627a59ad41b067f5bb9f8ee2d1fdc52ae3bff0b88bebf0a",
+      "time": "2026-11-24T14:20:35.680432-05:00"
     }
   },
   "quota.codex_next_move": {
@@ -856,32 +860,36 @@
     "codex_one": {
       "objections": [
         {
-          "quote": "Credits are off, so new work moves to the other Codex account, codex2, using 97% weekly usage left. Jobs already running finish their current turn first.",
+          "quote": "codex1 is out; Codex work now uses codex2",
           "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "codex1 is out; Codex work now uses codex2",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "codex1 is out; Codex work now uses codex2",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Account labels are canonical; this automatic transition remains a log notice under the authorized policy-only exception.; reviewer: opus",
-      "sha256": "150a18c101f8af3ecca676112b6d5959287eded9f98623c8813339b1634971b3",
-      "time": "2026-10-25T13:37:16.036203-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image ee5270cdbfbd and f2cc6a27f65a), 11:16 PST Nov 24: Title names the exhausted account and the account that now handles work.; reviewer: claude-opus-5-5",
+      "sha256": "1c46760806e1b03393aeb173ce3720f43c4eeb477a93c0f8d4057d65c3d5e39c",
+      "time": "2026-11-24T14:28:47.707479-05:00"
     },
     "codex_two": {
       "objections": [
         {
-          "quote": "Codex account codex2 has exhausted its included weekly usage until Thu 2026-10-22 07:00 AST.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "Credits are off",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Jobs already running finish their current turn first.",
+          "quote": "codex2 is out; Codex now uses codex1 credits",
           "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "codex2 is out",
+          "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25.; reviewer: opus",
-      "sha256": "150a18c101f8af3ecca676112b6d5959287eded9f98623c8813339b1634971b3",
-      "time": "2026-10-25T13:37:33.769043-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image ee5270cdbfbd and f2cc6a27f65a), 11:16 PST Nov 24: Title names the exhausted account and the account that now handles work.; reviewer: claude-opus-5-5",
+      "sha256": "1c46760806e1b03393aeb173ce3720f43c4eeb477a93c0f8d4057d65c3d5e39c",
+      "time": "2026-11-24T14:28:54.125236-05:00"
     }
   },
   "quota.codex_workers_stay": {
@@ -968,77 +976,73 @@
     "from_session": {
       "objections": [
         {
-          "quote": "natedev: codex1 now uses paid credits",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Thu 10-29 07:00 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "codex1 has 6,370 paid credits left.",
+          "quote": "codex1 now spends paid credits: 6,370 left",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "codex1 has 6,370 paid credits left. Its plan refills Thu 10-29 07:00 AST.",
+          "quote": "codex1 now spends paid credits: 6,370 left",
           "rule": "what-happened-why-what-you-do"
         },
         {
-          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "quote": "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts codex2 codex3",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "/tune accounts codex_credit_accounts codex2 codex3",
+          "rule": "before-and-after"
         }
       ],
-      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
-      "sha256": "5a67accfbf836cbf2f7dacb08126c37ec74fca41ebf34ef7765141ec71c926ad",
-      "time": "2026-11-13T16:42:08.391255-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 01d157c6c2b9), 11:20 PST Nov 24: Title shows the balance. The action gives the tune command.; reviewer: claude-opus-5-5",
+      "sha256": "052732a4bddf1a5aac789b1d018125297612a81998e2f0e8c4a1b55b18fbe540",
+      "time": "2026-11-24T14:29:19.878881-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "quota_alert: codex2 now uses paid credits",
-          "rule": "title-names-the-stake"
+          "quote": "codex2 now spends paid credits: 25,345 left",
+          "rule": "what-happened-why-what-you-do"
         },
         {
-          "quote": "Its plan refills Tue 10-27 02:33 AST.",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "codex2 has 25,345 paid credits left.",
+          "quote": "codex2",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "quote": "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none",
+          "rule": "before-and-after"
         }
       ],
-      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
-      "sha256": "5a67accfbf836cbf2f7dacb08126c37ec74fca41ebf34ef7765141ec71c926ad",
-      "time": "2026-11-13T16:41:50.535280-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 01d157c6c2b9), 11:20 PST Nov 24: Title shows the balance. The action gives the tune command.; reviewer: claude-opus-5-5",
+      "sha256": "052732a4bddf1a5aac789b1d018125297612a81998e2f0e8c4a1b55b18fbe540",
+      "time": "2026-11-24T14:29:06.277011-05:00"
     }
   },
   "quota.paid_credits_queued": {
     "typical": {
       "objections": [
         {
-          "quote": "quota_alert: codex2 now uses paid credits",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Tue 10-27 02:33 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "your queued move",
+          "quote": "codex2 uses credits until move",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Leave on (recommended): workers spend these credits until your queued move runs.",
+          "quote": "codex2 uses credits until move: 25,345 left",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "To stop it",
+          "rule": "before-and-after"
         }
       ],
-      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
-      "sha256": "e30d61127cd3bf1485f8c1ac674604c5c0b5f424067f08fa58abb0012e712bc6",
-      "time": "2026-11-13T16:42:20.376803-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 79c3bfd77f6c), 11:20 PST Nov 24: Title shows credits until the move. The action gives the tune command.; reviewer: claude-opus-5-5",
+      "sha256": "969e5fe2a32aa46c8d932d422737daa46c77ae9e378176a2a969136aed185052",
+      "time": "2026-11-24T14:29:29.370939-05:00"
     }
   },
   "quota.token_expiry": {
@@ -1093,50 +1097,210 @@
   },
   "rust.errors": {
     "many_errors": {
-      "reviewer": "opus",
-      "sha256": "ec1bbc7eab360d6ee8a5a03ad563c9ed231fb92f8d88aa809f27e967ff26244c",
-      "time": "2026-10-14T04:25:20.276905-04:00"
+      "objections": [
+        {
+          "quote": "reply wait (recommended) or upgrade.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Rust 1.100.0 fails Hana's check: 14 errors",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "upgrade",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Hana's check",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:59 PST Nov 23; session hana approved with rust.warnings 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "5d03f46f36e98835734161e349fb99f803fc5b083b2f0ee397dd8765fd394948",
+      "time": "2026-11-24T14:21:45.385823-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "ec1bbc7eab360d6ee8a5a03ad563c9ed231fb92f8d88aa809f27e967ff26244c",
-      "time": "2026-10-14T04:25:10.251051-04:00"
+      "objections": [
+        {
+          "quote": "reply wait (recommended) or upgrade",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Rust 1.100.0 fails Hana's check: 1 error",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "upgrade",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "Hana's check",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:59 PST Nov 23; session hana approved with rust.warnings 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "5d03f46f36e98835734161e349fb99f803fc5b083b2f0ee397dd8765fd394948",
+      "time": "2026-11-24T14:21:36.263778-05:00"
     }
   },
   "rust.passed": {
     "long_versions": {
-      "reviewer": "opus",
-      "sha256": "7d83e7c6f7b7b72a86dd80c428b5bb233deec67f4cda45d18106f2655de49977",
-      "time": "2026-10-14T04:24:27.034204-04:00"
+      "objections": [
+        {
+          "quote": "reply upgrade (recommended) or wait.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Hana passes on Rust 100.100.100",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "upgrade (recommended)",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "hana session",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:59 PST Nov 23; session hana approved with rust.warnings 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "dc213925b8a95fe6c66986e190580b5da5f6f4057f3c66302073d3a26b992b57",
+      "time": "2026-11-24T14:22:00.111370-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "7d83e7c6f7b7b72a86dd80c428b5bb233deec67f4cda45d18106f2655de49977",
-      "time": "2026-10-14T04:24:15.097690-04:00"
+      "objections": [
+        {
+          "quote": "reply upgrade (recommended) or wait.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Hana passes on Rust 1.100.0",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Hana",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "reply upgrade (recommended) or wait.",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:59 PST Nov 23; session hana approved with rust.warnings 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "dc213925b8a95fe6c66986e190580b5da5f6f4057f3c66302073d3a26b992b57",
+      "time": "2026-11-24T14:21:52.425941-05:00"
     }
   },
   "rust.repair_failed": {
     "long_versions": {
-      "reviewer": "opus",
-      "sha256": "20c1e55ca75cc062ed3dde5596e4611a060d86435949f7e4842f1a3a91b46cab",
-      "time": "2026-10-14T04:25:44.007958-04:00"
+      "objections": [
+        {
+          "quote": "Rust 100.100.100 breaks build repair",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "reply wait (recommended) or upgrade",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "build repair",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Rust 100.100.100 breaks build repair",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:59 PST Nov 23; session hana approved with rust.warnings 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "238002990d748d4b3f06201004ed93edad094bd36f1d1140eac8138399a4aa79",
+      "time": "2026-11-24T14:22:13.822631-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "20c1e55ca75cc062ed3dde5596e4611a060d86435949f7e4842f1a3a91b46cab",
-      "time": "2026-10-14T04:25:32.967909-04:00"
+      "objections": [
+        {
+          "quote": "Rust 1.100.0 breaks the build repair tool",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "reply wait (recommended) or upgrade",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "the build repair tool",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Rust 1.100.0 breaks the build repair tool",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:59 PST Nov 23; session hana approved with rust.warnings 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "238002990d748d4b3f06201004ed93edad094bd36f1d1140eac8138399a4aa79",
+      "time": "2026-11-24T14:22:07.064901-05:00"
     }
   },
   "rust.warnings": {
     "many_warnings": {
-      "reviewer": "opus",
-      "sha256": "f780c17a61255b97f0f1a01227f04cc80dd0ebb73837ca16f62e75c41166cd9e",
-      "time": "2026-10-14T04:24:51.112373-04:00"
+      "objections": [
+        {
+          "quote": "Rust 1.100.0 adds 14 warnings to Hana",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "reply wait (recommended) or upgrade.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "19d3b912a2e180db3ff0b903e88a8868053cf25c455c3850f7e9d0a5b2b326df",
+      "time": "2026-11-24T14:21:28.491015-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "f780c17a61255b97f0f1a01227f04cc80dd0ebb73837ca16f62e75c41166cd9e",
-      "time": "2026-10-14T04:24:37.910956-04:00"
+      "objections": [
+        {
+          "quote": "Rust 1.100.0 adds 2 warnings to Hana",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "reply wait (recommended) or upgrade.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "In the hana session",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Rust 1.100.0 adds 2 warnings to Hana",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 11:14 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "19d3b912a2e180db3ff0b903e88a8868053cf25c455c3850f7e9d0a5b2b326df",
+      "time": "2026-11-24T14:21:21.235144-05:00"
     }
   },
   "session.needs_go": {
@@ -1321,48 +1485,40 @@
     "edit": {
       "objections": [
         {
-          "quote": "messaging needs your answer",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "messaging asks to edit send.py.",
+          "quote": "It asks to edit send.py.",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "messaging asks to edit send.py.",
-          "rule": "before-and-after"
-        },
-        {
-          "quote": "Yes: it does that and goes on.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "messaging asks to edit send.py. It has waited since 06:05 AST.",
+          "quote": "It asks to edit send.py.",
           "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "messaging is stuck at a permission prompt",
+          "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
-      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
-      "time": "2026-10-23T09:51:09.284207-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image f16104bc1ec5), 11:23 PST Nov 24: Title names the permission prompt. The body shows the request.; reviewer: claude-opus-5-5",
+      "sha256": "38485bbb98667dc04b8f8f7d161eca24a6ddb35a9de0c42b655d805ce087c047",
+      "time": "2026-11-24T14:45:47.959292-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "Yes: it does that and goes on.",
-          "rule": "every-choice-says-what-it-does"
+          "quote": "handler is stuck at a permission prompt",
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "handler needs your answer",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "It has waited since 09:01 AST.",
+          "quote": "It asks to run cargo build -p cargo-handler.",
           "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "answer its prompt",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
-      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
-      "time": "2026-10-23T09:50:57.721466-04:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image f16104bc1ec5), 11:23 PST Nov 24: Title names the permission prompt. The body shows the request.; reviewer: claude-opus-5-5",
+      "sha256": "38485bbb98667dc04b8f8f7d161eca24a6ddb35a9de0c42b655d805ce087c047",
+      "time": "2026-11-24T14:45:36.778728-05:00"
     }
   },
   "sweep.disk_floor": {

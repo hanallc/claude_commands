@@ -453,24 +453,29 @@ class PushTextTests(unittest.TestCase):
         entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
-                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
-                         + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
-                         + "Turn off: work moves to Claude until Sat 10-24 16:40 AST.")
+        self.assertEqual(push.title, "codex2 now spends paid credits: 25,345 left")
+        self.assertEqual(push.action, ActionRequired(
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(push.body, "")
 
     def test_paid_credits_queued_keeps_the_agreed_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits_queued")
         plain = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")
-        self.assertEqual((entry.title, entry.action, entry.need, entry.sender), (plain.title, plain.action, plain.need, plain.sender))
+        self.assertEqual((entry.action, entry.need, entry.sender), (plain.action, plain.need, plain.sender))
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
-                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
-                         + "Leave on (recommended): workers spend these credits until your queued move runs. "
-                         + "If the credits run out first, workers wait.\n\n"
-                         + "Turn off: workers stop and wait for your queued move.")
+        self.assertEqual(push.title, "codex2 uses credits until move: 25,345 left")
+        self.assertEqual(push.action, ActionRequired(
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(push.body, "")
         self.assertNotIn("next_reset", entry.body)
+        for credits, title in (("1,000,000", "codex2 uses credits until move"),
+                               ("unknown", "codex2 uses credits until move"),
+                               ("unlimited", "codex2 uses credits until move: no limit")):
+            with self.subTest(credits=credits):
+                case = push_texts.render_entry(entry, {**entry.examples[0].values, "credits": credits})
+                self.assertEqual(case.title, title)
+                self.assertEqual(case.action, push.action)
+                self.assertEqual(case.body, push.body)
 
     def test_needs_go_keeps_the_user_approved_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "session.needs_go")

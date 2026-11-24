@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
@@ -30,6 +31,7 @@ from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
                          NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
+from scripts.whoami import agent_accounts
 
 REAL_REVIEW = review.review
 PARENT = "python test_pushover.py"
@@ -724,6 +726,39 @@ class PushoverTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
         self.assertEqual(posted, [footed("No action needed.\nThe build passed.", "build-followups", "test.kept")])
+
+        action = "Action: To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts "
+        for text_id, account, read_fails, legacy, expected in (
+                ("quota.paid_credits", "codex2", False, False, "codex3"),
+                ("quota.paid_credits_queued", "codex2", False, True, "codex3"),
+                ("quota.paid_credits_queued", "codex2", True, False, "none"),
+                ("quota.paid_credits_queued", "codex12345678901234567890", False, False, "codex3")):
+            with self.subTest(text_id=text_id, account=account, read_fails=read_fails, legacy=legacy):
+                posted.clear()
+                self.silence_on()
+                argv = ["--text-id", text_id, "--value", "sender=quota_alert", "--value", f"account={account}",
+                        "--value", "machine=natedev", "--value", "credits=25,345", "--value", "refill=Tue 02:33 AST"]
+                if text_id == "quota.paid_credits":
+                    argv.extend(["--value", "next_reset=Sat 16:40 AST"])
+                with (mock.patch.object(agent_accounts, "codex_credit_accounts", return_value=frozenset({account})) as read,
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(self.run_send(argv), (0, {}))
+                    kept = silence.read_kept()
+                    self.assertEqual([push["message"].strip() for push in kept], [action + "none"])
+                    if legacy:
+                        saved = {**kept[0], "detail": "registered text"}
+                        _ = silence.kept_file().write_text(json.dumps(saved) + "\n")
+                    before_release = len(self.log_lines())
+                    read.reset_mock()
+                    read.return_value = frozenset({account, "codex3"})
+                    read.side_effect = conf.Unusable("accounts config unavailable") if read_fails else None
+                    self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
+                    read.assert_called_once_with()
+                self.assertEqual(posted, [footed(action + expected, "quota_alert", text_id)])
+                outcomes = [str(line["outcome"]) for line in self.log_lines()[before_release:]]
+                self.assertTrue(outcomes[-1].startswith("sent, kept during silence"))
+                warning = "anomaly: kept paid-credit action uses the saved account list: accounts config unavailable"
+                self.assertEqual(outcomes[:-1], [warning] if read_fails else [])
 
     def test_an_empty_sender_is_refused_and_nothing_is_posted(self) -> None:
         for source in ("", "  ", "send.py in "):
