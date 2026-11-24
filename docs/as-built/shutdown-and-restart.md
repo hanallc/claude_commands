@@ -209,14 +209,10 @@ A user command takes a row that another operation holds:
 
 1. The command moves the free rows at once, and keeps no lock on a held row.
 2. A row is held when another process holds its row lock, or when it is in the restart record while a restart is active.
-3. At its first try on a held row, the command writes its own request without the row lock.
-   The request records the pid and process start of the command.
-4. A move that holds the row reads the request before its stop and drops the row as `not moved: a newer move ran`.
-5. If that move is already past its check, it finishes first.
-6. The command tries the held rows again after each poll and moves each row when it is free.
-7. If its claim is missing or has another request ID, a newer move ran.
-   The command then stops its wait for that row as `not moved: a newer move ran`.
-   This is the placeholder (x) default: a newer move by hand wins over an older one.
+3. The command joins the row's queue at its first try. The queue records its PID and process start.
+4. The first hand move in the queue can claim a held row. A later hand move waits for it.
+5. An automatic move checks its claim before the stop. If a hand move replaced it, the automatic move skips the row.
+6. The command tries the held rows after each poll and moves a row when it becomes free.
 
 A user claim is live while the process that wrote it lives, or while that process cannot be read.
 A command that cannot read its own process start after two reads records no start.
@@ -226,20 +222,41 @@ It drops that row as `not moved: a newer move ran` at once and does not wait.
 The claim of a killed command does not stop an automatic move.
 Each check and write of a request file holds the `latest-requests.lock` file beside the request folder.
 Plain reads, such as the ownership check of the detached child and the list of pending moves, do not take the lock.
-So an automatic move cannot write over a live user claim, and only a newer move removes or replaces it.
-`accounts.py move <session> <account>` on a session already on that account removes the claim, so an older waiting command stops its wait.
+The `latest-requests.lock` file also protects changes to the hand move queue.
+An automatic move cannot replace a live hand move claim or pass a live hand move in the queue.
 
 The restart record check keeps the move out of the gap between the stop and the start of a restart.
 The restart record is the shared list of rows to restart, and it can keep rows that an earlier stop saved.
 While any restart is active, a user command waits for each row in the record, and an automatic move reports it as busy.
-A limit stops the wait for a holder that is hung.
-The limit counts from the start of the command, so the move of the free rows uses part of it.
-The detached child counts the limit from the start of its parent, from the `--waited-seconds` handoff value.
-The limit is the sum of `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, `MOVE_STOP_MARGIN_SECONDS`, `UPKEEP_ROW_WAIT_SECONDS`, `RESTART_RECORD_LOCK_SECONDS`, `HOLDER_EXIT_SECONDS`, `OWN_PANE_SHELL_SECONDS`, `START_SECONDS`, `OPENING_PROMPT_SECONDS` and `STAY_SECONDS`.
-At the limit, the command tries the held rows one last time.
-For each row that is still held, it removes its request and gives the batch command with `--user-command`.
-The result names the holder pid and command when the row lock names them.
-Otherwise it gives the reason of the last try, for example `a restart holds this row`.
+A hand move starts its `move.stuck_seconds` timer when it first records a held row. The default is 60 seconds.
+A detached hand move requires the parent's monotonic deadline from `--move-deadline`.
+If the parent finds no held row, it sets the deadline at handoff.
+A detached automatic move takes no deadline.
+The child takes every claim before it confirms readiness. The parent cleans up untaken claims if the handoff fails.
+On the Mac, the child waits for the parent to acknowledge readiness before it starts a move.
+If a hand move includes a held row and the caller, the parent transfers the batch before it reads source accounts.
+The child starts the watch when it records a held row and keeps the parent's deadline.
+A separate deadline check can prove and signal holders while the move prepares or starts a free row.
+The watch drops a row as soon as the move takes it.
+Before each signal, the watch checks that the move still waits for the row.
+The row lock record and the restart holder record include the PID, command, and process start.
+The move can signal a restart only if it has a valid holder record and still holds the selected row.
+Between stop and start, the restart holds a separate lock for each row it stopped. It releases that lock when it takes or refuses the row for start.
+A holder record error reports one anomaly. The restart continues.
+On Linux, the move checks the lock file's device and inode, write access, and the `flock` entry in `/proc`.
+Linux sends each signal through a pidfd.
+On the Mac, the move checks the descriptor with `lsof`. It needs a matching live record when `lsof` gives no lock state.
+On the Mac, a short gap remains between the process start check and the signal.
+The move excludes its own process and descendants. Readers and processes that only wait for the lock do not qualify.
+The move sends `SIGTERM` to all proved holders before one wait of `KILL_GRACE_SECONDS`.
+After the wait, the move sends `SIGKILL` only to a process that still holds a proved lock.
+If it sends no `SIGKILL`, the move checks the same process for exit again.
+Each confirmed holder exit lets the move retry that row for up to `UPKEEP_ROW_WAIT_SECONDS`.
+The move retries recovered rows one at a time. The holder check can continue while a recovered row starts.
+Once the move confirms the target account, it removes the recovered restart entry under the row lock it holds.
+This includes a row that was already on the target account.
+If removal fails, the move reports the row and the restart record path.
+If the move cannot end a proved holder or take the row, it reports the holder when known and gives a retry command.
 A retry keeps the pending request and gives the retry command.
 When the command ends, it ends each of its claims, also after an interrupt in the first pass:
 

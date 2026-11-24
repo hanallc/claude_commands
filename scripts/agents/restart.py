@@ -1726,13 +1726,14 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             why: str = DEFAULT_RESTART_CAUSE) -> int:
     activity = (nullcontext() if dry_run else shutdown_record.active_operation(
         record_lock_seconds=shutdown_record.record_lock_seconds()))
-    with activity, ExitStack() as pane_evidence:
+    with activity as operation, ExitStack() as pane_evidence:
         _ = pane_evidence.enter_context(herdr.pane_evidence_run())
-        return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
+        return _restart(pane_evidence, operation, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
                         after_stop=after_stop, why=why)
 
 
-def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
+def _restart(pane_evidence: ExitStack, operation: shutdown_record.RestartActivity | None, *,
+             stop_all: bool, dry_run: bool, only: tuple[str, ...],
              account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
     report = _BULK_REPORT.get()
     command = BulkCommand("stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
@@ -2032,6 +2033,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                 if identity not in report.issues and identity in failures:
                                     report.failure(identity, row.name, failures[identity])
                 stopped = stop_row(holder, client, codex=observed.codex)
+                if stopped and operation is not None and after_stop is AfterStop.RESTART:
+                    operation.claim_rows([member for member in saved_by_holder[holder.id]
+                                          if staff.StaffId(member) not in changed and staff.StaffId(member) not in workers])
                 if not stopped and holder.kind != "worker":
                     if previous_hold is not None:
                         _ = staff.set_hold(str(holder.id), previous_hold)
@@ -2175,13 +2179,18 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition | None:
-        if stop_requested():
-            return None
         with ExitStack() as locks, use_checked_resume_policies(resume_policies), staff.upkeep_lock_wait(lock_wait):
+            members = members_by_holder[holder.id]
+            if operation is not None:
+                _ = locks.callback(operation.release_rows, members)
+            if stop_requested():
+                return None
             _ = locks.enter_context(staff.row_operation(str(holder.id)))
-            for member in members_by_holder[holder.id]:
+            for member in members:
                 if member != str(holder.id):
                     _ = locks.enter_context(staff.row_operation(member))
+            if operation is not None:
+                operation.release_rows(members)
             if stop_requested():
                 return None
             shutdown_record.update(started=[], pending=saved_by_holder[holder.id])

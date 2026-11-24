@@ -11,8 +11,10 @@ import fcntl
 import json
 import math
 import os
+import select
 import shlex
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -38,7 +40,7 @@ from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
 from scripts.agents import member_account, producer_transfer, restart, shutdown_record, stop_resume, stop_results
-from scripts.lib import agent_program, atomic_file, conf, operation_deadline, process_start, unit_runs
+from scripts.lib import agent_program, atomic_file, conf, lock_holder, operation_deadline, process_start, process_stop, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
 from scripts.agents.stop_results import ClaudeStartState, StopResult, shutdown_state_root
@@ -4036,7 +4038,9 @@ class StopResumeTests(unittest.TestCase):
         self.add_beta()
 
         def confirm_start(argv: list[str], **_options: object) -> None:
-            _ = os.write(int(argv[argv.index("--ready-fd") + 1]), b"1")
+            descriptor = os.dup(int(argv[argv.index("--ready-fd") + 1]))
+            self.addCleanup(os.close, descriptor)
+            _ = os.write(descriptor, b"1")
 
         for platform in ("linux", "darwin"):
             with (self.subTest(platform=platform),
@@ -6515,6 +6519,12 @@ class StopResumeTests(unittest.TestCase):
         busy, available = rows
         up = stop_resume.ClaudeUp(available.current_session, "fixture-pane", "claude4")
         log = self.root / "move.log"
+        number = conf.ConfigRead.number
+        clock = [120.0]
+
+        def short_move_limit(settings: conf.ConfigRead, key: str) -> float:
+            return 1.0 if key == "move.stuck_seconds" else number(settings, key)
+
         with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": available.current_session}),
               patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
@@ -6522,17 +6532,20 @@ class StopResumeTests(unittest.TestCase):
               patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(available.current_session)) as stop,
               patch.object(stop_resume, "_resume_move", return_value=up),
               patch.object(stop_resume, "_load_batch_modules"),
-              patch.object(stop_resume, "_hung_holder_seconds", return_value=1.0)):
+              patch.object(stop_resume, "monotonic", side_effect=lambda: clock[0]),
+              patch.object(conf.ConfigRead, "number", new=short_move_limit)):
             with staff.slot_operation(busy.id, busy.name):
                 results = stop_resume.move_sessions([busy.id, available.id], "claude4", why="move", user_command=True)
                 self.assertTrue(all(isinstance(result, stop_resume.MoveHandedOff) for result in results), results)
                 self.detach.assert_called_once()
                 argv = cast(list[str], self.detach.call_args.args[0])
                 self.assertIn("--user-command", argv)
-                self.assertIn("--waited-seconds", argv)
+                self.assertEqual(argv[argv.index("--move-deadline") + 1], "121.0")
                 self.assertIsInstance(cast(object, self.detach.call_args.kwargs["log_fd"]), int)
                 self.assertEqual(set(argv[argv.index("--") + 1:]), {busy.current_session, available.current_session})
-                self.assertEqual(stop_resume.main(["batch", "--log", str(log), *argv[1:]]), 1)
+                clock[0] = 122.0
+                with patch.object(time, "sleep", side_effect=AssertionError("the handoff extended the deadline")):
+                    self.assertEqual(stop_resume.main(["batch", "--log", str(log), *argv[1:]]), 1)
         stop.assert_called_once_with(available.id)
         text = log.read_text()
         self.assertIn(moves.batch_move_command(busy.current_session, "claude4", user_command=True), text)
@@ -6621,6 +6634,8 @@ class StopResumeTests(unittest.TestCase):
 
 
 REAL_PREPARE_MOVE = stop_resume._prepare_move  # pyright: ignore[reportPrivateUsage]
+REAL_MOVE_NOW = stop_resume._move_now  # pyright: ignore[reportPrivateUsage]
+REAL_HUNG_ROW_HOLDER = stop_resume._hung_row_holder  # pyright: ignore[reportPrivateUsage]
 
 
 @final
@@ -6671,6 +6686,523 @@ class MoveNowTests(unittest.TestCase):
         self.addCleanup(holder.close)
         _ = holder.enter_context(staff.session_operation(session, native_key=moves.native_row_key(session)))
         return holder
+
+    @contextmanager
+    def hung_operation(self, command: str, *, row: str = "alpha",
+                       ignore_term: bool = False) -> Generator[subprocess.Popen[str]]:
+        code = """
+import signal
+import sys
+from contextlib import ExitStack
+from scripts.accounts import moves
+from scripts.agents import shutdown_record
+from scripts.production import staff
+
+if sys.argv[-1] == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+row = sys.argv[2]
+operation = (shutdown_record.active_operation() if sys.argv[1].startswith("restart")
+             else open(sys.argv[-1], sys.argv[1]) if sys.argv[1] in ("rb", "a+b")
+             else staff.slot_operation(moves.native_row_key(row), row))
+with operation as activity, ExitStack() as locks:
+    if isinstance(activity, shutdown_record.RestartActivity):
+        if sys.argv[1] == "restart-slot":
+            locks.enter_context(staff.slot_operation(row, row))
+        else:
+            activity.claim_rows([row])
+            if sys.argv[1] == "restart-released":
+                activity.release_rows([row])
+    print("ready", flush=True)
+    signal.pause()
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        env = dict(os.environ)
+        env.update(SHUTDOWN_STATE_DIR=str(self.root / "shutdown"), VERIFY_PROC_ROOT="/proc")
+        slot = self.root / "rows" / f"{moves.native_row_key('alpha')}.lock"
+        argument = str(slot) if command in ("rb", "a+b") else "ignore" if ignore_term else ""
+        with subprocess.Popen([sys.executable, "-c", code, command, row, argument],
+                              cwd=checkout, env=env, stdout=subprocess.PIPE, text=True) as child:
+            try:
+                assert child.stdout is not None
+                ready, _, _ = select.select([child.stdout], [], [], 5)
+                self.assertTrue(ready, "the fixture command did not start")
+                self.assertEqual(child.stdout.readline(), "ready\n")
+                def fixture_process(pid: int) -> bool:
+                    return pid == child.pid
+
+                with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": env["SHUTDOWN_STATE_DIR"]}):
+                    # The fixture owns the child. A real move runs in a separate process.
+                    with patch.object(lock_holder, "_outside_move", new=fixture_process):
+                        yield child
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                _ = child.wait(timeout=5)
+
+    def move_at_the_limit(self, reference: str = "alpha", *, source_account: str = "") -> stop_resume.MoveResult:
+        result, = self.moves_at_the_limit(reference, source_account=source_account)
+        return result
+
+    def moves_at_the_limit(self, *references: str, source_account: str = "",
+                           grace_seconds: float = 0.2) -> list[stop_resume.MoveResult]:
+        clock = [0.0]
+        number = conf.ConfigRead.number
+        text = conf.ConfigRead.text
+
+        def value(settings: conf.ConfigRead, key: str) -> float:
+            return 0.01 if key == "move.stuck_seconds" else number(settings, key)
+
+        def text_value(settings: conf.ConfigRead, key: str, *, recover_invalid: bool = True) -> str:
+            return f"{grace_seconds:g}" if key == "KILL_GRACE_SECONDS" else text(settings, key, recover_invalid=recover_invalid)
+
+        def advance(seconds: float) -> None:
+            clock[0] += seconds
+
+        with (patch.object(conf.ConfigRead, "number", new=value),
+              patch.object(conf.ConfigRead, "text", new=text_value),
+              patch.object(stop_resume, "monotonic", side_effect=lambda: clock[0]),
+              patch.object(time, "sleep", side_effect=advance)):
+            return stop_resume.move_sessions(list(references), "claude3", why="by hand", user_command=True,
+                                             source_accounts=dict.fromkeys(references, source_account))
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_ends_a_proved_slot_holder_and_moves_the_row(self) -> None:
+        with self.hung_operation("resume") as child, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.move_at_the_limit(), self.up("alpha"))
+            self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+        self.assertEqual(self.moved, [["alpha"]])
+        self.assertEqual(output.getvalue(), f"alpha: ended a hung resume (pid {child.pid}) after 0.01 s "
+                         + "and moved it to claude3\n")
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_uses_the_kernel_lock_when_the_holder_record_is_stale(self) -> None:
+        with (self.hung_operation("resume") as child, self.hung_operation("a+b") as waiter,
+              self.hung_operation("rb") as reader):
+            slot = self.root / "rows" / f"{moves.native_row_key('alpha')}.lock"
+            _ = slot.write_text(json.dumps({"pid": 2147483647, "start": "gone", "command": "restart"}))
+
+            def fixture_process(pid: int) -> bool:
+                return pid in (child.pid, waiter.pid, reader.pid)
+
+            with patch.object(lock_holder, "_outside_move", new=fixture_process):
+                self.assertEqual(self.move_at_the_limit(), self.up("alpha"))
+            self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+            self.assertIsNone(waiter.poll())
+            self.assertIsNone(reader.poll())
+        self.assertEqual(self.moved, [["alpha"]])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_leaves_a_holder_with_a_wrong_record_start(self) -> None:
+        with self.hung_operation("resume") as child:
+            path = self.root / "rows" / f"{moves.native_row_key('alpha')}.lock"
+            _ = path.write_text(json.dumps({"pid": child.pid, "start": "wrong start", "command": "resume alpha"}))
+            with patch.object(signal, "pidfd_send_signal", side_effect=AssertionError("unexpected signal")):
+                result = self.move_at_the_limit()
+            self.assertIsNone(child.poll())
+        assert isinstance(result, moves.MoveWaitingForRow)
+        self.assertIn(f"pid {child.pid}: resume alpha", result.reason)
+        self.assertEqual(result.command, moves.batch_move_command("alpha", "claude3", user_command=True))
+        self.assertEqual(self.moved, [])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_reports_a_holder_that_stays_live_after_kill(self) -> None:
+        sent: list[int] = []
+
+        def signal_fixture(_descriptor: int, number: int) -> None:
+            sent.append(number)
+
+        with (self.hung_operation("start", ignore_term=True) as child,
+              patch.object(signal, "pidfd_send_signal", new=signal_fixture)):
+            result = self.move_at_the_limit()
+            self.assertIsNone(child.poll())
+        assert isinstance(result, moves.MoveWaitingForRow)
+        self.assertIn(f"pid {child.pid}:", result.reason)
+        self.assertEqual(result.command, moves.batch_move_command("alpha", "claude3", user_command=True))
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(self.moved, [])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_ends_a_restart_and_forgets_only_its_row(self) -> None:
+        row = self.restart_row()
+        up = self.up(row.current_session)
+        forget_moved = shutdown_record.forget_moved
+
+        def confirm(*_args: object) -> stop_resume.ClaudeUp:
+            self.assertEqual(shutdown_record.read(), [row.id, "another-row"])
+            return up
+
+        def record_outcome(*_args: object) -> None:
+            self.assertEqual(shutdown_record.read(), ["another-row"])
+
+        def forget_under_lock(row_id: str) -> None:
+            path = self.root / "rows" / f"{row.id}.lock"
+            with path.open("rb") as lock, self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            forget_moved(row_id)
+
+        for already_on_target in (False, True):
+            source = (stop_resume.LiveMoveSource(up, 123, "fixture") if already_on_target
+                      else stop_resume.StoppedMoveSource())
+            with (self.subTest(already_on_target=already_on_target), self.hung_operation("restart") as child,
+                  redirect_stdout(io.StringIO()) as output,
+                  patch.object(stop_resume, "_move_now", new=REAL_MOVE_NOW),
+                  patch.object(accounts, "check_move_target", return_value=accounts.MoveTargetReady(
+                      accounts.NamedAccount("claude3", self.root / ".claude3"))),
+                  patch.object(stop_resume, "_read_move_source", return_value=source),
+                  patch.object(member_account, "repair_home", side_effect=confirm) as repair,
+                  patch.object(stop_resume, "_record_launches"),
+                  patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(row.current_session)) as stop,
+                  patch.object(stop_resume, "_resume_move", side_effect=confirm) as resume,
+                  patch.object(shutdown_record, "forget_moved", side_effect=forget_under_lock) as forget,
+                  patch.object(stop_resume, "_record_move_outcome", new=record_outcome)):
+                shutdown_record.save([row.id, "another-row"])
+                self.assertEqual(self.move_at_the_limit(row.id), up)
+                self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+                self.assertEqual(shutdown_record.read(), ["another-row"])
+            forget.assert_called_once_with(row.id)
+            if already_on_target:
+                repair.assert_called_once()
+                resume.assert_not_called()
+                stop.assert_not_called()
+            else:
+                resume.assert_called_once()
+            self.assertEqual(output.getvalue(), f"{row.name}: ended a hung restart (pid {child.pid}) after 0.01 s "
+                             + "and moved it to claude3. Restart left 1 rows. Run ~/.claude/scripts/lib/py "
+                             + "~/.claude/scripts/agents/shutdown.py restart to finish them\n")
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_preserves_a_restart_of_a_different_row(self) -> None:
+        row = self.restart_row()
+        with (self.hung_operation("restart", row="beta") as child,
+              patch.object(signal, "pidfd_send_signal") as send):
+            shutdown_record.save([row.id, "beta"])
+            result = self.move_at_the_limit(row.id)
+            self.assertIsNone(child.poll())
+            self.assertEqual(shutdown_record.read(), [row.id, "beta"])
+        send.assert_not_called()
+        self.assertIsInstance(result, moves.MoveWaitingForRow)
+        self.assertEqual(self.moved, [])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_needs_a_current_restart_claim_or_a_recorded_slot_holder(self) -> None:
+        row = self.restart_row()
+        for operation in ("restart-released", "restart-slot"):
+            with (self.subTest(operation=operation), self.hung_operation(operation) as child,
+                  patch.object(signal, "pidfd_send_signal") as send):
+                shutdown_record.save([row.id])
+                if operation == "restart-slot":
+                    (shutdown_record.record_path().with_suffix(".holders") / str(child.pid)).unlink()
+                self.assertIsInstance(self.move_at_the_limit(row.id), moves.MoveWaitingForRow)
+                self.assertIsNone(child.poll())
+                send.assert_not_called()
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_keeps_the_restart_row_when_the_target_refuses(self) -> None:
+        row = self.restart_row()
+        with (self.hung_operation("restart") as child,
+              patch.object(stop_resume, "_move_now", new=REAL_MOVE_NOW),
+              patch.object(accounts, "check_move_target", return_value=accounts.MoveRefused("fixture refused"))):
+            shutdown_record.save([row.id, "another-row"])
+            result = self.move_at_the_limit(row.id)
+            self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+            self.assertEqual(shutdown_record.read(), [row.id, "another-row"])
+        assert isinstance(result, stop_resume.StopFailed)
+        self.assertIn("fixture refused", result.reason)
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_reports_pending_cleanup_after_restart_recovery(self) -> None:
+        row = self.restart_row()
+        up = self.up(row.current_session)
+        with (self.hung_operation("restart") as child, redirect_stdout(io.StringIO()) as output,
+              redirect_stderr(io.StringIO()) as errors,
+              patch.object(stop_resume, "_move_now", new=REAL_MOVE_NOW),
+              patch.object(accounts, "check_move_target", return_value=accounts.MoveTargetReady(
+                  accounts.NamedAccount("claude3", self.root / ".claude3"))),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(row.current_session)),
+              patch.object(stop_resume, "_resume_move", return_value=up),
+              patch.object(shutdown_record, "forget_moved", side_effect=shutdown_record.RecordBusy("fixture busy"))):
+            shutdown_record.save([row.id, "another-row"])
+            self.assertEqual(self.move_at_the_limit(row.id, source_account="claude1"), up)
+            self.assertEqual(child.wait(timeout=5), -signal.SIGTERM)
+            self.assertEqual(shutdown_record.read(), [row.id, "another-row"])
+            self.assertEqual(errors.getvalue(), f"{row.name}: could not remove the row from "
+                             + f"{shutdown_record.record_path()}: fixture busy\n")
+        self.assertEqual(output.getvalue(), f"{row.name}: ended a hung restart (pid {child.pid}) after 0.01 s "
+                         + "and moved it to claude3\n")
+
+    def test_an_ordinary_move_leaves_the_restart_record_alone(self) -> None:
+        row = self.restart_row()
+        up = self.up(row.current_session)
+        with (patch.object(stop_resume, "_move_now", new=REAL_MOVE_NOW),
+              patch.object(accounts, "check_move_target", return_value=accounts.MoveTargetReady(
+                  accounts.NamedAccount("claude3", self.root / ".claude3"))),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(row.current_session)),
+              patch.object(stop_resume, "_resume_move", return_value=up),
+              patch.object(shutdown_record, "forget_moved") as forget):
+            for user_command in (False, True):
+                with self.subTest(user_command=user_command):
+                    shutdown_record.save([row.id])
+                    self.assertEqual(stop_resume.move_sessions([row.id], "claude3", why="fixture",
+                                                               user_command=user_command), [up])
+                    self.assertEqual(shutdown_record.read(), [row.id])
+            forget.assert_not_called()
+
+    def test_holder_record_errors_do_not_change_the_restart_result(self) -> None:
+        real_unlink = Path.unlink
+
+        def unlink_holder(path: Path, *, missing_ok: bool = False) -> None:
+            if path.parent.name == "restart.holders" and path.name == str(os.getpid()):
+                raise OSError("fixture cleanup")
+            real_unlink(path, missing_ok=missing_ok)
+
+        for publishing in (True, False):
+            with (self.subTest(publishing=publishing), redirect_stderr(io.StringIO()) as output,
+                  patch.object(restart, "_restart", return_value=17) as action):
+                error = "fixture write" if publishing else "fixture cleanup"
+                failure = (patch.object(shutdown_record, "write_text_atomic", side_effect=OSError(error))
+                           if publishing else patch.object(Path, "unlink", new=unlink_holder))
+                with failure:
+                    self.assertEqual(restart.restart(), 17)
+                action.assert_called_once()
+                self.assertEqual(output.getvalue(), f"restart: holder record anomaly: {error}\n")
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_hand_move_ends_both_holders_before_a_slow_first_start(self) -> None:
+        with self.hung_operation("resume") as first, self.hung_operation("resume", row="beta") as second:
+            sent: list[int] = []
+            real_send = signal.pidfd_send_signal
+
+            def outside_move(pid: int) -> bool:
+                return pid in (first.pid, second.pid)
+
+            def send(descriptor: int, sig: int) -> None:
+                sent.append(sig)
+                real_send(descriptor, sig)
+
+            def start(selected: list[str], target: str, **_options: object) -> list[stop_resume.MoveResult]:
+                if not self.moved:
+                    self.assertEqual(sent, [signal.SIGTERM, signal.SIGTERM])
+                    child = first if selected == ["alpha"] else second
+                    self.assertEqual(child.poll(), -signal.SIGTERM)
+                    time.sleep(2)
+                self.moved.append(selected)
+                return [self.up(name, target) for name in selected]
+
+            with (patch.object(lock_holder, "_outside_move", new=outside_move),
+                  patch.object(signal, "pidfd_send_signal", new=send),
+                  patch.object(stop_resume, "_move_now", side_effect=start)):
+                self.assertEqual(self.moves_at_the_limit("alpha", "beta"), [self.up("alpha"), self.up("beta")])
+            self.assertEqual(first.wait(timeout=5), -signal.SIGTERM)
+            self.assertEqual(second.wait(timeout=5), -signal.SIGTERM)
+        self.assertCountEqual(self.moved, [["alpha"], ["beta"]])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_deadline_sends_both_terms_during_a_free_rows_start(self) -> None:
+        from threading import Event
+
+        number = conf.ConfigRead.number
+        text = conf.ConfigRead.text
+        sent: list[int] = []
+        escalated = Event()
+        starting = Event()
+        real_send = signal.pidfd_send_signal
+
+        def seconds(settings: conf.ConfigRead, key: str) -> float:
+            return 0.5 if key == "move.stuck_seconds" else number(settings, key)
+
+        def grace(settings: conf.ConfigRead, key: str, *, recover_invalid: bool = True) -> str:
+            return "0.2" if key == "KILL_GRACE_SECONDS" else text(settings, key, recover_invalid=recover_invalid)
+
+        def send(descriptor: int, sig: int) -> None:
+            self.assertTrue(starting.is_set())
+            sent.append(sig)
+            real_send(descriptor, sig)
+            if sig == signal.SIGKILL:
+                escalated.set()
+
+        def prepare(row: stop_resume.LockedMoveRow, target: str, record: staff.StaffSnapshot, *,
+                    check_presence: bool) -> object:
+            if row.session == "free" and slow_step == "prepare":
+                starting.set()
+                self.assertTrue(escalated.wait(5))
+            return REAL_PREPARE_MOVE(row, target, record, check_presence=check_presence)
+
+        def start(selected: list[str], target: str, **_options: object) -> list[stop_resume.MoveResult]:
+            if selected == ["free"] and slow_step == "start":
+                starting.set()
+                self.assertTrue(escalated.wait(5))
+            self.moved.append(selected)
+            return [self.up(name, target) for name in selected]
+
+        for slow_step in ("prepare", "start"):
+            sent.clear()
+            escalated.clear()
+            starting.clear()
+            self.moved.clear()
+            with (self.subTest(slow_step=slow_step), self.hung_operation("resume", ignore_term=True) as first,
+                  self.hung_operation("resume", row="beta") as second):
+                def outside_move(pid: int) -> bool:
+                    return pid in (first.pid, second.pid)
+
+                with (patch.object(lock_holder, "_outside_move", new=outside_move),
+                      patch.object(conf.ConfigRead, "number", new=seconds),
+                      patch.object(conf.ConfigRead, "text", new=grace),
+                      patch.object(signal, "pidfd_send_signal", new=send),
+                      patch.object(stop_resume, "_prepare_move", side_effect=prepare),
+                      patch.object(stop_resume, "_move_now", side_effect=start)):
+                    names = ["alpha", "beta", "free"]
+                    self.assertEqual(stop_resume.move_sessions(names, "claude3", why="fixture", user_command=True),
+                                     [self.up(name) for name in names])
+                self.assertEqual(first.wait(timeout=5), -signal.SIGKILL)
+                self.assertEqual(second.wait(timeout=5), -signal.SIGTERM)
+                self.assertEqual(sent, [signal.SIGTERM, signal.SIGTERM, signal.SIGKILL])
+                self.assertEqual(self.moved[0], ["free"])
+                self.assertCountEqual(self.moved[1:], [["alpha"], ["beta"]])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_row_retries_while_another_holder_still_runs(self) -> None:
+        with self.hung_operation("resume", row="beta", ignore_term=True) as second, self.hung_operation("resume") as first:
+            def outside_move(pid: int) -> bool:
+                return pid in (first.pid, second.pid)
+
+            def start(selected: list[str], target: str, **_options: object) -> list[stop_resume.MoveResult]:
+                if selected == ["alpha"]:
+                    self.assertEqual(first.poll(), -signal.SIGTERM)
+                    self.assertIsNone(second.poll())
+                    second.send_signal(signal.SIGKILL)
+                self.moved.append(selected)
+                return [self.up(name, target) for name in selected]
+
+            with (patch.object(lock_holder, "_outside_move", new=outside_move),
+                  patch.object(stop_resume, "_move_now", side_effect=start)):
+                self.assertEqual(self.moves_at_the_limit("beta", "alpha", grace_seconds=5),
+                                 [self.up("beta"), self.up("alpha")])
+            self.assertEqual(second.wait(timeout=5), -signal.SIGKILL)
+        self.assertEqual(self.moved, [["alpha"], ["beta"]])
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_the_watch_leaves_a_row_the_move_already_took(self) -> None:
+        from threading import Event
+
+        alpha = self.hold_row()
+        beta = self.hold_row("beta")
+        checking = Event()
+        replaced = Event()
+        checked = Event()
+        number = conf.ConfigRead.number
+        end_all = lock_holder.end_all
+        children: list[subprocess.Popen[str]] = []
+        proofs: list[lock_holder.ProvedLockHolder] = []
+
+        def seconds(settings: conf.ConfigRead, key: str) -> float:
+            return 0.1 if key == "move.stuck_seconds" else number(settings, key)
+
+        def prove(row: stop_resume.RowHeld) -> lock_holder.ProvedLockHolder | None:
+            if row.session == "alpha":
+                checking.set()
+                self.assertTrue(replaced.wait(5))
+            proof = REAL_HUNG_ROW_HOLDER(row)
+            if proof is not None:
+                proofs.append(proof)
+            return proof
+
+        def retry(_deadline: float) -> bool:
+            self.assertTrue(checking.wait(5))
+            alpha.close()
+            beta.close()
+            return True
+
+        def end(holders: Mapping[lock_holder.ProvedLockHolder, Callable[[], lock_holder.ProvedLockHolder | None]],
+                seconds: float, *, publish: lock_holder.HolderOutcome,
+                send_if_waiting: lock_holder.SignalGuard | None = None) -> None:
+            try:
+                end_all(holders, seconds, publish=publish, send_if_waiting=send_if_waiting)
+            finally:
+                checked.set()
+
+        with ExitStack() as replacement:
+            def prepare(row: stop_resume.LockedMoveRow, target: str, record: staff.StaffSnapshot, *,
+                        check_presence: bool) -> object:
+                if row.session == "alpha":
+                    return self.up("alpha")
+                children.append(replacement.enter_context(self.hung_operation("resume")))
+                replaced.set()
+                self.assertTrue(checked.wait(5))
+                return REAL_PREPARE_MOVE(row, target, record, check_presence=check_presence)
+
+            with (patch.object(conf.ConfigRead, "number", new=seconds),
+                  patch.object(stop_resume, "_await_row_operation", new=retry),
+                  patch.object(stop_resume, "_hung_row_holder", new=prove),
+                  patch.object(lock_holder, "end_all", new=end),
+                  patch.object(stop_resume, "_prepare_move", new=prepare)):
+                self.assertEqual(stop_resume.move_sessions(["alpha", "beta"], "claude3", why="fixture", user_command=True),
+                                 [self.up("alpha"), self.up("beta")])
+            child, = children
+            self.assertEqual([proof.record.pid for proof in proofs], [child.pid])
+            self.assertIsNone(child.poll())
+        self.assertEqual(self.moved, [["beta"]])
+
+    def test_mac_rechecks_the_lock_and_process_start_before_kill(self) -> None:
+        path = self.root / "slot.lock"
+        path.touch()
+        target = path.stat()
+        record = lock_holder.HolderRecord(12345, "resume", "fixture-start")
+        proof = lock_holder.ProvedLockHolder(record, path, "WRITE", target.st_dev, target.st_ino)
+        for lock_held, same_start, still_waiting in ((False, True, True), (False, False, True), (True, False, True),
+                                                    (True, True, True), (True, True, False)):
+            with self.subTest(lock_held=lock_held, same_start=same_start, still_waiting=still_waiting):
+                calls: list[str] = []
+                outcomes: list[tuple[lock_holder.ProvedLockHolder, lock_holder.HolderEnd]] = []
+
+                def publish(checked: lock_holder.ProvedLockHolder, outcome: lock_holder.HolderEnd) -> None:
+                    outcomes.append((checked, outcome))
+
+                def recheck() -> lock_holder.ProvedLockHolder | None:
+                    second = bool(calls)
+                    calls.append("lock")
+                    return proof if not second or lock_held else None
+
+                def read_start(pid: int) -> process_start.Started:
+                    self.assertEqual(pid, record.pid)
+                    second = "start" in calls
+                    calls.append("start")
+                    return process_start.Started("new-start" if second and not same_start else record.start)
+
+                def send(pid: int, sig: int) -> None:
+                    self.assertEqual(pid, record.pid)
+                    calls.append(signal.Signals(sig).name)
+
+                def send_if_waiting(_proof: lock_holder.ProvedLockHolder, send_signal: Callable[[], None]) -> bool:
+                    if "SIGTERM" in calls and not still_waiting:
+                        return False
+                    send_signal()
+                    return True
+
+                def observe(pending: list[lock_holder.SignalGroup],
+                            report: lock_holder.HolderOutcome,
+                            _seconds: float) -> None:
+                    if "SIGKILL" in calls:
+                        report(proof, lock_holder.HolderEnd.ENDED)
+                        pending.clear()
+
+                with (patch.object(sys, "platform", "darwin"),
+                      patch.object(process_start, "process_start", new=read_start),
+                      patch.object(lock_holder, "_wait_for_exits", new=observe),
+                      patch.object(os, "kill", new=send)):
+                    lock_holder.end_all({proof: recheck}, 0.2, publish=publish, send_if_waiting=send_if_waiting)
+                expected = ["lock", "start", "SIGTERM", "lock"]
+                if lock_held:
+                    expected.append("start")
+                if lock_held and same_start and still_waiting:
+                    expected.append("SIGKILL")
+                else:
+                    expected.append("start")
+                self.assertEqual(calls, expected)
+                ended = not same_start or (lock_held and still_waiting)
+                self.assertEqual(outcomes, [(proof, lock_holder.HolderEnd.ENDED if ended
+                                             else lock_holder.HolderEnd.RELEASED)])
 
     def test_an_automatic_move_with_a_live_step_moves_at_once(self) -> None:
         from scripts.build_queue import admission_client
@@ -6819,7 +7351,7 @@ finally:
                 self.assertEqual(self.moved, [["alpha"]])
 
     def automatic_move_at_a_poll(self, *, past_limit: bool = False,
-                                 child: stop_resume.DetachedMoveRequest | None = None) -> list[stop_resume.MoveResult]:
+                                 child: stop_resume.DetachedHandMoveRequest | None = None) -> list[stop_resume.MoveResult]:
         """The holder ends, and an automatic move tries the row before the next try of the waiting hand move."""
         holder = self.hold_row()
         clock = [0.0]
@@ -6827,7 +7359,7 @@ finally:
 
         def poll(_seconds: float) -> None:
             if past_limit:
-                clock[0] = stop_resume._hung_holder_seconds(conf.read("shutdown")) + 1  # pyright: ignore[reportPrivateUsage]
+                clock[0] = conf.read("shutdown").number("move.stuck_seconds") + 1
             if not automatic:
                 holder.close()
                 automatic.append(stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto"))
@@ -6848,7 +7380,7 @@ finally:
         self.assertEqual(self.automatic_move_at_a_poll(past_limit=True), [self.up("alpha", "claude4")])
 
     def test_the_child_of_a_self_move_by_hand_keeps_its_row_from_an_automatic_move(self) -> None:
-        request = stop_resume.DetachedMoveRequest("d" * 32, frozenset())
+        request = stop_resume.DetachedHandMoveRequest("d" * 32, frozenset(), conf.read("shutdown").number("move.stuck_seconds"))
         # The parent wrote the claim before the handoff and then ended; the child takes the claim at its first try.
         parent = moves.ClaimOwner(os.getpid(), "the parent process ended")
         moves.write_latest_request("alpha", moves.LatestMoveRequest(request.request_id, "claude4", owner=parent))
@@ -6859,8 +7391,8 @@ finally:
         moves.write_latest_request("alpha", moves.LatestMoveRequest("d" * 32, "claude3", owner=parent), name="alpha")
         confirmed: list[moves.LatestMoveRequest | moves.NoLatestMoveRequest] = []
 
-        def confirm(ready_fd: int | None, *, systemd: bool) -> None:
-            self.assertEqual((ready_fd, systemd), (7, True))
+        def confirm(ready_fd: int | None, *, systemd: bool, acknowledge: bool) -> None:
+            self.assertEqual((ready_fd, systemd, acknowledge), (7, True, True))
             confirmed.append(moves.read_latest_request("alpha"))
 
         with patch.object(stop_resume, "notify_ready", side_effect=confirm), \
@@ -6868,12 +7400,134 @@ finally:
                 patch.object(stop_resume, "move_sessions", return_value=[self.up("alpha")]) as batch:
             self.assertEqual(stop_resume.main(["batch", "--log", str(self.root / "move.log"), "--ready-fd", "7",
                                                "--notify-systemd", "--user-command", "--request-id", "d" * 32,
-                                               "--target", "claude3", "--", "alpha"]), 0)
+                                               "--move-deadline", "100", "--target", "claude3", "--", "alpha"]), 0)
         claim, = confirmed
         assert isinstance(claim, moves.LatestMoveRequest)
         self.assertEqual(claim.owner, moves.own_claim_owner())
         self.assertTrue(moves.claim_is_live(claim))
         batch.assert_called_once()
+
+    def test_the_child_does_not_confirm_a_batch_when_one_claim_cannot_transfer(self) -> None:
+        request_id = "d" * 32
+        for failure in (False, OSError("fixture write failed")):
+            with (self.subTest(failure=failure), redirect_stderr(io.StringIO()) as errors,
+                  patch.object(moves, "set_claim_owner", side_effect=[True, failure]) as transfer,
+                  patch.object(stop_resume, "notify_ready") as confirm,
+                  patch.object(stop_resume, "move_sessions") as move):
+                self.assertEqual(stop_resume.main(["batch", "--notify-systemd", "--user-command",
+                                                   "--request-id", request_id, "--move-deadline", "100", "--target", "claude3",
+                                                   "--", "alpha", "beta"]), 1)
+                self.assertIn("beta: cannot take the move request:", errors.getvalue())
+            self.assertEqual(transfer.call_args_list, [call(name, request_id, moves.own_claim_owner())
+                                                       for name in ("alpha", "beta")])
+            confirm.assert_not_called()
+            move.assert_not_called()
+
+    def test_failed_handoff_removes_the_partially_transferred_held_claim(self) -> None:
+        _ = self.hold_row()
+        transfer_owner = moves.ClaimOwner(os.getpid(), "fixture child")
+        take = moves.set_claim_owner
+        requests: list[str] = []
+
+        def transfer(identity: str, request_id: str, owner: moves.ClaimOwner | None) -> bool:
+            if identity == "beta" and owner == transfer_owner:
+                claim = moves.read_latest_request("alpha")
+                assert isinstance(claim, moves.LatestMoveRequest)
+                self.assertEqual(claim.owner, transfer_owner)
+                return False
+            return take(identity, request_id, owner)
+
+        def launch(argv: list[str], *_args: object, **_options: object) -> None:
+            boundary = argv.index("--")
+            requests.append(argv[argv.index("--request-id") + 1])
+            with (patch.object(stop_resume, "_own_claim_owner", return_value=transfer_owner),
+                  patch.object(moves, "set_claim_owner", new=transfer),
+                  redirect_stderr(io.StringIO())):
+                self.assertEqual(stop_resume.main([*argv[:boundary + 1], "alpha", "beta"]), 1)
+            raise OSError("fixture handoff failed")
+
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "beta"}),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_detach", side_effect=launch)):
+            results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="fixture", user_command=True)
+        self.assertEqual(results, [stop_resume.StopFailed(name, "fixture handoff failed") for name in ("alpha", "beta")])
+        request_id, = requests
+        self.assertIsInstance(moves.read_latest_request("alpha"), moves.NoLatestMoveRequest)
+        self.assertEqual(moves.read_latest_request("beta"), moves.LatestMoveRequest(request_id, "claude3"))
+        for name in ("alpha", "beta"):
+            self.assertFalse(moves.hand_move_is_queued(name, request_id))
+        self.assertEqual(self.moved, [])
+
+    def test_the_child_starts_no_move_when_the_parent_cannot_acknowledge(self) -> None:
+        for close_parent in (True, False):
+            parent, child = socket.socketpair()
+            with (self.subTest(close_parent=close_parent), parent, child,
+                  patch.object(stop_resume, "move_sessions") as move, redirect_stderr(io.StringIO()) as output):
+                if close_parent:
+                    parent.close()
+                else:
+                    parent.shutdown(socket.SHUT_WR)
+                self.assertEqual(stop_resume.main(["batch", "--ready-fd", str(child.detach()),
+                                                   "--target", "claude3", "--", "alpha"]), 1)
+                move.assert_not_called()
+                self.assertIn("could not confirm readiness", output.getvalue())
+
+    @unittest.skipUnless(process_stop.supported(), "requires Linux pidfds")
+    def test_a_handed_off_held_row_is_recovered_and_reported_by_the_child(self) -> None:
+        from threading import Event
+
+        clock = [0.0]
+        limit = conf.read("shutdown").number("move.stuck_seconds")
+        real_send = signal.pidfd_send_signal
+        for caller in ("alpha", "free"):
+            clock[0] = 0.0
+            self.moved.clear()
+            log = self.root / f"move-{caller}.log"
+            names = ["alpha"] if caller == "alpha" else ["alpha", caller]
+            signaled = Event()
+            with (self.subTest(caller=caller), self.hung_operation("resume") as holder,
+                  patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": caller}),
+                  patch.object(stop_resume, "monotonic", side_effect=lambda: clock[0]),
+                  patch.object(stop_resume, "_record_launches"),
+                  patch.object(stop_resume, "_detach") as detach,
+                  patch.object(stop_resume, "_load_batch_modules")):
+                with patch.object(stop_resume, "_prepare_move", side_effect=AssertionError("parent source lookup")):
+                    self.assertEqual(stop_resume.move_sessions(names, "claude3", why="fixture", user_command=True),
+                                     [stop_resume.MoveHandedOff(name) for name in names])
+                self.assertIsNone(holder.poll())
+                self.assertEqual(self.moved, [])
+                argv = cast(list[str], detach.call_args.args[0])
+
+                def send(descriptor: int, sig: int) -> None:
+                    real_send(descriptor, sig)
+                    signaled.set()
+
+                def prepare(row: stop_resume.LockedMoveRow, target: str, record: staff.StaffSnapshot, *,
+                            check_presence: bool) -> object:
+                    if row.session == "free":
+                        self.assertTrue(signaled.wait(10), "the child did not signal during source lookup")
+                        return self.up("free")
+                    return REAL_PREPARE_MOVE(row, target, record, check_presence=check_presence)
+
+                clock[0] = limit + 1
+                with (patch.object(stop_resume, "_prepare_move", new=prepare),
+                      patch.object(signal, "pidfd_send_signal", new=send)):
+                    result = stop_resume.main(["batch", "--log", str(log), *argv[1:]])
+                self.assertEqual(result, 0, log.read_text())
+                self.assertEqual(holder.wait(timeout=5), -signal.SIGTERM)
+                self.assertIn(f"alpha: ended a hung resume (pid {holder.pid}) after {limit:g} s "
+                              + "and moved it to claude3\n", log.read_text())
+                self.assertEqual(self.moved, [["alpha"]])
+
+    def test_detached_hand_and_automatic_moves_take_different_deadline_arguments(self) -> None:
+        common = ["batch", "--request-id", "d" * 32, "--target", "claude3"]
+        for options in (["--user-command"], ["--move-deadline", "100"],
+                        ["--user-command", "--move-deadline", "nan"]):
+            with (self.subTest(options=options), patch.object(stop_resume, "move_sessions") as move,
+                  redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failed):
+                _ = stop_resume.main([*common, *options, "--", "alpha"])
+            self.assertEqual(failed.exception.code, 2)
+            move.assert_not_called()
 
     def test_a_claim_with_no_start_is_live_while_its_pid_exists(self) -> None:
         with patch.object(process_start, "process_start", return_value=process_start.Unreadable("fixture")) as read:
@@ -6887,15 +7541,15 @@ finally:
                                                                      owner=moves.ClaimOwner(ended.pid, ""))))
 
     def test_the_child_counts_the_limit_from_the_start_of_its_parent(self) -> None:
-        limit = stop_resume._hung_holder_seconds(conf.read("shutdown"))  # pyright: ignore[reportPrivateUsage]
-        request = stop_resume.DetachedMoveRequest("d" * 32, frozenset(), waited_seconds=limit)
+        limit = conf.read("shutdown").number("move.stuck_seconds")
+        request = stop_resume.DetachedHandMoveRequest("d" * 32, frozenset(), deadline=limit)
         moves.write_latest_request("alpha", moves.LatestMoveRequest(request.request_id, "claude3",
                                                                     owner=moves.own_claim_owner()))
         _ = self.hold_row()
-        with patch.object(stop_resume, "monotonic", return_value=0.0), patch.object(time, "sleep") as sleep:
+        with patch.object(stop_resume, "monotonic", return_value=limit + 1), patch.object(time, "sleep") as sleep:
             waiting, = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True, request=request)
-        # The parent used the whole limit, so the child makes one last try after one poll.
-        sleep.assert_called_once()
+        # The parent used the whole limit, so the child makes its last try at once.
+        sleep.assert_not_called()
         assert isinstance(waiting, moves.MoveWaitingForRow)
         self.assertEqual(waiting.command, moves.batch_move_command("alpha", "claude3", user_command=True))
         self.assertEqual(self.moved, [])
@@ -6929,21 +7583,37 @@ finally:
         _ = self.enterContext(patch.object(stop_resume, "_move_now", side_effect=move_now))
         return hooks
 
-    def test_a_newer_move_by_hand_that_ends_during_a_long_pass_of_an_older_one_wins(self) -> None:
-        hooks = self.moves_remove_their_requests()
+    def test_hand_moves_take_the_row_in_arrival_order(self) -> None:
+        from threading import Event, Thread, current_thread, main_thread
+
+        _ = self.moves_remove_their_requests()
         holder = self.hold_row()
+        newer_is_waiting = Event()
+        older_finished = Event()
         newer: list[list[stop_resume.MoveResult]] = []
+        worker = Thread(target=lambda: newer.append(
+            stop_resume.move_sessions(["alpha"], "claude4", why="second", user_command=True)), daemon=True)
 
-        def during_beta() -> None:
-            holder.close()
-            newer.append(stop_resume.move_sessions(["alpha"], "claude4", why="by hand 2", user_command=True))
+        def poll(_seconds: float) -> None:
+            if current_thread() is main_thread():
+                before = moves.read_latest_request("alpha")
+                worker.start()
+                self.assertTrue(newer_is_waiting.wait(5))
+                self.assertEqual(moves.read_latest_request("alpha"), before)
+                holder.close()
+            else:
+                newer_is_waiting.set()
+                self.assertTrue(older_finished.wait(5))
 
-        hooks.append(during_beta)
-        older = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="by hand 1", user_command=True)
-        # Placeholder (x) default: the newer move by hand wins over the older one.
+        with patch.object(time, "sleep", side_effect=poll):
+            try:
+                older = stop_resume.move_sessions(["alpha"], "claude3", why="first", user_command=True)
+            finally:
+                older_finished.set()
+                worker.join(5)
+        self.assertEqual(older, [self.up("alpha", "claude3")])
         self.assertEqual(newer, [[self.up("alpha", "claude4")]])
-        self.assertEqual(older, [moves.MoveSuperseded("alpha"), self.up("beta")])
-        self.assertEqual(self.moved, [["beta", "claude3"], ["alpha", "claude4"]])
+        self.assertEqual(self.moved, [["alpha", "claude3"], ["alpha", "claude4"]])
 
     def test_the_claim_stays_live_through_a_long_pass(self) -> None:
         hooks = self.moves_remove_their_requests()
@@ -6953,7 +7623,7 @@ finally:
 
         def during_beta() -> None:
             # The move of beta ends after the limit; the holder of alpha ends during it.
-            clock[0] = stop_resume._hung_holder_seconds(conf.read("shutdown")) + 5  # pyright: ignore[reportPrivateUsage]
+            clock[0] = conf.read("shutdown").number("move.stuck_seconds") + 5
             holder.close()
             automatic.append(stop_resume.move_sessions(["alpha"], "claude5", why="auto: head", cause="auto"))
 
@@ -7033,21 +7703,6 @@ finally:
         self.assertEqual(results, [self.up(row.id)])
         self.assertEqual(self.moved, [[row.id]])
 
-    def test_a_waiting_move_by_hand_ends_when_a_newer_move_by_hand_replaces_its_claim(self) -> None:
-        """The placeholder (x) default: a newer move by hand wins over an older one."""
-        _ = self.hold_row()
-        newer = moves.LatestMoveRequest("e" * 32, "claude4", owner=moves.own_claim_owner())
-
-        def newer_move(_seconds: float) -> None:
-            moves.write_latest_request("alpha", newer)
-
-        with patch.object(time, "sleep", side_effect=newer_move) as sleep:
-            results = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
-        self.assertEqual(results, [moves.MoveSuperseded("alpha")])
-        sleep.assert_called_once()
-        self.assertEqual(moves.read_latest_request("alpha"), newer)
-        self.assertEqual(self.moved, [])
-
     def test_an_interrupted_move_by_hand_removes_its_claim(self) -> None:
         _ = self.hold_row()
 
@@ -7104,7 +7759,9 @@ finally:
         self.assertEqual(self.moved, [["alpha"]])
 
     def test_a_move_by_hand_names_a_hung_holder_after_its_limit(self) -> None:
-        _ = self.hold_row()
+        arguments = ["fixture", "resume", "x" * 6000]
+        with patch.object(sys, "argv", arguments):
+            _ = self.hold_row()
         clock = [0.0]
 
         def advance(seconds: float) -> None:
@@ -7114,9 +7771,9 @@ finally:
                 patch.object(time, "sleep", side_effect=advance):
             waiting, = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
         assert isinstance(waiting, moves.MoveWaitingForRow)
-        self.assertEqual(waiting.reason, f"another operation holds this row (pid {os.getpid()}: {shlex.join(sys.argv)})")
+        self.assertEqual(waiting.reason, f"another operation holds this row (pid {os.getpid()}: {shlex.join(arguments)})")
         self.assertEqual(waiting.command, moves.batch_move_command("alpha", "claude3", user_command=True))
-        self.assertGreaterEqual(clock[0], stop_resume._hung_holder_seconds(conf.read("shutdown")))  # pyright: ignore[reportPrivateUsage]
+        self.assertGreaterEqual(clock[0], conf.read("shutdown").number("move.stuck_seconds"))
         self.assertFalse(moves.latest_request_path("alpha").exists())
         self.assertEqual(self.moved, [])
         # The command at the limit runs as a user command.

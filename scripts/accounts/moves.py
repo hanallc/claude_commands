@@ -257,9 +257,75 @@ def claim_is_live(request: LatestMoveRequest) -> bool:
     """A user claim is live while its process lives or cannot be read; a claim with no start, while its pid exists."""
     if request.owner is None:
         return False
-    state = process_start.process_start(request.owner.pid)
+    return _claim_owner_is_live(request.owner)
+
+
+def _claim_owner_is_live(owner: ClaimOwner) -> bool:
+    state = process_start.process_start(owner.pid)
     return (isinstance(state, process_start.Unreadable)
-            or isinstance(state, process_start.Started) and request.owner.start in ("", state.start))
+            or isinstance(state, process_start.Started) and owner.start in ("", state.start))
+
+
+def _hand_queue_path(identity: str) -> Path:
+    path = latest_request_path(identity)
+    return path.parent.with_name("hand-move-queues") / path.name
+
+
+def _hand_queue(identity: str) -> dict[str, ClaimOwner]:
+    try:
+        raw = cast(object, json.loads(_hand_queue_path(identity).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid hand move queue")
+    queued: dict[str, ClaimOwner] = {}
+    for request, owner in cast(dict[str, object], raw).items():
+        match owner:
+            case [int(pid), str(start)] if type(pid) is int and pid > 1:
+                queued[request] = ClaimOwner(pid, start)
+            case _:
+                raise ValueError("invalid hand move queue owner")
+    return queued
+
+
+def _save_hand_queue(identity: str, queued: dict[str, ClaimOwner]) -> None:
+    path = _hand_queue_path(identity)
+    if queued:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(path, json.dumps({request: (owner.pid, owner.start) for request, owner in queued.items()}),
+                          new_file_mode=0o600)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def queue_hand_move(identity: str, request_id: str, owner: ClaimOwner) -> None:
+    """Register a hand move in arrival order under the claim lock."""
+    with claim_lock():
+        queued = _hand_queue(identity)
+        if request_id not in queued:
+            queued[request_id] = owner
+            _save_hand_queue(identity, queued)
+
+
+def hand_move_ahead(identity: str, request_id: str) -> ClaimOwner | None:
+    """Read the oldest live hand move before this request. The caller holds the claim lock."""
+    for queued_id, owner in _hand_queue(identity).items():
+        if queued_id == request_id:
+            break
+        if _claim_owner_is_live(owner):
+            return owner
+    return None
+
+
+def hand_move_is_queued(identity: str, request_id: str) -> bool:
+    return request_id in _hand_queue(identity)
+
+
+def end_hand_move(identity: str, request_id: str) -> None:
+    with claim_lock():
+        queued = _hand_queue(identity)
+        if queued.pop(request_id, None) is not None:
+            _save_hand_queue(identity, {key: owner for key, owner in queued.items() if _claim_owner_is_live(owner)})
 
 
 def write_latest_request(native_session: str, request: LatestMoveRequest, *, name: str = "") -> None:
@@ -267,9 +333,9 @@ def write_latest_request(native_session: str, request: LatestMoveRequest, *, nam
 
     A move writes its request while it holds the session locks.
     One exception: a user command writes its claim without the row lock while another operation holds the row.
-    The holder reads the request again before its stop and drops the row when the claim replaced its own.
+    An automatic holder reads the request again before its stop and drops the row if a hand move took its claim.
     An automatic move never takes a row while a live user claim is current.
-    A user command stops its wait for a row when its claim is missing or replaced, because a newer move ran.
+    Concurrent hand moves use the queue to preserve the order of their claims.
     """
     path = latest_request_path(native_session)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,8 +422,12 @@ def set_claim_owner(native_session: str, request_id: str, owner: ClaimOwner | No
     """
     with claim_lock():
         saved = _read_move_request(latest_request_path(native_session))
+        queued = _hand_queue(native_session)
+        if owner is not None and request_id in queued and queued[request_id] != owner:
+            queued[request_id] = owner
+            _save_hand_queue(native_session, queued)
         if not isinstance(saved, PendingMoveRequest) or saved.request.request_id != request_id:
-            return False
+            return owner is not None and request_id in queued
         if saved.request.owner != owner:
             write_latest_request(native_session, replace(saved.request, owner=owner), name=saved.member.name)
         return True
