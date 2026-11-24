@@ -326,6 +326,10 @@ async function sendSaved() {
     return json({id:'I2', key:'saved'});
    };
    const checkbox = dialog.querySelector('[name="include_page"]');
+   function requestsSince(start) {
+    return ownerPosts.slice(start).map(post => post.page_capture ? 'capture' :
+     post.discard_capture ? 'discard' : post.request_id ? 'send' : 'unknown').sort().join(',');
+   }
    function whenShown(element) {
     if (!element.hidden) return Promise.resolve();
     return new Promise(resolve => {
@@ -369,27 +373,35 @@ async function sendSaved() {
    check(shot.href !== image && captures.length === 2 &&
          captures[0].capture_key.slice(0, 35) !== captures[1].capture_key.slice(0, 35),
          'Changing the kind starts a capture for the new draft ID.');
+   const beforeCapturedSend = ownerPosts.length;
    await sendOwner();
-   const capturedSend = ownerPosts.findLast(post => post.request_id);
-   check(capturedSend.capture_key === captureKey && capturedSend.images.length === 0 &&
+   const capturedSend = ownerPosts.at(-1);
+   check(beforeCapturedSend === 3 && requestsSince(beforeCapturedSend) === 'capture,discard,send' &&
+         ownerPosts[beforeCapturedSend + 1].discard_capture === captureKey &&
+         capturedSend.capture_key === captureKey && capturedSend.images.length === 0 &&
          capturedSend.evidence.kind === 'none',
-         'Send includes the new capture without the fallback rows.');
+         'Send includes the new capture without the fallback rows.' + ' Requests: ' + requestsSince(beforeCapturedSend));
 
+   const beforeSkipped = ownerPosts.length;
    await openOwner();
    checkbox.click();
    const skippedCapture = new Promise(resolve => { discarded = resolve; });
    await sendOwner();
    await skippedCapture;
    const skipped = ownerPosts.findLast(post => post.request_id);
-   check(!skipped.capture_key && skipped.evidence.kind === 'none' && ownerPosts.at(-1).discard_capture === captureKey,
-         'Send with the box unchecked discards the capture.');
+   check(requestsSince(beforeSkipped) === 'capture,capture,discard,discard,send' &&
+         !skipped.capture_key && skipped.evidence.kind === 'none' && ownerPosts.at(-1).discard_capture === captureKey,
+         'Send with the box unchecked discards the capture.' + ' Requests: ' + requestsSince(beforeSkipped));
 
+   const beforeCancel = ownerPosts.length;
    await openOwner();
+   await whenShown(shot);
    const canceled = new Promise(resolve => { discarded = resolve; });
    dialog.querySelector('[data-cancel]').click();
    await canceled;
-   check(ownerPosts.at(-1).discard_capture === captureKey && !dialog.open,
-         'Closing the dialog discards the capture.');
+   check(requestsSince(beforeCancel) === 'capture,capture,discard,discard' &&
+         ownerPosts.at(-1).discard_capture === captureKey && !dialog.open,
+         'Closing the dialog discards the capture.' + ' Requests: ' + requestsSince(beforeCancel));
 
    pngAvailable = false;
    const emoji = 'x'.repeat(239) + '😀';
@@ -398,12 +410,13 @@ async function sendSaved() {
    const paragraph = document.createElement('p');
    paragraph.textContent = emoji + 'overflow';
    main.append(paragraph);
+   const beforeFallback = ownerPosts.length;
    await openOwner();
    await sendOwner();
-   const fallbackSend = ownerPosts.findLast(post => post.request_id);
+   const fallbackSend = ownerPosts.at(-1);
    const fallback = fallbackSend.evidence;
-   check(!fallbackSend.capture_key && fallback.kind === 'page-data' &&
-         fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.');
+   check(requestsSince(beforeFallback) === 'capture,capture,capture,send' && !fallbackSend.capture_key && fallback.kind === 'page-data' &&
+         fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.' + ' Requests: ' + requestsSince(beforeFallback));
    const running = fallback.sections?.find(section => section.label === 'Running');
    check(running?.columns[0] === 'Step' && running.columns[1] === 'Stage' &&
          running.rows.some(row => row[0] === 'hana nextest' && row[1] === 'testing'),
@@ -877,6 +890,12 @@ RESTORED_SEND_PROBE = r"""
     const later = dialog.querySelector('[data-later-draft]');
     later.click();
     check(!words.readOnly && send.disabled, 'The separate draft cannot send before Retry.');
+    if (scenario === 'open') {
+     const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
+     scheduled.click();
+     check(scheduled.checked && send.disabled, 'The separate draft can select Scheduled before Retry.');
+     selectedKind.click();
+    }
     enter('Keep my later edit.');
     recipient('builds-staff').click();
     if (scenario === 'reopen') {
@@ -1224,7 +1243,8 @@ const words = dialog.querySelector('textarea'), error = dialog.querySelector('.n
 const send = dialog.querySelector('[type="submit"]'), shot = dialog.querySelector('[data-shot]');
 const type = dialog.querySelector('[name="kind"][value="investigation"]');
 const include = dialog.querySelector('[name="include_page"]');
-const reloadAfterSend = __RELOAD_AFTER_SEND__;
+const reloadAfterSend = __RELOAD_AFTER_SEND__, shippedPointer = __SHIPPED_POINTER__;
+const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
 const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
 const probeKey = 'test-list-first-send', draftKey = 'console.list.pending-send';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
@@ -1276,25 +1296,57 @@ function enterWords(value) {
   if (!restored) {
    type.click();
    enterWords('Keep the first List Send.');
+   if (shippedPointer) {
+    const clipboard = new DataTransfer();
+    clipboard.items.add(new File([Uint8Array.from(atob('__PNG__'), char => char.charCodeAt(0))], 'pasted.png',
+                                 {type:'image/png'}));
+    const event = new ClipboardEvent('paste', {cancelable:true});
+    Object.defineProperty(event, 'clipboardData', {value: clipboard});
+    words.dispatchEvent(event);
+   }
    const evidence = reloadAfterSend ? dialog.querySelector('[data-fallback]') : shot;
    await waitFor(() => !send.disabled && !evidence.hidden);
+  } else if (shippedPointer) {
+   await waitFor(() => !!dialog.querySelector('[name="recipient_id"]'));
+   check(scheduled.disabled && !words.readOnly, 'A shipped draft permits native recovery only.');
+   scheduled.click();
+   check(send.form.elements.kind.value === 'bug', 'Scheduled cannot replace the shipped draft.');
+   type.click();
+   check(scheduled.disabled && type.checked, 'The restored draft permits changing the native kind.');
+   if (shippedPointer === 'id') dialog.querySelector('[name="recipient_id"][value="' + restored.recipient_id + '"]').click();
+   enterWords(restored.words);
   } else {
    await waitFor(() => !send.disabled);
    check(words.value === restored.words && words.readOnly && type.matches(':disabled') && send.textContent === 'Retry',
          'Reload locks the submitted List draft and displays Retry.');
   }
+  if (send.disabled) throw new Error('Send is disabled.');
   send.click();
   await waitFor(sendFinished);
   if (restored) {
    check(editable() && !words.readOnly, 'A saved item response unlocks the draft.');
-   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
-         'Reload keeps the draft ID and sends the original payload.');
+   if (shippedPointer) {
+    check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].kind === restored.kind &&
+          posts[0].recipient_id === restored.recipient_id && posts[0].words === restored.words && !posts[0].images.length,
+          'Native recovery uses the shipped ID, kind, recipient, and words.');
+    check(!scheduled.disabled, 'Scheduled is available after native recovery.');
+   } else {
+    check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
+          'Reload keeps the draft ID and sends the original payload.');
+   }
    check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
          'The retry shows the first saved item ID.');
    check(!sessionStorage.getItem(draftKey), 'An already filed response clears the draft ID.');
   } else if (reloadAfterSend && !failures.length) {
    check(words.readOnly && send.textContent === 'Retry', 'The lost reply locks Retry before reload.');
    sessionStorage.setItem(probeKey, JSON.stringify(posts[0]));
+   if (shippedPointer) {
+    check(posts[0].images.length === 1, 'The first Send includes the pasted image.');
+    sessionStorage.removeItem('console.new-item.submitted');
+    const {request_id, recipient_id} = posts[0];
+    sessionStorage.setItem(draftKey, shippedPointer === 'id' ? request_id :
+                           JSON.stringify({id: request_id, recipient: recipient_id}));
+   }
    location.reload();
    return;
   } else if (!reloadAfterSend && !failures.length) {
@@ -1680,9 +1732,11 @@ class NewItemDialogTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_send_after_reload_returns_the_item_from_the_lost_reply(self) -> None:
-        self.check_list_retry(reload_after_send=True)
+        for shipped_pointer in ("", "id", "id and recipient"):
+            with self.subTest(shipped_pointer=shipped_pointer):
+                self.check_list_retry(reload_after_send=True, shipped_pointer=shipped_pointer)
 
-    def check_list_retry(self, *, reload_after_send: bool) -> None:
+    def check_list_retry(self, *, reload_after_send: bool, shipped_pointer: str = "") -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
         configuration = temporary / "config"
@@ -1691,7 +1745,8 @@ class NewItemDialogTests(unittest.TestCase):
         image = (new_item_dialog.NO_PAGE_SCREENSHOT if reload_after_send else new_item_dialog.PageScreenshot(
             base64.b64decode(PNG), new_item_dialog.PageViewport(1440, 900, True)))
         fixture = DialogFixture(temporary, screenshot=image, reject_first_send=reload_after_send)
-        probe = LIST_RETRY_PROBE.replace("__RELOAD_AFTER_SEND__", json.dumps(reload_after_send))
+        probe = LIST_RETRY_PROBE.replace("__RELOAD_AFTER_SEND__", json.dumps(reload_after_send)).replace(
+            "__SHIPPED_POINTER__", json.dumps(shipped_pointer))
         page = fixture_page(1440, photo=False, script=probe).replace(
             b'data-page-owner="builds"', b'data-page-owner="list"')
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
@@ -1704,7 +1759,13 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertEqual((record.id, record.question), ("I1", "Keep the first List Send."))
         submission = record.submission
         assert isinstance(submission, new_item_dialog.ReviewSubmission)
-        self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
+        if shipped_pointer:
+            reference, = submission.images
+            with patch.dict(os.environ, fixture.environment()):
+                attachment = review_submissions.image_folder(submission) / reference.id / reference.file
+            self.assertEqual(attachment.read_bytes(), base64.b64decode(PNG))
+        else:
+            self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
         if isinstance(image, new_item_dialog.PageScreenshot):
             intent = submission.capture_intent
             assert isinstance(intent, new_item_dialog.DeferredCaptureIntent)

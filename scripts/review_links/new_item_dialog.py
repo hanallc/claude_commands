@@ -776,15 +776,26 @@ class ScheduledDraftRequired(SubmissionConflict):
         super().__init__("This draft ID is invalid for Scheduled. Start a new Scheduled draft.")
 
 
-def read_scheduled_draft_id(value: object) -> str:
-    if not isinstance(value, str) or not SCHEDULED_DRAFT_ID.fullmatch(value):
+@dataclass(frozen=True)
+class ScheduledDraftId:
+    """A draft ID reserved for a Scheduled Send."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not SCHEDULED_DRAFT_ID.fullmatch(self.value):
+            raise ScheduledDraftRequired()
+
+
+def read_scheduled_draft_id(value: object) -> ScheduledDraftId:
+    if not isinstance(value, str):
         raise ScheduledDraftRequired()
-    return value
+    return ScheduledDraftId(value)
 
 
 @dataclass(frozen=True)
 class ScheduledSubmission:
-    request_id: str
+    request_id: ScheduledDraftId
     recipient_id: staff.StaffId
     words: str
     page: str
@@ -1048,7 +1059,7 @@ SCRIPT = r'''(() => {
  let selectedRecipient = '';
  let pageOwner = '';
  let captureSession, pageContext, savedItem, laterDraft, laterBase;
- let awaitingEarlierSend = false, submittedDraft;
+ let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
  let draftDatabase;
 
  function node(tag, text = '', css = '') {
@@ -1097,7 +1108,8 @@ SCRIPT = r'''(() => {
   scheduledHelp.hidden = !scheduled || !!savedItem;
   words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
   for (const input of kindInputs) {
-   input.disabled = sending || locked || !!savedItem || (input.value === 'scheduled' && awaitingEarlierSend);
+   input.disabled = sending || locked || !!savedItem ||
+     (input.value === 'scheduled' && awaitingEarlierSend && !isEditingLater());
   }
   send.disabled = !!savedItem || sending || !token || isEditingLater() || submittedDraft?.mode === 'screenshot-expired' ||
     (scheduled && awaitingEarlierSend && !recovering) ||
@@ -1149,7 +1161,7 @@ SCRIPT = r'''(() => {
   if (sending || isRecovering()) return;
   if (event?.target.name === 'kind') {
    discardCapture();
-   draftId = undefined;
+   if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
    ensureDraftId();
    showRecipients();
    showBugPage();
@@ -1540,11 +1552,11 @@ SCRIPT = r'''(() => {
   try {
    const stored = sessionStorage.getItem(listSendKey);
    if (!stored) return null;
-   if (browserDraftId.test(stored)) return {id: stored, recipient: null, awaitingSend: false};
+   if (stored.startsWith('r6-') && browserDraftId.test(stored)) return {id: stored, recipient: null};
    const draft = JSON.parse(stored);
    if (typeof draft?.id !== 'string' || !browserDraftId.test(draft.id)) return null;
    const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
-   return {id: draft.id, recipient, awaitingSend: draft.awaitingSend === true};
+   return {id: draft.id, recipient, awaitingSend: draft.awaitingSend};
   } catch (_) { return null; }
  }
 
@@ -1552,7 +1564,8 @@ SCRIPT = r'''(() => {
   if (ownerPage !== 'list' || !draftId || isEditingLater() || !sendNotice.hidden) return;
   try {
    sessionStorage.setItem(listSendKey, JSON.stringify({
-    id: draftId, recipient: selectedRecipient, awaitingSend: awaitingEarlierSend
+    id: draftId, recipient: selectedRecipient,
+    awaitingSend: awaitingNativeRecovery ? undefined : awaitingEarlierSend
    }));
   } catch (_) {}
  }
@@ -1614,7 +1627,7 @@ SCRIPT = r'''(() => {
  function finishDraft() {
   clearSubmittedDraft();
   draftId = undefined;
-  awaitingEarlierSend = false;
+  awaitingEarlierSend = awaitingNativeRecovery = false;
   if (ownerPage === 'list') {
    try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
@@ -1806,7 +1819,9 @@ SCRIPT = r'''(() => {
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
-    awaitingEarlierSend = stored.awaitingSend;
+    // The shipped List dialog stores no Send state.
+    awaitingNativeRecovery = draftId.startsWith('r6-') && stored.awaitingSend === undefined;
+    awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
    }
   }
   const newDraft = !keepDraft && !draftId;
@@ -1944,7 +1959,7 @@ SCRIPT = r'''(() => {
       showSentDetails();
      }
     }
-    awaitingEarlierSend = failure.staleToken && hadEarlierSend;
+    awaitingEarlierSend = awaitingNativeRecovery || (failure.staleToken && hadEarlierSend);
     storeListDraft();
    }
    if (failure?.filedId) {

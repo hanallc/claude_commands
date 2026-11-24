@@ -558,6 +558,8 @@ def _read_request_file(path: Path, request_id: str) -> RequestFile:
         if isinstance(payload_hash, str) and re.fullmatch(r"[0-9a-f]{64}", payload_hash):
             if fields.get("destination") == "list":
                 try:
+                    if not new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(request_id):
+                        raise ValueError("Invalid Scheduled draft ID.")
                     return _list_request_file(path, fields, payload_hash)
                 except ValueError as error:
                     raise OSError(f"Cannot read the Review request file at {path}.") from error
@@ -1590,9 +1592,9 @@ def _sync_draft_parents(folder: Path) -> None:
     atomic_file.sync_folder(folder.parent)
 
 
-def list_draft_evidence(request_id: str, claim: ListDraftClaim) -> str:
+def list_draft_evidence(request_id: new_item_dialog.ScheduledDraftId, claim: ListDraftClaim) -> str:
     """Save the recovery data in the List creation log with the item."""
-    return f"New item draft {request_id}\n" + json.dumps(claim.fields(), separators=(",", ":"))
+    return f"New item draft {request_id.value}\n" + json.dumps(claim.fields(), separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -1671,8 +1673,6 @@ def _draft_filing(folder: Path, *, repair_index: bool = True) -> DraftFiling:
             if isinstance(pending, PendingFiling):
                 return pending
             if isinstance(pending, ListItemDestination):
-                if not repair_index:
-                    return UnclaimedDraft()
                 record = _indexed_list_record(folder.name, pending)
                 filing = record if isinstance(record, FiledDraft) else ClaimedDraft(pending)
             elif _is_earlier_native_draft(folder, pending):
@@ -1727,11 +1727,11 @@ class ListDraftWriter(Protocol):
     def __call__(self, claim_number: Callable[[int], None]) -> the_list.ListItem: ...
 
 
-def file_list_draft(request_id: str, payload_hash: str, *,
+def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: str, *,
                     prepare: Callable[[], AbstractContextManager[tuple[ListDraftClaim, ListDraftWriter]]],
                     deliver: Callable[[ListAssignmentNotice, str, str], bool]) -> ListItemDestination:
     """Recover the first Send or file a List item under its draft lock."""
-    _ = new_item_dialog.read_scheduled_draft_id(request_id)
+    request_id = draft_id.value
     with _locked_filing_draft(request_id) as folder:
         _sync_draft_parents(folder)
         filing = _draft_filing(folder)
@@ -1831,10 +1831,6 @@ def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on
         yield NoNativeSubmission()
         return
     hint = filing.destination
-    if not recovery and isinstance(hint, ListItemDestination):
-        if isinstance(filing, FiledDraft):
-            raise DraftAlreadyFiled(hint.id)
-        raise DraftPending()
     if isinstance(hint, NativeSubmissionDestination):
         earlier = _is_earlier_native_draft(folder, hint)
         if earlier:

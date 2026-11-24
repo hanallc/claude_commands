@@ -495,7 +495,7 @@ class DirectScheduledFiling(StrEnum):
 
 @dataclass(frozen=True)
 class ScheduledDraftFiling:
-    request_id: str
+    request_id: new_item_dialog.ScheduledDraftId
     claim: review_submissions.ListDraftClaim
 
 
