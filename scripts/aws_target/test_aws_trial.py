@@ -52,9 +52,9 @@ def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
         'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
         + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
     _ = (root / 'test_times.conf').write_text(
-        f'# range: 0..\nSLOW_TEST_S={slow_test_s}\n'
-        + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
-        + '# whole: 1..\nTOP_RUNS=5\n')
+        f'# range: 0..\nslow_test_s={slow_test_s}\n'
+        + '# whole: 1..\ngate_failure_log_kib=64\n'
+        + '# whole: 1..\ntop_runs=5\n')
 
 
 @final
@@ -64,11 +64,11 @@ class GuestTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
         install_aws_fixture_settings(root)
         write_guest_config(root)
-        _ = (root / 'gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
+        _ = (root / 'gate.conf').write_text('# range: 1..\ngate_time_limit_factor=1.5\n')
         _ = (root / 'buildlog.conf').write_text(
-            '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
-            + '# range: 0..\nINDEX_TOUCH_MINUTES=60\n'
-            + '# whole: 1..\nINDEX_SPILL_PAGES=65536\n')
+            '# range: 0..\nindex_unused_days=2\n'
+            + '# range: 0..\nindex_touch_minutes=60\n'
+            + '# whole: 1..\nindex_spill_pages=65536\n')
         _ = (root / 'build_folders.conf').write_text(
             f'roots.system={root}\nroots.gate={root}\nroots.build={root / "build"}\n'
             + '# whole: 1..\nnames.suffix_length=8\n'

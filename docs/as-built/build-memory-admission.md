@@ -1129,7 +1129,7 @@ A first checker failure or explicit refusal stops at once. A launch deadline app
 A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
-`detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+`detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `live_run_limit` to the worker.
 The launcher accepts `--kind python-tests` before `--` and defaults to `detect`.
 It records the kind and creates the scope `detached-<kind>-<run-id>.scope` when systemd is available.
 The scope name omits the worker suffix from the run ID.
@@ -1559,8 +1559,9 @@ So a damaged record of a killed gate does not make the hold claims unreadable fo
 Without a state file, the reader keeps the original row.
 The open state file supplies the UTC update time from its modification time.
 An unknown state word returns `UnreadableRecord` through the existing validation path.
-`on_mac` selects `mac`, `on_natedev` selects `natedev`, and `on_ssh` selects its supplied target.
-Other state words clear the selected target.
+`on_mac` selects `mac`, and `on_natedev` selects `natedev`.
+`on_ssh` and `waiting_ssh` keep their supplied target.
+`verify.sh` supplies a target only with these two words, so other state words have no selected target.
 Readers continue to find records through `*.json` only.
 
 A tree-writing step publishes `writes_tree <state>` with an optional target for its whole lifetime.

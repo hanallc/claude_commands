@@ -77,7 +77,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
                               worktree=staff.PresentWorktree(remote.local_machine(), staging))
         production = production_doc.read_production(self.owner)
         settings_path = self.root / "production.conf"
-        _ = settings_path.write_text("# range: 0.01..\nRETIRE_COMMAND_TIMEOUT_SECONDS=5\n")
+        _ = settings_path.write_text("# range: 0.01..\nretire_command_timeout_seconds=5\n")
         settings = conf.read(settings_path)
         collision = self.root / "collision"
         _ = self.git("worktree", "add", "-qb", "collision", str(collision))

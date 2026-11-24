@@ -79,7 +79,7 @@ class PathMove(NamedTuple):
 
 def git(checkout: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True,
-                            text=True, check=False, timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS"))
+                            text=True, check=False, timeout=_move_timeout("rename_command_timeout_seconds"))
     _check_move_deadline()
     if result.returncode:
         raise RenameRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
@@ -580,7 +580,7 @@ def _move_timeout(key: str) -> float:
 
 def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[staff.StaffId], *, running: bool) -> bool:
     """Accept observations only within the configured operation limit."""
-    key = "RENAME_LIVE_WAIT_SECONDS" if running else "RENAME_RUN_STOP_WAIT_SECONDS"
+    key = "rename_live_wait_seconds" if running else "rename_run_stop_wait_seconds"
     try:
         deadline = min(worker_lifecycle.effective_deadline(), time.monotonic() + _move_timeout(key))
     except worker_lifecycle.OperationDeadlineExpired:
@@ -597,7 +597,7 @@ def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[sta
             settled = wanted <= live if running else wanted.isdisjoint(live)
             if settled:
                 return True
-            poll = _move_timeout("RENAME_POLL_SECONDS")
+            poll = _move_timeout("rename_poll_seconds")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
@@ -976,7 +976,7 @@ def move_idle_folder(
 ) -> bool:
     """Move the folder and branch without changes to the session."""
     destination = destination.expanduser().resolve()
-    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS")),
+    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("rename_command_timeout_seconds")),
           staff.row_operation(str(unit)), ExitStack() as move_locks):
         _check_move_deadline()
         record = staff.snapshot()
@@ -1101,7 +1101,7 @@ def _push_moved_branch(checkout: Path, branch: str) -> None:
 def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBranch = KeepBranch.CURRENT) -> bool:
     """Defer running work, then move the idle worktree and resume the director."""
     destination = destination.expanduser().resolve()
-    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("RENAME_COMMAND_TIMEOUT_SECONDS")),
+    with (worker_lifecycle.operation_deadline(timeout=_move_timeout("rename_command_timeout_seconds")),
           staff.row_operation(str(unit)), ExitStack() as locks):
         _check_move_deadline()
         record = staff.snapshot()
@@ -1198,7 +1198,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         try:
             if move_source:
                 move_lock_created = _lock_move(folder, unit)
-            stop_deadline = time.monotonic() + _move_timeout("RENAME_RUN_STOP_WAIT_SECONDS")
+            stop_deadline = time.monotonic() + _move_timeout("rename_run_stop_wait_seconds")
             with worker_lifecycle.operation_deadline(deadline=stop_deadline):
                 for member in members:
                     if member.id in live:
@@ -1259,7 +1259,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                     _ = _unlock_move(folder, unit)
             finally:
                 try:
-                    start_deadline = time.monotonic() + _move_timeout("RENAME_LIVE_WAIT_SECONDS")
+                    start_deadline = time.monotonic() + _move_timeout("rename_live_wait_seconds")
                     with worker_lifecycle.operation_deadline(deadline=start_deadline):
                         still_live = observe()
                         for member in members:

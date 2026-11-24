@@ -1512,7 +1512,7 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
 
 def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> int | Literal["—"]:
     """Read the number of a test copy under the machine's build root."""
-    root = roots.get(f"roots.build.{machine}", roots.get("roots.build", ""))
+    root = roots.get(f"roots.build.{conf.host_key_name(machine)}", roots.get("roots.build", ""))
     if not root or not folder:
         return "—"
     uses_home = root == "~" or root.startswith("~/") or re.search(r"\$(?:HOME\b|\{HOME\})", root)
@@ -1874,9 +1874,9 @@ def token_wait_stage(pool: TokenPool | TokenPoolUnavailable) -> str:
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
     """Read the top costs from one provider result."""
     try:
-        recent_days = conf.read("buildlog").whole("TOP_COST_RECENT_DAYS")
+        recent_days = conf.read("buildlog").whole("top_cost_recent_days")
         if days < recent_days:
-            raise conf.Unusable(f"history_days={days} must be at least TOP_COST_RECENT_DAYS={recent_days}")
+            raise conf.Unusable(f"history_days={days} must be at least top_cost_recent_days={recent_days}")
         report = charts.page_data(days, n=3)
         if isinstance(report, charts.IndexUnavailable):
             return report

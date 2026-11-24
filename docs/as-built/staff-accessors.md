@@ -51,7 +51,7 @@ Each producer loads the common command and reads its job and current work from i
 The commands live in `commands/producer/`.
 Morty's operations document is `docs/producer/morty-operations.md`.
 The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
-`PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
+`producer_folder_root` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
 A producer's `worktree` is its launch folder and owns no path.
@@ -113,7 +113,7 @@ A joined child leaves that record intact.
 The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
-Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.
+Staff lock and remote waits read `operation_lock_seconds` and `remote_seconds` from `config/staff.conf` at use.
 Each wait uses the smaller configured limit or remaining operation deadline.
 
 ## Production document lookup

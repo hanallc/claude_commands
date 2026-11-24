@@ -1391,8 +1391,8 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path,
         main_publish.MacPulled | main_publish.MacPullPending):
     settings_read = conf.read("merge_checkpoint")
     try:
-        tries = settings_read.whole("MAC_PULL_TRIES")
-        retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
+        tries = settings_read.whole("mac_pull_tries")
+        retry_seconds = settings_read.number("mac_pull_retry_seconds")
     except ValueError as error:
         raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     pull: main_publish.MacCheckoutPull | main_publish.ProductionMacPull

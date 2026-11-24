@@ -460,7 +460,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(result_file.read_text(), str(start_folder))
 
     def test_start_refuses_at_the_live_run_limit_without_a_record_or_supervisor(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "live_run_limit=3\n")
         paths = self.seat_runs(3)
         before = {path: path.read_bytes() for path in paths}
         with patch.object(subprocess, "Popen") as popen, \
@@ -481,7 +481,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertIn("more files in one run", err.getvalue())
 
     def test_a_finished_run_frees_a_place_for_the_next_start(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "live_run_limit=3\n")
         paths = self.seat_runs(3)
         self.update_record(paths[0], status="finished", exit_code=0)
         popen, _ = self.start(["new-check"])
@@ -565,7 +565,7 @@ class DetachedRunsTests(unittest.TestCase):
     def test_start_completes_cancelled_run_after_releasing_start_lock(self) -> None:
         self.set_pass("active", 0)
         settings = self.root / "config/detached_runs.conf"
-        _ = write_config_fixture(settings, "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(settings, "live_run_limit=3\n")
         original = settings.read_text()
         for outcome, expected in (("start", 0), ("twin", 0), ("limit", 4), ("unusable config", 2)):
             with self.subTest(outcome=outcome):
@@ -573,7 +573,7 @@ class DetachedRunsTests(unittest.TestCase):
                 if outcome in ("twin", "limit"):
                     _ = self.seat_runs(3)
                 if outcome == "unusable config":
-                    _ = settings.write_text("# whole: 1..\nLIVE_RUN_LIMIT=invalid\n")
+                    _ = settings.write_text("# whole: 1..\nlive_run_limit=invalid\n")
                 command = ["fixture", "1"] if outcome == "twin" else ["new-check"]
                 with (self.completion_that_prunes(path) as completed,
                       self.supervisor_spawns() as spawn,
@@ -856,7 +856,7 @@ class DetachedRunsTests(unittest.TestCase):
             self.assertEqual(shared_state_defaults.read_stop_confirmation(request_id), "stopped")
 
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "live_run_limit=3\n")
         self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         paths = self.seat_runs(3)
         self.update_record(paths[0], pid=DEAD_PID)
@@ -865,7 +865,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(json.loads(paths[0].read_text())["status"], "finished")
 
     def test_a_live_twin_still_wins_at_the_live_run_limit(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "live_run_limit=3\n")
         paths = self.seat_runs(3)
         popen, output = self.start(["fixture", "1"])
         popen.assert_not_called()
@@ -875,20 +875,20 @@ class DetachedRunsTests(unittest.TestCase):
     def test_start_reads_the_live_run_limit_from_config(self) -> None:
         paths = self.seat_runs(1)
         config = self.root / "config/detached_runs.conf"
-        _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = config.write_text("# whole: 1..\nlive_run_limit=1\n")
         with patch.object(subprocess, "Popen") as popen, contextlib.redirect_stderr(io.StringIO()) as err:
             code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", WORKER,
                                    "--", "new-check"])
         self.assertEqual(code, 4)
         popen.assert_not_called()
         self.assertIn("live-run limit 1", err.getvalue())
-        _ = config.write_text("# whole: 1..\nLIVE_RUN_LIMIT=2\n")
+        _ = config.write_text("# whole: 1..\nlive_run_limit=2\n")
         accepted, _ = self.start(["new-check"])
         accepted.assert_called_once()
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 2)
 
     def test_another_seat_does_not_use_this_seats_live_run_places(self) -> None:
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "live_run_limit=3\n")
         paths = self.seat_runs(3)
         reviewer = self.record_worker("unit-review", fixture_runtime_id("another-seat-review"))
         popen, _ = self.start(["new-check"], to=reviewer.name)
@@ -896,7 +896,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
 
     def test_parallel_starts_cannot_exceed_one_configured_place(self) -> None:
-        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nlive_run_limit=1\n")
         runs = self.session / detached_runs.DETACHED_RUNS_DIR
         runs.mkdir()
         context = multiprocessing.get_context("fork")
@@ -935,7 +935,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(len(list(runs.glob("*.json"))), 1)
 
     def test_start_and_reap_preserve_an_unpublished_record_under_the_start_lock(self) -> None:
-        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nlive_run_limit=1\n")
         script = """
 import fcntl
 import sys
@@ -982,7 +982,7 @@ sys.exit(code)
                 self.assertEqual(list(path.parent.glob("*.json")), [path])
 
     def test_a_supervisor_holds_a_place_when_start_exits_before_its_pid_write(self) -> None:
-        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nLIVE_RUN_LIMIT=1\n")
+        _ = (self.root / "config/detached_runs.conf").write_text("# whole: 1..\nlive_run_limit=1\n")
         script = """
 import os
 import sys
@@ -1168,7 +1168,7 @@ sys.exit(1)
                       patch.object(subprocess, "run", return_value=output)):
                     self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
         record = self.root / "run folder/r1.json"
-        _ = write_config_fixture(self.root / "config/detached_runs.conf", "PROCESS_CHECK_SECONDS=7\n")
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "process_check_seconds=7\n")
         for tail, matches in (("", True), (" backup.json", False)):
             with self.subTest(tail=tail):
                 output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
@@ -3000,10 +3000,10 @@ send.deliver_worker_text = fake_sender
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         _ = write_config_fixture(self.root / "config/detached_runs.conf",
-                                 "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n")
+                                 "result_line_chars=200\nresult_text_chars=1800\n")
         limits = conf.read("detached_runs")
-        line_chars = limits.whole("RESULT_LINE_CHARS")
-        text_chars = limits.whole("RESULT_TEXT_CHARS")
+        line_chars = limits.whole("result_line_chars")
+        text_chars = limits.whole("result_text_chars")
         script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"
         _ = self.supervise(self.record([sys.executable, "-c", script]))
         message = cast(list[str], self.pending()["messages"])[0]
@@ -3017,7 +3017,7 @@ send.deliver_worker_text = fake_sender
 
     def test_result_text_caps_the_total_size_including_the_header(self) -> None:
         config = self.root / "config/detached_runs.conf"
-        _ = write_config_fixture(config, "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n")
+        _ = write_config_fixture(config, "result_line_chars=200\nresult_text_chars=1800\n")
         record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
         record["label"] = "verification " * 1_000
         _ = Path(record["log"]).write_text("line " * 1_000 + "\n" + ("x" * 5_000 + "\n") * 20 + "last line\n")
@@ -3029,7 +3029,7 @@ send.deliver_worker_text = fake_sender
         self.assertIn(f"Log: {record['log']}", text)
         self.assertTrue(text.endswith("\nlast line"))
 
-        _ = write_config_fixture(config, "RESULT_LINE_CHARS=100\nRESULT_TEXT_CHARS=1200\n")
+        _ = write_config_fixture(config, "result_line_chars=100\nresult_text_chars=1200\n")
         text = detached_runs.result_text(record, detached_runs.CompletedCommand(1))
         self.assertLessEqual(len(text), 1_200)
         self.assertIn(f"{'x' * 100} [cut: {5_000 - 100} more characters]", text)
@@ -3976,7 +3976,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                 family, *worker_panes.launch_arguments(policy, row.current_session, self.fixture.root)])
                             self.fixture.world.processes[pid].environment["CODEX_HOME"] = os.environ["CODEX_HOME"]
                             config = self.fixture.root / "conf/direct.conf"
-                            write_text_atomic(config, config.read_text() + "# range: 1..600\nWORKER_SETTLE_SECONDS=1\n")
+                            write_text_atomic(config, config.read_text() + "# range: 1..600\nworker_settle_seconds=1\n")
                             launches = len(self.fixture.world.launches)
                             with (patch.object(subprocess, "run", side_effect=agent.run),
                                   contextlib.redirect_stderr(io.StringIO()) as errors):
@@ -4114,7 +4114,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 family, *worker_panes.launch_arguments(policy, row.current_session, self.fixture.root)])
             self.fixture.world.processes[pid].environment["CODEX_HOME"] = os.environ["CODEX_HOME"]
             config = self.fixture.root / "conf/direct.conf"
-            write_text_atomic(config, config.read_text() + "# range: 1..600\nWORKER_SETTLE_SECONDS=1\n")
+            write_text_atomic(config, config.read_text() + "# range: 1..600\nworker_settle_seconds=1\n")
 
             def assign_before_delivery(options: send.Options) -> send.Result:
                 if send.body_text(options) == message:
@@ -5239,12 +5239,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     def test_exhausted_result_push_alerts_the_director_once(self) -> None:
         row = self.fixture.worker()
-        for outcome, response in (
-            ("sent", send.Result("sent", "fixture alert result")),
-            ("failed", send.Result("failed", "fixture alert result")),
-            ("sender-exit", SystemExit(2)),
+        for outcome, response, retries, seconds in (
+            ("sent", send.Result("sent", "fixture alert result"), 3, 5),
+            ("failed", send.Result("failed", "fixture alert result"), 3, 5),
+            ("sender-exit", SystemExit(2), 1, 0.25),
         ):
             with self.subTest(outcome=outcome):
+                _ = write_config_fixture(
+                    self.fixture.root / "conf/detached_runs.conf",
+                    f"result_push_retries={retries}\nresult_push_retry_seconds={seconds}\n",
+                )
                 record = self.record(row, f"alert-{outcome}")
                 path = Path(record["log"]).with_suffix(".json")
                 refusal = send.RefusedRelayRequest("failed", "fixture push error")
@@ -5256,8 +5260,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                       contextlib.redirect_stderr(io.StringIO()) as errors):
                     self.assertEqual(detached_runs.main(["supervise", str(path)]), 1)
                     self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
-                self.assertEqual(deliver.call_count, 4)
-                self.assertEqual(delay.call_args_list, [call(5)] * 3)
+                self.assertEqual(deliver.call_count, 1 + retries)
+                self.assertEqual(delay.call_args_list, [call(seconds)] * retries)
                 alert.assert_called_once()
                 options = cast(send.Options, alert.call_args.args[0])
                 self.assertEqual(options.to, self.fixture.parent.id)
@@ -5266,7 +5270,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertIn(detail, options.text or "")
                 saved = worker_lifecycle.read_json_object(path)
                 self.assertIs(saved["push_alert_attempted"], True)
-                self.assertEqual(saved["push_retries"], 3)
+                self.assertEqual(saved["push_retries"], retries)
                 self.assertEqual(saved["delivery"], detached_runs.FAILED_RESULT_PUSH + "failed: " + refusal.detail)
                 self.assertEqual(errors.getvalue().count("anomaly:"), int(outcome != "sent"))
                 if outcome == "sender-exit":

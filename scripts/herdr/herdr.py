@@ -2024,7 +2024,7 @@ class Herdr:
         created = self.created_workspaces.get(space)
         if created is not None and any(item.get("workspace_id") == created for item in self.listed("workspace")):
             return created
-        producer_space = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+        producer_space = conf.read_or_repository("staff").text("producer_workspace")
         if space == producer_space:
             return next((json_text(item.get("workspace_id"), "herdr workspace id")
                          for item in self.listed("workspace") if item.get("label") == space), None)
@@ -2257,7 +2257,7 @@ class Herdr:
         """Wait for the own pane to reach the shell; refuse the start when the time passes first."""
         identity = json_text(pane.get("pane_id"), "pane id")
         if not isinstance(self.pane_activity(identity), PaneAtShell):
-            limit = conf.read("shutdown").number("OWN_PANE_SHELL_SECONDS")
+            limit = conf.read("shutdown").number("own_pane_shell_seconds")
             if not self._shell_within(identity, limit):
                 raise OwnPaneNotAtShell(member.name, str(member.current_session), identity, limit)
         return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
@@ -3972,7 +3972,7 @@ def _claude_start_in_progress(pid: int, shell: int, foreground: int) -> bool:
                 return False
             uptime = float((proc_root() / "uptime").read_text().split(maxsplit=1)[0])
             age = uptime - started / os.sysconf("SC_CLK_TCK")
-        return 0 <= age < conf.read("shutdown").number("START_SECONDS")
+        return 0 <= age < conf.read("shutdown").number("start_seconds")
     except (HerdrFailure, OSError, ValueError, IndexError):
         return False
 
@@ -4695,7 +4695,7 @@ def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str
 def row_workspace(row: staff.StaffRow | staff.StaffRoot, record: staff.StaffSnapshot, name: str) -> str:
     """Select the configured producer workspace or the owner's workspace."""
     if isinstance(row, staff.StaffRow) and row.kind == "producer":
-        return conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+        return conf.read_or_repository("staff").text("producer_workspace")
     while isinstance(row, staff.StaffRow):
         if row.kind == "showrunner":
             return row.name

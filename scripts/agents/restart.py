@@ -720,8 +720,8 @@ class DirectorResumeChecks:
             return
         try:
             settings = conf.read("shutdown")
-            deadline = time.monotonic() + settings.number("RESUME_CHECK_SECONDS")
-            interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
+            deadline = time.monotonic() + settings.number("resume_check_seconds")
+            interval = settings.number("resume_check_interval_seconds")
         except (OSError, ValueError):
             for check in self.checks:
                 self.report_check(check, ResumeCheckState.UNREADABLE)
@@ -1124,7 +1124,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if projected is not None:
             environment = {**names.environment(projected), **environment}
         settings = conf.read("shutdown")
-        start_seconds = settings.number("START_SECONDS")
+        start_seconds = settings.number("start_seconds")
         reuse_deadline = time.monotonic() + operation_deadline.remaining(start_seconds)
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
@@ -1226,7 +1226,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
-            launch_seconds = (max(start_seconds, settings.number("OPENING_PROMPT_SECONDS"))
+            launch_seconds = (max(start_seconds, settings.number("opening_prompt_seconds"))
                               if kind == "claude" and isinstance(opening, herdr.OpeningPrompt) else start_seconds)
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
                 trust_arguments(kind, str(folder), arguments),
@@ -1750,7 +1750,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     try:
         record = staff.initial_snapshot()
         if stop_all and not dry_run:
-            deadline = time.monotonic() + conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS")
+            deadline = time.monotonic() + conf.read("shutdown").number("upkeep_row_wait_seconds")
             only = tuple(str(row.id) if (row := record.by_member_reference(reference)) is not None else reference
                          for reference in only)
             for row in record.find(kind="producer"):
@@ -1923,7 +1923,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             _discovery_anomaly("The stop includes the session that runs this reboot")
             return 1
         return _detach_stop(command, selected, record)
-    lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
+    lock_wait = conf.read("shutdown").number("upkeep_row_wait_seconds") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
     )

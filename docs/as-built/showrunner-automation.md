@@ -357,7 +357,7 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
      Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
      The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
-     It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
+     It reads the printed `rc=` line and uses `mac_pull_tries` and `mac_pull_retry_seconds` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
   10. Record the code checkpoint's review ledger row and production log line.
@@ -1006,7 +1006,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A missing pane launch record does not make a resolved staff worker unknown.
     `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
     `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
-    `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
+    `unit_phases.send_anomalies` sends all lines once to `unit_anomalies_to` from `config/production.conf` (`sdlc`).
     The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.

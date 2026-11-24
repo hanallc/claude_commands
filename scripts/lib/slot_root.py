@@ -14,12 +14,12 @@ class SlotsNotConfigured(ValueError):
     """The user has not activated repository slots on this machine."""
 
     def __init__(self, machine: str) -> None:
-        super().__init__(f"slots: roots.slots.{machine} is not configured; slots are not active")
+        super().__init__(f"slots: roots.slots.{conf.host_key_name(machine)} is not configured; slots are not active")
 
 
 def slot_root(values: Mapping[str, str], machine: str) -> str:
     """Select the machine's slot root, with the common root as the default."""
-    return values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
+    return values.get(f"roots.slots.{conf.host_key_name(machine)}", values.get("roots.slots", ""))
 
 
 def configured_slot_root() -> Path:

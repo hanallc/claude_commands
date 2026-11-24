@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import select
 import signal
-import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -2708,7 +2707,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
         with PlacementFixture() as fixture:
             settings, request, destination = self.target_settings_fixture(fixture)
-            host = socket.gethostname().split(".", 1)[0]
+            host = conf.local_host_key_name()
             good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
             _ = settings.write_text(good.replace("floor_sweep_timeout_s=180", "floor_sweep_timeout_s=broken"))
             repository = eligibility.KnownRepository("hana")

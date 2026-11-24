@@ -275,12 +275,12 @@ The ledger enforces these batch rules:
   naming the hunk that invalidated it.
 
 Advisories, checked in this order and reported in `advisory` beside a `dispatch`
-verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
-that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
+verdict: a finding reopened `max_reopens` times after being accepted; a finding
+that failed to close after `max_fix_attempts` repair attempts; `stalled_rounds`
 consecutive rounds with no decrease in the gating-open count;
-`MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
-`MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
-`RUNAWAY_ROUNDS` backstop.
+`max_consecutive_same_kind_passes` passes of one kind in a row; more than
+`max_review_cancellations` review cancellations; a spent repair budget; the
+`runaway_rounds` backstop.
 
 These advisories describe repair cost and progress.
 They do not stop the phase.
@@ -288,11 +288,11 @@ The director reports the advisory and continues through the repair rules.
 An unchanged open count can describe new findings or repeated failed repairs, so the count alone cannot decide when to stop.
 
 The repair budget is the first round's gating count times
-`REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
+`repair_rounds_per_finding`, never below `min_repair_budget`. All of these
 limits are set in `~/.claude/config/direct.conf` and read by `findings.py` at startup.
 An absent or unusable required value exits 2.
 The budget and convergence limits control advisories.
-`ROUTING_FROM_ROUND=4` and `ASTRA_AFTER_FAILED_FIXES=2` enforce repair evidence.
+`routing_from_round=4` and `astra_after_failed_fixes=2` enforce repair evidence.
 From round four, each kept finding needs its category and evidence.
 A due Astra record applies to the finding's current fix-attempt count.
 Every dispatch records affected accepted checks or an explicit reason for none.

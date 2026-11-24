@@ -147,15 +147,15 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
     modules = {(suite, test_module_name(repo, suite, path))
                for suite, path in discover_test_modules(repo)}
     config = conf.read("test_times")
-    count = config.whole("TOP_RUNS")
-    host_test, host_value, checkout_key = (("LIKE", AWS_HOST_PATTERN, "TOP_AWS_CHECKOUT") if host == AWS_HOSTS
-                                           else ("=", host, "TOP_CHECKOUT"))
+    count = config.whole("top_runs")
+    host_test, host_value, checkout_key = (("LIKE", AWS_HOST_PATTERN, "top_aws_checkout") if host == AWS_HOSTS
+                                           else ("=", host, "top_checkout"))
     checkout = Path(config.text(checkout_key)).expanduser().resolve()
     checkouts = [str(row["checkout"]) for row in query(connection,
                  f"SELECT DISTINCT checkout FROM gate_runs WHERE host {host_test} ?", (host_value,))
                  if Path(str(row["checkout"])).expanduser().resolve() == checkout]
     checkout_parameters = ", ".join(["?"] * len(checkouts))
-    oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
+    oldest = cutoff(config.whole("top_max_age_days"))
     histories: list[list[ModuleAttempt]] = []
     type_history: list[ModuleAttempt] = []
     for folder, filename in sorted(modules | {TYPE_CHECK_JOB}):
@@ -242,7 +242,7 @@ def nextest_top(connection: sqlite3.Connection, host: str, limit: int, repo: Pat
         JOIN tests t ON t.step_id = s.id
         WHERE s.repo_identity = ? AND s.host = ? AND s.started_at >= ?
         ORDER BY s.started_at
-    """, (identity, host, cutoff(config.whole("TOP_MAX_AGE_DAYS")))):
+    """, (identity, host, cutoff(config.whole("top_max_age_days")))):
         binary, name = str(row["binary"]), str(row["test"])
         key = binary, name
         if key not in histories:
@@ -499,7 +499,7 @@ def trend_day(connection: sqlite3.Connection, day: date,
 def trend(connection: sqlite3.Connection, days: int) -> None:
     """Read finished days from the cache and compute the other days."""
     today = datetime.now(user_zone()).date()
-    settle = conf.read("test_times").number("TREND_SETTLE_MINUTES") * 60
+    settle = conf.read("test_times").number("trend_settle_minutes") * 60
     costs = gate_costs()
     rows: list[TrendDay] = []
     with file_lock.exclusive(store.root() / (TREND_CACHE_NAME + ".lock")):
@@ -572,7 +572,7 @@ def arguments(argv: list[str]) -> ReportRequestArguments:
     _ = top_parser.add_argument("--repo", type=Path, default=Path.cwd())
     _ = top_parser.add_argument("--host", default=store.host_name())
     trend_parser = subcommands.add_parser("trend", help="show daily CPU, wall time and cost for targeted tests and merge gates")
-    _ = trend_parser.add_argument("--days", type=positive, default=conf.read("test_times").whole("TREND_DAYS"))
+    _ = trend_parser.add_argument("--days", type=positive, default=conf.read("test_times").whole("trend_days"))
     suites_parser = subcommands.add_parser("suites", help="show gate runs")
     _ = suites_parser.add_argument("--days", type=positive, default=7)
     suite_parser = subcommands.add_parser("suite", help="show one folder suite")

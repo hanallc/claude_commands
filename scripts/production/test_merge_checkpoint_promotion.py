@@ -1057,7 +1057,7 @@ with lock.open("a") as held:
 
     def test_mac_pull_retries_once_then_succeeds(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        _ = config.write_text("# whole: 1..\nmac_pull_tries=3\n# range: 0..\nmac_pull_retry_seconds=0\n")
         self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
@@ -1075,7 +1075,7 @@ with lock.open("a") as held:
 
     def test_mac_pull_stops_after_configured_tries_with_the_last_failure(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        _ = config.write_text("# whole: 1..\nmac_pull_tries=2\n# range: 0..\nmac_pull_retry_seconds=0\n")
         self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()

@@ -240,8 +240,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.trees.mkdir()
         self.state = self.root / "worktrees-state"
         config = self.root / "staff.conf"
-        _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
-                              + "# range: 0.001..\nREMOTE_SECONDS=5\n")
+        _ = config.write_text("# range: 0.001..\noperation_lock_seconds=5\n"
+                              + "# range: 0.001..\nremote_seconds=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
             **config_environment(self.root / "settings"),
@@ -401,10 +401,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         build = self.root / "build"
         scratch_root = self.root / "scratch"
         session_root = self.root / "session-root"
+        host_key = conf.local_host_key_name()
         _ = write_config_fixture(config / "build_folders.conf",
-            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_name()}={build}\n"
-            + f"roots.scratch={scratch_root}\nroots.scratch.{host_name()}={scratch_root}\n"
-            + f"roots.session={session_root}\nroots.session.{host_name()}={session_root}\n"
+            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_key}={build}\n"
+            + f"roots.scratch={scratch_root}\nroots.scratch.{host_key}={scratch_root}\n"
+            + f"roots.session={session_root}\nroots.session.{host_key}={session_root}\n"
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies = config / "copies.conf"
@@ -1958,7 +1959,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 root = Path(folder)
                 build = root / "build"
                 _ = write_config_fixture(config, f"roots.workspace={root}/trees\nroots.build={build}\n"
-                                         + f"roots.build.{host_name()}={build}\n")
+                                         + f"roots.build.{conf.local_host_key_name()}={build}\n")
                 scratch_root = build / "claude/scratch"
                 scratch_root.mkdir(parents=True)
                 damaged = scratch_root / "damaged"
@@ -2059,7 +2060,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 root = Path(folder)
                 build = root / "build"
                 _ = write_config_fixture(config, f"roots.workspace={root}/trees\nroots.build={build}\n"
-                                         + f"roots.build.{host_name()}={build}\n")
+                                         + f"roots.build.{conf.local_host_key_name()}={build}\n")
                 scratch_root = build / "claude/scratch"
                 scratch_root.mkdir(parents=True)
                 clone = scratch_root / "clone"

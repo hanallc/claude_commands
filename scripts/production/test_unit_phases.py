@@ -2709,7 +2709,7 @@ class UnitPhasesTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = write_config_fixture(config / "production.conf",
-                                 "UNIT_ANOMALIES_TO=fixture-director\nunits_anomaly_repeat_minutes=60\n")
+                                 "unit_anomalies_to=fixture-director\nunits_anomaly_repeat_minutes=60\n")
         def observed(*, record: staff.StaffSnapshot, running: object = None) -> tuple[session_staff.LabeledSession, ...]:
             self.assertEqual(record.by_id(member.id), member)
             self.assertIsNone(running)

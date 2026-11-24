@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import socket
 import shutil
 import subprocess
 import sys
@@ -18,7 +17,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation
+from scripts.lib import build_folders, cancellation, conf
 from scripts.lib.process_start import Gone, Started, Unreadable, Zombie
 from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
 from scripts.lint.memory_test_support import write_config_fixture
@@ -349,7 +348,7 @@ sys.stdin.read(1)
         parent = self.root / "nested-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
                                  f"roots.gate.{host}={parent}\n")
         record = self.state / "nested-folders.json"
@@ -496,7 +495,7 @@ gate.run_suites(Path.cwd(), full=True)
         parent = self.root / "gate-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
                                  f"roots.gate.{host}={parent}\n")
         self.write(self.state / "red-hooks", "red")

@@ -8362,7 +8362,7 @@ class RowTabTests(StaffTestCase):
 
     def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
         configuration = self.root / "configuration"
-        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "start_seconds=20\n")
         proc = self.root / "proc"
         uptime = proc / "uptime"
         ticks = os.sysconf("SC_CLK_TCK")
@@ -8920,7 +8920,7 @@ class SavedLayoutTests(unittest.TestCase):
             ("producer", "second-producer", "producers"))
         configuration = self.root / "configuration"
         configuration.mkdir()
-        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
+        _ = (configuration / "staff.conf").write_text("producer_workspace=producers\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         for kind, name, workspace in cases:
             with self.subTest(kind=kind, name=name):
@@ -8929,7 +8929,7 @@ class SavedLayoutTests(unittest.TestCase):
                 record = staff.StaffSnapshot((row,))
                 self.assertEqual(client.saved_row_tab(row.id, row.name, herdr.row_workspace(row, record, row.name)),
                                  herdr.NewTab(workspace, name))
-        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=crew\n")
+        _ = (configuration / "staff.conf").write_text("producer_workspace=crew\n")
         producer = staff.StaffRow(staff.StaffId("producer-row"), "producer", "custom-producer", staff.STAFF_ROOT,
                                   current_session=staff.StaffId("producer-current"))
         self.assertEqual(client.saved_row_tab(producer.id, producer.name,
@@ -8938,7 +8938,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 
-        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
+        _ = (configuration / "staff.conf").write_text("producer_workspace=producers\n")
         owner = fixture_member("producer", name="owner")
         other = fixture_member("producer", name="other-owner")
         for case, binding, native, launch_owner in (

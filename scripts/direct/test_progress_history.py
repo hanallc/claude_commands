@@ -337,7 +337,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
-            f"UNIT_PROGRESS_INTERVAL_SECONDS={seconds}\nROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n",
+            f"unit_progress_interval_seconds={seconds}\nrouting_from_round=4\nastra_after_failed_fixes=2\n",
             encoding="utf-8",
         )
 
@@ -365,7 +365,7 @@ for number in (1, 2):
     config.mkdir(parents=True)
     settings = config / 'direct.conf'
     registry = config / 'models.conf'
-    settings.write_text(f'UNIT_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
+    settings.write_text(f'unit_progress_interval_seconds={number * 60}\n')
     registry.write_text(f'registry-{number}\n')
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
@@ -5517,7 +5517,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_findings_refuses_fewer_than_two_stalled_rounds(self) -> None:
         _ = self.config_file.write_text(
-            STANDARD_CONFIG.replace("STALLED_ROUNDS=2", "STALLED_ROUNDS=1"),
+            STANDARD_CONFIG.replace("stalled_rounds=2", "stalled_rounds=1"),
             encoding="utf-8",
         )
         result = invoke_findings(
@@ -5526,7 +5526,7 @@ with patch.object(fcntl, "flock", admission):
             self.working_dir,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("STALLED_ROUNDS", result.stderr)
+        self.assertIn("stalled_rounds", result.stderr)
         self.assertIn("outside range 2..", result.stderr)
 
     def write_full_config(self) -> None:
@@ -5534,17 +5534,17 @@ with patch.object(fcntl, "flock", admission):
         _ = self.config_file.write_text(
             "\n".join(
                 (
-                    "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                    "# whole: 1..", "MIN_REPAIR_BUDGET=3",
-                    "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=0.5",
-                    "# whole: 1..", "RUNAWAY_ROUNDS=5",
-                    "# whole: 1..", "MAX_FIX_ATTEMPTS=2",
-                    "# whole: 1..", "MAX_REOPENS=2",
-                    "# whole: 2..", "STALLED_ROUNDS=2",
-                    "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=3",
-                    "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1",
-                    "# whole: 1..", "ROUTING_FROM_ROUND=4",
-                    "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2",
+                    "# whole: 1..", "unit_progress_interval_seconds=180",
+                    "# whole: 1..", "min_repair_budget=3",
+                    "# range: 5e-324..", "repair_rounds_per_finding=0.5",
+                    "# whole: 1..", "runaway_rounds=5",
+                    "# whole: 1..", "max_fix_attempts=2",
+                    "# whole: 1..", "max_reopens=2",
+                    "# whole: 2..", "stalled_rounds=2",
+                    "# whole: 1..", "max_consecutive_same_kind_passes=3",
+                    "# whole: 0..", "max_review_cancellations=1",
+                    "# whole: 1..", "routing_from_round=4",
+                    "# whole: 1..", "astra_after_failed_fixes=2",
                     "",
                 )
             ),

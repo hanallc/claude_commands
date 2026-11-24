@@ -443,7 +443,7 @@ def _compaction_plan(row: staff.StaffRow) -> CompactionRequired | CompactionNotR
             if usage is not None:
                 tokens = usage.uncached_input + usage.cached_input + usage.output
         offset = stream.tell()
-    return (CompactionRequired(backend, offset) if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
+    return (CompactionRequired(backend, offset) if tokens > conf.read("direct").whole("unit_compact_above_tokens")
             else CompactionNotRequired.SKIP)
 
 
@@ -452,7 +452,7 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
     plan = _compaction_plan(current.row)
     if not isinstance(plan, CompactionRequired):
         return
-    deadline = time.monotonic() + conf.read("direct").number("WORKER_COMPACT_SECONDS")
+    deadline = time.monotonic() + conf.read("direct").number("worker_compact_seconds")
     try:
         _agent_command(client, current, "compact", deadline=deadline)
         ended = client.wait_turn_end(current.pane, max(0, int((deadline - time.monotonic()) * 1000)))
@@ -1140,7 +1140,7 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
         return _blocked_question(client, current)
     if current.status == herdr.AgentStatus.WORKING:
         try:
-            _ = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
+            _ = client.wait_turn_end(current.pane, int(conf.read("direct").number("worker_settle_seconds") * 1000))
             observed = worker_panes.observe_worker(parent, current.row, staff.snapshot())
         except herdr.AgentBlocked as error:
             if codex:
@@ -1229,7 +1229,7 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         print(f"{reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
         return ExitCode.UNCERTAIN
     if codex:
-        deadline = time.monotonic() + conf.read("direct").number("WORKER_SETTLE_SECONDS")
+        deadline = time.monotonic() + conf.read("direct").number("worker_settle_seconds")
         while True:
             receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
             if not isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):

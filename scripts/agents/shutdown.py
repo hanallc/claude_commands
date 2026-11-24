@@ -826,7 +826,7 @@ def retirement_run(argv: list[str], cwd: Path | None = None, *, settings: conf.C
     if isinstance(settings, UseConfiguredValue):
         settings = conf.read("production")
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
-    limit = settings.number("RETIRE_COMMAND_TIMEOUT_SECONDS")
+    limit = settings.number("retire_command_timeout_seconds")
     operation_limit = worker_lifecycle.effective_deadline()
     remaining = operation_limit
     if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE:
@@ -934,12 +934,12 @@ def retirement_terminate(pids: list[int], what: dict[int, str], wait: float | No
         return []
     if isinstance(settings, UseConfiguredValue):
         settings = conf.read("production")
-    duration = settings.number("RETIRE_TERM_WAIT_SECONDS")
+    duration = settings.number("retire_term_wait_seconds")
     operation_limit = worker_lifecycle.effective_deadline()
     started = time.monotonic()
     if started >= operation_limit:
         raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
-    poll = settings.number("RETIRE_POLL_SECONDS")
+    poll = settings.number("retire_poll_seconds")
     if wait is not None:
         duration = min(duration, max(0, wait))
     deadline = min(started + duration, operation_limit)
@@ -1002,11 +1002,11 @@ def retirement_process_inside(pid: int, worktree: Path) -> bool:
 
 def retirement_stop_orphan(unit: RetiringUnit, pid: int, recorded_session_id: str = "", *, settings: conf.ConfigRead) -> list[str]:
     """Only a proven, isolated group of this stopped session can be ended."""
-    duration = settings.number("RETIRE_TERM_WAIT_SECONDS")
+    duration = settings.number("retire_term_wait_seconds")
     operation_limit = worker_lifecycle.effective_deadline()
     if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE and time.monotonic() >= operation_limit:
         raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
-    poll = settings.number("RETIRE_POLL_SECONDS")
+    poll = settings.number("retire_poll_seconds")
     description = f"unowned process {pid}"
     try:
         description = retirement_process_description(pid, settings=settings)
@@ -1304,7 +1304,7 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
         if observed.returncode == 0:
-            limit = min(settings.number("RETIRE_COMMAND_TIMEOUT_SECONDS"),
+            limit = min(settings.number("retire_command_timeout_seconds"),
                         worker_lifecycle.effective_deadline() - time.monotonic())
             result = origin_deletion.delete(unit.production.checkout, "origin", ref,
                                             observed.stdout.split()[0], timeout=limit)

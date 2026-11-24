@@ -188,6 +188,125 @@ class WaitingRowsTests(unittest.TestCase):
         with waiting_rows.locked_journal(journal) as pending:
             self.assertEqual(pending.accepted["example"]["amount"], waiting_rows.AcceptedOrder(2))
 
+    def test_a_newer_published_order_supersedes_an_old_save(self) -> None:
+        _ = (self.peer / waiting_rows.ORDER_PATH).write_text(json.dumps({
+            "example": {"AMOUNT": 5, "amount": 1},
+        }))
+        self.run_git(self.peer, "add", waiting_rows.ORDER_PATH)
+        target = self.peer_change("config/example.conf", "amount=2", "amount=4")
+        waiting_rows.move_to(self.checkout, target)
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "last_order": 4,
+            "register": {"example": {"AMOUNT": {"order": 3, "value": "3"},
+                                     "LIMIT": {"order": 4}, "limit": {"order": 2}}},
+            "changes": [
+                {"stem": "example", "key": "AMOUNT", "value": "3",
+                 "message": "tune(example): Save amount", "save_order": 3},
+                {"stem": "example", "key": "amount", "value": "1",
+                 "message": "tune(example): Older Save", "save_order": 1},
+            ],
+        }))
+        with waiting_rows.locked_journal(journal) as pending:
+            self.assertEqual(pending.order("example", "limit"), 4)
+            self.assertEqual([(change.key, change.save_order) for change in pending.changes], [("amount", 3)])
+            self.assertNotIn('"AMOUNT"', journal.read_text())
+            self.assertNotIn('"LIMIT"', journal.read_text())
+        self.edit("config/example.conf", "amount=4\n", "amount=4\nAMOUNT=3\n")
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True),
+                             ["main: amount=3 has a newer live value; no commit", "main: origin has it", "mac: pulled"])
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual((self.checkout / "config/example.conf").read_text(), SETTINGS.replace("amount=2", "amount=4"))
+
+    def test_an_old_gate_save_uses_the_current_file_and_order(self) -> None:
+        config = self.checkout / "config"
+        gate = config / "gate.conf"
+        legacy_gate = config / "merge_gate.conf"
+        original = "gate_time_limit_factor=2\nother=4\n"
+        _ = gate.write_text(original)
+        legacy_gate.symlink_to("gate.conf")
+        orders = self.checkout / waiting_rows.ORDER_PATH
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        for published_order, expected in ((2, "3"), (5, "2")):
+            with self.subTest(published_order=published_order):
+                _ = gate.write_text(original)
+                _ = orders.write_text(json.dumps({"gate": {"gate_time_limit_factor": published_order}}))
+                self.run_git(self.checkout, "add", "config/gate.conf", "config/merge_gate.conf", waiting_rows.ORDER_PATH)
+                self.run_git(self.checkout, "commit", "-qm", f"Published order {published_order}")
+                _ = journal.write_text(json.dumps({
+                    "last_order": 3,
+                    "register": {"merge_gate": {"GATE_TIME_LIMIT_FACTOR": {"order": 3, "value": "3"}}},
+                    "changes": [{"stem": "merge_gate", "key": "GATE_TIME_LIMIT_FACTOR", "value": "3",
+                                 "message": "tune(gate): Save time limit", "save_order": 3}],
+                }))
+                legacy_gate.unlink()
+                _ = legacy_gate.write_text(original.replace("gate_time_limit_factor=2", "GATE_TIME_LIMIT_FACTOR=3 # local note"))
+                waiting_rows.restore_live(self.checkout)
+                self.assertTrue(legacy_gate.is_symlink())
+                self.assertEqual(legacy_gate.readlink(), Path("gate.conf"))
+                self.assertEqual(gate.read_text(), original.replace("factor=2", f"factor={expected} # local note"))
+                with waiting_rows.locked_journal(journal) as pending:
+                    self.assertEqual(pending.order("gate", "gate_time_limit_factor"), max(3, published_order))
+                    self.assertEqual(pending.changes[0].stem, "gate")
+                    self.assertEqual(pending.changes[0].key, "gate_time_limit_factor")
+                    self.assertNotIn("merge_gate", pending.accepted)
+
+    def test_publication_recovers_the_legacy_row_appended_during_the_rename(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        before = self.peer_change(relative, "amount=2", "AMOUNT=2")
+        waiting_rows.move_to(self.checkout, before)
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        _ = journal.write_text(json.dumps({
+            "last_order": 3, "register": {"example": {"AMOUNT": {"order": 3, "value": "3"}}},
+            "changes": [{"stem": "example", "key": "AMOUNT", "value": "3",
+                         "message": "tune(example): Save amount", "save_order": 3}],
+        }))
+        self.edit(relative, "AMOUNT=2", "AMOUNT=3 # local note")
+        target = self.peer_change(relative, "AMOUNT=2", "amount=2")
+        def old_setting_name(stem: str, key: str) -> tuple[str, str]:
+            return stem, key
+
+        # Use the old name handling while the mover installs the rename.
+        with mock.patch.object(waiting_rows, "migrated_setting_name", old_setting_name):
+            waiting_rows.move_to(self.checkout, target)
+        self.assertEqual(path.read_text(), SETTINGS + "AMOUNT=3 # local note\n")
+        self.edit(relative, "limit=5", "limit=8")
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
+        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3 # local note").replace("limit=5", "limit=8"))
+        self.assertEqual(self.output("show", f"origin/main:{relative}"), SETTINGS.replace("amount=2", "amount=3 # local note"))
+        with pending_rows() as changes:
+            self.assertEqual(changes, [])
+
+    def test_two_legacy_saves_publish_with_the_first_rows_comment(self) -> None:
+        relative = "config/example.conf"
+        path = self.checkout / relative
+        _ = path.write_text(SETTINGS + "AMOUNT=3 # local note\nLIMIT=8\n")
+        journal = waiting_rows.journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        changes = [
+            {"stem": "example", "key": "AMOUNT", "value": "3", "save_order": 3, "message": "tune(example): Save amount"},
+            {"stem": "example", "key": "LIMIT", "value": "8", "save_order": 4, "message": "tune(example): Save limit"},
+        ]
+        _ = journal.write_text(json.dumps({"last_order": 4, "register": {}, "changes": changes}))
+
+        with mock.patch.object(live_settings, "pull_mac", return_value="mac: pulled"):
+            self.assertEqual(live_settings.publish(self.checkout, wait=True), ["main: pushed", "mac: pulled"])
+
+        first = SETTINGS.replace("amount=2", "amount=3 # local note")
+        both = first.replace("limit=5", "limit=8")
+        self.assertEqual(self.output("show", f"origin/main^:{relative}"), first)
+        self.assertEqual(self.output("show", f"origin/main:{relative}"), both)
+        self.assertEqual(path.read_text(), both)
+        self.assertEqual(self.output("status", "--porcelain"), "")
+        with pending_rows() as pending:
+            self.assertEqual(pending, [])
+
     def test_a_staged_setting_refuses_before_the_plan_is_written(self) -> None:
         relative = "config/example.conf"
         self.edit(relative, "limit=5", "limit=8")

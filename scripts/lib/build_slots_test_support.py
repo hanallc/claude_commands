@@ -27,15 +27,16 @@ class SlotTestConfiguration:
 
 def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
     """Set private slot, cargo, and build roots for the fixture."""
+    host = conf.host_key_name(machine)
     if not settings.exists():
         _ = write_config_fixture(settings)
     lines = [line for line in settings.read_text().splitlines()
              if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.build"))]
-    lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={root / 'slots'}",
-                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={root / 'cargo'}",
+    lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{host}={root / 'slots'}",
+                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{host}={root / 'cargo'}",
                   f"roots.build={root / 'build'}"))
-    for host in sorted({"natedev", machine}):
-        lines.append(f"roots.build.{host}={root / 'build'}")
+    for name in sorted({"natedev", host}):
+        lines.append(f"roots.build.{name}={root / 'build'}")
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
@@ -47,6 +48,7 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     slots = root / "slots"
     cargo = root / "cargo"
     machine = host_name()
+    host = conf.host_key_name(machine)
     fixed = f"""# whole: 1..
 names.suffix_length=8
 # whole: 1..64
@@ -58,9 +60,9 @@ roots.temporary={root / 'temporary'}
 roots.build={root / 'build'}
 roots.build.natedev={root / 'build'}
 roots.slots={root / 'default-slots'}
-roots.slots.{machine}={slots}
+roots.slots.{host}={slots}
 roots.slot_cargo={root / 'default-cargo'}
-roots.slot_cargo.{machine}={cargo}
+roots.slot_cargo.{host}={cargo}
 roots.workspace={root / 'workspaces'}
 roots.session={root / 'session'}
 roots.scratch={root / 'scratch'}
@@ -82,24 +84,24 @@ locks.probe_wait_seconds=0.25
 # range: 0.001..1
 locks.probe_retry_seconds=0.005
 # whole: 1..
-slots.{machine}.default_max={default_maximum}
+slots.{host}.default_max={default_maximum}
 # whole: 1..
 folders.unused_days=2
 # range: 5e-324..
 slots.wait_seconds=30"""
     fixed_lines = fixed.splitlines()
-    if machine != "natedev":
-        fixed_lines.append(f"roots.build.{machine}={root / 'build'}")
+    if host != "natedev":
+        fixed_lines.append(f"roots.build.{host}={root / 'build'}")
     mac_hosts = conf.read(settings.with_name("machines.conf")).words("mac.hosts")
     if mac_hosts and mac_hosts[0] != machine:
-        fixed_lines.extend(("# whole: 1..", f"slots.{mac_hosts[0]}.default_max=1"))
+        fixed_lines.extend(("# whole: 1..", f"slots.{conf.host_key_name(mac_hosts[0])}.default_max=1"))
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
     replaced_prefixes = ("slots.", *(f"{key}." for key in keys))
     lines = [line for line in settings.read_text().splitlines()
              if (key := line.partition("=")[0].strip()) not in keys and not key.startswith(replaced_prefixes)]
     lines.extend(fixed_lines)
     if isinstance(maximum, int):
-        lines.extend(("# whole: 1..", f"slots.{machine}.{repository}.max={maximum}"))
+        lines.extend(("# whole: 1..", f"slots.{host}.{repository}.max={maximum}"))
     _ = settings.write_text("\n".join(lines) + "\n")
     copies = settings.with_name("copies.conf")
     _ = write_config_fixture(copies, f"remote_registry={root / 'remote-mirrors'}\ngit_timeout_seconds=10\n")

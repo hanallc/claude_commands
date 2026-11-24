@@ -142,7 +142,7 @@ def _resume_destination(move: WorkerMove, source: str, state: worker_panes.OpenW
     began = time.monotonic()
     if isinstance(state, worker_panes.OpenWorker):
         settings = conf.read("shutdown")
-        stop_seconds = sum(settings.whole(key) for key in ("STOP_GRACE_SECONDS", "KILL_GRACE_SECONDS", "MOVE_STOP_MARGIN_SECONDS"))
+        stop_seconds = sum(settings.whole(key) for key in ("stop_grace_seconds", "kill_grace_seconds", "move_stop_margin_seconds"))
         stopped = restart.stop_row(move.row, move.client, deadline=time.monotonic() + stop_seconds)
         fresh = _observe(move)
         if not stopped or not isinstance(fresh, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):

@@ -1773,7 +1773,7 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
         return
     try:
         settings = conf.read("production")
-        target = settings.text("UNIT_ANOMALIES_TO")
+        target = settings.text("unit_anomalies_to")
         repeat_minutes = settings.number("units_anomaly_repeat_minutes")
         message = "\n".join(lines)
         key = "unit-anomalies:" + hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]

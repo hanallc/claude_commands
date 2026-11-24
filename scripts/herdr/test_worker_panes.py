@@ -139,14 +139,14 @@ class PaneWorld(herdr.Herdr):
         """Install shared accounts, configuration, and process facts."""
         config = test.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                          + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
-                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
-                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
-                          + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
-                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
+        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nworker_split_ratio=0.667\n"
+                          + "# whole: 1..\nunit_compact_above_tokens=43000\n"
+                          + "# range: 1..1800\nworker_compact_seconds=300\n"
+                          + "worker_first_turn_text=Reply with ready. Do not use tools.\n"
+                          + "# range: 1..600\nworker_first_turn_seconds=120\n"
+                          + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
+                          + "# range: 1..600\npane_agent_start_seconds=90\n")
+        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=2\n# whole: 1..300\nmove_stop_margin_seconds=2\n")
         write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
@@ -1304,7 +1304,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_failed_published_worker_closes_its_created_pane_and_keeps_its_row(self) -> None:
         name = staff.WorkerName.parse("held-lock")
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("WORKER_PUBLISH_LOCK_SECONDS=15", "WORKER_PUBLISH_LOCK_SECONDS=0.05"))
+        write_text_atomic(config, config.read_text().replace("worker_publish_lock_seconds=15", "worker_publish_lock_seconds=0.05"))
         flock = fcntl.flock
 
         def acquire(handle: int | worker_lifecycle.LockFileDescriptor, operation: int) -> None:
@@ -1364,7 +1364,7 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(opened, worker_panes.OpenWorker)
         self.completed_dispatch(opened.row, "impl")
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        write_text_atomic(config, config.read_text().replace("pane_agent_start_seconds=90", "pane_agent_start_seconds=37"))
         before = time.monotonic()
         changed = self.start(role="review")
         after = time.monotonic()
@@ -1636,8 +1636,8 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                             "UNIT_COMPACT_ABOVE_TOKENS=67000"))
+        write_text_atomic(config, config.read_text().replace("unit_compact_above_tokens=43000",
+                                                             "unit_compact_above_tokens=67000"))
         self.world.end_agent(first.pane)
         resumed = self.start("reviewer", "review")
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
@@ -1677,8 +1677,8 @@ class WorkerPaneTests(StaffTestCase):
     def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                             "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
+        write_text_atomic(config, config.read_text().replace("unit_compact_above_tokens=43000",
+                                                             "unit_compact_above_tokens=invalid"))
         self.assertIsInstance(self.start(), worker_panes.OpenWorker)
         family, arguments, _ = self.world.requests[-1]
         self.assertEqual(family, "claude")
@@ -1696,8 +1696,8 @@ class WorkerPaneTests(StaffTestCase):
         original = config.read_text()
         for index, value in enumerate(("", "invalid", "0", "-1", "1.5")):
             with self.subTest(value=value):
-                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                           "UNIT_COMPACT_ABOVE_TOKENS=" + value))
+                write_text_atomic(config, original.replace("unit_compact_above_tokens=43000",
+                                                           "unit_compact_above_tokens=" + value))
                 result = self.start(f"compact-{index}")
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 family, arguments, _ = self.world.requests[-1]
@@ -1925,7 +1925,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_first_turn_reads_its_text_and_wait_limit_from_configuration(self) -> None:
         path = self.root / "conf/direct.conf"
         write_text_atomic(path, path.read_text().replace("Reply with ready. Do not use tools.", "Reply with configured-ready.")
-                          .replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=45"))
+                          .replace("worker_first_turn_seconds=120", "worker_first_turn_seconds=45"))
         with patch.object(time, "monotonic", return_value=100.0):
             result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.OpenWorker)
@@ -1970,19 +1970,19 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_configured_launch_timeout_applies_to_fresh_start_and_resume(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        write_text_atomic(path, path.read_text().replace("pane_agent_start_seconds=90", "pane_agent_start_seconds=37"))
         opened = self.start("reviewer", "review")
         self.assertIsInstance(opened, worker_panes.OpenWorker)
         assert isinstance(opened, worker_panes.OpenWorker)
         self.assertTrue(self.world.stop(opened.row, self.world))
-        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=37", "PANE_AGENT_START_SECONDS=61"))
+        write_text_atomic(path, path.read_text().replace("pane_agent_start_seconds=37", "pane_agent_start_seconds=61"))
         resumed = self.start("reviewer", "review")
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
         self.assertEqual(self.world.launch_timeouts, [37000, 61000])
 
     def test_unusable_launch_timeout_refuses_start_without_a_split(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=invalid"))
+        write_text_atomic(path, path.read_text().replace("pane_agent_start_seconds=90", "pane_agent_start_seconds=invalid"))
         result = self.start()
         self.assertIsInstance(result, worker_panes.StartRefused)
         assert isinstance(result, worker_panes.StartRefused)
@@ -2031,7 +2031,7 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_missing_report_at_the_first_turn_deadline_closes_the_unpublished_pane(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=1"))
+        write_text_atomic(path, path.read_text().replace("worker_first_turn_seconds=120", "worker_first_turn_seconds=1"))
         self.world.report_reads_before_publish = 1000000
         result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.UnpublishedWorker)
@@ -2363,12 +2363,12 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_first_split_uses_the_private_live_ratio_and_the_next_split_is_below_it(self) -> None:
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=0.25"))
+        write_text_atomic(config, config.read_text().replace("worker_split_ratio=0.667", "worker_split_ratio=0.25"))
         first = self.start("first")
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[0], herdr.SplitPane("w1:p0", "right", 0.25, "unit-first"))
-        write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.25", "WORKER_SPLIT_RATIO=0.75"))
+        write_text_atomic(config, config.read_text().replace("worker_split_ratio=0.25", "worker_split_ratio=0.75"))
         second = self.start("second")
         self.assertIsInstance(second, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "unit-second"))
@@ -3132,7 +3132,7 @@ class WorkerPaneTests(StaffTestCase):
         original = config.read_text()
         for value in ("0.01", "0.99", "invalid"):
             with self.subTest(value=value):
-                write_text_atomic(config, original.replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=" + value))
+                write_text_atomic(config, original.replace("worker_split_ratio=0.667", "worker_split_ratio=" + value))
                 result = self.start()
                 self.assertIsInstance(result, worker_panes.StartRefused)
                 assert isinstance(result, worker_panes.StartRefused)
@@ -3141,8 +3141,8 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_split_uses_the_range_from_configuration(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667",
-                                                          "# range: 0.05..0.95\nWORKER_SPLIT_RATIO=0.95"))
+        write_text_atomic(path, path.read_text().replace("# range: 0.1..0.9\nworker_split_ratio=0.667",
+                                                          "# range: 0.05..0.95\nworker_split_ratio=0.95"))
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.95, "unit-impl2")])
@@ -3153,7 +3153,7 @@ class WorkerPaneTests(StaffTestCase):
                            "commit", "-qm", "private configuration")):
             _ = subprocess.run(["git", "-C", str(self.root), *arguments], check=True, capture_output=True,
                                text=True, timeout=TEST_HANG_GUARD_SECS)
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=invalid\n")
+        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nworker_split_ratio=invalid\n")
         with redirect_stderr(io.StringIO()) as errors:
             result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)

@@ -63,14 +63,14 @@ def review_timeout_seconds() -> float:
         contents = conf_reads.read_text(NOTIFY_CONFIG)
         for line in contents.splitlines():
             key, separator, value = line.partition("#")[0].partition("=")
-            if separator and key.strip() == "REVIEW_TIMEOUT_SECONDS":
+            if separator and key.strip() == "review_timeout_seconds":
                 seconds = float(value.strip())
                 if not math.isfinite(seconds) or seconds <= 0:
-                    raise ValueError("REVIEW_TIMEOUT_SECONDS must be positive and finite")
+                    raise ValueError("review_timeout_seconds must be positive and finite")
                 return seconds
-        raise ValueError("missing REVIEW_TIMEOUT_SECONDS")
+        raise ValueError("missing review_timeout_seconds")
     except (OSError, ValueError) as error:
-        print(f"review: {NOTIFY_CONFIG}: {error}; using REVIEW_TIMEOUT_SECONDS=60", file=sys.stderr)
+        print(f"review: {NOTIFY_CONFIG}: {error}; using review_timeout_seconds=60", file=sys.stderr)
         return 60.0
 
 

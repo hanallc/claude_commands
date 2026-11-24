@@ -1268,8 +1268,8 @@ class MacPromotionPathTests(unittest.TestCase):
                                    + f"sys.exit({code})\n")
                 ssh.chmod(0o755)
                 config = state / "merge_checkpoint.conf"
-                _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n"
-                                      + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                _ = config.write_text("# whole: 1..\nmac_pull_tries=2\n"
+                                      + "# range: 0..\nmac_pull_retry_seconds=0\n")
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
@@ -1316,7 +1316,7 @@ print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
 ''')
                 ssh.chmod(0o755)
                 _ = (state / "merge_checkpoint.conf").write_text(
-                    "# whole: 1..\nMAC_PULL_TRIES=1\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                    "# whole: 1..\nmac_pull_tries=1\n# range: 0..\nmac_pull_retry_seconds=0\n")
                 offline = state / "offline"
                 offline.touch()
                 targets = ((PurePosixPath("~/custom checkout"), state / "first-source"),

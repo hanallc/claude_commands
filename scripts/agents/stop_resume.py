@@ -170,7 +170,7 @@ def _pending_producer_opening(name: str, saved: dict[str, object]) -> PendingPro
 
 
 def producer_folder(name: str) -> Path:
-    root = conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")
+    root = conf.read_or_repository("staff").text("producer_folder_root")
     return Path(root).expanduser() / name
 
 
@@ -181,7 +181,7 @@ def _producer_start_request(row: StaffRow) -> ProducerFirstStart:
 
 def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
                            client: herdr.Herdr) -> PendingProducerAdmission:
-    workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
+    workspace = conf.read_or_repository("staff").text("producer_workspace")
     environment = account_reader.named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
     prepared = herdr.prepare_agent_environment(str(request.folder), environment)
     if isinstance(prepared, nix_env.Refused):
@@ -495,7 +495,7 @@ def _confirm_producer_opening(request: ProducerFirstStart, opening: PendingProdu
                 raise OSError(reason(cursor.readability))
             proof = client.submit_opening_prompt(pending.pane, herdr.OpeningPrompt(
                 text, transcript, cursor=cursor, resend_once=resend),
-                opening.since, int(conf.read("shutdown").number("START_SECONDS") * 1000))
+                opening.since, int(conf.read("shutdown").number("start_seconds") * 1000))
             if isinstance(proof, herdr.PromptNotSubmitted):
                 state = cursor.readability
                 raise OSError(reason(state) if isinstance(state, UnprovedCodexRollout) and not resend else proof.reason)
@@ -634,7 +634,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
-                int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)
+                int(conf.read("shutdown").number("start_seconds") * 1000), agent=request.name)
             if isinstance(outcome, herdr.PromptNotSubmitted):
                 raise OSError(outcome.reason)
         entry = client.producer_admission_launch(pending.pane, kind)
@@ -1098,7 +1098,7 @@ def _retire_prompt(session_id: str) -> None:
 
 
 def stop_grace_seconds() -> float:
-    return float(conf.read("shutdown").text("STOP_GRACE_SECONDS"))
+    return float(conf.read("shutdown").text("stop_grace_seconds"))
 
 
 def stop_target(session: str, *, strict: bool = False) -> str | SessionNotFound | StopFailed:
@@ -1162,7 +1162,7 @@ def _stop(session: str, kind: str = "", *,
     signal_pid = 0
     try:
         settings = conf.read("shutdown")
-        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("KILL_GRACE_SECONDS"))
+        stop_grace, kill_grace = stop_grace_seconds(), float(settings.text("kill_grace_seconds"))
         attempt = _move_stop_target.get()
         pinned = attempt.target if isinstance(attempt, MoveStopAttempt) else attempt
         if isinstance(pinned, MoveStopTarget):
@@ -1425,8 +1425,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     settings = conf.read("shutdown")
-    start_seconds = settings.number("START_SECONDS")
-    _ = settings.number("STAY_SECONDS")
+    start_seconds = settings.number("start_seconds")
+    _ = settings.number("stay_seconds")
     home = str(_launch_home(entry).path)
     transcript = herdr.SessionTranscript(Path(home), entry["session_id"])
     cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
@@ -1576,7 +1576,7 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         try:
             locks.enter_context(herdr.reboot_lock())
             settings = conf.read("shutdown")
-            for key in ("START_SECONDS", "STAY_SECONDS"):
+            for key in ("start_seconds", "stay_seconds"):
                 _ = settings.number(key)
         except (conf.Unusable, herdr.RebootLockBusy) as error:
             return ResumeFailed(session, str(error))
@@ -1731,7 +1731,7 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
     owner = unit_lookup.checked_unit(production, unit, record=record)
     if not isinstance(owner, unit_lookup.NonAgentPaneHolders):
         return owner
-    seconds = conf.read("shutdown").number("HOLDER_EXIT_SECONDS")
+    seconds = conf.read("shutdown").number("holder_exit_seconds")
     deadline = monotonic() + operation_deadline.remaining(seconds)
     wait = Event()
     while isinstance(owner, unit_lookup.NonAgentPaneHolders):
@@ -1978,7 +1978,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             attempt_pane = tab.pane_id
             launched = herdr.launch_prepared_agent(client.session, herdr.ExistingPane(tab.pane_id, ""), prepared, kind,
                 trust_arguments(kind, entry["cwd"], resume_arguments(entry)), herdr.NoOpeningPrompt(),
-                int(operation_deadline.remaining(conf.read("shutdown").number("START_SECONDS")) * 1000),
+                int(operation_deadline.remaining(conf.read("shutdown").number("start_seconds")) * 1000),
                 agent=entry["name"] or identity, client=client)
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
@@ -2183,7 +2183,7 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
                 requester: str = "", why: str = "") -> str:
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     settings = conf.read("shutdown")
-    stay_seconds = settings.number("STAY_SECONDS")
+    stay_seconds = settings.number("stay_seconds")
     began = monotonic()
     while _same_process(pid, generation):
         remaining = stay_seconds - (monotonic() - began)
@@ -2199,7 +2199,7 @@ def _send_move_push(push: RenderedPush, key: str) -> None:
     from scripts.notify import push_texts, review
 
     try:
-        window = conf.read("shutdown").whole("MOVE_ALERT_REPEAT_MINUTES")
+        window = conf.read("shutdown").whole("move_alert_repeat_minutes")
         limit = review.user_send_seconds()
         command = push_texts.user_send_argv(push, key=key, timeout=limit)
         command.extend(("--repeat-minutes", str(window)))
@@ -2460,11 +2460,11 @@ def _end_user_claims(held: Mapping[str, RowHeld]) -> None:
 
 def _hung_holder_seconds(settings: conf.ConfigRead) -> float:
     """Limit the wait for a holder that is hung: one stop and one start of a restart, a resume or a move."""
-    stop = (settings.whole("STOP_GRACE_SECONDS") + settings.whole("KILL_GRACE_SECONDS")
-            + settings.whole("MOVE_STOP_MARGIN_SECONDS"))
-    upkeep = settings.number("UPKEEP_ROW_WAIT_SECONDS") + settings.number("RESTART_RECORD_LOCK_SECONDS")
-    start = (settings.number("HOLDER_EXIT_SECONDS") + settings.number("OWN_PANE_SHELL_SECONDS")
-             + settings.number("START_SECONDS") + settings.number("OPENING_PROMPT_SECONDS") + settings.number("STAY_SECONDS"))
+    stop = (settings.whole("stop_grace_seconds") + settings.whole("kill_grace_seconds")
+            + settings.whole("move_stop_margin_seconds"))
+    upkeep = settings.number("upkeep_row_wait_seconds") + settings.number("restart_record_lock_seconds")
+    start = (settings.number("holder_exit_seconds") + settings.number("own_pane_shell_seconds")
+             + settings.number("start_seconds") + settings.number("opening_prompt_seconds") + settings.number("stay_seconds"))
     return stop + upkeep + start
 
 

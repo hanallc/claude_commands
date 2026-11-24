@@ -497,7 +497,7 @@ def _scope_stop_lock(path: Path, *, blocking: bool) -> Generator[bool]:
 
 def _scope_stop_graces() -> tuple[float, float]:
     settings = conf.read("shutdown")
-    return float(settings.text("STOP_GRACE_SECONDS")), float(settings.text("KILL_GRACE_SECONDS"))
+    return float(settings.text("stop_grace_seconds")), float(settings.text("kill_grace_seconds"))
 
 
 def _finish_slice_stop(
@@ -1667,7 +1667,7 @@ def command_start(args: argparse.Namespace) -> int:
                       + f"log {twin['log']}); started nothing; its result arrives as your next message")
                 return 0
             try:
-                limit = conf.read("detached_runs").whole("LIVE_RUN_LIMIT")
+                limit = conf.read("detached_runs").whole("live_run_limit")
             except conf.Unusable as error:
                 print(f"detached_runs: {error}", file=sys.stderr)
                 return 2
@@ -1729,7 +1729,7 @@ def _exit_status(returncode: int) -> int:
 
 
 def _cut_line(line: str) -> str:
-    limit = conf.read("detached_runs").whole("RESULT_LINE_CHARS")
+    limit = conf.read("detached_runs").whole("result_line_chars")
     if len(line) <= limit:
         return line
     return f"{line[:limit]} [cut: {len(line) - limit} more characters]"
@@ -1822,13 +1822,13 @@ def result_text(record: RunRecord, result: CommandResult) -> str:
             lines.extend(["", cancellation])
     header = "\n".join(lines)
     limits = conf.read("detached_runs")
-    tail_heading = f"\n\nLast log lines (lines over {limits.whole('RESULT_LINE_CHARS')} characters are cut):\n"
+    tail_heading = f"\n\nLast log lines (lines over {limits.whole('result_line_chars')} characters are cut):\n"
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES,
-                 limits.whole("RESULT_TEXT_CHARS") - len(header) - len(tail_heading))
+                 limits.whole("result_text_chars") - len(header) - len(tail_heading))
     if cancellation:
         tail = [line for line in tail if line != _cut_line(cancellation)]
     body = tail_heading + "\n".join(tail) if tail else ""
-    label_budget = max(0, limits.whole("RESULT_TEXT_CHARS") - len(header) - len(body))
+    label_budget = max(0, limits.whole("result_text_chars") - len(header) - len(body))
     lines[0] += record["label"][:label_budget]
     header = "\n".join(lines)
     return header + body
@@ -2108,8 +2108,8 @@ def _alert_failed_push(path: Path, *, check_receipt: bool = False) -> None:
 def _retry_failed_push(path: Path) -> None:
     """Retry a pending result after the supervisor releases the completion lock."""
     settings = conf.read("detached_runs")
-    limit = settings.whole("RESULT_PUSH_RETRIES")
-    delay = settings.number("RESULT_PUSH_RETRY_SECONDS")
+    limit = settings.whole("result_push_retries")
+    delay = settings.number("result_push_retry_seconds")
     while True:
         with record_lock(path):
             record = _read_record(path)

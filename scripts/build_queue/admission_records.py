@@ -191,7 +191,7 @@ class RepositoryRunLimits:
         return self.for_repository(machine, repository)
 
     def for_repository(self, machine: str, repository: str) -> RepositoryRunLimit | NoRepositoryRunLimit:
-        key = f"{machine}.{repository}"
+        key = f"{conf.host_key_name(machine)}.{repository}"
         if key not in self.by_machine_and_repository:
             return NoRepositoryRunLimit()
         return RepositoryRunLimit(self.by_machine_and_repository[key])
