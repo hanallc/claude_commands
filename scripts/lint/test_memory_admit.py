@@ -2536,6 +2536,18 @@ class QueueLifetimeReaderTests(unittest.TestCase):
             self.assertFalse(left.intervals)
             self.assertEqual(len(fixture.history()), 1)
 
+    def test_an_admitted_row_without_passed_reads_as_not_recorded(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = only_admitted(fixture.server.handle_request(fixture.request()))
+            step, = gate.read_queue_lifetimes(fixture.state_dir)
+            self.assertEqual(step.intervals[0].passed, gate.PassedRows(0, 0, 0, 0, 0, 0))
+            path = fixture.state_dir / "queue_times.jsonl"
+            events = [{key: value for key, value in event.items() if key != "passed"}
+                      for event in step_estimator.anonymous_history_rows(path)]
+            _ = path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            step, = gate.read_queue_lifetimes(fixture.state_dir)
+            self.assertEqual(step.intervals[0].passed, gate.PassedNotRecorded())
+
     def test_token_return_joins_intervals_without_completing_the_step(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(since=fixture.clock.now() - 5)
@@ -2723,7 +2735,7 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             assert not isinstance(saved, admission_records.NoQueuePriority)
             self.assertNotIn("until", wire.encode_record(saved))
             self.assertEqual([entry["unit"] for entry in saved.entries], ["first", "second"])
-            self.assertEqual(admission.server.handle_request(wire.PriorityClearRequest("clear", "showrunner-id")), [wire.Ok()])
+            self.assertEqual(admission.server.handle_request(wire.PriorityClearRequest("clear", "showrunner-id", why="clear words")), [wire.Ok()])
             reading, = admission.server.handle_request(wire.ViewRequest())
             assert isinstance(reading, wire.ViewReply)
             self.assertEqual([step.pid for step in reading.reading.view.waiting], [300, 400])
@@ -6410,6 +6422,69 @@ class QueueExplanationTests(MemoryQueueFixture):
         rows = gate.admission_pass(memory_hold, inputs.now, policy).rows
         self.assertEqual(rows[1].reason, follower.reason)
         self.assertIsInstance(rows[2].admission, gate.ProposedAdmission)
+
+    def passed_by_started_owner(self, inputs: admission_records.QueueInputs, result: gate.PassResult
+                                ) -> dict[str, gate.PassedRows | gate.PassedNotRecorded]:
+        """Count the passed rows of each step that the pass admits, and check the memory rule."""
+        passed = {row.owner: gate.passed_rows(result.policy.walk, row.owner, inputs.pending_remote_starts)
+                  for row in result.rows if row.decision.state == "admit"}
+        for owner, counts in passed.items():
+            assert isinstance(counts, gate.PassedRows), owner
+            self.assertEqual(counts.memory, 0, owner)
+        return passed
+
+    def test_a_start_past_a_run_limit_head_counts_run_limit_rows(self) -> None:
+        repo = "claude_commands"
+        _ = self.running(100, 2, age=30, fields={"repo": repo, "step": "gate"})
+        _ = self.running(200, 2, age=30, fields={"repo": repo, "step": "test-affected"})
+        _ = self.waiting(300, 2 * GIB, 20, repository_name=repo, step="test-affected")
+        _ = self.waiting(400, 2 * GIB, 10, repository_name=repo, step="test-affected")
+        self.processes[500] = "other"
+        _ = self.waiting(500, 2 * GIB, 5, repository_name="other", step="test-affected")
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        policy = replace(admission_policy_fixture(),
+            repository_runs=admission_records.RepositoryRunLimits({f"natedev.{repo}": 2}))
+        result = gate.admission_pass(inputs, inputs.now, policy)
+        self.assertEqual([row.decision.state for row in result.rows], ["hold", "hold", "admit"])
+        first, second, _ = result.policy.walk
+        # The second row waits behind the first row, so the run limit holds it too (rule 8).
+        hold = second.decision.order_hold
+        assert isinstance(hold, admission_records.HeldBehindHead)
+        self.assertEqual(admission_records.waiter_owner(hold.waiter), admission_records.waiter_owner(first.waiter))
+        self.assertEqual([entry.run_limit_line for entry in result.policy.walk],
+                         [gate.HeldByRunLimit(), gate.HeldByRunLimit(), gate.NotHeldByRunLimit()])
+        started = result.rows[2].owner
+        self.assertEqual(self.passed_by_started_owner(inputs, result), {started: gate.PassedRows(2, 0, 0, 0, 0, 0)})
+        head = result.policy.queued_head
+        assert isinstance(head, gate.QueuedHead)
+        # is_head is false: the first queued row waits for its run limit.
+        self.assertNotEqual(admission_records.waiter_owner(head.waiter), started)
+
+    def test_a_start_past_a_token_waiting_row_counts_a_cargo_token_row(self) -> None:
+        _ = self.waiting(300, 2 * GIB, 20, token_left_at=NOW.timestamp() - 60)
+        _ = self.waiting(400, 2 * GIB, 5)
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual([row.decision.state for row in result.rows], ["hold", "admit"])
+        self.assertIsInstance(result.policy.walk[0].state, admission_records.TokenWaitingWaiter)
+        self.assertEqual(self.passed_by_started_owner(inputs, result),
+                         {result.rows[1].owner: gate.PassedRows(0, 1, 0, 0, 0, 0)})
+
+    def test_no_start_passes_a_local_row_that_waits_for_memory(self) -> None:
+        _ = self.running(100, 2, age=30)
+        _ = self.waiting(300, 70 * GIB, 20)
+        _ = self.waiting(400, 2 * GIB, 10)
+        self.processes[500] = "zero"
+        _ = self.waiting(500, 0, 5)
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual([row.decision.state for row in result.rows], ["hold", "hold", "hold"])
+        # The count sees a fault: with the zero-need switch on, a start passes the memory rows.
+        with patch.object(gate, "ZERO_NEED_MAY_PASS", True):
+            fault = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+        self.assertEqual([row.decision.state for row in fault.rows], ["hold", "hold", "admit"])
+        self.assertEqual(gate.passed_rows(fault.policy.walk, fault.rows[2].owner, inputs.pending_remote_starts),
+                         gate.PassedRows(0, 0, 0, 0, 0, 2))
 
     def test_verify_waiting_only_for_its_run_limit_does_not_hold_another_repository(self) -> None:
         _ = self.waiting(300, 2 * GIB, 20, repository_name="hana", step="nextest")

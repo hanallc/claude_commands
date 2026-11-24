@@ -15,6 +15,7 @@ from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_queue.scope_activity import RunIdentity as RunIdentity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
     StepJob, VerifyStep)
@@ -71,13 +72,6 @@ class UnsupportedVersion(ValueError):
 @dataclass(frozen=True)
 class Owner:
     """The owner identity holds a process identifier and start time."""
-    pid: int
-    start_time: str
-
-
-@dataclass(frozen=True)
-class RunIdentity:
-    """The run identity holds a process identifier and start time."""
     pid: int
     start_time: str
 
@@ -328,20 +322,29 @@ class MineRequest(CallerCode):
 
 
 @dataclass(frozen=True)
+class WordsNotGiven:
+    """The caller gave no --words; the service refuses unless a plain shell asked."""
+
+
+WORDS_NOT_GIVEN = WordsNotGiven()
+
+
+@dataclass(frozen=True)
 class PrioritySetRequest(CallerCode):
-    """The request sets queue priority for a unit with a reason and actor."""
+    """Set queue priority for a unit and record the actor and the user's words."""
     request_id: str
     unit: str
-    why: str
+    why: str | WordsNotGiven
     actor: str
 
 
 @dataclass(frozen=True)
 class PriorityClearRequest(CallerCode):
-    """The request clears queue priority with an actor and optional unit."""
+    """The request clears queue priority with an actor, optional unit, and the user's words."""
     request_id: str
     actor: str
     unit: str = ""
+    why: str | WordsNotGiven = WORDS_NOT_GIVEN
 
 
 @dataclass(frozen=True)
@@ -745,6 +748,7 @@ Reply = (VerifyRunSlotWaiting
          | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
+_UNIT_PRIORITY_ONLY = "priority applies to a unit"
 _REQUESTS: dict[str, type] = {
     "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
@@ -833,6 +837,10 @@ def parse_record(text: str, schema: type[T]) -> T:
 
 
 def _parse_value(value: object, schema: type[T]) -> T:
+    if schema is PrioritySetRequest and isinstance(value, dict):
+        value = cast(dict[str, object], value)
+        if "target" in value:
+            raise ValueError(_UNIT_PRIORITY_ONLY)
     if schema in (QueueMoveRequest, QueueUndoRequest):
         if not isinstance(value, dict):
             raise ValueError("Invalid queue move request.")
@@ -863,12 +871,16 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if type(version) is not int or not 1 <= version <= VERSION:
             raise UnsupportedVersion(version)
         name = envelope.get("type")
-        if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
+        if not isinstance(name, str) or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
-        data = envelope["data"]
-        if version < 3 and variants[name] in _PLACEMENT_TYPES:
+        if variants is _REQUESTS and name == "priority_run_set":
+            raise ValueError(_UNIT_PRIORITY_ONLY)
+        schema = variants.get(name)
+        if schema is None:
+            raise ValueError("invalid admission envelope")
+        if version < 3 and schema in _PLACEMENT_TYPES:
             raise ValueError("placement requires version 3")
-        return version, cast(object, _parse_value(data, variants[name]))
+        return version, cast(object, _parse_value(envelope["data"], schema))
     except (ArithmeticError, KeyError, RecursionError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 

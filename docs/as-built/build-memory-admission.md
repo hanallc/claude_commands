@@ -579,18 +579,53 @@ An expired estimate requires a client refresh through the service.
 | `release` | Finalize one reservation |
 | `width` | Record the requested test width |
 | `token_wait` | Finalize a reservation and preserve its queue place |
-| `priority_set`, `priority_clear` | Change the one unit priority |
+| `priority_set`, `priority_clear` | Add a unit entry to the priority list, or remove entries |
 | `view`, `explain`, `mine` | Read the stored pass |
 
-`/build:bump <position|session|folder>` selects a waiting step by position, session, or folder.
-The command resolves session names through the staff roster. It reads positions and folders from `queue.json`.
-Set and clear append to `admission/person_actions.jsonl` under a file lock and sync the file.
-Each record holds its id, actor, time and reason. A set also holds the selected step's queue key.
-The command prints `recorded` and the id after the write. It uses no service socket.
-An unmatched selector or unknown unit exits 3 and writes no record.
-The socket priority requests still serve existing clients.
-`/build:bump` works from any session or a plain shell.
-`queue_command_actor()` selects `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then `"user"`.
+`/build:bump` selects a waiting step by position, session, or folder.
+A numeric selector uses the published queue view and includes kept positions.
+A session or folder selector can also use the saved queue order.
+Set and clear append to `admission/person_actions.jsonl` under a file lock.
+Each record contains an id, actor, time, and reason.
+A set also contains the selected step's queue key and position.
+The command syncs the record and prints its id.
+The command uses no service socket.
+The service still accepts socket priority requests from existing clients.
+Both paths apply priority through `_change_priority`.
+An empty saved clear advances the journal offset without reading history.
+An empty clear from a socket checks history.
+Neither empty clear writes a transition.
+
+`--words` supplies the record's reason and the history entry's reason.
+The command passes the user's request as `--words`.
+The command and the socket refuse a session that supplies no words.
+A plain shell without words stores `typed by nate in a plain shell`.
+`queue_command_actor()` checks `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, then uses `"user"`.
+
+A set stores the actor in `set_by` and resolves the actor's name for `asker`.
+If the roster has no name, the entry shows the session id.
+A plain shell shows `nate (plain shell)`.
+An older entry with no actor name shows its reason alone.
+A pending transition stays in state until the service writes its history row.
+The service retries a failed history write before it applies another change.
+
+`/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
+The no-unit display placeholder supplies no unit.
+Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
+Each pass applies bump records in file order before it ranks the waiters.
+The service saves the byte offset with the priority change in `admission/state.json`.
+A restart resumes at that offset.
+Complete records stay in the file.
+A bump for a departed step saves a refusal with the offset.
+The Builds page shows the saved time of each pending record in the user's zone.
+It shows the reason for each refusal.
+An applied record leaves the list of pending records.
+The priority tooltip shows the units in order and one `Bump` line for each entry.
+Each entry shows the unit, the actor's name, and the user's words.
+The service saves an applied move with the admission episode and the journal offset.
+Moved is the last column.
+It shows the actor in an orange mark for a moved row and a dash for other rows.
+The mark's tooltip shows the actor, source place, destination, and request time in the user's zone.
 
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
@@ -708,9 +743,32 @@ The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
-1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
+1. `admitted` records the original arrival, admission time, wait seconds, need, need source, `is_head`, and `passed`.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+
+`is_head` is true when the step was the first queued row in queue order.
+A token-waiting row is not a queued row.
+A false `is_head` does not show that the step went past a row that waits for memory.
+The first queued row is often a step that waits for its repository run limit.
+
+`passed` is a `PassedRows` object. It counts the earlier rows that the step went past, by cause.
+`passed_rows` reads the walk of the pass that admitted the step.
+The walk records the `run_limit` cause on each row as `HeldByRunLimit`, so `passed_rows` does not repeat rule 8.
+A row that the same pass admits is not a passed row.
+Each passed row has one cause. The first cause in this list that applies is the cause:
+
+1. `run_limit`: the row waits for its repository run limit, or waits behind such a row (rule 8).
+2. `cargo_token`: the row left to wait for the Cargo token.
+3. `other_machine`: the row is not routed to natedev, or a remote start is pending for it.
+4. `gpu`: the row waits for a GPU test slot.
+5. `folder`: the row waits for a busy Cargo folder.
+6. `memory`: any other held local row.
+
+The walk never starts a step past a local row that waits for memory, so `memory` is always 0.
+A nonzero `memory` is a walk fault.
+A cloud admission is not in the local walk and has no `passed`.
+`read_queue_lifetimes` reads a row without `passed` as `PassedNotRecorded`, not as zero counts.
 
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
@@ -1361,23 +1419,6 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 `run()` wraps `run_once`. A failed step is a memory kill when its output shows `SIGKILL|SIGTERM|signal: (9|15)` and the journal shows, inside the step's window, earlyoom's `sending SIG(TERM|KILL) to process` (`journalctl -u earlyoom`) or the kernel's `Memory cgroup out of memory` / `Out of memory: Killed` (`journalctl -k`). The query lives in `memory_kill_in_journal` so tests can stub `journalctl`. A memory kill is never the tree's failure: the step re-runs once (`killed for memory: <step>; retrying once`), and a second kill exits 137 with `killed for memory twice: <step>`. Each kill appends a byte to `MEM_KILL_FILE`; the second creates `<file>.stopped`. `note_event` passes `BUILDLOG_MEM_KILLS` and `BUILDLOG_MEM_KILL_STOPPED` to `record.py call`.
 
 `verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
-
-`/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
-The no-unit display placeholder supplies no unit.
-Unknown units keep the saved priority and return exit 3 with a refusal on stdout.
-Each pass applies bump records in file order before it ranks the waiters.
-The service persists the byte offset with the priority change in `admission/state.json`.
-A restart resumes at that offset. Complete records stay in the file.
-A set for a departed step saves a refusal with the offset.
-The Builds page shows the saved time of each waiting record in the user's zone.
-It shows the reason for each refusal. An applied record leaves the waiting list.
-A set record saves the selected step's queue place and the request time.
-When the service changes priority, it saves the applied bump with the admission episode and the journal offset.
-The applied record has the actor, source place, destination, and request time.
-The feed includes the bump on waiting and running rows for that episode.
-Moved is the last column. It shows the actor in an orange bump mark, or a dash when the row has no move.
-A kept place shows a dash.
-Hover on the mark to see the queue place, actor, source place, destination, and request time in the user's zone.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
@@ -2476,7 +2517,7 @@ The table starts half the cap line and one gap past the cap, and the fit measure
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
-A small line under a title (the showrunner or repository line, or a waiting note with the job start of a CI row) never wraps either. It ends in an ellipsis in the same way.
+A small line under a title (the showrunner or repository line, or a waiting note) never wraps either. It ends in an ellipsis in the same way.
 The 12rem cap (9rem in a narrow pane) on the label column stays.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
@@ -2496,7 +2537,7 @@ It loads `scripts/build_queue/builds_page_real_rows.json`, a cut of a real queue
 3. A running and a waiting hana CI row.
 4. A Mac build, and an AWS row.
 5. A fixed Mac-only waiting row.
-6. A waiting hana CI row with a long waiting note and a job start.
+6. A waiting hana CI row with a long waiting note, and a job start in its hover.
 The queue-move stub gives the page a token, so the reorder handles draw.
 At 1440 px and at 900 px, dark, it fails when one of these is false:
 1. The table has no Unit and no Slot column.
@@ -2706,8 +2747,8 @@ So each step of one CI job ranks at the job start, ahead of steps that arrived a
 Queue priority remains the first ordering field.
 A step with `NoJobStart` keeps its arrival place.
 `state.json` saves the job start with the waiter place, so the place survives a service restart.
-The Builds page waiting row shows `job started <time> · <age> ago` in the user zone, after any wait reason.
-Its hover shows the same time and age under `Job start`.
+The Builds page shows the job start only in the hover of the waiting row, under `Job start`.
+The hover shows the time in the user zone and the age.
 The page shows no time left to the 6-hour limit; that comes with a config key for the limit.
 
 Registered process trees count through their reservations.

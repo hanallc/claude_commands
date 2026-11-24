@@ -65,6 +65,8 @@ from scripts.build_queue.admission_wire import (
     QueueMoveConflict as QueueMoveConflict,
     PrioritySetRequest as PrioritySetRequest,
     PriorityClearRequest as PriorityClearRequest,
+    WordsNotGiven as WordsNotGiven,
+    WORDS_NOT_GIVEN as WORDS_NOT_GIVEN,
     TokenWaitRequest as TokenWaitRequest,
     CloudSlotWait as CloudSlotWait,
     Wait as Wait,

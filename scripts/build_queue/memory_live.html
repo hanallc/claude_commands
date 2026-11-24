@@ -492,6 +492,8 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
+.outside-queue-row { grid-template-columns: minmax(0, 1fr) max-content; }
+.outside-queue-row + .outside-queue-row { border-top: 1px solid var(--line); }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
@@ -718,6 +720,12 @@ small .aws-point { cursor: help; }
     <summary><span class="chev" aria-hidden="true">▶</span><span class="name"></span></summary>
     <div id="build-limits-content"></div>
   </details>
+
+  <section class="card" id="outside-queue" hidden>
+    <div class="section-head">Tests outside the queue</div>
+    <div id="outside-queue-rows"></div>
+  </section>
+
   <section class="card" id="aws-costs" aria-label="AWS costs">
     <div class="aws-title">
       <div class="section-head">AWS costs</div>
@@ -736,6 +744,10 @@ function field(label, value, kind = 'field', group = false) {
 }
 function staffField(label, names) {
   return {...field(label, names.join(', ')), valueStaffNames: names};
+}
+// Each bump line names the unit or the one run, the actor that asked, and the user's words.
+function priorityFields(entries, lines) {
+  return [staffField('Priority', entries.map(entry => entry.unit)), ...(lines || []).map(line => field('Bump', line))];
 }
 function staffTitle(name, value, suffix = '') {
   return {...field(name + suffix, value, 'title'), labelStaffName: name, labelSuffix: suffix};
@@ -1995,7 +2007,7 @@ function stepTooltip(key, data) {
       return {...field(partsText(parts), group.parts[index][1].text), labelParts:parts};
     }))];
   rows.push(...ownerFields(row), ...detailFields, ...stepFields);
-  if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
+  if (row.priority_entries?.length) rows.push(...priorityFields(row.priority_entries, row.priority_lines));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
@@ -2085,7 +2097,7 @@ function tooltipRows(key, rawData) {
   if (kind === 'swap-pool') return poolTip(index, data);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
-    rows.push(staffField('Priority', data.unmatched_priority_entries.map(entry => entry.unit)));
+    rows.push(...priorityFields(data.unmatched_priority_entries, data.unmatched_priority_lines));
   return rows;
 }
 function tooltipHtml(key, data) {
@@ -2561,6 +2573,7 @@ function render(d) {
   renderBuildLimits(d.build_limits);
   renderSwap(d);
   renderLeftovers(d);
+  renderOutsideQueue(d);
   restoreReportView(view);
 }
 
@@ -2793,6 +2806,17 @@ function renderLeftovers(d) {
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
     `<div class="leftover-row"><span class="detail">${roleName(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? leftoverReadings.get(scope).text : ""}</span></div>`));
   $("leftover-rows").innerHTML = rows.length ? rows.join("") : "No leftover processes.";
+}
+
+function renderOutsideQueue(d) {
+  const rows = d.outside_queue || [];
+  $("outside-queue").hidden = rows.length === 0;
+  $("outside-queue-rows").innerHTML = rows.map(row => {
+    const owner = row.owner || "Owner unknown";
+    const names = row.unit && row.unit !== owner
+      ? `${staffName(row.unit)} · ${staffName(owner)}` : staffName(owner);
+    return `<div class="leftover-row outside-queue-row"><span class="detail">${names} · ${esc(row.command)}</span><span class="num">${row.cpu_seconds.toFixed(1)} s CPU</span></div>`;
+  }).join("");
 }
 
 function reportCost(value, unit = "h/day") {
@@ -3371,8 +3395,7 @@ function renderWalk(d) {
     cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass, "—", "—", w.last_move, w.name);
     const reason = w.order_note
       || (["build hold", "build space", "the build in the same Cargo folder", "machine choice"].includes(w.why) ? w.reason : "");
-    const note = [reason, w.job_start && `job started ${w.job_start}`].filter(Boolean).join(" · ");
-    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(labels, note)}` +
+    rows.push(`<div class="wrow ${rowClass}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${grip(w)}${rowLabel(labels, reason)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
