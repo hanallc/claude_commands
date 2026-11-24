@@ -12,13 +12,46 @@ SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 SETTINGS_LOCAL_KEYS_NOTICES="settings.local-key-notices.json"
 _SETTINGS_LOCAL_ROOT="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)"
 
+# Read HEAD and the four index stages in order. Emit null for unavailable objects.
+_settings_local_keys_references() {
+    local objects oid kind reference head_oid="" head=null
+    objects="$(git -C "$_SETTINGS_LOCAL_ROOT" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null <<'EOF'
+HEAD:settings.json
+:0:settings.json
+:1:settings.json
+:2:settings.json
+:3:settings.json
+EOF
+    )" || { printf '%s\n' null; return; }
+    while read -r oid kind; do
+        reference=null
+        if [[ "$kind" == blob ]]; then
+            if [[ "$oid" == "$head_oid" ]]; then
+                reference="$head"
+            else
+                reference="$(git -C "$_SETTINGS_LOCAL_ROOT" cat-file blob "$oid" 2>/dev/null |
+                    jq -cs 'if length == 1 and (.[0] | type) == "object" then .[0] else null end' 2>/dev/null)" ||
+                    reference=null
+            fi
+        fi
+        printf '%s\n' "$reference"
+        if [[ -z "$head_oid" ]]; then
+            head_oid="$oid"
+            head="$reference"
+        fi
+    done <<<"$objects"
+}
+
+_SETTINGS_LOCAL_SHARED_KEYS='[.[] | objects | keys[]] | unique'
+
 settings_local_keys_baseline() {
-    local baseline
-    baseline="$(git -C "$_SETTINGS_LOCAL_ROOT" show HEAD:settings.json)" || {
+    local references
+    references="$(_settings_local_keys_references)"
+    if [[ "${references%%$'\n'*}" == null ]]; then
         echo "settings: cannot read committed HEAD:settings.json" >&2
         return 1
-    }
-    printf '%s\n' "$baseline" | jq -ce 'if type == "object" then keys else error("settings must be an object") end'
+    fi
+    jq -cs "$_SETTINGS_LOCAL_SHARED_KEYS" <<<"$references"
 }
 
 # Preserve hook groups that run commands on one machine.
@@ -37,17 +70,17 @@ def local_hooks: with_entries(.value |= map(select(local_hook))) | with_entries(
 def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_entries(select(.value | length > 0));
 def local_plugin: .key as \$k | ${SETTINGS_LOCAL_MARKETPLACES_JSON} | any(. as \$m | \$k | endswith(\"@\" + \$m));"
 
-# Remove local values and retain HEAD's object order.
+# Remove local values and retain the reference object's key order.
 # The clean filter uses this program.
 # shellcheck disable=SC2034
 SETTINGS_LOCAL_KEYS_STRIP='($ARGS.named.baseline // keys) as $baseline | '"$SETTINGS_LOCAL_DEFS"'
 def committed_order($reference):
   if type == "object" then
     . as $live
-    | (if ($reference | type) == "object" then $reference else {} end) as $head
-    | reduce (($head | keys_unsorted[]),
-              ($live | keys_unsorted[] | select(. as $key | $head | has($key) | not))) as $key
-        ({}; if $live | has($key) then .[$key] = ($live[$key] | committed_order($head[$key])) else . end)
+    | (if ($reference | type) == "object" then $reference else {} end) as $ordered
+    | reduce (($ordered | keys_unsorted[]),
+              ($live | keys_unsorted[] | select(. as $key | $ordered | has($key) | not))) as $key
+        ({}; if $live | has($key) then .[$key] = ($live[$key] | committed_order($ordered[$key])) else . end)
   elif type == "array" then
     if ($reference | type) == "array" then
       to_entries | map(. as $entry | $entry.value | committed_order($reference[$entry.key]))

@@ -260,6 +260,67 @@ else:
         clean = self.run_command(BASH, "scripts/settings/clean_settings_json.sh", contents=self.settings.read_text())
         self.assertEqual(json.loads(clean.stdout), {"shared": 1, "newSetting": "edited"})
 
+    def test_merge_abort_preserves_local_settings(self) -> None:
+        conflict = self.root / "conflict.txt"
+        _ = conflict.write_text("base\n")
+        _ = self.git("add", "-f", "conflict.txt")
+        _ = self.git("commit", "-qm", "Add the conflict file")
+        _ = self.git("checkout", "-qb", "incoming")
+        incoming = {"newSetting": "committed", "shared": 1}
+        blob = self.git("hash-object", "-w", "--stdin", contents=json.dumps(incoming, indent=2) + "\n").strip()
+        _ = self.git("update-index", "--cacheinfo", f"100644,{blob},settings.json")
+        self.write_settings(incoming)
+        _ = conflict.write_text("incoming\n")
+        _ = self.git("add", "conflict.txt")
+        _ = self.git("commit", "-qm", "Add a shared key and edit the conflict file")
+        _ = self.git("checkout", "-q", "baseline")
+        _ = conflict.write_text("baseline\n")
+        _ = self.git("commit", "-qam", "Edit the conflict file on the baseline branch")
+        local = {"worktreeOnly": "saved", "voice": {"enabled": True}}
+        self.write_settings({"shared": 1, **local})
+        _ = self.refresh()
+
+        merge = self.run_command("git", "merge", "--no-edit", "incoming", check=False)
+        self.assertEqual(merge.returncode, 1, merge.stdout + merge.stderr)
+        self.assertEqual(self.git("diff", "--name-only", "--diff-filter=U"), "conflict.txt\n")
+        self.assertEqual(self.read_json(self.settings), {**incoming, **local})
+        self.assertEqual(self.git("show", ":settings.json"), json.dumps(incoming, indent=2) + "\n")
+        self.assertEqual(self.git("show", "HEAD:settings.json"), json.dumps({"shared": 1}, indent=2) + "\n")
+
+        abort = self.run_command("git", "merge", "--abort", check=False)
+        self.assertEqual(abort.returncode, 0, abort.stdout + abort.stderr)
+        self.assertEqual(self.read_json(self.settings), {"shared": 1, **local})
+        self.assertEqual(self.read_json(self.sidecar), local)
+        self.assertEqual(self.git("status", "--porcelain", "--untracked-files=no"), "")
+
+    def test_index_stages_keep_shared_keys_out_of_the_sidecar(self) -> None:
+        staged = {"stagedKey": "shared", "voice": {"enabled": False}, "hooks": NATEDEV["hooks"]}
+        local = {"worktreeOnly": "saved", "voice": {"enabled": True}}
+        blob = self.git("hash-object", "-w", "--stdin", contents=json.dumps(staged)).strip()
+        for stage in (0, 1, 2, 3):
+            with self.subTest(stage=stage):
+                _ = self.git("rm", "--cached", "-f", "settings.json")
+                _ = self.git("update-index", "--index-info", contents=f"100644 {blob} {stage}\tsettings.json\n")
+                self.write_settings({"shared": 1, **staged, **local})
+                cleaned = self.run_command(BASH, "scripts/settings/clean_settings_json.sh",
+                                           contents=self.settings.read_text())
+                self.assertEqual(json.loads(cleaned.stdout), {
+                    "shared": 1, "stagedKey": "shared",
+                    "hooks": {"SessionStart": [{"matcher": "startup", "hooks": [
+                        {"type": "command", "command": "shared.py"}]}]},
+                })
+                saved = {"stagedKey": "stale", **local}
+                _ = self.sidecar.write_text(json.dumps(saved))
+                self.write_settings({"shared": 1, "stagedKey": "current", **local})
+                _ = self.run_command(BASH, "-c", """source scripts/settings/settings_local_keys.sh
+settings_local_keys_snapshot settings.json""")
+                self.assertEqual(self.read_json(self.sidecar), local)
+                _ = self.sidecar.write_text(json.dumps(saved))
+                self.write_settings({"shared": 1})
+                _ = self.run_command(BASH, "-c", """source scripts/settings/settings_local_keys.sh
+settings_local_keys_restore""")
+                self.assertEqual(self.read_json(self.settings), {"shared": 1, **local})
+
     def test_shared_edits_stay_tracked_while_listed_keys_stay_local(self) -> None:
         self.write_settings({"shared": 2, "theme": "dark", "voice": {"enabled": True}})
         _ = self.refresh()
@@ -285,23 +346,29 @@ else:
     def test_clean_without_committed_settings_keeps_live_order(self) -> None:
         revision = self.git("rev-parse", "HEAD").strip()
         live = {"second": {"b": 2, "a": 1}, "first": [2, 1], "voice": {"enabled": True}}
-        for missing in ("HEAD", "settings.json"):
+        for missing in ("HEAD", "settings.json", "index"):
             with self.subTest(missing=missing):
                 self.write_settings({"shared": 1})
                 _ = self.git("update-ref", "HEAD", revision)
                 _ = self.git("read-tree", revision)
                 if missing == "HEAD":
                     _ = self.git("update-ref", "-d", "HEAD")
-                else:
+                elif missing == "settings.json":
                     _ = self.git("rm", "--cached", "-f", "settings.json")
                     _ = self.git("commit", "-qm", "Remove the settings blob")
+                else:
+                    _ = self.git("rm", "--cached", "-f", "settings.json")
                 self.write_settings(live)
                 before = self.settings.read_bytes()
                 cleaned = self.run_command(BASH, "scripts/settings/clean_settings_json.sh", contents=self.settings.read_text())
-                self.assertEqual(cleaned.stdout, json.dumps({"second": live["second"], "first": live["first"]}, indent=2) + "\n")
+                if missing == "index":
+                    self.assertEqual(cleaned.stdout, "{}\n")
+                else:
+                    self.assertEqual(cleaned.stdout, json.dumps({"second": live["second"], "first": live["first"]}, indent=2) + "\n")
                 self.assertEqual(cleaned.stderr, "")
                 self.assertEqual(self.settings.read_bytes(), before)
-                self.assertEqual(self.read_json(self.sidecar), {"voice": {"enabled": True}})
+                expected_local = live if missing == "index" else {"voice": {"enabled": True}}
+                self.assertEqual(self.read_json(self.sidecar), expected_local)
 
     def test_clean_uses_live_order_when_the_head_read_fails(self) -> None:
         shims = self.root / "shims"
