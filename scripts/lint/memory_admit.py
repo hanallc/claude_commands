@@ -2057,8 +2057,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
-def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt, *,
-                rank_holds: Mapping[str, Waiter] | None = None) -> HeadPolicy:
+def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
     candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
@@ -2067,8 +2066,7 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
-        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start,
-                                    rank_holds=rank_holds)
+        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
         if not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
@@ -2106,7 +2104,7 @@ def repository_run_owner(row: Reservation | Waiter) -> str:
 
 
 def reserved_repository_runs(inputs: QueueInputs, limits: records.RepositoryRunLimits) -> dict[str, set[str]]:
-    """Count distinct runs from reservations, Verify slots, and kept ranks."""
+    """Count distinct runs from local reservations and Verify slots."""
     runs = {repository: set(owners) for repository, owners in inputs.verify_run_owners.items()}
     for row in inputs.reservations:
         waiter = row.get("queue_waiter")
@@ -2134,7 +2132,7 @@ def can_use_natedev(row: Waiter) -> bool:
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
-                   next_start: NextStartAt, *, rank_holds: Mapping[str, Waiter] | None = None) -> list[WaiterAdmission]:
+                   next_start: NextStartAt) -> list[WaiterAdmission]:
     """Admit local steps in order and name the first local step that waits."""
     if isinstance(room, MemoryRoom):
         remaining, readable = room.signed_room, True
@@ -2226,9 +2224,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             if isinstance(ahead, NoWaiter) or positions[records.waiter_owner(limited)] < positions[records.waiter_owner(ahead)]:
                 ahead = limited
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
-        if local and rank_holds is not None and (held_by_run := rank_holds.get(owner)) is not None:
-            order_hold = HeldBehindHead(held_by_run)
-        elif local and not may_pass and not isinstance(ahead, NoWaiter):
+        if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(records.stored_waiter(ahead))
         elif local and not isinstance(first_folder_wait, NoWaiter):
             order_hold = HeldBehindHead(first_folder_wait)
@@ -2310,10 +2306,9 @@ def admission_wait_holder(decision: AdmissionDecision, reason: WaitReason,
     return wait_holder_identity(session_id, session_name, unit)
 
 
-def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *,
-                   rank_holds: Mapping[str, Waiter] | None = None) -> PassResult:
+def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> PassResult:
     next_start = start_spacing_after(now, policy)
-    resolved = head_policy(inputs, now, policy, next_start, rank_holds=rank_holds)
+    resolved = head_policy(inputs, now, policy, next_start)
     candidate = resolved.queued_head
     head_owner = records.waiter_owner(candidate.waiter) if isinstance(candidate, QueuedHead) else ""
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0

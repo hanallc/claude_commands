@@ -414,6 +414,7 @@ A missing or malformed value gives the step its own place.
 The first step creates one `RunPlace` with its arrival time and its `Owner`.
 The service sets `order_since` on snapshot row copies from the run place.
 It uses the earlier of the run time and the step arrival time.
+When a returning step uses the saved rank, its first step's arrival time and PID break ties on `order_since`.
 Durable waiter records retain only the step arrival time.
 An absent wait retains its run identity so it can use the run place while it exists.
 Each step retains its own `since` for reconnects, waiting age, token reacquisition, and AWS eligibility.
@@ -422,16 +423,12 @@ Queue priority remains the first ordering field.
 A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
 The service retains the run's process watch between steps.
-The first local gate preparation stores its queue row ID in `RunPlace`.
-The grant also stores the repository name.
-A later step of the run uses the same queue row ID, so queue moves apply to the run.
-Between reservations, the rank holds later local requests behind the run.
-A request that ranks earlier can start during the gap.
-The live rank counts once toward the local repository run limit.
-The next step of that run uses the same place at the limit.
-A placed gate that completes its suites does not create a preparation rank.
+The first local gate preparation saves its queue row ID and repository name in `RunPlace`.
+Each later step receives its own queue row ID.
+The service uses the rank to sort queued steps of the run.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
-The rank itself holds no memory.
+A younger run that fits in memory can start during the gap.
+The service logs each such grant once with both run IDs, the earlier gate's repository, and the machine.
 When the run ends, waiting steps use their own arrival times for order again.
 The service persists run places with waiter places through the generic codec in `state.json`.
 After a restart, the service restores live run places and removes ended run places.
@@ -1527,7 +1524,6 @@ An unreadable staff record gives no own hold key for that pass, so the step wait
 A waiter that joined before the hold is held too; the check runs at each pass, not only when the waiter joins.
 A held waiter keeps its place, gets a `NatedevHeld` wait and starts at the release in its order.
 A held waiter claims no between-steps slot and gives back a slot it claimed, so that slot can expire during the hold.
-During a natedev hold, a saved gate rank keeps its place without delaying local requests that the hold allows.
 View and explain replies between passes show the holds of the last pass.
 Only an unreadable hold state gives a legacy CI request `ReadingUnavailable`, which the client refuses after its retry time.
 Other local waiters are not held while the hold state is unreadable; the enforcer stays their guard.

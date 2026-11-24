@@ -8777,110 +8777,73 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(fixture.queue_pids(), [other.owner.pid, second.owner.pid])
             self.assertFalse(service.read_state(fixture.state_dir).run_places)
 
-    def test_a_run_behind_the_head_never_starts_before_the_head_runs_next_step(self) -> None:
+    def test_returning_run_sorts_by_its_first_wait_start(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
-            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
-            fixture.clock.advance(1)
-            younger = fixture.request(step="gate")
-            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
-            fixture.clock.advance(59)
-            _ = fixture.run_pass()
-            self.assertFalse(fixture.server.reservations)
-            self.assertFalse(fixture.server.slots)
-            step = fixture.request(run=run, step="gate")
-            step = replace(step, sidecar=str(fixture.root / "gate.cgroup"))
-            _ = only_admitted(fixture.server.handle_request(step))
-            self.assertNotIn(younger.episode, fixture.server.reservations)
-
-    def test_a_younger_gate_stays_behind_the_run_after_restart_in_the_gap(self) -> None:
-        with AdmissionFixture() as fixture:
-            run = fixture.run_owner()
-            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
-            fixture.clock.advance(60)
+            first = fixture.request(run=run, step="gate")
+            _ = fixture.finish_step(first, end_owner=True)
+            fixture.allow_next_start()
             fixture.restart()
-            younger = fixture.request(step="gate")
-            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
-            self.assertFalse(fixture.server.slots)
-            self.assertFalse(fixture.server.reservations)
-            fixture.end_run(run)
-            _ = only_admitted([fixture.server.ledger[younger.episode].reply])
+            saved, = service.read_state(fixture.state_dir).run_places.values()
+            fixture.hold_starts()
+            peers = [fixture.request(step="gate", owner=fixture.fixture_owner(pid, "4000"))
+                     for pid in (700001, 700002)]
+            for peer in peers:
+                self.assertIsInstance(fixture.server.handle_request(peer)[0], wire.Wait)
+            returning = fixture.request(run=run, step="gate")
+            self.assertIsInstance(fixture.server.handle_request(returning)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [returning.owner.pid, *(peer.owner.pid for peer in peers)])
+            row, = (row for _, row in self.reading(fixture).ordered if row["pid"] == returning.owner.pid)
+            self.assertEqual(row["since"], returning.since)
+            self.assertEqual(row.get("order_since"), first.since)
+            self.assertTrue(saved.move_id)
+            self.assertEqual(saved.repository, "fixture")
+            self.assertNotEqual(row.get("move_id"), saved.move_id)
 
-    def test_kept_gate_rank_allows_the_hold_owner_to_start(self) -> None:
-        for gate_waits in (False, True):
-            with (self.subTest(gate_waits=gate_waits), mock.patch.object(store, "host_name", return_value="natedev"),
-                  AdmissionFixture() as fixture, fixture.loop_turn()):
-                run = fixture.run_owner()
-                _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
-                directory = fixture.root / "holders"
-                directory.mkdir()
-                hold = directory / "fps-run"
-                _ = hold.write_text(json.dumps({
-                    "holder": "fps-run", "since": "2026-11-22T22:33:19+00:00", "for": "fixture",
-                    "release_eta": "unknown", "keep": []}))
-                step = fixture.request(run=run, step="gate")
-                if gate_waits:
-                    waiting, = fixture.server.handle_request(step)
-                    assert isinstance(waiting, wire.Wait)
-                    self.assertEqual(waiting.reason, records.NatedevHeld("fps-run", "fixture"))
-                fixture.allow_next_start()
-                holder = replace(fixture.request(), session=OwningSession("fps-run"))
-                grant = only_admitted(fixture.server.handle_request(holder))
-                self.assertNotIn(step.episode, fixture.server.reservations)
-                fixture.release(grant)
-                hold.unlink()
-                fixture.allow_next_start()
-                younger = fixture.request(step="gate")
-                self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
-                _ = only_admitted(fixture.server.handle_request(step))
-                self.assertNotIn(younger.episode, fixture.server.reservations)
-
-    def test_ranked_gate_takes_its_next_step_at_the_repository_run_limit(self) -> None:
-        with AdmissionFixture() as fixture:
-            config = fixture.root / "build_admission.conf"
-            _ = config.write_text(config.read_text()
-                + f"\nmax_runs.{fixture.server.host}.fixture=2\nmax_runs.exempt_unit=natemerge\n")
-            first, second = fixture.run_owner(), fixture.run_owner()
-            first_step = fixture.request(run=first, step="gate")
-            first_grant = only_admitted(fixture.server.handle_request(first_step))
-            fixture.allow_next_start()
-            second_step = fixture.request(run=second, step="gate", since=first_step.since - 1)
-            second_grant = only_admitted(fixture.server.handle_request(second_step))
-            for request, grant in ((first_step, first_grant), (second_step, second_grant)):
-                fixture.release(grant)
-                fixture.end_owner(request.owner)
-            fixture.clock.advance(60)
-            waiting = fixture.request(step="gate")
-            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
-            occupancy = self.reading(fixture).explanation.local_occupancy
-            assert occupancy is not None
-            self.assertFalse(occupancy.reservations)
-            self.assertEqual(occupancy.verify_run_owners, {"fixture": frozenset(
-                records.run_owner(run.pid, run.start_time) for run in (first, second))})
-            step = fixture.request(run=second, step="gate")
-            _ = only_admitted(fixture.server.handle_request(step))
-            self.assertNotIn(waiting.episode, fixture.server.reservations)
-            inputs = fixture.server.last_inputs
-            assert isinstance(inputs, records.QueueInputs)
-            result = fixture.server.last_result
-            assert isinstance(result, gate.PassResult)
-            decision, = (row.decision for row in result.rows
-                         if row.owner == records.run_owner(waiting.owner.pid, waiting.owner.start_time))
-            self.assertEqual(decision.run_limit, records.RunLimitWait(2, 2, "fixture", inputs.local_machine))
-
-    def test_priority_step_can_start_ahead_of_the_kept_gate_rank(self) -> None:
+    def test_tied_waiter_keeps_the_first_step_at_the_head(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
-            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
-            fixture.clock.advance(60)
-            fixture.server.priority = records.QueuePriority(({"unit": "urgent", "why": "fixture",
-                "set_at": fixture.clock.now(), "set_by": "fixture"},))
-            first = fixture.request(step="gate")
-            first = replace(first, identity=replace(first.identity, unit="urgent"))
-            _ = only_admitted(fixture.server.handle_request(first))
+            first = fixture.request(run=run, step="gate", owner=fixture.fixture_owner(700001, "4000"))
+            _ = fixture.finish_step(first)
             fixture.allow_next_start()
-            normal = fixture.request(step="gate")
-            self.assertIsInstance(fixture.server.handle_request(normal)[0], wire.Wait)
+            fixture.restart()
+            fixture.hold_starts()
+            peer = fixture.request(step="gate", since=first.since,
+                                   owner=fixture.fixture_owner(700002, "4000"))
+            self.assertIsInstance(fixture.server.handle_request(peer)[0], wire.Wait)
+            returning = fixture.request(run=run, step="gate", owner=fixture.fixture_owner(700003, "4000"))
+            self.assertIsInstance(fixture.server.handle_request(returning)[0], wire.Wait)
+            self.assertGreater(returning.since, peer.since)
+            rows = [row for _, row in self.reading(fixture).ordered]
+            self.assertEqual([row.get("order_since") for row in rows], [first.since, first.since])
+            self.assertEqual([row["pid"] for row in rows], [returning.owner.pid, peer.owner.pid])
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {returning.episode})
+
+    def test_younger_run_logs_once_when_it_starts_in_a_gate_gap(self) -> None:
+        with AdmissionFixture() as fixture:
+            first_run, second_run = fixture.run_owner(), fixture.run_owner()
+            first = fixture.request(run=first_run, step="gate")
+            first_grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            second = fixture.request(run=second_run, step="gate")
+            second_grant = only_admitted(fixture.server.handle_request(second))
+            fixture.release(first_grant)
+            fixture.release(second_grant)
+            fixture.allow_next_start()
+            self.assertEqual(len(fixture.server.slots), 2)
+            younger_run = fixture.run_owner()
+            younger = fixture.request(run=younger_run, step="gate")
+            with redirect_stderr(io.StringIO()) as journal:
+                grant = only_admitted(fixture.server.handle_request(younger))
+                self.assertEqual(only_admitted(fixture.server.handle_request(younger)), grant)
+                _ = fixture.run_pass()
+            lines = [line for line in journal.getvalue().splitlines() if "started in the gate gap" in line]
+            expected = (f"memory admission: run {younger_run.pid}:{younger_run.start_time} "
+                        f"started in the gate gap of {first_run.pid}:{first_run.start_time} "
+                        f"for fixture on {fixture.server.host}")
+            self.assertEqual(lines, [expected])
 
     def test_old_run_place_loads_with_empty_move_id_and_repository(self) -> None:
         with AdmissionFixture() as fixture:
