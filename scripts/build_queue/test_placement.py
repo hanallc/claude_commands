@@ -31,6 +31,7 @@ from scripts.build_queue import admission_client as client, mac_run, queue_snaps
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import limits_view, memory_feed
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
+from scripts.build_queue.admission_test_support import FixedSystemReader
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
@@ -1152,6 +1153,22 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual(fixture.caller_reservations(), {})
                 replay, = fixture.connect(request).replies()
                 self.assertNotIsInstance(replay, wire.LocalPlacementGranted)
+
+    def test_completed_placed_gate_allows_a_younger_gate_while_its_caller_lives(self) -> None:
+        with PlacementFixture() as fixture:
+            base = placement_request(fixture)
+            request = replace(base, constraints=replace(base.constraints,
+                candidates=(local_candidate(fixture),), command_kind="final"),
+                profile=replace(base.profile, step="gate"), identity=replace(base.identity, step="gate"))
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted)
+            fixture.release(granted.grant)
+            fixture.clock.advance(60)
+            fixture.allow_next_start()
+            younger = fixture.request(step="gate")
+            _ = only_admitted(fixture.server.handle_request(younger))
+            assert isinstance(request.run, wire.RunIdentity)
+            self.assertIn(records.run_owner(request.run.pid, request.run.start_time), fixture.server.run_places)
 
     def test_restart_requires_token_confirmation_before_a_local_grant(self) -> None:
         with PlacementFixture() as fixture:

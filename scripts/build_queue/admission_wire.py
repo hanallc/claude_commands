@@ -133,11 +133,13 @@ def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]
 
 @dataclass(frozen=True)
 class RunPlace:
-    """The run placement holds its identity, first owner, start time, and unit."""
+    """Keep the first place of a live run."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    move_id: str = ""
+    repository: str = ""
 
 
 @dataclass(frozen=True)
