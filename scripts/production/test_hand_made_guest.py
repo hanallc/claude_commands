@@ -22,7 +22,7 @@ from scripts.lib import models_registry, nix_env
 from scripts.mac_test import eligibility
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
-from scripts.production import hand_made, hand_made_guest
+from scripts.production import hand_made, hand_made_guest, hand_made_limit
 from scripts.production.hand_made_route import Machine
 from scripts.production.test_hand_made import (REGISTRY_TEXT, SCRIPT, YES, FakeLine, envelope, local_grant, no_envrc,
                                                remote, same_model)
@@ -33,9 +33,10 @@ ORIGIN = "https://example.test/claude_commands.git"
 COMMAND = ("python3", "check.py")
 # The injected stream: it reads the request from the bootstrap on its input, and prints the lock line when it
 # has one. Then it prints the setup error, and the refused line when it has one, and exits with the status. Or it
-# prints the start line and the request and exits with the status.
+# prints the start line, the request and the program output, and exits with the status.
 GUEST_RUN = """import json, sys, tarfile
-status, start, locked, setup_error, refused = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+status, start, locked, setup_error, refused, output = (int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4],
+                                                       sys.argv[5], sys.argv[6])
 with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
     for member in archive:
         if member.name == "request.json":
@@ -49,6 +50,7 @@ if setup_error:
     sys.exit(status)
 print(start, request["attempt"], flush=True)
 print("guest ran", json.dumps(request), flush=True)
+print(output, end="", flush=True)
 sys.exit(status)
 """
 
@@ -61,6 +63,7 @@ class InjectedGuest:
     arm_error: str = ""
     setup_error: str = ""
     refused: bool = False
+    output: str = ""
     stream_program: str = sys.executable
     before_snapshot: Callable[[], None] = lambda: None
     proofs: list[mac_linux.GuestEndProven | mac_linux.GuestEndPending] = field(
@@ -89,14 +92,13 @@ class InjectedGuest:
         self.events.append("arm")
         return mac_linux.ArmedGuestAttempt(attempt, "0" * 32, "boot", 1, "fixture", "/fixture/checkout")
 
-    def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
-               _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
+    def stream(self, _settings: mac_linux.GuestSettings, _shell: str, _prefix: str, _send: mac_linux.BundleSend, *,
                count: bool, link: int) -> list[str]:
         del link
         self.events.append(f"run count={count}")
         return [self.stream_program, "-c", GUEST_RUN, str(self.status), mac_linux.RUN_START,
                 mac_linux.RUN_LOCKED if self.locked else "", self.setup_error,
-                mac_linux.RUN_REFUSED if self.refused else ""]
+                mac_linux.RUN_REFUSED if self.refused else "", self.output]
 
     def prove(self, _settings: mac_linux.GuestSettings, armed: mac_linux.ArmedGuestAttempt, *,
               proof_deadline: float) -> mac_linux.GuestEndProven | mac_linux.GuestEndPending:
@@ -138,7 +140,6 @@ class GuestRouteTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.lift_read_limit_guard()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.config = self.root / "config"
         self.config.mkdir()
@@ -167,10 +168,6 @@ class GuestRouteTests(unittest.TestCase):
         (self.root / "place").mkdir()
         # The queue gives the run to the guest; a later wait gives it to natedev.
         self.line = FakeLine(self.root / "place", answers=[remote(hand_made_guest.MACHINE), local_grant()])
-
-    def lift_read_limit_guard(self) -> None:
-        """Remove the refusal for a guest with no read limit, so that the test reaches the guest route behind it."""
-        _ = self.enterContext(mock.patch.object(hand_made_guest, "NO_READ_LIMIT", ""))
 
     def checkout(self, name: str, origin: str) -> Path:
         """A clean checkout with check.py and an origin/main at its head."""
@@ -379,6 +376,20 @@ class GuestRouteTests(unittest.TestCase):
         row = self.only_row()
         self.assertEqual((row["refusal"], row["status"], row["machine"], row["failed_machines"]),
                          (cause, None, "mac-linux", []))
+
+    def test_a_cargo_failure_from_offline_mode_is_the_no_network_refusal_as_on_natedev(self) -> None:
+        self.guest.status, self.guest.output = 101, "error: failed to download\n  but --offline was specified\n"
+        # A cargo program of the checkout: the cargo of the host PATH can be a script outside the checkout.
+        cargo = self.repo / "cargo"
+        _ = cargo.write_text("#!/bin/sh\nexit 101\n")
+        cargo.chmod(0o755)
+        status, errors = self.attempt(("./cargo", "build"))
+        self.assertEqual(status, hand_made.REFUSED_EXIT, errors)
+        self.assertIn(hand_made_limit.NO_NETWORK, errors)
+        # The output passes at once and unchanged.
+        self.assertTrue(self.output.getvalue().endswith(self.guest.output.encode()))
+        self.assertEqual(self.guest.events[-2:], ["prove True", "refs removed"])
+        self.assertEqual((self.only_row()["refusal"], self.only_row()["status"]), (hand_made_limit.NO_NETWORK, None))
 
     def test_a_folder_word_that_the_check_refuses_at_the_run_start_takes_no_guest_run(self) -> None:
         (self.repo / "out").mkdir()

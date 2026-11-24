@@ -11,8 +11,10 @@ import sys
 import tempfile
 import unittest
 from typing import cast
+from unittest import mock
 
 from scripts.lib.helper_tree_test_support import copy_helpers
+from scripts.lib.shell_test_support import fixture_zsh_environment
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -98,6 +100,7 @@ class CargoGateTests(unittest.TestCase):
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("CLAUDECODE", "CODEX_HOME", "SSH_CONNECTION", "SSH_CLIENT", "MAC_PLACEMENT", "MAC_GATE_RECORD")}
         environment.update(config_environment(root / "config"))
+        environment.update(fixture_zsh_environment())
         environment.update(HOME=str(root), GATE_TEST_ROOT=str(root), GATE_TEST_BIN=str(GATE),
             PATH=os.pathsep.join((str(GATE), str(fake), str(real), "/usr/bin", "/bin")))
         return environment
@@ -105,6 +108,19 @@ class CargoGateTests(unittest.TestCase):
     def run_gate(self, environment: dict[str, str], *arguments: str, name: str = "cargo") -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(GATE / name), *arguments], env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS)
+
+    def test_gate_keeps_fixture_path_without_caller_zsh_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ):
+            _ = os.environ.pop("__NIXOS_SET_ENVIRONMENT_DONE", None)
+            _ = os.environ.pop("__ETC_ZSHENV_SOURCED", None)
+            root = Path(temporary)
+            environment = self.fixture(root)
+            command = subprocess.run(["/bin/zsh", "-c", "command -v cargo"], env=environment,
+                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(command.stdout.strip(), str(GATE / "cargo"), command.stderr)
+            result = self.run_gate(environment, "--version")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "runs").is_file())
 
     def test_copied_gate_links_find_the_copied_configuration_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

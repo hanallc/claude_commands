@@ -17,8 +17,8 @@ class MacRunRefused(Exception):
 
 @contextmanager
 def held(repo: Path, target: str, work: SuiteMode | StepJob,
-         gate_job: StepJob | GateJobNotRecorded) -> Generator[None]:
-    """Hold the Mac repository claim until the guest run ends."""
+         gate_job: StepJob | GateJobNotRecorded) -> Generator[claim_state.ClaimIdentity]:
+    """Hold the Mac repository claim until the guest run ends, and give its identity."""
     try:
         paths = claim_state.state_paths(target)
     except (OSError, ValueError) as error:
@@ -61,7 +61,7 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
             raise MacRunRefused(attempt.reason)
         if not acquired:
             raise MacRunRefused(f"{target} needs cleanup before the run can start")
-        yield
+        yield identity
     except BaseException as error:
         if acquired:
             try:
@@ -71,6 +71,16 @@ def held(repo: Path, target: str, work: SuiteMode | StepJob,
         raise
     else:
         _release(paths, args.pid, identity)
+
+
+def claim_held(target: str, claim_id: str, pid: int, start: str) -> bool:
+    """Tell whether the process holds the exact repository claim.
+
+    Each claim file is written whole, so the read takes no lock.
+    """
+    return any(claim.record["claim_id"] == claim_id and claim.record["pid"] == pid
+               and claim.record["proc_start"] == start
+               for claim in claim_state.read_claims(claim_state.state_paths(target)))
 
 
 def _release(paths: claim_state.StatePaths, pid: int, identity: claim_state.ClaimIdentity) -> None:

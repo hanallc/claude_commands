@@ -6,6 +6,18 @@ import unittest
 
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_STUB
+from scripts.lib import conf
+
+
+def assert_clippy_calls(fixture: support.VerifyLintScopeFixture, *, fix_passes: int = 1) -> None:
+    judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
+    expected = [judgment]
+    if fix_passes:
+        jobs = conf.read(fixture.config).whole("clippy_fix_jobs")
+        fix = ["--jobs", str(jobs), "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+        expected.extend([fix] * fix_passes)
+        expected.append(judgment)
+    fixture.assertEqual(fixture.calls("clippy"), expected)
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
@@ -47,7 +59,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
         _ = self.verify("lint", "sample")
         self.assert_workspace_taplo_check()
-        self.assert_fix_and_judgment_calls()
+        assert_clippy_calls(self)
         self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
         self.assertEqual(self.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "-p", "sample"],

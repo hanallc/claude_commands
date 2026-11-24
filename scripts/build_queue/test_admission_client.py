@@ -278,6 +278,31 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
 
+    def test_replaced_placement_control_uses_the_replacement_message(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+
+        owner = placement.SubmittingOwner("fixture", 123, "start")
+        cancel = wire.CancelPlacement("cancel", "episode", owner, "the caller left")
+        prerequisite = wire.PrerequisiteReport("prerequisite", "episode", owner, placement.TokenHeld())
+        expected = "Replaced: a newer run of fixture-unit took the place of this run."
+        with mock.patch.object(client, "_call", return_value=wire.Refused(status_wire.REPLACED_REASON)):
+            with self.subTest(command="cancel-placement CLI"):
+                with mock.patch.object(records, "process_start_time", return_value=owner.start_time), \
+                        redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    code = client.main(["cancel-placement", "--episode", cancel.episode, "--pid", str(owner.pid)])
+                self.assertEqual(code, 2)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "Replaced: a newer run of this unit took the place of this run.\n")
+            with self.subTest(command="cancel-placement with a unit"):
+                with self.assertRaises(client.RunReplaced) as refused:
+                    _ = client.cancel_placement(cancel, unit="fixture-unit")
+                self.assertEqual(refused.exception.reason, expected)
+            for report_refusal in (True, False):
+                with self.subTest(command="report-prerequisite", report_refusal=report_refusal):
+                    with self.assertRaises(client.RunReplaced) as refused:
+                        _ = client.report_prerequisite(prerequisite, unit="fixture-unit", report_refusal=report_refusal)
+                    self.assertEqual(refused.exception.reason, expected)
+
     def test_wait_subject_uses_the_usable_repository_and_step_fields(self) -> None:
         for repository, step, subject in (
             ("—", "nextest", "nextest"),
@@ -860,6 +885,9 @@ class ClientTests(unittest.TestCase):
                                 self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
                                     str(assignment_file), "--token", "after-grant"]), 0)
                                 fixture.free(60 * GIB)
+                            elif execution_target != "mac-retry-notice":
+                                self.assertEqual(client.main(["report-prerequisite", "--assignment-file",
+                                    str(assignment_file), "--token", "required"]), 0)
                             self.assertEqual(client.main(["claim-failed", "--assignment-file", str(assignment_file),
                                                           "--reason", "lost" if execution_target == "mac-retry-notice" else "busy"]), 0)
                             if execution_target == "mac-handoff":
@@ -878,9 +906,10 @@ class ClientTests(unittest.TestCase):
 
                                 def free_after_first_reply(request: wire.Request,
                                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+                                    replies = previous(request, connection)
                                     if isinstance(request, wire.PrerequisiteReport):
                                         fixture.free(60 * GIB)
-                                    replies = previous(request, connection)
+                                        _ = fixture.run_pass()
                                     if isinstance(request, wire.PlacementRequest):
                                         observed.extend(replies)
                                     return replies
@@ -893,16 +922,11 @@ class ClientTests(unittest.TestCase):
                                 self.assertEqual(output.getvalue().count("retry verify.sh: Mac attempt ended (lost); "), 1)
                                 self.assertIn("waiting 180 s before each retry", output.getvalue())
                             else:
-                                def release_before_retry() -> None:
-                                    fixture.free(60 * GIB)
-
+                                fixture.free(60 * GIB)
                                 token_arguments = [*arguments[:arguments.index("--")], "--token", "after-grant",
                                                    *arguments[arguments.index("--"):]]
-                                # After its first pass, a caller without its token can get a local grant;
-                                # it takes the token after the grant. The service marks every TokenRequired
-                                # row token-waiting, as a service from before this client does.
-                                with mock.patch.object(fixture.server, "before_admission", side_effect=release_before_retry):
-                                    self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
+                                # The new prerequisite schedules a pass with the available memory.
+                                self.assertEqual(client.main(token_arguments), 0, errors.getvalue())
                             retry_grant = client.read_assignment(assignment_file)
                             self.assertIsInstance(retry_grant, wire.LocalPlacementGranted)
                             assert isinstance(retry_grant, wire.LocalPlacementGranted)
@@ -1417,9 +1441,10 @@ class ClientTests(unittest.TestCase):
             _ = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)), Exchange(reply_bytes(wire.Ok())))
             released: list[str] = []
             release = client.release
-            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
                 released.append(reservation)
-                return release(reservation, status, configuration)
+                return release(reservation, status, configuration, ending)
             with mock.patch.object(client, "step_request", return_value=original), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \

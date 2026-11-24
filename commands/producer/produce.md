@@ -72,14 +72,18 @@ A status answers the last next step: say if each named step happened. When a tim
 Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
-Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, `--add-evidence`, `--title`, or `--done-when`.
+Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-The List is shared. Each item has one producer, who keeps its status, next step, ETA and check time current.
-Add an item for your own work with `the_list.py add --producer <your staff ID> --owner <showrunner staff ID> --title <text> --source <source> --done-when <result that closes it>`. Name what to track, its owner, and the result that closes it.
-Park or close your own item only on nate's word. Without his word, set the state to Delivered only when the whole item is done and nate can check it. While more work follows, the state is Working.
-nate's words on a List page item come to its producer. Act on them and record them in the item in the same turn.
+Add an item with `the_list.py add --producer <your staff ID> --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.
+Park, unpark, close, or reopen your own items with `the_list.py`.
+Park, unpark, or close an item only when nate asks. Quote his words in `--source`.
+Set Delivered only when the whole item is done and nate can check it.
+Set Working while more work remains.
+Act on nate's Tell and record his words in the item in the same turn.
 Answer a List question saved for you with the command in its message: `the_list.py answer L<n> --keeper <keeper> --question <id> --text "<answer>"`.
-morty assigns items to producers, takes `/recall` and New item requests, and reads every item at each round. Correct an item when morty says that its text is not clear.
+Ask morty to reassign an item or record a decision that you cannot save.
+morty takes `/recall` and New item requests and reads every item at each round.
+Correct an item when morty says that its text is not clear.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.
 Use staff reporting lines for a survey of showrunner needs. Include child productions.

@@ -31,6 +31,7 @@ import uuid
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import REPLACED_REASON
 from scripts.build_queue.admission_wire import assignment_what
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
@@ -66,6 +67,12 @@ class PlacementConstraintBuilder(Protocol):
                  command: tuple[str, ...], session: placement.SubmittingSession,
                  source_key: execution_identity.SourceIdentity, routing: target_config.Routing,
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
+
+
+def placement_constraint_builder() -> PlacementConstraintBuilder:
+    """Load the fixed placement policy when a caller needs it."""
+    return cast(PlacementConstraintBuilder, getattr(
+        import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
 
 
 CLOCK: ClientClock = SystemClock()
@@ -484,6 +491,8 @@ def request_placement(request: wire.PlacementRequest, *, report_refusal: bool = 
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):
+        if (line := replaced_line(reply.reason, request.identity.unit)) is not None:
+            raise RunReplaced(line)
         raise wire.AdmissionUnavailable(reply.reason)
     if isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted, wire.PlacementWait, wire.DispatchStatus)):
         return reply
@@ -499,19 +508,27 @@ def acquire_placement(request: wire.PlacementRequest
         return LeftQueue()
 
 
-def report_prerequisite(request: wire.PrerequisiteReport, *, report_refusal: bool = True) -> wire.Ok:
+def report_prerequisite(request: wire.PrerequisiteReport, *, unit: str = "", report_refusal: bool = True) -> wire.Ok:
     reply = _call(request, lambda _wait: None, report_refusal=report_refusal)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Ok):
         return reply
-    if not report_refusal and isinstance(reply, wire.Refused):
-        raise wire.AdmissionUnavailable(reply.reason)
+    if isinstance(reply, wire.Refused):
+        if (line := replaced_line(reply.reason, unit)) is not None:
+            raise RunReplaced(line)
+        if not report_refusal:
+            raise wire.AdmissionUnavailable(reply.reason)
     raise wire.AdmissionUnavailable("invalid prerequisite answer")
 
 
-def cancel_placement(request: wire.CancelPlacement) -> wire.Ok:
-    reply = _query(request)
+def cancel_placement(request: wire.CancelPlacement, *, unit: str = "") -> wire.Ok:
+    try:
+        reply = _query(request)
+    except wire.AdmissionUnavailable as error:
+        if (line := replaced_line(error.reason, unit)) is not None:
+            raise RunReplaced(line) from error
+        raise
     if isinstance(reply, wire.Ok):
         return reply
     raise wire.AdmissionUnavailable("invalid cancellation answer")
@@ -535,17 +552,17 @@ def token_prerequisite(choice: str) -> placement.TokenRequired | placement.Token
 
 
 def finish_step(path: Path, status: int, reason: str = "", *,
-                prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
-                ) -> wire.DispatchStatus:
+                prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE,
+                ending: wire.ReleaseEnding = "result") -> wire.DispatchStatus:
     reply = read_assignment(path)
     if not isinstance(reply, wire.LocalPlacementGranted):
         raise wire.AdmissionUnavailable("finish-step requires a local grant")
-    return finish_local(reply, status, reason, prerequisite=prerequisite)
+    return finish_local(reply, status, reason, prerequisite=prerequisite, ending=ending)
 
 
 def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "", *,
-                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
-                 ) -> wire.DispatchStatus:
+                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE,
+                 ending: wire.ReleaseEnding = "result") -> wire.DispatchStatus:
     """Release a local grant with its status, and close its attempt; a reason closes it as refused before launch."""
     from scripts.build_queue import placement
 
@@ -553,7 +570,7 @@ def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
     if not reason:
-        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+        _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing, ending)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
         execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
@@ -777,9 +794,22 @@ def _leave_queue() -> bool:
         return False
 
 
+class RunReplaced(wire.AdmissionUnavailable):
+    """A newer run of the unit took the place of this run."""
+
+
+def replaced_line(reason: str, unit: str) -> str | None:
+    """Give the line for a refusal that ends a replaced run, or None for another refusal."""
+    if reason != REPLACED_REASON:
+        return None
+    return f"Replaced: a newer run of {unit or 'this unit'} took the place of this run."
+
+
 def _refused(reason: str, *, checker: bool = False) -> wire.Refused:
-    text = f"memory admission check failed ({reason}); step refused" if checker else reason
-    print(text, file=sys.stderr)
+    # The client of a replaced run knows its unit, so it shows the replaced line itself.
+    if reason != REPLACED_REASON:
+        text = f"memory admission check failed ({reason}); step refused" if checker else reason
+        print(text, file=sys.stderr)
     return wire.Refused(reason)
 
 
@@ -1603,8 +1633,9 @@ def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.
     return wire.Refused("invalid service estimate answer")
 
 
-def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration)
+def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+            ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
+    return _mutation(wire.ReleaseRequest(request_id(), reservation, status, ending), configuration)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
@@ -2188,8 +2219,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             kind = "test"
         elif kind in ("clippy", "mend-check"):
             kind = "lint"
-        builder = cast(PlacementConstraintBuilder, getattr(
-            import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+        builder = placement_constraint_builder()
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
             cast(placement.CommandKind, kind), tuple(step_argv), session,
             execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),
@@ -2217,20 +2247,20 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         report_refusal = not args.pinned_refusals
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
-                                    report_refusal=report_refusal)
+                                    unit=identity.unit, report_refusal=report_refusal)
         while True:
             answer = request_placement(request, report_refusal=report_refusal)
             output.placement_notices(answer, placement_events=args.wait_events)
             if isinstance(answer, wire.PlacementWait) and isinstance(answer.wait, wire.Wait):
                 _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
-                                        report_refusal=report_refusal)
+                                        unit=identity.unit, report_refusal=report_refusal)
                 answer = request_placement(request, report_refusal=report_refusal)
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
             if _leave_queue():
                 _ = cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, episode, owner,
-                    "the caller left before placement"))
+                    "the caller left before placement"), unit=identity.unit)
                 raise _QueueLeft()
             # The first pass only lets a free remote target take the step; it is no memory wait.
             token_check = (isinstance(prerequisite, placement.TokenRequired)
@@ -2422,7 +2452,9 @@ def main(argv: list[str] | None = None) -> int:
                 + str(output.elapsed_seconds()) + "\n")
         return 75
     except (_QueueUnreachable, wire.AdmissionUnavailable, ValueError, OSError) as error:
-        if isinstance(error, wire.AdmissionUnavailable):
+        if isinstance(error, RunReplaced):
+            reason = error.reason
+        elif isinstance(error, wire.AdmissionUnavailable):
             reason = f"admission service unavailable: {error.reason}"
             if args.command == "place-step" and not args.pinned_refusals:
                 reason += "; step refused"
