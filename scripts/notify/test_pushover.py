@@ -1431,6 +1431,26 @@ class PushoverTests(unittest.TestCase):
         self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
         self.assertEqual(self.log_lines()[-1]["outcome"], f"dropped: retired template {push['text_id']}")
 
+    def test_silence_release_drops_all_kept_rca_follow_up_pushes(self) -> None:
+        self.silence_on()
+        text_ids = ("permission.rca_started", "permission.rca_fixed", "permission.rca_fixed_rewritten")
+        for number, text_id in enumerate(text_ids, start=1):
+            push: silence.KeptPush = {
+                "source": "builds", "priority": "0", "title": "Permission case",
+                "message": "No action needed.", "detail": "", "key": f"rca-261124-{number}", "text_id": text_id,
+            }
+            self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        self.assertEqual([push["text_id"] for push in silence.read_kept()], list(text_ids))
+        post = mock.Mock(side_effect=AssertionError("Retired RCA push posted"))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(silence.off(lambda _argv: 0,
+                lambda push: pushover.post_kept(push, self.keys, post)), 0)
+        post.assert_not_called()
+        self.assertEqual(silence.read_kept(), [])
+        self.assertIn("0 kept pushes delivered; 3 dropped", output.getvalue())
+        self.assertEqual([line["outcome"] for line in self.log_lines()],
+                         [f"dropped: retired template {text_id}" for text_id in text_ids])
+
     def test_a_push_after_a_missed_end_posts_the_kept_pushes_first(self) -> None:
         self.silence_on()
         with redirect_stdout(io.StringIO()):

@@ -409,6 +409,22 @@ subprocess.run([sys.executable, '-c',
         self.assertEqual(retire, ["retire", "--to", "user", "--from", "stall-watch",
                                   "--key", "stall-watch:prompt:cargo-liner:handler"])
 
+    def test_fixed_reports_retirement_failure_and_retries_the_saved_alert(self) -> None:
+        _ = rca.open_case(ALERTED, OPENED)
+        arguments = ["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"]
+        retire = ["retire", "--to", "user", "--from", ALERTED.source, "--key", ALERTED.key]
+        with mock.patch.object(rca, "send", side_effect=[(False, "Cancellation timed out."), (True, "Cancelled.")]) as send_call:
+            code, out, err = self.quiet(arguments)
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("Cancellation timed out.", err)
+            self.assertIn("The alert can still repeat.", err)
+            self.assertIn("Run fixed again to retry retirement.", err)
+            send_call.assert_called_once_with(retire)
+            case = self.case("261023-1")
+            self.assertEqual((case["status"], case["cause"], case["fix"], case["commit"]), ("fixed", CAUSE, FIX, "abc"))
+            self.assertEqual(self.quiet(arguments), (0, "Cancelled.\n", ""))
+            self.assertEqual(send_call.call_args_list, [mock.call(retire), mock.call(retire)])
+
     def test_a_case_saved_before_the_new_fields_still_loads(self) -> None:
         _ = rca.open_case(HANDLER, OPENED)
         path = rca.case_path("261023-1")

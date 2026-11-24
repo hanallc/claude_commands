@@ -306,8 +306,33 @@ Legacy failure records remain readable by the existing tools.
   The queued decision omits `next_reset`. Older callers can omit `credit_accounts` to use the live config.
   `paid_credits_values()` uses the session name as the sender. Without a session record, it uses `--value sender`, then `--from`.
   It refuses the call if it has no sender.
-- `--text-id auto_mode.refused`: the session gives `session`, `machine`, one `command` for each refused command (in order), `waits` and an optional `rule`. `command` is the only key that can repeat, and only for this template; `parse()` collects the items in a list. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), `action` from the commands' first words (`rca.action_of()`: `a file change`, `a shell command`, `an action`, `2 shell commands`, or `2 actions` for mixed kinds), `refused` from the commands (one per line), `waits_line` from `waits` (`rca.waits_line()`), `noun` and `this` from the number of commands, and `rule_line` from `rule`. It drops the final periods from `waits` and cuts a command longer than 90 characters to its first 89 and `…`. A send with no `--key` gets the key `auto-mode:<session>:<first 12 hex of the sha256 of the sorted one-line commands>` (`auto_mode_key()`), so `rca.py fixed` can retire the alert. The waits sentence is a value the session writes, so `send()` keeps it only when the cold-read review approves the whole alert within `WAITS_REVIEW_SECONDS` (30 s, `review.review(…, limit=30)`; `reviewed_waits()`). A timeout or a `Failed`, `Rewritten`, `Withheld` or `Unreviewed` verdict sends the alert without it and prints why to stderr. With the review off the alert goes as given. It refuses no command, an empty command, a `waits` that has a thing to type or names a pane or session (`waits` says only what waits; the Action line says what the user does), `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the push templates a session can send (`SESSION_TEMPLATES`). `Options.commands` keeps each `command` value as given, before the cut, for the rca.py case.
-  The send rule lives beside `auto_mode.refused` in `send.py --help`. The session applies it before sending; no program checks it.
+- Use `--text-id auto_mode.refused` for an auto-mode refusal.
+  Give `session`, `machine` and one `command` for each refused command.
+  Give `waits` and `rule` when applicable.
+  For this template, `parse()` accepts repeated `command` values in the order given.
+  Give at least one command and make each command nonempty.
+  Describe only the work that waits in `waits`.
+  Put the user's instruction in the Action line.
+  `parse()` rejects `waits` values that tell the user what to type.
+  It also rejects `waits` values that name a pane or session.
+  It also rejects `--value sender`, `--from`, `--machine` and a send without a session record.
+  `auto_mode_values()` uses the sending session's name as the sender.
+  It counts the commands, selects the singular or plural noun and removes final periods from `waits`.
+  The template shows the count in the title and the target session on the Session line.
+  It adds `waits` to the title if the result fits within 44 characters.
+  `Options.commands` keeps each original command for the RCA case.
+  If the caller omits `--key`, `auto_mode_key()` uses the session and a hash of the commands.
+  It collapses whitespace, removes duplicates and sorts the commands before computing the SHA-256 hash.
+  The key uses `auto-mode:<session>:<first 12 hex digits>`.
+  `rca.py fixed` uses this key to retire the alert.
+  `reviewed_waits()` reviews the clause with the alert title and action.
+  The `waits_review_seconds` setting gives the review 30 seconds by default.
+  The send keeps the clause if the review approves it or flags only the fixed title or header.
+  Otherwise, the send omits the clause and prints the reason to stderr.
+  If review is off, the send uses the clause as given.
+  `send.py --help` lists the templates in `SESSION_TEMPLATES`.
+  The help for `auto_mode.refused` gives the send rule.
+  Apply that rule before sending.
 - After `parse()` renders a registered text, it refuses the run when `action_conflicts()` gives a reason: `<id> gives a second action: <reasons>`. A template value cannot add a second action. Registered texts other than agent-written ids are sent as rendered and skip live review when approved (2026-10-23: a `waits` value told the user to type `! kill …` in a second session).
 - `--text-id session.needs_go`: the session gives `session`, `machine`, `go`, `why` and `does`. `needs_go_values()` fills `sender` from the session's own record and drops a final period from `why` and `does`. It refuses the same things as `auto_mode.refused`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `type: Go:`, `until you allow`, `until you type` or `waits for your go` is held (`wrong_template()`).
 - `user()` passes the message's `--key` to `pushover.py`, in the free-text and the `--text-id` forms, so a kept push with the same key from the same sender replaces the older kept one, and a `--need blocked` push carries the key's tag. `remote()` forwards `--key` to the far `send.py`. `push_texts.user_send_argv(…, key=)` adds `--key`.
@@ -485,8 +510,9 @@ With recurring jobs that have enough budget to admit work, accessible state, and
 
 ### Permission root cause: `scripts/message/rca.py`
 
-Each permission alert starts a root cause analysis.
-The initial permission alert is the only push to the user for the case.
+A permission alert can open a case.
+A later permission alert can join an open or started case with the same session and commands.
+The `start` and `fixed` commands send no follow-up push.
 
 - Each machine stores its own case files in `$XDG_STATE_HOME/message/rca` or `~/.local/state/message/rca`.
   Run the `rca.py` commands on the machine that opened the case.
@@ -532,6 +558,8 @@ The initial permission alert is the only push to the user for the case.
   It then runs `send.py retire --to user --from <alert_source> --key <alert_key>` if the case has an alert key.
   It prints the retirement result.
   Retirement removes a kept alert and stops an emergency alert from repeating.
+  If retirement fails, `fixed` exits 1 and keeps the saved cause, fix and commit.
+  The alert can still repeat.
   Run `fixed` again to retry retirement.
   An unknown case ID exits 2.
   A `start` command for a fixed case also exits 2.

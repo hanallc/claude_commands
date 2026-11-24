@@ -7317,6 +7317,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
             self.assertEqual(send.send(local_options(self.user_arguments("--key", "plain"))).outcome, "sent")
 
+    def test_free_text_auto_mode_refusal_is_held_without_an_action(self) -> None:
+        for title, body in (("Build status", "Auto mode refused a command."),
+                            ("Auto mode", "The session refused a command.")):
+            with self.subTest(title=title):
+                options = send.parse(["--here", "--to", "user", "--no-action", "--summary", title, "--text", body])
+                self.assertEqual(options.text_id, "")
+                self.assertIsInstance(options.action, NoActionRequired)
+                self.assertEqual(send.wrong_template(options, f"{title}\n{body}"), send.AUTO_MODE_HELD)
+
     def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
         with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             _ = send.parse(["--help"])

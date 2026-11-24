@@ -313,12 +313,12 @@ def tell_owner(case: Case, *, reminder: bool = False, deadline: float = math.inf
     return "" if sent else outcome or "send.py failed"
 
 
-def retire_alert(case: Case) -> str:
-    """Retire the case's alert by its sender and key, and say what send.py did; "" when it has no key."""
+def retire_alert(case: Case) -> tuple[bool, str]:
+    """Return the status and output of the retirement attempt."""
     if not case["alert_key"]:
-        return ""
+        return True, ""
     command = push_texts.user_retire_argv(case["alert_source"], case["alert_key"])
-    return send(command[2:])[1]
+    return send(command[2:])
 
 
 def open_case(report: Report, at: datetime | None = None, *, defer_owner: bool = False,
@@ -369,7 +369,7 @@ def start(case_id: str, owner: str) -> None:
         save(case)
 
 
-def fixed(case_id: str, cause: str, fix: str, commit: str) -> str:
+def fixed(case_id: str, cause: str, fix: str, commit: str) -> tuple[bool, str]:
     """Close the case and return the result of retiring its alert."""
     with locked():
         case = loaded(case_id)
@@ -452,12 +452,15 @@ def main(argv: list[str]) -> int:
         if action == "start":
             start(cast(str, args.id), cast(str, args.owner))
             return 0
-        detail = fixed(cast(str, args.id), cast(str, args.cause), cast(str, args.fix), cast(str, args.commit))
+        retired, detail = fixed(cast(str, args.id), cast(str, args.cause), cast(str, args.fix), cast(str, args.commit))
     except ValueError as error:
         print(f"rca: {error}", file=sys.stderr)
         return 2
     if detail:
-        print(detail)
+        print(detail, file=sys.stdout if retired else sys.stderr)
+    if not retired:
+        print("rca: The alert can still repeat. Run fixed again to retry retirement.", file=sys.stderr)
+        return 1
     return 0
 
 
