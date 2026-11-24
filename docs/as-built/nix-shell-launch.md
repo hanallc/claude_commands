@@ -208,20 +208,24 @@ unchanged skip reasons do not add lines.
 
 A refused environment or failed recovery alerts the nearest showrunner above the session's staff row.
 The message gives the cause, the raw reason, and the recovery commands.
+The healer saves a new showrunner key before the first send in each alert episode.
+Later attempts in that episode use the saved key.
 The healer accepts `SKIPPED` as confirmation when the sender already holds or accepted the alert.
+The healer clears the key after it confirms recovery or after a successful `retry` command.
 The journal records `showrunner_alerted` with the name of the showrunner after a confirmed send.
 If the staff record is unreadable, no showrunner owns the session, or the send lacks confirmation, the healer sends Nate the push.
 The healer writes the fallback reason to stderr. The timer saves it in its run log.
 
 1. Repair the nix setup on the affected machine. Get Nate's approval before you change `/etc/nixos`.
-2. Run `heal.py retry --only <id>` after the repair. It clears the restart guard and notification flag for the next sweep.
-3. Run `heal.py escalate --only <id>` if you cannot repair the setup. It uses the saved failure reason to send Nate the push.
+2. Run `heal.py retry --only <id>` after the repair if there is no pending restart. It clears the restart guard and notification flag.
+3. Run `heal.py escalate --only <id>` after the repair if a restart is pending. Nate gets a push to restart the session.
+
+Run `heal.py escalate --only <id>` if you cannot repair the setup. The healer uses the saved failure reason for the push.
 
 Both commands take the same state lock as the sweep. If the lock is busy, run the command again after the sweep ends.
 Retry refuses while a restart is pending. The refusal and the showrunner alert give the escalation command.
 Escalation requires a saved failure reason and a live session or a pending restart.
 If the session is gone, escalation uses the name and worktree from the pending restart.
-A successful retry command gives the next showrunner alert a new message key.
 
 The push catalog owns the title, action and text of `nix_heal.failed`.
 The push keeps the key `nix-heal-<id>` and the clear command `heal.py sweep --only <id> --check`.
