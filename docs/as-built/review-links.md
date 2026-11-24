@@ -534,7 +534,22 @@ The command prints one plain error line for a refused update.
 The states are **Open**, **Validating**, **Waiting** and **Done**.
 Changes use Validating while the showrunner checks the change.
 Records use Waiting while they await an answer or action.
-Later hides an item without changing its state.
+List and Review use the queue rule in `question_path.py`.
+An active Later value hides the item in Review and puts it in Parked on the List.
+An unread answer puts the item in Open on Review and Needs me on the List.
+The row shows **New answer** while the answer is unread.
+Review uses the saved answer time or the latest Answer event time.
+An answer is unread if its time is after the last Mark read or Later.
+During validation, a Change answer must also follow the current handoff and question.
+An answer without either time remains visible in the record.
+Saved positions and exchange IDs identify copies in the display.
+Review keeps the legacy history when it cannot identify a copy.
+Review, the question count and `/next` interpret legacy local times in the user's zone.
+Mark read removes the mark.
+Mark read also works when the Question owner is unavailable.
+An active Later value continues to apply after Mark read.
+A decision that still requires an action stays in Open after Mark read if Later does not hide it.
+The List and Review keep their existing Later storage formats.
 Validating changes remain visible in Validating and All.
 The count readers and `/next` use this shared reader.
 Open items count in the status line.
@@ -916,8 +931,16 @@ Each showrunner check uses its delivery attempt as the validation ID.
 Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
 The native verdict command refuses a missing, old or completed validation ID under the same rule.
 Every request message includes the complete answer command.
-Later keeps the state and hides the item from the page views, the counts and `/next` until its time.
-A change hand-off or return to Open clears the saved Later time.
+Later keeps the saved state.
+An unread answer takes priority over an active Later time in Review, the counts and `/next`.
+An answer keeps the saved Later time.
+Mark read returns the item to Later if the time is still active.
+Saving Later also marks the answer read.
+A legacy Question reply can lack an Answer event.
+Each new native reply saves its Answer event position with the exchange.
+A Change row with an empty Verdict can still show in Open after it moves to Reviewed.
+A validation answer stays in Open, the status counts and `/next` until Mark read.
+The change also stays in Validating until the handoff ends.
 The shared reader ignores any old Later time on a Validating change.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
@@ -1474,8 +1497,7 @@ A newer update stays unread if it arrives before the read saves.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
 The List and Review use the same question color rule.
-An unread answer puts the item in Needs me even during an active park.
-Mark read returns the item to Parked if its park is still active.
+Mark read restores the List queue for the saved item state and its active parking condition.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
@@ -1508,6 +1530,7 @@ The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
 Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
+List and Review use the same Later code to read and write their saved values.
 The server reads a date as midnight in the user zone.
 The writer checks a new parking time against the current time under the List lock.
 The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.

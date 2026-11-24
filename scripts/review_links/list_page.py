@@ -23,7 +23,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
+from scripts.review_links import question_path, change_browser, change_page, console, page_frame, page_question, record_table, review_link
 from scripts.review_links import review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -54,28 +54,34 @@ class ListChip(StrEnum):
     PARKED = "parked"
 
 
-CHIP_BY_STATE = {
-    the_list.ItemState.NEW: ListChip.WORKING,
-    the_list.ItemState.WORKING: ListChip.WORKING,
-    the_list.ItemState.BLOCKED: ListChip.BLOCKED,
-    the_list.ItemState.WAITING_FOR_NATE: ListChip.NEEDS_ME,
-    the_list.ItemState.DELIVERED: ListChip.NEEDS_ME,
-    the_list.ItemState.DONE: ListChip.ALL,
-    the_list.ItemState.PAUSED: ListChip.BLOCKED,
+QUEUE_BY_STATE = {
+    the_list.ItemState.NEW: question_path.Queue.WORKING,
+    the_list.ItemState.WORKING: question_path.Queue.WORKING,
+    the_list.ItemState.BLOCKED: question_path.Queue.BLOCKED,
+    the_list.ItemState.WAITING_FOR_NATE: question_path.Queue.NEEDS_ME,
+    the_list.ItemState.DELIVERED: question_path.Queue.NEEDS_ME,
+    the_list.ItemState.DONE: question_path.Queue.DONE,
+    the_list.ItemState.PAUSED: question_path.Queue.BLOCKED,
+    the_list.ItemState.CLOSED: question_path.Queue.CLOSED,
+}
+
+CHIP_BY_QUEUE = {
+    question_path.Queue.NEEDS_ME: ListChip.NEEDS_ME,
+    question_path.Queue.WAITING_FOR_ANSWER: ListChip.MORTY_ANSWERING,
+    question_path.Queue.LATER: ListChip.PARKED,
+    question_path.Queue.WORKING: ListChip.WORKING,
+    question_path.Queue.BLOCKED: ListChip.BLOCKED,
+    question_path.Queue.DONE: ListChip.ALL,
+    question_path.Queue.CLOSED: ListChip.ALL,
 }
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
     """Find the one status chip for this item."""
-    chip = CHIP_BY_STATE[state]
-    if unread_answer:
-        return ListChip.NEEDS_ME
-    if parked:
-        return ListChip.PARKED
-    if unread_delivery:
-        return ListChip.NEEDS_ME
-    return ListChip.MORTY_ANSWERING if open_question else chip
+    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer, later=parked,
+                                unread_delivery=unread_delivery, waiting_for_answer=open_question)
+    return CHIP_BY_QUEUE[queue]
 
 
 class ListRecord(NamedTuple):
@@ -159,16 +165,19 @@ def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
 
 
 def parked_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
-    return moment.value if moment is the_list.ParkUntilDelivered.DELIVERED else short_list_time(moment, zone)
+    # Keep the delivery value in the save response for existing List tabs.
+    return short_list_time(moment, zone) if isinstance(moment, datetime) else question_path.write_later(moment)
 
 
 def parking_notice_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
-    if moment is the_list.ParkUntilDelivered.DELIVERED:
-        return moment.value
-    local = moment.astimezone(zone)
-    if local.hour or local.minute:
-        return local.strftime("%Y-%m-%d %H:%M %Z")
-    return local.date().isoformat()
+    def time_label(time: datetime) -> str:
+        local = time.astimezone(zone)
+        if local.hour or local.minute:
+            return local.strftime("%Y-%m-%d %H:%M %Z")
+        return local.date().isoformat()
+
+    label = question_path.later_label(moment, time_label)
+    return f"until {label}" if isinstance(moment, datetime) else label.lower()
 
 
 def field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames) -> str:
@@ -382,7 +391,8 @@ def feedback_form(entry: ListRecord, secret: str, *, keeper_name: str, parking_l
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
             + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
             + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
-            + '<button type="submit" name="action" value="park-until-delivered" data-later-preset>Until delivered</button>'
+            + '<button type="submit" name="action" value="park-until-delivered" data-later-preset>'
+            + question_path.later_label(the_list.ParkUntilDelivered.DELIVERED, datetime.isoformat) + '</button>'
             + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
@@ -618,6 +628,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         else:
             state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
+    if unread_answers:
+        update += question_path.NEW_ANSWER_HTML
     sent = the_list.sent_notice_time(item)
     if isinstance(sent, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
@@ -839,10 +851,9 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
-        parked_until = the_list.parking_value(until)
-        assert parked_until is not the_list.NoTimestamp.UNSET
+        parked_until = the_list.read_parking_time(until)
         label = parking_notice_label(parked_until, user_zone())
-        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
+        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park", words)
         changed = the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
@@ -1164,6 +1175,7 @@ background:var(--ink-2);border-radius:50%}
 .list-log .log-evidence div{white-space:pre-wrap}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .page-question time{color:var(--ink-3);font-size:13px}
+.list-table small[data-new-answer]{color:var(--accent)}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
 .list-panel:has([data-waiting-note]){min-height:12rem}
 .list-panel [data-waiting-note]{margin-top:16px}
@@ -1190,22 +1202,19 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
-const chipsByQuestion=''' + json.dumps({
-    str(open_question).lower(): {
-        str(parked).lower(): {
-            state.value: list_chip(state, parked=parked, open_question=open_question).value for state in CHIP_BY_STATE
-        } for parked in (False, True)
-    } for open_question in (False, True)
-}) + ''';
+''' + question_path.queue_script() + '''
+const queuesByState=''' + json.dumps(QUEUE_BY_STATE) + ''';
+const chipsByQueue=''' + json.dumps(CHIP_BY_QUEUE) + ''';
+const newAnswerMarkup=''' + json.dumps(question_path.NEW_ANSWER_HTML) + ''';
 const shows=''' + json.dumps(list(ListChip)) + r''';
-const chipsByState=chipsByQuestion.false.false;
+const chipsByState=Object.fromEntries(Object.entries(queuesByState).map(([state,queue])=>[state,chipsByQueue[queue]]));
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
  const parked=isParked(data);
- if(data.unread==='true' && data.unreadAnswer==='true' || !parked && data.unreadDelivery==='true') return 'needs-me';
- return chipsByQuestion[data.openQuestion][String(parked)][data.state];
+ return chipsByQueue[questionQueue(queuesByState[data.state],data.unread==='true' && data.unreadAnswer==='true',
+  parked,data.unreadDelivery==='true',data.openQuestion==='true')];
 };
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
@@ -1257,6 +1266,10 @@ function syncUnread(item,form,unread,unreadSort){
  item.dataset.sortValues=JSON.stringify(sortValues);
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
  const read=form?.querySelector('[value="read"]');
+ const answerMark=update.querySelector('[data-new-answer]');
+ if(unread && item.dataset.unreadAnswer==='true'){
+  if(!answerMark) update.insertAdjacentHTML('beforeend',newAnswerMarkup);
+ }else answerMark?.remove();
  if(unread){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');

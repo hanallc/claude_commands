@@ -29,7 +29,7 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.production import delivery_state, record_store, staff
-from scripts.review_links import change_page, page_question, question_record
+from scripts.review_links import change_page, page_question, question_path, question_record
 
 
 class ListError(ValueError):
@@ -73,11 +73,8 @@ class NoTimestamp(StrEnum):
 Timestamp = datetime | NoTimestamp
 
 
-class ParkUntilDelivered(StrEnum):
-    DELIVERED = "delivered"
-
-
-Parking = Timestamp | ParkUntilDelivered
+ParkUntilDelivered = question_path.UntilDelivered
+Parking = question_path.LaterValue | NoTimestamp
 
 
 class EtaStatus(StrEnum):
@@ -422,16 +419,25 @@ def time_value(text: str) -> Timestamp:
     return value
 
 
+def read_parking_time(text: str) -> question_path.LaterValue:
+    def local_date(value: datetime) -> datetime:
+        if len(text) != 10:
+            _validate_time(value)
+        return value.replace(tzinfo=user_zone())
+
+    return question_path.read_later(text, local_date)
+
+
 def parking_value(text: str) -> Parking:
-    return ParkUntilDelivered.DELIVERED if text == ParkUntilDelivered.DELIVERED else time_value(text)
+    return read_parking_time(text) if text else NoTimestamp.UNSET
+
+
+def later_value(parking: Parking) -> question_path.Later:
+    return question_path.NO_LATER if parking is NoTimestamp.UNSET else parking
 
 
 def parking_active(value: Parking, moment: datetime) -> bool:
-    return value is ParkUntilDelivered.DELIVERED or isinstance(value, datetime) and value > moment
-
-
-def _parking_text(value: Parking) -> str:
-    return value.value if isinstance(value, ParkUntilDelivered) else _time_text(value)
+    return question_path.later_active(later_value(value), moment)
 
 
 def _request_parking(value: Parking) -> Parking:
@@ -727,7 +733,7 @@ def _log_fields(fields: LogFields) -> dict[str, object]:
     if "next_check" in fields:
         values["next_check"] = next_check_text(fields["next_check"])
     if "parked_until" in fields:
-        values["parked_until"] = _parking_text(fields["parked_until"])
+        values["parked_until"] = question_path.write_later(later_value(fields["parked_until"]))
     if "blocked_by" in fields:
         values["blocked_by"] = [(dependency.number, dependency.condition) for dependency in fields["blocked_by"]]
     return values
@@ -897,7 +903,7 @@ def _question_id(value: object) -> str:
 def _request_fields(request: PageRequest) -> dict[str, str]:
     fields = {"request": _request_id(request.request), "action": request.action, "words": request.words, "form_words": request.form_words}
     if request.parked_until is not NoTimestamp.UNSET:
-        fields["parked_until"] = _parking_text(request.parked_until)
+        fields["parked_until"] = question_path.write_later(later_value(request.parked_until))
     return fields
 
 
@@ -1076,7 +1082,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "owner": item.owner, "producer": item.producer, "unit": item.unit, "state": item.state.value,
               "next_check": next_check_text(item.next_check), "eta": eta_text(item.eta),
               "eta_kind": _eta_kind(item.eta),
-              "unread_since": _time_text(item.unread_since), "parked_until": _parking_text(item.parked_until),
+              "unread_since": _time_text(item.unread_since),
+              "parked_until": question_path.write_later(later_value(item.parked_until)),
               "blocked_by": json.dumps([(entry.number, entry.condition) for entry in item.blocked_by], ensure_ascii=False),
               "related_to": json.dumps(item.related_to), "reviews": json.dumps(item.reviews),
               "requested_by": item.requested_by.value,
