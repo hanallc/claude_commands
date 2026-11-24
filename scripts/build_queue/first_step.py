@@ -29,6 +29,9 @@ from scripts.lib.build_steps import (
 from scripts.mac_test import claim_state
 
 
+MAC_LINUX_START_UNCONFIRMED = "mac_linux_start_unconfirmed"
+
+
 class FirstStepRefused(RuntimeError):
     """The command did not receive permission to take a slot."""
 
@@ -259,15 +262,22 @@ def run_gate_with_placement(
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
                 refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
+                unconfirmed_start = refusal.reason == MAC_LINUX_START_UNCONFIRMED
                 waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
                     destination.provider == 'scaler' or
                     (mac_linux and isinstance(settled.permission, placement.PermissionConsumed)))
                 if (settled.assignment != refusal.assignment
                         or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
                         or not isinstance(settled.retry, placement.RetryAt)
+                        or unconfirmed_start and (not mac_linux or settled.reason
+                            or not isinstance(settled.permission, placement.PermissionConsumed))
                         or (settled.state != placement.ClosedAssignment(refusal.reason) and not waiting_for_settlement)):
                     raise wire.AdmissionUnavailable('the queue did not permit a retry for the gate attempt')
+                if unconfirmed_start:
+                    waiting_for_settlement = False
                 reason = 'did not answer' if refusal.reason == placement.MAC_LINUX_NO_ANSWER else refusal.reason
+                if unconfirmed_start:
+                    reason = 'did not confirm a start'
                 retry_notice = (f'placement: retry — {destination.host} ({destination.target}) {reason}. '
                                 + 'Received a replacement assignment.')
             else:

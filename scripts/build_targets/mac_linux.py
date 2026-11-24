@@ -562,7 +562,11 @@ def guest_ssh_environment() -> dict[str, str]:
 def inner_connect_failure[Output: (bytes, str)](
     reply: subprocess.CompletedProcess[Output], *, bundle_stream: bool = False,
 ) -> str:
-    if reply.returncode != INNER_CONNECT_STATUS or reply.stdout:
+    if reply.returncode == INNER_CONNECT_STATUS:
+        if reply.stdout:
+            return ''
+    elif (not bundle_stream or reply.returncode != 0
+          or reply.stdout not in (b'', b'\n\n', '', '\n\n')):
         return ''
     stderr = reply.stderr.decode(errors='replace') if isinstance(reply.stderr, bytes) else reply.stderr
     if bundle_stream:
@@ -674,14 +678,16 @@ class GuestNotStarted:
 
     reason: str
     settlement_required: bool = False
+    retry_before_settlement: bool = False
 
 
 class GuestEndUnproven(GuestUnavailable):
     """The proof wait expired for an armed guest attempt."""
 
-    def __init__(self, message: str, armed: ArmedGuestAttempt) -> None:
+    def __init__(self, message: str, armed: ArmedGuestAttempt, *, retry_before_settlement: bool = False) -> None:
         super().__init__(message)
         self.armed: ArmedGuestAttempt = armed
+        self.retry_before_settlement: bool = retry_before_settlement
 
 
 GUEST_ARM_RECORDS = '''\
@@ -1159,11 +1165,11 @@ class GuestEndWait:
             elif not self.first_failure:
                 self.first_failure = proof.detail
 
-    def unreachable(self) -> GuestEndUnproven:
+    def unreachable(self, *, retry_before_settlement: bool = False) -> GuestEndUnproven:
         guest = self.settings.ssh_hops[-1]
         error = GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
                                  + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
-                                 self.armed)
+                                 self.armed, retry_before_settlement=retry_before_settlement)
         if self.first_failure:
             error.add_note(f'First cleanup failure: {self.first_failure}')
         return error
@@ -1250,6 +1256,8 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
                 elif (isinstance(error, Exception) or isinstance(failure, GuestEndUnproven)
                       or not isinstance(failure, Exception)):
                     failure.add_note(f'Cannot remove bundle ref {ref}: {error}')
+                    if isinstance(failure, GuestEndUnproven):
+                        failure.retry_before_settlement = False
                 else:
                     # An interrupt must end the route, never a retry that catches the earlier error.
                     error.add_note(f'Interrupted while handling: {failure!r}')
@@ -1970,7 +1978,7 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
             if isinstance(error, subprocess.TimeoutExpired):
                 stderr = error.stderr if isinstance(error.stderr, bytes) else b''
                 started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
-                failure = GuestResultUnavailable if started else GuestUnavailable
+                failure = GuestResultUnavailable if started else GuestTookNoRun
                 raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
@@ -2053,7 +2061,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
 
     assert end is not None
     if not end.proven:
-        error = end.unreachable()
+        retry_before_settlement = (dispatch.started is None
+            and (stream is None or run_start_line(request['attempt']).encode() not in stream.stderr.splitlines())
+            and (first_error is None or isinstance(first_error, GuestTookNoRun | GuestNotLocked)))
+        error = end.unreachable(retry_before_settlement=retry_before_settlement)
         if stream is not None and stream.returncode:
             error.add_note(stream_report(stream))
         if first_error is not None and isinstance(first_error.__cause__, subprocess.TimeoutExpired):
@@ -2358,18 +2369,22 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
         if dispatch is None and not permission_unknown:
             return GuestNotStarted(reason)
+        retry_before_settlement = False
         if dispatch is not None:
-            if dispatch.settled and dispatch.arm_requested and not lock_refused:
-                if dispatch.started is None:
+            if dispatch.arm_requested:
+                if dispatch.started is not None:
+                    return GuestGateBlocked(reason)
+                retry_before_settlement = True
+                if dispatch.settled and not lock_refused:
                     reason += '. The guest did not confirm whether the run started.'
-                return GuestGateBlocked(reason)
-            if not dispatch.arm_requested:
+                    return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
+            else:
                 settle_guest_no_run(dispatch)
         try:
             release_launch()
         except OSError as error:
             return GuestGateBlocked(f'{reason}. Cannot release the Mac Linux launch holder: {error}')
-        return GuestNotStarted(reason, settlement_required=True)
+        return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=retry_before_settlement)
 
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
@@ -2451,6 +2466,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 except OSError as release_error:
                     detail = f'{error}. Cannot save the Mac Linux guest end: {journal_error}.'
                     return GuestGateBlocked(f'{detail} Cannot release the Mac Linux launch holder: {release_error}')
+            else:
+                if error.retry_before_settlement and dispatch.started is None:
+                    notes = cast(list[str], getattr(error, '__notes__', []))
+                    return GuestNotStarted(' '.join((str(error), *notes)), settlement_required=True,
+                                           retry_before_settlement=True)
         raise
     except GuestResultUnavailable as error:
         notes = cast(list[str], getattr(error, '__notes__', []))

@@ -3426,6 +3426,9 @@ class GuestNotStartedOutcome(Protocol):
     @property
     def settlement_required(self) -> bool: ...
 
+    @property
+    def retry_before_settlement(self) -> bool: ...
+
 
 class GuestToolSettings(Protocol):
     def command(self, shell: str) -> tuple[str, ...]: ...
@@ -3527,15 +3530,17 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
-            if outcome.settlement_required:
-                try:
-                    write_gate_claim_failure(failure)
-                except (KeyError, OSError) as error:
-                    raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
-                                                + f'Cannot save the placement refusal. {error}') from error
+            reason = first_step.MAC_LINUX_START_UNCONFIRMED if outcome.retry_before_settlement else MAC_LINUX_NO_ANSWER
+            failure = admission_wire.ClaimFailure(token_hex(16), assignment, reason)
+            try:
+                write_gate_claim_failure(failure)
+            except (KeyError, OSError) as error:
+                if not outcome.settlement_required:
+                    raise
+                raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
+                                            + f'Cannot save the placement refusal. {error}') from error
+            if outcome.settlement_required and not outcome.retry_before_settlement:
                 raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
-            write_gate_claim_failure(failure)
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         first_failures = {(job.suite, job.module): job for job in outcome.executions
                           if job.kind is GateJobKind.TEST_MODULE and job.returncode
