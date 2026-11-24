@@ -6050,23 +6050,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         finished = threading.Event()
-        real_deliver = change_page.deliver
+        real_deliver = list_page.deliver
 
-        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> None:
+        def deliver(submission: list_page.ListActionSubmission) -> None:
             try:
-                real_deliver(message, status)
+                real_deliver(submission)
             finally:
                 finished.set()
 
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(change_page, "deliver", side_effect=deliver),
+              patch.object(list_page, "deliver", side_effect=deliver),
               patch.object(change_page, "send_question", return_value=question_outcome()) as send):
             for _ in range(2):
                 finished.clear()
                 self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(fields))[0], 200)
-                self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+                self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS), "List question delivery did not finish.")
             send.assert_called_once()
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
@@ -6077,23 +6076,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         finished = threading.Event()
-        real_deliver = change_page.deliver
+        real_deliver = list_page.deliver
         messages: list[str] = []
         tries = conf.read("review_links").whole("delivery_tries")
 
-        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> None:
+        def deliver(submission: list_page.ListActionSubmission) -> None:
             try:
-                if isinstance(message, change_page.MessageDelivery):
-                    messages.append(message.message)
-                real_deliver(message, status)
+                if isinstance(submission, list_page.ListQuestionDelivery):
+                    messages.append(submission.delivery.message)
+                real_deliver(submission)
             finally:
                 finished.set()
 
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
-              patch.object(change_page, "deliver", side_effect=deliver),
+              patch.object(list_page, "deliver", side_effect=deliver),
               patch.object(change_page, "alert_delivery_failures"),
               patch.object(change_page, "send_question", side_effect=[
                   *([question_outcome("refused", "Producer offline")] * tries)]) as send):
@@ -6101,7 +6099,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
             self.assertEqual(json.loads(response)["open_question"], "true")
-            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS), "List question delivery did not finish.")
             saved = the_list.load(morty.id, item.id)
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
             opened = self.request(list_page.PAGE_PATH)
