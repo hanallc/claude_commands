@@ -286,6 +286,27 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("diff", original, duplicate), "")
         return duplicate
 
+    def test_shrink_scope_accepts_an_empty_diff_already_on_main(self) -> None:
+        shrink = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("fetch", "origin", "main")
+        _ = self.git("merge", "--no-ff", "-m", "Bring main into production", "origin/main")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        before = self.git("rev-parse", "HEAD^{tree}")
+        main = self.git("rev-parse", "main", cwd=self.origin)
+        _ = self.git("update-ref", "refs/heads/main", f"{shrink}^1", cwd=self.origin)
+        held = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+        self.assertEqual(held.process.returncode, 1, held.process.stdout + held.process.stderr)
+        self.assertIn("scope: held — shrink paths must be", held.process.stdout)
+        _ = self.git("update-ref", "refs/heads/main", main, cwd=self.origin)
+
+        result = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("scope: ok — 0 changed paths", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "origin/production^{tree}"), before)
+        self.assertEqual(self.git("rev-parse", "origin/production^2"), shrink)
+
     def test_shrink_ancestry_accepts_a_duplicate_shrink_on_another_branch(self) -> None:
         duplicate = self.duplicate_shrink_on_unit_branch()
         plan = "docs/plans/alpha.md"

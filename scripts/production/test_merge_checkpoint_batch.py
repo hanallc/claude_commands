@@ -307,6 +307,25 @@ subprocess.run(["git", "-C", {str(self.root / "main-fix-writer")!r}, "push", "or
         self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_later_rows_name_the_held_row_and_say_they_did_not_run(self) -> None:
+        first = self.checkpoint("src/alpha.txt", "Code in a shrink\n", subject="shrink")
+        second = self.beta_checkpoint("src/beta.txt", "Beta checkpoint\n")
+        third = self.checkpoint("src/third.txt", "Third checkpoint\n")
+        start = self.git("rev-parse", "HEAD")
+
+        result = self.land_batch([self.batch_line("alpha", "2", first, "--shrink"),
+                                  self.batch_line("beta", "5", second), self.batch_line("alpha", "3", third)])
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
+        self.assertEqual(len(notices), 3, result.stdout)
+        self.assertIn(f"send alpha: phase 2 ({first[:12]}): shrink paths must be", notices[0])
+        detail = f"Not run because alpha phase 2 ({first[:12]}) was held."
+        self.assertEqual(notices[1:], [f"send beta: phase 5 ({second[:12]}): {detail}",
+                                       f"send alpha: phase 3 ({third[:12]}): {detail}"])
+        self.assertEqual(self.events("checkpoint-test"), [])
+        self.assert_rolled_back(start)
+
     def test_batch_preserves_an_open_merge_and_its_staged_resolution(self) -> None:
         start = self.git("rev-parse", "HEAD")
         first = self.checkpoint(content="alpha batch side\n")
