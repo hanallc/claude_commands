@@ -7162,18 +7162,18 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         finished = threading.Event()
-        real_deliver = change_page.deliver
+        real_deliver = change_page.deliver_with_outcome
 
         def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> None:
+                    status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
             try:
-                real_deliver(message, status)
+                return real_deliver(message, status)
             finally:
                 finished.set()
 
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(change_page, "deliver", side_effect=deliver),
+              patch.object(change_page, "deliver_with_outcome", side_effect=deliver),
               patch.object(change_page, "send_question", return_value=question_outcome()) as send):
             for _ in range(2):
                 finished.clear()
@@ -7189,23 +7189,23 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         finished = threading.Event()
-        real_deliver = change_page.deliver
+        real_deliver = change_page.deliver_with_outcome
         messages: list[str] = []
         tries = conf.read("review_links").whole("delivery_tries")
 
         def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> None:
+                    status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
             try:
                 if isinstance(message, change_page.MessageDelivery):
                     messages.append(message.message)
-                real_deliver(message, status)
+                return real_deliver(message, status)
             finally:
                 finished.set()
 
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
-              patch.object(change_page, "deliver", side_effect=deliver),
+              patch.object(change_page, "deliver_with_outcome", side_effect=deliver),
               patch.object(change_page, "alert_delivery_failures"),
               patch.object(change_page, "send_question", side_effect=[
                   *([question_outcome("refused", "Producer offline")] * tries)]) as send):
