@@ -20,8 +20,7 @@ from unittest import mock
 
 from scripts.build_queue import memory_files
 from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
-from scripts.review_links.firefox_test_support import load_firefox
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, load_firefox
 from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names

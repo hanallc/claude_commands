@@ -43,8 +43,8 @@ TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "script
                      "scripts/production/gate_modules.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
-                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
-                     "config/test_times.conf")
+                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "scripts/lib/testing_folders.py",
+                     "scripts/lib/session_folder.py", "config/build_folders.conf", "config/test_times.conf")
 _DIRECT_TEST_UNIT_PREFIX = "claude-direct-test-"
 _GATE_ANCESTOR_LIMIT = 32
 _GATE_ENVIRONMENT_LIMIT = 64 * 1024
@@ -258,7 +258,7 @@ def start_process(arguments: list[str]) -> str:
             and "dataclasses" not in sys.modules
             and not any(type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path)):
         sys.meta_path.insert(0, DataclassCodeFinder())
-    _install_unittest_boundary()
+    install_unittest_boundary()
     return selected
 
 
@@ -453,6 +453,8 @@ def _unittest_boundary(module: ModuleType) -> None:
         if not started:
             with lock:
                 if not started:
+                    sys.dont_write_bytecode = True
+                    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
                     has_runtime_limit = within_test_limit()
                     enforce_case_count = not has_runtime_limit and not _has_inherited_test_folder()
                     if not has_runtime_limit:
@@ -537,7 +539,8 @@ class UnittestBoundary:
         return spec
 
 
-def _install_unittest_boundary() -> None:
+def install_unittest_boundary() -> None:
+    """Install the test boundary once for the selected checkout."""
     state = sys.modules["_devtools_checkout"]
     if state.__dict__.get("unittest_boundary"):
         return
@@ -635,9 +638,9 @@ def _has_inherited_test_folder() -> bool:
         return False
 
 
-def within_test_limit() -> bool:
-    """Identify a gate or a direct test scope that enforces a deadline."""
-    return _verified_gate() or (sys.platform == "linux" and _has_linux_test_scope())
+def within_test_limit(*, gate_parent_only: bool = False) -> bool:
+    """Check for a gate parent or an active test deadline."""
+    return _verified_gate() or (not gate_parent_only and sys.platform == "linux" and _has_linux_test_scope())
 
 
 def _begin_direct_test() -> str | None:
@@ -768,6 +771,8 @@ def _watch_direct_test(seconds: int) -> None:
     import signal
     from contextlib import suppress
 
+    # Close the descriptors that the watchdog inherits from the test, so it holds no build folder lock of the test.
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
     _ = os.write(1, _WATCHDOG_READY)
     os.close(1)
     readable, _, _ = select.select([0], [], [], seconds)

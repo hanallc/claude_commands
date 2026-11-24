@@ -4,7 +4,7 @@ from decimal import Decimal
 import shutil
 import unittest
 
-from scripts.review_links.firefox_test_support import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links import console_theme, page_frame, setting_controls
 
 

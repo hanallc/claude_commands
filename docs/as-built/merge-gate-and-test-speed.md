@@ -724,7 +724,9 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The outer gate removes the nested gate files when it removes the module folder.
   The short names leave room for Unix socket paths below `TMPDIR`.
   The runner reads the output and removes the temporary folder when the job ends.
-  At the first unittest load or run, the bootstrap checks whether the process already runs under a test limit.
+  At the first unittest load or run, the bootstrap disables bytecode writes for the test.
+  Python child processes inherit `PYTHONDONTWRITEBYTECODE=1`.
+  The bootstrap then checks whether the process already runs under a test limit.
   On Linux, the bootstrap first checks for a verified gate parent.
   It then reads at most 32 ancestor records and up to 64 KiB of environment data per session leader.
   If neither check proves a gate launch, it reads the cgroup name once.
@@ -745,15 +747,29 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A Linux process without a user systemd manager uses a private folder and a watchdog process for the same deadline.
   Only a proven absence selects the watchdog: no user bus, a bus socket path that does not exist, or a bus where no process owns the systemd name.
   Any other failed manager check stops the test with status 1. The test starts only after the watchdog reports that it is ready; a watchdog that does not start also stops the test with status 1.
+  Before it reports that it is ready, the watchdog closes each descriptor above standard error that it inherits from the test.
+  Thus the watchdog holds no build folder lock of the test.
   At the deadline the watchdog stops the test first and then prints the limit line. The watchdog stops only the test process, not its children.
   Herdr adds the startup path to every agent pane because the server can launch it outside the client's test limit.
   The bootstrap gives a new direct test run a maker folder.
   A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `gate.py --affected` uses the same test-folder context for its outer run.
-  These folders use `<inherited TMPDIR>/test-runs/r*`.
+  A modeled checkout keeps each `r*` run folder in `test-runs` in its build output.
+  Worktree and main checkouts use their `target` link to the build output.
+  On natedev, a modeled `~/.claude` uses `/build/claude/main/test-runs`.
+  Numbered copies use their own `target` folder.
+  A checkout without a model output uses `$TMPDIR/test-runs`.
+  A nested legacy run uses the parent of the current run folder.
+  A gate job without `MERGE_GATE_MODULE_DIR` keeps the timed runner folders in its `TMPDIR`.
+  A direct timed runner selects the output from the checkout that contains `start_dir`.
+  It gives `config-reads-*` and `test-run-roots-*` unique names in that checkout's `test-runs` folder.
+  A new direct test run in that runner also puts its `TMPDIR` there.
   Child processes inherit TMPDIR, and each run holds its folder lock.
   Normal exit removes the folder, its lease, and its lock.
-  Before allocation, the next run sweeps free folders in that `test-runs` parent, including older `test-run-*` folders.
+  Before allocation, each run that prepares a `test-runs` parent sweeps its free folders, including older `test-run-*` folders.
+  This includes a direct run and the `gate.py --affected` outer run.
+  `test_run_folder()` uses the checkout output even when TMPDIR names a gate module folder.
+  The sweep does not wait for held folders.
   The sweep also removes free lease records, lock records, and unfinished temporary lease files.
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
@@ -981,7 +997,10 @@ It also removes unpublished formatter commits.
 
 Shrink and as-built items use their commit subject's plan slug within the configured plan folder.
 Subjects without the closing-item format retain the configured plan.
-An ancestry hold names the first unmerged commit by its short hash and subject.
+Ancestry uses each pending commit's first parent as the test merge base.
+It skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
+Ancestry holds on a root commit, a tree change, a conflict, or a configured custom merge driver.
+The hold names the first such commit by its short hash and subject.
 A row that repeats a checkpoint in the batch receives instructions to resume it alone.
 
 `test_merge_checkpoint_batch.py` checks fresh and resumed red batches, formatter rollback, and the next queued item.
@@ -1202,7 +1221,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 
 **Stub app-server shutdown** (`scripts/agents/codex_test_support.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
-**Shared Firefox for browser tests** (`scripts/review_links/firefox_test_support.py`).
+**Shared Firefox for browser tests** (`scripts/review_links/browser_test_support.py`).
 Each test module starts Firefox on its first probe.
 Marionette closes the probe windows and tabs.
 It clears the profile data before it opens the next tab with the requested viewport.

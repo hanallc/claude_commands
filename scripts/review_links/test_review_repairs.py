@@ -18,7 +18,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links.firefox_test_support import load_firefox
+from scripts.review_links.browser_test_support import load_firefox
 from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
 from scripts.review_links import question_record
 

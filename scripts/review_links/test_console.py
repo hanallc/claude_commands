@@ -23,7 +23,7 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links.firefox_test_support import firefox_probe_results, load_firefox
+from scripts.review_links.browser_test_support import firefox_probe_results, load_firefox
 from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
     review_submissions,
