@@ -137,7 +137,7 @@ def register(image: Path, title: str, owner: staff.StaffId, subject: str,
     title = title.strip()
     if title.splitlines() != [title]:
         raise ValueError("The image title must be one nonempty line.")
-    limit = conf.read("review_links").whole("image_title_max_chars")
+    limit = conf.read("review_links").whole("max_chars.image_title")
     if len(title) > limit:
         raise ValueError(f"--title has {len(title)} characters. The limit is {limit}. Put the details in --look-for lines.")
     lines = tuple(line.strip() for line in look_for)

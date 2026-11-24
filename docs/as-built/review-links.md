@@ -1642,7 +1642,7 @@ A showrunner or unit registers each image, or a before and after pair, with one 
 ```
 
 - The title says what the image shows. Give one `--look-for` for each point the user needs to check.
-- `image_title_max_chars` in `config/review_links.conf` limits the title to 80 characters.
+- `max_chars.image_title` in `config/review_links.conf` limits the title to 80 characters.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
