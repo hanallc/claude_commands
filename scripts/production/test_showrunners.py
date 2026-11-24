@@ -488,7 +488,9 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
 
     def test_failed_lookup_keeps_healthy_rows_and_reserves_inspection_budget(self) -> None:
         self.instance("showrunner-a-stalled", target="session:stalled-id", doc=self.doc)
-        self.instance("showrunner-b-healthy", target="session:healthy-id", doc=self.doc)
+        healthy_doc = self.root / "healthy-production.md"
+        _ = healthy_doc.write_text("# Healthy production\n")
+        self.instance("showrunner-b-healthy", target="session:healthy-id", doc=healthy_doc)
         for failure in (TimeoutError, OSError):
             clock = [100.0]
             errors = io.StringIO()

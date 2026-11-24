@@ -9092,7 +9092,7 @@ class VerifyRunSlotTests(unittest.TestCase):
         fixture.configure(slot_gap_seconds=60)
         config = fixture.root / "build_admission.conf"
         _ = config.write_text(config.read_text() +
-            f"\nmax_runs.{fixture.server.host}.fixture={maximum}\nmax_runs.exempt_unit=natemerge\n")
+            f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.fixture={maximum}\nmax_runs.exempt_unit=natemerge\n")
 
     def verify_step(self, fixture: AdmissionFixture, *, unit: str = "", episode: str = "",
                     owner: wire.Owner | None = None) -> wire.PlacementRequest:

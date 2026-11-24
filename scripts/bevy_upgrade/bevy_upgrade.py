@@ -88,7 +88,7 @@ def _line(production: Production, now: datetime, as_json: bool, identity: str) -
         return 0
     pins_error = ""
     try:
-        latest = pins.read_pins(production.checkout)
+        latest = pins.read_pins(production.repository_checkout)
     except pins.PinsFailure as error:
         pins_error = str(error)
     else:
@@ -147,7 +147,7 @@ def _run(args: argparse.Namespace, production: Production, now: datetime, identi
     latest: pins.Pins | None = None  # None means no successful lockfile read in this run.
     with upgrade_record.locked(identity):
         if verb == "start":
-            latest = pins.read_pins(production.checkout)
+            latest = pins.read_pins(production.repository_checkout)
             current = upgrade_record.start(production, cast(str, args.target), latest, now, staff_id=identity)
         else:
             current = upgrade_record.load(identity)
@@ -161,7 +161,7 @@ def _run(args: argparse.Namespace, production: Production, now: datetime, identi
                     return 0
                 raise upgrade_record.RecordFailure("the watch is closed; start a new one")
             try:
-                latest = pins.read_pins(production.checkout)
+                latest = pins.read_pins(production.repository_checkout)
             except pins.PinsFailure as error:
                 pins_error = str(error)
             else:

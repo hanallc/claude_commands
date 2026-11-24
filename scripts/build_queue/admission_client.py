@@ -401,9 +401,10 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | wire.SettlementRequest | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | wire.SettlementRequest
+           | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    if _waits_for_live_service(request):
+    if wait_for_service and _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
@@ -600,8 +601,8 @@ def consume_permission(request: wire.ConsumePermission) -> wire.FirstAuthorizati
     raise wire.AdmissionUnavailable("invalid permission answer")
 
 
-def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
-    reply = _query(request)
+def report_execution(request: wire.ExecutionReport, *, wait_for_service: bool = True) -> wire.DispatchStatus:
+    reply = _query(request, wait_for_service=wait_for_service)
     if isinstance(reply, wire.DispatchStatus):
         return reply
     raise wire.AdmissionUnavailable("invalid execution report answer")
@@ -1052,7 +1053,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
     placement_control = _waits_for_live_service(request)
     generation_query = isinstance(request, wire.BuildHistoryRequest)
     slot_waiting = (wire.RepositorySlotWaiting(request.repository, tuple(range(1, request.maximum + 1)),
-                    request.maximum, f"slots.{request.machine}.{request.repository}.max")
+                    request.maximum, f"slots.{conf.host_key_name(request.machine)}.{request.repository}.max")
                     if isinstance(request, wire.RepositorySlotRequest) else None)
     bound_outage = isinstance(request, (wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport,
                                         wire.RepositorySlotRequest))

@@ -95,9 +95,11 @@ Use TodoWrite tool with todos:
     [STOP and wait for user response]
 
     If user chooses **cleanup**:
-    - Run `git branch -d [branch-name]` to delete local branch
-    - Run `git push origin --delete [branch-name]` to delete remote branch
-    - Confirm successful removal
+    1. Verify that the PR is merged and its head is the selected branch on origin.
+    2. Save the merged PR's `headRefOid` as `EXPECTED_COMMIT` and its full ref as `FULL_BRANCH_REF`.
+    3. Run `git branch -d [branch-name]` to delete the local branch.
+    4. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/origin_deletion.py "$PWD" origin "$FULL_BRANCH_REF" "$EXPECTED_COMMIT"`.
+    5. Report the local and origin results.
 
     If user chooses **keep**:
     - Inform user the branch remains available for future work

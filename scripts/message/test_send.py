@@ -8746,7 +8746,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.row_id = self.fixture.worker("impl").id
         self.fixture.world.add(self.row, "w1:p1")
         self.state = self.fixture.root / "messages"
-        _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_SPLIT_RATIO=0.667\n")
+        _ = (self.fixture.root / "conf/direct.conf").write_text("worker_split_ratio=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation",
@@ -9291,6 +9291,14 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertEqual(self.fixture.world.commands, before)
                 if state == "blocked":
                     self.assertIn("Worker blocked: worker is blocked", retained)
+                    marker = "Detached run: fixture"
+                    result = send.deliver_worker_text(row, staff.snapshot(), marker,
+                        sender="detached-runs", timeout=send.delivery_timeout(),
+                        receipt=send.WorkerResultReceipt(marker))
+                    self.assertEqual(result.outcome, "retry", result.detail)
+                    self.assertEqual(result.detail, "worker is blocked")
+                    self.assertEqual(self.fixture.world.commands, before)
+                    self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
                 elif state == "unknown":
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())

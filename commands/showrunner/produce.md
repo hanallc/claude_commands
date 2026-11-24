@@ -80,11 +80,13 @@ State:
   `open_for_user`. Omitting that key leaves the durable list unchanged.
   `report_to_user` is kept the same way in
   `~/.local/state/showrunner/reports/<staff id>.json`.
-- `LOG` backups — `~/.local/state/showrunner/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`,
-  `log_backup.py` copies a changed `LOG` when `production_check.sh` runs and keeps the newest 48 copies.
-  No automatic report runs this check. To create a copy, run
-  `~/.claude/scripts/lib/py ~/.claude/scripts/production/log_backup.py <staff id>`.
-  To restore `LOG`, copy the selected file over it.
+- The hourly `production-backup` job saves the document, LOG, and notes.
+  Find the local repository at `~/.local/state/production-backups/<staff-id>/backup/`.
+  The Mac mirror uses `backup.git` in the same staff folder.
+  Legacy LOG copies stay in `log-backups/` beside the local repository.
+  On natedev, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/log_backup.py` for an immediate backup.
+  To restore a LOG, run `git -C "$BACKUP" show "$REV:log/$LOG_NAME" > "$SCRATCH_LOG"`.
+  Set `BACKUP` to either repository. Check the recovered file before copying it to the live path.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -329,7 +331,11 @@ Your text to nate while he is away follows this import:
   never poll.
 - A ruling that parks, stops or replaces work names the runs to cancel in
   the same turn under <WorkerRuns/> in `/unit:direct`.
-- **Helpers.** Stop each named helper agent once its report is read.
+- **Helpers.** On an enrolled showrunner, assign `review` or `astra-reviewer` with
+  `/showrunner:worker`. Keep orders and replies in the existing run directory.
+  Respect the worker limit when assigning reviews in parallel. End each helper
+  after reading its report. Send write orders to a unit or the serving merge unit.
+  Before enrollment, stop each built-in helper after reading its report.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
 - **Unmeasured ETAs.** When a unit has no measured phase ETA, run `~/.claude/scripts/lib/py
@@ -739,7 +745,9 @@ Read a shot, not even to look before a merge or before the user sees it. The
 2026-10-01 nightly review counted 116 shots (227k tokens) loaded there in 2.6
 days. Units run this check themselves before each checkpoint notice
 (<MergeCheckpoint/> step 3). Run it here only when a notice's verdict is
-missing or stale: spawn a fresh helper agent with this prompt:
+missing or stale.
+Assign a fresh read-only review worker through `/showrunner:worker` when enrolled.
+Before enrollment, start a built-in helper. Give it this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
 > <paths>. Guide: <UX guide path>. Scale: <shot pixels per logical pixel>.
@@ -748,8 +756,9 @@ missing or stale: spawn a fresh helper agent with this prompt:
 > rules: <the doc's Production rules that concern looks>. Return only the
 > verdict and the table.
 
-Read its verdict, then stop the helper. Save each canonical candidate it
-lists, without viewing it, into a slot still empty: `mkdir -p
+Read the verdict and end the helper. When enrolled, send the following
+example writes to the unit that owns the guide.
+Save each listed candidate in an empty slot. Do not open the image: `mkdir -p
 <guide>/examples/<stem> && magick <shot> -crop <crop> +repage
 <guide>/examples/<stem>/<slot>.png`. Saving it approves it for use now; add
 `- <stem>/<slot>.png — <why it is clear> — showrunner, <date>` to
@@ -814,11 +823,13 @@ Merge unit directors dispatch smoke checks, pushes, and promotion through worker
 Promote the exact sha pushed by <CIPoint/> after these checks:
 
 1. The CIPoint's local validation passed.
-2. Right after validation, with `CHECKOUT` still at that sha, run in the
-   background with `dangerouslyDisableSandbox: true`:
+2. After validation, run the smoke check in a copy of the exact sha. Run it in
+   the background with `dangerouslyDisableSandbox: true`.
 
    ```sh
-   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+     --repo CHECKOUT --commit <sha> -- \
+     bash ~/.claude/scripts/production/smoke_launch.sh '{tree}' <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,

@@ -21,8 +21,8 @@ class ConfigFixtureTests(unittest.TestCase):
             root = Path(directory)
             template = root / "template.conf"
             _ = template.write_text(
-                "# whole: 1..\nMAX_FIX_ATTEMPTS=3\n"
-                + "# whole: 1..\nMAX_REOPENS=3\n"
+                "# whole: 1..\nmax_fix_attempts=3\n"
+                + "# whole: 1..\nmax_reopens=3\n"
                 + "# whole: 1..4\ncount=4\n"
                 + "# whole: 2..2\nfixed=2\n"
                 + "# range: 0..10\ntimeout=9\n"
@@ -30,19 +30,19 @@ class ConfigFixtureTests(unittest.TestCase):
                 + "# one of: 1, 2\nmode=1\n"
                 + "unbounded=7\n")
             path = root / "direct.conf"
-            _ = path.write_text("MAX_FIX_ATTEMPTS=17\nfixture_only=kept\n")
+            _ = path.write_text("max_fix_attempts=17\nfixture_only=kept\n")
             with mock.patch("scripts.lint.memory_test_support._template", return_value=template):
-                _ = write_config_fixture(path, "MAX_REOPENS=19\n")
+                _ = write_config_fixture(path, "max_reopens=19\n")
                 _ = write_config_fixture(path)
             text = path.read_text()
         expected = {
-            "MAX_FIX_ATTEMPTS": "17", "MAX_REOPENS": "19", "fixture_only": "kept",
+            "max_fix_attempts": "17", "max_reopens": "19", "fixture_only": "kept",
             "count": "3", "fixed": "2", "timeout": "4.5", "retry": "0.25", "mode": "1", "unbounded": "7",
         }
         actual = dict(line.split("=", 1) for line in text.splitlines()
                       if "=" in line and not line.startswith("#"))
         self.assertEqual(actual, expected)
-        self.assertIn("# whole: 1..\nMAX_FIX_ATTEMPTS=17\n", text)
+        self.assertIn("# whole: 1..\nmax_fix_attempts=17\n", text)
         self.assertIn("# test config shift: 4 3\n# whole: 1..4\ncount=3\n", text)
 
     def test_config_environment_shifts_unpinned_values_and_uses_short_deadlines(self) -> None:
