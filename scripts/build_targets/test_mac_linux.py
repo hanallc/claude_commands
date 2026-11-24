@@ -34,7 +34,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
-from scripts.lib import conf, process_group, process_start, scratch
+from scripts.lib import atomic_file, conf, process_group, process_start, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
@@ -1711,7 +1711,8 @@ fi
             self.assertGreater(synced.index(path.parent.stat().st_ino), synced.index(path.stat().st_ino))
             return consume(request)
 
-        with (patch.object(os, 'fsync', side_effect=record_sync),
+        with (patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
+              patch.object(os, 'fsync', side_effect=record_sync),
               patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
             result = self.route()
         assert isinstance(result, GateRun), result
@@ -1727,37 +1728,46 @@ fi
                 raise OSError('fixture journal directory sync failed')
             fsync(fd)
 
-        with (patch.object(os, 'fsync', side_effect=fail_directory_sync),
+        with (patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
+              patch.object(os, 'fsync', side_effect=fail_directory_sync),
               patch.object(admission_client, 'consume_permission') as consume):
             self.assertEqual(self.route(), 'mac-linux: fixture journal directory sync failed')
         consume.assert_not_called()
         self.assert_guest_clean()
 
-    def test_new_journal_ancestors_must_sync_before_consume_even_after_a_failed_sync(self) -> None:
+    def test_journal_sync_stops_at_the_state_root_even_after_a_failed_sync(self) -> None:
         new_root = self.root / 'new' / 'target-state'
+        new_root.mkdir(parents=True)
         path = new_root / 'mac-linux' / 'end-proofs.jsonl'
+        sync_folder = atomic_file.sync_folder
         fsync = os.fsync
         failed = False
         synced: list[int] = []
 
-        def record_sync(fd: int) -> None:
+        def sync_journal_folder(folder: Path) -> None:
             nonlocal failed
-            inode = os.fstat(fd).st_ino
-            if not failed and new_root.is_dir() and inode == new_root.stat().st_ino:
+            if folder not in (path.parent, new_root):
+                raise PermissionError('fixture ancestor is searchable only')
+            if not failed and folder == new_root:
                 failed = True
                 raise OSError('fixture ancestor sync failed')
+            sync_folder(folder)
+
+        def record_sync(fd: int) -> None:
             fsync(fd)
-            synced.append(inode)
+            synced.append(os.fstat(fd).st_ino)
 
         consume = admission_client.consume_permission
 
         def check_launch(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
-            expected = [entry.stat().st_ino for entry in (path, path.parent, new_root, new_root.parent, self.root)]
+            expected = [entry.stat().st_ino for entry in (path, path.parent, new_root)]
             first = synced.index(expected[0])
             self.assertEqual(synced[first:first + len(expected)], expected)
             return consume(request)
 
         with (patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(new_root)}),
+              patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
+              patch.object(atomic_file, 'sync_folder', side_effect=sync_journal_folder),
               patch.object(os, 'fsync', side_effect=record_sync),
               patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
             self.assertEqual(self.route(), 'mac-linux: fixture ancestor sync failed')

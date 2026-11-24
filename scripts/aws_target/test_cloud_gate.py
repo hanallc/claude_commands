@@ -2004,6 +2004,59 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
                          ledger.GateTerminated(int(self.now), 'i-' + attempt))
 
+    def test_paired_cleanup_accepts_a_concurrent_confirmation_for_the_same_box(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        launch = self.folder / 'launch.json'
+        cloud_gate.save(launch, {'instance': 'i-' + attempt})
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        read = cloud_gate.read
+
+        def confirm_after_selection(path: Path) -> dict[str, object]:
+            if path == launch:
+                with mock.patch.object(cloud_gate, 'read', read):
+                    self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+            return read(path)
+
+        with mock.patch.object(cloud_gate, 'read', side_effect=confirm_after_selection):
+            self.assertTrue(aws_trial.cleanup_trial(self.folder, worker))
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-' + attempt))
+        calls = [command[command.index('--instance-ids') - 1] for command in self.fake.commands]
+        self.assertEqual(calls, ['terminate-instances', 'describe-instances'])
+
+    def test_cleanup_confirmation_requires_the_same_region_and_instance_set(self) -> None:
+        self.record_running_gate('group', 'm7a.8xlarge', 'fixture-region')
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+        owner = ledger.GateOwnerUnknown()
+        instances = ('i-group', 'i-extra')
+        targets = ledger.GateCleanupTargets('fixture-region', instances)
+        box = cloud_gate.GateTermination('group', targets, owner)
+        deadline = self.now + 60
+        progress = worker.request_terminations((box,), deadline)
+        self.assertEqual(progress, cloud_gate.GateTerminationProgress([box], False))
+        self.assertTrue(worker.confirm_terminations(progress.pending, deadline))
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-group', ('i-extra',)))
+        saved_calls = list(self.fake.commands)
+
+        same = replace(box, targets=replace(targets, instances=instances[::-1]))
+        self.assertEqual(worker.request_terminations((same,), deadline), cloud_gate.GateTerminationProgress([], False))
+        outcome = ledger.GateTerminated(int(self.now) + 1, 'i-group')
+        self.book.resolve_gate(box.attempt, outcome, cleanup=same.targets)
+        for different in (replace(targets, region='other-region'), replace(targets, instances=('i-group',))):
+            with self.subTest(targets=different), redirect_stderr(StringIO()):
+                self.assertEqual(worker.request_terminations((replace(box, targets=different),), deadline),
+                                 cloud_gate.GateTerminationProgress([], True))
+                with self.assertRaises(ledger.GateCleanupSuperseded):
+                    self.book.resolve_gate(box.attempt, outcome, cleanup=different)
+        self.assertEqual(self.fake.commands, saved_calls)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state,
+                         ledger.GateTerminated(int(self.now), 'i-group', ('i-extra',)))
+
     def test_reconcile_resolves_a_lost_termination_reply(self) -> None:
         def lose_termination_reply(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
             result = self.fake(arguments, **options)
