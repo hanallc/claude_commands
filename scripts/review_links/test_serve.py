@@ -1028,6 +1028,49 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once_with(f"session:{other.current_session}", change_page.SENDER, ANY)
         self.assertEqual(len(investigation.records(other.id)), 1)
 
+    def test_a_retried_post_reuses_the_hold(self) -> None:
+        case, other, body = self.held_new_item()
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request_id = send_hold.new_hold_id()
+        result = f"{send_hold.HOLD_PATH}/{request_id}"
+        headers = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: request_id}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            first = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+            self.assertEqual(first, (202, "held", {"hold": request_id, "seconds": 60}))
+            repeated = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+            self.assertEqual((repeated[0], repeated[1], repeated[2]["hold"]), (202, "held", request_id))
+            self.assertEqual(self.hold_states(), ["pending"])
+            self.assertEqual(self.held_http("POST", result + "/send")[0], 200)
+            self.assertEqual(self.held_http("GET", result)[0], 200)
+            _ = write_config_fixture(conf.path("review_links"), "undo_seconds=0\n")
+            repeated = self.held_http("POST", review_page.NEW_ITEM_PATH, body, headers=headers)
+            self.assertEqual((repeated[0], repeated[1], repeated[2]["hold"]), (202, "held", request_id))
+            self.assertEqual(self.hold_states(), ["released"])
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(other.id)), 1)
+
+    def test_a_retried_hold_reports_the_remaining_undo_time(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        request_id = send_hold.new_hold_id()
+        headers = {send_hold.HOLD_HEADER: "1", send_hold.REQUEST_HEADER: request_id}
+        body = b"outcome=works"
+        started = now = time.time()
+        with patch.object(send_hold, "time", Mock(wraps=time, time=lambda: now)):
+            first = self.held_http("POST", review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(first, (202, "held", {"hold": request_id, "seconds": 60}))
+            now = started + 42.5
+            repeated = self.held_http("POST", review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(repeated, (202, "held", {"hold": request_id, "seconds": 17.5}))
+            now = started + 60
+            repeated = self.held_http("POST", review_page.PAGE_PATH, body, headers=headers)
+            self.assertEqual(repeated, (202, "held", {"hold": request_id, "seconds": 0}))
+            undo = f"{send_hold.HOLD_PATH}/{request_id}/undo"
+            self.assertEqual(self.held_http("POST", undo)[0], 200)
+
     def test_an_undone_new_item_is_never_filed_or_sent(self) -> None:
         case, other, body = self.held_new_item()
         _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
@@ -6993,23 +7036,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         finished = threading.Event()
-        real_deliver = change_page.deliver_with_outcome
+        real_deliver = list_page.deliver
 
-        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
+        def deliver(submission: list_page.ListActionSubmission) -> None:
             try:
-                return real_deliver(message, status)
+                real_deliver(submission)
             finally:
                 finished.set()
 
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(change_page, "deliver_with_outcome", side_effect=deliver),
+              patch.object(list_page, "deliver", side_effect=deliver),
               patch.object(change_page, "send_question", return_value=question_outcome()) as send):
             for _ in range(2):
                 finished.clear()
                 self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(fields))[0], 200)
-                self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+                self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS), "List question delivery did not finish.")
             send.assert_called_once()
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
@@ -7020,23 +7062,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         finished = threading.Event()
-        real_deliver = change_page.deliver_with_outcome
+        real_deliver = list_page.deliver
         messages: list[str] = []
         tries = conf.read("review_links").whole("delivery_tries")
 
-        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                    status: change_page.DeliveryStatus) -> change_page.DeliveryOutcome:
+        def deliver(submission: list_page.ListActionSubmission) -> None:
             try:
-                if isinstance(message, change_page.MessageDelivery):
-                    messages.append(message.message)
-                return real_deliver(message, status)
+                if isinstance(submission, list_page.ListQuestionDelivery):
+                    messages.append(submission.delivery.message)
+                real_deliver(submission)
             finally:
                 finished.set()
 
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
-              patch.object(change_page, "deliver_with_outcome", side_effect=deliver),
+              patch.object(list_page, "deliver", side_effect=deliver),
               patch.object(change_page, "alert_delivery_failures"),
               patch.object(change_page, "send_question", side_effect=[
                   *([question_outcome("refused", "Producer offline")] * tries)]) as send):
@@ -7044,7 +7085,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
             self.assertEqual(json.loads(response)["open_question"], "true")
-            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS), "List question delivery did not finish.")
             saved = the_list.load(morty.id, item.id)
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
             opened = self.request(list_page.PAGE_PATH)
