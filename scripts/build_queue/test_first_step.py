@@ -343,7 +343,7 @@ class FirstStepTests(unittest.TestCase):
                     self.assertFalse(admitted.assignment_file.exists())
                     admitted.handoff(fixture.root)
                     self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
-                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing)
+                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing, "handed_off")
                 placement_grant.assert_not_called()
 
     def test_close_after_verify_cancels_the_completed_remote_placement(self) -> None:
