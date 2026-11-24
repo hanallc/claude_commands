@@ -847,6 +847,23 @@ fi
         self.assertIn('fixture socket outage', errors.getvalue())
         self.assertEqual(mac_linux.settlement(assignment.episode, 16), placement.Settled())
 
+    def test_guest_end_report_accepts_pending_settlement_and_warns_on_refusal(self) -> None:
+        dispatch = self.guest_dispatch()
+        dispatch.started = mac_linux.ArmedGuestAttempt('stream-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture')
+        pending = wire.DispatchStatus(dispatch.assignment, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        for reason in ('', 'fixture refusal'):
+            with (self.subTest(reason=reason), redirect_stderr(io.StringIO()) as errors,
+                  patch.object(mac_linux, 'send_guest_execution', return_value=replace(pending, reason=reason)) as send):
+                mac_linux.settle_guest_dispatch(dispatch, 0)
+                send.assert_called_once()
+                request = cast(wire.ExecutionReport, send.call_args.args[0])
+                self.assertEqual(request.assignment, dispatch.assignment)
+                self.assertEqual(request.outcome, placement.AttemptCompleted(0))
+                self.assertEqual(request.path, placement.DispatchPathSettled())
+                expected = f'Mac Linux guest settlement report failed: {reason}\n' if reason else ''
+                self.assertEqual(errors.getvalue(), expected)
+
     def test_guest_settlement_reads_only_a_complete_matching_proof(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
         episode = 'fixture-episode'

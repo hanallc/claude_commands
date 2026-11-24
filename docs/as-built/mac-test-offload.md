@@ -102,6 +102,7 @@ It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state
 It records `proven` when cleanup confirms the end, even when the stream gives no start marker.
 It records `unproven` and saves the armed guest identity when the proof wait expires.
 The route sends the end report only if the stream gave the start marker.
+The queue can acknowledge the end report while it waits to read the proof.
 Each record contains the queue attempt key, the Mac claim ID, the result, the detail, and the wall time.
 The writer locks the file during the append and syncs the record to disk.
 A failed report send leaves the proof available on disk.

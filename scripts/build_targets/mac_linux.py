@@ -1360,8 +1360,11 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, status: int) -> None:
         with conf.diagnostics(report=False):
             timeout = conf.read('build_admission').number('query_timeout_seconds')
         reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
-        if reply.assignment != assignment or not isinstance(reply.state, placement.ClosedAssignment) or reply.reason:
-            raise wire.AdmissionUnavailable(reply.reason or 'the queue did not settle the guest attempt')
+        settlement_pending = (isinstance(reply.state, placement.CurrentAssignment)
+                              and isinstance(reply.permission, placement.PermissionConsumed))
+        if (reply.assignment != assignment or reply.reason
+                or not (settlement_pending or isinstance(reply.state, placement.ClosedAssignment))):
+            raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
     except (wire.AdmissionUnavailable, OSError, ValueError) as error:
         print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
 
