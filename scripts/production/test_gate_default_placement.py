@@ -475,9 +475,17 @@ class GateDefaultPlacementTests(unittest.TestCase):
             commit = commit_repository(repo, "Unit fixture", allow_empty=True, env=environment)
             environment["BUILDLOG_PREPARED_COPY"] = str(repo)
             _ = environment.pop(copies.PREPARED_GATE_FD, None)
-            for cwd, options in ((repo, ()), (nested, ()),
-                                 (repo, ("--module", "fixture/test_ok.py", f"--checkout={nested}"))):
-                arguments = ["--affected", *options]
+            for cwd, repo_options in (
+                (repo, ()),
+                (nested, ()),
+                (repo, ("--repo", str(nested))),
+                (repo, (f"--repo={nested}",)),
+                (repo, ("--checkout", str(nested))),
+                (repo, (f"--checkout={nested}",)),
+                (repo, ("--repo", str(repo), f"--checkout={nested}")),
+            ):
+                module_options = ["--module", "fixture/test_ok.py"] if repo_options else []
+                arguments = ["--affected", *repo_options, *module_options]
                 with (self.subTest(cwd=cwd, arguments=arguments), chdir(cwd),
                       mock.patch.dict(os.environ, environment, clear=True),
                       mock.patch.object(gate, "checked_gate_target") as place,
@@ -488,7 +496,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(shlex.split(command), [
                     "~/.claude/scripts/lib/py", "~/.claude/scripts/copies/copies.py", "run", "--repo", str(repo),
                     "--commit", commit, "--", "./scripts/lib/py", "scripts/production/gate.py",
-                    *arguments, *(["--repo", "{tree}"] if options else [])])
+                    "--affected", *module_options, "--repo", "{tree}"])
                 place.assert_not_called()
                 run.assert_not_called()
 
@@ -507,7 +515,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
             def launch(words: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...],
                        env: dict[str, str], text: bool) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(cwd, tree)
-                self.assertEqual(list(words), ["./scripts/lib/py", "scripts/production/gate.py", *arguments,
+                self.assertEqual(list(words), ["./scripts/lib/py", "scripts/production/gate.py", "--affected", "--full",
                                                "--repo", str(tree)])
                 self.assertTrue(text)
                 reader, = pass_fds

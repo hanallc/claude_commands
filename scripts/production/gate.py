@@ -3809,11 +3809,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             except (GateRefused, OSError, RuntimeError) as error:
                 raise GateRefused(" ".join(str(error).splitlines())) from error
             command = ["run", "--repo", str(repo), "--commit", commit, "--",
-                       "./scripts/lib/py", "scripts/production/gate.py", *arguments]
-            if any(word in {"--repo", "--checkout"} or word.startswith(("--repo=", "--checkout="))
-                   for word in arguments):
-                # copies.py replaces {tree} with the prepared checkout path.
-                command.extend(("--repo", "{tree}"))
+                       "./scripts/lib/py", "scripts/production/gate.py"]
+            remaining = iter(arguments)
+            for word in remaining:
+                if word in ("--repo", "--checkout"):
+                    _ = next(remaining)
+                elif not word.startswith(("--repo=", "--checkout=")):
+                    command.append(word)
+            # copies.py replaces {tree} with the prepared checkout path.
+            command.extend(("--repo", "{tree}"))
             # Keep newlines in quoted arguments on one shell command line.
             words = shlex.join(command).replace("\n", "'$'\\n''")
             print(f"~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
