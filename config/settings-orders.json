@@ -1,4 +1,7 @@
 {
+  "accounts": {
+    "login_sitting_interval_days": 25
+  },
   "aws_target": {
     "accounting_zone": 8
   },
@@ -27,7 +30,9 @@
     "sweep_build_floor_gib.natedev": 6
   },
   "mac_test": {
-    "offload": 21
+    "free_floor_gib": 27,
+    "offload": 21,
+    "probe_timeout_s": 26
   },
   "merge_gate": {
     "GATE_TIME_LIMIT_FACTOR": 5

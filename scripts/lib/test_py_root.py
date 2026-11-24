@@ -45,8 +45,10 @@ def load_tests(loader, tests, pattern):
 COPY_TARGETED_RUN = COPY_IMPORT_AUDIT + '''
 import runpy
 from unittest import mock
+from scripts.copies import copies
 from scripts.production import gate
 root = Path(os.environ['EXPECTED_CHECKOUT'])
+os.environ['BUILDLOG_PREPARED_COPY'] = str(root.resolve())
 os.environ['GATE_STATE_DIR'] = str(root / 'gate-state')
 os.environ['GATE_PASSED_DIR'] = str(root / 'gate-passes')
 def selected_suite(repo, *args, **kwargs):
@@ -55,7 +57,8 @@ def selected_suite(repo, *args, **kwargs):
         selected=gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
         mode=kwargs['mode'])
 sys.argv = [str(root / 'scripts/production/targeted_test.py'), '--repo', str(root)]
-with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
+with (mock.patch.object(copies, 'take_prepared_gate_handoff', return_value=True),
+      mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite)):
     try:
         runpy.run_path(sys.argv[0], run_name='__main__')
     finally:

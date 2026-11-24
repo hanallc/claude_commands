@@ -44,6 +44,22 @@ def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> Tem
     return TemplateValues(displayed, dict(given))
 
 
+AUTO_MODE_REFUSED_TITLE = "{session}: {count} {noun} refused"
+
+
+def auto_mode_refused_values(given: dict[str, str]) -> TemplateValues:
+    """Add the waits clause when it fits in the title."""
+    values = hide_sender_values(given, hidden=tuple(field for field in ("waits", "rule") if field in given))
+    waits = given.get("waits", "")
+    clause = ""
+    if waits and {"session", "count", "noun"} <= values.displayed.keys():
+        suffix = f"; {waits}"
+        title = AUTO_MODE_REFUSED_TITLE.format(**values.displayed)
+        if len(title + suffix) <= 44:
+            clause = suffix
+    return TemplateValues(values.displayed | {"waits_clause": clause}, values.supplied)
+
+
 def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
     """Shorten the held-push sentence for the title."""
     if "held" not in given:
@@ -189,44 +205,6 @@ ENTRIES = (
              "stopped": "1 session",
              "cause": "restart prompt not submitted"})),
         purpose="One restart problem sends one push with the failed session count."),
-    PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs folder trust",
-        ActionTemplate("In a terminal on {machine}, run ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust. "
-                       + "Then run /agents restart {account} in the natedev session."),
-        "After your restart request, {stopped} on Claude account {account} could not start on {machine}. Coding work stays stopped. "
-        + "The first command trusts the configured folders. The second retries stopped sessions.",
-        (PushExample("typical", {"stopped": "3 sessions", "machine": "natedev", "account": "claude2"}),),
-        purpose="One push counts sessions that need folder trust on one machine."),
-    PushText("shutdown.restart_untrusted_unlisted", "shutdown", "decision", "Stopped Claude work needs folder trust",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Trust the folders of the stopped Claude sessions on {machine} from their shutdown records."'),
-        "After your restart request, {stopped} on Claude account {account} could not start on {machine}. "
-        + "Claude does not trust the folders. "
-        + "Coding work stays stopped until the folders are trusted and the sessions restart.",
-        (PushExample("one_session", {"stopped": "1 session", "machine": "Mac", "account": "claude3"}),
-         PushExample("several_sessions", {"stopped": "4 sessions", "machine": "natedev", "account": "claude2"})),
-        purpose="Stopped sessions need trust for folders outside the configured list."),
-    PushText("shutdown.move_failed", "shutdown", "decision", "A Claude session did not finish its move",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Finish moving the Claude session named {session} to {target} from its shutdown record."'),
-        "The Claude session {session} on {machine} stopped on account {source} to move to account {target}. "
-        + "It did not start on {target}, so its work stays paused. "
-        + "Its shutdown record starts it on {target}, not on {source}.",
-        (PushExample("typical", {"session": "ups", "machine": "natedev", "source": "claude1", "target": "claude3"}),
-         PushExample("long_session", {"session": "build-followups-message-clarity-unit-director-session-12",
-             "machine": "Mac", "source": "claude2", "target": "claude4"})),
-        purpose="A session stopped for an account move did not start on its new account."),
-    PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
-        "The restart of Claude account {account} could not be confirmed on {machine}. "
-        + "Its stopped sessions may still be unable to work. Retrying asks any sessions that are still stopped to start again.",
-        (PushExample("typical", {"account": 'claude2', "machine": "Mac"}),
-         PushExample("long_account", {"account": '"claude-team-build-followups-12"', "machine": "natedev"})),
-        purpose="A restart ended, but its result could not be confirmed."),
-    PushText("shutdown.manual_restart", "shutdown", "decision", "Stopped Claude coding work needs you",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude sessions on {machine} from their shutdown records."'),
-        "After your shutdown, {stopped} on {machine} cannot restart without help. "
-        + "Coding work stays stopped. The shutdown records hold the commands to resume the stopped sessions.",
-        (PushExample("typical", {"machine": "natedev", "stopped": "3 sessions"}),
-         PushExample("one_session", {"machine": "Mac", "stopped": "1 session"})),
-        purpose="Stopped Claude sessions need their saved commands to resume."),
     PushText("quota.claude_next_move", "quota_alert", "note", "{account} has {remaining} left with no move",
         ActionTemplate("Set a move on the Accounts page"),
         "",
@@ -370,14 +348,13 @@ ENTRIES = (
         purpose="natedev's GPU stopped, and both displays are dark.",
         expand_values=partial(hide_sender_values, hidden=("xid", "meaning", "time"))),
     # Current ups.nix: low-runtime shutdown at five minutes or 30% charge.
-    PushText("nixos.ups_battery", "ups", "blocked", "Power outage threatens open work",
-        ActionTemplate("Save your open work on the natedev computer now."),
-        "Mains power is out. The natedev computer is on backup battery and could shut down soon. "
-        + "Charge: {charge}%. Time left: about {minutes} minutes. It shuts down at 30% charge. "
-        + "It also shuts down at 5 minutes left. This prevents the battery dying while a file is being saved.",
+    PushText("nixos.ups_battery", "ups", "blocked", "Power out: natedev on battery, {minutes} min left",
+        ActionTemplate("Save your open work on natedev now."),
+        "",
         (PushExample("typical", {"charge": "80", "minutes": "20"}),
          PushExample("shutdown_threshold", {"charge": "30", "minutes": "5"})),
-        purpose="Power is out, and natedev runs on battery. Save your work."),
+        purpose="Power is out, and natedev runs on battery. Save your work.",
+        expand_values=partial(hide_sender_values, hidden=("charge",))),
     PushText("nixos.ups_replace_battery", "ups", "note", "natedev UPS battery is worn out",
         ActionTemplate("Replace the battery in the natedev UPS."),
         "",
@@ -437,26 +414,18 @@ ENTRIES = (
                                      + "Both are done, and both units run under their new names."})),
         purpose="An update that an agent writes for you with /nate adhoc.",
         header=False, agent_written=True),
-    # Auto-mode refusal (texts from 2026-11-06, on the user's question via natedev): a session sends it with send.py --text-id auto_mode.refused.
-    # send.py fills sender from the session's own name, action from the commands' first words (rca.action_of),
-    # refused from the command values (one per line), waits_line from waits when the 30 s push review passes it
-    # (else ""), noun and this from the number of commands, and rule_line from rule.
-    PushText("auto_mode.refused", "{sender}", "decision", "{sender}: {session} {noun} refused",
+    # send.py counts the refused commands and reviews the waits clause.
+    PushText("auto_mode.refused", "{sender}", "decision", AUTO_MODE_REFUSED_TITLE + "{waits_clause}",
         ActionTemplate("On {machine}, in the {session} pane, type: Go: run the refused {noun}"),
-        "Auto mode refused {action} in the {session} session.{waits_line}\n{refused}\n\n"
-        + "Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.\n\n"
-        + "Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}",
+        "",
         (PushExample("typical", {"sender": "cargo-liner-style", "session": "modules", "machine": "natedev",
-            "action": "2 shell commands", "refused": "implement.sh --to modules-impl\nreview.sh --to modules-test",
-            "noun": "commands", "this": "these", "waits_line": " The modules build waits for them.", "rule_line": ""}),
+            "count": "2", "noun": "commands", "waits": "its build waits"}),
          PushExample("one_with_rule", {"sender": "build-followups", "session": "messaging", "machine": "natedev",
-            "action": "a shell command", "refused": "git push origin build-followups-messaging", "noun": "command",
-            "this": "this", "waits_line": " The merge of the messaging work waits for it.", "rule_line": " The rule: Bash(git push:*)"}),
+            "count": "1", "noun": "command", "waits": "its work waits", "rule": "Bash(git push:*)"}),
          PushExample("file_change_no_waits", {"sender": "hana", "session": "demo", "machine": "natedev",
-            "action": "a file change", "refused": "write phases/34h/delegated_phase_reservation_state.json",
-            "noun": "command", "this": "this", "waits_line": "", "rule_line": ""})),
+            "count": "1", "noun": "command"})),
         purpose="Auto mode refused a session's commands. The commands wait for you.",
-        session=SessionTemplate("{session}")),
+        session=SessionTemplate("{session}"), expand_values=auto_mode_refused_values),
     # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
     # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
     # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop from the case.

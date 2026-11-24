@@ -2422,6 +2422,13 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(commit, self.head)
                 self.assertEqual(Path(path).read_bytes(), b"same artifact")
 
+    def test_run_refuses_a_named_gate_without_a_test_mode_before_admission(self) -> None:
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", "--module", "x"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
+        admit.assert_not_called()
+
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
         output = self.base / "command-result.json"
         evidence = self.base / "build-evidence.json"
