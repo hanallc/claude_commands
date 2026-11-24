@@ -4,6 +4,8 @@ from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
 from textwrap import dedent
@@ -160,6 +162,79 @@ class CopyGateRetryTests(unittest.TestCase):
         self.assertEqual(self.runs.read_text().splitlines(), ["guest-attempt"])
         self.assertEqual(output, b"guest-attempt stdout\xff\n")
         self.assertTrue(errors.startswith(b"guest-attempt stderr\xfe\nGate placement blocked. "), errors)
+
+    @contextmanager
+    def assigned_aws_gate(self, command: tuple[str, ...]) -> Generator[None]:
+        script = self.tree / "scripts/production/gate.py"
+        script.parent.mkdir(parents=True)
+        _ = script.write_text(dedent("""\
+            import os
+            import signal
+            import sys
+
+            with os.fdopen(int(os.environ["BUILDLOG_PREPARED_GATE_FD"]), "rb") as handoff:
+                assert handoff.read(32) == f"{os.getpid()}\\n".encode("ascii")
+            if sys.argv[1:] == ["--wait"]:
+                signal.alarm(8)
+                signal.pause()
+                raise AssertionError("The gate should have stopped")
+            """))
+        destination = placement.PlacementDestination("scaler", "aws", "fixture-aws", claim_state.WHOLE_MAC)
+        owner = placement.SubmittingOwner("fixture-local", os.getpid(), "123")
+        source_key = execution_identity.SourceKeyKnown("fixture-source")
+        session = NoOwningSession()
+        assignment = placement.PlacementAssignment("episode", "attempt", destination, source_key, owner, session, 1.0)
+        profile = records.ProgramProfile("gate", str(self.root), str(self.root),
+                                         records.HistoryPeakSizing(1, records.FirstProgramPeak(1), 0.0))
+        request = wire.PlacementRequest(assignment.episode, owner, assignment.since, profile,
+            placement.PlacementConstraints(source_key, command, str(self.root), "", session,
+                                           (placement.PlacementCandidate(destination),)))
+        with (mock.patch("scripts.build_queue.first_step._gate_request", return_value=request) as prepare,
+              mock.patch.object(queue_place, "wait_for_placement", return_value=wire.Assignment(assignment)) as place):
+            yield
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.args[:3], (list(command), self.root, ("aws",)))
+        place.assert_called_once_with(request, "the caller left before first-step admission")
+
+    def test_tree_placeholder_in_the_gate_path_can_request_aws(self) -> None:
+        command = (sys.executable, "{tree}/scripts/production/gate.py")
+        with (self.assigned_aws_gate(command),
+              mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel):
+            status = copies.main(["run", "--repo", str(self.root), "--commit", "HEAD", "--targets", "aws",
+                                  "--", *command])
+        self.assertEqual(status, 0)
+        cancel.assert_called_once()
+
+    def test_interrupt_reaps_the_gate_before_cancelling_placement(self) -> None:
+        command = (sys.executable, "scripts/production/gate.py", "--wait")
+        wait = subprocess.Popen[str].wait
+        launched: list[subprocess.Popen[str]] = []
+
+        def interrupt_wait(process: subprocess.Popen[str], timeout: float | None = None) -> int:
+            if not launched:
+                launched.append(process)
+                raise KeyboardInterrupt
+            return wait(process, timeout=timeout)
+
+        def cancel_after_exit(_request: wire.CancelPlacement) -> wire.Ok:
+            child, = launched
+            self.assertEqual(child.returncode, -signal.SIGKILL)
+            with self.assertRaises(ChildProcessError):
+                _ = os.waitpid(child.pid, os.WNOHANG)
+            return wire.Ok()
+
+        try:
+            with (self.assigned_aws_gate(command),
+                  mock.patch.object(subprocess.Popen, "wait", interrupt_wait),
+                  mock.patch.object(client, "cancel_placement", side_effect=cancel_after_exit) as cancel,
+                  self.assertRaises(KeyboardInterrupt)):
+                _ = copies.main(["run", "--repo", str(self.root), "--commit", "HEAD", "--targets", "aws",
+                                 "--", *command])
+            cancel.assert_called_once()
+        finally:
+            for child in launched:
+                child.kill()
+                _ = wait(child, timeout=3)
 
     def test_non_gate_runs_once_without_admission(self) -> None:
         script = self.root / "ordinary.py"

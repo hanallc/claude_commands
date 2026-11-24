@@ -2645,7 +2645,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
-            targets = first_step.gate_targets(command, source, args.targets)
+            source_arguments = [part.replace("{tree}", str(source)) for part in command]
+            targets = first_step.gate_targets(source_arguments, source, args.targets)
             prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
                                                          gate_targets=targets))
             tree = prepared.tree
@@ -2662,17 +2663,21 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             _ = child_environment.pop(PREPARED_GATE_FD, None)
             if not first_step.canonical_gate_command(arguments, tree):
                 return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
-            with ExitStack() as child_scope:
+            with ExitStack() as pipes:
                 reader, writer = os.pipe()
-                try:
-                    with os.fdopen(writer, "wb") as pipe:
-                        child_environment[PREPARED_GATE_FD] = str(reader)
-                        child = child_scope.enter_context(subprocess.Popen(
-                            arguments, cwd=tree, pass_fds=(*locks, reader), env=child_environment, text=True))
-                        _ = pipe.write(f"{child.pid}\n".encode("ascii"))
-                finally:
-                    os.close(reader)
-                return subprocess.CompletedProcess(arguments, child.wait())
+                _ = pipes.callback(os.close, reader)
+                _ = pipes.callback(os.close, writer)
+                child_environment[PREPARED_GATE_FD] = str(reader)
+                with subprocess.Popen(arguments, cwd=tree, pass_fds=(*locks, reader),
+                                      env=child_environment, text=True) as child:
+                    try:
+                        _ = os.write(writer, f"{child.pid}\n".encode("ascii"))
+                        pipes.close()
+                        return subprocess.CompletedProcess(arguments, child.wait())
+                    except BaseException:
+                        child.kill()
+                        _ = child.wait()
+                        raise
 
         if isinstance(prepared, AdmittedCommandCopy):
             result = prepared.admission.run_gate(launch)
