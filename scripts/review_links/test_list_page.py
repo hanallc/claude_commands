@@ -44,7 +44,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production import (change_review, change_routing, delivery_state, investigation,
                                 session_pane, session_staff, showrunners, staff, the_list, unrouted_alert)
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, go_ledger, list_page, page_frame, serve, staff_names
+from scripts.review_links import console, go_ledger, list_page, page_frame, serve, staff_names, studio_page
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_link, review_page, search_fold, send_hold
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
@@ -1173,8 +1173,207 @@ if(example.filterOn){
 }
 ''')
 
-    def browser_row_expansion(self, steps: str) -> None:
-        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+    def studio_avatars(self, *producers: staff.StaffId) -> Path:
+        """Point the Studio at a temporary avatar root with one picture for All and for each producer."""
+        root = self.root / "avatars"
+        for folder in ("all", *producers):
+            (root / folder).mkdir(parents=True)
+            for size in studio_page.SIZES:
+                _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
+        with (self.root / "config/review_links.conf").open("a") as settings:
+            _ = settings.write(f"studio_avatar_root={root}\n")
+        return root
+
+    def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
+        _ = self.fixture_items()
+        _ = self.studio_avatars(DWIGHT.id)
+        listing = list_page.render(self.root / "reviews").decode()
+        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
+        self.assertIn('<div class="list-producer-filter">' + row, listing)
+        self.assertIn('<h1 class="page-title">The List</h1>', listing)
+        self.assertIn('<title>The List</title>', listing)
+        self.assertNotIn('studio-tabs', listing)
+        self.assertEqual(studio.count(row), 1)
+        self.assertIn('<div class="studio-tabs">' + row, studio)
+        self.assertIn('<div class="list-producer-filter"><div class="record-filter-words">', studio)
+        self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
+        self.assertIn('<title>The Studio</title>', studio)
+        self.assertEqual(studio.count('<tbody data-list-item'), listing.count('<tbody data-list-item'))
+        tab = studio.split(f'data-filter-value="staff:{DWIGHT.id}"', 1)[1].split('</button>', 1)[0]
+        self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
+        self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
+        _ = self.fixture_items()
+        _ = self.studio_avatars(DWIGHT.id)
+        self.browser_row_expansion(r'''
+ const tab=chip('producer','staff:'+DWIGHT);
+ check(tab.closest('.studio-tabs') && tab.querySelector('img[data-keep-src]'),'The producer filter is a picture tab.');
+ const others=rows.filter(row=>!row.hidden && row.dataset.producer!==DWIGHT);
+ tab.click();
+ const shown=rows.filter(row=>!row.hidden);
+ check(shown.length && shown.every(row=>row.dataset.producer===DWIGHT),'The tab shows only its producer rows.');
+ check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'The fragment names the producer.');
+ chip('producer','all').click();
+ check(others.length && others.every(row=>!row.hidden),'All shows the other producer rows again.');
+ const initial=chip('producer','staff:'+MORTY);
+ check(initial.querySelector('.studio-initial[aria-hidden="true"]'),'A producer without a picture shows the initial.');
+ initial.click();
+ check(JSON.stringify(activeChipLabels(document,'[data-filter-row="producer"] [aria-pressed="true"]'))
+  ==='["Producer: morty"]','The filter label omits the initial.');
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('MORTY', json.dumps(MORTY.id)), studio_page.STUDIO_VIEW)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_refresh_keeps_the_pictures_and_updates_the_tab_counts(self) -> None:
+        _ = self.add("Test List action retries", number=1)
+        avatars = self.studio_avatars(DWIGHT.id)
+        for folder in ("all", DWIGHT.id):
+            for size in studio_page.SIZES:
+                _ = (avatars / folder / f"02-{size}.webp").write_bytes(b"RIFF")
+
+        def page() -> str:
+            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+
+        with patch.object(studio_page, "choice", side_effect=min):
+            initial = page()
+        added = self.add("A new item for dwight", number=2)
+        _ = the_list.update(MORTY.id, added.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(studio_page, "choice", side_effect=max):
+            fresh = page()
+        self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/02-128.webp"', fresh)
+        steps = r'''
+ const tab=value=>document.querySelector('[data-filter-row="producer"] [data-filter-value="'+value+'"]');
+ const values=['all','staff:'+DWIGHT];
+ const pictures=()=>JSON.stringify(values.map(value=>{
+  const picture=tab(value).querySelector('img');
+  return [picture.getAttribute('src'),picture.getAttribute('srcset')];
+ }));
+ const shown=pictures();
+ check(shown.includes('/01-128.webp') && !shown.includes('/02-'),'The first render shows picture 01.');
+ check(tab('staff:'+DWIGHT).dataset.filterCount==='0' && tab('all').dataset.filterCount==='1',
+  'The first render counts one item.');
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ check(document.querySelector('[data-number="2"]'),'The refresh shows the new row.');
+ check(pictures()===shown,'The refresh keeps each picture src and srcset on screen.');
+ check(tab('staff:'+DWIGHT).dataset.filterCount==='1' && tab('staff:'+DWIGHT).querySelector('b').textContent==='1'
+  && tab('all').dataset.filterCount==='2','The refresh updates the tab counts.');
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, add_item=False, markup=initial)
+
+    def test_studio_marks_the_open_top_item_of_each_producer_and_the_list_shows_no_marks(self) -> None:
+        items = self.fixture_items()
+        _ = self.studio_avatars(DWIGHT.id)
+        status, latest, removed = items[1], items[2], items[5]
+        _ = staff.set_producer_top_item(DWIGHT.id, staff.TopItem(status.number))
+        # A Closed item reads as no top item.
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(removed.number))
+        listing = list_page.render(self.root / "reviews").decode()
+        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        for mark in ("list-top", 'value="top"', "Make top priority"):
+            self.assertNotIn(mark, listing)
+        rows: dict[int, str] = {}
+        for part in studio.split('<tbody data-list-item')[1:]:
+            row = part.split('</tbody>', 1)[0]
+            number = re.search(r'data-number="(\d+)"', row)
+            assert number is not None
+            rows[int(number[1])] = row
+        self.assertEqual([number for number, row in rows.items() if 'class="list-top-mark"' in row], [status.number])
+        self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority" title="Top priority"><svg',
+                      rows[status.number])
+        self.assertNotIn('value="top"', rows[status.number])
+        self.assertIn('<button name="action" value="top">Make top priority</button><div class="list-parking-actions">',
+                      rows[latest.number])
+        self.assertLess(studio.index('<div class="studio-tabs">'), studio.index('<div class="list-top-bands">'))
+        bands = studio.split('<div class="list-top-bands">', 1)[1].split('<div data-record-filters>', 1)[0]
+        dwight = bands.split(f'<section class="list-top-band" data-top-band="staff:{DWIGHT.id}" aria-label="Top priority">',
+                             1)[1].split('</section>', 1)[0]
+        self.assertIn(f'<b>#{status.number} {status.title}</b>', dwight)
+        self.assertIn("Read the result and check the page.", dwight)
+        self.assertIn('<span class="list-state accent">Working</span><small>ETA ', dwight)
+        self.assertNotIn(MORTY.id, bands)
+        self.assertIn('<section class="list-top-band" data-top-band="none" aria-label="Top priority">', bands)
+        self.assertIn('<b>No top priority item</b><div class="list-top-next">Open an item and click "Make top priority".',
+                      bands)
+        self.assertIn(f':not([data-filter-value="all"],[data-filter-value="staff:{DWIGHT.id}"])) '
+                      + '[data-top-band="none"]{display:flex}', bands)
+        # A retired producer has no top item.
+        _ = staff.set_producer_retirement(DWIGHT.id, staff.RetiredProducer("claude:sonnet:high"))
+        retired = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        self.assertNotIn('class="list-top-mark"', retired)
+
+    def test_studio_waiting_item_has_the_make_top_priority_button(self) -> None:
+        _ = self.studio_avatars(MORTY.id)
+        item = self.add("Wait for an answer", number=1)
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            list_page.deliver(list_page.submit(root, urlencode(
+                self.fields(item, "question", words="Which check passed?")), status))
+
+        def waiting_row() -> str:
+            studio = list_page.render(root, include_counts=False, status=status, view=studio_page.STUDIO_VIEW).decode()
+            return studio.split(f'data-number="{item.number}"', 1)[1].split('</tbody>', 1)[0]
+
+        self.assertIn('<form method="post" data-feedback-form data-waiting-actions>', waiting_row())
+        self.assertIn('<div class="list-actions"><button name="action" value="top">Make top priority</button>'
+                      + '<div class="list-parking-actions">', waiting_row())
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(item.number))
+        top = waiting_row()
+        self.assertIn('class="list-top-mark"', top)
+        self.assertNotIn('value="top"', top)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_band_follows_the_tab_and_make_top_priority_moves_the_flag(self) -> None:
+        _ = self.studio_avatars(MORTY.id, DWIGHT.id)
+        first = self.add("First item", number=1)
+        second = self.add("Second item", number=2)
+
+        def page() -> str:
+            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(second.number))
+        initial = page()
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(first.number))
+        fresh = page()
+        steps = r'''
+ const flagged=()=>JSON.stringify([...document.querySelectorAll('[data-list-item]')]
+  .filter(item=>item.querySelector('.list-top-mark')).map(item=>item.dataset.number));
+ const shown=()=>[...document.querySelectorAll('[data-top-band]')].filter(band=>getComputedStyle(band).display!=='none');
+ const bands=()=>JSON.stringify(shown().map(band=>band.dataset.topBand));
+ const tab=value=>document.querySelector('[data-filter-row="producer"] [data-filter-value="'+value+'"]');
+ check(flagged()==='["2"]' && bands()==='[]','The flag marks item 2 on the All tab, and All shows no band.');
+ check(form.querySelector('[value="top"]')?.textContent==='Make top priority','Item 1 has the Make top priority button.');
+ const listFetch=window.fetch;
+ window.fetch=(path,options={})=>{
+  if(options.method==='POST') check(path===STUDIO_PATH,'Studio posts to its own path.');
+  return listFetch(path,options);
+ };
+ refreshMarkup=FRESH_PAGE;
+ submit('top');
+ check(requests.at(-1).get('action')==='top','The button posts the top action.');
+ finishPost({state:'saved',unread:'false'});
+ for(let tries=0;tries<200 && flagged()!=='["1"]';tries++) await new Promise(resolve=>setTimeout(resolve,10));
+ check(flagged()==='["1"]','The refresh moves the flag to item 1.');
+ tab('staff:'+MORTY).click();
+ check(bands()===JSON.stringify(['staff:'+MORTY]) && shown()[0].textContent.includes('#1 First item'),
+  'The producer tab shows its top item band.');
+ tab('staff:'+DWIGHT).click();
+ check(bands()==='["none"]' && shown()[0].textContent.includes('No top priority item'),
+  'A producer without a top item shows the empty band.');
+ tab('all').click();
+ check(bands()==='[]','The All tab hides the band.');
+'''.replace('MORTY', json.dumps(MORTY.id)).replace('DWIGHT', json.dumps(DWIGHT.id))
+        steps = steps.replace('STUDIO_PATH', json.dumps(studio_page.PAGE_PATH))
+        steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
+
+    def browser_row_expansion(self, steps: str, view: list_page.ListView = list_page.LIST_VIEW) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False, view=view).decode()
         probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};

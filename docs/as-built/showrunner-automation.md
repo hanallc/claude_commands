@@ -625,6 +625,8 @@ An empty optional time removes that time.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
 9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+10. Make an open item the top priority item of its producer with `top-priority --id L<n>`.
+    A producer can name only its own item. Morty can name the item of any producer.
 
 `ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
 The ids are `A1`, `A2` and on for each item.

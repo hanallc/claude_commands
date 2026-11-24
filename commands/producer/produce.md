@@ -87,6 +87,9 @@ Run an `update` command from a List message as it is.
 Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
 
+Name your top priority item with `the_list.py top-priority --id L<n>`.
+Nate can change the top priority item on the Studio page.
+
 Add your own item with `the_list.py add --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.
 `park`, `unpark`, `close`, and `reopen` use morty's folder.
 Park, unpark, close, or reopen your own item only on nate's word. Quote his words in `--source`.

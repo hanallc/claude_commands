@@ -1555,6 +1555,21 @@ def _open(item: ListItem) -> None:
         raise ListError(f"{item.id}: reopen the Closed item before changing it")
 
 
+def make_top_priority(keeper: staff.StaffId, identity: str, *,
+                      assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+    """Make an open item the top priority item of its producer. A producer names only its own items."""
+    item = load(keeper, identity)
+    if item.state == ItemState.CLOSED:
+        raise ListError(f"{item.id} is Closed. Only an open item can be the top priority item.")
+    if assigned_to is not AllItems.INCLUDED and item.producer != assigned_to:
+        raise ListError(f"{item.id} is assigned to another producer")
+    try:
+        _ = staff.set_producer_top_item(item.producer, staff.TopItem(item.number))
+    except (staff.StaffRefused, staff.StaffNotFound) as error:
+        raise ListError(f"{item.id}: {error}") from error
+    return item
+
+
 def _without_evidence_block(evidence: str, start: int, end: int) -> str:
     before = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", evidence[:start])
     if not before.strip():
@@ -2488,6 +2503,11 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot, add_evi
     return changes
 
 
+def _cli_item_id(text: str) -> str:
+    """Accept an item number with or without its L prefix."""
+    return f"L{text}" if text.isascii() and text.isdecimal() else text
+
+
 def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
                                      "--from", "morty", "--text", text)
@@ -2582,6 +2602,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = ask.add_argument("--what", required=True, help="the one change that nate approves")
     _ = ask.add_argument("--why", required=True, help="why the session needs nate's word")
     _ = ask.add_argument("--config", action="store_true", help="the change is a settings.json, CLAUDE.md or config change")
+    top = commands.add_parser("top-priority", help="make an open item the top priority item of its producer")
+    _ = top.add_argument("--id", required=True, help="the List item ID, such as L1")
     for name in ("add", "update", "park", "unpark", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -2676,9 +2698,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ListError("The List results are incomplete. Could not read every record.")
             return 0
         if name == "update":
-            identity = cast(str, args.id)
-            if identity.isascii() and identity.isdecimal():
-                identity = f"L{identity}"
+            identity = _cli_item_id(cast(str, args.id))
             keeper = _record_keeper(morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
                                     policy=_KeeperRouting.UPDATE)
             reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
@@ -2699,6 +2719,11 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
+        if name == "top-priority":
+            item = make_top_priority(keeper, _cli_item_id(cast(str, args.id)), assigned_to=assigned_to)
+            producer = record.by_id(item.producer)
+            print(f"{item.id} is the top priority item of {producer.name if producer is not None else item.producer}")
+            return 0
         if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "unpark", "close", "reopen"):
             raise ListError(f"only morty can run {name}")
         assert source is not None

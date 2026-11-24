@@ -172,7 +172,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Review and Placement disk POC.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Studio, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`, except the Placement disk POC page.
 That page is a standalone document with its own layout and styles, and it has no status line.
@@ -334,7 +334,7 @@ Review retains typed text across refresh and holds replacement during an active 
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-Accounts, AWS, Builds, Disks, Images, List and Review put the title and status line in the same place.
+Accounts, AWS, Builds, Disks, Images, List, Studio and Review put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -1925,7 +1925,69 @@ Risks:
   morty and the List record both hold the go id. This is in the class of a session that breaks the rules on purpose.
 - An agent on the Mac that breaks the rules can still post a Go. The refusal stops only a click from natedev.
 - The item log shows nate every Go.
-Item 225 (Undo) does not exist, so a Go has no Undo.
+A Go sends immediately.
+
+### The Studio page
+
+`/console/studio.html` shows the List rows with one picture tab for each producer.
+The navigation label is Studio, with the Lucide `clapperboard` icon, and the page title is The Studio.
+Its `config/console.conf` block follows the List block.
+`studio_page.STUDIO_VIEW` is a `list_page.ListView`, so the page uses the List rows, filters, script and status line.
+`list_page.LIST_VIEW` keeps the List output unchanged.
+The Studio shows the Producer row as picture tabs above the filters.
+The Owner and Show rows and the words box stay below the tabs.
+`ListView.placement` puts the List Producer chips beside the words box and the Studio tabs above the filters.
+A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
+
+The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.
+They use the same `staff:<id>` values and the same `#producer=<id>` fragment as the List.
+All is first. Then each active producer that is not retired follows in name order, also with a count of 0.
+A producer that has rows but no active staff row also gets a tab.
+Each tab shows a picture with the name and the item count on it. A click filters the rows to that producer.
+The counts change with the Owner, Show and words filters, as on the List.
+
+`studio_avatar_root` in `config/review_links.conf` names the picture folder.
+The All tab reads the folder `all`. A producer tab reads the folder named by its staff ID.
+A picture has three files: `NN-64.webp`, `NN-128.webp` and `NN-256.webp`.
+Each render lists each folder and picks one picture number at random for each tab. The page does not read `index.json`.
+The `<img>` uses the 128 file as `src` and all three files in `srcset`.
+A missing root, a missing folder, or a folder with no complete picture shows the initial of the name in a circle.
+A page refresh copies the `src` and `srcset` of each `img[data-keep-src]` into the new content.
+So a picture changes only when the page loads.
+
+`GET /console/studio/avatars/<folder>/<NN>-<size>.webp` serves one picture.
+The folder is `all` or a 36-character staff ID. The size is 64, 128 or 256.
+The request gets the Tailscale, host and origin checks of a Review attachment request, and a failure gets 403.
+Any other name, a link below the root, a missing file, or a file over 64 KB gets 404.
+A picture goes out as `image/webp` with `Cache-Control: max-age=86400`.
+
+On the Studio, `data-list-path` on `[data-list]` sets the path for row actions and item-state reads to `/console/studio.html`.
+The List uses `location.pathname` for these requests.
+`serve.LIST_VIEWS` maps each path to its view, so both paths use one POST handler with the same Tailscale, origin and form-token checks.
+The view sets the item panels in an action answer, so a Studio action keeps the Studio panel.
+A page refresh reads `location.pathname`, so the Studio refreshes as the Studio.
+Both pages use the shared HTML gzip response.
+In both views, **Tell** and **Ask question** use the send hold.
+
+Each producer has one top priority item: the `top_item` List number in its staff row.
+`ListView.top_priority` is `TopPriority.SHOWN` for the Studio and `TopPriority.HIDDEN` for the List, so the List does not change.
+`list_page.top_priority_mark` reads the mark at render time.
+An item is the top item when it is open, its producer is an active producer row, and that row names its number.
+A Closed or missing item reads as no top item, and the page writes nothing when an item closes.
+A flag before the title marks the top item in its row, also on the All tab.
+Each other open item of an active producer has the button **Make top priority** in its panel. An item of a retired or unknown producer shows neither the flag nor the button.
+`list_page.top_button` gives the button to both panel forms: beside Remove, or beside Mark read and Unpark when the item waits for an answer.
+The button posts the action `top`. `the_list.make_top_priority` names the item as the top item of its producer, so it takes the place of the old one.
+The List path refuses `top`. The refresh after the save moves the flag and the band.
+
+The band is above the filters on a producer tab and hidden on All.
+It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
+A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
+The page renders one band for each top item and one band for no top item.
+A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
+`CONSOLE_DOCUMENTS` maps the Studio path to `list`, so New item and its screenshot use the List owner, `page.list.owner`.
+`page.studio.owner` sets the owner when the console shows the Studio as unavailable.
+The Studio uses the List status age limit and has no `status.studio` key.
 
 ### Images page
 
@@ -2484,7 +2546,7 @@ It exits with status 0 when the folder disappears.
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
 
-The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+The shared check covers POST requests, New item token requests, Go token requests, Review attachment requests, and Studio picture requests.
 These requests require a single `Host` header for the server's bound address and port.
 The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
 On port 80, the server also accepts either host without a port.
@@ -2750,6 +2812,8 @@ The page, the footer and `/next` use these same folder readers.
 
 `placement_disk.file` in `config/console.conf` names the Placement disk POC file; see [Placement disk POC page](#placement-disk-poc-page).
 A `~` at the start of the path expands to the home folder.
+`studio_avatar_root` in `config/review_links.conf` names the Studio picture folder; see [The Studio page](#the-studio-page).
+It must be an absolute path or start with `~`.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.

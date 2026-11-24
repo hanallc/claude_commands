@@ -19,7 +19,7 @@ from scripts.review_links import send_hold, setting_controls
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
-                         "rebuilds", "review"))
+                         "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions" data-page-actions>'
 

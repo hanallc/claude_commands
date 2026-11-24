@@ -534,7 +534,8 @@ function trackRecordRowDuringMotion(row,top,motions){
 }
 function activeChipLabels(content,selector){
  return [...content.querySelectorAll(selector)].map(button=>{
-  const label=[...button.childNodes].filter(node=>node.nodeName!=='B').map(node=>node.textContent).join('').trim();
+  const label=[...button.childNodes].filter(node=>!node.matches?.('b,[aria-hidden="true"]'))
+   .map(node=>node.textContent).join('').trim();
   return button.closest('[role="group"]').getAttribute('aria-label')+': '+label;
  });
 }
