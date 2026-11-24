@@ -214,12 +214,14 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
     return reference
 
 
-@dataclass(frozen=True)
+@dataclass
 class GuestGateDispatch:
     """The guest gate holds the queue's launch permission for this claim."""
 
     assignment: PlacementAssignment
     claim: ProviderClaimReference
+    started: ArmedGuestAttempt | None = None
+    settled: bool = False
 
 
 class GuestRunRequest(TypedDict):
@@ -1075,6 +1077,25 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
+def report_guest_end(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, status: int) -> None:
+    """Report the exact guest attempt after the guest proves that it ended."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+    assignment = dispatch.assignment
+    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
+    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+        execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
+        placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read('build_admission').number('query_timeout_seconds')
+        reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
+        if reply.assignment != assignment or not isinstance(reply.state, placement.ClosedAssignment) or reply.reason:
+            raise wire.AdmissionUnavailable(reply.reason or 'the queue did not settle the guest attempt')
+    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
+        print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
+
+
 def warn_guest_report(reason: str) -> None:
     print(f'Mac Linux guest queue report failed: {reason}', file=sys.stderr, flush=True)
 
@@ -1165,6 +1186,7 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
         if started or line.rstrip(b'\r') != start_line:
             return
         started = True
+        dispatch.started = armed
         start_guest_report(armed, dispatch, deadline, reports)
 
     def read_reply(data: bytes) -> None:
@@ -1266,6 +1288,7 @@ def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
                prefix: str, bundle: FullBundle | DeltaBundle, dispatch: GuestGateDispatch) -> GuestReply:
+    dispatch.settled = False
     bootstrap = runner_bootstrap(request)
     send = bundle_send(repo, source, bundle, prefix)
     armed: ArmedGuestAttempt | None = None
@@ -1316,6 +1339,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
             error.add_note(str(first_error))
         raise error
 
+    dispatch.settled = True
     cleanup_detail = end.cleanup_detail()
     if first_error is not None:
         first_error.add_note(cleanup_detail)
@@ -1587,6 +1611,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     from scripts.build_queue.admission_client import step_identity
     from scripts.production import gate
 
+    dispatch: GuestGateDispatch | None = None
+    status = 1
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
         # run_gate_suites always sends a list for a targeted run without --full, so this guard protects only a future caller.
@@ -1611,7 +1637,6 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
-        dispatch = None
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
                 dispatch = GuestGateDispatch(assignment, consume_launch_permission(claim, assignment))
@@ -1629,6 +1654,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
+        status = int(not run.passed)
         return run
     except mac_run.MacRunRefused as error:
         return GuestNotStarted(str(error))
@@ -1638,6 +1664,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
+    finally:
+        if dispatch is not None and dispatch.settled and dispatch.started is not None:
+            report_guest_end(dispatch.started, dispatch, status)
 
 
 def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:

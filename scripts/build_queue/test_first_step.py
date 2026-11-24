@@ -10,6 +10,7 @@ from typing import cast
 import unittest
 from unittest import mock
 
+from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_records as records, execution_identity, queue_place
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_wire, first_step, placement
@@ -61,6 +62,57 @@ def gate_source(fixture: PlacementFixture, repository: str, *, enabled: str = "o
 
 
 class FirstStepTests(unittest.TestCase):
+    def test_late_settlement_reply_uses_placement_control(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            destination = register_scaler(fixture).destination
+            assignment = placement.PlacementAssignment(request.episode, "a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+
+            def late_reply(_connection: object, _pending: bytearray, deadline: float) -> bytes:
+                fixture.clock.advance(1)
+                if fixture.clock.monotonic() >= deadline:
+                    raise TimeoutError("the short query expired")
+                return wire.encode_reply(wire.Ok()).encode()
+
+            fixture.configure(query_timeout_seconds=0.5)
+            with (mock.patch.object(client, "CLOCK", fixture.clock),
+                  mock.patch.object(client, "_connect", return_value=nullcontext(mock.Mock())),
+                  mock.patch.object(client, "_line", side_effect=late_reply)):
+                client.request_settlement(wire.SettlementRequest(assignment))
+
+    def test_scaler_replacement_uses_the_existing_launch_wait_limit(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            cloud = register_scaler(fixture)
+
+            def grant(request: wire.PlacementRequest) -> wire.Assignment:
+                return wire.Assignment(placement.PlacementAssignment(request.episode, "attempt",
+                    cloud.destination, request.constraints.source_key, request.owner,
+                    request.constraints.session, request.since))
+
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": cloud.destination.target,
+                                               "BUILDLOG_MEM_WAIT_LIMIT_S": "0"}),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(first_step, "_placement_grant", side_effect=grant) as place,
+                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
+                  forbid_admission_calls()):
+                with first_step.admitted_run(GATE_COMMAND, source) as admitted:
+                    assignment = client.read_assignment(admitted.assignment_file).assignment
+                    refusal = wire.ClaimFailure("capacity", assignment, "no capacity")
+                    report = admitted.assignment_file.with_name(admitted.assignment_file.name + CLAIM_FAILURE_SUFFIX)
+                    _ = report.write_text(wire.encode_request(refusal))
+                    reply = wire.DispatchStatus(assignment, placement.CurrentAssignment(),
+                        placement.PermissionAvailable(), retry=placement.RetryAt(0))
+                    run = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, GATE_PRELAUNCH_REFUSED_STATUS))
+                    with mock.patch.object(client, "claim_failure", return_value=reply) as claim:
+                        result = admitted.run_gate(run)
+                    claim.assert_called_once_with(refusal)
+                    place.assert_called_once()
+                    run.assert_called_once()
+                    self.assertEqual(result.returncode, GATE_PRELAUNCH_REFUSED_STATUS)
+                    self.assertEqual(result.stderr, "Gate placement blocked\n")
+
     def test_copies_run_hana_gate_keeps_unassigned_route(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "hana")
@@ -173,8 +225,10 @@ class FirstStepTests(unittest.TestCase):
                     assigned = saved.grant.assignment
                     status = admission_wire.KnownPlacementStatus(assigned, placement.CurrentAssignment(),
                         placement.NoProviderClaim())
-                    with mock.patch.object(client, "placement_status",
-                            return_value=admission_wire.PlacementStatusReply(status)):
+                    owner = build_hold.ProcessIdentity(assigned.owner.pid, assigned.owner.start_time)
+                    with (mock.patch.object(build_hold, "caller_processes", return_value={owner}),
+                          mock.patch.object(client, "placement_status",
+                                            return_value=admission_wire.PlacementStatusReply(status))):
                         with first_step.admitted_run(GATE_COMMAND, source) as attached:
                             self.assertEqual(attached.grant, first_step.InheritedGatePlacement(saved.grant))
                             self.assertEqual(attached.assignment_file, outer.assignment_file)
@@ -226,6 +280,14 @@ class FirstStepTests(unittest.TestCase):
                                 self.assertEqual(sent.assignment, original)
                             else:
                                 settle.assert_not_called()
+                            if exit_code == GATE_UNSETTLED_LAUNCH_STATUS:
+                                could_not_settle = wire.AdmissionUnavailable("the queue is unavailable")
+                                run = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, exit_code))
+                                with mock.patch.object(client, "request_settlement", side_effect=could_not_settle):
+                                    blocked = admitted.run_gate(run)
+                                self.assertEqual(blocked.returncode, GATE_PRELAUNCH_REFUSED_STATUS)
+                                self.assertIn("launch settlement", blocked.stderr)
+                                run.assert_called_once()
 
                     with first_step.admitted_run(GATE_COMMAND, source) as admitted:
                         admitted.handoff(source)

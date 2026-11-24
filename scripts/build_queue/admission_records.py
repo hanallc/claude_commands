@@ -107,6 +107,7 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+    guest_execution_observed: bool = False
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125

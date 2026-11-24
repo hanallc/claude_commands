@@ -660,9 +660,8 @@ class ExecutionReport(CallerCode):
 
 
 @dataclass(frozen=True)
-class SettlementRequest(CallerCode):
+class SettlementRequest:
     """Ask the queue to confirm settlement for an exact scaler attempt."""
-    request_id: str
     assignment: placement.PlacementAssignment
 
 

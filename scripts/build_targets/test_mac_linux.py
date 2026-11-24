@@ -804,20 +804,29 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
-    def test_started_guest_reports_once_for_its_placement(self) -> None:
+    def test_started_guest_reports_start_and_settlement_for_its_placement(self) -> None:
         reports: list[wire.ExecutionReport] = []
 
         def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
             self.assertGreater(deadline, time.monotonic())
             self.assertEqual(timeout, 1)
             reports.append(request)
+            if isinstance(request.path, placement.DispatchPathSettled):
+                self.assertEqual(self.trace.read_text().splitlines()[-1], 'cleanup')
+                self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
+                return wire.DispatchStatus(self.placed, placement.ClosedAssignment('completed'),
+                                           placement.PermissionConsumed(1.0))
             return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
 
         with patch.object(mac_linux, 'send_guest_execution', report):
             result = self.route()
         self.assertIsInstance(result, GateRun)
-        report_row, = reports
+        report_row, settled = reports
         self.assertEqual((report_row.assignment, report_row.claim), (self.placed, self.consumed[0][0].claim))
+        self.assertEqual((settled.assignment, settled.claim, settled.evidence),
+                         (report_row.assignment, report_row.claim, report_row.evidence))
+        self.assertEqual(settled.outcome, placement.AttemptCompleted(0))
+        self.assertIsInstance(settled.path, placement.DispatchPathSettled)
         assert isinstance(report_row.evidence, execution_identity.ObservedExecution)
         identity = report_row.evidence.identity
         assert isinstance(identity, execution_identity.CloudExecution)

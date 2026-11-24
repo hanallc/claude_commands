@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
@@ -249,19 +249,27 @@ def run_gate_with_placement(
                 retry_notice = (f'placement: retry — {destination.host} ({destination.target}) {reason}. '
                                 + 'Received a replacement assignment.')
             else:
-                client.request_settlement(wire.SettlementRequest(uuid4().hex, previous))
-            place_again(request)
+                client.request_settlement(wire.SettlementRequest(previous))
+            scaler_declined = (result.returncode == GATE_PRELAUNCH_REFUSED_STATUS
+                               and previous.destination.provider == 'scaler')
+            with (client.scaler_retry_window(request.since) if scaler_declined else nullcontext()):
+                place_again(request)
             replacement = read_assignment(assignment_file).assignment
             if (not assignment_matches_request(replacement, request)
                     or replacement.attempt == previous.attempt):
                 raise wire.AdmissionUnavailable('the queue did not provide a replacement assignment')
             if retry_notice:
                 print(retry_notice, flush=True)
-        except PlacementExhausted:
-            return subprocess.CompletedProcess(request.constraints.command, result.returncode, '', 'Gate placement blocked\n')
         except (OSError, ValueError, wire.AdmissionUnavailable, FirstStepRefused) as error:
-            return subprocess.CompletedProcess(request.constraints.command, result.returncode, '',
-                                               f'Gate placement blocked. {error}\n')
+            exhausted = isinstance(error, PlacementExhausted) or str(error) == client.LAUNCH_WAIT_LIMIT_REASON
+            if exhausted:
+                message = 'Gate placement blocked'
+            elif result.returncode == GATE_UNSETTLED_LAUNCH_STATUS:
+                message = f'Gate placement blocked during launch settlement. {error}'
+            else:
+                message = f'Gate placement blocked. {error}'
+            return subprocess.CompletedProcess(request.constraints.command, GATE_PRELAUNCH_REFUSED_STATUS, '',
+                                               message + '\n')
 
 
 def assignment_matches_request(assignment: placement.PlacementAssignment, request: wire.PlacementRequest) -> bool:
@@ -341,6 +349,12 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
         local=queue_place.local_context(local))
 
 
+def assignment_matches_source(assignment: placement.PlacementAssignment, source: Path) -> bool:
+    """Check the current checkout against the assignment source key."""
+    key = treekey.tree_key(str(source))
+    return key is not None and assignment.source_key == execution_identity.SourceKeyKnown(key)
+
+
 def checked_gate_assignment(command: Sequence[str], source: Path, file: Path, targets: tuple[str, ...]
                             ) -> wire.Assignment | wire.LocalPlacementGranted:
     """Check that a live wrapper owns the current assignment for this gate."""
@@ -360,8 +374,7 @@ def checked_gate_assignment(command: Sequence[str], source: Path, file: Path, ta
         raise FirstStepRefused('the placement owner has a different gate job')
     if targets and assignment.destination.target not in targets:
         raise FirstStepRefused('the placement target is outside the caller target list')
-    key = treekey.tree_key(str(source))
-    if key is None or assignment.source_key != execution_identity.SourceKeyKnown(key):
+    if not assignment_matches_source(assignment, source):
         raise FirstStepRefused('the requested source does not match the placement source')
     status = client.placement_status(assignment.episode, assignment.attempt).status
     if (not isinstance(status, KnownPlacementStatus) or status.assignment != assignment
