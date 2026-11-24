@@ -361,7 +361,9 @@ An older observation cannot close a newer permit or replace a later running obse
 The fence survives controller restarts.
 Observations at the same time as the fence leave exposure unchanged.
 
-The existing `cost-ledger.json` version remains 1.
+The ledger reads versions 1 and 2 of `cost-ledger.json` and writes version 2.
+Version 2 makes older readers and writers refuse the ledger.
+Upgrade ledger users before they access version 2.
 The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
 Older records have no Hana exposure when these collections are absent.
 A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
