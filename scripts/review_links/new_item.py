@@ -32,16 +32,21 @@ class ItemType(StrEnum):
     PROPOSAL = "proposal"
     EFFICIENCY = "efficiency"
     FEEDBACK = "feedback"
+    ENHANCEMENT = "enhancement"
 
 
-# The console server takes four kinds. Feedback and efficiency file as an investigation.
-FILED_KINDS: dict[ItemType, new_item_dialog.SubmissionKind] = {
+type _WireKind = new_item_dialog.SubmissionKind | Literal["enhancement"]
+
+
+# The server files Feedback, Efficiency and Enhancement as investigations.
+FILED_KINDS: dict[ItemType, _WireKind] = {
     ItemType.BUG: new_item_dialog.SubmissionKind.BUG,
     ItemType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
     ItemType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL,
     ItemType.EFFICIENCY: new_item_dialog.SubmissionKind.INVESTIGATION,
     ItemType.FEEDBACK: new_item_dialog.SubmissionKind.INVESTIGATION,
+    ItemType.ENHANCEMENT: "enhancement",
 }
 
 
@@ -228,19 +233,18 @@ def recipient_for(member: staff.StaffRow, options: Options, members: staff.Staff
     return found
 
 
-def request_body(options: Options, kind: new_item_dialog.SubmissionKind, recipient: Recipient, words: str) -> bytes:
+def request_body(options: Options, kind: _WireKind, recipient: Recipient, words: str) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": kind.value,
+        "token": options.token, "request_id": "r6-" + secrets.token_hex(16), "kind": kind,
         "recipient_id": recipient.id, "words": words, "evidence": {"kind": "none"}, "images": [],
         "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value,
     }).encode()
 
 
 def words_text(item_type: ItemType, description: str, extra: str) -> str:
-    """A type that files as another server kind names itself first; feedback files as the window files it."""
-    marked = FILED_KINDS[item_type].value != item_type.value and item_type != ItemType.FEEDBACK
-    first = f"{item_type.value.capitalize()}: {description.strip()}" if marked else description.strip()
+    """Add the Efficiency prefix and append any extra words."""
+    first = f"Efficiency: {description.strip()}" if item_type == ItemType.EFFICIENCY else description.strip()
     return first + (f"\n\n{extra.strip()}" if extra.strip() else "")
 
 
@@ -310,8 +314,9 @@ def main(arguments: list[str] | None = None) -> int:
         caller = members.by_current_session(args.session) if args.session else None
         this_session = caller is not None and caller.id == member.id
         words = words_text(item_type, args.description, args.extra)
+        kind = FILED_KINDS[item_type]
         reply = exchange(address, "POST", review_page.NEW_ITEM_PATH,
-                         request_body(options, FILED_KINDS[item_type], recipient, words))
+                         request_body(options, kind, recipient, words))
         if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
@@ -323,6 +328,8 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         if not isinstance(review_key, str) or not review_key:
             raise ValueError("the console server sent no Review item key")
+        if kind == "enhancement":
+            words = new_item_dialog.read_words(words, "Your words", kind=kind)
         item = add_list_item(review_key, words, recipient, member, mapped, members)
     except UnlinkedListItem as error:
         print(result_line(item_type, member, mapped, members, this_session=this_session, filed=str(error)))

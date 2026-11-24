@@ -149,7 +149,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Te
 
 from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
-from scripts.herdr import herdr_types
+from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.production import session_staff, staff, unit_lookup, unit_names
 from scripts.lib import conf, models_registry, process_start
@@ -4317,11 +4317,34 @@ def relay(message: Message, timeout: float) -> Result:
     return result
 
 
+def _unique_message_owner(conversation: str, registry: sessions.RegistryRead, candidates: list[sessions.SessionRecord]
+                          ) -> _message_proof.MessageOwnerProof:
+    generations = {(row["pid"], row.get("procStart", "")) for row in candidates}
+    if registry.unreadable or len(generations) != 1:
+        return _message_proof.StrictOwnerProof.REQUIRED
+    pid, started = next(iter(generations))
+    if not started:
+        return _message_proof.StrictOwnerProof.REQUIRED
+    for entry in registry.entries:
+        row = entry.record
+        if row["sessionId"] != conversation:
+            continue
+        other_pid, other_started = row["pid"], row.get("procStart", "")
+        if (other_pid, other_started) == (pid, started):
+            continue
+        if not other_started or not isinstance(
+                sessions.process_liveness(other_pid, other_started), sessions.SessionNotLive):
+            return _message_proof.StrictOwnerProof.REQUIRED
+    return _message_proof.ProvedMessageOwner(conversation=conversation, pid=pid, start=started)
+
+
 def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: sessions.RegistryRead,
                           records: list[sessions.SessionRecord]) -> RelayPlan:
     conversation = conversation_recipient(mailbox).conversation
-    checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
     candidates = [record for record in records if record["sessionId"] == conversation]
+    message_owner = _unique_message_owner(conversation, registry, candidates)
+    with _message_proof.message_lookup(message_owner):
+        checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
     if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
         try:
             _ = staff.native_id(conversation)

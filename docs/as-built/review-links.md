@@ -1009,6 +1009,7 @@ The shared reader ignores any old Later time on a Validating change.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
 When wrap moves a Bug or Investigation, it moves the Later timestamp to the new owner key.
+The queue and status counts compare and order Later deadlines by epoch time.
 The status cache watches that file and expires at the first pending Later time.
 The item returns after that time without a new action.
 Every action keeps its time, actor and words in the existing record log.
