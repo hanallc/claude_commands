@@ -64,6 +64,25 @@ const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens'];
 const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU'];
 
+function waitForMoveHandle(evaluate, rowId) {
+  return evaluate(`new Promise((resolve, reject) => {
+    const walk = document.querySelector('#walk');
+    const selector = '.queue-grip[data-move-id="' + CSS.escape(${JSON.stringify(rowId)}) + '"]';
+    if (walk.querySelector(selector)) return resolve(true);
+    const observer = new MutationObserver(() => {
+      if (!walk.querySelector(selector)) return;
+      observer.disconnect();
+      clearTimeout(timeout);
+      resolve(true);
+    });
+    const timeout = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error('The waiting row has no move handle: ' + selector));
+    }, 3000);
+    observer.observe(walk, {childList:true, subtree:true});
+  })`);
+}
+
 // nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
 // on the served reading, which has rows in the shape of the live feed. The path names the page to check.
 // With a shot folder, the check first saves the Running and Queued card at each width as real-<width>.png.
@@ -247,7 +266,7 @@ try {
   const headcountComparison = comparison === '--headcount';
   const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
-  const fixtureTime = readings.good.read_at;
+  const fixtureTime = guestTipProof ? Math.floor(Date.now() / 1000) : readings.good.read_at;
   for (const reading of Object.values(readings)) {
     const shift = fixtureTime - reading.read_at;
     for (const row of reading.walk) {
@@ -256,6 +275,7 @@ try {
       for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
     }
     for (const waiter of reading.waiters) waiter.since += shift;
+    if (guestTipProof) reading.fresh_until += shift;
     reading.read_at = fixtureTime;
   }
   const base = readings.good;
@@ -629,7 +649,7 @@ try {
           // A fourth argument names a published page to shoot as the before view.
           // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
           const shootBefore = queueRowsProof && beforePage;
-          const guestTipShot = join(folder, 'guesttip-dark-3.png');
+          const guestTipShot = join(folder, 'guesttip-dark-4.png');
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
@@ -656,6 +676,9 @@ try {
             guest.started_at = reading.read_at - 4 * 60;
             reading.walk[2] = {...mac, started_at:reading.read_at - 3 * 60, read_at:reading.read_at};
             waiting.since = reading.read_at - 90;
+            waiting.place = 1;
+            waiting.move = {row_id:'shot-admin-console', movable:true, kept_before:0};
+            reading.move_line = {revision:reading.move_revision, members:[waiting.move], kept_runs:[]};
             await call('Emulation.setTimezoneOverride', {timezoneId:'America/Los_Angeles'});
           }
           servedReading = reading;
@@ -675,7 +698,10 @@ try {
           let rows;
           for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+            const showHandle = guestTipProof && width === 1440;
+            if (guestTipProof) queueFixture = showHandle ? reading : null;
             await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            if (showHandle) await waitForMoveHandle(evaluate, waiting.move.row_id);
             rows = await evaluate(`(() => {
               const walk = document.querySelector('#walk');
               const name = row => row.querySelector('.name').textContent;
@@ -687,6 +713,7 @@ try {
               const box = walk.closest('.card').getBoundingClientRect();
               const scroll = walk.closest('.walk-scroll');
               const waitingName = chart(keys[4]).querySelector('.name');
+              const handle = chart(keys[4]).querySelector('.queue-grip');
               const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
                 icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
                 icon?.getAttribute('data-badge')];
@@ -708,6 +735,7 @@ try {
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
                 waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
+                handleFits:handle?.getBoundingClientRect().right <= waitingName.getBoundingClientRect().left,
                 waitingHeading:walk.querySelector('.walk-chart .queue-title').firstElementChild.textContent,
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
@@ -747,6 +775,7 @@ try {
                 'The mac-linux icon has no mac color.');
               if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
               if (guestTipProof) assert.equal(rows.waitingHeading, 'Waiting, in queue order');
+              if (showHandle) assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut.');
               if (width >= 900) {
                 const pointer = await evaluate(`(() => {
                   const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
@@ -818,7 +847,7 @@ try {
             }
           }
           if (guestTipProof) {
-            console.log(JSON.stringify({pass:true,shot:guestTipShot}));
+            console.log(JSON.stringify({pass:true,shot:guestTipShot,captureClock:new Date(fixtureTime * 1000).toISOString()}));
             break browserProof;
           }
           // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
@@ -957,15 +986,7 @@ try {
         servedReading = queueFixture;
         await navigate('memory_live.html');
         await evaluate('window.render = window.renderReading; true');
-        await evaluate(`new Promise(resolve => {
-          const walk = document.querySelector('#walk');
-          const ready = () => walk.querySelector('[data-move-id="typesafe"]');
-          if (ready()) return resolve(true);
-          const observer = new MutationObserver(() => {
-            if (ready()) { observer.disconnect(); resolve(true); }
-          });
-          observer.observe(walk, {childList:true, subtree:true});
-        })`);
+        await waitForMoveHandle(evaluate, 'typesafe');
         const snapshot = () => evaluate(`({
           handles:[...document.querySelectorAll('.queue-grip')].map(button => button.dataset.moveId),
           lifted:document.querySelector('.wrow.queue-lift .queue-grip')?.dataset.moveId,
