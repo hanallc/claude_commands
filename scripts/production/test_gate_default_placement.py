@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import subprocess
 from tempfile import TemporaryDirectory
+from typing import cast
 import unittest
 from unittest import mock
 
@@ -241,15 +242,18 @@ class GateDefaultPlacementTests(unittest.TestCase):
         arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
         parent = mock.Mock(spec=OuterReservation)
         for nested in (True, False):
-            with (self.subTest(nested=nested), mock.patch.dict(os.environ, clear=True),
+            environment = {"BUILDLOG_GATE_TARGETS": "mac-linux"} if nested else {}
+            with (self.subTest(nested=nested), mock.patch.dict(os.environ, environment, clear=True),
                   mock.patch.object(gate, 'outer_reservation', return_value=parent if nested else None),
                   mock.patch.object(gate, 'current_gate_placement', return_value=gate.NO_GATE_ASSIGNMENT),
-                  mock.patch.object(first_step, 'gate_targets', return_value=()),
+                  mock.patch.object(first_step, 'gate_targets', return_value=()) as targets,
                   mock.patch.object(first_step, 'admitted_run') as admit,
                   mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
                 self.assertEqual(gate.main(arguments), 0)
             admit.assert_not_called()
             self.assertEqual(run.call_args.args[-1], 'natedev')
+            if nested:
+                targets.assert_not_called()
 
     def test_named_module_selection_uses_the_exact_tree_and_has_no_pass_certificate(self) -> None:
         checked, run = self.run_named_guest()
@@ -261,7 +265,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
     def test_named_guest_modules_use_the_configured_run_limit(self) -> None:
         _checked, run = self.run_named_guest()
         run.assert_called_once()
-        self.assertEqual(run.call_args.kwargs["module_time_limit_s"], 1200)
+        self.assertIsNone(cast(object, run.call_args.kwargs["module_time_limit_s"]))
 
     def run_named_guest(self) -> tuple[gate.GateRun, mock.Mock]:
         assignment = placed("mac-linux")
@@ -271,7 +275,6 @@ class GateDefaultPlacementTests(unittest.TestCase):
             root = Path(directory)
             settings = root / "config"
             _ = write_config_fixture(settings / "build_targets.conf", "enabled.mac-linux=on\n")
-            _ = write_config_fixture(settings / "mac_linux.conf", "run.time_limit_seconds=1200\n")
             with (mock.patch.dict(os.environ, config_environment(settings)),
                   mock.patch.object(cloud_gate, "working_tree", return_value=("tree", set())),
                   mock.patch.object(gate, "checked_git", return_value="fixture-commit"),

@@ -48,7 +48,8 @@ The caller checks the targets in `targets` in the order the file lists them.
 It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
 The current rules permit natedev and `mac-linux` for full gates, named module tests, and nightly suites.
 Named module tests on `mac-linux` use `run.time_limit_seconds` from the guest settings.
-Named module tests with a live parent reservation use that reservation by default.
+A nested named gate always reuses its live parent reservation on natedev.
+For named gates, `BUILDLOG_GATE_TARGETS` applies only to standalone runs.
 Promotion without tests uses natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 Hana gates have no repository default.

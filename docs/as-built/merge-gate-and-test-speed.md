@@ -66,7 +66,8 @@ The gate keeps merge writes, validation, push, promotion and nightly publication
 The natedev handoff keeps its memory reservation until the suites end.
 The suites publish progress to the sidecar from the granted request.
 A `--module` run can use natedev or `mac-linux`.
-A nested named run keeps its parent reservation on natedev by default.
+A nested named gate always reuses its live parent reservation on natedev.
+For named gates, `BUILDLOG_GATE_TARGETS` applies only to standalone runs.
 `--promote-only` runs on natedev.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
