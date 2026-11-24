@@ -19,18 +19,26 @@ from scripts.build_queue.admission_client import OuterReservation
 from scripts.build_targets import mac_linux
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, scratch
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.production import gate
-from scripts.production.gate_routes import GateResultUnknown, ModuleCoverage
+from scripts.production.gate_routes import GateResultUnknown, GateTookNoRun, ModuleCoverage
 
 
 def placed(target: str) -> wire.Assignment:
-    provider = 'scaler' if target == 'aws' else 'ssh' if target == 'mac-linux' else 'local'
+    provider = 'scaler' if target == 'claude-aws' else 'ssh' if target == 'mac-linux' else 'local'
     return wire.Assignment(placement.PlacementAssignment('episode', 'attempt',
         placement.PlacementDestination(provider, target, 'fixture-host', WHOLE_MAC),
         execution_identity.SourceKeyKnown('fixture-source'), placement.SubmittingOwner('fixture-host', 1, '1'),
         NoOwningSession(), 1.0))
+
+
+def scaler_registry(root: Path) -> dict[str, str]:
+    _ = write_config_fixture(root / "build_targets.conf",
+        "targets=natedev,mac-linux,claude-aws\nkind.claude-aws=scaler\n"
+        + "settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n")
+    return {"CONF_DIR": str(root)}
 
 
 class GateDefaultPlacementTests(unittest.TestCase):
@@ -95,14 +103,14 @@ class GateDefaultPlacementTests(unittest.TestCase):
         checkpoint = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
                       '--previous-checkpoint', 'base', '--unit', 'fixture', '--phase', '1']
         for arguments in (checkpoint, ['--affected'], ['--tests-only']):
-            with self.subTest(arguments=arguments):
+            with self.subTest(arguments=arguments), TemporaryDirectory() as config:
                 calls: list[str] = []
 
                 @contextmanager
                 def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[object]:
-                    self.assertEqual(list(command), ['gate.py', *arguments])
+                    self.assertEqual(list(command), ['scripts/production/gate.py', *arguments])
                     self.assertEqual(source, Path.cwd())
-                    self.assertEqual(targets, ('natedev', 'mac-linux'))
+                    self.assertEqual(targets, ('natedev', 'mac-linux', 'claude-aws'))
                     calls.append('admit')
                     try:
                         yield mock.Mock(spec=first_step.FirstStepAdmission,
@@ -118,7 +126,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     with gate.gate_suite_target(args, Path.cwd(), target):
                         return run()
 
-                with (mock.patch.dict(os.environ, {'BUILDLOG_GATE_TARGETS': 'natedev,mac-linux,aws'}, clear=True),
+                with (mock.patch.dict(os.environ, {**scaler_registry(Path(config)),
+                                            'BUILDLOG_GATE_TARGETS': 'natedev,mac-linux,claude-aws'}, clear=True),
                       mock.patch.object(first_step, 'admitted_run', side_effect=admit),
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('natedev')]),
@@ -131,7 +140,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(calls, ['admit', 'run', 'release'])
 
     def test_copied_gate_reuses_its_aws_assignment(self) -> None:
-        assignment = placed('aws')
+        assignment = placed('claude-aws')
         with TemporaryDirectory() as directory:
             tree = Path(directory)
             command = ["./scripts/lib/py", "scripts/production/gate.py", "--tests-only"]
@@ -148,26 +157,26 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, inherited, clear=True):
                     gate_arguments = ["--tests-only", "--repo", directory]
                     status = gate.main(gate_arguments)
-                    self.assertEqual(gate.main(gate_arguments), 1)
                 return subprocess.CompletedProcess(arguments, status)
 
-            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
+            with (mock.patch.dict(os.environ, {**scaler_registry(tree), "BUILDLOG_GATE_TARGETS": "claude-aws"}, clear=True),
                   mock.patch.object(copies, "caller_owner", return_value="fixture"),
                   mock.patch("scripts.copies.copies._command_copy",
                              return_value=nullcontext(copies.DirectCommandCopy(tree))),
                   mock.patch.object(subprocess, "run", side_effect=launch),
                   mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
                   mock.patch.object(first_step, 'admitted_run') as admit,
-                  mock.patch.object(gate, 'run_tests_only', return_value=0) as run,
-                  redirect_stderr(StringIO()) as errors):
+                  mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
                 args = copies.CopyArguments(repo=directory)
                 self.assertEqual(copies.run_copy(args, command, copies.CommittedSource("HEAD"), copies.NO_MERGE), 0)
-            self.assertIn("A direct gate cannot take an AWS assignment", errors.getvalue())
         admit.assert_not_called()
         run.assert_called_once()
-        self.assertEqual(run.call_args.args[-1], 'aws')
+        self.assertEqual(run.call_args.args[-1], gate.AwsGateAssignment(assignment.assignment))
 
     def test_a_gate_inside_a_copy_shell_requires_direct_placement(self) -> None:
+        assignment = placed('claude-aws')
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission,
+                             grant=mock.Mock(spec=first_step.GatePlacement))
         with TemporaryDirectory() as directory:
             tree = Path(directory)
             command = ["sh", "-c", "gate.py --tests-only"]
@@ -182,23 +191,24 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     status = gate.main(["--tests-only", "--repo", directory])
                 return subprocess.CompletedProcess(arguments, status)
 
-            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
+            with (mock.patch.dict(os.environ, {**scaler_registry(tree), "BUILDLOG_GATE_TARGETS": "claude-aws"}, clear=True),
                   mock.patch.object(copies, "caller_owner", return_value="fixture"),
                   mock.patch("scripts.copies.copies._command_copy",
                              return_value=nullcontext(copies.DirectCommandCopy(tree))),
                   mock.patch.object(subprocess, "run", side_effect=launch),
-                  mock.patch.object(gate, "run_tests_only", return_value=0) as run,
-                  mock.patch.object(first_step, "admitted_run") as admit,
-                  redirect_stderr(StringIO()) as errors):
+                  mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment]),
+                  mock.patch.object(gate, 'run_tests_only', return_value=0) as run,
+                  mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)) as admit):
                 args = copies.CopyArguments(repo=directory)
-                self.assertEqual(copies.run_copy(args, command, copies.CommittedSource("HEAD"), copies.NO_MERGE), 1)
-            self.assertIn("Direct gates require natedev or mac-linux", errors.getvalue())
-            run.assert_not_called()
-            admit.assert_not_called()
+                self.assertEqual(copies.run_copy(args, command, copies.CommittedSource("HEAD"), copies.NO_MERGE), 0)
+        admit.assert_called_once_with(("scripts/production/gate.py", "--tests-only", "--repo", directory),
+                                      tree, targets=("claude-aws",))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[-1], gate.AwsGateAssignment(assignment.assignment))
 
     def test_each_assignment_runs_its_route(self) -> None:
         result = gate.GateRun((), 1, 0, selection_certified=True)
-        for target in ('natedev', 'mac-linux'):
+        for target in ('natedev', 'mac-linux', 'claude-aws'):
             assignment = placed(target)
             with (self.subTest(target=target),
                   mock.patch.object(cloud_gate, 'working_tree', return_value=('tree', set())),
@@ -208,33 +218,45 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(cloud_gate, 'route', return_value=result) as aws):
                 self.assertIs(gate.run_gate_suites(Path.cwd(), target=gate.placement_target(assignment)), result)
                 self.assertEqual([local.call_count, guest.call_count, aws.call_count],
-                                 [int(target == name) for name in ('natedev', 'mac-linux', 'aws')])
+                                 [int(target == name) for name in ('natedev', 'mac-linux', 'claude-aws')])
 
-    def test_direct_gate_refuses_aws_as_its_only_target(self) -> None:
-        with (mock.patch.dict(os.environ, {'BUILDLOG_GATE_TARGETS': 'aws'}, clear=True),
-              mock.patch.object(first_step, 'admitted_run') as place,
-              mock.patch.object(gate, 'run_tests_only') as run,
-              redirect_stderr(StringIO()) as errors):
-            self.assertEqual(gate.main(['--tests-only']), 1)
-        self.assertIn('Direct gates require natedev or mac-linux', errors.getvalue())
-        place.assert_not_called()
-        run.assert_not_called()
+    def test_without_a_queue_assignment_the_gate_uses_natedev(self) -> None:
+        result = gate.GateRun((), 1, 0, selection_certified=True)
+        with (mock.patch.object(cloud_gate, 'working_tree', return_value=('tree', set())),
+              mock.patch.object(cloud_gate, 'route') as aws,
+              mock.patch.object(cloud_gate, 'run') as legacy_aws,
+              mock.patch.object(gate, 'run_suites', return_value=result) as local):
+            self.assertIs(gate.run_gate_suites(Path.cwd(), target=gate.NO_GATE_ASSIGNMENT), result)
+        local.assert_called_once()
+        aws.assert_not_called()
+        legacy_aws.assert_not_called()
 
-    def test_direct_gate_refuses_an_aws_assignment(self) -> None:
-        aws = placed('aws')
-        for assigned_at_start in (True, False):
-            assignments = (aws,) if assigned_at_start else (gate.NO_GATE_ASSIGNMENT, aws)
-            admitted = mock.Mock(spec=first_step.FirstStepAdmission,
-                                 grant=mock.Mock(spec=first_step.GatePlacement))
-            with (self.subTest(assigned_at_start=assigned_at_start),
-                  mock.patch.dict(os.environ, {'BUILDLOG_GATE_TARGETS': 'natedev'}, clear=True),
-                  mock.patch.object(gate, 'current_gate_placement', side_effect=assignments),
-                  mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)),
-                  mock.patch.object(gate, 'run_tests_only') as run,
+    def test_direct_aws_ends_after_one_placement_with_no_test_verdict(self) -> None:
+        assignment = placed('claude-aws')
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission,
+                             grant=mock.Mock(spec=first_step.GatePlacement))
+        for outcome in (GateTookNoRun('fixture prelaunch refusal'), GateResultUnknown('fixture lost result')):
+            with (self.subTest(status=outcome.status), TemporaryDirectory() as directory,
+                  mock.patch.dict(os.environ, {**scaler_registry(Path(directory)),
+                                                'BUILDLOG_GATE_TARGETS': 'claude-aws'}, clear=True),
+                  mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment]),
+                  mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)) as place,
+                  mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
+                  mock.patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+                  mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),
+                  mock.patch.object(copies, 'source_owner', return_value=''),
+                  mock.patch.object(cloud_gate, 'working_tree', return_value=('tree', set())),
+                  mock.patch.object(cloud_gate, 'route', side_effect=outcome) as aws,
+                  mock.patch.object(gate, 'run_suites') as local,
+                  mock.patch.object(mac_linux, 'route') as guest,
                   redirect_stderr(StringIO()) as errors):
-                self.assertEqual(gate.main(['--tests-only']), 1)
-            self.assertIn('A direct gate cannot take an AWS assignment', errors.getvalue())
-            run.assert_not_called()
+                arguments = ('--affected', '--full', '--repo', directory)
+                self.assertEqual(gate.main(arguments), outcome.status)
+                self.assertIn(str(outcome), errors.getvalue())
+                place.assert_called_once_with(('scripts/production/gate.py', *arguments), Path(directory), targets=('claude-aws',))
+                aws.assert_called_once()
+                local.assert_not_called()
+                guest.assert_not_called()
 
     def test_a_standalone_named_module_stays_local_and_a_nested_module_keeps_its_parent(self) -> None:
         arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
@@ -355,7 +377,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                     guest.return_value = outcome
                 arguments = ['--affected', '--full', '--repo', directory]
                 self.assertEqual(gate.main(arguments), status)
-            place.assert_called_once_with(('gate.py', *arguments), repo, targets=targets)
+            place.assert_called_once_with(('scripts/production/gate.py', *arguments), repo, targets=targets)
             self.assertIn('fixture recovery cleanup failed', errors.getvalue())
         guest.assert_called_once()
         local.assert_not_called()

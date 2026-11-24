@@ -2982,7 +2982,7 @@ class GateDispatchJournalTests(unittest.TestCase):
                       mock.patch.object(cloud_gate, 'run', side_effect=no_result) as run,
                       mock.patch.object(admission_client, 'report_execution', side_effect=report),
                       self.assertRaises(GatePlacementIncomplete) as failed):
-                    _ = cloud_gate.route_assigned(root, mode=gate.SuiteMode.GATE, full=True,
+                    _ = cloud_gate.route(root, mode=gate.SuiteMode.GATE, full=True,
                         module_time_limit_s=10, assignment=assignment, selected=gate.ALL_MODULES,
                         gate_job=GateJobNotRecorded())
                 self.assertEqual(failed.exception.status, 80 if launch_pending else 79)

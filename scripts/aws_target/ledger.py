@@ -172,6 +172,12 @@ class GateReservation:
     root_gib: int = 0
 
 
+def gate_booking(values: conf.ConfigRead, attempt: str, now: int, expires: int) -> GateReservation:
+    """Use the same booking terms for placement and the worker."""
+    return GateReservation(attempt, now, expires, money(str(values.number('spot_max_usd_per_hour'))),
+        money(str(values.number('attempt_allowance_usd'))), instance_type=values.words('instance_types')[0])
+
+
 def gate_is_open(reservation: GateReservation) -> bool:
     """Keep pending and running reservations open until AWS confirms closure."""
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
@@ -2536,15 +2542,23 @@ class CostLedger:
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
                 if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
-            state.gate_reservations.append(request)
-            reason = self.reservation_cap(state, settings, request.at, costs)
-            if reason:
-                state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
-                self._save(state)
-                return GateCapReached(reason)
+            reason = self._book_gate(state, settings, request)
             self._save(state)
+            if reason:
+                return GateCapReached(reason)
             return GateReserved(state.gate_reservations[-1])
+
+    def gate_booking_refusal(self, settings_path: Path, request: GateReservation) -> str:
+        """Project the booking against local account evidence without changing the ledger."""
+        return self._book_gate(self.read_snapshot(), read_settings(settings_path), request)
+
+    def _book_gate(self, state: LedgerEvidence, settings: SpendingSettings, request: GateReservation) -> str:
+        costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+        state.gate_reservations.append(request)
+        reason = self.reservation_cap(state, settings, request.at, costs)
+        if reason:
+            _ = state.gate_reservations.pop()
+        return reason
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:

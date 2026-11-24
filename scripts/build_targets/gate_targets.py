@@ -2,14 +2,13 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.aws_target.config import AwsOn, aws_switch, cloud_gate_off_reason
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import execution_identity, placement
 from scripts.build_queue.admission_client import placement_constraint_builder
 from scripts.build_targets import target_config
 from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
-from scripts.lib.build_steps import OtherCommand, gate_natedev_only_flag, gate_target_kind, parse_command_program
+from scripts.lib.build_steps import OtherCommand, gate_natedev_only_flag, parse_command_program
 from scripts.mac_test.claim_state import WHOLE_MAC
 
 
@@ -28,15 +27,12 @@ def aws_gate_command(repo: Path, command: tuple[str, ...]) -> bool:
             and "--nightly" not in program[1] and gate_natedev_only_flag(program[1]) is None)
 
 
-def aws_gate_candidate() -> placement.PlacementCandidate:
-    """Read the cloud gate switch for the AWS scaler."""
-    path = conf.path("cloud_gate")
-    destination = placement.PlacementDestination("scaler", "aws", "aws", WHOLE_MAC)
-    settings = placement.ExplicitProviderSettings(path)
-    switch = aws_switch(conf.read_or_repository("cloud_gate"))
-    eligibility = (placement.AllowedHost() if isinstance(switch, AwsOn)
-                   else placement.FixedExclusion(cloud_gate_off_reason(switch)))
-    return placement.PlacementCandidate(destination, eligibility, settings)
+def scaler_gate_candidate(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> placement.PlacementCandidate:
+    """Use the registry switch for this scaler."""
+    enabled = registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False)
+    destination = placement.PlacementDestination("scaler", target.name, target.name, WHOLE_MAC)
+    eligibility = placement.AllowedHost() if enabled else placement.FixedExclusion("off")
+    return placement.PlacementCandidate(destination, eligibility, placement.ExplicitProviderSettings(target.settings))
 
 
 def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...] | NoEnabledTarget:
@@ -52,12 +48,16 @@ def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[st
     registry = conf.read("build_targets")
     builder = placement_constraint_builder()
     names: list[str] = []
-    for target in target_config.read_targets(purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
-        kind = gate_target_kind(target.name)
-        if kind is None:
+    for target in target_config.read_registered_targets(purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
+        if isinstance(target, target_config.ScalerTarget):
+            if (aws_gate_command(repo_root, command)
+                    and isinstance(scaler_gate_candidate(registry, target).eligibility, placement.AllowedHost)):
+                names.append(target.name)
+            continue
+        if target.name not in ("natedev", "mac-linux"):
             continue
         enabled = registry.value(f"enabled.{target.name}", conf.on_off,
-                                 default=kind != "mac-linux", recover_invalid=False)
+                                 default=target.name != "mac-linux", recover_invalid=False)
         if not enabled:
             continue
         fixed = builder(repo_root, "", "final", command, NoOwningSession(),
@@ -66,6 +66,4 @@ def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[st
         if any(candidate.destination.target == target.name and isinstance(candidate.eligibility, placement.AllowedHost)
                for candidate in fixed.candidates):
             names.append(target.name)
-    if aws_gate_command(repo_root, command) and isinstance(aws_gate_candidate().eligibility, placement.AllowedHost):
-        names.append("aws")
     return tuple(names) if names else NoEnabledTarget()

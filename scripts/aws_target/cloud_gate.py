@@ -31,7 +31,7 @@ from scripts.aws_target import admin_secrets, gate_box, key_refusal, ledger, run
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
-    gate_regions, money, read_settings)
+    gate_regions, read_settings)
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, execution_identity, placement, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
@@ -900,11 +900,8 @@ class GateWorker:
             if not (folder / 'launch.json').exists():
                 if request.get('task') != 'paired':
                     self.charges()
-                reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
-                    attempt, int(self.clock()), ledger.instant(request, 'expires'),
-                    money(str(settings().number('spot_max_usd_per_hour'))),
-                    money(str(settings().number('attempt_allowance_usd'))),
-                    instance_type=settings().words('instance_types')[0]))
+                reservation = self.book.reserve_gate(self.settings_path, ledger.gate_booking(
+                    settings(), attempt, int(self.clock()), ledger.instant(request, 'expires')))
                 if isinstance(reservation, (ledger.GateCapReached, ledger.GateAttemptEnded)):
                     return {'status': 'fallback', 'reason': reservation.reason}
                 identity = process_start(os.getpid())
@@ -1776,15 +1773,6 @@ def execute_gate_worker(folder: Path, worker: Callable[[], GateWorker]) -> int:
     return 0
 
 
-def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
-          selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
-          gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> gate.GateRun | str:
-    """Return a completed gate or the reason for local fallback."""
-    outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                  selected=selected, gate_job=gate_job)
-    return outcome.reason if isinstance(outcome, LocalFallback) else outcome.run
-
-
 def begin_assigned_gate(assignment: placement.PlacementAssignment) -> AssignedCloudGate:
     """Record the caller in the journal that the queue supplied."""
     start = process_start(os.getpid())
@@ -1805,7 +1793,7 @@ def begin_assigned_gate(assignment: placement.PlacementAssignment) -> AssignedCl
         raise GateTookNoRun(f'The AWS prelaunch record is unavailable. {error}') from error
 
 
-def route_assigned(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
+def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                    assignment: placement.PlacementAssignment, selected: gate.AllModules | gate.TreeSelection,
                    gate_job: StepJob | GateJobNotRecorded) -> gate.GateRun:
     """Use the assignment once and report its verdict or its lack of a verdict."""

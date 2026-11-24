@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext, redirect_stderr, redirect_stdout
@@ -41,7 +42,9 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
-from scripts.build_targets.gate_targets import aws_gate_candidate
+from scripts.aws_target.ledger_test_support import install_aws_fixture_settings
+from scripts.build_targets import target_config
+from scripts.build_targets.gate_targets import scaler_gate_candidate
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
 
@@ -59,6 +62,26 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
     """Write a fixture settings file. A new mac_test file gets the pins in place of the repository values."""
     pins = MAC_TEST_PINS if (template or path.stem) == "mac_test" and not path.exists() else ""
     return memory_test_support.write_config_fixture(path, pins + overrides, template=template)
+
+
+class FixedSystemReader:
+    """Publish private evidence without an operating-system reader."""
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 class PlacementFixture(AdmissionFixture):
@@ -619,25 +642,56 @@ class CargoFolderTests(unittest.TestCase):
                     self.assertEqual(wire.parse_request(wire.encode_request(decoded)), decoded)
 
 
+def aws_gate_request(fixture: PlacementFixture, *, enabled: bool = True, daily_room: bool = True
+                     ) -> wire.PlacementRequest:
+    """Prepare an AWS request and read the scaler's local evidence."""
+    install_aws_fixture_settings(fixture.root)
+    _ = write_config_fixture(fixture.root / "build_targets.conf",
+        "targets=natedev,claude-aws\nkind.claude-aws=scaler\nsettings.claude-aws=cloud_gate.conf\n"
+        + f"enabled.claude-aws={'on' if enabled else 'off'}\n")
+    _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
+    _ = write_config_fixture(fixture.root / "aws_target.conf", "# range: 0..\ndaily_limit_usd=35\n")
+    book = aws_ledger.CostLedger(fixture.root / "queue-target-state" / "aws")
+    now = int(fixture.clock.now())
+    with book.transaction() as state:
+        state.inventories.append(aws_ledger.ResourceInventory(now - 60, (), "fixture", builder_removed=True))
+        if not daily_room:
+            state.gate_reservations.append(aws_ledger.GateReservation(
+                "full-day", now, now + 60, Decimal(0), Decimal(35)))
+    request = placement_request(fixture)
+    local = request.local
+    assert isinstance(local, wire.LocalAdmissionContext)
+    sidecar = fixture.root / "progress"
+    registry = conf.read("build_targets")
+    scaler, = target_config.read_registered_targets(selected="claude-aws",
+        purpose=target_config.RegistryRead.PLACEMENT, configuration=registry)
+    assert isinstance(scaler, target_config.ScalerTarget)
+    candidate = scaler_gate_candidate(registry, scaler)
+    return replace(request, local=replace(local, sidecar=str(sidecar)), route=PinnedTarget("claude-aws"),
+        constraints=replace(request.constraints, candidates=(replace(candidate, eligibility=ALLOWED_HOST),),
+                            repository=str(fixture.root), command=("scripts/production/gate.py", "--tests-only"),
+                            command_kind="final"))
+
+
+def read_aws_gate_evidence(fixture: PlacementFixture, request: wire.PlacementRequest) -> placement.FreshHostEvidence:
+    key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+    evidence = fixture.read_host_evidence(key)
+    assert isinstance(evidence, placement.FreshHostEvidence)
+    fixture.provider_evidence[key] = evidence
+    fixture.server.publish_host_evidence(evidence)
+    return evidence
+
+
 class AwsGatePlacementTests(unittest.TestCase):
     def assigned_gate(self, fixture: PlacementFixture) -> tuple[wire.PlacementRequest, placement.PlacementAssignment,
                                                                 aws_ledger.GateDispatchBinding]:
-        _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
-        request = placement_request(fixture)
-        local = request.local
-        assert isinstance(local, wire.LocalAdmissionContext)
-        sidecar = fixture.root / "progress"
-        request = replace(request, local=replace(local, sidecar=str(sidecar)), route=PinnedTarget("aws"),
-            constraints=replace(request.constraints, candidates=(aws_gate_candidate(),),
-                                command=("scripts/production/gate.py", "--tests-only"), command_kind="final"))
-        key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
-        evidence = fixture.read_host_evidence(key)
-        assert isinstance(evidence, placement.FreshHostEvidence)
+        request = aws_gate_request(fixture)
+        with mock.patch.dict(os.environ, {"AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+            evidence = read_aws_gate_evidence(fixture, request)
         self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-        fixture.provider_evidence[key] = evidence
-        fixture.server.publish_host_evidence(evidence)
         assignment = assignment_for(fixture, request)
-        binding = aws_ledger.GateDispatchBinding.read(aws_ledger.gate_dispatch_binding_path(sidecar))
+        assert isinstance(request.local, wire.LocalAdmissionContext)
+        binding = aws_ledger.GateDispatchBinding.read(aws_ledger.gate_dispatch_binding_path(Path(request.local.sidecar)))
         self.assertEqual(binding.claim, placement.assigned_claim_reference(assignment))
         self.assertEqual(binding.journal.parent, fixture.server.state_dir)
         self.assertEqual(binding.directory, fixture.root / "queue-target-state" / "aws")
@@ -666,7 +720,7 @@ class AwsGatePlacementTests(unittest.TestCase):
                     self.assertEqual(report.outcome, placement.AttemptCancelled("no launch"))
                     self.assertEqual(report.path, placement.DispatchPathSettled())
                     self.assertEqual(journal.read().state, "no launch")
-                    self.assertFalse((binding.directory / "cost-ledger.json").exists())
+                    self.assertEqual(aws_ledger.CostLedger(binding.directory).read_snapshot().gate_reservations, [])
 
     def test_caller_uses_the_queue_journal_with_a_different_aws_state_root(self) -> None:
         from scripts.aws_target import cloud_gate
@@ -1534,8 +1588,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_guest_gate_that_took_no_run_after_its_consume_closes_for_a_retry(self) -> None:
         # The gate ends before copies.py reports the claim failure. The last system reading can still show the gate.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1592,8 +1644,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_gate_newer_than_the_system_reading_consumes_its_guest_permission(self) -> None:
         # copies.py starts the gate after the last system reading, so that reading does not show the holder.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1608,8 +1658,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_a_gate_whose_pid_named_another_process_in_the_reading_consumes_its_guest_permission(self) -> None:
         # The last system reading shows the gate pid with the start time of an earlier process.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         with PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -1628,8 +1676,6 @@ class PlacementTests(unittest.TestCase):
     def test_a_holder_the_fresh_read_does_not_confirm_keeps_the_guest_permission(self) -> None:
         # The last system reading shows the holder pid with the start time of an earlier process.
         # The fresh read then refuses a holder that is not a descendant or that states a start that is not live.
-        from scripts.build_queue.test_admission_service import FixedSystemReader
-
         cases = (("not a descendant", False, None), ("not the live start", True, "not-the-live-start"))
         for case, descendant, stated_start in cases:
             with self.subTest(case), PlacementFixture() as fixture:

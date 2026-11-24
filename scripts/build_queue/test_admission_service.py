@@ -65,6 +65,7 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.build_queue.test_placement import FixedSystemReader
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 
 
@@ -1932,26 +1933,6 @@ class SwapInReadingsTests(unittest.TestCase):
                         assert isinstance(reading, records.ReadingUnavailable)
                         self.assertIn("swap-in reading unavailable", reading.reason)
                         self.assertIn(str(path), reading.reason)
-
-
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 class ReferenceActivityReader(ScopeActivityReader):
@@ -3957,6 +3938,38 @@ class PlacementRestartTests(unittest.TestCase):
 
 
 class CloudAdmissionTests(unittest.TestCase):
+    def test_aws_grant_requires_a_registered_enabled_scaler_with_slots_and_daily_room(self) -> None:
+        from scripts.aws_target import ledger
+        from scripts.build_queue.test_placement import PlacementFixture, aws_gate_request, read_aws_gate_evidence
+
+        for cause in ("off", "slots", "daily", "absent", "ready"):
+            with self.subTest(cause=cause), PlacementFixture() as fixture:
+                fixture.configure(cloud_gate_slots=16)
+                if cause == "slots":
+                    for _ in range(16):
+                        _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+                request = aws_gate_request(fixture, enabled=cause != "off", daily_room=cause != "daily")
+                if cause == "absent":
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\n")
+                directory = fixture.root / "queue-target-state"
+                book = ledger.CostLedger(directory / "aws")
+                saved = book.path.read_bytes()
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                    _ = read_aws_gate_evidence(fixture, request)
+                    reply, = fixture.server.handle_request(request)
+                    if cause == "ready":
+                        assert isinstance(reply, wire.Assignment)
+                        self.assertEqual(reply.assignment.destination.target, "claude-aws")
+                        self.assertEqual(fixture.server.current_assignments[request.episode],
+                            execution_identity.attempt_key(request.episode, reply.assignment.attempt))
+                    else:
+                        self.assertNotIsInstance(reply, wire.Assignment)
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                        candidate, = fixture.server.placement_eligibility[request.episode]
+                        self.assertNotIsInstance(candidate.eligibility, placement.AllowedHost)
+                self.assertEqual(book.path.read_bytes(), saved)
+
     def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
         from scripts.build_queue import cloud_progress
 

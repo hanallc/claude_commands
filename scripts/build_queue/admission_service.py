@@ -3107,6 +3107,10 @@ class AdmissionServer:
                 + sum(self.assignments[key].assignment.destination.provider == "scaler"
                       for key in self.current_assignments.values()))
 
+    def _cloud_slots_full(self) -> bool:
+        return (not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
+                or self._cloud_slots_used() >= self.configuration.cloud_gate_slots)
+
     def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
         waiting_cloud = self._cloud_waiters()
         if not waiting_cloud and not self.pending_cloud_groups:
@@ -3888,14 +3892,20 @@ class AdmissionServer:
                 else:
                     holder = placement.ResourceHolderSession(blocking.key)
             return placement.FreshHostEvidence(key, self.clock.now(), "", local_eligibility, holder=holder)
-        if destination.provider == "scaler" and destination.target == "aws":
-            from scripts.build_targets.gate_targets import aws_gate_candidate
+        if destination.provider == "scaler":
+            from scripts.build_targets.gate_targets import scaler_gate_candidate
 
-            candidate = aws_gate_candidate()
-            if (destination, key.settings) != (candidate.destination, candidate.settings):
-                eligibility = placement.FixedExclusion("AWS placement differs from the configured target")
-            else:
-                eligibility = candidate.eligibility
+            registry = conf.read("build_targets")
+            configured = target_config.read_registered_targets(selected=destination.target,
+                purpose=target_config.RegistryRead.PLACEMENT, configuration=registry)
+            target = next((entry for entry in configured if isinstance(entry, target_config.ScalerTarget)), None)
+            eligibility = placement.FixedExclusion("The scaler is absent from the target registry")
+            if target is not None:
+                candidate = scaler_gate_candidate(registry, target)
+                eligibility = (candidate.eligibility if (destination, key.settings) == (candidate.destination, candidate.settings)
+                               else placement.FixedExclusion("The scaler differs from the configured target"))
+            if isinstance(eligibility, placement.AllowedHost):
+                eligibility = self._aws_gate_spending()
             return placement.FreshHostEvidence(key, self.clock.now(), key.configuration_generation, eligibility)
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
@@ -4430,6 +4440,8 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+            if destination.provider == "scaler" and isinstance(permitted, placement.AllowedHost) and self._cloud_slots_full():
+                permitted = placement.TemporaryExclusion("cloud slots full")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -4583,6 +4595,21 @@ done
             remote_start_hold=hold, placement_candidates=self._placement_candidate_reading(request))
         self.current_assignments[request.episode] = key
         return assignment
+
+    def _aws_gate_spending(self) -> placement.AllowedHost | placement.TemporaryExclusion:
+        """Read the charge room for one AWS gate from local files."""
+        from scripts.aws_target import ledger as aws_ledger
+        from scripts.aws_target.config import account_settings_path
+
+        try:
+            book = aws_ledger.CostLedger(target_config.ssh_target_state_directory("aws"))
+            values = conf.read_or_repository("cloud_gate")
+            now = int(self.clock.now())
+            offered = aws_ledger.gate_booking(values, "placement-preview", now, now + values.whole("lifetime_minutes") * 60)
+            reason = book.gate_booking_refusal(account_settings_path(), offered)
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            return placement.TemporaryExclusion(f"AWS spending evidence is unavailable. {error}")
+        return placement.TemporaryExclusion(reason) if reason else placement.AllowedHost()
 
     def _aws_gate_binding(self, assignment: placement.PlacementAssignment) -> aws_ledger.GateDispatchBinding:
         from scripts.aws_target import ledger as aws_ledger
@@ -4849,8 +4876,7 @@ done
                         break
                     continue
                 if destination.provider == "scaler":
-                    if (destination.target != "aws" or not isinstance(self.configuration, gate.UsableAdmissionConfiguration)
-                            or self._cloud_slots_used() >= self.configuration.cloud_gate_slots):
+                    if self._cloud_slots_full():
                         continue
                 elif (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
@@ -4992,7 +5018,7 @@ done
                                 return self._placement_status(assignment, f'Hana admission refused: {memory.reason}')
                 except (OSError, ValueError) as error:
                     return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
-        if destination.provider == "scaler" and destination.target == "aws":
+        if destination.provider == "scaler":
             from scripts.aws_target import ledger as aws_ledger
 
             binding = self._aws_gate_binding(assignment)
