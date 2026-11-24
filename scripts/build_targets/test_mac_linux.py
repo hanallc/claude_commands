@@ -1092,7 +1092,7 @@ fi
     def test_the_gate_holds_its_launch_permission_before_the_guest_starts(self) -> None:
         report_received = Event()
 
-        def receive_report(_request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+        def receive_report(_request: wire.ExecutionReport, **_timing: float) -> wire.DispatchStatus:
             report_received.set()
             return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
 
@@ -1139,7 +1139,7 @@ fi
         release_report = Event()
         report_finished = Event()
 
-        def publish(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+        def publish(request: wire.ExecutionReport, **_timing: float) -> wire.DispatchStatus:
             self.assertIsInstance(request.evidence, execution_identity.ObservedExecution)
             if isinstance(request.evidence, execution_identity.ObservedExecution):
                 self.assertIsInstance(request.evidence.identity, execution_identity.GuestExecution)

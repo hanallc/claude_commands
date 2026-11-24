@@ -7633,7 +7633,7 @@ window.fetch=async(path,options={})=>{
         request = uuid4().hex
         _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback(request, "Recover these words."))
         with patch.object(change_page, "send_to_staff") as send:
-            list_page.recover_pending()
+            list_page.recover_pending(root)
             send.assert_called_once()
             self.assertEqual(send.call_args.args[0], MORTY.id)
             self.assertIn("Recover these words.", cast(str, send.call_args.args[2]))

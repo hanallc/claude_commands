@@ -727,7 +727,7 @@ def _validate_ask(ask: Ask) -> None:
         raise ListError("invalid List ask")
     _line(ask.what, "ask what")
     _line(ask.why, "ask why")
-    _staff_id(ask.target, "ask target")
+    _ = staff_id(ask.target, "ask target")
     for moment in (ask.opened, ask.closed):
         _validate_time(moment)
     if ask.is_open == bool(ask.go_id) or any(char.isspace() for char in ask.go_id):
@@ -1151,7 +1151,7 @@ def _read_log_line(line: str, number: int) -> ItemChange:
                 content = GoGiven(ask)
             case {"action": "Go not delivered", "ask": value, "recipient": str(recipient)} if len(fields) == 3:
                 ask = _read_ask(value)
-                _staff_id(recipient, "Go recipient")
+                _ = staff_id(recipient, "Go recipient")
                 if ask.is_open:
                     raise ListError("an undelivered Go closes its ask")
                 content = GoNotDelivered(ask, staff.StaffId(recipient))
@@ -1904,7 +1904,7 @@ def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staf
     """Open an ask for nate; the open ask makes the item unread."""
     _line(what, "--what")
     _line(why, "--why")
-    _staff_id(target, "target")
+    _ = staff_id(target, "target")
 
     def edit(item: ListItem, moment: datetime) -> ListItem:
         _open(item)
