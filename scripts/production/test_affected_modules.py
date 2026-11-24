@@ -15,10 +15,9 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import cloud_gate
 from scripts.buildlog import index, store
 from scripts.production import affected_modules as affected
-from scripts.production import gate, mac_gate_process
+from scripts.production import gate
 from scripts.test_times import gate_record
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -461,14 +460,19 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(result, affected.FullSuite("local module read snapshot unavailable"))
 
     def test_missing_empty_or_corrupt_local_snapshot_requests_every_module(self) -> None:
+        class SelectionReady(Exception):
+            pass
+
+        self.write(".git/test-config/build_admission.conf", "# range: 0.125..64\nmerge_gate_governor_gib=4\n")
+        gate_config = self.repo / ".git/test-config/gate.conf"
+        self.write(".git/test-config/gate.conf", gate_config.read_text() + "# whole: 0..\nmemory_stop_reruns=0\n")
+        self.write("scripts/test_times/module_run.py", "")
         self.add_test("checks/test_dynamic.py", "VALUE = 1\n")
         self.certify()
         self.record_history(self.config_gate({}), host="Mac")
         self.write("docs/guide.md", "changed\n")
         local_path = gate_record.latest_module_reads_path("natedev")
-        found = [(path.parent.name, path) for path in self.modules]
         expected = {path.relative_to(self.repo).as_posix() for path in self.modules}
-        cloud_result = gate.GateRun((), 0.0, 0.0)
         for label, contents in (("missing", None), ("blank", ""), ("empty", "{}"),
                                 ("invalid JSON", "{"), ("invalid field", '{"config_reads":4}')):
             with self.subTest(case=label):
@@ -478,18 +482,17 @@ class AffectedModulesTests(unittest.TestCase):
                     _ = local_path.write_text(contents)
                 self.assertEqual(affected.select_affected(self.repo, self.base, self.modules, {"docs/guide.md"}),
                                  affected.FullSuite("local module read snapshot unavailable"))
-                with (mock.patch.object(gate, "discover_test_modules", return_value=found),
+                with (mock.patch.object(gate, "gate_state_dir", return_value=self.cache_dir()),
+                      mock.patch.object(gate, "_gate_job_parent", return_value=self.repo),
+                      mock.patch.object(gate.BuildHoldWait, "wait_until_free"),
                       mock.patch.object(gate.PassedTreeLedger, "certified_base", return_value=self.base),
                       mock.patch.object(gate.PassedTreeLedger, "reuse", return_value=False),
-                      mock.patch.object(mac_gate_process, "load_mac_gate_route",
-                                        side_effect=ModuleNotFoundError(name=mac_gate_process.MAC_GATE_MODULE)),
-                      mock.patch.object(cloud_gate, "working_tree", return_value=("tree", {"docs/guide.md"})),
-                      mock.patch.object(cloud_gate, "route", return_value=cloud_result) as route,
-                      redirect_stdout(io.StringIO())):
-                    self.assertEqual(gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED,
-                                                          target=gate.NO_GATE_ASSIGNMENT), cloud_result)
-                selection = cast(gate.TreeSelection, route.call_args.kwargs["selected"])
-                self.assertEqual(set(selection.paths), expected)
+                      mock.patch.object(gate, "read_time_limit", side_effect=SelectionReady) as limit,
+                      redirect_stdout(io.StringIO()), self.assertRaises(SelectionReady)):
+                    _ = gate.run_gate_suites(self.repo, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+                limit.assert_called_once()
+                paths = cast(list[str], limit.call_args.args[1])
+                self.assertEqual(set(paths), expected)
 
     def test_mac_snapshot_adds_a_module_to_natedev_selection(self) -> None:
         self.add_test("checks/test_local.py", "VALUE = 1\n")
