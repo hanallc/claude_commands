@@ -1928,28 +1928,21 @@ Every nextest run that lint starts prints one line after admission: `nextest: <g
 
 **Gotchas:** held paths taken at the first scan miss a live use that `shrink_floor` finds later; compute them from the final `busy` map. The no-evidence branch walks `_build_trees` only when a cargo lock is held.
 
-### Phase 94 — Each fall below the floor line gives one phone push, and the return gives one more  · status: done
+### Phase 94 — Each fall below the floor line gives one phone push  · status: done
 
 #### As-built
 
-- Each fall of free space below `sweep_phone_floor_gib` (150 GiB) gives one fall push for that machine, and the return gives one `sweep.disk_floor_recovered` push. No push goes between them. The rule is the same for natedev and the Mac.
-- `notify_floor_problem` rearms a crossing only when every pass during `sweep_phone_rearm_minutes` (60) reads strictly above the line plus `sweep_phone_rearm_gib` (155 GiB). `AboveRearmLine.since` keeps the first above-line time under the record lock. A reading at or below 155 GiB restarts the interval.
-- `RecoveringPhoneCrossing` holds the return receipt, the retirement result and `ReturnPushPolicy`. The fall key is `phone:<identity>` and the return key is `phone-recovered:<identity>`. A failed return delivery retries above the rearm line and a repeat is stopped by the receipt. A later fall opens a new episode even when the prior return receipt is pending.
-- At recovery, `retire_floor_fall` retires the crossing's fall key on natedev, which owns the silence queue. The Mac reaches natedev through `silence.SSH`. A dropped kept push means no return push and the crossing closes, even when the retire exits with an error. A retire with no count suppresses the return push in saved state, and the next pass retries. Only an accepted fall and a first retire result of zero dropped permit a return push.
+- Each fall below `sweep_phone_floor_gib` (150 GiB) permits one phone push per crossing. Recovery rearms the next fall without sending a phone push. The same rule applies to natedev and the Mac.
+- `notify_floor_problem` rearms a crossing after every pass reads above 155 GiB for `sweep_phone_rearm_minutes` (60 minutes). The rearm line adds `sweep_phone_rearm_gib` (5 GiB) to the alert line. `AboveRearmLine.since` records the start of the interval under the record lock. A reading at or below the rearm line restarts the interval.
+- `retire_floor_fall` retires the crossing's `phone:<identity>` fall key in the silence queue on natedev. The Mac uses `silence.SSH`. A reported dropped count confirms retirement even when the command exits with an error. `RetiringPhoneCrossing` preserves the identity and interval when retirement needs a retry. A later fall can start a new episode while retirement is pending.
 - The alert folder list shows only the largest folders that cover the shortfall, at most `sweep_alert_folder_count` (3, range 3..5). It never shows 0-byte folders and shows each path in full (`~` allowed). At the text limit it shows fewer folders. `notify_floor_problem` falls back to `UNAVAILABLE_FOLDER_CHOICES`.
 - Both Mac floor paths, the launchd job and the ssh call, read and write the same `floor.json` under one `floor-alert.lock`.
 
 **Files:**
-- `scripts/lint/sweep.py` — crossing states, timed rearm, return push, fall-key retirement, folder list.
-- `scripts/lint/test_sweep.py` — return, retirement, lost-receipt, timed-rearm and folder-list rows.
-- `scripts/notify/push_catalog.py` — `sweep.disk_floor_recovered`.
-- `scripts/notify/push_texts_reviewed.json` — approval records for the natedev and Mac return examples.
+- `scripts/lint/sweep.py` — crossing states, timed rearm, fall-key retirement and folder list.
+- `scripts/lint/test_sweep.py` — retirement, lost receipts, timed rearm and folder list.
 - `config/lint.conf` — `sweep_phone_rearm_minutes`, `sweep_alert_folder_count`.
-- `docs/as-built/build-memory-admission.md` — the two-push rule and the folder list.
-
-**Gotchas:**
-- The approval record for the return text carries the reviewer's objection to a push that asks for no action. The user approved the words on 2026-11-09.
-- A pending fall phone receipt gets no return push.
+- `docs/as-built/build-memory-admission.md` — the fall push and the folder list.
 
 **Ruled out:**
 - A deploy repair for the crossing record: the older and current formats read the same crossing, and the 147.7 GiB alert followed a real rise to 155.23 GiB.

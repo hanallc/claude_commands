@@ -40,6 +40,7 @@ from scripts.lib import build_folders, conf, copy_record, removal_guard
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
+from scripts.lib.sizes import MIB, gib
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -4378,9 +4379,9 @@ class FloorTests(SweepCase):
         self.assertIn("The sweep keeps their output.", message)
         self.assertNotIn("Free ", message)
         lock_path = busy_tree / sweep.LOCK_NAMES[0]
-        self.assertIn(f"- {busy_tree.parent} ({sweep.gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
+        self.assertIn(f"- {busy_tree.parent} ({gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
                       + " no session found", message)
-        self.assertIn(f"Not swept: CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertIn(f"Not swept: CI's targets ({gib(ci_bytes)})", message)
         self.assertIn("No phone alert was attempted for this event.", message)
         self.assertNotIn("phone", send.call_args.kwargs)
         self.assertNotIn("Could not remove", message)
@@ -4486,26 +4487,23 @@ class FloorTests(SweepCase):
         with self.crossing_delivery({}) as delivery:
             _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\nsweep_phone_rearm_minutes=0\n")
             for free, expected in ((200, 0), (140, 2), (130, 2), (150, 2), (140, 2), (151, 2), (140, 2),
-                                   (155, 2), (140, 2), (160, 3), (140, 5)):
+                                   (155, 2), (140, 2), (160, 2), (140, 4)):
                 with self.subTest(free=free, expected=expected):
                     self.finalize_crossing(free)
                     self.assertEqual(len(delivery.attempts), expected)
-                    if expected >= 3:
-                        self.assertIn("sweep.disk_floor_recovered", delivery.attempts[2].command)
             self.assertEqual([attempt.recipient for attempt in delivery.attempts],
-                             ["natedev", "user", "user", "natedev", "user"])
+                             ["natedev", "user", "natedev", "user"])
             for recipient in ("natedev", "user"):
-                keys = [attempt.key for attempt in delivery.attempts
-                        if attempt.recipient == recipient and "sweep.disk_floor_recovered" not in attempt.command]
+                keys = [attempt.key for attempt in delivery.attempts if attempt.recipient == recipient]
                 self.assertNotEqual(keys[0], keys[1])
 
-    def test_phone_floor_crossing_sends_one_return_before_the_next_fall(self) -> None:
+    def test_phone_floor_crossing_rearms_silently_after_the_interval(self) -> None:
         for machine in ("natedev", "Mac"):
             for event, readings in (
                 ("cycle", ((0, 200, 0), (1, 149.8, 1), (2, 148.5, 1), (3, 149.9, 1),
-                           (4, 148.2, 1), (5, 156, 1), (64, 156, 1), (65, 156, 2), (66, 149, 3))),
+                           (4, 148.2, 1), (5, 156, 1), (64, 156, 1), (65, 156, 1), (66, 149, 2))),
                 ("margin", ((0, 200, 0), (1, 149.8, 1), (2, 150, 1), (3, 151, 1), (4, 155, 1),
-                            (5, 149, 1), (6, 156, 1), (66, 156, 2), (67, 149, 3))),
+                            (5, 149, 1), (6, 156, 1), (66, 156, 1), (67, 149, 2))),
                 ("morning", ((0, 149.8, 1), (1, 155.23, 1), (20, 154.47, 1), (40, 150.86, 1), (120, 147.7, 1))),
                 ("dip at line", ((0, 149.8, 1), (1, 156, 1), (60, 155, 1), (61, 156, 1),
                                  (120, 156, 1), (121, 149, 1))),
@@ -4531,31 +4529,17 @@ class FloorTests(SweepCase):
                             self.assertEqual(len(pushes), expected)
                     self.assertTrue(all(attempt.accepted for attempt in pushes))
                     self.assertIn(f"{machine} has 149.8 GiB free", pushes[0].text)
+                    self.assertEqual([attempt.command[attempt.command.index("--text-id") + 1] for attempt in pushes],
+                                     ["sweep.disk_floor"] * len(pushes))
                     if event in ("cycle", "margin"):
-                        self.assertEqual([attempt.command[attempt.command.index("--text-id") + 1] for attempt in pushes],
-                                         ["sweep.disk_floor", "sweep.disk_floor_recovered", "sweep.disk_floor"])
-                        self.assertIn(f"{machine} disk space is back", pushes[1].text)
-                        self.assertIn(f"{machine} has 156.0 GiB free, above the 155.0 GiB line.", pushes[1].text)
-                        self.assertIn("The next fall below 150.0 GiB sends one alert.", pushes[1].text)
-                        self.assertIn(f"{machine} has 149.0 GiB free", pushes[2].text)
-                        self.assertNotEqual(pushes[0].key, pushes[2].key)
-                    else:
-                        self.assertEqual([attempt.command[attempt.command.index("--text-id") + 1] for attempt in pushes],
-                                         ["sweep.disk_floor"])
+                        self.assertIn(f"{machine} has 149.0 GiB free", pushes[1].text)
+                        self.assertNotEqual(pushes[0].key, pushes[1].key)
 
-    def test_phone_floor_return_retries_until_accepted_and_requires_a_sent_fall(self) -> None:
+    def test_phone_floor_recovery_retires_the_fall_key(self) -> None:
         for machine in ("natedev", "Mac"):
-            for event, replies, counts, accepted in (
-                ("sent", {}, (1, 2, 2, 2), (True, True)),
-                ("failed return", {"user": [0, 3, 0]}, (1, 2, 3, 3), (True, False, True)),
-                ("fall after failed return", {"user": [0, 3, 0]}, (1, 2, 3, 3), (True, False, True)),
-                ("lost return receipt", {}, (1, 2, 3, 3), (True, True, False)),
-                ("failed fall", {"user": [3]}, (1, 1, 1, 1), (False,)),
-                ("kept fall", {}, (1, 1, 1, 1), (False,)),
-                ("kept fall retire exit 3", {}, (1, 1, 1, 1), (False,)),
-                ("lost retire reply", {}, (1, 1, 1, 1), (False,)),
-                ("lost kept fall receipt", {}, (1, 1, 1, 1), (False,)),
-            ):
+            for event in ("sent", "failed fall", "kept fall", "kept fall retire exit 3",
+                          "lost retire reply", "lost kept fall receipt"):
+                replies = {"user": [3]} if event == "failed fall" else {}
                 with (self.subTest(machine=machine, event=event), self.crossing_delivery(replies) as delivery,
                       mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([]))):
                     _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\nsweep_phone_rearm_minutes=0\n")
@@ -4569,62 +4553,63 @@ class FloorTests(SweepCase):
                     base = delivery.base
                     policy = (sweep.MacFloor((str(base),), floor_claims.ClaimSnapshot(frozenset()), base / "mirror")
                               if machine == "Mac" else sweep.NatedevFloor.CURRENT)
-                    pushes: list[AlertSendAttempt] = []
                     save = sweep.write_floor_record
-
-                    def interrupt_return_receipt(path: Path, record: sweep.FloorRecord) -> None:
-                        if any("sweep.disk_floor_recovered" in attempt.command for attempt in delivery.attempts):
-                            raise RuntimeError("fixture stops before the return receipt save")
-                        save(path, record)
 
                     def interrupt_kept_fall_receipt(path: Path, record: sweep.FloorRecord) -> None:
                         if delivery.kept_keys:
                             raise RuntimeError("fixture stops before the kept fall receipt save")
                         save(path, record)
 
-                    readings = (140, 156, 139, 138) if event == "fall after failed return" else (140, 156, 157, 158)
-                    for free, expected in zip(readings, counts, strict=True):
-                        if event == "lost kept fall receipt" and free == 140:
-                            with (mock.patch.object(sweep, "write_floor_record", side_effect=interrupt_kept_fall_receipt),
-                                  self.assertRaisesRegex(RuntimeError, "before the kept fall receipt save")):
-                                _ = self.hold(base, 300 * GIB, [free * GIB, free * GIB], recorded=True, policy=policy)
-                            self.assertIs(self.saved_receipts()[1], sweep.CrossingReceipt.PENDING)
-                        elif event == "lost return receipt" and free == 156:
-                            with (mock.patch.object(sweep, "write_floor_record", side_effect=interrupt_return_receipt),
-                                  self.assertRaisesRegex(RuntimeError, "before the return receipt save")):
-                                _ = self.hold(base, 300 * GIB, [free * GIB, free * GIB], recorded=True, policy=policy)
-                        else:
-                            self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
-                                                       recorded=True, policy=policy)[0], 0)
-                        pushes = [attempt for attempt in delivery.attempts if attempt.recipient == "user"]
-                        self.assertEqual(len(pushes), expected)
-                        if event == "kept fall retire exit 3" and free == 156:
-                            self.assertIsInstance(self.saved_record().phone_crossing, sweep.AbovePhoneFloor)
-                    self.assertEqual(tuple(attempt.accepted for attempt in pushes), accepted)
-                    returns = pushes[1:2] if event == "fall after failed return" else pushes[1:]
-                    for attempt in returns:
-                        self.assertIn("sweep.disk_floor_recovered", attempt.command)
-                        self.assertIn(f"{machine} disk space is back", attempt.text)
-                    if event == "fall after failed return":
-                        self.assertIn("sweep.disk_floor", pushes[2].command)
-                        self.assertIn(f"{machine} has 139.0 GiB free", pushes[2].text)
-                        self.assertNotEqual(pushes[0].key, pushes[2].key)
-                    if event in ("failed return", "lost return receipt"):
-                        self.assertEqual(pushes[1].key, pushes[2].key)
+                    if event == "lost kept fall receipt":
+                        with (mock.patch.object(sweep, "write_floor_record", side_effect=interrupt_kept_fall_receipt),
+                              self.assertRaisesRegex(RuntimeError, "before the kept fall receipt save")):
+                            _ = self.hold(base, 300 * GIB, [140 * GIB, 140 * GIB], recorded=True, policy=policy)
+                        self.assertIs(self.saved_receipts()[1], sweep.CrossingReceipt.PENDING)
+                    else:
+                        self.assertEqual(self.hold(base, 300 * GIB, [140 * GIB, 140 * GIB],
+                                                   recorded=True, policy=policy)[0], 0)
+                    pushes = [attempt for attempt in delivery.attempts if attempt.recipient == "user"]
+                    self.assertEqual(len(pushes), 1)
+                    self.assertEqual(pushes[0].accepted, event == "sent")
+
+                    for free in (156, 157, 158):
+                        attempts = len(delivery.attempts)
+                        self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
+                                                   recorded=True, policy=policy)[0], 0)
+                        self.assertEqual(len(delivery.attempts), attempts)
+                        expected = (sweep.RetiringPhoneCrossing if event == "lost retire reply" and free == 156
+                                    else sweep.AbovePhoneFloor)
+                        self.assertIsInstance(self.saved_record().phone_crossing, expected)
                     retired = [command for command in delivery.commands if "retire" in command]
-                    if event != "failed fall":
-                        self.assertTrue(retired)
-                        self.assertEqual(delivery.retire_hosts,
-                                         ["natedev" if machine == "Mac" else "local"] * len(retired))
-                        for command in retired:
-                            self.assertEqual(command[command.index("--key") + 1], pushes[0].key)
-                        if len(pushes) > 1:
-                            self.assertLess(delivery.commands.index(retired[0]), delivery.commands.index(pushes[1].command))
-                    if event in ("kept fall", "kept fall retire exit 3", "lost retire reply", "lost kept fall receipt"):
-                        self.assertEqual(delivery.kept_keys, set())
-                        self.assertIsInstance(self.saved_record().phone_crossing, sweep.AbovePhoneFloor)
-                    if event == "lost retire reply":
-                        self.assertEqual(len(retired), 2)
+                    self.assertEqual(len(retired), 2 if event == "lost retire reply" else 1)
+                    self.assertEqual(delivery.retire_hosts,
+                                     ["natedev" if machine == "Mac" else "local"] * len(retired))
+                    for command in retired:
+                        self.assertEqual(command[command.index("--key") + 1], pushes[0].key)
+                    self.assertEqual(delivery.kept_keys, set())
+
+    def test_old_recovery_record_rearms_without_delivery(self) -> None:
+        for receipt, retired in (("pending", False), ("pending", True), ("accepted", True)):
+            with self.subTest(receipt=receipt, retired=retired), self.crossing_delivery({}) as delivery:
+                _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_gib=5\nsweep_phone_rearm_minutes=60\n")
+                now = time.time()
+                path = sweep.floor_record_path()
+                _ = path.write_text(json.dumps({
+                    "measured_at": now - 60, "free_bytes": 156 * GIB, "build_cache_bytes": 0,
+                    "phone_crossing": {"identity": "old-crossing", "rearm_since": now - 3601,
+                                       "recovery": receipt, "retired": retired, "return_policy": "allowed"},
+                }))
+                expected = (sweep.AbovePhoneFloor() if retired else
+                            sweep.RetiringPhoneCrossing("old-crossing", sweep.AboveRearmLine(now - 3601)))
+                self.assertEqual(self.saved_record().phone_crossing, expected)
+                self.finalize_crossing(156)
+                self.assertIsInstance(self.saved_record().phone_crossing, sweep.AbovePhoneFloor)
+                self.assertEqual(delivery.attempts, [])
+                self.assertEqual(delivery.retire_hosts, [] if retired else ["local"])
+                self.finalize_crossing(140)
+                self.assertEqual([attempt.recipient for attempt in delivery.attempts], ["natedev", "user"])
+                self.assertIn("sweep.disk_floor", delivery.attempts[1].command)
+                self.assertNotEqual(delivery.attempts[1].key, "phone:old-crossing")
 
     def test_crossing_retries_only_the_channel_without_a_receipt(self) -> None:
         for failed in ("user", "natedev"):
@@ -5003,7 +4988,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                     else:
                         self.finalize_crossing(140, removed=2 * GIB)
                 choices.assert_called_once()
-                shortfall = sweep.gib(150 * GIB - free)
+                shortfall = gib(150 * GIB - free)
                 if links == "held-only":
                     recommendation = ("Every measured folder holds output a build is using. "
                                       "The sweep frees it when the build ends.")
@@ -5042,7 +5027,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 held_effect = "A build is using output inside it; deleting it can break that build."
                 other_effect = "Deleting it removes its contents; their use is unknown."
                 lines = [
-                    f"Free disk space fell below the 150.0 GiB alert line. {sweep.gib(free)} remains."
+                    f"Free disk space fell below the 150.0 GiB alert line. {gib(free)} remains."
                     + (" This is the Mac disk." if machine == "Mac" else ""),
                     "Cleanup removed 2.0 GiB.",
                     *([f"{large}: holds {large_size}. " + (held_effect if held_targets else other_effect)]
@@ -5340,7 +5325,6 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                     policy = (sweep.MacFloor((str(base),), floor_claims.ClaimSnapshot(frozenset()), base / "mirror")
                               if machine == "Mac" else sweep.NatedevFloor.CURRENT)
                     send = cast(mock.Mock, sweep.send_floor_alert)
-                    recovery_count = 0
                     for free, expected in readings:
                         self.assertEqual(self.hold(base, 300 * GIB, [free * GIB, free * GIB],
                                                    recorded=True, policy=policy)[0], 0)
@@ -5348,13 +5332,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                         self.assertEqual(len(messages), expected)
                         for call in messages:
                             self.assertIn("Free disk space fell", call)
-                        if free > 150 + margin and expected:
-                            recovery_count = 1
-                        self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts),
-                                         expected + recovery_count)
-                        recovered = [attempt for attempt in delivery.attempts
-                                     if "sweep.disk_floor_recovered" in attempt.command]
-                        self.assertEqual(len(recovered), recovery_count)
+                        self.assertEqual(sum(attempt.recipient == "user" for attempt in delivery.attempts), expected)
                     self.assertEqual(self.saved_receipts(), (sweep.CrossingReceipt.ACCEPTED, sweep.CrossingReceipt.ACCEPTED))
                     text = phone_text(delivery.attempts)
                     self.assertIn(f"{machine} disk is low; {machine} tests can fail", text)
@@ -7901,7 +7879,7 @@ class BudgetTests(unittest.TestCase):
         target = root / "target"
         target.mkdir()
         repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
-        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * sweep.MIB)
+        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),
