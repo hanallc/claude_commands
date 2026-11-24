@@ -6127,13 +6127,13 @@ done
             action = "set"
             why = request.why
         else:
+            if not request.unit and not entries:
+                _ = self._priority_history_end(self.clock.now())
+                return self._mutation_reply(key, wire.Ok())
             action = "clear"
             why = ", ".join(entry["why"] for entry in entries if not request.unit or entry["unit"] == request.unit)
-        previous = self.priority
         if refusal := self._change_priority(action, request.unit, why, request.actor, key, self.clock.now()):
             return self._mutation_reply(key, wire.Refused(refusal))
-        if self.priority is previous:
-            return self._mutation_reply(key, wire.Ok())
         self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
         self._finish_priority()
@@ -6142,6 +6142,9 @@ done
 
     def _priority_entries(self) -> tuple[records.PriorityEntry, ...]:
         return self.priority.entries if isinstance(self.priority, records.QueuePriority) else ()
+
+    def _priority_history_end(self, at: float) -> int:
+        return store.read_last_whole_row_end(store.host_file(self.host, at))
 
     def _change_priority(self, action: Literal["set", "clear"], unit: str, why: str,
                          actor: str, key: str, written_at: float) -> str:
@@ -6153,14 +6156,12 @@ done
             entries = (*entries, entry)
         else:
             kept = tuple(entry for entry in entries if unit and entry["unit"] != unit)
-            if unit and kept == entries:
-                return f"unknown unit {unit}; the queue priority did not change"
+            if kept == entries:
+                return f"unknown unit {unit}; the queue priority did not change" if unit else ""
             unit = unit or ", ".join(entry["unit"] for entry in entries)
             entries = kept
         at = self.clock.now()
-        month_row_end = store.read_last_whole_row_end(store.host_file(self.host, at))
-        if not unit:
-            return ""
+        month_row_end = self._priority_history_end(at)
         transition = records.PendingPriorityTransition(key, action, at, month_row_end, unit, why, actor)
         self.input_event_count += 1
         self.priority = records.QueuePriority(entries, transition)
