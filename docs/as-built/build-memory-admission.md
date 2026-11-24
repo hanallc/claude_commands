@@ -343,6 +343,7 @@ Other Linux callers keep the local admission and hold checks.
 `scripts.lib.build_folders.create_build_folder(request) -> Path` allocates temporary build folders.
 
 1. `UniqueBuildFolder(prefix, parent)` creates a private folder atomically with mode `0700`.
+   When another run holds the name, it takes a new name at once and does not wait for the lock.
 2. `StableOwnerFolder(name, parent, mode)` retains the owner's folder, contents, and existing permissions.
 
 `FOLDER_PREFIXES` defines each build kind's prefix.
@@ -414,10 +415,11 @@ On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step 
 
 ### The verify run place
 
-The outer Linux `verify.sh` sets `BUILDLOG_RUN` after detachment.
-The value contains its PID and the start-time string from `/proc/<pid>/stat`, separated by `:`.
-Nested calls retain that value.
-The Mac uses `NoRun` and retains claim admission without reading `/proc`.
+On Linux, `verify.sh` and the full CI check in `validate_ci.sh` use the same initializer in `scripts/lib/buildlog_run.sh`.
+`verify.sh` calls it after detachment. `validate_ci.sh` calls it when the validation shell starts.
+The initializer retains an inherited `BUILDLOG_RUN`. Otherwise it exports the shell PID and its start time from `/proc/<pid>/stat`, separated by `:`.
+Every validation step inherits this identity, including commands in the repository's `.claude/config/local_ci.sh`.
+On the Mac, the initializer creates no identity and reads no `/proc` data.
 
 `queue_place.py admit` inherits the exported `BUILDLOG_RUN` through `memory_gate.sh`.
 The client parses the value once into `RunIdentity` or `NoRun`.
