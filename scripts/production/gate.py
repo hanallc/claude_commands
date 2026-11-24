@@ -3248,11 +3248,15 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         assignment = grant.grant.assignment
         if assignment.destination.target not in targets:
             raise GateAssignmentRefused("The queue returned a target outside the gate request")
-        if (args.tests_only or args.affected) and not first_step.assignment_matches_source(assignment, source):
-            raise GateAssignmentRefused("The requested source does not match the gate placement source")
         admitted.handoff(source)
+        mode = SuiteMode.TARGETED if args.affected else SuiteMode.GATE
+        placed = current_gate_placement(mode, args.gate_job, source=source if args.tests_only or args.affected else None)
+        if isinstance(placed, NoGateAssignment):
+            raise GateAssignmentRefused("The queue returned no gate placement")
+        if placed != grant.grant:
+            raise GateAssignmentRefused("The gate placement changed after handoff")
         try:
-            yield placement_target(grant.grant)
+            yield placement_target(placed)
         except GateSettlementPending as error:
             if isinstance(grant, first_step.OwnedGatePlacement):
                 try:

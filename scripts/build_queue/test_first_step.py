@@ -526,7 +526,7 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
                   mock.patch.object(first_step, "_placement_grant") as place,
                   mock.patch.object(queue_place, "request_place", return_value=PROGRAM_GRANT) as program,
-                  mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
+                  mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
                   forbid_admission_calls()):
                 with first_step.admitted_run(GATE_COMMAND, source) as admitted:
                     refresh = cast(object, program.call_args.args[0])
@@ -542,6 +542,8 @@ class FirstStepTests(unittest.TestCase):
                     self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
                     self.assertNotIn("BUILDLOG_PLACEMENT_SIDECAR", os.environ)
                     self.assertFalse(admitted.assignment_file.exists())
+                program.assert_called_once()
+                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing)
                 place.assert_not_called()
 
     def test_close_after_verify_cancels_the_completed_remote_placement(self) -> None:

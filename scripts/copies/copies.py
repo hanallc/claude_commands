@@ -2733,7 +2733,8 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
                                               check=False, text=True)
                 return run()
 
-            result = admitted.run_gate(run_assigned)
+            result = run_assigned()
+            admitted.preserve_exit_status = first_step.is_gate_placement_exit(result.returncode)
     if result.stderr:
         _ = sys.stderr.write(result.stderr)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode

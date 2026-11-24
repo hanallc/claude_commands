@@ -110,24 +110,25 @@ The queue currently releases the Mac claim at this deadline. The guest run keeps
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
-It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
+The runner writes `mac-linux run start` before it starts the suites.
+A failure before that line can leave the start unconfirmed. The gate returns status 80 in that case.
 The gate prints `Mac Linux guest took no run: <cause>`.
 A merge gate also reports that it undid the merge.
 When the guest proves that no test started, the gate can exit with status 79.
 It writes a claim failure next to the assignment file (`<assignment>.claim-failure`).
-Status 80 means the gate has no verdict after the guest could have started tests.
+Status 80 means the gate has no verdict and cannot return a confirmed no-run result.
 A direct gate returns the status after one placement request.
 A gate with an inherited placement returns the status to its wrapper.
-A wrapper that owns the placement request uses the exact claim failure to ask for a replacement.
+`copies.py run` uses the exact claim failure to ask for a replacement when it owns the placement request.
 The queue also accepts a claim failure after a consumed launch permission when it confirms the gate process ended.
-A wrapper can request settlement on status 80.
+`copies.py run` can request settlement on status 80.
 For Mac Linux it also needs proof that no tests started before it can request a replacement.
 The wrapper writes a replacement assignment into the same file and runs the gate again.
 The 180-second wait applies to the guest. Another eligible target can take the run immediately.
 If the guest is the only free target, the run waits 180 seconds before it tries the guest again.
 A second guest refusal removes the guest from that episode.
 If placement fails, the wrapper reports the reason and stops.
-`copies.py gate-step` preserves status 79 or 80 when cleanup fails and prints the cleanup error.
+`copies.py gate-step` returns the result of one placement. It preserves status 79 or 80 when cleanup fails and prints the cleanup error.
 Checkpoint and bump treat these statuses as blocked when the wrapper returns them.
 A nightly gate reports the refusal to its production owner. It records no red test result.
 A confirmed test failure gives status 1.

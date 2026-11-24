@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager, nullcontext, redirect_stderr
+from dataclasses import replace
 import io
 import os
 from pathlib import Path
@@ -106,16 +107,48 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(source)),
                       mock.patch.object(first_step, "_gate_request", return_value=request),
                       mock.patch.object(first_step, "_placement_grant", return_value=placed("mac-linux")),
-                      mock.patch.object(first_step, "assignment_matches_request", return_value=True),
-                      mock.patch.object(admission_client, "request_settlement"),
                       mock.patch.object(admission_client, "cancel_placement", side_effect=wire.AdmissionUnavailable(
                           "fixture queue unavailable")) as cancel,
                       mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(command, status)),
                       redirect_stderr(io.StringIO()) as errors):
                     result = copies.main(["gate-step", "--repo", folder, "--targets", "mac-linux", "--", *command])
                 self.assertEqual(result, status)
-                self.assertIn("Gate cleanup failed. fixture queue unavailable\n", errors.getvalue())
+                self.assertEqual(errors.getvalue(), "Gate cleanup failed. fixture queue unavailable\n")
                 cancel.assert_called_once()
+
+    def test_gate_step_stops_after_a_mac_linux_claim_failure(self) -> None:
+        with TemporaryDirectory() as folder:
+            source = Path(folder)
+            command = ["gate.py", "--tests-only"]
+            request = mock.Mock(spec=wire.PlacementRequest, local=wire.LocalAdmissionUnavailable("fixture"))
+            original = placed("mac-linux")
+            replacement = wire.Assignment(replace(placed("natedev").assignment, attempt="replacement"))
+            failure = wire.ClaimFailure("refusal", original.assignment, placement.MAC_LINUX_NO_ANSWER)
+            settled = wire.DispatchStatus(original.assignment, placement.ClosedAssignment(failure.reason),
+                                          placement.PermissionAvailable(), retry=placement.RetryAt(0))
+
+            def launch(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                assignment_file = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
+                if wire.read_assignment(assignment_file) == original:
+                    report = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
+                    _ = report.write_text(wire.encode_request(failure))
+                    return subprocess.CompletedProcess(command, GATE_PRELAUNCH_REFUSED_STATUS)
+                return subprocess.CompletedProcess(command, 0)
+
+            with (mock.patch.dict(os.environ, clear=True),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(source)),
+                  mock.patch.object(first_step, "_gate_request", return_value=request),
+                  mock.patch.object(first_step, "_placement_grant", side_effect=(original, replacement)) as place,
+                  mock.patch.object(first_step, "assignment_matches_request", return_value=True),
+                  mock.patch.object(admission_client, "claim_failure", return_value=settled) as claim,
+                  mock.patch.object(admission_client, "cancel_placement", return_value=wire.Ok()) as cancel,
+                  mock.patch.object(subprocess, "run", side_effect=launch) as run):
+                result = copies.main(["gate-step", "--repo", folder, "--targets", "mac-linux,natedev", "--", *command])
+            self.assertEqual(result, GATE_PRELAUNCH_REFUSED_STATUS)
+            place.assert_called_once_with(request)
+            claim.assert_not_called()
+            run.assert_called_once()
+            cancel.assert_called_once()
 
     def test_gate_step_hands_off_its_aws_assignment(self) -> None:
         with TemporaryDirectory() as folder:
@@ -202,23 +235,36 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], assignment.episode)
                 return 0
 
+            state: placement.AssignmentState = placement.CurrentAssignment()
+
             def status(_episode: str, _attempt: str) -> wire.PlacementStatusReply:
                 assignment = wire.read_assignment(repo / "assignment.json").assignment
                 return wire.PlacementStatusReply(wire.KnownPlacementStatus(
-                    assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+                    assignment, state, placement.NoProviderClaim()))
 
             with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"], "CONF_DIR": directory, "HOME": directory,
                                                "CLAUDE_SESSION_NAME": "gate-fixture"}, clear=True),
                   mock.patch.object(build_folders, "repo_word", return_value="claude"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(repo)),
                   mock.patch.object(treekey, "tree_key", return_value="fixture-source"),
-                  mock.patch.object(admission_client, "placement_status", side_effect=status),
+                  mock.patch.object(admission_client, "placement_status", side_effect=status) as query,
                   mock.patch.object(queue_place, "wait_for_placement", side_effect=place) as request,
                   mock.patch.object(admission_client, "cancel_placement") as close,
-                  mock.patch.object(gate, "run_tests_only", side_effect=run)):
+                  mock.patch.object(gate, "run_tests_only", side_effect=run) as suites,
+                  redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(gate.main(["--tests-only"]), 0)
-            request.assert_called_once()
-            close.assert_called_once()
+                request.assert_called_once()
+                query.assert_called_once()
+                close.assert_called_once()
+                suites.assert_called_once()
+
+                state = placement.ClosedAssignment("fixture closed")
+                self.assertEqual(gate.main(["--tests-only"]), 1)
+            self.assertEqual(errors.getvalue(), "REFUSED: The gate placement attempt is stale: fixture closed\n")
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(query.call_count, 2)
+            self.assertEqual(close.call_count, 2)
+            suites.assert_called_once()
 
     def test_aws_gate_exit_records_only_the_confirmed_prelaunch_decline(self) -> None:
         assignment = placed("aws")
@@ -414,6 +460,11 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 return wire.Assignment(placement.PlacementAssignment(request.episode, 'attempt', destination,
                     request.constraints.source_key, request.owner, request.constraints.session, request.since))
 
+            def status(_episode: str, _attempt: str) -> wire.PlacementStatusReply:
+                assignment = wire.read_assignment(repo / 'assignment.json').assignment
+                return wire.PlacementStatusReply(wire.KnownPlacementStatus(
+                    assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+
             arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
             with (mock.patch.dict(os.environ, {'PATH': os.environ['PATH'], 'CONF_DIR': directory, 'HOME': directory,
                                                'CLAUDE_SESSION_NAME': 'gate-fixture', 'BUILDLOG_GATE_TARGETS': 'natedev'}, clear=True),
@@ -422,6 +473,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                   mock.patch.object(gate, 'outer_reservation', return_value=None),
                   mock.patch.object(queue_place, 'wait_for_placement', side_effect=place),
+                  mock.patch.object(admission_client, 'placement_status', side_effect=status),
                   mock.patch.object(admission_client, 'cancel_placement',
                                     side_effect=wire.AdmissionUnavailable('The queue is unavailable')) as cancel,
                   mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),
@@ -564,7 +616,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
             with (mock.patch.dict(os.environ, clear=True),
                   mock.patch.object(first_step, 'gate_targets', return_value=targets),
                   mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)) as place,
-                  mock.patch.object(gate, 'current_gate_placement', return_value=gate.NO_GATE_ASSIGNMENT),
+                  mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment]),
                   mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                   mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
                   mock.patch.object(gate, 'gate_recovery', side_effect=recovery),

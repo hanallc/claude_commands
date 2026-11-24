@@ -251,10 +251,7 @@ def run_gate_with_placement(
             mac_linux = destination.provider == 'ssh' and destination.target == 'mac-linux'
             retry_notice = ''
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
-                try:
-                    refusal = read_gate_claim_failure(assignment_file, request)
-                except FileNotFoundError:
-                    return result
+                refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
                 waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
                     destination.provider == 'scaler' or
