@@ -146,39 +146,52 @@ def short_list_time(moment: datetime, zone: tzinfo | None) -> str:
 
 
 @dataclass(frozen=True)
-class ScheduleDisplay:
-    """The schedule and its selected run at the time of the page read."""
-
-    run: the_list.ScheduledRun
-    series_number: int
-    rule: str
-    repeat_words: str
-
-    def label(self, zone: tzinfo | None) -> str:
-        start = short_list_time(self.run.start, zone)
-        return f"{self.repeat_words} · next {start}" if self.rule else "Starts " + start
+class UpcomingSeriesRun:
+    selected: the_list.SeriesRun
+    series: the_list.ScheduledSeries
 
 
-def schedule_display(item: the_list.ListItem, today: datetime) -> ScheduleDisplay | the_list.NoSchedule:
+@dataclass(frozen=True)
+class ExhaustedSeries:
+    series: the_list.ScheduledSeries
+
+
+type DisplayedSchedule = the_list.NoSchedule | the_list.ScheduledRun | UpcomingSeriesRun | ExhaustedSeries
+
+
+def schedule_display(item: the_list.ListItem, today: datetime) -> DisplayedSchedule:
     schedule = item.schedule
     if item.state is the_list.ItemState.SCHEDULED:
         if isinstance(schedule, the_list.ScheduledRun):
-            return ScheduleDisplay(schedule, 0, "", "")
+            return schedule
         if isinstance(schedule, the_list.ScheduledSeries):
             run = schedule.next_run(today, the_list.series_run_limit())
-            words = schedule.rule.describe(schedule.first.start)
             if isinstance(run, the_list.SeriesRun):
-                return ScheduleDisplay(run.run, run.number, schedule.rule.rrule, words)
-            return ScheduleDisplay(schedule.first, 0, schedule.rule.rrule, words)
+                return UpcomingSeriesRun(run, schedule)
+            return ExhaustedSeries(schedule)
     return the_list.NoSchedule.UNSET
 
 
-def schedule_label(schedule: ScheduleDisplay | the_list.NoSchedule, today: datetime) -> str:
-    if isinstance(schedule, ScheduleDisplay):
-        if schedule.rule and not schedule.series_number:
-            return schedule.repeat_words + " · No next run"
-        return schedule.label(today.tzinfo)
+def schedule_label(schedule: DisplayedSchedule, today: datetime) -> str:
+    if isinstance(schedule, the_list.ScheduledRun):
+        return "Starts " + short_list_time(schedule.start, today.tzinfo)
+    if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
+        series = schedule.series
+        words = series.rule.describe(series.first.start)
+        if isinstance(schedule, UpcomingSeriesRun):
+            return words + " · next " + short_list_time(schedule.selected.run.start, today.tzinfo)
+        return words + " · No next run"
     return ""
+
+
+def displayed_work(item: the_list.ListItem, schedule: DisplayedSchedule) -> tuple[the_list.Eta, str]:
+    if isinstance(schedule, the_list.ScheduledRun):
+        return schedule.start, schedule.words
+    if isinstance(schedule, UpcomingSeriesRun):
+        return schedule.selected.run.start, schedule.selected.run.words
+    if isinstance(schedule, ExhaustedSeries):
+        return the_list.EtaStatus.NO_TIME_YET, schedule.series.first.words
+    return item.eta, item.next_step
 
 
 def check_row_html(check: the_list.NextCheck, today: datetime, *, parked: bool) -> str:
@@ -451,18 +464,26 @@ REPEAT_CHOICES = (
 )
 
 
-def schedule_fields(entry: ListRecord, schedule: ScheduleDisplay | the_list.NoSchedule,
+def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
                     members: staff.StaffSnapshot, key: str, zone: ZoneInfo) -> str:
     owner = html.escape(owner_name(members, entry.item.owner))
     producer = html.escape(owner_name(members, entry.item.producer))
     options = ''.join(f'<option value="{value}">{label}</option>' for value, label in REPEAT_CHOICES)
-    start = rule = words = ""
-    number = 0
-    if isinstance(schedule, ScheduleDisplay):
-        start = schedule.run.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
-        rule, words, number = schedule.rule, schedule.run.words, schedule.series_number
-    return (f'<div class="list-schedule-fields" data-schedule-fields data-start="{start}" '
-            + f'data-rule="{html.escape(rule, quote=True)}" data-run="{number}">'
+    attributes = ""
+    words = ""
+    if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
+        series = schedule.series
+        origin = series.first.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
+        attributes += f' data-rule="{html.escape(series.rule.rrule, quote=True)}" data-repeat-start="{origin}"'
+        words = series.first.words
+    if isinstance(schedule, UpcomingSeriesRun):
+        attributes += f' data-run="{schedule.selected.number}"'
+        schedule = schedule.selected.run
+    if isinstance(schedule, the_list.ScheduledRun):
+        start = schedule.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
+        attributes += f' data-start="{start}"'
+        words = schedule.words
+    return (f'<div class="list-schedule-fields" data-schedule-fields{attributes}>'
             + f'<label for="schedule-words-{key}">At that time, do this</label>'
             + f'<textarea id="schedule-words-{key}" rows="3" maxlength="10000" data-schedule-words>'
             + html.escape(words) + '</textarea>'
@@ -474,17 +495,17 @@ def schedule_fields(entry: ListRecord, schedule: ScheduleDisplay | the_list.NoSc
 
 
 def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
-                  schedule: ScheduleDisplay | the_list.NoSchedule, today: datetime) -> str:
+                  schedule: DisplayedSchedule, today: datetime) -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
-    scheduled = isinstance(schedule, ScheduleDisplay)
+    scheduled = not isinstance(schedule, the_list.NoSchedule)
     label = html.escape(schedule_label(schedule, today))
     parked = '' if parking_label or scheduled else ' hidden'
     note = label if scheduled else ('Parked until ' + parking_label if parking_label else '')
     picker_label = "Edit schedule" if scheduled else "Park until"
     start_now = ('<button name="action" value="start-now">Start now</button>'
-                 if isinstance(schedule, ScheduleDisplay) and (not schedule.rule or schedule.series_number) else '')
+                 if isinstance(schedule, (the_list.ScheduledRun, UpcomingSeriesRun)) else '')
     zone = user_zone()
     schedule_editor = schedule_fields(entry, schedule, members, key, zone)
     producer_name = owner_name(members, entry.item.producer)
@@ -583,14 +604,13 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
                  unread_answers: frozenset[str],
-                 schedule: ScheduleDisplay | the_list.NoSchedule = the_list.NoSchedule.UNSET) -> str:
+                 schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
     status_time = item.latest_status_time
     status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
-    eta = schedule.run.start if isinstance(schedule, ScheduleDisplay) else item.eta
-    next_step = schedule.run.words if isinstance(schedule, ScheduleDisplay) else item.next_step
+    eta, next_step = displayed_work(item, schedule)
     fields = ''.join(
         f'<section class="list-field-{field}"><h3>{FIELD_LABELS[field]}'
         + (status_stamp if field == "latest_status" else "") + '</h3>'
@@ -686,7 +706,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
             unread_answers: frozenset[str], *, parking_label: str,
-            schedule: ScheduleDisplay | the_list.NoSchedule) -> str:
+            schedule: DisplayedSchedule) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label)
@@ -706,16 +726,16 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, parked: bool, open_question: bool,
               visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str],
-              schedule: ScheduleDisplay | the_list.NoSchedule) -> str:
+              schedule: DisplayedSchedule) -> str:
     item = entry.item
     owner = owner_name(names.members, item.owner)
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
-    scheduled = isinstance(schedule, ScheduleDisplay)
-    due = schedule.run.start if scheduled else the_list.eta_due(item.eta)
-    next_step = schedule.run.words if scheduled else item.next_step
-    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(item.eta, today).casefold())
+    scheduled = not isinstance(schedule, the_list.NoSchedule)
+    eta, next_step = displayed_work(item, schedule)
+    due = the_list.eta_due(eta)
+    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(eta, today).casefold())
     values = (item.number, owner.casefold(), producer.casefold(), item.title.casefold(), item.state.value.casefold(),
               next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
@@ -768,7 +788,6 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     overdue = not scheduled and due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
-    eta = schedule.run.start if scheduled else item.eta
     full_eta = field_html("eta", eta, today, names)
     short_eta = html.escape(eta_cell_text(eta, today))
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
@@ -848,6 +867,7 @@ class SavedActionState(TypedDict):
     detail_html: NotRequired[str]
     detail_revision: NotRequired[str]
     detail_closed: NotRequired[bool]
+    remove_request_saved: NotRequired[bool]
     scheduled_note: NotRequired[str]
     next_step_html: NotRequired[str]
     next_step_sort: NotRequired[str]
@@ -877,7 +897,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                     if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
     parked = bool(parked_until)
     schedule = schedule_display(item, today)
-    scheduled = isinstance(schedule, ScheduleDisplay)
+    scheduled = not isinstance(schedule, the_list.NoSchedule)
     unread = item.unread_since
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
@@ -896,8 +916,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     if scheduled:
         saved["scheduled_note"] = schedule_label(schedule, local_today)
     if include_detail:
-        next_step = schedule.run.words if scheduled else item.next_step
-        eta = schedule.run.start if scheduled else item.eta
+        eta, next_step = displayed_work(item, schedule)
         due = the_list.eta_due(eta)
         saved.update(next_step_html=change_browser.question_paragraphs(next_step or "Not recorded"),
                      next_step_sort=next_step.casefold(), eta_short=eta_cell_text(eta, local_today),
@@ -912,6 +931,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         else:
             park_request = prefix.format() + retry
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
+        notice = the_list.feedback_requests(item).get(park_request)
+        saved["remove_request_saved"] = notice is not None and notice.action == "remove"
     if waiting or include_detail and item.state != the_list.ItemState.CLOSED:
         members = staff.snapshot()
         names = staff_names.StaffNames(members)
@@ -1309,8 +1330,14 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     today = datetime.fromtimestamp(read_at, zone)
     ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today),
                       schedule_display(entry.item, today)) for entry in items]
-    ordered_items.sort(key=lambda row: (2, row[2].run.start.timestamp()) if isinstance(row[2], ScheduleDisplay)
-                       else (int(row[1]), 0))
+    def row_order(row: tuple[ListRecord, bool, DisplayedSchedule]) -> tuple[int, float]:
+        entry, parked, schedule = row
+        if isinstance(schedule, the_list.NoSchedule):
+            return int(parked), 0
+        eta, _ = displayed_work(entry.item, schedule)
+        return (2, eta.timestamp()) if isinstance(eta, datetime) else (3, 0)
+
+    ordered_items.sort(key=row_order)
     secret = form_secret(root)
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
@@ -1318,7 +1345,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
     for index, (entry, parked, schedule) in enumerate(ordered_items):
-        scheduled = isinstance(schedule, ScheduleDisplay)
+        scheduled = not isinstance(schedule, the_list.NoSchedule)
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
         open_question = not scheduled and the_list.has_open_question(entry.item)
@@ -1428,8 +1455,10 @@ SCHEDULE_TEMPLATES = """
 <label><input type="number" min="1" max="2147483647" value="13" data-repeat-count aria-label="Occurrences"> occurrences</label>
 </div>
 </fieldset>
+<p role="status" data-repeat-start-status></p>
 <p role="status" data-dialog-status></p>
-<div class="list-repeat-buttons"><button type="button" data-cancel>Cancel</button>
+<div class="list-repeat-buttons"><button type="button" data-change-start hidden>Change start date</button>
+<button type="button" data-cancel>Cancel</button>
 <button type="button" class="primary" data-done>Done</button></div>
 </dialog></template>
 <template id="list-repeat-scope">
@@ -1505,15 +1534,15 @@ background:var(--ink-2);border-radius:50%}
 }
 .list-tell>[data-send-status]:empty{display:none}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
-.list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
 .list-table .list-row.open :is([data-parked-note],[data-scheduled-note]){display:none}
 .list-state.scheduled{color:light-dark(#12666d,#62d7dd);background:light-dark(#e7f7f8,#103238)}
-.list-park [data-later-menu]{width:min(34rem,calc(100vw - 36px));max-height:calc(100dvh - 32px);overflow:auto}
-.list-park [data-later-menu]:not([hidden]){display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}
-.list-park [data-later-preset]{grid-column:1}
-.list-park [data-later-custom]{grid-column:1}
-.list-schedule-fields{grid-column:2;grid-row:1 / span 2;display:grid;gap:6px;padding:6px;min-width:0}
+.list-park [data-later-menu]{width:min(34rem,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;
+ transform:translate(var(--list-picker-x,0px),var(--list-picker-y,0px))}
+.list-park [data-later-menu] [data-later-preset]{display:block;width:calc(50% - 12px);margin:6px 6px 4px}
+.list-park [data-later-custom]{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px 12px;align-items:start}
+.list-park .later-save{grid-column:1 / -1}
+.list-schedule-fields{display:grid;gap:6px;min-width:0}
 .list-schedule-fields small{color:var(--ink-2)}
 .list-schedule-fields textarea{width:100%;box-sizing:border-box;margin:0;resize:vertical}
 :is(.list-schedule-fields,.list-schedule-dialog) :is(select,input:not([type=radio])){
@@ -1539,11 +1568,14 @@ background:var(--ink-2);border-radius:50%}
 .list-schedule-dialog :is(.primary,[aria-pressed=true]){background:var(--accent);color:#fff}
 .list-schedule-dialog [type=number]{width:4rem}
 .list-schedule-dialog [data-weekday]{border-radius:50%;min-width:34px}
-:is([data-schedule-status],[data-dialog-status]):empty{display:none}
+:is([data-schedule-status],[data-dialog-status],[data-repeat-start-status]):empty{display:none}
+@media(max-width:1100px){
+ .list-park [data-later-menu]{width:min(20rem,calc(100vw - 32px))}
+ .list-park [data-later-custom]{grid-template-columns:minmax(0,1fr)}
+ .list-park [data-later-menu] [data-later-preset]{width:calc(100% - 12px)}
+}
 @media(max-width:620px){
- .list-park [data-later-menu]{position:fixed;inset:16px;bottom:auto;width:auto;max-width:none}
- .list-park [data-later-menu]:not([hidden]){grid-template-columns:minmax(0,1fr)}
- .list-schedule-fields{grid-column:1;grid-row:auto}
+ .list-park [data-later-menu]{position:fixed;inset:16px;bottom:auto;width:auto;max-width:none;transform:none}
  .list-parking-actions{flex-wrap:wrap;justify-content:flex-end}
 }
 .list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
@@ -1848,10 +1880,7 @@ function customRepeat(parent,start,rule,zone){
  const endRadio=value=>dialog.querySelector('[name=repeat-end][value="'+value+'"]');
  frequency.value=parts.FREQ ?? 'WEEKLY';interval.value=parts.INTERVAL ?? '1';
  const weeklyDays=parts.FREQ==='WEEKLY' && parts.BYDAY ? parts.BYDAY.split(',') : [start.weekday];
- for(const button of days){
-  button.setAttribute('aria-pressed',String(weeklyDays.includes(button.dataset.weekday)));
-  button.onclick=()=>button.setAttribute('aria-pressed',String(button.getAttribute('aria-pressed')==='false'));
- }
+ for(const button of days) button.setAttribute('aria-pressed',String(weeklyDays.includes(button.dataset.weekday)));
  monthDay.options[0].textContent='Monthly on day '+start.day;
  monthDay.options[1].textContent='Monthly on the '+start.monthly;
  monthDay.value=parts.FREQ==='MONTHLY' && parts.BYDAY ? 'weekday' : 'date';
@@ -1865,16 +1894,29 @@ function customRepeat(parent,start,rule,zone){
   count.value=parts.COUNT;endRadio('count').checked=true;
  }
  const end=()=>dialog.querySelector('[name=repeat-end]:checked').value;
+ const done=dialog.querySelector('[data-done]'),changeStart=dialog.querySelector('[data-change-start]');
+ const startStatus=dialog.querySelector('[data-repeat-start-status]');
+ const selectedDays=()=>days.filter(button=>button.getAttribute('aria-pressed')==='true').map(button=>button.dataset.weekday);
  const showFields=()=>{
   field('week').hidden=frequency.value!=='WEEKLY';
   field('month').hidden=frequency.value!=='MONTHLY';
   endDate.disabled=end()!=='date';count.disabled=end()!=='count';
+  const selected=selectedDays(),weekly=frequency.value==='WEEKLY';
+  done.disabled=weekly && !selected.includes(start.weekday);
+  changeStart.hidden=!done.disabled || !selected.length;
+  startStatus.textContent=!weekly ? '' : !selected.length ? 'Select at least one repeat day.'
+   : done.disabled ? 'The start date must fall on a selected repeat day.' : '';
+ };
+ for(const button of days) button.onclick=()=>{
+  button.setAttribute('aria-pressed',String(button.getAttribute('aria-pressed')==='false'));
+  showFields();
  };
  dialog.addEventListener('change',showFields);
  showFields();
  return new Promise(resolve=>{
-  dialog.addEventListener('close',()=>resolve(dialog.returnValue || null),{once:true});
-  dialog.querySelector('[data-done]').onclick=()=>{
+  let result=null;
+  dialog.addEventListener('close',()=>resolve(result),{once:true});
+  const save=changeDate=>{
    const status=dialog.querySelector('[data-dialog-status]');
    const rule=['FREQ='+frequency.value];
    if(!interval.value || !interval.validity.valid || end()==='count' && (!count.value || !count.validity.valid)){
@@ -1883,9 +1925,8 @@ function customRepeat(parent,start,rule,zone){
    if(interval.valueAsNumber!==1) rule.push('INTERVAL='+interval.valueAsNumber);
    if(frequency.value==='WEEKLY'){
     const order=[...weekdays.slice(1),weekdays[0]];
-    const selected=order.filter(day=>days.find(button=>button.dataset.weekday===day).getAttribute('aria-pressed')==='true');
-    if(!selected.includes(start.weekday)){status.textContent='Select the weekday of the start date.';return;}
-    rule.push('BYDAY='+selected.join(','));
+    const selected=selectedDays();
+    rule.push('BYDAY='+order.filter(day=>selected.includes(day)).join(','));
    }
    if(frequency.value==='MONTHLY') rule.push(monthDay.value==='date' ? 'BYMONTHDAY='+start.day : 'BYDAY='+start.ordinal+start.weekday);
    if(end()==='count') rule.push('COUNT='+count.valueAsNumber);
@@ -1895,8 +1936,11 @@ function customRepeat(parent,start,rule,zone){
     const local=zoneEpoch(zone,date.getUTCFullYear(),date.getUTCMonth()+1,date.getUTCDate(),24*60)-1000;
     rule.push('UNTIL='+new Date(local).toISOString().replace(/[-:]|\.\d{3}/g,''));
    }
-   dialog.close(rule.join(';'));
+   result={rule:rule.join(';'),changeDate};
+   dialog.close();
   };
+  done.onclick=()=>save(false);
+  changeStart.onclick=()=>save(true);
   dialog.showModal();
   const picker=parent.getBoundingClientRect(),box=dialog.getBoundingClientRect();
   if(innerWidth-picker.right>=box.width+32){
@@ -1926,14 +1970,37 @@ function bindScheduleFields(form,until,zone,draft,edit){
  const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
  const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
  const menu=form.querySelector('[data-later-menu]'),status=panel.querySelector('[data-schedule-status]');
- const observer=new MutationObserver(()=>{if(menu.hidden) panel.remove();});
+ const picker=menu.querySelector('[data-later-custom]'),save=picker.querySelector('.later-save');
+ const calendar=document.createElement('div');
+ calendar.append(...[...picker.children].filter(child=>child!==save));
+ picker.prepend(calendar);
+ const anchor=menu.closest('.list-actions');
+ const fitPicker=()=>{
+  if(!menu.offsetWidth){pickerSize.disconnect();return;}
+  const width=document.documentElement.clientWidth;
+  const {top,right}=anchor.getBoundingClientRect();
+  const baseLeft=right-menu.offsetWidth,baseTop=top-menu.offsetHeight-6;
+  const left=Math.max(16,Math.min(baseLeft,width-menu.offsetWidth-16));
+  const pickerTop=Math.max(16,Math.min(baseTop,innerHeight-menu.offsetHeight-16));
+  menu.style.setProperty('--list-picker-x',left-baseLeft+'px');
+  menu.style.setProperty('--list-picker-y',pickerTop-baseTop+'px');
+ };
+ const pickerSize=new ResizeObserver(fitPicker);
+ const observer=new MutationObserver(()=>{
+  if(menu.hidden){panel.remove();pickerSize.disconnect();}
+  else{
+   fitPicker();
+   pickerSize.observe(anchor);
+   pickerSize.observe(menu);
+  }
+ });
  observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
  const custom=panel.querySelector('[data-edit-custom]');
  const label=panel.querySelector('[for="'+select.id+'"]');
- const {start,rule}=panel.dataset,number=Number(panel.dataset.run);
- if(!until.value) until.value=start;
+ const {start,rule='',repeatStart}=panel.dataset,number=Number(panel.dataset.run || 0);
+ if(!until.value && start) until.value=start;
  if(draft) words.value=draft.words;
- let choice=draft?.choice,customRule=draft?.customRule ?? rule;
+ let choice=draft?.choice,customRule=draft?.customRule ?? rule,repeatEdited=draft?.repeatEdited ?? false;
  const preset=(at,value)=>repeatChoices(at)[value]?.[1];
  function update(){
   const at=scheduleDate(until.value);
@@ -1943,7 +2010,8 @@ function bindScheduleFields(form,until,zone,draft,edit){
   const choices=repeatChoices(at);
   for(const [value,[label]] of Object.entries(choices)) select.querySelector('[value='+value+']').textContent=label;
   if(choice===undefined){
-   choice=Object.keys(choices).find(key=>choices[key][1]===rule) ?? 'custom';
+   const savedChoices=repeatStart ? repeatChoices(scheduleDate(repeatStart)) : choices;
+   choice=Object.keys(savedChoices).find(key=>savedChoices[key][1]===rule) ?? 'custom';
    if(choice==='custom' && rule==='FREQ=WEEKLY') choice='weekly';
   }
   select.value=choice;
@@ -1956,31 +2024,46 @@ function bindScheduleFields(form,until,zone,draft,edit){
   const summary=menu.querySelector('[data-later-summary]');
   summary.textContent=summary.textContent.replace(/^(Starts|Parks until) /,words.value.trim() ? 'Starts ' : 'Parks until ');
  });
- until.addEventListener('input',update);
+ until.addEventListener('input',()=>{status.textContent='';update();});
  const openCustom=async()=>{
   const at=scheduleDate(until.value);
   const saved=await customRepeat(menu,at,choice==='custom' ? customRule : preset(at,choice),zone);
-  if(saved){choice='custom';customRule=saved;edit();}
-  update();select.focus({preventScroll:true});
+  if(saved){choice='custom';customRule=saved.rule;repeatEdited=true;edit();}
+  update();
+  if(saved?.changeDate) calendar.querySelector('[tabindex="0"]').focus();
+  else select.focus({preventScroll:true});
  };
  custom.addEventListener('click',openCustom);
  select.addEventListener('change',()=>{
   status.textContent='';
   if(select.value==='custom') void openCustom();
-  else{choice=select.value;update();edit();}
+  else{choice=select.value;repeatEdited=true;update();edit();}
  });
  return {
-  attach:()=>menu.append(panel),
-  draft:()=>({words:words.value,choice,customRule}),
+  attach:()=>save.before(panel),
+  draft:()=>({words:words.value,choice,customRule,repeatEdited}),
   data:(action)=>{
    const text=words.value.trim(),at=scheduleDate(until.value);
    const base={number,scope:'',repeat:undefined,words:text,startChanged:!start || start!==until.value};
-   if(action!=='schedule') return base;
+   if(action!=='schedule' || !repeatEdited) return base;
    const repeat=choice==='custom' ? customRule : at ? preset(at,choice) : '';
-   const unchanged=repeat===rule || choice==='weekly' && rule==='FREQ=WEEKLY' && !base.startChanged;
-   return {...base,repeat:unchanged ? undefined : repeat};
+   return {...base,repeat:repeat===rule ? undefined : repeat};
   },
-  scheduled:!!start,
+  applySeriesRepeat:data=>{
+   const at=scheduleDate(until.value);
+   if(!at || data.scope==='this') return true;
+   if(!repeatEdited && data.startChanged && choice!=='custom'){
+    const repeat=preset(at,choice);
+    if(repeat!==rule) data.repeat=repeat;
+   }
+   const nextRule=repeatParts(data.repeat ?? rule);
+   if(nextRule.FREQ==='WEEKLY' && nextRule.BYDAY && !nextRule.BYDAY.split(',').includes(at.weekday)){
+    status.textContent='The start date must fall on a selected repeat day.';
+    return false;
+   }
+   return true;
+  },
+  scheduled:!!(start || rule),
   repeating:!!rule,
   words:()=>words.value.trim(),
   scope:(action,data)=>chooseScheduleScope(menu.hidden ? form : menu,
@@ -2124,7 +2207,9 @@ function bindFeedbackForm(form){
    (scheduleKey===undefined || attempt.scheduleKey===scheduleKey) &&
    (action===undefined || attempt.action===action));
   const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
+  let retiredDraft=false;
   const retainDraft=()=>{
+   if(retiredDraft) return;
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
     until:waitingForm ? draft?.until ?? '' : until.value,stamp:draftStamp,unconfirmed,
     schedule:scheduleEditor?.draft() ?? draft?.schedule});
@@ -2168,6 +2253,8 @@ function bindFeedbackForm(form){
     schedule.scope=action==='start-now' ? 'this' : await scheduleEditor.scope(action,schedule);
     if(!schedule.scope || !tableView.canSubmit(form,formKey) || !form.isConnected) return;
    }
+   if(action==='schedule' && !scheduleEditor.applySeriesRepeat(schedule)) return;
+   const scopedRemove=action==='remove' && Boolean(schedule?.scope);
    const scheduleKey=scheduleWrite || schedule?.scope ? JSON.stringify(schedule) : '';
    const retry=matching(action,scheduleKey);
    let parkingTime=parkForDelivery ? deliveryParking : retry?.parkingTime ?? until.value;
@@ -2192,6 +2279,14 @@ function bindFeedbackForm(form){
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
    const stampAtSubmit=draftStamp;
+   const clearConfirmedScheduleDraft=()=>{
+    if(!scheduleWrite && !schedule?.scope) return;
+    unconfirmed.delete(attempt);
+    const latest=drafts.get(key);
+    if(draftStamp!==stampAtSubmit || latest?.stamp!==stampAtSubmit) return;
+    drafts.set(key,{...latest,schedule:undefined,until:''});
+    retiredDraft=true;
+   };
    const request=tableView.startItemRequest(key);
    item.listRequest=request;
    startListSave();
@@ -2234,6 +2329,7 @@ function bindFeedbackForm(form){
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+    clearConfirmedScheduleDraft();
     if(stale){
      if(tableView.openItem?.dataset.key===key) return;
      tableView.preserveRecordRowTop(()=>{
@@ -2245,12 +2341,6 @@ function bindFeedbackForm(form){
     }
     const closes=parks || scheduleWrite || action==='remove' || result.detail_closed;
     if(closes){
-     if((scheduleWrite || schedule?.scope) && draftStamp===stampAtSubmit){
-      unconfirmed.delete(attempt);
-      const latest=drafts.get(key);
-      if(latest){latest.schedule=undefined;latest.until='';}
-      form.retainDraft=()=>{};
-     }
      tableView.preserveRecordRowTop(()=>{
       if((scheduleWrite || schedule?.scope) && result.detail_html && result.detail_revision)
        presentListDetail(item,result);
@@ -2303,6 +2393,7 @@ function bindFeedbackForm(form){
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
     if(saved){
+     clearConfirmedScheduleDraft();
      if(stale) return;
      tableView.preserveRecordRowTop(()=>{
       if(parkingReceipt || action==='remove'){
@@ -2319,7 +2410,7 @@ function bindFeedbackForm(form){
     if(!refused && (parkingReceipt || action==='remove')){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
-      if(parkingReceipt) query.set('park-request',attempt.request);
+      if(parkingReceipt || scopedRemove) query.set('park-request',attempt.request);
       const response=await fetch(location.pathname+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
@@ -2333,12 +2424,15 @@ function bindFeedbackForm(form){
      else if(parkingReceipt || action==='remove'){
       if(current){
        applySavedState(current,{metadataOnly:true});
-       restore=confirmed.state!=='Closed' && (!parkingReceipt || current.park_request_saved===false);
-       confirmedByReadback=confirmed.state==='Closed' || current.park_request_saved===true;
-       if(confirmedByReadback){
-        if(!stale) tableView.closeCard(key);
-        tableView.applyAction();
-       }else if(!stale) presentListDetail(item,current);
+       const receipt=scopedRemove ? current.remove_request_saved : current.park_request_saved;
+       confirmedByReadback=receipt===true || !scopedRemove && confirmed.state==='Closed';
+       restore=!confirmedByReadback && confirmed.state!=='Closed';
+       if(confirmedByReadback) clearConfirmedScheduleDraft();
+       if(!stale){
+        presentListDetail(item,current);
+        if(confirmedByReadback) tableView.closeCard(key);
+       }
+       if(confirmedByReadback) tableView.applyAction();
       }else{
        syncConfirmed(stale);
        restore=confirmed.state!=='Closed';

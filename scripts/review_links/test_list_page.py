@@ -3699,8 +3699,27 @@ window.fetch=async(_path,options={})=>{
             skipped = the_list.load(MORTY.id, item.id).schedule
             assert isinstance(skipped, the_list.ScheduledSeries)
             self.assertEqual(skipped.exceptions, (the_list.RunException(2, the_list.RemovedRun.SKIPPED),))
+            other = self.fields(saved, "remove", scope="this", run="3")["request"]
+            for request, expected in ((remove["request"], True), (create["request"], False), (other, False)):
+                with self.subTest(request=request):
+                    state = list_page.saved_action_state(MORTY.id, item.id, park_request=request)
+                    self.assertEqual(state.get("remove_request_saved"), expected)
             _ = list_page.submit(root, urlencode(self.fields(saved, "remove", scope="all", run="3")))
         self.assertIs(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
+
+        exhausted = the_list.add(
+            MORTY.id, "Review a finished series", owner=OWNER.id, source="nate",
+            changes={"state": the_list.ItemState.SCHEDULED, "schedule": the_list.ScheduledSeries(
+                the_list.ScheduledRun(first, "Review the result."), repeat_rule.parse("FREQ=DAILY;COUNT=1"))},
+        )
+        for today, short_eta, note in (
+            (NOW, "Nov 30 09:00 EST", " · next Nov 30 09:00 EST"),
+            (first + timedelta(days=1), "No time yet", " · No next run"),
+        ):
+            with self.subTest(today=today), patch.object(the_list, "now", return_value=today):
+                state = list_page.saved_action_state(MORTY.id, exhausted.id, include_detail=True)
+                self.assertEqual(state.get("eta_short"), short_eta)
+                self.assertTrue(state.get("scheduled_note", "").endswith(note))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_schedule_filters_repeat_menu_and_scopes(self) -> None:
@@ -3717,17 +3736,25 @@ window.fetch=async(_path,options={})=>{
                          changes={"state": the_list.ItemState.SCHEDULED, "schedule": first})
         _ = self.add("Give the result", the_list.ItemState.WAITING_FOR_NATE)
         for title in ("Park this item", "Start once", "Repeat daily", "Repeat weekly", "Repeat monthly",
-                      "Repeat annually", "Repeat on weekdays", "Repeat with custom settings"):
+                      "Repeat annually", "Repeat on weekdays", "Repeat with custom settings",
+                      "Repeat on Thursday"):
             _ = self.add(title)
 
         class FixtureList(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path != list_page.PAGE_PATH:
+                url = urlsplit(self.path)
+                if url.path != list_page.PAGE_PATH:
                     self.send_error(404)
                     return
-                content = list_page.render(root, include_counts=False)
+                query = parse_qs(url.query)
+                if "item-state" in query:
+                    state = list_page.saved_action_state(query["keeper"][0], query["item-state"][0],
+                                                         park_request=query["park-request"][0], include_detail=True)
+                    mime, content = "application/json", json.dumps(state).encode()
+                else:
+                    mime, content = "text/html; charset=utf-8", list_page.render(root, include_counts=False)
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", mime)
                 self.end_headers()
                 _ = self.wfile.write(content)
 
@@ -3767,10 +3794,6 @@ window.fetch=async(_path,options={})=>{
                                              "returnByValue": True}, session)
                     self.assertNotIn("exceptionDetails", answer, answer)
 
-                def capture(name: str, folder: str) -> None:
-                    result = cast(dict[str, str], browser.command("Page.captureScreenshot", {"format": "png"}, session))
-                    _ = (Path(folder) / name).write_bytes(base64.b64decode(result["data"]))
-
                 evaluate(r"""
 (() => {
  Date.now=()=>Date.parse('2026-11-16T18:00:00Z');
@@ -3793,8 +3816,6 @@ window.fetch=async(_path,options={})=>{
   'The repeated row shows the rule and next start.');
 })();
 """)
-                if proof:
-                    capture("scheduled-list-dark.png", proof)
                 evaluate(r"""
 (() => {
  const form=openItem(1);
@@ -3808,8 +3829,48 @@ window.fetch=async(_path,options={})=>{
  dialog.querySelector('[data-weekday="TH"]').click();
 })();
 """)
+                _ = browser.command("Emulation.setDeviceMetricsOverride",
+                                    {"width": 1024, "height": 1024, "deviceScaleFactor": 1, "mobile": False}, session)
+                evaluate(r"""
+(async () => {
+ const dialog=document.querySelector('.list-schedule-dialog[open]');
+ const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+ dialog.querySelector('[data-cancel]').click();
+ await closed;
+ const picker=recordDetails(row(1)).querySelector('[data-later-menu]');
+ window.checkPicker=picker=>{
+  const box=picker.getBoundingClientRect();
+  check(box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight &&
+   picker.scrollWidth<=picker.clientWidth,'The schedule picker fits the viewport.');
+  const instruction=picker.querySelector('[data-schedule-words]');
+  const calendar=picker.querySelector('[data-later-grid]');
+  const save=picker.querySelector('[value=park]');
+  check(calendar.getBoundingClientRect().bottom<instruction.getBoundingClientRect().top,
+   'The picker stacks the fields at this width.');
+  check(instruction.getBoundingClientRect().bottom<save.getBoundingClientRect().top &&
+   picker.querySelector('[data-repeat]').getBoundingClientRect().bottom<save.getBoundingClientRect().top,
+   'Save is below the instruction and Repeat.');
+ };
+ checkPicker(picker);
+})();
+""")
                 if proof:
-                    capture("scheduled-custom-dark.png", proof)
+                    clip = browser.command("Runtime.evaluate", {"returnByValue": True, "expression": """
+(() => {
+ const box=document.querySelector('[data-later-menu]:not([hidden])').getBoundingClientRect();
+ return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
+})()
+"""}, session)
+                    rect = cast(dict[str, object], clip["result"])["value"]
+                    result = cast(dict[str, str], browser.command(
+                        "Page.captureScreenshot", {"format": "png", "clip": rect}, session))
+                    _ = (Path(proof) / "scheduled-picker-dark.png").write_bytes(base64.b64decode(result["data"]))
+                evaluate(r"""
+(() => {
+ const select=recordDetails(row(1)).querySelector('[data-repeat]');
+ select.value='custom';select.dispatchEvent(new Event('change'));
+})();
+""")
                 _ = browser.command("Emulation.setDeviceMetricsOverride",
                                     {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": True}, session)
                 _ = browser.command("Emulation.setEmulatedMedia", {"features": [
@@ -3829,6 +3890,7 @@ window.fetch=async(_path,options={})=>{
  const pickerBox=picker.getBoundingClientRect();
  check(pickerBox.left>=0 && pickerBox.right<=innerWidth && pickerBox.top>=0 && pickerBox.bottom<=innerHeight &&
   picker.scrollWidth<=picker.clientWidth,'The schedule picker fits a phone.');
+ checkPicker(picker);
  form.querySelector('[data-later-toggle]').click();
  form.querySelector('[value=remove]').click();
  dialog=document.querySelector('.list-schedule-dialog[open]');
@@ -3849,41 +3911,53 @@ window.fetch=async(_path,options={})=>{
  const cases=[
   [5,'','none'],[6,'Start once','none'],[7,'Run daily','daily'],[8,'Run weekly','weekly'],
   [9,'Run monthly','monthly'],[10,'Run annually','yearly'],[11,'Run each weekday','weekdays'],
-  [12,'Run a custom rule','custom'],
+  [12,'Run a custom rule','custom'],[13,'Run every other Thursday','custom','2026-12-03'],
  ];
  const words=form=>form.querySelector('[data-schedule-words]');
  const edit=control=>control.dispatchEvent(new Event('input',{bubbles:true}));
- const waitForSave=async(form,save,scope)=>{
+ const pickDate=(form,date)=>{
+  form.querySelector('[data-later-month-step="1"]').click();
+  form.querySelector('[data-date="'+date+'"]').click();
+ };
+ const waitForSave=async(form,save,scope,{lost=false,date}={})=>{
   let posted;
-
+  let readback;
+  const send=window.fetch;
   const response=new Promise(resolve=>{
-   const send=window.fetch;
    window.fetch=async(...args)=>{
     const reply=await send(...args);
     if(args[1]?.method==='POST'){
      posted=new URLSearchParams(args[1].body);
-     window.fetch=send;resolve(await reply.clone().json());
+     resolve(await reply.clone().json());
+     if(lost) throw new Error('Response lost.');
     }
+    if(new URL(args[0],location.href).searchParams.has('item-state')) readback=await reply.clone().json();
     return reply;
    };
   });
   save.click();
   if(scope){
    const dialog=document.querySelector('.list-schedule-dialog[open]');
-   dialog.querySelector('[value='+scope+']').click();
+   const selected=dialog.querySelector('[value='+scope+']');
+   check(!selected.disabled,'The requested scope is available.');
+   selected.click();
    dialog.querySelector('[data-done]').click();
   }
   const result=await response;
   check(!result.reason,result.reason);
   if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
+  if(date) check(posted.get('until')===date && !posted.has('repeat'),'The move keeps the saved repeat rule.');
   await new Promise(resolve=>{
    const sent=()=>!form.dataset.sending;
    const observer=new MutationObserver(()=>{if(sent()){observer.disconnect();resolve();}});
    observer.observe(form,{attributes:true});
    if(sent()){observer.disconnect();resolve();}
   });
+  window.fetch=send;
+  if(lost) check(readback?.remove_request_saved && readback.item_state==='Scheduled' &&
+   !recordIsOpen(row(1)),'The removal receipt confirms the save and closes the detail.');
  };
- for(const [number,task,repeat] of cases){
+ for(const [number,task,repeat,newStart] of cases){
   const form=openItem(number);
   form.querySelector('[data-later-toggle]').click();
   form.elements.until.value='2026-11-30T09:00';edit(form.elements.until);
@@ -3901,15 +3975,43 @@ window.fetch=async(_path,options={})=>{
     dialog.querySelector('[data-weekday="TH"]').click();
     dialog.querySelector('[value=count]').click();
     dialog.querySelector('[data-repeat-count]').value='5';
-    dialog.querySelector('[data-done]').click();
-    await closed;
+    if(newStart){
+     dialog.querySelector('[data-weekday="MO"]').click();
+     check(dialog.querySelector('[data-done]').disabled &&
+      dialog.querySelector('[data-repeat-start-status]').textContent.includes('selected repeat day'),
+      'Custom explains why the selected days require a new start.');
+     dialog.querySelector('[data-change-start]').click();
+     await closed;
+     check(document.activeElement.matches('[data-later-grid] [tabindex="0"]'),
+      'Change start date returns focus to the calendar.');
+     pickDate(form,newStart);
+    }else{
+     dialog.querySelector('[data-done]').click();
+     await closed;
+    }
    }
   }
   await waitForSave(form,form.querySelector('[value=park]'));
  }
- for(const [number,scope] of [[1,'this'],[3,'all'],[1,'following']]){
+ for(const [number,action,scope,options] of [
+  [1,'park','this',{date:'2026-12-01T14:00:00.000Z'}],
+  [2,'unpark',null,{}],
+  [1,'remove','this',{lost:true}],
+  [3,'remove','all',{}],
+  [1,'remove','following',{}],
+ ]){
   const form=openItem(number);
-  await waitForSave(form,form.querySelector('[value=remove]'),scope);
+  if(options.date){
+   form.querySelector('[data-later-toggle]').click();
+   pickDate(form,'2026-12-01');
+  }
+  await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);
+  if(action==='unpark'){
+   const current=openItem(number);
+   current.querySelector('[data-later-toggle]').click();
+   check(words(current).value==='','Unpark clears the saved instruction from the next editor.');
+   current.querySelector('[data-later-toggle]').click();
+  }
  }
 })();
 """)
@@ -3926,7 +4028,8 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(single.schedule, the_list.ScheduledRun(start.start, "Start once"))
         for number, rule in enumerate(("FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO", "FREQ=MONTHLY;BYDAY=-1MO",
                                        "FREQ=YEARLY", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
-                                       "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH;COUNT=5"), 7):
+                                       "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH;COUNT=5",
+                                       "FREQ=WEEKLY;INTERVAL=2;BYDAY=TH;COUNT=5"), 7):
             with self.subTest(number=number):
                 schedule = the_list.load(MORTY.id, f"L{number}").schedule
                 assert isinstance(schedule, the_list.ScheduledSeries)
