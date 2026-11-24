@@ -20,6 +20,7 @@ from scripts.accounts import accounts
 from scripts.herdr import herdr
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import add_unit, demote_showrunner as demote, promote_showrunner, session_staff, showrunners, staff, transfer_unit, unit_config, unit_effort, unit_lookup, update_registration
 from scripts.production.production_doc import Production, read_production
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
@@ -107,7 +108,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         fixture_session(self.child.current_session, staff.ClaudeBackend())
         self.events = []
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "state"),
-            "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "__ETC_ZSHENV_SOURCED": "1"})))
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"), **fixture_zsh_environment()})))
         _ = self.enterContext(mock.patch.object(showrunners, "own_name", return_value=self.parent_name))
         _ = self.enterContext(mock.patch.object(update_registration, "local_machine", side_effect=lambda: remote.local_machine()))
         self.observed = self.enterContext(mock.patch.object(unit_lookup, "observed_session_labels", side_effect=self.session_labels))

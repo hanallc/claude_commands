@@ -29,6 +29,7 @@ scripts/build_queue/snapshot_codec.py
 scripts/build_queue/step_estimator.py
 scripts/build_queue/system_clock.py
 scripts/build_targets/execution_transport.py
+scripts/build_targets/gate_targets.py
 scripts/build_targets/target_config.py
 scripts/buildlog/__init__.py
 scripts/buildlog/cgroup_capture.py

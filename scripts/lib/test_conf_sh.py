@@ -14,6 +14,7 @@ import unittest
 
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SHELL_READER = Path(__file__).with_name("conf.sh")
@@ -42,6 +43,7 @@ class ShellConfTests(unittest.TestCase):
         cache = self.root / "cache"
         seed_interpreter_cache(cache, interpreter=python)
         self.env = {
+            **fixture_zsh_environment(),
             "PATH": str(programs), "HOME": str(self.root / "home"),
             "XDG_CACHE_HOME": str(cache),
             "CONF_DIR": str(self.config), "HOSTNAME": socket.gethostname(),
@@ -254,8 +256,8 @@ class ShellConfTests(unittest.TestCase):
         self.write("# whole: 1..4\ncount=1.5\n")
         result = subprocess.run(
             [*self.shell, "-c",
-             'PATH="$CONF_TEST_PATH"; source conf.sh; conf_value example count'],
-            cwd=SHELL_READER.parent, env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
+             'source conf.sh; conf_value example count'],
+            cwd=SHELL_READER.parent, env=self.env,
             capture_output=True, text=True,
             check=False, timeout=TEST_HANG_GUARD_SECS,
         )
@@ -268,10 +270,10 @@ class ShellConfTests(unittest.TestCase):
     def test_next_read_observes_changed_file_in_the_same_shell(self) -> None:
         self.write("count=2\n")
         result = subprocess.run(
-            [*self.shell, "-c", 'PATH="$CONF_TEST_PATH"; source "$1"; conf_value example count; '
+            [*self.shell, "-c", 'source "$1"; conf_value example count; '
              + 'printf "count=7\\n" > "$CONF_DIR/example.conf"; conf_value example count',
              "conf-test", str(SHELL_READER)],
-            env={**self.env, "CONF_TEST_PATH": self.env["PATH"]},
+            env=self.env,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

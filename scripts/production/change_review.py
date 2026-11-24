@@ -38,7 +38,7 @@ from datetime import date, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
@@ -2018,10 +2018,11 @@ def _append_review_log(path: Path, lines: list[str], row: str, event: review_eve
 
 
 def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate", *,
-                      feedback_request_id: str = "") -> None:
+                      feedback_request_id: str = "",
+                      event_time: datetime | Literal["write-time"] = "write-time") -> None:
     """Keep the user's Review action in the authoritative table row."""
     now = datetime.now().astimezone(user_zone())
-    event = review_events.ReviewLog(now, who, words, feedback_request_id)
+    event = review_events.ReviewLog(now if event_time == "write-time" else event_time, who, words, feedback_request_id)
     _edit(path, production, now.date(), lambda lines: _append_review_log(path, lines, row, event),
           lambda _: f"review {row}")
 
@@ -2251,32 +2252,8 @@ def _validation_fault_event(production: Path, verdict: str) -> review_events.Rev
 @contextmanager
 def clear_change_later(path: Path, row: str) -> Generator[None, None, None]:
     """Clear the Later time before publishing the change state."""
-    target = review_later.path()
-    if not target.is_file():
+    with review_later.cleared(f"{_owner(path)}/{row}"):
         yield
-        return
-    key = f"{_owner(path)}/{row}"
-    with file_lock.exclusive(target.with_suffix('.lock')):
-        stored = review_later.times()
-        if key not in stored:
-            yield
-            return
-        encoded = {key: until.isoformat() for key, until in stored.items()}
-        until = encoded.pop(key)
-        try:
-            write_text_atomic(target, json.dumps(encoded) + '\n')
-        except AtomicDurabilityUnconfirmed:
-            encoded[key] = until
-            write_text_atomic(target, json.dumps(encoded) + '\n')
-            raise
-        try:
-            yield
-        except AtomicDurabilityUnconfirmed:
-            raise
-        except OSError:
-            encoded[key] = until
-            write_text_atomic(target, json.dumps(encoded) + '\n')
-            raise
 
 
 def _cleared_validation(delivery: Path, slots: delivery_state.DeliverySlots) -> str:

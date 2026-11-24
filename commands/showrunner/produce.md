@@ -212,8 +212,15 @@ Your text to nate while he is away follows this import:
     - the order of promotions to a shared destination: the parent of the
       productions promoting;
     - disk room and quota: the root, always.
-  - **Give the Mac to one unit with a Mac hold, never with words.** Run
-    `/build:mac block <why> [hours N]`, or direct the unit to run it.
+  - **Hold the Mac only on nate's explicit request; never reserve it with words.**
+    Quote his words with the place and the time.
+    A go from nate for a Mac run means a normal queued run, not a Mac hold.
+    Source: nate, bob session, 2026-11-23 about 12:14 PST: "yes a hold has
+    to be explicitly requested by me - but i don't know how you are making
+    that be invariant". This replaces the part of the 2026-10-18 rule that
+    let a showrunner give the Mac to a unit with a hold.
+    On his request, run `/build:mac block <why> [hours N]` with his quoted
+    words in `<why>`, or direct the unit to run it.
     Tests skip a held Mac by themselves,
     `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records

@@ -509,9 +509,7 @@ def finish_rename(row: staff.StaffRow, pending: PendingRename) -> bool:
         _ = staff.set_worktree(row.id, replace(row.worktree, branch=staff.ParkedBranch(pending.branch)),
                               expected=row.worktree)
     if pending.destination.is_dir():
-        module = import_module("scripts.worktree.worktrees")
-        sync_branch = cast(Callable[[Path], None], module.sync_worktree_branch)
-        sync_branch(pending.destination)
+        _sync_worktree_branch(pending.destination, pending.branch)
     rename_move_path(row.id).unlink()
     return True
 
@@ -1045,7 +1043,7 @@ def move_idle_folder(
             if pending is not None:
                 _finish_rename_push(record, row, pending, folder)
             elif isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
             return False
         restart = import_module("scripts.agents.restart")
         live_members = cast(Callable[[Iterable[staff.StaffRow], staff.StaffSnapshot], list[staff.StaffRow]], restart.live_members)
@@ -1075,7 +1073,7 @@ def move_idle_folder(
             if pending is not None:
                 _finish_rename_push(record, row, pending, folder)
             elif isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
             push_finished = True
         finally:
             if isinstance(managed, LegacyWorktreeDestination) and not old.exists() and destination.exists():
@@ -1090,6 +1088,17 @@ def move_idle_folder(
                     _ = staff.set_worktree(unit, updated, expected=location)
                     changed = True
         return _unlock_move(folder, unit) or changed
+
+
+def _sync_worktree_branch(checkout: Path, branch: str) -> None:
+    module = import_module("scripts.worktree.worktrees")
+    sync_branch = cast(Callable[[Path, str], None], module.sync_worktree_branch)
+    sync_branch(checkout, branch)
+
+
+def _sync_and_push_moved_branch(checkout: Path, branch: str) -> None:
+    _sync_worktree_branch(checkout, branch)
+    _push_moved_branch(checkout, branch)
 
 
 def _push_moved_branch(checkout: Path, branch: str) -> None:
@@ -1140,12 +1149,14 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
         current_branch = checked_out_branch(folder)
         move_source = source != destination if isinstance(managed, ManagedWorktreeDestination) else folder != destination
         move_complete = not move_source and old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
+        if isinstance(managed, ManagedWorktreeDestination) and not current_branch and not move_complete:
+            raise RenameRefused(f"{folder}: the checkout has no branch (detached HEAD)")
         apply_move = (prepare_checkout_move(source, folder, destination, managed)
                       if move_source else NoCheckoutMove.STAYS)
         if move_complete:
             if not move_locked(unit, folder):
                 if isinstance(branch, str):
-                    _push_moved_branch(folder, branch)
+                    _sync_and_push_moved_branch(folder, branch)
                 return False
         members = [row, *record.find(kind="worker", parent=row.id)]
         for member in members[1:]:
@@ -1176,7 +1187,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 print(f"info: {member.name}: stopped; agents restart --only {member.id}")
         if move_complete:
             if isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
             _ = _unlock_move(folder, unit)
             return True
         changed = False
@@ -1229,7 +1240,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 _ = git(folder, "branch", "-m", branch)
                 changed = True
             if isinstance(branch, str):
-                _push_moved_branch(folder, branch)
+                _sync_and_push_moved_branch(folder, branch)
         finally:
             if isinstance(managed, LegacyWorktreeDestination) and not old.exists() and destination.exists():
                 folder = destination
