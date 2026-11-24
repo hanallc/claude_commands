@@ -369,7 +369,7 @@ def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_p
 @dataclass(frozen=True)
 class GateTermination:
     attempt: str
-    cleanup: ledger.GateCleanupPending
+    targets: ledger.GateCleanupTargets
     owner: ledger.GateWorkerOwner | ledger.GateOwnerUnknown
 
 
@@ -443,7 +443,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
         if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)):
             continue
         if isinstance(reservation.cleanup, ledger.GateCleanupPending):
-            boxes.append(GateTermination(reservation.attempt, reservation.cleanup, reservation.owner))
+            boxes.append(GateTermination(reservation.attempt, reservation.cleanup.targets, reservation.owner))
             continue
         try:
             region = str(launch.get('region', reservation.region or worker.api.region))
@@ -451,7 +451,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
             if not instance and isinstance(reservation.state, ledger.GateRunning):
                 instance = reservation.state.instance_id
             if instance:
-                boxes.append(GateTermination(reservation.attempt, ledger.GateCleanupPending(region, (instance,)),
+                boxes.append(GateTermination(reservation.attempt, ledger.GateCleanupTargets(region, (instance,)),
                                              reservation.owner))
             elif 'arguments' in launch:
                 token = ledger.text(ledger.mapping(launch['arguments']), 'ClientToken')
@@ -486,7 +486,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances:
                     targets = tuple(sorted({ledger.text(row, 'InstanceId') for row in instances}))
-                    discovered = GateTermination(reservation.attempt, ledger.GateCleanupPending(region, targets),
+                    discovered = GateTermination(reservation.attempt, ledger.GateCleanupTargets(region, targets),
                                                  reservation.owner)
                     progress = worker.request_terminations((discovered,), deadline)
                     boxes.extend(progress.pending)
@@ -539,14 +539,6 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
             yield reservation
         finally:
             held.status = reservation.status
-
-
-@dataclass(frozen=True)
-class _ResultNotReceived:
-    """No valid final result establishes an earlier box end time."""
-
-
-_RESULT_NOT_RECEIVED = _ResultNotReceived()
 
 
 @final
@@ -605,10 +597,10 @@ class GateWorker:
             raise
 
     def terminate(self, attempt: str, instance: str, owner: ledger.GateWorkerOwner, *,
-                  result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
-        cleanup = ledger.GateCleanupPending(self.box_region, (instance,))
+                  result_seen_at: int | ledger.GateResultNotReceived = ledger.GATE_RESULT_NOT_RECEIVED) -> None:
+        targets = ledger.GateCleanupTargets(self.box_region, (instance,))
         with self.book.transaction() as state:
-            ledger.mark_gate_cleanup(state, attempt, owner, cleanup)
+            ledger.mark_gate_cleanup(state, attempt, owner, targets, result_seen_at=result_seen_at)
         api = self.regional_api(self.box_region)
         deadline = self.clock() + settings().number('termination_timeout_s')
         requested = False
@@ -629,8 +621,7 @@ class GateWorker:
             self.pause(settings().number('result_poll_s'))
         else:
             raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
-        ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
-        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance), cleanup=cleanup)
+        self.book.resolve_gate(attempt, ledger.GateTerminated(int(self.clock()), instance), cleanup=targets)
 
     def termination_call(self, region: str, operation: str, instances: Sequence[str], deadline: float) -> dict[str, object]:
         remaining = deadline - self.clock()
@@ -663,10 +654,10 @@ class GateWorker:
         pending: list[GateTermination] = []
         skipped = False
         for box in boxes:
-            if box.cleanup.region == region and ended.issuperset(box.cleanup.instances):
+            if box.targets.region == region and ended.issuperset(box.targets.instances):
                 try:
                     self.book.resolve_gate(box.attempt,
-                        ledger.GateTerminated(int(self.clock()), box.cleanup.instances[0]), cleanup=box.cleanup)
+                        ledger.GateTerminated(int(self.clock()), box.targets.instances[0]), cleanup=box.targets)
                     continue
                 except ledger.GateCleanupSuperseded as error:
                     print('gate cleanup: ' + str(error), file=sys.stderr)
@@ -681,16 +672,16 @@ class GateWorker:
         """Save the cleanup state before requesting termination."""
         pending: list[GateTermination] = []
         skipped = False
-        for region in dict.fromkeys(box.cleanup.region for box in boxes):
+        for region in dict.fromkeys(box.targets.region for box in boxes):
             current: list[GateTermination] = []
             superseded: list[str] = []
             try:
                 with self.book.transaction() as state:
                     for box in boxes:
-                        if box.cleanup.region != region:
+                        if box.targets.region != region:
                             continue
                         try:
-                            ledger.mark_gate_cleanup(state, box.attempt, box.owner, box.cleanup)
+                            ledger.mark_gate_cleanup(state, box.attempt, box.owner, box.targets)
                         except ledger.GateCleanupSuperseded as error:
                             superseded.append(str(error))
                         else:
@@ -704,7 +695,7 @@ class GateWorker:
                 skipped = True
             if not current:
                 continue
-            instances = tuple(dict.fromkeys(instance for box in current for instance in box.cleanup.instances))
+            instances = tuple(dict.fromkeys(instance for box in current for instance in box.targets.instances))
             ended = self.confirmed_ends(region, 'terminate-instances', instances, deadline)
             progress = self.record_ends(current, region, ended)
             pending.extend(progress.pending)
@@ -713,13 +704,13 @@ class GateWorker:
 
     def confirm_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> bool:
         """Record confirmed terminations under one shared deadline."""
-        confirmed: dict[str, set[str]] = {box.cleanup.region: set() for box in boxes}
+        confirmed: dict[str, set[str]] = {box.targets.region: set() for box in boxes}
         pending = list(boxes)
         skipped = False
         while pending and self.clock() < deadline:
             for region, known in confirmed.items():
-                instances = tuple(dict.fromkeys(instance for box in pending if box.cleanup.region == region
-                                                for instance in box.cleanup.instances if instance not in known))
+                instances = tuple(dict.fromkeys(instance for box in pending if box.targets.region == region
+                                                for instance in box.targets.instances if instance not in known))
                 if instances and self.clock() < deadline:
                     known.update(self.confirmed_ends(region, 'describe-instances', instances, deadline))
                 progress = self.record_ends(pending, region, known)
@@ -1063,7 +1054,7 @@ class GateWorker:
         row: dict[str, object] = {}
         interruption_code = ''
         interruption_confirmed = False
-        result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
+        result_seen_at: int | ledger.GateResultNotReceived = ledger.GATE_RESULT_NOT_RECEIVED
         try:
             # Read the wait before any launch, so a bad value costs no box.
             unreachable_wait_s = target_config.unreachable_wait_seconds(conf.read_or_repository('build_targets'))
