@@ -46,7 +46,7 @@ from scripts.build_targets import build_targets
 from scripts.build_targets.mac_linux import (BWRAP_FAILED, BWRAP_MISSING, COMPILED_START, TOOL_FOLDERS, bindable,
                                              entry_kind, home_folder, main_folder, setup_failed)
 from scripts.buildlog import parse, record, store, treekey
-from scripts.lib import build_steps, models_registry
+from scripts.lib import build_steps, conf_reads, models_registry
 from scripts.lib.build_steps import HAND_MADE
 from scripts.notify import review
 from scripts.production import hand_made_guest, hand_made_limit, hand_made_mac
@@ -137,9 +137,10 @@ def read_settings(text: str) -> CheckSettings:
     section = models_registry.parse_registry(text).get(SECTION)
     if section is None:
         raise Refused(f"the model registry has no [{SECTION}] section")
+    settings = conf_reads.trace_values(models_registry.registry_path(), text, section)
 
     def value(key: str) -> str:
-        found = section.get(key, "")
+        found = settings.get(key, "")
         if not found:
             raise Refused(f"the model registry has no {SECTION}.{key}")
         return found

@@ -747,7 +747,7 @@ os.execvp(command[0], command)
         before = self.remote_branches()
         config = self.root / 'cloud_gate.conf'
         lifetime = 5
-        _ = config.write_text(config.read_text().replace('lifetime_minutes=20', f'lifetime_minutes={lifetime}'))
+        override_fixture_settings(config, f'lifetime_minutes={lifetime}\n')
 
         def first_service(_command: Sequence[str], _unit: str) -> int:
             live = self.remote_branches()
@@ -755,7 +755,7 @@ os.execvp(command[0], command)
             folder = next((self.state / 'paired-trials').iterdir())
             request = cloud_gate.read(next(folder.glob('*/request.json')))
             self.assertEqual(request['expires'], now + lifetime * 60)
-            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
+            override_fixture_settings(config, 'lifetime_minutes=1\n')
 
             def second_service(_command: Sequence[str], _unit: str) -> int:
                 remote = self.remote_branches()

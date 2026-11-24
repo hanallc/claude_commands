@@ -860,6 +860,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(self.admission.server, "host", machine),
+              mock.patch.object(gate, "gate_start_target", return_value="natedev"),
               mock.patch.object(self.admission.server, "reply_filter", observe),
               mock.patch.object(gate, "local_release_waiter", side_effect=release_fixture_hold),
               mock.patch("scripts.aws_target.cloud_gate.route", side_effect=AssertionError("unexpected cloud route")),

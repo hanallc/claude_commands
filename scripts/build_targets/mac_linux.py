@@ -1235,22 +1235,55 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
+def report_guest_completion(dispatch: GuestGateDispatch, status: int) -> None:
+    """Report the result after the guest proves that the run ended."""
+    ended_at = time()
+
+    def send(deadline: float, timeout: float) -> None:
+        from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+        assignment = dispatch.assignment
+        request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+            execution_identity.ExecutionEvidenceUnavailable('the guest run ended', ended_at),
+            placement.AttemptCompleted(status), placement.DispatchPathSettled(),
+            code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+        response = send_guest_execution(request, deadline=deadline, timeout=timeout)
+        if (response.assignment != assignment or response.state != placement.ClosedAssignment('completed')
+                or not isinstance(response.permission, placement.PermissionConsumed) or response.reason):
+            raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest result')
+
+    def warn(reason: str) -> None:
+        with suppress(OSError, ValueError):
+            print(f'Mac Linux guest completion report failed: {reason}', file=sys.stderr, flush=True)
+
+    with ExitStack() as reports:
+        _start_guest_queue_report(send, math.inf, reports, warn)
+
+
 def warn_guest_report(reason: str) -> None:
     print(f'Mac Linux guest queue report failed: {reason}', file=sys.stderr, flush=True)
 
 
 def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
                        reports: ExitStack) -> None:
+    def send(deadline: float, timeout: float) -> None:
+        report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+
+    _start_guest_queue_report(send, transfer_deadline, reports, warn_guest_report)
+
+
+def _start_guest_queue_report(send: Callable[[float, float], None], deadline_limit: float,
+                              reports: ExitStack, warn: Callable[[str], None]) -> None:
     """Read the timeout before starting the report worker. Bound both waits."""
     started = monotonic()
-    preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
+    preparation_deadline = min(deadline_limit, started + SSH_CONNECT_TIMEOUT_SECONDS)
     ready: Future[Callable[[], None]] = Future()
 
     def prepare() -> None:
         try:
             with conf.diagnostics(report=False):
                 timeout = conf.read('build_admission').number('query_timeout_seconds')
-            deadline = min(transfer_deadline, started + timeout)
+            deadline = min(deadline_limit, started + timeout)
             dispatch_deadline = min(preparation_deadline, deadline)
             if monotonic() >= dispatch_deadline:
                 raise TimeoutError('the queue report deadline expired during configuration')
@@ -1260,7 +1293,7 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
                 try:
                     if monotonic() >= dispatch_deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
-                    report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+                    send(deadline, timeout)
                     if monotonic() >= deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
                 except Exception as error:
@@ -1286,18 +1319,18 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
     try:
         preparation.start()
     except RuntimeError as error:
-        warn_guest_report(str(error))
+        warn(str(error))
         return
 
     def collect() -> None:
         preparation.join(timeout=max(0.0, preparation_deadline - monotonic()))
         if not ready.done():
-            warn_guest_report('the queue report configuration read timed out')
+            warn('the queue report configuration read timed out')
             return
         try:
             ready.result()()
         except Exception as error:
-            warn_guest_report(str(error) or type(error).__name__)
+            warn(str(error) or type(error).__name__)
 
     _ = reports.callback(collect)
 
@@ -1792,12 +1825,13 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
                            bundle_reason=reply.bundle_reason, module_skips=skips)
 
 
-def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
+def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float | None,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
           assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
     """Return the guest gate result, a run the guest did not take, or the reason the guest route failed.
 
     The assignment is the one the gate checked at its start. The route consumes its launch permission.
+    A None module limit uses the configured full-run limit.
     """
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import mac_run
@@ -1812,6 +1846,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         settings = new_run_settings()
         if not isinstance(settings, GuestSettings):
             return settings
+        run_time_limit_seconds = settings.run_time_limit_seconds
+        if module_time_limit_s is None:
+            module_time_limit_s = run_time_limit_seconds
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()
@@ -1826,7 +1863,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                origin_main=source.origin_main, runner_commit=source.runner_commit, mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
-                               module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
+                               module_time_limit_s=module_time_limit_s, run_time_limit_seconds=run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         dispatch = None
         try:
@@ -1844,7 +1881,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 reply = run_remote(repo, settings, source, request, prefix,
                                    FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
                 run = completed_run(reply, request, source)
-        if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
+        status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
+        checkout_changed = (gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head
+                            or cloud_gate.working_tree(repo)[0] != source.tree)
+        report_guest_completion(dispatch, (status or 1) if checkout_changed else status)
+        if checkout_changed:
             raise GuestUnavailable('the checkout changed during the guest run')
         return run
     except mac_run.MacRunRefused as error:
