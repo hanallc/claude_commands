@@ -1471,19 +1471,32 @@ GATE_MODULE = "scripts.production.gate"
 GATE_CHECK_HELP = 3
 GATE_CHECK_PROGRAM = """
 import argparse
+from importlib.util import find_spec
 from pathlib import Path
 import sys
+
+root = Path.cwd()
+copy_run = sys.argv[2] == "run"
 
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         raise SystemExit(message)
 
-root = Path.cwd()
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        repo = getattr(parsed, "repo", ".")
+        if copy_run and repo != "{tree}" and Path(repo) != Path("."):
+            self.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
+        return parsed
+
 sys.path.insert(0, str(root))
+spec = find_spec("scripts.production.gate")
+if spec is None or spec.origin is None or Path(spec.origin) != root / "scripts/production/gate.py":
+    raise SystemExit("Use the gate module from the prepared source.")
 from scripts.production.gate import check_prepared_gate_source
 
 try:
-    check_prepared_gate_source(sys.argv[2:], Parser(prog="gate.py", allow_abbrev=False), root)
+    check_prepared_gate_source(sys.argv[3:], Parser(prog="gate.py", allow_abbrev=False), root)
 except SystemExit as error:
     if error.code == 0:
         raise SystemExit(int(sys.argv[1])) from None
@@ -1491,26 +1504,40 @@ except SystemExit as error:
 """
 
 
-def gate_command_source_check(command: Sequence[str], checkout: Path) -> Callable[[Path], None] | None:
+def gate_module_arguments(command: Sequence[str]) -> Sequence[str] | None:
+    """Read the arguments of the qualified gate module."""
+    module = parse_command_program(command)
+    if isinstance(module, OtherCommand) or module[0] != GATE_SCRIPT.name:
+        return None
+    _, arguments = module
+    word = command[len(command) - len(arguments) - 1]
+    return arguments if word == GATE_MODULE or word.partition("m")[2] == GATE_MODULE else None
+
+
+def gate_command_source_check(command: Sequence[str], checkout: Path, *,
+                              numbered_copy: bool = False) -> Callable[[Path], None] | None:
     """Select the check for the gate script or its qualified module."""
     program = parse_command_program(command, keep_path=True)
     if isinstance(program, OtherCommand):
-        module = parse_command_program(command)
-        if isinstance(module, OtherCommand) or module[0] != GATE_SCRIPT.name:
-            return None
-        _, arguments = module
-        word = command[len(command) - len(arguments) - 1]
-        if word != GATE_MODULE and word.partition("m")[2] != GATE_MODULE:
+        arguments = gate_module_arguments(command)
+        if arguments is None:
             return None
     else:
         script, arguments = program
-        path = Path(script.replace("{tree}", str(checkout))).expanduser()
-        if checkout / path != checkout / GATE_SCRIPT:
+        path = Path(script).expanduser()
+        if numbered_copy:
+            if Path(os.path.normpath(path)).parts[-len(GATE_SCRIPT.parts):] != GATE_SCRIPT.parts:
+                return None
+            if path != GATE_SCRIPT:
+                raise CopyError(f"Use {GATE_SCRIPT} or -m {GATE_MODULE} in copies.py run.")
+        elif checkout / path != checkout / GATE_SCRIPT:
             return None
 
     def check(source: Path) -> None:
         path = source.resolve() / GATE_SCRIPT
-        if not path.is_file() or path.resolve() != path:
+        if path.resolve() != path:
+            raise CopyError(f"Use the regular {GATE_SCRIPT} file in the prepared source.")
+        if not path.is_file():
             return
         try:
             syntax = ast.parse(path.read_bytes(), filename=str(path))
@@ -1519,8 +1546,9 @@ def gate_command_source_check(command: Sequence[str], checkout: Path) -> Callabl
         if not any(isinstance(node, ast.FunctionDef) and node.name == "check_prepared_gate_source"
                    for node in syntax.body):
             return
+        mode = "run" if numbered_copy else "gate-step"
         result = subprocess.run(
-            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), *arguments],
+            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), mode, *arguments],
             cwd=source, capture_output=True, text=True,
         )
         if result.returncode == GATE_CHECK_HELP:
@@ -2725,7 +2753,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
-    check_source = gate_command_source_check(command, source)
+    check_source = gate_command_source_check(command, source, numbered_copy=True)
     verification = verify_command(command)
     with ExitStack() as scope:
         captured = ""
@@ -2762,7 +2790,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         def launch() -> subprocess.CompletedProcess[str]:
             child_environment = {**os.environ, **environment}
             _ = child_environment.pop(PREPARED_GATE_FD, None)
-            if not first_step.canonical_gate_command(arguments, tree):
+            entry = (str(GATE_SCRIPT),) if gate_module_arguments(arguments) is not None else arguments
+            if not first_step.canonical_gate_command(entry, tree):
                 return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
             return run_prepared_gate(arguments, cwd=tree, descriptors=locks, environment=child_environment)
 

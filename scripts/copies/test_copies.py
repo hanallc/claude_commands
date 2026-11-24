@@ -2502,6 +2502,48 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertIn("The gate --repo must stay in the prepared source.", result.stderr)
         admit.assert_not_called()
 
+    def test_run_refuses_a_repo_path_that_only_matches_the_validation_snapshot(self) -> None:
+        _ = self.commit_gate_validator()
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir()
+        test.touch()
+        _ = self.git(self.source, "add", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Add the test module")
+        for repo in ("../source", "./{tree}"):
+            with self.subTest(repo=repo), mock.patch.object(first_step, "admitted_run") as admit:
+                result = self.run_cli(command=(sys.executable, "scripts/production/gate.py",
+                    "--tests-only", "--module", "lib/test_fixture.py", f"--checkout={repo}"))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("Use --repo '{tree}'.", result.stderr)
+                admit.assert_not_called()
+
+    def test_run_refuses_a_gate_script_path_outside_the_numbered_copy(self) -> None:
+        revision = self.commit_gate_script("raise SystemExit(0)\n")
+        _ = self.commit_gate_validator()
+        for script in (str(self.source / "scripts/production/gate.py"), "{tree}/scripts/production/gate.py"):
+            with self.subTest(script=script), mock.patch.object(first_step, "admitted_run") as admit:
+                result = self.run_cli("--commit", revision, command=(sys.executable, script, "--targeted"))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("Use scripts/production/gate.py or -m scripts.production.gate", result.stderr)
+                admit.assert_not_called()
+
+    def test_run_checks_only_the_requested_module_paths(self) -> None:
+        _ = self.commit_gate_validator()
+        named = self.source / "scripts/lib/test_fixture.py"
+        named.parent.mkdir()
+        named.touch()
+        unrelated = self.source / "scripts/test_unrelated.py"
+        unrelated.touch()
+        _ = self.git(self.source, "add", str(named), str(unrelated))
+        _ = self.git(self.source, "commit", "-qm", "Add the fixture modules")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            result = self.run_cli(command=(sys.executable, "scripts/production/gate.py",
+                "--tests-only", "--module", "lib/test_fixture.py"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+        admit.assert_called_once()
+
     def test_run_uses_the_gate_parser_from_the_requested_revision(self) -> None:
         revision = self.commit_gate_script("""\
             def check_prepared_gate_source(arguments, parser, source):
@@ -2563,6 +2605,37 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
         admit.assert_not_called()
+
+    def test_run_launches_the_qualified_gate_from_the_numbered_copy(self) -> None:
+        revision = self.commit_gate_script(f"""\
+            import os
+            from pathlib import Path
+            import sys
+
+            def parse(arguments, parser):
+                parser.add_argument("--repo")
+                return parser.parse_args(arguments)
+
+            def check_prepared_gate_source(arguments, parser, source):
+                parse(arguments, parser)
+
+            if __name__ == "__main__":
+                import argparse
+
+                root = Path.cwd()
+                assert Path(__file__).parents[2] == root
+                assert parse(sys.argv[1:], argparse.ArgumentParser()).repo == str(root)
+                fd = int(os.environ[{copies.PREPARED_GATE_FD!r}])
+                assert os.read(fd, 32) == f"{{os.getpid()}}\\n".encode("ascii")
+            """)
+        _ = self.commit_gate_script("raise SystemExit(9)\n")
+        run_gate = mock.Mock(side_effect=launch_copy_fixture)
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+        with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)):
+            result = self.run_cli("--commit", revision,
+                command=(sys.executable, "-m", "scripts.production.gate", "--repo", "{tree}"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_gate.assert_called_once()
 
     def test_run_prints_gate_help_without_admission(self) -> None:
         _ = self.commit_gate_validator()

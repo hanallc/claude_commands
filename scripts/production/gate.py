@@ -91,7 +91,7 @@ from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
     affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
 )
-from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
+from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules, GatePlacementIncomplete, GateResultUnknown, GateTookNoRun,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun, GuestGateBlocked,
@@ -3819,11 +3819,15 @@ def parse_gate_arguments(arguments: Sequence[str], parser: argparse.ArgumentPars
 
 
 def check_named_modules(repo: Path, names: Sequence[str]) -> None:
-    if not names:
-        return
-    available = {path.relative_to(repo / "scripts").as_posix() for _, path in discover_test_modules(repo)}
+    scripts = repo / "scripts"
     for name in names:
-        if name not in available:
+        relative = Path(name)
+        path = scripts / relative
+        if (len(relative.parts) < 2 or relative.is_absolute() or relative.as_posix() != name
+                or ".." in relative.parts or "__pycache__" in relative.parts[:-1]
+                or not is_test_module(name)
+                or any((scripts / parent).is_symlink() for parent in relative.parents if parent != Path("."))
+                or not path.resolve().is_relative_to(repo) or not path.is_file()):
             raise GateRefused(f"--module {name!r} does not name a test module in {repo}. "
                               + "Use a path under scripts/, for example lib/test_x.py.")
 
@@ -3837,15 +3841,12 @@ def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.Argume
     if not args.modules:
         return
     repo = (source / Path(args.repo.replace("{tree}", str(source))).expanduser()).resolve()
-    if not repo.is_relative_to(source) or not (repo / "scripts").resolve().is_relative_to(source):
+    if not repo.is_relative_to(source):
         parser.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
     try:
         check_named_modules(repo, args.modules)
     except GateRefused as error:
         parser.error(str(error))
-    for name in args.modules:
-        if not (repo / "scripts" / name).resolve().is_relative_to(source):
-            parser.error(f"--module {name!r} points outside the prepared source.")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
