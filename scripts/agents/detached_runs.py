@@ -1488,6 +1488,7 @@ def result_is_from_another_pass(record: Mapping[str, object], instance: object) 
 def later_results_from_other_passes(runs: Path, worker: staff.StaffRow, *, pane_dispatch_id: str,
                                    result_ids: Collection[str]) -> bool:
     """Require a readable record from another pass for each result ID."""
+    wanted = frozenset(result_ids)
     verified: set[str] = set()
     for path in _run_record_paths(runs):
         if (owner := _record_owner(path)) and owner != worker.id:
@@ -1498,11 +1499,11 @@ def later_results_from_other_passes(runs: Path, worker: staff.StaffRow, *, pane_
             unit_runs.report_anomaly(" ".join(f"anomaly: {error}".splitlines()))
             continue
         run_id = path.name.removesuffix(".json")
-        if (run_id in result_ids and _is_run_record(record)
+        if (run_id in wanted and _is_run_record(record)
                 and record["run_id"] == run_id and record["staff_id"] == worker.id
                 and result_is_from_another_pass(record, pane_dispatch_id)):
             verified.add(run_id)
-    return verified.issuperset(result_ids)
+    return verified >= wanted
 
 
 class ResultPassOwnership(Enum):
