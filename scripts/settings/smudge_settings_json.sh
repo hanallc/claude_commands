@@ -21,12 +21,8 @@ sidecar="$REPO_ROOT/$SETTINGS_LOCAL_KEYS_SIDECAR"
 blob="$(cat)"
 
 if [[ -s "$sidecar" ]]; then
-    # The incoming blob supplies the keys for a stage 0 checkout.
-    # During abort, stage 0 can still contain the blob that Git will replace.
-    conflict_keys="$(_settings_local_keys_references |
-        jq -c "$_SETTINGS_LOCAL_REFERENCE_DEFS"'conflict_keys' 2>/dev/null)" &&
     merged="$(printf '%s\n' "$blob" |
-        jq --argjson conflict_keys "$conflict_keys" --slurpfile local "$sidecar" "$SETTINGS_LOCAL_KEYS_MERGE" 2>/dev/null)" &&
+        jq --slurpfile local "$sidecar" "$SETTINGS_LOCAL_KEYS_MERGE" 2>/dev/null)" &&
         [[ -n "$merged" ]] &&
         { printf '%s\n' "$merged"; exit 0; }
 fi
