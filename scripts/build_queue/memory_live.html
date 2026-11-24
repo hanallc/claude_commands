@@ -111,11 +111,6 @@ __PAGE_FRAME_STYLE__
 .build-limit-cell .build-limit-mark:is(.free, .kept) { width: 9px; height: 9px; }
 .build-limit-wait { margin-top: 5px; }
 .build-limit-cell .build-limit-wait { margin-top: 0; }
-.build-limit-tip > .tip {
-  max-width: min(24rem, calc(100vw - 16px));
-  grid-template-columns: fit-content(44%) minmax(0, 1fr);
-}
-.build-limit-tip .tip dd { white-space: normal; overflow-wrap: anywhere; }
 .build-limit-legend { display: flex; flex-wrap: wrap; gap: 5px 16px; margin-top: 10px; color: var(--ink-2); font-size: .8rem; }
 .build-limit-legend > span { display: inline-flex; gap: 6px; align-items: center; }
 .bar > div:first-child { border-radius: 4px 2px 2px 4px; }
@@ -163,26 +158,26 @@ __PAGE_FRAME_STYLE__
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 /* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
-#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
+#tip { position: fixed; z-index: 10; width: max-content; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
-.tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
-  width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
+.tip { display: grid; grid-template-columns: fit-content(44%) minmax(0, 1fr); column-gap: 0; row-gap: 2px; margin: 0;
+  width: max-content; min-width: min(15rem, var(--tip-width, 15rem)); max-width: min(24rem, var(--tip-width, 24rem));
+  padding: 10px 12px; border-radius: 8px;
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
-.tip dt { text-align: left; white-space: nowrap; }
-.tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip :is(dt, dd) { overflow-wrap: anywhere; }
+.tip dt { text-align: left; }
+.tip dd { margin: 0; padding-left: 24px; text-align: right; font-variant-numeric: tabular-nums; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
-#tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
-.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
 .tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden; white-space: normal; }
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
+#tip > .tip { max-height: var(--tip-height); overflow: hidden; }
 .seg-remote { background: var(--remote-memory); }
 /* The one machine color map. Each name matches without case, so the hover words "Mac" and "AWS" match too.
    mac-linux is the Linux guest on the Mac, so it takes the mac color. hana-aws and hana-gpu are AWS boxes, so they take the aws color. */
@@ -372,7 +367,6 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .move-mark[data-tip] { cursor: help; }
 .walk-table .move-mark { vertical-align: middle; }
-#tip.move-tip dd { white-space: normal; overflow-wrap: anywhere; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.tokens { text-align: left; }
 /* A waiting step sizes the Step column (fitWalkDetails). In a tight pane it wraps between words inside the column.
@@ -1686,56 +1680,68 @@ function ago(then, now) {
   return h < 24 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
 }
 // Put the tooltip above the pointer, or below it near the top, and keep it inside the window.
-function placeTipAt(tip, x, y) {
+function placeTipAt(tip, x, y, fit, anchor) {
+  const {clientWidth, clientHeight} = document.documentElement;
+  const inset = 8;
+  const maxHeight = Math.max(0, clientHeight - 2 * inset);
+  tip.style.setProperty("--tip-width", `${Math.max(0, clientWidth - 2 * inset)}px`);
+  tip.style.setProperty("--tip-height", `${maxHeight}px`);
+  fit?.(tip, maxHeight);
   const w = tip.offsetWidth, h = tip.offsetHeight;
-  const left = Math.min(Math.max(8, x - w / 2), window.innerWidth - w - 8);
-  const top = y - h - 14 < 8 ? y + 18 : y - h - 14;
-  tip.style.left = `${left}px`;
-  tip.style.top = `${top}px`;
+  const rightEdge = clientWidth - w - inset;
+  const above = y - h - 14;
+  let left = x - w / 2;
+  let top = above < inset ? y + 18 : above;
+  if (anchor) {
+    const bounds = anchor.getBoundingClientRect();
+    left = bounds.right + inset <= rightEdge ? bounds.right + inset : bounds.left - inset - w;
+    top = bounds.top - 4;
+  }
+  tip.style.left = `${Math.max(inset, Math.min(left, rightEdge))}px`;
+  tip.style.top = `${Math.max(inset, Math.min(top, clientHeight - h - inset))}px`;
 }
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
-// Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
-// content(key) gives the tooltip HTML, or "" for no tooltip.
-function hoverTips(tip, content, place = placeTipAt) {
+// Open a tooltip on hover or click. Click its trigger again or press Escape to close it.
+function hoverTips(tip, content, fit, getAnchor) {
   let shown = null;
-  const show = (key, x, y, anchor) => {
+  const refresh = (html, anchor = shown?.anchor) => {
+    if (!shown) return;
+    shown.anchor = anchor;
+    tip.innerHTML = html;
+    placeTipAt(tip, shown.x, shown.y, fit, anchor);
+  };
+  const show = (key, x, y, trigger) => {
     const html = content(key);
     if (!html) return;
-    shown = key;
-    tip.innerHTML = html;
+    shown = {key, x, y, anchor:getAnchor?.(trigger)};
+    refresh(html);
     tip.classList.add("on");
-    place(tip, x, y, anchor);
   };
   const hide = () => { shown = null; tip.classList.remove("on"); };
+  window.addEventListener("resize", () => {
+    if (!shown) return;
+    const html = content(shown.key);
+    if (html) refresh(html); else hide();
+  });
   document.addEventListener("pointermove", (e) => {
-    const el = e.target.closest("[data-tip]");
     if (e.pointerType !== "mouse") return;
+    const el = e.target.closest("[data-tip]");
     if (el) show(el.dataset.tip, e.clientX, e.clientY, el); else if (shown) hide();
   });
   document.addEventListener("click", (e) => {
     const el = e.target.closest("[data-tip]");
-    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY, el); else hide();
+    if (el && shown?.key !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY, el); else hide();
   });
-  return {show, hide, key: () => shown};
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") hide();
+  });
+  return {show, hide, refresh, key: () => shown?.key};
 }
 // shared:step-tip:end
 const tip = document.getElementById("tip");
-function placeWalkTip(tip, x, y, anchor) {
-  const moved = Boolean(anchor?.classList.contains("move-mark"));
-  tip.classList.toggle("move-tip", moved);
-  if (!moved) {
-    placeTipAt(tip, x, y);
-    return;
-  }
-  const {left, right, top} = anchor.getBoundingClientRect();
-  const width = tip.offsetWidth;
-  const height = tip.offsetHeight;
-  const beside = right + 8 + width <= window.innerWidth - 8 ? right + 8 : left - 8 - width;
-  tip.style.left = `${Math.max(8, Math.min(beside, window.innerWidth - width - 8))}px`;
-  tip.style.top = `${Math.max(8, Math.min(top - 4, window.innerHeight - height - 8))}px`;
-}
-const tips = hoverTips(tip, key => latest ? pageTooltipHtml(key, latest) : "", placeWalkTip);
+const tips = hoverTips(tip, key => latest ? pageTooltipHtml(key, latest) : "", undefined,
+  trigger => trigger?.classList.contains("move-mark") ? trigger : undefined);
 const showTip = tips.show, hideTip = tips.hide;
 function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
@@ -1795,14 +1801,10 @@ function restoreReportView(view) {
     if (!html) {
       hideTip();
       tip.replaceChildren();
-    } else {
-      tip.innerHTML = html;
-      if (tipKey.startsWith("moved:")) {
-        const mark = $("walk").querySelector(`.move-mark[data-tip="${CSS.escape(tipKey)}"]`);
-        if (mark) placeWalkTip(tip, 0, 0, mark);
-        else hideTip();
-      }
-    }
+    } else if (tipKey.startsWith("moved:")) {
+      const mark = $("walk").querySelector(`.move-mark[data-tip="${CSS.escape(tipKey)}"]`);
+      if (mark) tips.refresh(html, mark); else hideTip();
+    } else tips.refresh(html);
   }
 }
 function render(d) {
@@ -2032,7 +2034,7 @@ function pageTooltipHtml(key, data) {
     return tooltipHtml(key, queueTip && displayedQueue ? displayedQueue : data);
   }
   const rows = limitTooltipRows(key, data.build_limits);
-  return rows.length ? `<div class="build-limit-tip">${tipRowsHtml(rows)}</div>` : "";
+  return rows.length ? tipRowsHtml(rows) : "";
 }
 let lastBuildLimitsHtml = "";
 function renderBuildLimits(limits) {
@@ -2615,7 +2617,7 @@ function renderWalk(d) {
     const labels = queueRowLabels(r);
     const idleCI = r.ci && visibleDetail(r) === "idle";
     const guest = guestRow(r);
-    const target = targetCell(r.machine, undefined, r.guest_unconfirmed ? "not confirmed" : "");
+    const target = targetCell(r.machine, undefined, r.guest_unconfirmed === true ? "not confirmed" : r.guest_unconfirmed);
     cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
       r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens, r.last_move);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +

@@ -13,7 +13,9 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
-// Use --queue-rows to capture the dark queue card and its tooltips. The fourth argument selects the older page.
+// Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
+// Use the fourth argument to select the older page.
+// Use --guest-tip after the output folder for the guest row tooltip screenshot.
 // Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
 // Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
 // Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
@@ -63,12 +65,32 @@ const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
+const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || standingProof;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
 const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU','Moved'];
+
+function waitForMoveHandle(evaluate, rowId) {
+  return evaluate(`new Promise((resolve, reject) => {
+    const walk = document.querySelector('#walk');
+    const selector = '.queue-grip[data-move-id="' + CSS.escape(${JSON.stringify(rowId)}) + '"]';
+    if (walk.querySelector(selector)) return resolve(true);
+    const observer = new MutationObserver(() => {
+      if (!walk.querySelector(selector)) return;
+      observer.disconnect();
+      clearTimeout(timeout);
+      resolve(true);
+    });
+    const timeout = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error('The waiting row has no move handle: ' + selector));
+    }, 3000);
+    observer.observe(walk, {childList:true, subtree:true});
+  })`);
+}
 
 // nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
 // on the served reading, which has rows in the shape of the live feed. The path names the page to check.
@@ -259,8 +281,9 @@ try {
     : JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const base = readings.good;
   const queueShot = queueRowsProof && !beforePage;
+  const liveFixtureTime = queueShot || guestTipProof;
   const fixtureTime = approvedAwsCostShot ? Date.parse('2026-11-23T20:00:00Z') / 1000
-    : queueShot ? Math.floor(Date.now() / 1000) : base.read_at;
+    : liveFixtureTime ? Math.floor(Date.now() / 1000) : base.read_at;
   const clockTime = liveAwsCostSource ? Date.now() : fixtureTime * 1000;
   if (liveAwsCostSource) {
     base.report = JSON.parse(await readFile(join(liveAwsCostSource, 'report.json'), 'utf8'));
@@ -281,7 +304,7 @@ try {
         for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
       }
       for (const waiter of reading.waiters) waiter.since += shift;
-      if (queueShot) reading.fresh_until += shift;
+      if (liveFixtureTime) reading.fresh_until += shift;
       reading.read_at = fixtureTime;
     }
     base.waiters = structuredClone(readings.spacing.waiters);
@@ -706,13 +729,14 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
-        if (queueRowsProof || !focusedProof) {
+        if (queueRowsProof || guestTipProof || !focusedProof) {
           // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it. The Machine column
           // shows icons: one bright icon where a step runs, and one dim icon for each machine that can take a waiting step.
           // The gate checks these rows too; only --queue-rows takes the shot.
           // A fourth argument names a published page to shoot as the before view.
           // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
           const shootBefore = queueRowsProof && beforePage;
+          const guestTipShot = join(folder, 'guesttip-dark-4.png');
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
@@ -722,7 +746,8 @@ try {
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
           const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
-            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'guest-attempt'},
+            changes:'report/keep-all-long-tooltip-values-inside-the-builds-page-at-desktop-and-narrow-widths',
+            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'82ba556d347749b08184ad3ab38ea22a'},
             targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
@@ -750,28 +775,19 @@ try {
             reading.move_line = {revision:reading.move_revision, members:[waiting.move], kept_runs:['proof-kept']};
           }
           reading.queued_priority_units = [];
+          if (guestTipProof) {
+            guest.started_at = reading.read_at - 4 * 60;
+            reading.walk[2] = {...mac, started_at:reading.read_at - 3 * 60, read_at:reading.read_at};
+            waiting.since = reading.read_at - 90;
+            await call('Emulation.setTimezoneOverride', {timezoneId:'America/Los_Angeles'});
+          }
           servedReading = reading;
           const navigateQueueRows = async width => {
             const showHandle = !shootBefore && width === 1440;
             // The narrow layout checks use the read-only view.
             queueFixture = showHandle ? reading : null;
             await navigate(shootBefore ? 'before.html' : 'memory_live.html');
-            if (showHandle) await evaluate(`new Promise((resolve, reject) => {
-              const walk = document.querySelector('#walk');
-              const ready = () => walk.querySelector('.queue-grip[data-move-id="shot-admin-console"]');
-              if (ready()) return resolve(true);
-              const observer = new MutationObserver(() => {
-                if (!ready()) return;
-                observer.disconnect();
-                clearTimeout(timeout);
-                resolve(true);
-              });
-              const timeout = setTimeout(() => {
-                observer.disconnect();
-                reject(new Error('The waiting row has no move handle.'));
-              }, 3000);
-              observer.observe(walk, {childList:true, subtree:true});
-            })`);
+            if (showHandle) await waitForMoveHandle(evaluate, waiting.move.row_id);
           };
           const machineGraphics = {
             'natedev':['🐧', null],
@@ -879,6 +895,77 @@ try {
               assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
                 'The mac-linux icon has no mac color.');
               if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+              if (width >= 900) {
+                const pointer = await evaluate(`(() => {
+                  const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                  icon.scrollIntoView({block:'center',inline:'nearest'});
+                  const box = icon.getBoundingClientRect();
+                  return {x:box.left + box.width/2, y:box.top + box.height/2};
+                })()`);
+                await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+                const hover = await evaluate(`(() => {
+                  const tooltip = document.querySelector('#tip.on > .tip');
+                  const box = tooltip.getBoundingClientRect();
+                  const viewport = document.documentElement;
+                  const range = document.createRange();
+                  const clipped = Array.from(tooltip.children).filter(cell => {
+                    range.selectNodeContents(cell);
+                    const bounds = cell.getBoundingClientRect();
+                    return [...range.getClientRects()].some(rect =>
+                      rect.left < Math.max(box.left, bounds.left) - 1 || rect.right > Math.min(box.right, bounds.right) + 1
+                      || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1);
+                  }).map(cell => cell.textContent);
+                  const labels = [...tooltip.querySelectorAll('dt')];
+                  const fields = Object.fromEntries(labels.map(cell => [cell.textContent, cell.nextElementSibling.textContent]));
+                  range.selectNodeContents(labels.find(cell => cell.textContent === 'Changes').nextElementSibling);
+                  const changesLines = range.getClientRects().length;
+                  const card = document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  const left = Math.min(card.left, box.left), top = Math.min(card.top, box.top);
+                  const right = Math.max(card.right, box.right), bottom = Math.max(card.bottom, box.bottom);
+                  return {fields, clipped, changesLines,
+                    visible:box.left >= 0 && box.right <= viewport.clientWidth
+                      && box.top >= 0 && box.bottom <= viewport.clientHeight,
+                    clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+                })()`);
+                assert.equal(hover.fields.Changes, guest.changes);
+                assert.ok(hover.changesLines > 1, `Changes does not wrap at ${width} px.`);
+                assert.equal(hover.fields.Showrunner, guest.showrunner);
+                assert.equal(hover.fields['Runs on'], guest.machine);
+                assert.ok(hover.visible, `The guest row tooltip is outside the viewport at ${width} px.`);
+                assert.deepEqual(hover.clipped, [], `The guest row tooltip clips text at ${width} px.`);
+                if (guestTipProof && width === 1440) {
+                  const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:hover.clip});
+                  await writeFile(guestTipShot, Buffer.from(shot.data,'base64'));
+                }
+                await evaluate('hideTip()');
+              }
+              if (width === 1440) {
+                const {guest_run:_guestRun, ...pending} = guest;
+                pending.pid = {kind:'PidNotRecorded'};
+                pending.vcpus = {kind:'UnknownCpuCount'};
+                const guestStates = [
+                  {...pending, guest_unconfirmed:'starting'},
+                  {...pending, guest_unconfirmed:'not confirmed'},
+                  guest,
+                ];
+                const guestCells = await evaluate(`(() => {
+                  const data = latest;
+                  const cells = ${JSON.stringify(guestStates)}.map(state => {
+                    renderWalk({...data, walk:data.walk.map(row => row.key === state.key ? state : row)});
+                    const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                    const machine = row.querySelector('td.machine');
+                    return [machine.querySelector('.machine-icon.run')?.dataset.machine, machine.textContent.trim(),
+                      row.querySelector('td.pid').textContent, row.querySelector('td.vcpus').textContent];
+                  });
+                  renderWalk(data);
+                  return cells;
+                })()`);
+                assert.deepEqual(guestCells, [
+                  ['mac-linux','starting','—','—'],
+                  ['mac-linux','not confirmed','—','—'],
+                  ['mac-linux','',String(guest.pid),String(guest.vcpus)],
+                ]);
+              }
             }
             if (queueRowsProof) {
               const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);
@@ -904,6 +991,10 @@ try {
               }
             }
           }
+          if (guestTipProof) {
+            console.log(JSON.stringify({pass:true,shot:guestTipShot,captureClock:new Date(fixtureTime * 1000).toISOString()}));
+            break browserProof;
+          }
           // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
           // scrollbars, so one more load shows them. At 1440 px the sideways scroll box has no scrollbar and no overflow.
           await call('Emulation.setScrollbarsHidden', {hidden:false});
@@ -924,6 +1015,62 @@ try {
             }
             if (!shootBefore) assert.deepEqual(scroll.bars, {right:0, bottom:0, down:0, sideways:0},
               'The Running/Queued scroll box shows a scrollbar.');
+            if (!shootBefore) {
+              const pointer = await evaluate(`(() => {
+                const style = document.createElement('style');
+                style.textContent = 'html { overflow-y: scroll; } html::-webkit-scrollbar { width: 15px; }';
+                document.head.append(style);
+                const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                icon.scrollIntoView({block:'center', inline:'nearest'});
+                const box = icon.getBoundingClientRect();
+                return {x:box.left+box.width/2, y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+              const before = await evaluate("document.querySelector('#tip.on > .tip').getBoundingClientRect().toJSON()");
+              await call('Emulation.setDeviceMetricsOverride', {width:390,height:300,deviceScaleFactor:1,mobile:false});
+              const resized = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const viewport = document.documentElement;
+                const box = document.querySelector('#tip.on > .tip');
+                return {box:box.getBoundingClientRect().toJSON(), viewport:{width:viewport.clientWidth,height:viewport.clientHeight},
+                  innerWidth, overflow:box.scrollHeight-box.clientHeight, key:tips.key()};
+              })()`);
+              const {box, viewport} = resized;
+              assert.equal(resized.key, 'row:shot-guest');
+              assert.ok(before.right > viewport.width && box.left < before.left,
+                'The tooltip did not move after resize with a stationary pointer.');
+              assert.ok(resized.innerWidth > viewport.width, 'The proof needs a classic scrollbar.');
+              assert.ok(box.left >= 8 && box.right <= viewport.width-8, 'The tooltip exceeds the visible width.');
+              assert.ok(box.top >= 8 && box.bottom <= viewport.height-8, 'The tooltip exceeds the visible height.');
+              assert.ok(resized.overflow > 0, 'The tooltip has no content below its visible area.');
+
+              const rowPoint = await evaluate(`(() => {
+                const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                row.scrollIntoView({block:'center', inline:'nearest'});
+                const bounds = row.getBoundingClientRect();
+                const x = Math.max(bounds.left, ${box.left}) + 12;
+                const y = bounds.top + bounds.height/2;
+                row.addEventListener('click', () => { row.dataset.proofClicked = 'yes'; }, {once:true});
+                return {x, y};
+              })()`);
+              assert.ok(rowPoint.x > box.left && rowPoint.x < box.right && rowPoint.y > box.top && rowPoint.y < box.bottom,
+                'The guest row click is outside the tooltip.');
+              const click = async point => {
+                await call('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
+                await call('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+              };
+              await click(rowPoint);
+              assert.equal(await evaluate(`document.querySelector('tr[data-tip="row:shot-guest"]').dataset.proofClicked`),
+                'yes', 'The tooltip blocks the guest row click.');
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'The trigger click did not close the tooltip.');
+
+              await click(rowPoint);
+              assert.deepEqual(await evaluate("[tips.key(), getComputedStyle(document.querySelector('#tip')).pointerEvents]"),
+                ['row:shot-guest', 'none'], 'The click should open a pointer-transparent tooltip.');
+              await call('Input.dispatchKeyEvent', {type:'keyDown', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              await call('Input.dispatchKeyEvent', {type:'keyUp', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'Escape did not close the tooltip.');
+            }
           } finally {
             queueFixture = null;
             await call('Emulation.setScrollbarsHidden', {hidden:true});
@@ -985,15 +1132,7 @@ try {
         servedReading = queueFixture;
         await navigate('memory_live.html');
         await evaluate('window.render = window.renderReading; true');
-        await evaluate(`new Promise(resolve => {
-          const walk = document.querySelector('#walk');
-          const ready = () => walk.querySelector('[data-move-id="typesafe"]');
-          if (ready()) return resolve(true);
-          const observer = new MutationObserver(() => {
-            if (ready()) { observer.disconnect(); resolve(true); }
-          });
-          observer.observe(walk, {childList:true, subtree:true});
-        })`);
+        await waitForMoveHandle(evaluate, 'typesafe');
         const snapshot = () => evaluate(`({
           handles:[...document.querySelectorAll('.queue-grip')].map(button => button.dataset.moveId),
           lifted:document.querySelector('.wrow.queue-lift .queue-grip')?.dataset.moveId,

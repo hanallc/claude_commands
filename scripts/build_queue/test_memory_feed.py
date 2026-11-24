@@ -1,6 +1,7 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
@@ -39,7 +40,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
-from scripts.build_targets import build_targets, target_config, targets
+from scripts.build_targets import build_targets, mac_linux, target_config, targets
 from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import (
@@ -66,6 +67,8 @@ from scripts.mac_test.claim_state import RepositoryScope
 
 REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
+FIXTURE_GUEST_REPORT_SECONDS = 2
+FIXTURE_GUEST_START_LIMIT = mac_linux.TRANSFER_ALLOWANCE_SECONDS + FIXTURE_GUEST_REPORT_SECONDS
 UNIT_LABELS_FOR = unit_labels.unit_labels_for
 STEVIE = Path("/fixture/bin/stevie")
 FIXTURE_MACHINE = "fixture"
@@ -453,6 +456,8 @@ class MemoryFeedTests(unittest.TestCase):
         write_private_slot_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
+        _ = write_config_fixture(self.root / "build_admission.conf",
+                                 f"query_timeout_seconds={FIXTURE_GUEST_REPORT_SECONDS}\n")
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
@@ -782,7 +787,7 @@ class MemoryFeedTests(unittest.TestCase):
         _tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row["key"]}" tabindex="0"'), 1)
 
-    def guest_gate_page(self) -> memory_feed.MemoryPage:
+    def guest_gate_page(self, *, unconfirmed_age: float = FIXTURE_GUEST_START_LIMIT) -> memory_feed.MemoryPage:
         base = captured_reading()
         now = base.explanation.now
         guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
@@ -793,7 +798,7 @@ class MemoryFeedTests(unittest.TestCase):
             counter=progress_profile.ProgressCounter("modules", 7, 12),
             placement_candidates=gate_candidates(placement.AllowedHost()))
         # The queue names no Mac placement for an unconfirmed guest attempt.
-        pending = replace(guest, pid=8201, started_at=now - 20, mac_placement="", confirmed_guest_run=None,
+        pending = replace(guest, pid=8201, started_at=now - unconfirmed_age, mac_placement="", confirmed_guest_run=None,
                           execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
         running = (guest, pending)
         explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
@@ -808,16 +813,29 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
             return memory_feed.reading()
 
+    def test_guest_gate_is_starting_just_before_the_start_report_limit(self) -> None:
+        page = self.guest_gate_page(unconfirmed_age=FIXTURE_GUEST_START_LIMIT - 0.001)
+        pending = next(row for row in page["walk"] if row["pid"] == 8201)
+        self.assertEqual(pending.get("guest_unconfirmed"), "starting")
+        self.assertNotIn("guest_run", pending)
+
+    def test_guest_gate_is_not_confirmed_at_the_start_report_limit(self) -> None:
+        page = self.guest_gate_page(unconfirmed_age=FIXTURE_GUEST_START_LIMIT)
+        pending = next(row for row in page["walk"] if row["pid"] == 8201)
+        self.assertEqual(pending.get("guest_unconfirmed"), "not confirmed")
+        self.assertNotIn("guest_run", pending)
+
     def test_guest_gate_rows_show_on_mac_linux_with_the_confirmed_attempt_or_not_confirmed(self) -> None:
         page = self.guest_gate_page()
         row = next(row for row in page["walk"] if row["pid"] == 8200)
         self.assertEqual(row.get("guest_run"), {"target": "mac-linux", "attempt": "guest-attempt"})
+        self.assertNotIn("guest_unconfirmed", row)
         self.assertEqual((row.get("machine"), row.get("state")), ("mac-linux", "running"))
         self.assertFalse(any(other["pid"] == 8202 for other in page["walk"]))
         unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
         self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
-                         ("mac-linux", True, "running"))
+                         ("mac-linux", "not confirmed", "running"))
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
@@ -869,7 +887,7 @@ class MemoryFeedTests(unittest.TestCase):
             page = memory_feed.reading()
         remote = [row for row in page["walk"] if row.get("keep_text") == "remote memory is unavailable"]
         guest = next(row for row in remote if row["started_at"] == consumed.started_at)
-        self.assertEqual((guest.get("machine"), guest.get("guest_unconfirmed")), ("mac-linux", True))
+        self.assertEqual((guest.get("machine"), guest.get("guest_unconfirmed")), ("mac-linux", "starting"))
         self.assertNotIn("guest_run", guest)
         waiting = next(row for row in remote if row["started_at"] == 0)
         self.assertEqual(waiting.get("machine"), "linux-guest")
@@ -884,7 +902,7 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
         # The Machine cell shows the bright guest icon and the confirmation status.
         self.assertIn('class="machine machine-icon run" data-machine="mac-linux"', table)
-        self.assertIn("</svg></span> not confirmed</td>", table)
+        self.assertIn("</svg></span> starting</td>", table)
         text = "\n".join(tips["walk"][page["walk"].index(guest)])
         self.assertIn("Runs on  mac-linux", text)
         self.assertIn("Testing  2 of 5 modules", text)
@@ -1642,7 +1660,7 @@ process.stdout.write(JSON.stringify({
                 payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 # The shared browser test sets the data time for each response.
                 del payload["fresh_until"]
-                test_page_frame.assert_status_states(self, page, seconds, payload)
+                assert_status_states(self, page, seconds, payload)
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -4105,7 +4123,7 @@ const refresh = createPageRefresh(tick);
                 with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
                     page = memory_feed.reading()
-                names_read.assert_called_once_with(self.root / "buildlog" / "admission")
+                names_read.assert_called_once_with()
                 self.assertEqual(page["walk"][0]["name"],
                     queue_lines.step_text(reading.view.running[0], read_step_names()))
                 self.assertEqual(page["waiters"][0]["name"],

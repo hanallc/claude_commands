@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import unittest
 from typing import cast
@@ -13,7 +14,9 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import target_config
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS as TARGETS, RUNNER as RUNNER
+from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyCallShellTests(unittest.TestCase):
@@ -53,6 +56,73 @@ printf '%s\n' "$VERIFY_CALL_TEXT"
 
 
 class VerifyStepRoutesTests(VerifyStepRoutesFixture):
+    def test_verb_list_runs_in_order_with_one_run_identity(self) -> None:
+        git = shutil.which("git")
+        assert git is not None
+        stub = self.fixture.bin_directory / "git"
+        stub.unlink()
+        stub.symlink_to(git)
+        git_config = self.fixture.root / "git-config"
+        _ = git_config.write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /nonexistent/fixture-gpg\n")
+        self.fixture.environment.update({"GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1"})
+        _ = subprocess.run([git, "init", "-q", "-b", "main"], cwd=self.fixture.root,
+                           env=self.fixture.environment, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(self.fixture.root, "fixture", "Cargo.toml", "src", env=self.fixture.environment)
+        _ = (self.fixture.root / ".git/info/exclude").write_text("/*\n!/Cargo.toml\n!/src/\n")
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        previous = admission.server.handle_request
+        requests: dict[str, wire.PlacementRequest] = {}
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                _ = requests.setdefault(request.identity.step, request)
+            return previous(request, connection)
+
+        metadata = cast(dict[str, object], json.loads(self.fixture.environment["TEST_METADATA"]))
+        metadata["target_directory"] = str(self.fixture.root / "target")
+        self.fixture.environment["TEST_METADATA"] = json.dumps(metadata)
+        self.fixture.environment["BUILDLOG_OFF"] = "0"
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("test,lint,doc", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(requests), ["nextest", "mend", "clippy", "doc"])
+        run = requests["nextest"].run
+        self.assertIsInstance(run, wire.RunIdentity)
+        assert isinstance(run, wire.RunIdentity)
+        self.assertEqual([requests[step].run for step in ("mend", "clippy")], [run, run])
+        # Doc has its own slot, so it can leave its grant without a memory handoff.
+        self.assertEqual(requests["doc"].run, wire.NO_RUN)
+        rows = cast(list[dict[str, object]], self.fixture.call_records())
+        self.assertEqual([row["verb"] for row in rows], ["test", "lint", "doc"])
+        self.assertEqual([row.get("run_id") for row in rows], [f"{run.pid}:{run.start_time}"] * 3)
+        self.assertEqual(len({row["id"] for row in rows}), 3)
+        self.assert_removed()
+
+    def test_verb_list_prepares_only_the_first_requested_step(self) -> None:
+        request_path = self.fixture.root / "request.json"
+        self.fixture.environment.update({
+            "BUILDLOG_FIRST_STEP_REQUEST": str(request_path),
+            "BUILDLOG_FIRST_STEP_EPISODE": "first-verb",
+            "BUILDLOG_FIRST_STEP_SINCE": "1",
+        })
+        result = self.run_verify("test,lint", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        request = wire.parse_request(request_path.read_text())
+        assert isinstance(request, wire.PlacementRequest)
+        self.assertEqual((request.episode, request.identity.step), ("first-verb", "nextest"))
+        self.assertEqual(self.mac_rows(), [])
+        self.assert_removed()
+
+    def test_verb_list_stops_at_the_first_failure_and_returns_its_status(self) -> None:
+        self.fixture.environment.update({"TEST_MAC_ALLOWED": "0", "TEST_LOCAL_STATUS": "41"})
+        result = self.run_verify("test,lint,doc", "sample")
+        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
+        steps = [event["args"] for event in self.fixture.cargo_events()]
+        self.assertEqual(sum(args[:2] == ["nextest", "run"] for args in steps), 1)
+        self.assertTrue(all(args[0] in ("metadata", "nextest") for args in steps), steps)
+        self.assert_removed()
+
     def test_check_uses_mac_during_hold_and_removes_record(self) -> None:
         result = self.run_verify("check", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
