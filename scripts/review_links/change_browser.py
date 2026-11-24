@@ -9,12 +9,12 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
@@ -23,6 +23,7 @@ from scripts.production import change_review, change_routing, next_item, staff, 
 from scripts.production.production_doc import Production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
+from scripts.rebuild import need
 from scripts.review_links import change_page, console, new_item_dialog, page_frame, question_record, review_events, review_items, staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
@@ -503,16 +504,17 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 
 @dataclass(frozen=True)
 class Rebuild:
-    """One change that a machine's rebuild applies: its time, its owner and its reason."""
+    """One entry with its time, owner, and text."""
 
     at: str
     owner: str
-    reason: str
+    text: str
 
 
 def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
-                 record: staff.StaffSnapshot) -> str:
-    """Show each machine the status line names, then its changes under each owner and each shown time."""
+                 record: staff.StaffSnapshot, completed: tuple[need.CompletedNeedRecord, ...] = (),
+                 damaged: Iterable[str] = ()) -> str:
+    """Show waiting machines and completed requests."""
     def who(session: str) -> str:
         member = record.by_member_reference(session) if session else None
         return (f"{member.name} ({member.kind})" if member is not None
@@ -523,29 +525,52 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
     for machine_name, name in zip(answer.machines, names):
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
         filed = {item["nixos_commit"] for item in records}
-        # A filed need and its commit are one change; the need gives the requester and the reason.
-        items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]), item["reason"])
+        items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]),
+                         item["reason"].strip() or need.NO_REASON)
                  for item in records]
-        items += [Rebuild(change.at, who(change.session), change.reason)
-                  for change in changes.get(machine_name, ()) if change.commit not in filed]
-        listed = owner_groups(items, staff_names.StaffNames(record)) if items else '<p>The change list is not available yet.</p>'
+        commits = [Rebuild(change.at, who(change.session), change.reason)
+                   for change in changes.get(machine_name, ()) if change.commit not in filed]
+        staff_names_by_reference = staff_names.StaffNames(record)
+        listed = owner_groups(items, staff_names_by_reference)
+        if commits:
+            listed += '<section class="rebuild-commits"><h3>Commits</h3>' + owner_groups(
+                commits, staff_names_by_reference, heading="h4") + '</section>'
+        if not listed:
+            listed = '<p>The change list is not available yet.</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
+    if not blocks:
+        blocks.append('<p>No rebuilds needed.</p>')
+    if completed:
+        names_by_reference = staff_names.StaffNames(record)
+        history: list[str] = []
+        for item in completed:
+            at = need.completion_time(item)
+            requester = who(item["requested_by"] or item["concerns"])
+            metadata = names_by_reference.html(requester)
+            words = html.escape(item["reason"].strip() or need.NO_REASON)
+            history.append(f'<li>{words}<small>{html.escape(item["machine"])} · {metadata} · '
+                           + f'<time datetime="{at.isoformat()}">{shown_time(at)}</time></small></li>')
+        blocks.append('<section class="rebuild-history"><h2>Completed requests</h2><ul>'
+                      + ''.join(history) + '</ul></section>')
+    blocks.extend(f'<p class="rebuild-history" role="status">Cannot read completed request {html.escape(name)}.</p>'
+                  for name in damaged)
     return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
-            + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
+            + ''.join(blocks) + '</div>')
 
 
 def owner_groups(items: list[Rebuild],
-                 names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
-    """Name each owner once, newest change first; under an owner, changes at one shown time share that time."""
+                 names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT,
+                 *, heading: Literal["h3", "h4"] = "h3") -> str:
+    """Group entries by owner and time, newest first."""
     owners: dict[str, dict[str, list[Rebuild]]] = {}
     names = names if isinstance(names, staff_names.StaffNames) else staff_names.read()
-    for item in sorted(items, key=lambda item: datetime.fromisoformat(item.at), reverse=True):
-        owners.setdefault(item.owner, {}).setdefault(shown_time(datetime.fromisoformat(item.at)), []).append(item)
+    for item in sorted(items, key=lambda item: need.request_time(item.at), reverse=True):
+        owners.setdefault(item.owner, {}).setdefault(shown_time(need.request_time(item.at)), []).append(item)
     return ''.join(
-        f'<div data-owner><h3>{names.html(owner)}</h3><dl>'
+        f'<div data-owner><{heading}>{names.html(owner)}</{heading}><dl>'
         + ''.join(f'<dt><time datetime="{html.escape(group[0].at, quote=True)}">{html.escape(shown)}</time></dt>'
-                  + ''.join(f'<dd>{html.escape(item.reason)}</dd>' for item in group)
+                  + ''.join(f'<dd>{html.escape(item.text)}</dd>' for item in group)
                   for shown, group in times.items())
         + '</dl></div>' for owner, times in owners.items())
 
@@ -554,16 +579,24 @@ def owner_groups(items: list[Rebuild],
 REBUILD_STYLE = """<style>main{max-width:1124px}
 [data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
 [data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
+[data-rebuilds] h4{font-size:15px;line-height:1.3;margin:16px 0 8px}
 [data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
 [data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;margin:0;min-width:0;overflow-wrap:anywhere}
 [data-rebuilds] dd+dt,[data-rebuilds] dd+dt+dd{padding-top:8px}
+.rebuild-history{grid-column:1/-1;overflow-wrap:anywhere}
+.rebuild-history ul{list-style:none;margin:0;padding:0}
+.rebuild-history li{margin-top:12px}
+.rebuild-history small{display:block;color:var(--ink-3)}
 @media (max-width:480px){[data-rebuilds] dl{display:block}[data-rebuilds] dd+dt{padding-top:12px}[data-rebuilds] dd+dt+dd{padding-top:0}}</style>"""
 
 
 def render_rebuilds() -> bytes:
     """Render the status line's rebuild answer for the console's rebuild link and Rebuilds page."""
     config = conf.path("statusline")
-    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
+    damaged: list[str] = []
+    completed = need.read_completed_needs(damaged)
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot(),
+                            completed, damaged)
     return change_page.document(REBUILD_STYLE + '<h1 class="page-title">Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
@@ -735,14 +768,15 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
 
 def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
                          outcome: change_page.QuestionOutcome, words: str,
-                         verify_revision: Callable[[], object] | None = None) -> None:
+                         save: ExactQuestionSave | SelectedQuestionSave, *,
+                         before_write: Callable[[], None]) -> None:
     """Validate and write one canonical question under its owner's lock."""
     path = update_registration.outstanding_path(production)
     superseded = ''
     with update_registration.outstanding_lock(path):
-        if verify_revision is not None:
-            _ = verify_revision()
-        records = update_registration.selected_question_records([question.record.path], (), None)
+        if isinstance(save, ExactQuestionSave):
+            _ = save.verify_revision()
+        records = update_registration.selected_question_records([question.record.path], (), None, owner=question.owner)
         if not records or records[0].owner != question.owner or records[0].status != 'open':
             raise review_items.ReviewRecordChanged('This question is no longer open.')
         current = records[0]
@@ -750,7 +784,7 @@ def save_question_record(production: update_registration.QuestionScope, question
         pending = item.get('followup')
         if pending != question.record.item.get('followup'):
             raise review_items.ReviewRecordChanged('The follow-up on this question changed.')
-        if item != question.record.item:
+        if current != question.record:
             raise review_items.ReviewRecordChanged('This question changed. Check it again before saving.')
         now = datetime.now(production.zone)
         events = review_events.decode(item.get('review_log', ''))
@@ -770,7 +804,7 @@ def save_question_record(production: update_registration.QuestionScope, question
         label = 'feedback sent' if outcome == 'feedback' else outcome
         item['review_log'] = review_events.encode(review_events.append(
             events, review_events.ReviewLog(now.astimezone(user_zone()), 'nate', label+': '+words)))
-        update_registration.write_question_record(current)
+        update_registration.write_question_record(current, assign_id=True, before_write=before_write)
         if current.status == 'closed':
             with review_items.after_store_write(question.key):
                 update_registration.record_answer(path, production.name, item, now)
@@ -780,10 +814,30 @@ def save_question_record(production: update_registration.QuestionScope, question
                                            superseded, None, False)
 
 
+@dataclass(frozen=True)
+class ExactQuestionSave:
+    """Save the selected question after its revision check."""
+
+    verify_revision: Callable[[], object]
+
+
+@dataclass(frozen=True)
+class SelectedQuestionSave:
+    """Save a Question selected without a page snapshot."""
+
+
+@dataclass(frozen=True)
+class QuestionQueueSave:
+    """Save a question through its production queue."""
+
+
+QUESTION_QUEUE_SAVE = QuestionQueueSave()
+
+
 def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
                     status: change_page.DeliveryStatus, *,
-                    exact_record: bool = False,
-                    verify_revision: Callable[[], object] | None = None) -> tuple[change_page.MessageDelivery, str]:
+                    save: ExactQuestionSave | SelectedQuestionSave | QuestionQueueSave = QUESTION_QUEUE_SAVE
+                    ) -> tuple[change_page.MessageDelivery, str]:
     """Save through the production API before the existing sender delivers the message to the asker."""
     if question.tab == "unrouted":
         raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
@@ -797,7 +851,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
                     import_module("scripts.review_links.review_actions").sent_question_action)
         return send(
             current, question.record, production, "question" if outcome == "followup" else outcome, words, status,
-            verify_revision=verify_revision)
+            verify_revision=save.verify_revision if isinstance(save, ExactQuestionSave) else None)
     relay = update_registration.answer_relay(production, production.name,
         update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
     recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
@@ -811,26 +865,31 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     page = change_page.UserQuestionPage(question.record.path, document, (question.record.path.stem,), "", saved)
     # The delivery lock prevents startup recovery from reading an answer during its save.
     with status.locked():
-        if not exact_record and frontmatter(question.record.path).get("status") != ["open"]:
+        if isinstance(save, QuestionQueueSave) and frontmatter(question.record.path).get("status") != ["open"]:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
         previous_page = status.metadata_page(page)
         previous_slots = status.slots(page, page.rows[0])
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
         slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
-        status.write_slots(page, page.rows[0], slots)
-        status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+
+        def claim_delivery() -> None:
+            status.write_slots(page, page.rows[0], slots)
+            status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
+
         try:
-            if exact_record:
-                save_question_record(production, question, outcome, words, verify_revision)
+            if not isinstance(save, QuestionQueueSave):
+                save_question_record(production, question, outcome, words, save, before_write=claim_delivery)
             else:
+                claim_delivery()
                 relay = save_outcome(production, question, outcome, words, identities)
         except BaseException as error:
             try:
-                if exact_record:
-                    status.write_slots(previous_page, page.rows[0], previous_slots)
-                else:
-                    status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
+                if attempt in status.request_attempts:
+                    if not isinstance(save, QuestionQueueSave):
+                        status.write_slots(previous_page, page.rows[0], previous_slots)
+                    else:
+                        status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
             finally:
                 _ = status.request_attempts.pop(attempt, None)
             if isinstance(error, update_registration.RegistrationFailure):
@@ -841,7 +900,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         intent = replace(intent, recipients=(recipient,))
         page = replace(page, saved={**saved, "saved": True})
         status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
-        if not exact_record and outcome != "skip":
+        if isinstance(save, QuestionQueueSave) and outcome != "skip":
             with review_items.after_store_write(question.key):
                 update_registration.record_review_log(question.record.path,
                     ('feedback sent' if outcome == 'feedback' else outcome)+": "+words, owner=question.owner)

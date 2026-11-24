@@ -12,7 +12,7 @@ import subprocess
 import sys
 from typing import cast
 
-from scripts.lib import land_main, main_push_lock, waiting_rows
+from scripts.lib import conf, land_main, main_push_lock, waiting_rows
 from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -218,6 +218,19 @@ def ssh(remote: str, *, ssh_program: str, host: str = "mac",
         return str(error)
 
 
+def forward(script: str, arguments: list[str], *, label: str, ssh_program: str) -> int:
+    """Run a ~/.claude/scripts command on natedev with these arguments and pass on its output and exit."""
+    command = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/{script}" ' + shlex.join(arguments)
+    limit = CommandTimeLimit(conf.read_or_repository("live_settings").whole("natedev_forward_seconds"))
+    done = ssh(command, ssh_program=ssh_program, host="natedev", time_limit=limit)
+    if isinstance(done, str):
+        print(f"{label}: natedev: {done}", file=sys.stderr)
+        return 1
+    print(done.stdout, end="")
+    print(done.stderr, end="", file=sys.stderr)
+    return done.returncode
+
+
 def remote_path(path: PurePosixPath) -> str:
     """Quote a Mac path and let the Mac expand its home directory."""
     text = str(path)
@@ -255,7 +268,7 @@ def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_M
 def queue_path() -> Path:
     state = os.environ.get("ZONE_STATE") or str(
         Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "zone")
-    return Path(state) / "mac.json"
+    return Path(state).absolute() / "mac.json"
 
 
 def read_queue() -> PendingMacPull | NoPendingMacPull:

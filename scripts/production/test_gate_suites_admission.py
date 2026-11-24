@@ -1,4 +1,4 @@
-"""Merge gate suites contracts."""
+"""Test the gate suite runner."""
 
 from __future__ import annotations
 
@@ -125,16 +125,18 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         self.assert_gate_released()
 
     def test_suites_refuse_unwritable_memory_parent_before_admission(self) -> None:
+        gate_root = self.root
         access = os.access
 
         def writable(path: str | os.PathLike[str], mode: int) -> bool:
-            return False if Path(path) == build_folders.tmpfs_temporary_parent() else access(path, mode)
+            return False if Path(path) == gate_root else access(path, mode)
 
         with mock.patch.dict(os.environ, self.environment), \
+             mock.patch.object(build_folders, "configured_gate_root", return_value=gate_root), \
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(gate, "gate_reservation") as admission:
             with self.assertRaisesRegex(GateRefused,
-                                        f"requires a writable gate folder at {build_folders.tmpfs_temporary_parent()}"):
+                                        f"requires a writable gate folder at {gate_root}"):
                 _ = gate.run_suites(self.checkout)
             admission.assert_not_called()
         self.assert_gate_released()
@@ -155,7 +157,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         foreign.mkdir()
         (tmpfs / "foreign.lock").touch()
         with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=tmpfs),
+              mock.patch.object(build_folders, "configured_gate_root", return_value=tmpfs),
               mock.patch.object(gate, "gate_reservation", side_effect=GateRefused("stopped at admission")),
               redirect_stderr(io.StringIO()) as report):
             with self.assertRaisesRegex(GateRefused, "stopped at admission"):
@@ -297,8 +299,9 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             def held(reply: wire.Wait) -> None:
                 waits.append(reply)
                 on_wait(reply)
-                fixture.proc.kill(older.owner)
-                fixture.free(60 * admission_records.GIB)
+                with fixture.loop_turn():
+                    fixture.proc.kill(older.owner)
+                    fixture.free(60 * admission_records.GIB)
             return admit(request, held, refresh, _attempt=_attempt)
 
         with mock.patch.dict(os.environ, self.environment), \
@@ -306,7 +309,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with gate.gate_reservation(self.checkout, self.state, gate.BuildHoldWait()):
                 pass
-        self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
+        self.assertIn("head older-step: nextest needs 0.4 GiB", output.getvalue())
         self.assertIsInstance(waits[0].reason, admission_records.BehindHead)
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
@@ -342,34 +345,51 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with fixture.loop_turn():
             busy = only_admitted(fixture.server.handle_request(fixture.request()))
             fixture.allow_next_start()
-        fixture.free(0)
-        profiles: list[admission_records.ProgramProfile] = []
-        identities: list[tuple[str, float, wire.Identity]] = []
+            fixture.free(0)
+        initial_requests: list[wire.AdmitRequest] = []
+        refreshed_requests: list[wire.AdmitRequest] = []
         admit = client.admit
+
         def acquire(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None], refresh: Callable[[], wire.AdmitRequest], *,
                     _attempt: Callable[[], None]) -> wire.Admitted | wire.Refused | client.LeftQueue:
+            initial_requests.append(request)
+            advanced = False
+
             def held(reply: wire.Wait) -> None:
+                nonlocal advanced
                 on_wait(reply)
-                self.assertIsInstance(request.profile, admission_records.ProgramProfile)
                 self.assertEqual(reply.snapshot.decision.state, "hold")
-                profiles.append(cast(admission_records.ProgramProfile, request.profile))
-                identities.append((request.episode, request.since, request.identity))
-                if len(profiles) == 1:
-                    fixture.clock.advance(admission_policy_fixture().timing.estimate_refresh_seconds + 1)
-                else:
-                    fixture.free(60 * admission_records.GIB)
-            result = admit(request, held, refresh, _attempt=_attempt)
-            profiles.append(cast(admission_records.ProgramProfile, request.profile))
-            return result
+                cause = reply.reason.cause if isinstance(reply.reason, admission_records.HeadAdmissionStatus) else reply.reason
+                if isinstance(cause, admission_records.EstimateExpired):
+                    with fixture.loop_turn():
+                        fixture.free(60 * admission_records.GIB)
+                elif not advanced:
+                    with fixture.loop_turn():
+                        fixture.clock.advance(admission_policy_fixture().timing.estimate_refresh_seconds + 1)
+                    advanced = True
+
+            def refreshed() -> wire.AdmitRequest:
+                updated = refresh()
+                refreshed_requests.append(updated)
+                return updated
+
+            return admit(request, held, refreshed, _attempt=_attempt)
+
         with mock.patch.object(client, "admit", side_effect=acquire), \
              mock.patch.object(client, "CLOCK", fixture.clock), \
              mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("gate inferred cargo")):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(profiles), 3)
-        self.assertEqual(len(set(identities)), 1)
-        for profile in profiles:
+        self.assertEqual(len(initial_requests), 1)
+        self.assertEqual(len(refreshed_requests), 1)
+        first, = initial_requests
+        refreshed, = refreshed_requests
+        self.assertEqual((refreshed.episode, refreshed.since, refreshed.identity, refreshed.owner),
+                         (first.episode, first.since, first.identity, first.owner))
+        for request in (first, refreshed):
+            profile = request.profile
             self.assertIsInstance(profile, admission_records.ProgramProfile)
+            assert isinstance(profile, admission_records.ProgramProfile)
             self.assertEqual((profile.step, profile.worktree), ("gate", str(self.checkout)))
             self.assertIsInstance(profile.sizing, admission_records.HistoryPeakSizing)
             assert isinstance(profile.sizing, admission_records.HistoryPeakSizing)
@@ -382,7 +402,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         with self.admission.loop_turn():
             busy = only_admitted(self.admission.server.handle_request(self.admission.request()))
             self.admission.allow_next_start()
-        self.admission.free(0)
+            self.admission.free(0)
         held: list[str] = []
         disconnected = threading.Event()
         disconnect = cast(Callable[[service.Connection], None], getattr(self.admission.server, "_disconnect"))
@@ -491,9 +511,10 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             assert_cap()
             kinds.append(kind)
             return started(suite, path, argv, repo, environment, log, kind=kind)
-        def finish(reservation: str, status: int, configuration: admission_records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+        def finish(reservation: str, status: int, configuration: admission_records.MemoryConfig | wire.CleanupTiming,
+                   ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
             assert_cap()
-            return release(reservation, status, configuration)
+            return release(reservation, status, configuration, ending)
         with mock.patch.object(gate, "start_gate_job", side_effect=start), \
              mock.patch.object(client, "release", side_effect=finish):
             result = self.run_gate("--tests-only")
@@ -560,7 +581,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
 
     def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
-            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
+            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1", "DETACHED_RUN_SLICE": ""}), \
                     mock.patch.object(queue, "in_builds_slice", return_value=False), \
                     mock.patch("scripts.production.gate.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:

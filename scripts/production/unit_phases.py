@@ -158,41 +158,67 @@ def eta_plan_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
     return display_cells.NONE
 
 
+class _PendingEta(NamedTuple):
+    at: datetime
+    stated: float
+    instance: str
+
+    def has_competing_attempt(self, instance: str, finished: set[str]) -> bool:
+        if self.instance:
+            return bool(instance) and instance != self.instance
+        return instance in finished
+
+
 def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str, ...], land: land_queue.LandView, *,
                      unit: str, now: float, zone: ZoneInfo, completed_phase_ids: tuple[str, ...] = ()) -> str:
     """Name promises with no later finish, sent work, or open row."""
-    targets: dict[str, tuple[datetime, float]] = {}
+    targets: dict[str, _PendingEta] = {}
     instances: dict[str, str] = {}
+    checkpoints: dict[str, dict[str, set[str]]] = {}
+    finished: set[str] = set()
     for event in events:
         kind = event.get("event_type")
-        instance = str(event.get("phase_instance_id", ""))
+        instance = pass_recorder.string(event.get("phase_instance_id"))
         phase_id = str(event.get("phase_id") or instances.get(instance, ""))
         if kind == "phase_started":
             instances[instance] = phase_id
+            if (promise := targets.get(phase_id)) is not None and not promise.instance:
+                targets[phase_id] = promise._replace(instance=instance)
         elif kind in ("phase_finished", "checkpoint"):
-            _ = targets.pop(phase_id, None)
+            if kind == "checkpoint" and (commit := pass_recorder.string(event.get("checkpoint_commit"))):
+                checkpoints.setdefault(phase_id, {}).setdefault(instance, set()).add(commit.lower())
+            promise = targets.get(phase_id)
+            if promise is not None and not promise.has_competing_attempt(instance, finished):
+                del targets[phase_id]
+            if kind == "phase_finished" and instance:
+                finished.add(instance)
         elif kind == "eta_stated":
             target = str(event.get("eta_phase_id", phase_id))
             at, stated = event.get("eta_at"), event.get("timestamp_epoch")
             if (target and target not in open_phase_ids and target not in completed_phase_ids
                     and isinstance(at, int | float)):
-                targets[target] = (datetime.fromtimestamp(at, UTC), float(stated) if isinstance(stated, int | float) else 0.0)
-    results: dict[str, float] = {}
+                targets[target] = _PendingEta(datetime.fromtimestamp(at, UTC),
+                                              float(stated) if isinstance(stated, int | float) else 0.0,
+                                              instance if target == phase_id else "")
     for result in land.results.values():
-        if result["unit"] != unit:
+        owner, phase_id, commit = checkpoint_result_key(result)
+        promise = targets.get(phase_id)
+        if owner != unit or promise is None:
+            continue
+        if any(promise.has_competing_attempt(instance, finished) and land_runs.holds(commits, commit)
+               for instance, commits in checkpoints.get(phase_id, {}).items()):
             continue
         try:
             at = datetime.fromisoformat(result["time"]).timestamp()
         except ValueError:
             continue
-        results[result["phase"]] = max(results.get(result["phase"], at), at)
+        if at > promise.stated:
+            del targets[phase_id]
     parts: list[str] = []
-    for phase_id, (promise, stated) in targets.items():
-        if results.get(phase_id, stated) > stated:
-            continue
-        text = f"phase {phase_id}: {short_time(promise, now=now, zone=zone)}"
-        if now > promise.timestamp():
-            text += " · late " + elapsed_text(now - promise.timestamp())
+    for phase_id, promise in targets.items():
+        text = f"phase {phase_id}: {short_time(promise.at, now=now, zone=zone)}"
+        if now > promise.at.timestamp():
+            text += " · late " + elapsed_text(now - promise.at.timestamp())
         parts.append(text)
     return " · ".join(parts) or display_cells.NONE
 
@@ -331,8 +357,8 @@ def _director_shells(view: CensusView | census.CensusFailed, unit: live_units.Li
 
     candidates = view.sessions.get(conversation, [])
     if isinstance(generation, session_staff.ProvedProcessGeneration):
-        process = census.CensusProcessIdentity(generation.pid, generation.started)
-        matches = [row for row in candidates if row.machine == machine and row.process == process]
+        matches = [row for row in candidates
+                   if row.machine == machine and row.pid == generation.pid and row.process_start == generation.started]
         if matches:
             shells = tuple(shell for row in matches for shell in row.shells)
             if shells or _checked_activity(unit) != "shell":
@@ -645,16 +671,19 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
 def completed_unit_phases(events: Sequence[dict[str, object]]) -> dict[str, PhaseSentWork]:
     """Read completed phases and their sent work from their latest instances."""
     instances: dict[str, str] = {}
+    latest: dict[str, str] = {}
     phases: dict[str, list[dict[str, object]]] = {}
     completed: set[str] = set()
     for event in events:
         kind = event.get("event_type")
-        phase = str(event.get("phase_id") or instances.get(str(event.get("phase_instance_id", "")), ""))
+        instance = str(event.get("phase_instance_id", ""))
+        phase = str(event.get("phase_id") or instances.get(instance, ""))
         if kind == "phase_started":
-            instances[str(event.get("phase_instance_id", ""))] = phase
+            instances[instance] = phase
+            latest[phase] = instance
             phases[phase] = []
             completed.discard(phase)
-        if phase in phases and phase not in completed:
+        if latest.get(phase) == instance and (phase not in completed or kind == "checkpoint"):
             phases[phase].append(event)
             if kind == "phase_finished" and event.get("status") == "completed":
                 completed.add(phase)
@@ -1395,11 +1424,15 @@ def phase_dependency(events: list[dict[str, object]], phase: str) -> waits_on.Ph
     if instance is None:
         return waits_on.PhaseNotStarted()
     attempt: list[dict[str, object]] = []
+    completed = False
     for event in events:
-        if event.get("phase_instance_id") == instance:
+        if event.get("phase_instance_id") != instance:
+            continue
+        kind = event.get("event_type")
+        if not completed or kind == "checkpoint":
             attempt.append(event)
-            if event.get("event_type") == "phase_finished" and event.get("status") == "completed":
-                break
+        if kind == "phase_finished" and event.get("status") == "completed":
+            completed = True
     sent = phase_sent_work(attempt)
     if isinstance(sent, SentCommit):
         hold = next((wait for wait in phase_waits.unit_waits(events) if wait.target == phase), phase_waits.NO_UNIT_WAIT)

@@ -10,12 +10,11 @@ import shlex
 import subprocess
 
 from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_VERBS,
-                                     SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
+                                     VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
                                                 GateJobNotRecorded, NotVerifyCall, VerifyCall, VerifyStep)
-from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text as public_queue_text, select_queue_name
-from scripts.message.owner_role import OwnerRole
+from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text as public_queue_text, row_text, select_queue_name
 
 
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"})
@@ -24,7 +23,6 @@ SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "t
 class QueueKind(Enum):
     """A fixed name for queue work without a verify or script name."""
 
-    MERGE_GATE = "merge gate"
     CI = "hana CI"
     COMPILER_CACHE = "compiler cache"
     MAC = "Mac builds"
@@ -44,6 +42,11 @@ class QueueRowName(str):
     @classmethod
     def owner_only(cls, *candidates: object) -> QueueRowName:
         return str.__new__(cls, select_queue_name(*candidates))
+
+    @classmethod
+    def owned(cls, owner: object, what: object) -> QueueRowName:
+        """Name a queue request `<owner>: <what>`."""
+        return str.__new__(cls, row_text(owner, what))
 
     @classmethod
     def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
@@ -74,32 +77,6 @@ class QueueRowName(str):
         if queue_identifier(package):
             shown = f"{shown} {package}"
         return str.__new__(cls, shown)
-
-    def for_owner(self, names: StepNames, step: str, unit: str, role: OwnerRole, *,
-                  prefix: str = "", ci: bool = False) -> QueueRowName:
-        """Apply the owner template to a recorded build verb."""
-        if not is_recorded_step(step):
-            return self
-        verb = step.partition(" ")[0]
-        return self.with_prefix(prefix)._show_owner(names, verb, unit, role, ci)
-
-    def _show_owner(self, names: StepNames, verb: str, unit: str, role: OwnerRole, ci: bool) -> QueueRowName:
-        step = names.queue_name(verb)
-        unit = public_queue_text(unit)
-        try:
-            shown = public_queue_text(names.for_owner(verb, unit, role, ci=ci, current_name=self, step_name=step))
-        except (ValueError, KeyError, AttributeError, IndexError):
-            return self
-        owner = "CI" if ci else "showrunner" if role is OwnerRole.SHOWRUNNER else unit
-        short = SHORT_OWNER_STEPS.get(verb, step)
-        if owner and shown in (f"{owner} {step}", f"{owner} {short}"):
-            return str.__new__(type(self), shown)
-        return self
-
-    def with_prefix(self, prefix: str) -> QueueRowName:
-        """Add a repository or a resolved staff name before the step."""
-        prefix = public_queue_text(prefix)
-        return str.__new__(type(self), f"{prefix} {self}") if prefix else self
 
     def with_mac_status(self, status: str) -> QueueRowName:
         """Add a fixed status to the Mac name."""

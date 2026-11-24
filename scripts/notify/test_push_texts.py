@@ -161,16 +161,15 @@ class PushTextTests(unittest.TestCase):
         entries = [entry for entry in push_texts.catalog() if entry.id.startswith("mac_idle.")]
         self.assertEqual([entry.id for entry in entries], ["mac_idle.unreachable"])
         entry = entries[0]
-        for example, minutes, tests in (("one_test", "10", "1 test waits"),
-                                         ("three_tests", "12", "3 tests wait")):
+        for example, title in (("one_test", "Mac does not answer; 1 test waits"),
+                               ("three_tests", "Mac does not answer; 3 tests wait")):
             with self.subTest(example=example):
                 values = next(row.values for row in entry.examples if row.name == example)
                 push = push_texts.render_entry(entry, values)
                 self.assertEqual(push.action, ActionRequired("Wake the Mac or check its network."))
-                self.assertEqual(push.title, "Mac tests stopped")
-                self.assertEqual(push.body, f"Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.")
-                self.assertEqual(push.message.splitlines(), ["Action: Wake the Mac or check its network.",
-                    f"Mac tests stopped {minutes} min ago.", f"{tests}; builds cannot reach the Mac."])
+                self.assertEqual(push.title, title)
+                self.assertEqual(push.body, "")
+                self.assertEqual(push.message, "Action: Wake the Mac or check its network.")
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
@@ -187,7 +186,8 @@ class PushTextTests(unittest.TestCase):
                         self.assertLess(len(text), 1024)
                     else:
                         self.assertLess(len(text), 500)
-                    self.assertLess(len(push.title), 45)
+                    # A one-line text posts no title; its line is the message.
+                    self.assertLess(len(push.posted_title), 45)
 
     def test_decision_argv_carries_the_question_record_path(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
@@ -266,12 +266,10 @@ class PushTextTests(unittest.TestCase):
 
     def test_ups_maintenance_alerts_keep_the_approved_text_and_nonurgent_action(self) -> None:
         cases = (
-            ("nixos.ups_replace_battery", "UPS battery needs replacing",
-             "Replace the battery in the natedev UPS.",
-             "The natedev UPS reports that its battery is worn out. During a power outage it may not keep natedev on long enough to shut down safely."),
+            ("nixos.ups_replace_battery", "natedev UPS battery is worn out",
+             "Replace the battery in the natedev UPS.", ""),
             ("nixos.ups_no_contact", "natedev lost contact with its UPS",
-             "Check the USB cable between the UPS and natedev.",
-             "natedev cannot read its UPS. During a power outage it gets no warning and cannot shut down safely."),
+             "Check the USB cable between the UPS and natedev.", ""),
         )
         for text_id, title, action, body in cases:
             with self.subTest(id=text_id):
@@ -279,17 +277,17 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual((push.sender, push.need, push.title, push.action, push.body),
                                  ("ups", "note", title, ActionRequired(action), body))
 
-    def test_every_gpu_xid_renders_its_meaning_and_restart_action(self) -> None:
+    def test_every_gpu_xid_keeps_the_sender_values_and_renders_the_restart_action(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
                 push = push_texts.render("nixos.gpu_stopped", xid=code, meaning=meaning, time="02:17 EDT")
                 self.assertEqual(push.sender, "gpu")
                 self.assertEqual(push.need, "decision")
                 self.assertEqual(push.title, "natedev GPU stopped")
-                self.assertIn(f"Xid {code}", push.message)
-                self.assertIn(meaning, push.message)
-                self.assertIn("02:17 EDT", push.message)
-                self.assertEqual(push.message.splitlines()[0], "Action: Restart natedev to bring the GPU back.")
+                self.assertEqual(push.values["xid"], code)
+                self.assertEqual(push.values["meaning"], meaning)
+                self.assertEqual(push.values["time"], "02:17 EDT")
+                self.assertEqual(push.message, "Action: Restart natedev.")
 
     def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
@@ -493,6 +491,32 @@ class PushTextTests(unittest.TestCase):
                   self.assertRaises(ValueError)):
                 _ = push_texts.catalog()
 
+    def one_line_entry(self) -> PushText:
+        return PushText("test", "test", "note", "codex1 has {left} left; units work alone next", push_texts.NoActionNeeded(),
+                        "", (PushExample("typical", {"left": "1%"}),), purpose="Test.", one_line=True)
+
+    def test_one_line_text_posts_its_line_as_the_message_with_no_title(self) -> None:
+        push = push_texts.render_entry(self.one_line_entry(), {"left": "1%"})
+        self.assertEqual(push.title, "codex1 has 1% left; units work alone next")
+        self.assertEqual(push.posted_title, "")
+        self.assertEqual(push.message, "codex1 has 1% left; units work alone next")
+        self.assertNotIn("No action needed", push.message)
+        self.assertIn("Title: none (the phone shows the app name)\ncodex1 has 1% left",
+                      push_texts.shown(self.one_line_entry()))
+
+    def test_one_line_is_fingerprinted_and_cannot_hold_an_action_session_or_body(self) -> None:
+        entry = self.one_line_entry()
+        with mock.patch.object(importlib, "import_module", return_value=SimpleNamespace(ENTRIES=(entry,))):
+            self.assertEqual(push_texts.catalog(), (entry,))
+        self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, one_line=False)))
+        for label, invalid in (("action", replace(entry, action=ActionTemplate("Reply go."))),
+                               ("session", replace(entry, session=SessionTemplate("{left}"))),
+                               ("body", replace(entry, body="Left: {left}."))):
+            module = SimpleNamespace(ENTRIES=(invalid,))
+            with (self.subTest(label=label), mock.patch.object(importlib, "import_module", return_value=module),
+                  self.assertRaises(ValueError)):
+                _ = push_texts.catalog()
+
     def test_remote_control_push_is_absent_from_catalog_and_approvals(self) -> None:
         removed_id = "shutdown." + "remote_control"
         self.assertNotIn(removed_id, {entry.id for entry in push_texts.catalog()})
@@ -515,6 +539,16 @@ class PushTextTests(unittest.TestCase):
             for id, values in (("absent", {"version": "1"}), ("test", {}), ("test", {"version": "1", "other": "2"})):
                 with self.subTest(id=id, values=values), self.assertRaises(ValueError):
                     _ = push_texts.render(id, **values)
+
+    def test_render_rejects_missing_hidden_values_and_unknown_held_text(self) -> None:
+        unknown_held = "The three pushes held while you were away come next."
+        cases: tuple[tuple[str, dict[str, str], str], ...] = (
+            ("nixos.gpu_stopped", {}, "missing values ['meaning', 'time', 'xid']"),
+            ("silence.auto_off", {"sender": "natedev", "held": unknown_held}, f"unknown held value {unknown_held!r}"),
+        )
+        for text_id, values, error in cases:
+            with self.subTest(id=text_id), self.assertRaisesRegex(ValueError, re.escape(error)):
+                _ = push_texts.render(text_id, **values)
 
     def test_missing_catalog_fails_instead_of_appearing_empty_or_unknown(self) -> None:
         with mock.patch.object(importlib, "import_module", side_effect=ModuleNotFoundError("catalog absent", name="push_catalog")):

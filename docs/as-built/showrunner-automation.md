@@ -293,11 +293,15 @@ Each local Promote checkout must exist before the command pushes.
 - **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
+     For a shrink or as-built checkpoint, the test merge uses the pending commit's first parent as its base.
+     Ancestry skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
      `_unit_paths` excludes unchanged paths that an origin merge base contains.
      A path absent from that base remains in scope, including a deleted plan.
      The report gives both path counts.
-     A shrink allows only the plan doc and `<plan stem>-next.md`.
+     A shrink changes the plan doc and can also change `<plan stem>-next.md`.
+     A shrink with no paths in scope passes if a clean test merge leaves the fetched `origin/main` tree unchanged.
+     The test merge uses the shrink's first parent as its base.
      An as-built commit passes when every changed path is Markdown and the commit changes or deletes `docs/plans/<slug>.md`, from its `docs(<slug>): as-built` subject.
      The plan in `.unit.toml` does not change that path, because the as-built step repoints it first.
      It also passes when that plan is absent on the production's merge branch and every changed path matches `docs/as-built/*.md`.
@@ -320,10 +324,10 @@ Each local Promote checkout must exist before the command pushes.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
      Otherwise, restore the tip before the checkpoint merge while origin still has its old tip.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
-     A red names its failed nextest tests, or the red modules of a merge gate command (`--- <suite>/<module> exit=<rc> ---`).
+     A failure names the failed nextest tests or the failed gate modules (`--- <suite>/<module> exit=<rc> ---`).
      A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
   8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
-     The run is limited to its red names, with `--filter`, `-E test(=<name>)` or the merge gate's `--module <suite>/<module>`.
+     Limit the run to failed names with `--filter`, `-E test(=<name>)`, or the gate's `--module <suite>/<module>`.
      The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
      A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
      The unit gets a repair line only for its own red names.
@@ -366,12 +370,12 @@ Each local Promote checkout must exist before the command pushes.
   An invisible change uses `Change-Review: none — <why>`.
   `problem` reads both visible forms through the shared parser.
   A merge message can carry only invisible lines.
-  The hook and merge gates reject visible lines and `Change-Review-Covers` lines on merge commits.
+  The hook and the integrate job reject visible lines and `Change-Review-Covers` lines on merge commits.
   A checkpoint that changes more than Markdown needs a valid trailer unless a later plain commit covers it.
   A malformed line holds any unit commit, whatever its subject, unless a later plain commit covers it.
   Other commits need no line.
   `Change-Review-Covers: <hash>` names each covered commit.
-  The merge gates retain their staff reads before publication.
+  The integrate job retains its staff reads before publication.
 
   Merge callers use `list_ready` after promotion succeeds or the Mac pull enters the shared pending queue.
   A failed required step adds no rows.
@@ -459,7 +463,12 @@ Each local Promote checkout must exist before the command pushes.
   A directory lock protects every write without a separate lock file.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
-  A failed commit prints `written but not committed`; the next write commits the complete list.
+  Commits share the vault's main push lock with the other Git writers.
+  The readiness scan also runs after a merge. It tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
+  Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+  Other list writes report a commit failure immediately.
+  The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
   Every new or edited visible row requires a registered image.
@@ -542,12 +551,12 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
 The CLI requires a producer staff row for the current session.
-Morty's fixed staff ID selects the folder for every caller.
+Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
 Old records without the field default to morty.
-`record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
+`record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
 Investigations retain their existing format and command behavior.
@@ -585,7 +594,7 @@ Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
-2. Preserve an existing item number with `add --number <n>`.
+2. Use `add --number <n>` as morty to advance the sequence to a specified number.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
 4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
    Use a time or `delivered` to park. Use an empty condition to unpark.
@@ -601,15 +610,20 @@ They include the date for updates from another day.
 The page shows the time of each log entry beside its source.
 The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
+Other producers can add items assigned to themselves.
+The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
+They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
 Their updates use the caller's staff name as the log source.
+They can also run `park`, `close`, and `reopen` on those items.
+These commands use the `--source` words as the log source.
+The command refuses each item of another producer.
+Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-New items default to morty.
+Morty's new items default to morty.
 Changing the producer to someone other than morty sends two notices after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
@@ -627,15 +641,21 @@ They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in the same producer folder.
+References use numbers in morty's List folder.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
 Closing a prerequisite preserves its dependents' conditions.
 
-Closed records remain on disk with their time and closing words.
-Automatic numbering includes invalid records and Closed records.
-An explicit number must name an unused path.
+Closed and removed records remain on disk with their time, closing words, and log.
+The `.next-number` record in morty's List folder stores the next number.
+The sequence is per machine, and the List's machine is the one source.
+If the counter is missing, the allocator reads the record names and the migration log in all existing List folders.
+This scan includes invalid and Closed records and the migration entries for removed records.
+The first number is one more than the highest recorded number.
+The allocator advances the counter under the List store lock before it publishes the item.
+An explicit number must be at or above the next available number.
+A failed write after reservation leaves a gap in the sequence.
 Exact repeated operations change nothing.
 An update appends a log line and marks the item unread if it is not Closed.
 Closing clears the unread time.
@@ -650,7 +670,8 @@ Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
-`create_records` validates a complete typed batch before writing into an empty list folder.
+`create_records` validates a complete typed batch before writing into morty's empty List folder without a counter.
+It reserves the highest number in the batch before it writes any records.
 It checks forward references and cycles under the same lock as other writes.
 The one-off converter lives outside the repository and uses this API.
 It preserves item numbers, source sections, and each item's JSON data in Evidence.
@@ -1143,17 +1164,6 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Zero recent builds gives `no ETA: nothing built in 24 h`.
     Numbers use thousands commas; times and the date use the production zone.
   - **Style reads and tests:** `unit_phases.main` passes each unit's staff worktree to `style_ledger.ledger_location`. A missing plan folder does not affect this lookup. A worktree that cannot be resolved supplies no ledger data for that row. It passes the explicit unit-to-database map to the renderer even when phase records are unavailable. One read-only SQLite connection serves each distinct database; missing databases or tables supply no data. No ledger lock or migration runs. The command overlaps independent reads. `display_cells.py` owns the shared step and escaping helpers used by both tables. `style_units.table` requires the keyword argument `ledger_paths` (unit id to database path); it never reads ledger paths from phase records. It also accepts `now`, `zone`, and `decision_folder` for fixed test inputs. Relative proposal paths use that folder; absolute paths stay absolute.
-
-- **A unit's newest run.** `unit_run.py --production <showrunner name> <unit>` prints the run id, machine, and UTC start.
-  Staff supplies the current unit folder.
-  Each candidate `run_started` event resolves its owner through staff before the reader compares that folder.
-  The newest numeric start wins; sorted file order settles equal starts.
-  Invalid or unreadable files are skipped.
-  The scan stops after the first valid run-start event in each file.
-  `--root` selects the history root, then `UNIT_HISTORY_DIR`, then the configured history default.
-  With no local match, the reader queries the Mac unless `--no-mac` is present.
-  An unavailable Mac prints its cause.
-  No matching run exits 1 with the unit and folder in the diagnostic.
 
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.

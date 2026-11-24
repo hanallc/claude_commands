@@ -15,6 +15,30 @@ from scripts.direct.verify_lint_scope_test_support import VERIFY
 
 
 class VerifyVerbTests(VerifyLintCacheFixture):
+    def test_cached_lint_checks_the_named_package(self) -> None:
+        cache = self.enable_cache()
+        _ = self.verify("lint")
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+        valid = self.verify("lint", "sample")
+        self.assertIn("PASS (recorded)", valid.stdout)
+
+        result = self.invoke_verify("lint", "missing", cwd=self.root)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("verify.sh: package missing not found in workspace", result.stderr.splitlines())
+        self.assertNotIn("PASS (recorded)", result.stdout)
+        self.assertEqual(self.calls("clippy"), [])
+
+    def test_cached_lint_step_checks_the_named_package(self) -> None:
+        cache = self.enable_cache()
+        _ = self.verify("lint")
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
+        result = self.invoke_verify("lint", "sample", "+", "lint", "missing", cwd=self.root)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("verify.sh: package missing not found in workspace", result.stderr.splitlines())
+        self.assertEqual(result.stdout.count("PASS (recorded)"), 1)
+        self.assertEqual(self.calls("clippy"), [])
+
     def test_help_forms_print_the_same_short_usage_with_short_lines(self) -> None:
         missing = self.invoke_verify(cwd=self.root)
         self.assertEqual(missing.returncode, 2)
@@ -67,6 +91,16 @@ class VerifyVerbTests(VerifyLintCacheFixture):
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn(form, result.stderr)
                 self.assertEqual(self.cargo_calls(), [])
+
+    def test_repeated_verbs_are_refused_before_repository_setup(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        for verbs, duplicate in (("test,test", "test"), ("test,lint,test", "test"),
+                                 ("doc,lint,lint", "lint")):
+            with self.subTest(verbs=verbs):
+                result = self.invoke_verify(verbs, cwd=outside)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr.splitlines(), [f"verify.sh: repeated verb: {duplicate}"])
 
     def test_missing_or_unknown_help_command_keeps_the_usage_error(self) -> None:
         usage = self.invoke_verify(cwd=self.root).stderr
@@ -163,7 +197,7 @@ class VerifyWorkspaceFormTests(FinalPassFixture):
         self.environment["BUILDLOG_OFF"] = "0"
         result = self.verify("check", "--features", "foo")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("check --workspace --lib --bins --features foo,extra", self.calls_made())
+        self.assertIn("check --workspace --all-targets --features foo,extra", self.calls_made())
         self.assertEqual([(row["package"], row["command"]) for row in self.recorded_calls()],
                          [("workspace", "check --features foo")])
 

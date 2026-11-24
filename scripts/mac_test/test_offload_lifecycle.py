@@ -18,9 +18,10 @@ import threading
 import unittest
 from unittest import mock
 from collections.abc import Sequence
+from scripts.copies import copies
 from scripts.mac_test import offload, mac_test, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 from scripts.buildlog import treekey
 from scripts.lib import test_hang_guard
@@ -28,6 +29,109 @@ from scripts.lib import process_start as process_identity
 
 
 class PendingDispatchTests(unittest.TestCase):
+    def test_a_mirror_build_child_inherits_the_start_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = Path(offload.__file__).resolve().parents[2]
+            (root / ".claude").symlink_to(checkout, target_is_directory=True)
+            environment = {**os.environ, **config_environment(root), "HOME": str(root),
+                           "XDG_CACHE_HOME": str(root / "cache"), "TMPDIR": str(root),
+                           "PYTHONDONTWRITEBYTECODE": "1", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1"}
+            _ = write_config_fixture(root / "build_admission.conf", "# whole: 0..\nnested_tokens=0\n")
+            identity = claim_state.ClaimIdentity("child-claim", "child-episode", "child-attempt")
+            mirror = copies.RemoteMirror("verify", copies.SelectedRepository("hana"), "private-host",
+                                        str(root / "mirrors/hana"), "fixture-session")
+            fence = root / offload.start_fence_relative(identity, "mac").with_suffix(".lock")
+            prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(identity, "mac")],
+                cwd=root, env=environment, capture_output=True, text=True, check=False,
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
+            release = root / "release"
+            finished = root / "finished"
+            os.mkfifo(release)
+            os.mkfifo(finished)
+            release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, release_fd)
+            finished_fd = os.open(finished, os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, finished_fd)
+            child = root / "child.py"
+            _ = child.write_text('''import os, select, sys
+assert os.path.samestat(os.fstat(8), os.stat(sys.argv[1]))
+with open(sys.argv[2], 'rb') as release:
+    assert select.select([release], [], [], float(sys.argv[4]))[0]
+    assert release.read(1) == b'x'
+os.close(8)
+with open(sys.argv[3], 'wb') as finished:
+    finished.write(b'x')
+''')
+            manifest = root / "Cargo.toml"
+            _ = manifest.write_text('''[workspace.metadata.dev.prebuild.fixture-artifact]
+target = "fixture-target"
+env = "FIXTURE_ARTIFACT"
+for = ["fixture-tests"]
+''')
+            pool = root / "tokens"
+            os.mkfifo(pool)
+            pool_fd = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, pool_fd)
+            _ = os.write(pool_fd, b"+")
+            cargo = root / "cargo"
+            _ = cargo.write_text(f"#!{sys.executable}\n" + '''import json, os, subprocess, sys
+from pathlib import Path
+
+root = Path(os.environ["HOME"])
+fence = os.environ["TEST_FENCE"]
+assert os.path.samestat(os.fstat(8), os.stat(fence)), sys.argv
+if sys.argv[1] == "build":
+    print(json.dumps({"reason": "compiler-artifact", "package_id": "fixture-artifact 0.1.0 (path+file:///fixture)",
+                      "target": {"kind": ["bin"]}, "executable": "/fixture/artifact"}))
+elif sys.argv[1:3] == ["nextest", "list"]:
+    print(json.dumps({"rust-suites": {"fixture": {"testcases": {"test": {"filter-match": {"status": "matches"}}}}}}))
+elif "--no-run" not in sys.argv:
+    assert os.environ["FIXTURE_ARTIFACT"] == "/fixture/artifact"
+    assert os.environ["CARGO_MAKEFLAGS"].startswith("--jobserver-auth=fifo:")
+    with (root / "finished.errors").open("wb") as errors:
+        subprocess.Popen([sys.executable, str(root / "child.py"), fence, str(root / "release"),
+                          str(root / "finished"), os.environ["TEST_FENCE_TIMEOUT"]],
+                         pass_fds=(8,), start_new_session=True, cwd=root,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors)
+''')
+            cargo.chmod(0o755)
+            environment.update({"PATH": f"{root}:{environment['PATH']}", "TEST_FENCE": str(fence),
+                                "TEST_FENCE_TIMEOUT": str(test_hang_guard.TEST_HANG_GUARD_SECS)})
+            scripts = root / ".claude/scripts"
+            py = str(scripts / "lib/py")
+            command = shlex.join([py, "-m", "scripts.mac_test.nextest_log", "run", "4096", "4096",
+                py, str(scripts / "lint/prebuild.py"), "--manifest", str(manifest), "--",
+                py, str(scripts / "lint/nextest_tokens.py"), "--pool", str(pool), "--",
+                "cargo", "nextest", "run", "--test-threads", "1", "-p", "fixture-tests"])
+            invocation = "cd " + shlex.quote(mirror.path) + " && " + command
+            launch = offload.fenced_start_command(identity, "mac", copies.remote_use_command(mirror, invocation))
+            key = offload.pending_start_key(identity)
+            try:
+                completed = subprocess.run(["bash", "-c", launch], cwd=root, env=environment,
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertEqual(completed.stdout.splitlines()[-2:], ["mac_exit=0", f"dispatch_start_pending={key}"],
+                                 completed.stdout + completed.stderr)
+                self.assertNotIn("nextest list exited", completed.stdout)
+                self.assertTrue(fence.exists())
+            finally:
+                _ = os.write(release_fd, b"x")
+
+            child_errors = finished.with_suffix(".errors")
+            self.assertTrue(child_errors.is_file(), "Cargo did not start the child")
+            self.assertTrue(select.select([finished_fd], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)[0],
+                            child_errors.read_text())
+            self.assertEqual(os.read(finished_fd, 1), b"x")
+            settle = offload.start_fence_command(identity, "mac", settle=True)
+            settled = subprocess.run(["bash", "-c", settle], cwd=root, env=environment,
+                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            self.assertEqual(settled.returncode, 0, settled.stderr)
+            self.assertEqual(settled.stdout, f"dispatch_start_settled={key}\n")
+            self.assertFalse(fence.exists())
+
     def test_a_pending_claim_or_start_cannot_release_capacity_before_its_child_settles(self) -> None:
         for operation in ("claim", "start-acknowledged", "start-uncertain"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
@@ -36,7 +140,7 @@ class PendingDispatchTests(unittest.TestCase):
                 paths.directory.mkdir()
                 (root / "mac_test.conf").touch()
                 _ = (root / "build_targets.conf").write_text(
-                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE,
                     encoding="utf-8",
                 )
                 owner = process_identity.process_start(os.getpid())
@@ -192,7 +296,7 @@ class PendingDispatchTests(unittest.TestCase):
                                    "MAC_TEST_STATE_DIR": str(root / ".local/state/mac-test")}
                     _ = (root / "build_targets.conf").write_text(
                         "targets=mac,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n")
+                        + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                     settings = root / ("mac_test.conf" if target == "mac" else "linux_target.conf")
                     for name in ("mac_test.conf", "linux_target.conf"):
                         _ = write_config_fixture(root / name, "offload=on\nhost=private-host\n", template="mac_test")
@@ -365,14 +469,8 @@ class OffloadCommandTests(OffloadCommandFixture):
     def test_signal_during_fresh_claim_releases_without_ssh_when_check_would_omit_status(self) -> None:
         self.assert_fresh_claim_signal_releases_without_ssh("missing_status")
 
-    def test_signal_during_takeover_checks_reply_host_and_keeps_claim_when_check_fails(self) -> None:
-        self.assert_takeover_signal_checks_reply_host("ssh_error")
-
-    def test_signal_during_takeover_checks_reply_host_and_keeps_claim_when_leftovers_remain(self) -> None:
-        self.assert_takeover_signal_checks_reply_host("remaining")
-
-    def test_signal_during_takeover_checks_reply_host_and_releases_claim_when_check_is_clean(self) -> None:
-        self.assert_takeover_signal_checks_reply_host("clean")
+    def test_signal_during_takeover_keeps_claim_for_leased_cleanup_without_ssh(self) -> None:
+        self.assert_takeover_signal_keeps_claim_for_leased_cleanup("reply-mac")
 
     def test_signal_during_fresh_claim_from_process_group_preserves_reply_and_releases_without_ssh(self) -> None:
         self.set_leftover_answer("ssh_error")
@@ -392,14 +490,20 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(ssh), 1)
         self.assertEqual(ssh[0]["args"][-2], "previous-mac")
 
+    def test_signal_during_linux_takeover_checks_reply_host_and_releases_claim_when_check_is_clean(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("clean")
+
+    def test_signal_during_linux_takeover_checks_reply_host_and_keeps_claim_when_leftovers_remain(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("remaining")
+
+    def test_signal_during_linux_takeover_checks_reply_host_and_keeps_claim_when_check_fails(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("ssh_error")
+
+    def test_signal_during_linux_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
+        self.assert_linux_takeover_signal_checks_reply_host("clean", reply_host="")
+
     def test_signal_during_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
-        output = self.interrupt_held_claim(takeover=True, reply_host="")
-        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim"])
-        self.assert_claim_is_kept("previous-mac")
-        self.assert_leftover_diagnostic(output, "missing_status")
-        self.assertIn("the kept claim's host could not be read", output)
-        self.assertEqual(self.events_for("ssh"), [])
-        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+        self.assert_takeover_signal_keeps_claim_for_leased_cleanup("")
 
     def test_unchanged_copy_sends_its_known_tree_key_beside_the_call_id(self) -> None:
         key = self.commit_sent_tree()
@@ -424,6 +528,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_stable_copy_sends_key()
 
     def test_copy_with_unavailable_before_key_and_known_after_key_sends_no_key(self) -> None:
+        self.remove_tree_key()
         self.assertIsNone(treekey.tree_key(str(self.repository)))
 
         def change() -> None:
@@ -449,6 +554,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assert_stable_copy_sends_key()
 
     def test_copy_with_both_tree_keys_unavailable_sends_no_key(self) -> None:
+        self.remove_tree_key()
         self.assertIsNone(treekey.tree_key(str(self.repository)))
         result = self.command()
         self.assertEqual(result.returncode, 0, result.stdout)

@@ -16,16 +16,18 @@ import ctypes
 import json
 import os
 import fcntl
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from inspect import currentframe
+from inspect import currentframe, getsource, signature
 from pathlib import Path
 import resource
 import select
+import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 from types import FrameType, MethodType, TracebackType
@@ -33,9 +35,10 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
-from scripts.lib.python_startup.sitecustomize import gate_parent_pid
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, checkout_root, gate_parent
 
 if TYPE_CHECKING:
+    from scripts.lib.testing_folders import PreparedTestRunsParent
     from scripts.test_times.gate_record import TestStatus, TestTime
 
 
@@ -205,6 +208,127 @@ class RepositoryReadAudit:
             return
 
 
+def install_live_config_guard(folder: str, violation_log: str, startup_hook: str) -> None:
+    """Reject Python writes to the live config and record the first attempt."""
+    canonical = os.path.realpath
+
+    def entry_path(path: str) -> str:
+        parent, name = os.path.split(path.rstrip(os.sep) or os.sep)
+        return os.path.normpath(os.path.join(canonical(parent), name))
+
+    roots = (entry_path(folder), canonical(folder))
+    prefixes = tuple(root.rstrip(os.sep) + os.sep for root in roots)
+    reported = False
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def descriptor_path(descriptor: int) -> str:
+        if sys.platform == "darwin":
+            # macOS uses command 50 for F_GETPATH.
+            raw = fcntl.fcntl(descriptor, 50, bytes(1024)).split(b"\0", 1)[0]
+            return os.fsdecode(raw)
+        return os.readlink(f"/proc/self/fd/{descriptor}")
+
+    def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
+        nonlocal reported
+        try:
+            if isinstance(value, int):
+                path = descriptor_path(value)
+            elif isinstance(value, (str, bytes)):
+                path = os.fsdecode(value)
+                if not os.path.isabs(path) and isinstance(directory_fd, int) and directory_fd >= 0:
+                    path = os.path.join(descriptor_path(directory_fd), path)
+            else:
+                return
+            absolute = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+            resolved = canonical(absolute) if follow_entry else entry_path(absolute)
+        except (OSError, ValueError):
+            return
+        if resolved in roots or resolved.startswith(prefixes):
+            if not os.path.isfile(startup_hook):
+                return
+            if not reported:
+                try:
+                    with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
+                        _ = log.write(f"{absolute}\n")
+                except FileNotFoundError:
+                    if not os.path.isfile(startup_hook):
+                        return
+                    raise
+                reported = True
+            raise AssertionError(f"Test attempted to write live configuration at {absolute}")
+
+    def check_entry(value: object, directory_fd: object = -1) -> None:
+        check(value, directory_fd, follow_entry=False)
+
+    def audit(event: str, arguments: tuple[object, ...]) -> None:
+        if event == "open":
+            path, _, flags = arguments
+            # The event omits dir_fd. The working directory may be wrong.
+            if isinstance(flags, int) and flags & write_flags and isinstance(path, (str, bytes)) and os.path.isabs(path):
+                exclusive = flags & os.O_CREAT and flags & os.O_EXCL
+                check(path, follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
+        elif event in {"os.rename", "os.link"}:
+            check_entry(arguments[0], arguments[2])
+            check_entry(arguments[1], arguments[3])
+        elif event == "os.symlink":
+            check_entry(arguments[1], arguments[2])
+        elif event in {"os.mkdir", "os.remove", "os.rmdir", "shutil.rmtree", "os.chmod", "os.chown", "os.utime"}:
+            check_entry(arguments[0], arguments[-1])
+        elif event in {"os.setxattr", "os.removexattr"}:
+            check_entry(arguments[0])
+        elif event == "os.truncate":
+            check(arguments[0], follow_entry=True)
+
+    sys.addaudithook(audit)
+
+
+@contextmanager
+def guard_live_config(folder: Path, startup_folder: Path, violation_log: Path) -> Generator[None]:
+    """Use the same guard in the runner and its Python child processes."""
+    folder = folder.absolute()
+    violation_log = violation_log.absolute()
+    hook = startup_folder.absolute() / "sitecustomize.py"
+    _ = hook.write_text(
+        """from __future__ import annotations
+import fcntl
+import os
+import sys
+from importlib.machinery import PathFinder
+from importlib.util import module_from_spec
+
+""" + getsource(install_live_config_guard)
+        + f"\ninstall_live_config_guard({str(folder)!r}, {str(violation_log)!r}, __file__)\n"
+        + """
+# Keep the primary hook registered while the next hook runs.
+directory = os.path.realpath(os.path.dirname(__file__))
+search = iter(sys.path)
+for entry in search:
+    if os.path.realpath(entry) == directory:
+        break
+spec = PathFinder.find_spec("sitecustomize", list(search))
+if spec is not None and spec.loader is not None:
+    module = module_from_spec(spec)
+    if __file__ == sys.modules["sitecustomize"].__file__:
+        sys.modules["sitecustomize"] = module
+    spec.loader.exec_module(module)
+""", encoding="utf-8")
+    previous = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (str(hook.parent) if previous is None
+                                else os.pathsep.join((str(hook.parent), previous)))
+    install_live_config_guard(str(folder), str(violation_log), str(hook))
+    try:
+        yield
+    finally:
+        if previous is None:
+            _ = os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = previous
+        hook.unlink(missing_ok=True)
+        if violation_log.exists():
+            with violation_log.open(encoding="utf-8") as log:
+                raise AssertionError(f"Test attempted to write live configuration at {log.readline().rstrip()}")
+
+
 @dataclass(frozen=True)
 class TimesOutput:
     path: Path
@@ -234,6 +358,9 @@ else:
 
 
 class TimedResult(TimedResultBase):
+    shift_directory: ClassVar[Path | None] = None
+    select_shift_log: ClassVar[Callable[[str], str] | None] = None
+
     def __init__(self, stream: TestOutput, descriptions: bool, verbosity: int,
                  *, durations: int | None = None) -> None:
         super().__init__(stream, descriptions, verbosity, durations=durations)
@@ -243,6 +370,8 @@ class TimedResult(TimedResultBase):
         self.test_labels: dict[str, str] = {}
         self.cpu_times: dict[str, float] = {}
         self.test_cpu_started: float = 0.0
+        self.shift_log: Path | None = None
+        self.previous_shift_log: str = ""
 
     @override
     def startTest(self, test: unittest.TestCase) -> None:
@@ -250,12 +379,24 @@ class TimedResult(TimedResultBase):
         self.open_test = OpenTest(test.id())
         self.test_labels[test.id()] = test.id().removeprefix(type(test).__module__ + ".")
         super().startTest(test)
+        select_log = TimedResult.select_shift_log
+        if self.shift_directory is not None and select_log is not None:
+            self.shift_log = self.shift_directory / f"shift-{self.testsRun}"
+            self.previous_shift_log = select_log(str(self.shift_log))
 
     @override
     def stopTest(self, test: unittest.TestCase) -> None:
         self.cpu_times[test.id()] = cpu_seconds() - self.test_cpu_started
-        super().stopTest(test)
-        self.open_test = NoOpenTest()
+        try:
+            super().stopTest(test)
+        finally:
+            self.open_test = NoOpenTest()
+            select_log = TimedResult.select_shift_log
+            if self.shift_log is not None and select_log is not None:
+                _ = select_log(self.previous_shift_log)
+                failed = self.outcomes.get(test.id()) in ("fail", "error", "unexpected_success")
+                finish_shift_log(self.shift_log, test.id(), self.stream.writeln, failed=failed)
+                self.shift_log = None
 
     def record_outcome(self, test: unittest.TestCase, status: TestStatus) -> None:
         if isinstance(self.open_test, OpenTest):
@@ -357,6 +498,78 @@ def test_times(result: TimedResult) -> list[TestTime]:
     return rows
 
 
+def finish_shift_log(log: Path, label: str, write: Callable[[str], None], *, failed: bool) -> None:
+    """Print the distinct shifted reads only when the call fails."""
+    try:
+        if failed and log.is_file():
+            reads = sorted(set(log.read_text(encoding="utf-8").splitlines()))
+            if reads:
+                write(f"Shifted configuration reads for {label}")
+                for read in reads:
+                    write(f"  {read}")
+    except (OSError, UnicodeError):
+        pass
+    finally:
+        try:
+            log.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@contextmanager
+def trace_fixture_shifts(name: str, index: int) -> Generator[None]:
+    """Give each unittest setup call its own shift read log."""
+    directory, select_log = TimedResult.shift_directory, TimedResult.select_shift_log
+    if directory is None or select_log is None or not name.startswith(("setUpModule (", "setUpClass (")):
+        yield
+        return
+    log = directory / f"shift-fixture-{index}"
+    previous = select_log(str(log))
+    failed = False
+    try:
+        yield
+    except unittest.SkipTest:
+        raise
+    except Exception:
+        failed = True
+        raise
+    finally:
+        _ = select_log(previous)
+        finish_shift_log(log, name, lambda line: print(line, file=sys.stderr), failed=failed)
+
+
+@contextmanager
+def preserve_child_shift_log(shift_environment: Callable[[], dict[str, str]]) -> Generator[None]:
+    """Pass the active read log through subprocess environment replacements."""
+    popen = subprocess.Popen
+    initialize = cast(Callable[..., None], popen.__init__)
+    parameters = tuple(signature(initialize).parameters)
+    env_index = parameters.index("env") - 1
+
+    @wraps(initialize)
+    def launch(process: object, *arguments: object, **options: object) -> None:
+        if additions := shift_environment():
+            positional = len(arguments) > env_index
+            supplied = arguments[env_index] if positional else options.get("env")
+            if supplied is not None or any(os.environ.get(key) != value for key, value in additions.items()):
+                inherited = os.environ if supplied is None else supplied
+                environment = dict(cast(Mapping[str | bytes, str | bytes], inherited))
+                for key, value in additions.items():
+                    _ = environment.pop(os.fsencode(key), None)
+                    environment[key] = value
+                if positional:
+                    arguments = (*arguments[:env_index], environment, *arguments[env_index + 1:])
+                else:
+                    options["env"] = environment
+        initialize(process, *arguments, **options)
+
+    setattr(popen, "__init__", launch)
+    try:
+        yield
+    finally:
+        setattr(popen, "__init__", initialize)
+
+
 @contextmanager
 def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
                      ) -> Generator[list[FixtureMeasure], None, None]:
@@ -378,7 +591,8 @@ def fixture_measures(suite: unittest.TestSuite | unittest.TestCase
             cpu = cpu_seconds()
             started = time.perf_counter()
             try:
-                return function()
+                with trace_fixture_shifts(name, len(rows)):
+                    return function()
             finally:
                 depth -= 1
                 rows.append({"kind": "fixture", "test": name,
@@ -515,7 +729,79 @@ class TimedRunner(unittest.TextTestRunner):
         return result
 
 
-def main() -> None:
+@dataclass(frozen=True)
+class GateModuleLease:
+    root: Path
+
+
+@dataclass(frozen=True)
+class UnleasedGateJob:
+    """A gate job without a module lease. The runner keeps its folder leases in the gate's TMPDIR."""
+
+
+@dataclass(frozen=True)
+class DirectModuleRun:
+    """A direct run. The runner keeps its folder leases in the test-runs folder of the start_dir checkout.
+
+    A checkout without a modeled output uses `$TMPDIR/test-runs` instead.
+    """
+    parent: PreparedTestRunsParent
+
+
+RunnerFolderOwner = GateModuleLease | UnleasedGateJob | DirectModuleRun
+
+
+def runner_folder_owner(start_dir: Path) -> RunnerFolderOwner:
+    if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
+        return GateModuleLease(Path(root))
+    if not isinstance(gate_parent(), UnverifiedGateParent):
+        return UnleasedGateJob()
+    from scripts.lib import git_files
+    from scripts.lib.testing_folders import prepare_test_runs_parent, use_test_runs_parent
+
+    try:
+        checkout = git_files.locate(start_dir).toplevel
+    except git_files.GitFilesError:
+        checkout = Path(checkout_root(str(start_dir)) or start_dir)
+    parent = prepare_test_runs_parent(checkout)
+    use_test_runs_parent(parent)
+    return DirectModuleRun(parent)
+
+
+@contextmanager
+def runner_folder(owner: RunnerFolderOwner, name: str) -> Generator[Path]:
+    if isinstance(owner, GateModuleLease):
+        folder = owner.root / name
+        creator = os.getpid()
+        folder.mkdir(mode=0o700)
+        try:
+            yield folder
+        finally:
+            # The supervisor reaps all descendants before it removes the folders.
+            if os.getpid() == creator:
+                try:
+                    shutil.rmtree(folder)
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    from scripts.lib import build_folders
+
+                    build_folders.remove_folder(folder)
+    elif isinstance(owner, DirectModuleRun):
+        from scripts.lib import build_folders
+
+        request = build_folders.UniqueBuildFolder(f"{name}-", build_folders.ExplicitBuildParent(owner.parent))
+        with build_folders.temporary_build_folder(request) as folder:
+            yield folder
+    else:
+        from scripts.lib import build_folders
+
+        with build_folders.tool_folder(name) as folder:
+            yield folder
+
+
+def main(owner: RunnerFolderOwner, run_root: Path) -> None:
+    violation_log = (owner.root if isinstance(owner, GateModuleLease) else run_root) / "live-config-writes"
     try:
         from scripts.lib import conf_reads
     except ImportError:
@@ -523,22 +809,21 @@ def main() -> None:
 
         if find_spec("scripts.lib.conf_reads") is not None:
             raise
-        run_module(NoConfigReadLog())
+        run_module(NoConfigReadLog(), run_root, violation_log)
         return
 
-    from scripts.lib import build_folders
-
-    with build_folders.tool_folder("config-reads") as temporary:
-        log = Path(temporary) / "reads"
+    with ExitStack() as cleanup:
+        temporary = (owner.root / "config-reads" if isinstance(owner, GateModuleLease)
+                     else cleanup.enter_context(runner_folder(owner, "config-reads")))
+        log = temporary / "reads"
         log.touch()
-        with conf_reads.record_reads(log):
-            run_module(log)
+        TimedResult.shift_directory = log.parent
+        TimedResult.select_shift_log = conf_reads.set_shift_read_log
+        with conf_reads.record_reads(log), preserve_child_shift_log(conf_reads.shift_child_environment):
+            run_module(log, run_root, violation_log)
 
 
-def run_module(config_log: Path | NoConfigReadLog) -> None:
-    if len(sys.argv) != 3:
-        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
-        sys.exit(2)
+def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log: Path) -> None:
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
@@ -553,13 +838,15 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
                     if all(part.isidentifier() for part in parts):
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
-        if isinstance(TimedRunner.destination, TimesOutput):
-            TimedRunner.scanned_folders = set()
-            TimedRunner.read_contents = set()
-            sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
-                                                TimedRunner.read_contents))
-        suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-        result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
+        # The guard reads this file, so the read audit starts after it.
+        with guard_live_config(Path.home() / ".claude" / "config", run_root, violation_log):
+            if isinstance(TimedRunner.destination, TimesOutput):
+                TimedRunner.scanned_folders = set()
+                TimedRunner.read_contents = set()
+                sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                                                    TimedRunner.read_contents))
+            suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+            result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
         sys.exit(1 if not result.wasSuccessful() else 5 if result.testsRun == 0 and not result.skipped else 0)
     except SystemExit:
         if "scripts.message.session_send_test_support" in sys.modules:
@@ -572,31 +859,32 @@ def run_module(config_log: Path | NoConfigReadLog) -> None:
 
 
 @contextmanager
-def private_run_roots() -> Generator[Callable[[], None]]:
+def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
     """Keep imported run roots and child processes under one private folder."""
-    from scripts.lib import build_folders
-
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
     with ExitStack() as cleanup:
-        root = cleanup.enter_context(build_folders.tool_folder("test-run-roots"))
+        root = cleanup.enter_context(runner_folder(owner, "test-run-roots"))
+        if isinstance(owner, GateModuleLease):
+            _ = cleanup.enter_context(runner_folder(owner, "config-reads"))
         try:
             os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-            yield cleanup.close
+            yield root
         finally:
             for name in names:
                 _ = os.environ.pop(name, None)
             os.environ.update(previous)
 
 
-def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
+def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
-        main()
+        main(owner, cleanup.enter_context(private_run_roots(owner)))
         return
+    parent = gate_parent(consume=True)
     libc = ctypes.CDLL(None, use_errno=True)
     watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGCHLD)
     blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
@@ -609,12 +897,12 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    parent = gate_parent_pid(consume=True)
-    if parent:
+    if not isinstance(parent, UnverifiedGateParent):
         # No test child exists before the parent-death handoff completes.
-        parent_fds.append(os.pidfd_open(int(parent)))
+        parent_fds.append(os.pidfd_open(int(parent.pid)))
         if cast(int, libc.prctl(1, 0, 0, 0, 0)) != 0:
             raise OSError(ctypes.get_errno(), "cannot watch the gate parent")
+    run_root = cleanup.enter_context(private_run_roots(owner))
     usage = resource.getrusage(resource.RUSAGE_SELF)
     supervisor = os.getpid()
     test_pid = os.fork()
@@ -628,7 +916,7 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-        main()
+        main(owner, run_root)
         return
     status = 0
     received = 0
@@ -672,9 +960,9 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
         for descriptor in [signal_fd, test_fd, *parent_fds]:
             os.close(descriptor)
     exit_code = os.waitstatus_to_exitcode(status)
+    cleanup.close()
     if received or exit_code < 0:
         number = received or -exit_code
-        cleanup_run_roots()
         if number not in (signal.SIGKILL, signal.SIGSTOP):
             _ = signal.signal(number, signal.SIG_DFL)
         os.kill(os.getpid(), number)
@@ -684,5 +972,9 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
 
 
 if __name__ == "__main__":
-    with private_run_roots() as cleanup_run_roots:
-        run_with_descendant_cleanup(cleanup_run_roots)
+    if len(sys.argv) != 3:
+        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
+        sys.exit(2)
+    folder_owner = runner_folder_owner(Path(sys.argv[1]).resolve())
+    with ExitStack() as runner_cleanup:
+        run_with_descendant_cleanup(folder_owner, runner_cleanup)

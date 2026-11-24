@@ -4,6 +4,10 @@ description: Hold the Mac, audit packages, or run a queued Mac command.
 
 `$ARGUMENTS` is `block <why> [hours N]`, `unblock`, `status`, or `audit <repo dir>`.
 
+Run `block` only on nate's explicit request for a Mac hold. Quote his words with the place and the time in `<why>`.
+A go from nate for a Mac run means a normal queued run, not a hold.
+Source: nate, bob session, 2026-11-23 about 12:14 PST: "yes a hold has to be explicitly requested by me - but i don't know how you are making that be invariant".
+
 1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py block --holder '<your session name>' --for '<why>' [--hours N]`.
    A unit director also passes `--showrunner '<showrunner name>'`.
    Resolve the name with `~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py name <showrunner name>`.

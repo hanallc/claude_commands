@@ -26,14 +26,15 @@ from typing import Unpack, cast
 from unittest import mock
 
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
+from scripts.lib import release_waiter
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.build_queue import admission_records as records, program_start, step_estimator
+from scripts.build_queue import admission_records as records, program_start, queue_snapshot, step_estimator
 from scripts.lint import memory_admit as gate
 
-from scripts.buildlog import store
+from scripts.buildlog import sample, store
 
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -189,6 +190,12 @@ class HelperLifelineTests(unittest.TestCase):
             for stream in (owner.stdin, owner.stdout):
                 if stream is not None:
                     stream.close()
+
+
+def exported_step_scopes(pid: int) -> list[str]:
+    """Each BUILDLOG_STEP_SCOPE value in the environment of the live process pid."""
+    return [entry.removeprefix(gate.STEP_SCOPE_ENTRY).decode()
+            for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if entry.startswith(gate.STEP_SCOPE_ENTRY)]
 
 
 def private_slice_name() -> str:
@@ -413,6 +420,70 @@ class QueuePlaceTests(unittest.TestCase):
                 queue.cleanup_queue_place_folders()
             self.assertFalse(place.exists())
 
+    def test_wait_for_placement_uses_the_timer_after_queue_json_changes(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            fixture.configure(waiting_pass_seconds=1)
+            request = placement_request(fixture)
+            clock = FakeClock()
+            poll_times: list[float] = []
+
+            def poll(_request: wire.PlacementRequest) -> wire.PlacementWait | client.LeftQueue:
+                poll_times.append(clock.monotonic())
+                if len(poll_times) == 1:
+                    _ = (fixture.state_dir / "queue.json").write_text("{}")
+                    now = fixture.clock.now()
+                    queue_snapshot.write_view_snapshot(fixture.state_dir, now, now, b"{}")
+                    return wire.PlacementWait(request.episode, request.since, 1, ())
+                return client.LeftQueue()
+
+            def select_or_advance(readers: list[int], writers: list[int], errors: list[int],
+                                  timeout: float) -> tuple[list[int], list[int], list[int]]:
+                ready = select.select(readers, writers, errors, 0)
+                if not any(ready):
+                    clock.sleep(timeout)
+                return ready
+
+            with mock.patch.object(queue, "time", clock), \
+                    mock.patch.object(release_waiter, "time", clock), \
+                    mock.patch.object(release_waiter, "select", select=select_or_advance), \
+                    mock.patch.object(client, "acquire_placement", side_effect=poll), \
+                    mock.patch.object(client, "cancel_placement") as cancel:
+                answer = queue.wait_for_placement(request, "caller left")
+            self.assertIsInstance(answer, client.LeftQueue)
+            self.assertEqual(poll_times, [0, 1])
+            cancel.assert_called_once()
+
+    def test_detached_module_scope_stays_in_builds_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            builds = Path(directory) / "builds.slice"
+            parent = "builds-detached-r1.slice"
+            step = builds / "builds-detached.slice" / parent / "run-step.scope"
+            step.mkdir(parents=True)
+            _ = (step / "memory.stat").write_text("anon 4096\nfile 16384\n")
+            _ = (builds / "memory.stat").write_text("anon 12288\nfile 32768\n")
+            read = Path.read_text
+
+            def read_membership(path: Path) -> str:
+                if path == Path("/proc/self/cgroup"):
+                    return f"0::/{step.relative_to(builds.parent)}\n"
+                return read(path)
+
+            with (mock.patch.dict(os.environ, {"DETACHED_RUN_SLICE": parent, "BUILDLOG_SCOPE": "1"}),
+                  mock.patch.object(Path, "read_text", autospec=True, side_effect=read_membership),
+                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["true"], 0)) as probe):
+                self.assertTrue(queue.in_builds_slice())
+                prefix = queue.suite_scope_prefix()
+                self.assertIn(f"--slice={parent}", prefix)
+                self.assertIn("--scope", prefix)
+                self.assertEqual(probe.call_args.args[0], [*prefix, "true"])
+
+            step_anon = sample.anon_bytes(step)
+            assert isinstance(step_anon, int)
+            self.assertEqual(step_anon, 4096)
+            self.assertEqual(sample.anon_bytes(builds), 8192 + step_anon)
+
     def test_fixture_removes_child_folders_after_exit_term_int_and_kill(self) -> None:
         source = """
 from pathlib import Path
@@ -497,7 +568,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 assert "queue_waiter" in row
                 waiter = row["queue_waiter"]
                 self.assertEqual(waiter.get("unit"), "queue-unit")
-                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "")["session_id"])
+                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "", records.request_owner(""))["session_id"])
 
     def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
         executable = fixture.root / "rust-analyzer"
@@ -572,6 +643,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(child.stdout.readline(), b"ready\n")
                     scope = Path(place.sidecar.read_text().strip())
                     self.assertIn(child.pid, gate.scope_members(scope))
+                    # No reservation pays for the editor scope, so the editor does not name it to its cargo calls.
+                    self.assertNotIn(str(scope), exported_step_scopes(child.pid))
                     self.assertFalse(fixture.admission.server.reservations)
                     place.observe(2 * GIB, 2 * GIB)
                     self.assertEqual(place.peak_bytes, 2 * GIB)
@@ -726,7 +799,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if not stopped.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("the sampler barrier exceeded its test deadline")
 
-            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                              ending: wire.ReleaseEnding = "result") -> None:
                 if fork_during_scope_read:
                     self.assertTrue(raced_scope_read, "cleanup did not read the scope before release")
                     scope_pids = {int(pid) for procs in Path(scope_name).rglob("cgroup.procs")
@@ -735,7 +809,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if descendant_descriptor >= 0:
                     self.assertTrue(select.select([descendant_descriptor], [], [], 0)[0],
                                     "the reservation ended while its detached descendant still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
 
             def fork_and_exit() -> None:
                 nonlocal descendant, descendant_descriptor
@@ -859,13 +933,14 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
             release = client.release
 
-            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                      ending: wire.ReleaseEnding = "result") -> None:
                 self.assertEqual(len(fixture.children), 1)
                 child = fixture.children[0]
                 self.assertIsNotNone(child.returncode)
                 with self.assertRaises(ChildProcessError):
                     _ = os.waitpid(child.pid, os.WNOHANG)
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
 
             with mock.patch.object(client, "release", side_effect=release_after_reaping) as released:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
@@ -880,9 +955,10 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
             release = client.release
-            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                   ending: wire.ReleaseEnding = "result") -> None:
                 self.assertIsNotNone(child.poll(), "reservation released while its program still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
             with mock.patch.object(client, "release", side_effect=release_after_stop) as released:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
                     child = fixture.start_blocked(place)
@@ -925,10 +1001,11 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if current == 3 * GIB:
                     sampled.set()
 
-            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                              ending: wire.ReleaseEnding = "result") -> None:
                 self.assertTrue(select.select([descriptor], [], [], 0)[0],
                                 "reservation released while its descendant still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, ending)
 
             try:
                 with mock.patch.object(client, "release", side_effect=release_after_descendant_exit) as released, \
@@ -1686,6 +1763,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     directory = Path(Path(row["sidecar"]).read_text().strip())
                     self.assertTrue(directory.is_relative_to("/sys/fs/cgroup"))
                     self.assertIn(fixture.private_slice, directory.parts)
+                    # The program names its own scope, in the form the cargo wrapper compares with its cgroup.
+                    cgroup = next(line[3:] for line in Path(f"/proc/{child.pid}/cgroup").read_text().splitlines()
+                                  if line.startswith("0::"))
+                    named = exported_step_scopes(child.pid)
+                    self.assertEqual(named, [f"/sys/fs/cgroup{cgroup}"])
+                    self.assertEqual(Path(named[0]), directory)
                     self.assertIsInstance(gate.reservation_lifetime(row, True), gate.PopulatedStepScope)
                     self.assertEqual(int(place.path.with_suffix(".max").read_text()), 3 * GIB)
                     self.assertIsNone(child.poll())
@@ -1715,7 +1798,16 @@ class HeldReservationTests(unittest.TestCase):
                             raise RuntimeError("holder failed")
                 except RuntimeError:
                     self.assertTrue(failure)
-                release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing)
+                release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing, "result")
+
+    def test_release_runs_when_the_wait_message_fails(self) -> None:
+        with (mock.patch.object(client, "admit", return_value=self.grant),
+              mock.patch.object(client.WaitOutput, "finished", side_effect=BrokenPipeError("closed pipe")),
+              mock.patch.object(client, "release", return_value=wire.Ok()) as release,
+              self.assertRaisesRegex(BrokenPipeError, "closed pipe")):
+            with queue.held_reservation(self.step_request()):
+                self.fail("the holder ran after the wait message failed")
+        release.assert_called_once_with("reservation-1", 1, self.grant.cleanup_timing, "result")
 
     def test_refusal_and_queue_exit_raise_before_any_release(self) -> None:
         replies: tuple[tuple[wire.Refused | client.LeftQueue, str], ...] = (
@@ -1741,7 +1833,7 @@ class HeldReservationTests(unittest.TestCase):
                 held.status = 0
         service_admit.assert_called_once()
         self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY))
-        release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing)
+        release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing, "result")
 
 
 QUEUE_ENTRY_CALLS = frozenset({"admit", "launch", "service_admit", "release", "wait_for_admission", "wait_for_launch"})

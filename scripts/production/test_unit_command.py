@@ -19,6 +19,7 @@ from scripts.agents import remote
 from scripts.herdr import herdr
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_runtime_id
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 @dataclass
@@ -73,7 +74,7 @@ class UnitCommandTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.enterContext(mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}))
+        self.enterContext(mock.patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}))
         _ = self.enterContext(mock.patch.object(remote, "local_machine", return_value="natedev"))
         self.client = CommandHerdr()
         _ = self.enterContext(mock.patch.object(herdr, "Herdr", return_value=self.client))

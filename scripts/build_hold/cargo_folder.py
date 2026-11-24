@@ -5,18 +5,25 @@ try:
 except FileNotFoundError:
     pass
 
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import IntEnum
 import fcntl
+import functools
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 
 from scripts.lib import build_folder_lock, build_folders, cargo_target_config, git_files
 from scripts.lib.atomic_file import write_bytes_atomic
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
+
+
+# The build-hold cargo wrapper. It holds the cargo word lists, each on one line, and this module reads them there.
+WRAPPER = Path(__file__).with_name("cargo")
 
 
 class OutsideBuildFolders(ValueError):
@@ -51,20 +58,68 @@ class UnassignedWorkspace:
     reason: str
 
 
-def _workspace(argv: list[str], cwd: Path) -> CargoWorkspace:
+@functools.cache
+def wrapper_words(name: str) -> frozenset[str]:
+    """The words of the wrapper list on the line name=(word ...)."""
+    found = re.search(rf"^{name}=\(([^)]*)\)$", WRAPPER.read_text(), re.MULTILINE)
+    if found is None:
+        raise ValueError(f"{WRAPPER}: no {name} list")
+    return frozenset(found.group(1).split())
+
+
+def in_named_step_scope(environment: Mapping[str, str]) -> bool:
+    """The cgroup folder of this process equals BUILDLOG_STEP_SCOPE, the scope that a queued step or a reserved
+    program names. The wrapper starts cargo there at once, with no folder step. A value from another scope is
+    stale and changes nothing."""
+    step_scope = environment.get("BUILDLOG_STEP_SCOPE")
+    if not step_scope:
+        return False
+    try:
+        lines = Path(environment.get("CARGO_WRAPPER_CGROUP_FILE") or "/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return False
+    return any(line.startswith("0::") and "/sys/fs/cgroup" + line[3:] == step_scope for line in lines)
+
+
+def folder_step_due(argv: Sequence[str], environment: Mapping[str, str]) -> bool:
+    """The wrapper does its folder steps for the cargo words argv in the environment: a build subcommand other
+    than install, no help or version word after it, no outer step that did the steps, and no named step scope."""
+    if environment.get("CARGO_FOLDER_CHECKED") == "1" or in_named_step_scope(environment):
+        return False
+    value_options, skip = wrapper_words("value_options"), False
+    for index, word in enumerate(argv):
+        if skip:
+            skip = False
+        elif word.startswith("-"):
+            skip = word in value_options
+        elif not word.startswith("+"):
+            subcommand = word
+            rest = argv[index + 1:]
+            break
+    else:
+        return False
+    if subcommand == "install" or subcommand not in wrapper_words("build_subcommands"):
+        return False
+    words = rest[:rest.index("--")] if "--" in rest else rest
+    return not any(word in ("-h", "--help", "-V", "--version") or (word == "--build-info" and subcommand == "mend")
+                   for word in words)
+
+
+def _workspace(argv: list[str], cwd: Path, environment: Mapping[str, str]) -> CargoWorkspace:
     directory = cargo_target_config.cargo_path_argument(argv, "-C") or next(
         (arg[2:] for arg in argv if arg.startswith("-C") and len(arg) > 2), "")
     if directory:
         cwd = (cwd / directory).resolve()
-    home = cargo_target_config.cargo_home_folder(str(cwd), os.environ)
+    home = cargo_target_config.cargo_home_folder(str(cwd), environment)
     manifest = cargo_target_config.cargo_workspace_manifest(argv, str(cwd), home).resolve()
     checkout = git_files.locate(manifest.parent).toplevel
     return CargoWorkspace(cwd, home, manifest.parent, checkout)
 
 
-def _output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
+def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
+    """The build output folder that the build folder model gives for the checkout."""
     layout = worktrees.worktree_output(checkout)
-    if isinstance(layout, worktrees.RecordedWorktreeOutput):
+    if isinstance(layout, worktree_records.RecordedWorktreeOutput):
         return LinkedOutput(worktrees.checked_output(layout))
     form = build_folders.parse_form(checkout)
     if isinstance(form, build_folders.UnverifiedFolderPath):
@@ -75,17 +130,17 @@ def _output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
         return LocalOutput(checkout)
     try:
         word = build_folders.repo_word(checkout)
-        if worktrees.main_checkout_for_word(word) == checkout:
+        if worktree_records.main_checkout_for_word(word) == checkout:
             return LinkedOutput(build_folders.main_output_path(word))
     except ValueError:
         pass
     return UnassignedWorkspace(f"{checkout}: no build folder. Use worktrees.py make <repo> <unit> <short-name>")
 
 
-def _check_paths(workspace: CargoWorkspace, argv: list[str], output: Path) -> None:
+def _check_paths(workspace: CargoWorkspace, argv: list[str], output: Path, environment: Mapping[str, str]) -> None:
     cwd = str(workspace.cwd)
     settings = cargo_target_config.cargo_folder_settings(
-        argv, cwd, os.environ, policy=cargo_target_config.CargoConfigPolicy.CURRENT_STRICT)
+        argv, cwd, environment, policy=cargo_target_config.CargoConfigPolicy.CURRENT_STRICT)
     destination = settings.get("target-dir")
     selected = workspace.root / "target" if destination is None else destination.base / destination.value
     if selected.resolve() != output.resolve():
@@ -123,6 +178,11 @@ def _use_linked_output(workspace: CargoWorkspace, output: Path,
             if not build_folder_lock.lock_current(output, directory, descriptor):
                 break
             worktrees.ensure_target_link(workspace.checkout, output, save_existing=False, output_parent=directory)
+            if mode == fcntl.LOCK_EX:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                if (not build_folders.allocation_parent_current(output, directory)
+                        or not build_folder_lock.lock_current(output, directory, descriptor) or not output.is_dir()):
+                    break
             _ = locks.enter_context(opened.pop_all())
             return descriptor
     raise ValueError(f"{output}: the build folder lock changed")
@@ -158,22 +218,22 @@ class NoOutputLock:
     """A copy or CI runner owns the output lock."""
 
 
-def check_step(argv: list[str], cwd: Path, locks: ExitStack, *,
+def check_step(argv: list[str], cwd: Path, locks: ExitStack, environment: Mapping[str, str], *,
                enforce: bool) -> CheckedOutputLock | NoOutputLock:
-    """Check the Cargo paths and hold the assigned output."""
+    """Check the Cargo paths that the environment gives and hold the assigned output."""
     if "--" in argv:
         argv = argv[:argv.index("--")]
     try:
-        workspace = _workspace(argv, cwd)
+        workspace = _workspace(argv, cwd, environment)
     except (OSError, ValueError) as error:
         raise OutsideBuildFolders(str(error)) from error
-    output = _output(workspace.checkout)
+    output = assigned_output(workspace.checkout)
     if isinstance(output, UnassignedWorkspace):
         raise OutsideBuildFolders(output.reason)
     if isinstance(output, LinkedOutput):
         descriptor = _use_linked_output(workspace, output.path, locks)
         try:
-            _check_paths(workspace, argv, output.path)
+            _check_paths(workspace, argv, output.path, environment)
         except OutsideBuildFolders as error:
             if enforce:
                 raise
@@ -183,8 +243,32 @@ def check_step(argv: list[str], cwd: Path, locks: ExitStack, *,
     path = output.path
     if path != workspace.checkout and (path.is_symlink() or (path.exists() and not path.is_dir())):
         raise OutsideBuildFolders(f"{path}: the copy needs a real target folder at its root")
-    _check_paths(workspace, argv, path)
+    _check_paths(workspace, argv, path, environment)
     return NoOutputLock()
+
+
+# The errors that end a checked step with no Cargo run.
+STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktree_records.Refused)
+
+
+def checked_step(argv: list[str], cwd: Path, locks: ExitStack,
+                 environment: Mapping[str, str], *, note_outside: bool) -> CheckedOutputLock | NoOutputLock:
+    """The folder steps of the build-hold cargo wrapper before Cargo starts with the environment: make or check
+    the checkout target link to the assigned build folder, hold the build folder lock in locks, and write the use
+    stamp.
+
+    A path outside the build folders is a note when the build folder model only reports; with note_outside
+    False, a later step gives that note. Each other error in STEP_ERRORS ends the step.
+    """
+    enforce = worktrees.enforce_build_folders()
+    try:
+        return check_step(argv, cwd, locks, environment, enforce=enforce)
+    except OutsideBuildFolders as error:
+        if enforce:
+            raise
+        if note_outside:
+            print(f"cargo: {error}", file=sys.stderr)
+        return NoOutputLock()
 
 
 def clean_output(argv: list[str], cwd: Path) -> CleanExit:
@@ -192,13 +276,13 @@ def clean_output(argv: list[str], cwd: Path) -> CleanExit:
     if argv != ["clean"]:
         return CleanExit.USE_CARGO
     try:
-        workspace = _workspace(argv, cwd)
+        workspace = _workspace(argv, cwd, os.environ)
     except (OSError, ValueError):
         return CleanExit.USE_CARGO
-    output = _output(workspace.checkout)
+    output = assigned_output(workspace.checkout)
     if not isinstance(output, LinkedOutput):
         return CleanExit.USE_CARGO
-    _check_paths(workspace, argv, output.path)
+    _check_paths(workspace, argv, output.path, os.environ)
     print(f"kept for a manual removal list: {output.path} (cargo, clean requested)", file=sys.stderr)
     return CleanExit.REVIEWED
 
@@ -207,14 +291,9 @@ def main(argv: list[str]) -> int:
     if argv[:1] == ["--clean-output"]:
         try:
             return clean_output(argv[1:], Path.cwd())
-        except (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused) as error:
+        except STEP_ERRORS as error:
             print(f"cargo: {error}", file=sys.stderr)
             return 1
-    try:
-        enforce = worktrees.enforce_build_folders()
-    except (OSError, ValueError) as error:
-        print(f"cargo: {error}", file=sys.stderr)
-        return 1
     execute = argv[:1] == ["--exec-checked"]
     if execute:
         if len(argv) < 4 or argv[1] not in ("direct", "queue"):
@@ -225,13 +304,8 @@ def main(argv: list[str]) -> int:
         route, executable = "", ""
     with ExitStack() as locks:
         try:
-            output = check_step(argv, Path.cwd(), locks, enforce=enforce)
-        except OutsideBuildFolders as error:
-            print(f"cargo: {error}", file=sys.stderr)
-            if enforce:
-                return 1
-            output = NoOutputLock()
-        except (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused) as error:
+            output = checked_step(argv, Path.cwd(), locks, os.environ, note_outside=True)
+        except STEP_ERRORS as error:
             print(f"cargo: {error}", file=sys.stderr)
             return 1
         if execute:

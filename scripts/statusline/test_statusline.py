@@ -30,6 +30,7 @@ from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
@@ -38,13 +39,13 @@ from scripts.message import review_hold
 from scripts.review_links import for_you
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Preserve the fixture PATH when NixOS starts a child shell.
-SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
+SHELL_ENVIRONMENT = fixture_zsh_environment()
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
@@ -508,7 +509,8 @@ class ForYouStatusTests(unittest.TestCase):
                 requests.append(self.path)
                 self.send_response(200)
                 self.end_headers()
-                reply: dict[str, object] = {"available": True, "count": 3}
+                reply: dict[str, object] = {"available": True, "count": 3, "other_count": 2,
+                                            "rebuild_machines": ["mac"]}
                 if self.path == "/console/for-you.json":
                     reply["entries"] = [{"command": "x" * 70000}]
                 _ = self.wfile.write(json.dumps(reply).encode())
@@ -547,7 +549,7 @@ class ForYouStatusTests(unittest.TestCase):
                     thread.join()
             unavailable = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
                                          text=True, check=True, env=env, cwd=home)
-            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], "For you: 3 actions", result.stderr)
+            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], "For you: rebuild mac, 2 actions", result.stderr)
             self.assertEqual(requests, ["/console/for-you.json?view=count"])
             self.assertEqual(unavailable.stdout.splitlines()[-1], "For you: Unavailable")
             self.assertFalse((home / ".local/state/for-you").exists())
@@ -560,9 +562,9 @@ class ForYouStatusTests(unittest.TestCase):
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
             _ = cache.write_text("\n9999999999\n", encoding="utf-8")
 
-            def console_count() -> str:
+            def read_console_actions() -> for_you.StatusLineActions:
                 _ = cache.write_text("\n0\n", encoding="utf-8")
-                return "3"
+                return for_you.StatusLineActions(other_count=3)
 
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
                                          "STATUSLINE_SYSTEM": "Darwin",
@@ -570,7 +572,7 @@ class ForYouStatusTests(unittest.TestCase):
                   patch.object(sys, "argv", ["assignment.py", "-r"]),
                   patch.object(sys, "stdin", io.StringIO("{}")),
                   patch.object(rebuild_row, "DEFAULT_CONFIG", config),
-                  patch.object(for_you, "console_action_count", side_effect=console_count) as request,
+                  patch.object(for_you, "console_status_line_actions", side_effect=read_console_actions) as request,
                   patch.object(subprocess, "Popen") as refresh,
                   patch.object(os, "execvp") as render):
                 assignment.main()
@@ -610,19 +612,23 @@ class ForYouStatusTests(unittest.TestCase):
                       patch.object(os, "execvp") as render):
                     assignment.main()
                 read.assert_called_once_with()
-                needs.assert_called_once_with()
+                needs.assert_called_once_with([])
                 self.assertEqual(refresh.call_count, int(expire))
                 render.assert_called_once()
                 arguments = cast(list[str], render.call_args.args[1])
                 self.assertEqual(arguments[arguments.index("for_you") + 1], expected)
 
-    def test_review_and_action_rows_have_separate_counts(self) -> None:
+    def test_review_and_for_you_show_separate_rows_with_both_rebuilds(self) -> None:
+        rebuilds = rebuild_row.rebuild_names(("natedev", "mac", "natedev"))
         lines = status_lines({"session_id": "sid"}, counts="sid Review: 1 question, 2 changes, 1 investigation",
-                             adhoc="3 adhoc items", for_you="2", rebuild="rebuild mac")
+                             adhoc="3 adhoc items", for_you="0", rebuild=rebuilds)
         plain = [ANSI.sub("", line) for line in lines]
         self.assertIn("Review: 3 adhoc items, 1 question, 2 changes, 1 investigation", plain)
-        self.assertIn("For you: 2 actions", plain)
-        self.assertNotIn("rebuild mac", "\n".join(plain))
+        self.assertIn("For you: rebuild natedev, rebuild mac", plain)
+
+    def test_rebuild_and_other_action_share_the_for_you_row(self) -> None:
+        lines = status_lines({}, for_you="1", rebuild="rebuild natedev")
+        self.assertIn("For you: rebuild natedev, \x1b[1m1\x1b[22m action", lines)
 
     def test_global_actions_do_not_depend_on_the_session(self) -> None:
         for identity in ("", "sid", "another-session"):
@@ -673,8 +679,12 @@ class AdhocItemsTests(unittest.TestCase):
                         result.keep(item)
                 command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
                 result = subprocess.run(command, text=True, capture_output=True, check=True)
-                self.assertEqual(result.stdout, "Messages from the review\n\n"
-                    + "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
+                held_file = Path(directory) / ".local/state/adhoc_review/.holds/review-session.held.md"
+                header, entries = held_file.read_text(encoding="utf-8").split("\n\n", 1)
+                self.assertRegex(header, r"^Released at \d\d:\d\d:\d\d E[SD]T$")
+                self.assertEqual(result.stdout, review_hold.held_notice(2, held_file, header) + "\n")
+                self.assertEqual(entries,
+                    "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
                     + "2. Pat · build\n   Sent: 12:06 EST\n   Sender native id: codex:pat\n   Second report.\n")
                 self.assertEqual(result.stderr, "")
                 again = subprocess.run(command, text=True, capture_output=True, check=True)
@@ -702,14 +712,18 @@ class AdhocItemsTests(unittest.TestCase):
                     assert isinstance(result, review_hold.OpenReview)
                     result.keep(message)
                 command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]
+                held_file = Path(directory) / ".local/state/adhoc_review/.holds/review-session.held.md"
                 payload = json.dumps({"session_id": "review-session", "source": "resume",
                                       "hook_event_name": "SessionStart"})
                 reply = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                header = held_file.read_text(encoding="utf-8").splitlines()[0]
+                self.assertRegex(header, r"^Released at \d\d:\d\d:\d\d UTC$")
                 self.assertEqual(cast(object, json.loads(reply.stdout)), {"hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": ("Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n"
-                                          + "   Sender native id: unavailable\n   A saved report."),
+                    "additionalContext": review_hold.held_notice(1, held_file, header),
                 }})
+                self.assertIn("1. Drew\n   Sent: 16:20 UTC\n   Sender native id: unavailable\n   A saved report.\n",
+                              held_file.read_text(encoding="utf-8"))
                 self.assertEqual(reply.stderr, "")
                 again = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
                 self.assertEqual(again.stdout + again.stderr, "")
@@ -1341,7 +1355,7 @@ class CountsRowTests(ConfiguredShellTests):
                 path.unlink()
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
@@ -1381,7 +1395,7 @@ class CountsRowTests(ConfiguredShellTests):
     def test_each_count_in_the_row_is_bold_inside_its_fixture_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
-        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+        env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
@@ -2203,7 +2217,7 @@ class RebuildRowTests(unittest.TestCase):
         self.assertEqual(ANSI.sub("", line), "Review: 1 question, 2 changes, 1 proposal")
 
     def test_rebuild_argument_does_not_create_an_action_count(self) -> None:
-        self.assertFalse(any(line.startswith(("Review:", "For you:")) for line in status_lines({}, rebuild="rebuild mac")))
+        self.assertIn("For you: rebuild mac", status_lines({}, rebuild="rebuild mac"))
 
     def test_settings_read_values_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2294,17 +2308,24 @@ class RebuildRowTests(unittest.TestCase):
                                   + "rebuild.generations=~/.local/state/rebuild/generations.log\n", encoding="utf-8")
             switched = {"natedev": "a" * 40, "mac": "b" * 40}
             # The running natedev system is the earlier switch, so a later switch to another system is not the base.
-            logs = {"natedev": f"/nix/store/x\nt switch system-1-link {'a' * 40}-dirty /nix/store/x\n"
-                               + f"t switch system-2-link {'c' * 40} /nix/store/y",
-                    "mac": f"/nix/store/m\nt switch system-9-link {'b' * 40} /nix/store/m"}
+            def switch(path: str, generation: int, revision: str) -> str:
+                return (f"/nix/store/{path}\nactivated 2026-11-19T13:00:00Z 100\n"
+                        f"generation system-{generation}-link 2026-11-19T12:59:59Z 101\n--- generations ---\n"
+                        f"2026-11-19T13:00:01Z switch system-{generation}-link {revision} /nix/store/{path}")
+
+            logs = {"natedev": switch("x", 1, switched["natedev"] + "-dirty")
+                               + f"\n2026-11-19T13:00:02Z switch system-2-link {'c' * 40} /nix/store/x",
+                    "mac": switch("m", 9, switched["mac"])}
             commands: list[list[str]] = []
             mac_reachable = True
 
             def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
                 if command[0] == "sh":
-                    self.assertEqual(command[2], "realpath /run/current-system && tail -n 200 "
-                                     + "~/.local/state/rebuild/generations.log")
+                    self.assertIn("current=/run/current-system", command[2])
+                    self.assertIn('realpath "$current"', command[2])
+                    self.assertIn('cat "$running/configuration-revision"', command[2])
+                    self.assertIn('tail -n 200 "$HOME"/.local/state/rebuild/generations.log', command[2])
                     return logs["natedev"]
                 if command[0] == "ssh":
                     return logs["mac"] if mac_reachable else ""
@@ -2320,7 +2341,8 @@ class RebuildRowTests(unittest.TestCase):
                         + "https://claude.ai/code/session_01Abc\n"
                         + f"{'e' * 40}\x1f2026-11-15T01:09:21-05:00\x1fby hand\x1f")
 
-            with patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]):
+            with (patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]),
+                  patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(root / "needs")})):
                 rebuild_row.write_changes(config, run)
                 wrote = [rebuild_row.Change("d" * 40, "2026-11-15T08:45:08-05:00", "memory: THP defrag defer", "96b016bf"),
                          rebuild_row.Change("e" * 40, "2026-11-15T01:09:21-05:00", "by hand", "")]
@@ -2331,12 +2353,11 @@ class RebuildRowTests(unittest.TestCase):
                 commands.clear()
                 mac_reachable = False
                 switched["natedev"] = "c" * 40
-                logs["natedev"] = f"/nix/store/y\nt switch system-2-link {'c' * 40} /nix/store/y"
+                logs["natedev"] = switch("y", 2, switched["natedev"])
                 rebuild_row.write_changes(config, run)
                 # The session map is kept, and a Mac that does not answer keeps its last list.
                 self.assertFalse(any(command[0] == "rg" for command in commands))
                 self.assertEqual(rebuild_row.read_changes(config)["mac"], tuple(wrote))
-                self.assertEqual(rebuild_row.switched_commit("", "/nix/store/x"), "")
 
     def test_read_command_prints_both_one_or_no_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2519,7 +2540,8 @@ class RebuildRowTests(unittest.TestCase):
                 with self.subTest(need_error=type(error).__name__), patch.object(need, "read_needs", side_effect=error):
                     answer = rebuild_row.read(config)
                     self.assertEqual(answer.row(), "rebuild mac")
-                    self.assertFalse(any(line.startswith(("Review:", "For you:")) for line in status_lines({}, rebuild=answer.row())))
+                    self.assertIn("For you: rebuild mac, Unavailable",
+                                  status_lines({}, rebuild=answer.row(), for_you="unavailable"))
 
     def test_shell_reads_a_fresh_cache_without_running_the_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2536,10 +2558,18 @@ class RebuildRowTests(unittest.TestCase):
                 if source == "actions":
                     actions = actions.with_name("malformed-actions")
                     actions.mkdir(parents=True)
-                    depth = 2 * sys.getrecursionlimit()
+                    depth = 100_000
                     _ = (actions / "action.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+                    with self.assertRaises(RecursionError):
+                        _ = ActionStore(actions).list()
                 elif source == "needs":
-                    (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
+                    folder = home / ".local/state/rebuild/needs"
+                    (folder / "unreadable.json").mkdir(parents=True)
+                    with patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(folder)}):
+                        need.add_need("mac", "a" * 40, "Apply settings.", "fixture")
+                    _ = ActionStore(actions).add(title="Check the build", command="check", machine="mac",
+                                                 cwd="/fixture", requested_by="fixture", reason="Read the result.",
+                                                 waits="Build", concerns="fixture", dedupe_key="check")
                 for shell in SHELLS:
                     with self.subTest(shell=shell, source=source):
                         result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
@@ -2547,8 +2577,10 @@ class RebuildRowTests(unittest.TestCase):
                                                                  "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: \x1b[1m1\x1b[22m action" if source == "ready" else "For you: Unavailable"
-                        self.assertEqual(result.stdout.splitlines()[-1], expected)
+                        expected = {"ready": "For you: rebuild natedev",
+                                    "actions": "For you: rebuild natedev, Unavailable",
+                                    "needs": "For you: rebuild natedev, rebuild mac, 1+ actions"}
+                        self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], expected[source])
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)
 

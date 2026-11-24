@@ -17,10 +17,26 @@ from scripts.build_targets.execution_transport import (
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 
 
 Platform = Literal["linux", "macos"]
+
+# One wait for every machine that the queue sends a run to (build_targets.conf).
+UNREACHABLE_WAIT_KEY = "unreachable_wait_seconds"
+MAX_UNREACHABLE_WAIT_SECONDS = 86400
+
+
+def _unreachable_wait(value: str) -> int:
+    seconds = conf.positive_whole(value)
+    if seconds > MAX_UNREACHABLE_WAIT_SECONDS:
+        raise ValueError(f"expected at most {MAX_UNREACHABLE_WAIT_SECONDS} seconds")
+    return seconds
+
+
+def unreachable_wait_seconds(registry: conf.ConfigRead) -> int:
+    """Read how long a machine may send nothing before its run ends as unreachable."""
+    return registry.value(UNREACHABLE_WAIT_KEY, _unreachable_wait, recover_invalid=False)
 
 
 @dataclass(frozen=True)
@@ -39,6 +55,16 @@ class SshTarget:
 
 
 Target = LocalTarget | SshTarget
+
+
+@dataclass(frozen=True)
+class ScalerTarget:
+    """The registry names the scaler and its settings file."""
+    name: str
+    settings: Path
+
+
+RegisteredTarget = Target | ScalerTarget
 
 
 @dataclass(frozen=True)
@@ -173,15 +199,42 @@ def ssh_target_state_directory(target: str) -> Path:
     """Return the state path without requiring target registration."""
     require_target_name(target)
     if target != "mac":
-        configured_root = os.environ.get("BUILD_TARGETS_STATE_DIR")
-        root = Path(configured_root).expanduser() if configured_root else Path.home() / ".local/state/build-targets"
-        return root / target
+        return build_targets_state_root() / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
     return Path(configured).expanduser()
 
 
+def build_targets_state_root() -> Path:
+    """Return the shared state root for SSH build targets."""
+    configured = os.environ.get("BUILD_TARGETS_STATE_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".local/state/build-targets"
+
+
+def provision_mac_linux_state_root(root: Path) -> None:
+    """Create the root and sync each directory entry up to home or the filesystem root."""
+    root = root.absolute()
+    home = Path.home().absolute()
+    boundary = home if root.is_relative_to(home) else Path(root.anchor)
+    folders = (root, *root.parents)
+    for folder in reversed(folders[:folders.index(boundary)]):
+        if folder.is_symlink():
+            raise OSError(f"The Mac Linux state root path {folder} is a symbolic link. Use a real directory")
+    for folder in reversed(folders):
+        if not folder.is_dir():
+            folder.mkdir(exist_ok=True)
+    for folder in folders:
+        if folder == boundary:
+            break
+        atomic_file.sync_folder(folder.parent)
+
+
+def mac_linux_end_proof_journal() -> Path:
+    """Return the journal for guest launch and end proof."""
+    return ssh_target_state_directory("mac-linux") / "end-proofs.jsonl"
+
+
 def uses_legacy_mac_layout(platform: Platform) -> bool:
-    """Mac targets retain one mirror and claim per source repository name."""
+    """Mac targets retain one mirror per source repository name."""
     return platform == "macos"
 
 
@@ -197,9 +250,9 @@ def _target_names(value: str) -> tuple[str, ...]:
     return names
 
 
-def _target_kind(value: str) -> Literal["local", "ssh"]:
-    if value not in ("local", "ssh"):
-        raise ValueError(f"expected local or ssh, got {value!r}")
+def _target_kind(value: str) -> Literal["local", "ssh", "scaler"]:
+    if value not in ("local", "ssh", "scaler"):
+        raise ValueError(f"expected local, ssh or scaler, got {value!r}")
     return value
 
 
@@ -229,20 +282,21 @@ def _registry_value[Value](config: conf.ConfigRead, key: str, convert: Callable[
         raise ConfigError(f"{key}: {error} in {config.source}") from error
 
 
-def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> Target:
+def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> RegisteredTarget:
     if purpose is RegistryRead.PLACEMENT:
         require_target_name(name)
     kind = _registry_value(config, f"kind.{name}", _target_kind, purpose)
-    platform = _registry_value(config, f"platform.{name}", _target_platform, purpose)
     if kind == "local":
-        return LocalTarget(name, platform)
+        return LocalTarget(name, _registry_value(config, f"platform.{name}", _target_platform, purpose))
     key = f"settings.{name}"
     settings = _registry_value(config, key, lambda value: _settings_path(value, config.source), purpose)
     if purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not settings.is_file():
         raise ConfigError(f"{key}: settings file does not exist: {settings}")
+    if kind == "scaler":
+        return ScalerTarget(name, settings)
     if name == "aws" or settings.name == "aws_target.conf":
         raise ConfigError("The permanent AWS builder was removed; use cloud gates")
-    return SshTarget(name, platform, settings)
+    return SshTarget(name, _registry_value(config, f"platform.{name}", _target_platform, purpose), settings)
 
 
 def pinned_target_names(configuration: conf.ConfigRead) -> tuple[str, ...]:
@@ -255,6 +309,16 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
                  purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
                  ) -> tuple[Target, ...]:
+    """Read the targets that local and SSH commands can use."""
+    return tuple(target for target in read_registered_targets(path, selected=selected, target_name=target_name,
+        purpose=purpose, configuration=configuration) if not isinstance(target, ScalerTarget))
+
+
+def read_registered_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
+                            purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
+                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                            ) -> tuple[RegisteredTarget, ...]:
+    """Read the local, SSH, and scaler entries in the target registry."""
     if selected and target_name and selected != target_name:
         raise ConfigError("expected one selected target")
     selected = selected or target_name
@@ -268,14 +332,15 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
         else:
             configuration = conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
-    if selected and selected not in names and selected in pinned_target_names(configuration):
-        names = (selected,)
-    targets: list[Target] = []
-    for name in names:
+    pinned = bool(selected and selected not in names and selected in pinned_target_names(configuration))
+    targets: list[RegisteredTarget] = []
+    for name in (selected,) if pinned else names:
         if selected and name != selected:
             continue
         try:
-            targets.append(_read_target(configuration, name, purpose))
+            target = _read_target(configuration, name, purpose)
+            if not (pinned and isinstance(target, ScalerTarget)):
+                targets.append(target)
         except ConfigError:
             if selected or purpose is RegistryRead.REQUIRE_SETTINGS_FILES:
                 raise

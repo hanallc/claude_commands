@@ -1,6 +1,9 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout, suppress
+from datetime import UTC, datetime, timedelta
+import io
 import json
 import os
 from pathlib import Path
@@ -12,15 +15,21 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import TextIO, cast
+from typing import BinaryIO, TextIO, cast
 import unittest
+from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib import conf
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import mac_queue_run
+from scripts.build_hold import override_guard
+from scripts.build_hold.test_override_guard import installed_script
+from scripts.mac_test import mac_queue_run, mac_test, mac_transport
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id
 
 
 QUEUE = r'''
@@ -42,7 +51,14 @@ if args[0] == "place-step":
     if os.environ.get("FAKE_QUEUE_REFUSE") == "1":
         print("refused\tclosed")
         raise SystemExit(2)
-    Path(option("--assignment-file")).write_text(json.dumps({"episode":option("--episode"),"attempt":"attempt"}))
+    pending = root / "block-on-placement.json"
+    if pending.exists():
+        pending.rename(Path(os.environ["MAC_TEST_STATE_DIR"]) / "block.json")
+    receipt = Path(option("--assignment-file"))
+    if os.environ.get("FAKE_QUEUE_SIDECARS") == "1":
+        for suffix in (".wait", ".queued"):
+            receipt.with_name(receipt.name + suffix).touch()
+    receipt.write_text(json.dumps({"episode":option("--episode"),"attempt":"attempt"}))
     print("mac\tmac\tfake-mac\t0\t"+option("--episode")+"\tattempt")
 else:
     if os.environ.get("FAKE_RETURN_FAIL") == "1":
@@ -64,7 +80,6 @@ if "mac_stopped=" in args[-1]:
 (root / "remote").write_text(json.dumps(args))
 print("mac_group=4567", flush=True)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
-    (root / "running").write_text(str(os.getpid()))
     print("Mac command started", flush=True)
     # The real ssh sends the end of its input to the Mac wrapper, which stops the work.
     _ = sys.stdin.read()
@@ -94,7 +109,8 @@ def plain_ssh_builds(root: Path) -> list[str]:
 
 
 # The queue releases on process end, so these files set no signal handler (user rule, 2026-11-14).
-NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/cargo_gate/gate.zsh")
+NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/mac_transport.py",
+                    "mac_test/cargo_gate/gate.zsh")
 SIGNAL_HANDLER = re.compile(r"\bsignal\.(?:signal|SIG_IGN|SIG_DFL|pthread_sigmask|setitimer)\b|\bfrom signal import\b"
                             + r"|^\s*trap\b|\bTRAP[A-Z]+\b")
 
@@ -115,10 +131,58 @@ def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
     _ = ssh.write_text(f"#!{sys.executable}\n" + ssh_source)
     ssh.chmod(0o755)
     environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
-                   "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
+                   "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root),
+                   "MAC_TEST_STATE_DIR": str(root / "mac-test"), "STAFF_FILE": str(root / "staff.json")}
     _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
                              + shlex.join([sys.executable, str(queue)]) + "\n")
     return environment
+
+
+def queue_with_ready_event(root: Path) -> Path:
+    """Run the real queue and wait for the watcher pipe in lifecycle tests."""
+    source = Path(__file__).resolve().parents[2]
+    script = root / "queue-entry.py"
+    _ = script.write_text(f"import sys\nsys.path.insert(0, {str(source)!r})\n" + r"""
+import os
+import select
+
+from scripts.mac_test import mac_queue_run
+
+def wait_for_ready(output, _timeout):
+    expected = b"ready\n"
+    received = b""
+    while received != expected:
+        readable, _, _ = select.select([caller, output], [], [])
+        if caller in readable:
+            return False
+        chunk = os.read(output, len(expected) - len(received))
+        received += chunk
+        if not chunk or not expected.startswith(received):
+            return False
+    return True
+
+with os.fdopen(os.dup(int(sys.argv[sys.argv.index("--caller-fd") + 1])), "rb") as pipe:
+    caller = pipe.fileno()
+    mac_queue_run.watcher_ready = wait_for_ready
+    raise SystemExit(mac_queue_run.main())
+""")
+    return script
+
+
+def end_queue_fixture(process: subprocess.Popen[str] | subprocess.Popen[bytes], caller: BinaryIO,
+                      *, queue_group: bool = False) -> None:
+    """Close the caller pipe so the queue can stop and reap its watcher."""
+    caller.close()
+    try:
+        _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+    except subprocess.TimeoutExpired:
+        if queue_group:
+            with suppress(ProcessLookupError):
+                send_process_group(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+        _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        raise
 
 
 class QueueRunTests(unittest.TestCase):
@@ -129,6 +193,348 @@ class QueueRunTests(unittest.TestCase):
 
     def events(self, root: Path) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in (root / "events").read_text().splitlines()]
+
+    def write_block(self, path: Path, *, expired: bool = False, ci: mac_test.CiSwitch = "not_configured",
+                    session: str = "holder-session") -> None:
+        now = datetime.now(UTC)
+        since = now - timedelta(hours=2) if expired else now
+        mac_test.write_block(path, mac_test.ActiveMacBlock(
+            "fixture-holder", "fixture work\nneeds the Mac", since, since + timedelta(hours=1),
+            mac_test.RecordedSession(session, "fixture-holder"),
+            mac_test.NO_SHOWRUNNER, ci, mac_test.FREE_MESSAGE_NOT_NEEDED))
+
+    def test_run_waits_once_for_another_sessions_block(self) -> None:
+        for block_after_request in (False, True):
+            with self.subTest(block_after_request=block_after_request), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                self.write_block(root / "block-on-placement.json" if block_after_request else block)
+                previous = ["place-step", "cancel-placement"] if block_after_request else []
+                waits = 0
+
+                def release_after_two_waits() -> None:
+                    nonlocal waits
+                    waits += 1
+                    self.assertTrue(block.is_file())
+                    self.assertFalse((root / "remote").exists())
+                    events = self.events(root) if (root / "events").exists() else []
+                    self.assertEqual([event[0] for event in events], previous)
+                    if waits == 2:
+                        block.unlink()
+
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_after_two_waits),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(mac_queue_run.main(self.command(root, "run")[3:]), 0)
+                self.assertEqual(waits, 2)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac",
+                    "Mac output", "mac_exit=0",
+                ])
+                self.assertTrue((root / "remote").is_file())
+                self.assertEqual([event[0] for event in self.events(root)],
+                                 [*previous, "place-step", "cancel-placement"])
+
+    def test_run_starts_for_the_block_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "CLAUDE_CODE_SESSION_ID": "holder-session"}
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block)
+            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+            self.assertTrue((root / "remote").is_file())
+
+    def test_run_uses_the_block_holding_units_session_for_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            named_run = root / "unit-run"
+            holder = fixture_runtime_id("queue-run-holder")
+            environment = {**queue_fixture(root), "UNIT_RUN_DIR": str(named_run),
+                           "CLAUDE_CODE_SESSION_ID": "worker-session", "CODEX_THREAD_ID": "worker-thread"}
+            director = staff.StaffId(fixture_runtime_id("queue-run-director"))
+            parent = staff.StaffRow(director, "showrunner", "fixture-director", staff.StaffRoot(),
+                                    current_session=director)
+            row = staff.StaffRow(staff.StaffId(fixture_runtime_id("queue-run-unit")), "unit", "fixture-holder",
+                                 staff.ReportsTo(director), current_session=staff.StaffId(holder),
+                                 run=staff.OpenRun(named_run), unit_type=staff.UnitDetails("direct"))
+            _ = Path(environment["STAFF_FILE"]).write_text(staff.StaffSnapshot((parent, row)).encode())
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block, session=holder)
+            with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()) as output:
+                self.assertIn(row, staff.local_snapshot().rows)
+                self.assertEqual(mac_queue_run.main(["--no-wait", *self.command(root, "run")[3:]]), 0)
+            placed = self.events(root)[0]
+            self.assertEqual(placed[placed.index("--session-id") + 1], holder)
+            self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+
+    def test_shot_of_the_block_holding_units_worker_starts_with_its_own_placement_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            named_run = root / "unit-run"
+            holder = fixture_runtime_id("queue-shot-holder")
+            environment = {**queue_fixture(root), "UNIT_RUN_DIR": str(named_run),
+                           "CLAUDE_CODE_SESSION_ID": "worker-session", "CODEX_THREAD_ID": "worker-thread"}
+            director = staff.StaffId(fixture_runtime_id("queue-shot-director"))
+            parent = staff.StaffRow(director, "showrunner", "fixture-director", staff.StaffRoot(),
+                                    current_session=director)
+            row = staff.StaffRow(staff.StaffId(fixture_runtime_id("queue-shot-unit")), "unit", "fixture-holder",
+                                 staff.ReportsTo(director), current_session=staff.StaffId(holder),
+                                 run=staff.OpenRun(named_run), unit_type=staff.UnitDetails("direct"))
+            _ = Path(environment["STAFF_FILE"]).write_text(staff.StaffSnapshot((parent, row)).encode())
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block, session=holder)
+            with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(mac_queue_run.main(["--no-wait", *self.command(root, "shot")[3:]]), 0)
+            placed = self.events(root)[0]
+            self.assertEqual(placed[placed.index("--session-id") + 1], "worker-thread")
+            self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue(block.is_file())
+
+    def test_block_during_recovery_prevents_prepare_and_removes_retry_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "FAKE_QUEUE_SIDECARS": "1"}
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            callback = root / "callback"
+            write_stdlib_tool(callback, """
+import json, sys
+from pathlib import Path
+if sys.argv[1] == "prepare":
+    Path(__file__).with_name("prepared").touch()
+    Path(sys.argv[2]).write_text(json.dumps(sys.argv[3:]))
+""")
+            receipts = root / mac_queue_run.RECEIPTS
+
+            def block_after_placement(_environment: dict[str, str]) -> None:
+                if len(self.events(root)) == 1:
+                    self.assertEqual(sorted(path.suffix for path in receipts.iterdir()), [".json", ".queued", ".wait"])
+                    self.write_block(block)
+                else:
+                    for suffix in (".wait", ".queued"):
+                        for path in receipts.glob("*" + suffix):
+                            path.unlink()
+
+            def release_block() -> None:
+                self.assertFalse((root / "prepared").exists())
+                self.assertFalse((root / "remote").exists())
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                self.assertEqual(list(receipts.iterdir()), [])
+                block.unlink()
+
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_queue_run, "clean_ended_runs", side_effect=block_after_placement),
+                  mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_block) as wait,
+                  redirect_stdout(io.StringIO()) as output):
+                status = mac_queue_run.main(["--lifecycle-script", str(callback), *self.command(root, "run")[3:]])
+            self.assertEqual(status, 0)
+            wait.assert_called_once()
+            self.assertTrue((root / "prepared").is_file())
+            self.assertTrue((root / "remote").is_file())
+            self.assertEqual(output.getvalue().splitlines(), [
+                "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac",
+                "Mac output", "mac_exit=0",
+            ])
+
+    def test_mac_run_refuses_blocked_or_unreadable_state_after_placement(self) -> None:
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session",
+                               "FAKE_QUEUE_SIDECARS": "1"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                pending = root / "block-on-placement.json"
+                if unreadable:
+                    _ = pending.write_text("damaged\n")
+                    expected = f"state unreadable: {block}\n"
+                else:
+                    self.write_block(pending)
+                    expected = "blocked by fixture-holder: fixture work\nneeds the Mac\n"
+
+                callback = root / mac_queue_run.MAC_RUN_SCRIPT.name
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "run_callback") as lifecycle,
+                      mock.patch.object(mac_queue_run, "wait_to_retry") as wait,
+                      redirect_stdout(io.StringIO()) as output):
+                    status = mac_queue_run.main(["--lifecycle-script", str(callback), *self.command(root, "run")[3:]])
+
+                self.assertEqual(status, 9)
+                self.assertEqual(output.getvalue(), expected)
+                lifecycle.assert_not_called()
+                wait.assert_not_called()
+                self.assertTrue(block.is_file())
+                self.assertFalse((root / "remote").exists())
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+
+    def check_kind_waits_for_a_block_after_its_placement(self, kind: str) -> None:
+        """A block or an unreadable block record that appears at placement keeps the kind waiting."""
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**queue_fixture(root), "CODEX_THREAD_ID": "other-session"}
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                pending = root / "block-on-placement.json"
+                if unreadable:
+                    _ = pending.write_text("damaged\n")
+                    expected = f"Waiting for a readable Mac block record: {block}"
+                else:
+                    self.write_block(pending)
+                    expected = "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac"
+                waits = 0
+
+                def release_block() -> None:
+                    nonlocal waits
+                    waits += 1
+                    self.assertTrue(block.is_file())
+                    self.assertFalse((root / "remote").exists())
+                    self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                    block.unlink()
+
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=release_block),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(mac_queue_run.main(self.command(root, kind)[3:]), 0)
+                self.assertEqual(waits, 1)
+                self.assertEqual(output.getvalue().splitlines(), [expected, "Mac output", "mac_exit=0"])
+                self.assertTrue((root / "remote").is_file())
+                self.assertEqual([event[0] for event in self.events(root)],
+                                 ["place-step", "cancel-placement", "place-step", "cancel-placement"])
+
+    def test_shot_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("shot")
+
+    def test_install_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("install")
+
+    def test_probe_waits_for_a_block_after_its_placement(self) -> None:
+        self.check_kind_waits_for_a_block_after_its_placement("probe")
+
+    def test_expired_block_lifts_without_the_watcher_and_preserves_a_failed_ci_restore(self) -> None:
+        for restore_fails in (False, True):
+            with self.subTest(restore_fails=restore_fails), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root)
+                block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+                block.parent.mkdir()
+                self.write_block(block, expired=True, ci="off_by_this_block" if restore_fails else "not_configured")
+                _ = write_config_fixture(root / "config/mac_test.conf", "ci_repo=fixture/project\n")
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(mac_test, "switch_ci_back", return_value=mac_test.GhFailure("fixture CI error")) as restore,
+                      mock.patch.object(mac_test, "send_to_block_recipients"),
+                      mock.patch.object(mac_test, "record_hold_event") as hold,
+                      mock.patch.object(mac_test, "start_watcher") as watcher,
+                      mock.patch.object(mac_queue_run, "wait_to_retry") as wait,
+                      redirect_stdout(io.StringIO()) as output):
+                    status = mac_queue_run.main(["--no-wait", *self.command(root, "run")[3:]])
+                watcher.assert_not_called()
+                wait.assert_not_called()
+                self.assertEqual(block.exists(), restore_fails)
+                self.assertEqual((root / "remote").exists(), not restore_fails)
+                if restore_fails:
+                    self.assertEqual(status, mac_queue_run.MAC_BUSY_STATUS)
+                    self.assertIn("Mac blocked held by fixture-holder", output.getvalue())
+                    restore.assert_called_once()
+                    hold.assert_not_called()
+                else:
+                    self.assertEqual(status, 0)
+                    self.assertEqual(output.getvalue().splitlines(), ["Mac output", "mac_exit=0"])
+                    restore.assert_not_called()
+                    hold.assert_called_once()
+
+    def test_two_waiters_keep_waiting_after_one_failed_ci_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "CLAUDE_CODE_SESSION_ID": "first-waiter"}
+            block = Path(environment["MAC_TEST_STATE_DIR"]) / "block.json"
+            block.parent.mkdir()
+            self.write_block(block, expired=True, ci="off_by_this_block")
+            _ = write_config_fixture(root / "config/mac_test.conf", "ci_repo=fixture/project\n")
+            args = self.command(root, "run")[3:]
+            first_waits = second_waits = 0
+            second_output = io.StringIO()
+            restores = [mac_test.GhFailure("fixture CI error"), mac_test.GhAnswer("")]
+
+            def check_wait() -> None:
+                self.assertTrue(block.is_file())
+                self.assertFalse((root / "events").exists())
+                restore.assert_called_once()
+
+            def wait_second() -> None:
+                nonlocal second_waits
+                second_waits += 1
+                check_wait()
+                if second_waits == 2:
+                    unblock = mac_test.CliArguments()
+                    unblock.holder = "fixture-holder"
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(mac_test.command_unblock(
+                            unblock, mac_test.state_paths(), mac_test.read_config()), 0)
+
+            def wait_first() -> None:
+                nonlocal first_waits
+                first_waits += 1
+                check_wait()
+                if first_waits == 2:
+                    with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "second-waiter"}),
+                          mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=wait_second),
+                          redirect_stdout(second_output)):
+                        self.assertEqual(mac_queue_run.main(args), 0)
+
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_test, "switch_ci_back", side_effect=restores) as restore,
+                  mock.patch.object(mac_test, "send_to_block_recipients") as send,
+                  mock.patch.object(mac_test, "record_hold_event"),
+                  mock.patch.object(mac_test, "skipped_ci_runs", return_value=""),
+                  mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=wait_first),
+                  redirect_stdout(io.StringIO()) as first_output):
+                self.assertEqual(mac_queue_run.main(args), 0)
+            self.assertEqual((first_waits, second_waits), (2, 2))
+            self.assertEqual(restore.call_count, 2)
+            send.assert_called_once()
+            self.assertFalse(block.exists())
+            self.assertFalse((block.parent / "block-lift-failure.json").exists())
+            for output in (first_output, second_output):
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "Waiting for the Mac block held by fixture-holder: fixture work needs the Mac",
+                    "Mac output", "mac_exit=0",
+                ])
+
+    def test_installed_run_refuses_a_mac_state_override_before_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            installed = installed_script(root, "mac_test/mac_queue_run.py")
+            override = str(root / "private-mac-state")
+            with (mock.patch.object(mac_queue_run, "__file__", str(installed.script)),
+                  mock.patch.object(override_guard, "user_home", return_value=installed.home),
+                  mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": override}, clear=True),
+                  mock.patch.object(mac_queue_run, "run") as run, redirect_stderr(io.StringIO()) as error,
+                  self.assertRaises(SystemExit) as stopped):
+                _ = mac_queue_run.main(self.command(root, "run")[3:])
+            self.assertEqual(stopped.exception.code, override_guard.REFUSED_STATUS)
+            self.assertIn(f"MAC_TEST_STATE_DIR is set to '{override}'", error.getvalue())
+            run.assert_not_called()
+
+    def test_run_starts_without_a_mac_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = subprocess.run(self.command(root, "run"), env=queue_fixture(root),
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["Mac output", "mac_exit=0"])
+            self.assertTrue((root / "remote").is_file())
 
     def test_every_run_returns_the_placement_and_keeps_the_mac_status(self) -> None:
         cases = ((0, False, False), (23, False, False), (125, False, False), (2, True, False), (0, False, True), (2, True, True))
@@ -183,6 +589,27 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
             self.assertFalse((root / "remote").exists())
 
+    def test_run_retries_the_busy_status_when_it_can_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "FAKE_QUEUE_BUSY": "1"}
+
+            def allow_placement() -> None:
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+                self.assertFalse((root / "remote").exists())
+                del os.environ["FAKE_QUEUE_BUSY"]
+
+            with (mock.patch.dict(os.environ, environment, clear=True),
+                  mock.patch.object(mac_queue_run, "wait_to_retry", side_effect=allow_placement) as wait,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(mac_queue_run.main(self.command(root, "run")[3:]), 0)
+
+            wait.assert_called_once()
+            self.assertEqual(output.getvalue().splitlines(), ["waiting for the Mac", "Mac output", "mac_exit=0"])
+            self.assertEqual([event[0] for event in self.events(root)],
+                             ["place-step", "place-step", "cancel-placement"])
+            self.assertTrue((root / "remote").is_file())
+
     def test_caller_watch_must_be_ready_before_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -200,38 +627,109 @@ class QueueRunTests(unittest.TestCase):
             self.assertIn("caller watch did not start", result.stderr)
             self.assertFalse((root / "events").exists())
 
+    def test_caller_watch_ends_a_watcher_without_a_complete_ready_line(self) -> None:
+        for output in (b"", b"rea"):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root)
+                _ = write_config_fixture(root / "config/mac_gate.conf", "placement_check_timeout_seconds=1\n")
+                watcher = root / "watcher.py"
+                _ = watcher.write_text(f"import os, sys\nos.write(1, {output!r})\nos.read(int(sys.argv[2]), 1)\n")
+                queue_program = """\
+import sys
+from scripts.mac_test import mac_queue_run
+mac_queue_run.__file__ = sys.argv[1]
+raise SystemExit(mac_queue_run.main(sys.argv[2:]))
+"""
+                reader, writer = os.pipe()
+                try:
+                    command = [sys.executable, "-c", queue_program, str(watcher), "--caller-fd", str(reader),
+                               *self.command(root)[3:]]
+                    # The watcher holds stderr open until it ends. Keep its caller pipe open.
+                    result = subprocess.run(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                finally:
+                    os.close(reader)
+                    os.close(writer)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "mac queue: the Mac queue caller watch did not start\n")
+                self.assertFalse((root / "events").exists())
+
     def test_a_caller_watch_failure_after_ready_stops_the_queue_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = {**queue_fixture(root), "FAKE_SSH_HOLD": "1"}
             reader, writer = os.pipe()
             try:
-                command = self.command(root)
-                command[3:3] = ["--caller-fd", str(reader)]
-                with subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
+                with os.fdopen(writer, "wb") as caller:
+                    command = [sys.executable, str(queue_with_ready_event(root)), "--caller-fd", str(reader),
+                               *self.command(root)[3:]]
+                    queue = subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    assert queue.stdout is not None and queue.stderr is not None
+                    queue_output = cast(TextIO, queue.stdout)
                     try:
-                        assert queue.stdout is not None
-                        queue_output = cast(TextIO, queue.stdout)
-                        self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
-                        self.assertEqual(queue_output.readline().strip(), "Mac command started")
-                        processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True)
-                        watchers: list[int] = []
-                        for line in processes.splitlines():
-                            fields = line.split(maxsplit=2)
-                            if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
-                                watchers.append(int(fields[0]))
-                        self.assertEqual(len(watchers), 1)
-                        os.kill(watchers[0], signal.SIGKILL)
-                        output, errors = queue.communicate(timeout=10)
+                        with queue_output, queue.stderr:
+                            self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(queue_output.readline().strip(), "Mac command started")
+                            processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True,
+                                                                timeout=TEST_HANG_GUARD_SECS)
+                            watchers: list[int] = []
+                            for line in processes.splitlines():
+                                fields = line.split(maxsplit=2)
+                                if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
+                                    watchers.append(int(fields[0]))
+                            self.assertEqual(len(watchers), 1)
+                            os.kill(watchers[0], signal.SIGKILL)
+                            output, errors = queue.communicate(timeout=10)
                     finally:
-                        if queue.poll() is None:
-                            send_process_group(queue.pid, signal.SIGKILL)
-                            _ = queue.communicate()
+                        end_queue_fixture(queue, caller, queue_group=True)
                 self.assertEqual(queue.returncode, -signal.SIGTERM, output + errors)
                 self.assertIn("caller watch ended unexpectedly", errors)
                 self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
                 self.assertIn("signal_group TERM", (root / "stop").read_text())
+            finally:
+                os.close(reader)
+
+    def test_caller_watch_accepts_ready_after_the_termination_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            grace = conf.read(root / "config/mac_gate.conf").number("terminate_grace_seconds")
+            watcher = root / "watcher.py"
+            _ = watcher.write_text(
+                """\
+import os, sys
+print('watcher started', file=sys.stderr, flush=True)
+assert os.read(int(sys.argv[2]), 1) == b'x'
+print('ready', flush=True)
+assert os.read(int(sys.argv[3]), 1) == b''
+""")
+            queue_program = """\
+import sys
+from scripts.mac_test import mac_queue_run
+mac_queue_run.__file__ = sys.argv[1]
+with mac_queue_run.caller_watch(int(sys.argv[2])):
+    print('queue ready', flush=True)
+"""
+            reader, writer = os.pipe()
+            try:
+                with subprocess.Popen([sys.executable, "-c", queue_program, str(watcher), str(reader)],
+                                      env=environment, start_new_session=True, pass_fds=(reader,),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
+                    try:
+                        assert queue.stderr is not None
+                        self.assertTrue(select.select([queue.stderr], [], [], TEST_HANG_GUARD_SECS)[0])
+                        self.assertEqual(queue.stderr.readline(), "watcher started\n")
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            _ = queue.wait(timeout=2 * grace)
+                        self.assertEqual(os.write(writer, b"x"), 1)
+                        output, errors = queue.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(queue.returncode, 0, errors)
+                        self.assertEqual(output, "queue ready\n")
+                    finally:
+                        if queue.poll() is None:
+                            queue.kill()
             finally:
                 os.close(reader)
                 os.close(writer)
@@ -326,9 +824,10 @@ else:
                 with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, env=environment, start_new_session=True) as process:
                     try:
-                        wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
-                        if signum == signal.SIGINT:
-                            # The queue reads the group before it forwards this line.
+                        if waiting:
+                            wait_until((root / "waiting").exists, root, processes=(process,))
+                        else:
+                            # Wait for the queue to forward SSH's last line before sending the signal.
                             assert process.stdout is not None
                             queue_output = cast(TextIO, process.stdout)
                             self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
@@ -354,7 +853,8 @@ else:
                     # The queue ends the placement when this process ends.
                     self.assertEqual(events, ["place-step"])
                     if not waiting:
-                        wait_until((root / "input_closed").exists, root)
+                        # The SSH fixture keeps the captured stderr open until it exits.
+                        self.assertTrue((root / "input_closed").exists(), errors)
                     # The run's state folder stays until the next run cleans it.
                     runs = root / mac_queue_run.RUNS
                     self.assertEqual(len(list(runs.iterdir())), 1)
@@ -379,7 +879,7 @@ else:
                         + ("exec sleep 60" if closes else "exit 7"))
                 on_close = (f"kill -0 $(<{root}/work) 2>/dev/null && print alive > {root}/order"
                             + f" || print ended > {root}/order; kill -TERM $(<{root}/app)")
-                wrapper = mac_queue_run.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
+                wrapper = mac_transport.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
                 # Its own session stands in for the SSH session on the Mac.
                 with subprocess.Popen([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True, start_new_session=True) as process:

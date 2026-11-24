@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refuse a Bash command or file write that makes a new loose folder in ~, /tmp, $TMPDIR, /tmp/claude,
 ~/rust, ~/rust/scratch, the session root (/session on natedev) or the folder that holds the scratch and
-copies roots (/build/claude on natedev).
+copies roots (/tmp/claude).
 
 Agents made repo copies, repros and test trees in those folders, and nothing removed them
 (user, 2026-10-26: "i need a more robust solution"). A scratch folder now belongs to a task and
@@ -12,7 +12,7 @@ cargo new/init, and tar extraction (-C or the working folder); a Write or Notebo
 file's path. A command is refused when it makes a folder directly in one of the roots that does not
 exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp/claude-<uid>),
 /tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session), the scratch roots
-(build_folders.conf roots.scratch, /tmp/claude/scratch, ~/rust/repro) and the copies roots (roots.copies, /tmp/claude/copies). A TMPDIR inside a session or run root still permits ordinary temporary files.
+(build_folders.conf roots.scratch, /tmp/claude/scratch) and the copies roots (roots.copies, /tmp/claude/copies). A TMPDIR inside a session or run root still permits ordinary temporary files.
 In ~ no new folder is allowed (resources, 2026-11-15: gate_tree.sh once cloned 45 GiB into ~/port-gate-tree-test*).
 In the session root only the session-start hook makes folders (scripts/lib/session_folder.py).
 Use worktrees.py make for editable checkouts. Use copies.py run for fixed commits.
@@ -132,9 +132,7 @@ def allowed(top: Path) -> bool:
         return True
     if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch", "session", "copies"):
         return True
-    if top in configured_roots():
-        return True
-    return top == real("~/rust/repro")
+    return top in configured_roots()
 
 
 def loose_folder(path: Path) -> Path | None:
@@ -493,7 +491,7 @@ def refusal(folders: list[Path]) -> str:
         + "Make scratch that belongs to a task, and it goes when the task ends:\n"
         + "  ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new [--task <run:<id> | "
         + "phase:<unit>/<phase> | gate:<id> | row:<showrunner>-C<n>> | --until <YYYY-MM-DD [HH:MM]>] "
-        + "[--name <word>] [--visible]\n"
+        + "[--name <word>]\n"
         + "With no task it lasts 24 h. It prints the folder to use. For temp files, use $TMPDIR (mktemp -d "
         + "with no path). Use add_unit for a new unit."
     )

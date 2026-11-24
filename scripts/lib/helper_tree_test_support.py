@@ -17,6 +17,7 @@ COPY_HELPERS = (
     "scripts/lib", "scripts/buildlog", "scripts/copies", "scripts/mac_test", "scripts/message",
     "scripts/production", "scripts/agents", "scripts/direct", "scripts/hooks", "scripts/lint", "scripts/herdr",
     "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times", "scripts/aws_target",
+    "scripts/worktree",
 )
 VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
 VERIFY_TEST_ENVIRONMENT = frozenset({
@@ -24,12 +25,15 @@ VERIFY_TEST_ENVIRONMENT = frozenset({
     # Keep the test runner's Python process settings in fixture subprocesses.
     "PYTHON_CPU_COUNT", "PYTHONDONTWRITEBYTECODE",
 })
+# Every fixture says who started its queue requests, so the queue never refuses a test run.
+FIXTURE_OWNER = "test fixture"
 
 
 def verify_test_environment() -> dict[str, str]:
-    """Read the allowed caller settings and set the fixture locale."""
+    """Read the allowed caller settings, set the fixture locale, and name the fixture owner."""
     environment = {name: value for name, value in os.environ.items() if name in VERIFY_TEST_ENVIRONMENT}
     environment["LANG"] = environment["LC_ALL"] = "C"
+    environment["CLAUDE_SESSION_NAME"] = FIXTURE_OWNER
     return environment
 
 
@@ -76,7 +80,13 @@ def copy_helpers(home: Path, *folders: str) -> Path:
             target = Path(os.readlink(source)) if source.is_symlink() else None
             resolved = source.resolve()
             inside = resolved.is_relative_to(SOURCE) and resolved.relative_to(SOURCE) in selected_files
-            if target is not None and not target.is_absolute() and inside:
+            if target is not None and resolved.is_dir():
+                if (target.is_absolute() or not resolved.is_relative_to(SOURCE)
+                        or not any(member.is_relative_to(resolved.relative_to(SOURCE)) for member in files)):
+                    raise ValueError(f"The fixture helper directory has no private copy: {source}")
+                copied_directory = installed / resolved.relative_to(SOURCE)
+                destination.symlink_to(os.path.relpath(copied_directory, destination.parent), target_is_directory=True)
+            elif target is not None and not target.is_absolute() and inside:
                 destination.symlink_to(target)
             else:
                 _ = shutil.copy2(source, destination)

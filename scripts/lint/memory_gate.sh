@@ -153,7 +153,11 @@ build_hold_check_local() {
     local status=0
     local session_args=()
     if [[ -n "${BUILDLOG_PLACEMENT_EPISODE:-}" ]]; then session_args=(--session "${PLACEMENT_SESSION:-}"); fi
-    buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" ${session_args[@]+"${session_args[@]}"} || status=$?
+    (
+        [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+        buildlog_memory_python "$BUILD_TARGETS_SCRIPT" check-local --caller "${BUILDLOG_HOLD_CALLER:-verify}" \
+            ${session_args[@]+"${session_args[@]}"}
+    ) || status=$?
     build_hold_check_result "$status" check-local
 }
 
@@ -166,7 +170,7 @@ buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
     buildlog_check_nested_step || return $?
-    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION="" BUILDLOG_MEM_REPLACED=""
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
         return 0
@@ -199,7 +203,7 @@ buildlog_wait_for_memory() {
         if [[ "$BUILDLOG_MEM_OUTCOME" != Refused ]]; then
             buildlog_memory_refuse "admission client failed (exit $status)" || true
         else
-            build_check_record_failure 'memory admission client refused the step'
+            build_check_record_failure "${BUILDLOG_MEM_REPLACED:-memory admission client refused the step}"
         fi
         BUILDLOG_MEM_OUTCOME=Refused
     fi

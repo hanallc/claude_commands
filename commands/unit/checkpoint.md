@@ -174,7 +174,7 @@ Loop/verbose only:
    Add ` | image <id>` last, after ` | after <step>` when present.
    Use a change image id or an Images page id. A pair supplies its after image.
    The commit hook refuses a visible line without an image.
-   Merge checks require the image for commits dated at or after 2026-11-16 00:00 EST, using the Git committer time.
+   The integrate job requires the image for commits dated at or after 2026-11-16 00:00 EST. It uses the Git committer time.
    Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart | image <id>`.
    The session that completes the step runs the printed `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>` command.
    A change the user can check outside the app counts as visible too: a
@@ -185,6 +185,9 @@ Loop/verbose only:
    The command requires both arguments and releases only the named step.
 
    After every successful checkpoint commit, enrolled or not, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py checkpoint --session-dir "${SESSION_DIR}" --phase <phase id> --commit <full hash>`.
+   Add `--closed` with `--phase-id <id>` to record a missed checkpoint for a finished phase.
+   It refuses a hash that is not a commit in the phase's working dir, and it prints the checkpoint event id.
+   To cancel a wrong checkpoint event, run `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py void-checkpoint --session-dir "${SESSION_DIR}" --event-id <event id> --reason "<reason>"`.
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of

@@ -20,6 +20,7 @@ except FileNotFoundError:
     pass
 
 import base64
+import fcntl
 import secrets
 import struct
 import json
@@ -39,7 +40,7 @@ import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from threading import RLock
+from threading import Lock, RLock
 from functools import cache, cached_property
 from importlib import import_module
 from dataclasses import dataclass, field, replace
@@ -47,10 +48,11 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TextIO, TypedDict, Protocol, cast, final, override
 
 
 from scripts.herdr import pane_launch
+from scripts.herdr import message_proof as _message_proof
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, operation_deadline, script_prompts, session_folder
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
@@ -62,6 +64,7 @@ from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.python_startup.sitecustomize import startup_pythonpath
 from scripts.lib import nix_env as nix_env
 from scripts.herdr.place import HerdrPlace as HerdrPlace
 from scripts.herdr.pane_launch import RecordedLabels, StaffLabelsRead
@@ -77,6 +80,66 @@ START_RETRY_MAX_SECONDS = 1.0
 _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
+
+
+class RebootLockBusy(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__("A reboot is running; wait for it to end.", "reboot_in_progress")
+
+
+@dataclass
+class _HeldRebootLock:
+    handle: TextIO
+    exclusive: bool
+    users: int = 1
+
+
+_reboot_locks: dict[tuple[int, Path], _HeldRebootLock] = {}
+_reboot_locks_guard = Lock()
+
+
+def reboot_state_directory() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return state / "agents" / "reboot"
+
+
+def reboot_lock_path() -> Path:
+    """Use the directory of the server that agents reboot stops."""
+    return _session_socket(SHARED_SESSION).with_name("reboot.lock")
+
+
+@contextmanager
+def reboot_lock(*, exclusive: bool = False) -> Generator[None]:
+    """Hold the lock without waiting. Share the descriptor within the process."""
+    path = reboot_lock_path().resolve()
+    key = os.getpid(), path
+    with _reboot_locks_guard:
+        held = _reboot_locks.get(key)
+        if held is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a")
+            try:
+                mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                fcntl.flock(handle, mode | fcntl.LOCK_NB)
+            except BaseException as error:
+                handle.close()
+                if isinstance(error, BlockingIOError):
+                    raise RebootLockBusy() from error
+                raise
+            held = _HeldRebootLock(handle, exclusive)
+            _reboot_locks[key] = held
+        else:
+            if exclusive and not held.exclusive:
+                raise RebootLockBusy()
+            held.users += 1
+    try:
+        yield
+    finally:
+        with _reboot_locks_guard:
+            held.users -= 1
+            if not held.users:
+                del _reboot_locks[key]
+                held.handle.close()
 
 
 @dataclass(frozen=True)
@@ -589,6 +652,31 @@ def _prepare_prompt(pane: str, text: str) -> str:
     text = script_prompt(text)
     script_prompts.record(pane, text)
     return text
+
+
+_PRINTABLE_KEY_NAMES = {
+    "space": " ", "minus": "-", "comma": ",", "period": ".", "slash": "/",
+    "backslash": "\\", "quote": "'", "double_quote": '"', "double-quote": '"',
+    "semicolon": ";", "colon": ":", "percent": "%", "ampersand": "&",
+    "backtick": "`", "plus": "+",
+}
+
+
+def _printable_key(key: str) -> str:
+    key = key.strip()
+    if key == "+":
+        return key
+    if key.endswith("++"):
+        key = key[:-1] + "plus"
+    parts = [part.strip() for part in key.split("+")]
+    characters = [part for part in parts if part.lower() != "shift"]
+    if len(characters) != 1:
+        return ""
+    name = characters[0]
+    char = _PRINTABLE_KEY_NAMES.get(name.lower(), name)
+    if len(char) != 1 or not char.isprintable():
+        return ""
+    return char.upper() if len(parts) > 1 and char.isascii() else char
 
 
 @dataclass(frozen=True)
@@ -2738,6 +2826,11 @@ class Herdr:
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         """Start once, then prove the opening prompt arrived as this session's user turn."""
+        with reboot_lock():
+            return self._start_agent(name, pane, kind, agent_arguments, opening, timeout_ms)
+
+    def _start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
+                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
         forget_pane_evidence(self.session, pane)
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
@@ -3074,8 +3167,10 @@ class Herdr:
 
     def idle_command(self, pane: str, terminal: str, text: str, *, target: str, codex: bool) -> tuple[str, ...]:
         """Submit to an empty composer and return the history before submission."""
-        record = script_prompts.prepare_record(pane, text, deadline=worker_lifecycle.effective_deadline())
-        record.publish()
+        record = (script_prompts.prepare_record(pane, text, deadline=worker_lifecycle.effective_deadline())
+                  if script_prompts.needs_record(text) else None)
+        if record is not None:
+            record.publish()
         sent = False
         try:
             ready = self.readiness(pane)
@@ -3094,10 +3189,11 @@ class Herdr:
             sent = False
             raise
         finally:
-            if sent:
-                record.trim()
-            else:
-                record.path.unlink(missing_ok=True)
+            if record is not None:
+                if sent:
+                    record.trim()
+                else:
+                    record.path.unlink(missing_ok=True)
         return history
 
     def _wait_for_submit(self, receipt: Callable[[], PromptSubmitted | TranscriptReadable | TranscriptUnreadable],
@@ -3151,7 +3247,7 @@ class Herdr:
             nonlocal terminal, recipient, typed, draft_pending
             with operation_deadline.within(deadline):
                 record = (script_prompts.prepare_record(pane, text, deadline=deadline)
-                           if action is _OpeningComposer.EMPTY and text.lstrip().startswith("/") else None)
+                          if action is _OpeningComposer.EMPTY and script_prompts.needs_record(text) else None)
                 result = receipt()
                 if isinstance(result, PromptSubmitted):
                     return result
@@ -3369,6 +3465,18 @@ class Herdr:
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
                             pane_info=row, client=self, text=expected_text):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+        characters = tuple(_printable_key(key) for key in keys)
+        text = ""
+        for char in characters:
+            if char:
+                text += char
+            elif text:
+                script_prompts.record(pane, text)
+                text = ""
+        if text:
+            script_prompts.record(pane, text)
+        if any(characters):
+            script_prompts.mark_keys(pane)
         self._send_keys(pane, *keys)
 
     def answer_question(self, pane: str, text: str, *, target: str) -> None:
@@ -3382,6 +3490,7 @@ class Herdr:
                 raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
             self._send_keys(pane, key)
             if index == 0:
+                script_prompts.record(pane, text)
                 _ = self.run("pane", "send-text", pane, text)
 
     def _send_keys(self, pane: str, *keys: str) -> None:
@@ -3642,14 +3751,19 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
 def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     """Prove the pane owner. Check for Codex terminal holders when input is pending."""
+    return _foreground_pane_owner(info, for_input=for_input, message_owner=_message_proof.StrictOwnerProof.REQUIRED)
+
+
+def _foreground_pane_owner(info: dict[str, object], *, for_input: bool, message_owner: _message_proof.MessageOwnerProof
+                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     try:
-        return _prove_foreground_owner(info, for_input=for_input)
+        return _prove_foreground_owner(info, for_input=for_input, message_owner=message_owner)
     except _CodexForegroundProcessGone as error:
         if isinstance(info, _PaneProcessInfo):
             try:
                 fresh = info.read_again()
                 if _pane_process_ids(fresh, "fresh pane process info") == _pane_process_ids(info, "pane process info"):
-                    owner = _prove_foreground_owner(fresh, for_input=for_input)
+                    owner = _prove_foreground_owner(fresh, for_input=for_input, message_owner=message_owner)
                     if isinstance(owner, ProvedCodexForeground) and owner.pid == error.owner_pid:
                         return owner
                     if isinstance(owner, UnprovedForegroundOwner) and owner.kind == "codex":
@@ -3659,7 +3773,7 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
         return UnprovedForegroundOwner("codex", str(error))
 
 
-def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
+def _prove_foreground_owner(info: dict[str, object], *, for_input: bool, message_owner: _message_proof.MessageOwnerProof
                             ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     foreground = _foreground_processes(info)
     claude: list[tuple[dict[str, object], list[str]]] = []
@@ -3706,14 +3820,28 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
             if len(candidates) == 1:
                 return candidates[0]
             registered: list[ProvedClaudeForeground] = []
+            denied: _ProcessEnvironmentDenied | None = None
             for candidate in candidates:
                 try:
                     native = native_process(candidate.pid, "claude")
                 except NativeRegistryChanging:
                     continue
+                except _ProcessEnvironmentDenied as error:
+                    if for_input or isinstance(message_owner, _message_proof.StrictOwnerProof):
+                        raise
+                    denied = error
+                    continue
                 registered.append(replace(candidate, native=native))
             if len(registered) == 1:
-                return registered[0]
+                owner = registered[0]
+                if denied is None:
+                    return owner
+                if isinstance(owner.native, NativeAgentProcess) and message_owner == _message_proof.ProvedMessageOwner(
+                        conversation=owner.native.current_identity, pid=owner.pid, start=owner.native.started):
+                    return owner
+                raise denied
+            if denied is not None and not registered:
+                raise denied
         except (HerdrFailure, OSError, ValueError) as error:
             return UnprovedForegroundOwner("claude", str(error))
         return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
@@ -3733,7 +3861,7 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
 def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPaneAgent | ObservedEmpty | UnknownPaneOwner:
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
-        owner = foreground_pane_owner(info)
+        owner = _foreground_pane_owner(info, for_input=False, message_owner=_message_proof.message_owner.get())
         if isinstance(owner, ClaudeForegroundWithoutArgv):
             return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
         if isinstance(owner, UnprovedForegroundOwner):
@@ -4497,6 +4625,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: Securi
     return ServerCreated()
 
 
+@reboot_lock()
 def start_server(name: str, timeout_ms: int, *,
                  session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _timeout(timeout_ms)
@@ -4528,6 +4657,7 @@ def start_server(name: str, timeout_ms: int, *,
             time.sleep(min(PANE_POLL_SECONDS, remaining))
 
 
+@reboot_lock()
 def restore_server(name: str, timeout_ms: int, *,
                    session_kind: SecuritySession) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
@@ -5342,11 +5472,18 @@ def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
     return set(codex.live)
 
 
+class _ProcessEnvironmentDenied(PermissionError):
+    """The Linux process environment cannot be read."""
+
+
 def process_environment(pid: int) -> dict[str, str]:
     """Read a process even outside herdr; a failed observation remains an error."""
     if _platform() == "darwin":
         return darwin_process_environment(pid)
-    return _process_environment(proc_root() / str(pid))
+    try:
+        return _process_environment(proc_root() / str(pid))
+    except PermissionError as error:
+        raise _ProcessEnvironmentDenied(error.errno, error.strerror, cast(object, error.filename)) from error
 
 
 def _process_arguments(process: Path) -> list[str]:
@@ -5681,7 +5818,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
             continue
         except OSError as error:
             return ClientsUnreadable(str(error))
-        if (session == name and not command) or command == ["session", "attach", name]:
+        if (session == name and command in ([], ["client"])) or command == ["session", "attach", name]:
             count += 1
     return ClientsAttached(count) if count else NoClientAttached()
 
@@ -6393,7 +6530,7 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
             except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
                 return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
-        if (session == name and not command) or command == ["session", "attach", name]:
+        if (session == name and command in ([], ["client"])) or command == ["session", "attach", name]:
             count += 1
     return ClientsAttached(count) if count else NoClientAttached()
 
@@ -6837,6 +6974,19 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
+    prepared = replace(prepared, env={**prepared.env, "PYTHONPATH": startup_pythonpath(prepared.env.get("PYTHONPATH", ""))},
+                       unset_environment=prepared.unset_environment - {"PYTHONPATH"})
+    with reboot_lock():
+        return _launch_prepared_agent(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
+                                      agent=agent, reported_unknown=reported_unknown, agent_name=agent_name,
+                                      codex=codex, client=client)
+
+
+def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
+                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                           timeout_ms: int, *, agent: str, reported_unknown: str,
+                           agent_name: str | AgentNameSource, codex: CodexConversations | CodexLaunchRead,
+                           client: Herdr | LaunchClientSource) -> AgentLaunched:
     launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":

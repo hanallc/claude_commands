@@ -162,8 +162,11 @@ def usage($config; $label; $window; $fmt):
                  | color($colors; "counts." + ($part.word | gsub(" "; "_")) + (if $part.word == "efficiency" then "" else "s" end))
                end)) as $counts_row
 | ($ARGS.named.for_you // "") as $actions
-| (if $actions == "unavailable" then "For you: Unavailable"
-   elif ($actions | test("^[1-9][0-9]*$")) then
-     "For you: " + "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
-   else "" end) as $action_row
+| ([($ARGS.named.rebuild // ""),
+    (if $actions == "unavailable" then "Unavailable"
+     elif ($actions | test("^([1-9][0-9]*|[0-9]+\\+)$")) then
+       "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
+     else "" end)]
+   | map(select(. != ""))
+   | if length == 0 then "" else "For you: " + join(", ") end) as $action_row
 | [$first_line, $second_line, $action_row, $counts_row] | map(select(. != "")) | join("\n")

@@ -1,9 +1,10 @@
 """Render the accounts board on the Hana console Accounts page."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 import html
 import json
@@ -13,12 +14,14 @@ from statistics import median
 import subprocess
 import sys
 import time
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, next_moves
+from scripts.accounts import accounts, next_moves, role_activity
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
-from scripts.whoami import quota_alert, run_out
+from scripts.whoami import mac_fallback_token, quota_alert, run_out, token_expiry
+# The alias keeps the module apart from this page's quota_state() path function.
+from scripts.whoami import quota_state as worker_quota_state
 
 PAGE_NAME = "accounts.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -306,31 +309,46 @@ def _spans(spans: list[accounts.BoardSpan]) -> str:
     return "".join(parts)
 
 
-def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: dict[str, accounts.BoardSpan]) -> str:
+NextMove = accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["unselected", "none", "auto"]
+
+
+def _next_cell(row: accounts.BoardRow, move: NextMove,
+               labels: dict[str, accounts.BoardSpan]) -> str:
     """Render the selected group's target or the reason this line has no target."""
     if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
         return ""
-    move = accounts.account_board_next_move(row, reading.first_next_moves)
     editable = row.get("group")
     if move == "unselected":
         return ('<span class="next-muted next-minus" title="Not the selected account for a role">'
                 + page_frame.icon_svg("minus") + '</span>')
-    target = ""
-    if isinstance(move, accounts.BoardNextMoveTarget):
-        target = move.label
-        content = _spans([labels.get(target, accounts.BoardSpan(text=target, tone="default", kind="bold"))])
-    elif isinstance(move, accounts.NextMovesUnavailable):
-        content = '<span class="next-muted" title="' + html.escape(move.reason, quote=True) + '">unavailable</span>'
-    elif move == "none":
-        content = '<span class="next-muted">none</span>'
-    else:
-        content = ('<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>')
+    target = move.label if isinstance(move, accounts.BoardNextMoveTarget) else ""
+    content = _next_text(move, labels)
     if editable:
         content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
                     + f'data-move-account="{html.escape(editable["account"], quote=True)}" data-move-group="{editable["group"]}" '
                     + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="menu" aria-expanded="false">'
                     + page_frame.icon_svg("chevron-down") + '</button>')
     return content
+
+
+def _next_text(move: accounts.BoardNextMoveTarget | accounts.NextMovesUnavailable | Literal["none", "auto"],
+               labels: dict[str, accounts.BoardSpan]) -> str:
+    """Render a next move target or state as text, without the move control."""
+    if isinstance(move, accounts.BoardNextMoveTarget):
+        return _spans([labels.get(move.label, accounts.BoardSpan(text=move.label, tone="default", kind="bold"))])
+    if isinstance(move, accounts.NextMovesUnavailable):
+        return '<span class="next-muted" title="' + html.escape(move.reason, quote=True) + '">unavailable</span>'
+    if move == "none":
+        return '<span class="next-muted">none</span>'
+    return '<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>'
+
+
+def _next_sort_value(move: NextMove) -> str | None:
+    if isinstance(move, accounts.BoardNextMoveTarget):
+        return move.label.casefold()
+    if isinstance(move, accounts.NextMovesUnavailable):
+        return "unavailable"
+    return None if move == "unselected" else move
 
 
 def _swatch(spans: list[accounts.BoardSpan]) -> str:
@@ -340,9 +358,10 @@ def _swatch(spans: list[accounts.BoardSpan]) -> str:
     color = accounts.account_color(spans[0].get("color", ""))
     css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
     background = f' style="background:{css}"' if css else ""
-    return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
+    key = html.escape(spans[0]["color_key"], quote=True)
+    return (f'<button type="button" class="color-swatch" data-color-key="{key}" '
             + f'data-color-name="{name}" data-saved-color="{css}"{background} '
-            + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
+            + f'aria-label="Change {name} color" aria-haspopup="dialog" data-window-place="color:{key}"></button>')
 
 
 def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...],
@@ -363,11 +382,27 @@ SortValue = str | float | None
 SortValues = dict[str, SortValue]
 ACCOUNT_COLUMNS = (
     ("", "left"), ("account", "left"), ("", "left"), ("left", "right"),
-    ("roles", "left"), ("used / hour", "right"), ("empty at", "left"),
+    ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
     ("resets", "right"), ("credits", "right"), ("enabled", "left"),
 )
-ROLE_COLUMNS = (("role", "left"), ("", "left"), ("account", "left"), ("next", "left"),
-                *((key, "right") for key in accounts.COUNT_COLUMNS))
+ROLE_COUNT_COLUMNS = ("busy", "idle", "total")
+# Paused and exited sessions are not running. They have no column: a warning icon after the role total names them.
+NOT_RUNNING_STATES: tuple[Literal["paused", "exited"], ...] = ("paused", "exited")
+BUSY_LINE_HEADING = "busy, last 24 h"
+ROLE_COLUMNS = (("role", "left"), ("", "left"), (BUSY_LINE_HEADING, "left"), ("account", "left"), ("next", "left"),
+                *((key, "right") for key in ROLE_COUNT_COLUMNS))
+# The busy line of each role, in SVG pixels: the line area, then the hour labels under it.
+BUSY_LINE_WIDTH = 288
+BUSY_LINE_HEIGHT = 22
+BUSY_LINE_TOTAL_HEIGHT = 35
+BUSY_LINE_LABEL_PX = 9
+BUSY_LINE_EDGE = 4
+BUSY_LINE_TICK = 4
+BUSY_LINE_LABEL_HOURS = 3
+# The statusline.conf key of the codex pair row tint, and the strength of that tint over the card.
+PAIR_TINT_KEY = "background.codex-pair"
+PAIR_TINT_PERCENT = 12
+ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,9,10,11"
 DASH = '<span class="next-muted">—</span>'
 
 
@@ -383,14 +418,16 @@ def _sort_orders(values: list[SortValues], descending: tuple[str, ...]) -> dict[
 
 
 def _split_card(title: str, name: str, default: str, columns: tuple[tuple[str, str], ...],
-                rows: list[str], values: list[SortValues], *, descending: tuple[str, ...] = (),
+                rows: list[str], orders: dict[str, list[int]] | dict[str, list[accounts.AccountRowPlacement]],
+                *, descending: tuple[str, ...] = (), unsorted: tuple[str, ...] = (),
                 sort_field: str = "", attributes: str = "", after: str = "") -> str:
-    head = "".join(_sort_heading(accounts.BoardColumn(key=key, heading=key,
-                                 align="right" if align == "right" else "left"),
-                                 default, descending, sort_field=sort_field) for key, align in columns)
-    orders = html.escape(json.dumps(_sort_orders(values, descending)), quote=True)
+    head = "".join(f'<th class="{align}">{html.escape(key)}</th>' if key in unsorted
+                   else _sort_heading(accounts.BoardColumn(key=key, heading=key,
+                                      align="right" if align == "right" else "left"),
+                                      default, descending, sort_field=sort_field) for key, align in columns)
+    orders_json = html.escape(json.dumps(orders), quote=True)
     return (f'<section class="card" data-sort-table="{name}" data-sort-default="{default}" '
-            f'data-sort-orders="{orders}"{attributes}><h2>{title}</h2><div class="scroll">'
+            f'data-sort-orders="{orders_json}"{attributes}><h2>{title}</h2><div class="scroll">'
             f'<table class="{name}-table" aria-label="{title}"><thead><tr>{head}</tr></thead>'
             f'<tbody>{"".join(rows)}</tbody></table></div>{after}</section>')
 
@@ -407,14 +444,71 @@ def _forecast_dash(reason: str) -> str:
     return f'<span title="{reason}">{DASH}</span>'
 
 
-def _accounts_table(reading: accounts.StatusReading, details: dict[str, accounts.BoardRow],
-                    roles_by_account: dict[str, list[accounts.BoardSpan]], alerts: Mapping[str, QuotaAlert]) -> str:
+def _shown_lines(lines: list[accounts.BoardRow]) -> list[accounts.BoardRow]:
+    """The role lines of one account; an account with no role but spare keeps its first line."""
+    return [line for line in lines if line["cells"]["roles"][0]["text"] != "spare"] or lines[:1]
+
+
+def _shown_moves(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
+                 facts: Mapping[str, accounts.StatusRow]) -> dict[str, list[NextMove]]:
+    """The next move of each shown line; while workers move by themselves, each workers or spare Codex line reads auto."""
+    moves: dict[str, list[NextMove]] = {
+        label: [accounts.account_board_next_move(line, reading.first_next_moves) for line in _shown_lines(lines)]
+        for label, lines in rows_by_account.items()}
+    # The selected Codex workers line reads auto when workers have no Claude next move; the spare Codex lines join it.
+    if any(facts[label].tool == "codex" and "auto" in row_moves for label, row_moves in moves.items()):
+        for label, row_moves in moves.items():
+            for index, line in enumerate(_shown_lines(rows_by_account[label])):
+                if (row_moves[index] == "unselected" and facts[label].tool == "codex"
+                        and line["cells"]["roles"][0]["text"] in (accounts.CODEX_ROLE, "spare")):
+                    row_moves[index] = "auto"
+    return moves
+
+
+def _joined(names: Sequence[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _pair_text(pair: Sequence[accounts.StatusRow]) -> str:
+    """The user's words for the Codex accounts that take the workers in turn."""
+    # Only a known 0% on every account says there is no availability; an unknown value makes no claim.
+    empty = all(isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent <= 0 for row in pair)
+    working = next((row.label for row in pair if accounts.CODEX_ROLE in row.selected_roles), None)
+    now = ("No account has availability. " if empty else f"{working} is working right now. " if working else "")
+    mode = "self-actualizing" if worker_quota_state.no_worker_mode() else "working workers"
+    return f"{_joined([row.label for row in pair])} alternate when available. {now}We are in {mode} mode."
+
+
+def _tip_target(target_id: str, css: str, attributes: str, content: str, text: str) -> str:
+    """A focusable target whose tooltip text is also its accessible description, in a hidden element next to it."""
+    target = html.escape(target_id, quote=True)
+    return (f'<span class="{css}" id="{target}"{attributes} tabindex="0" aria-describedby="{target}-tip" data-tip>'
+            f'{content}</span><span id="{target}-tip" hidden>{html.escape(text)}</span>')
+
+
+def _pair_tint(colors: Mapping[str, str]) -> str:
+    color = accounts.account_color(colors.get(PAIR_TINT_KEY, ""))
+    if not isinstance(color, accounts.AccountColor):
+        return ""
+    return f' style="background:color-mix(in srgb,{color.css} {PAIR_TINT_PERCENT}%,transparent)"'
+
+
+def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
+                    labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert],
+                    colors: Mapping[str, str]) -> str:
     histories = run_out.read_readings(run_out.READINGS_LOG)
     rows: list[str] = []
     values: list[SortValues] = []
+    labels_in_row_order: list[str] = []
     facts = {row.label: row for row in reading.rows}
-    for label, line in details.items():
-        row, cells = facts[label], line["cells"]
+    moves = _shown_moves(reading, rows_by_account, facts)
+    pair = [facts[label] for label, row_moves in moves.items() if facts[label].tool == "codex" and "auto" in row_moves]
+    # One Codex account has nothing to take turns with, so it keeps the plain auto text.
+    pair_text = _pair_text(pair) if len(pair) > 1 else ""
+    pair_row = f' class="auto-pair"{_pair_tint(colors)}' if pair_text else ""
+    targets: list[tuple[str, str, str, accounts.BoardTone]] = []
+    for label, lines in rows_by_account.items():
+        row, cells = facts[label], lines[0]["cells"]
         dot = "Current reading" if cells["dot"][0]["tone"] == "success" else "Reading unavailable or stale"
         left = _spans(cells["left"])
         if alert := alerts.get(label):
@@ -436,114 +530,249 @@ def _accounts_table(reading: accounts.StatusReading, details: dict[str, accounts
             empty_text = _forecast_dash("The weekly reset time is unavailable.")
         else:
             empty_text = _forecast_dash("The estimated run-out time has passed.")
-        roles = roles_by_account.get(label, [])
-        role_text = ", ".join(span["text"] for span in roles)
-        role_title = f' title="{html.escape(role_text, quote=True)}"' if role_text else ""
-        role_content = ", ".join(_spans([span]) for span in roles)
-        rows.append("<tr>" + _cell(f'<span title="{dot}" aria-label="{dot}">{_spans(cells["dot"])}</span>')
-                    + f'<td class="left" data-account-name>{_spans(cells["label"])}</td>'
-                    + _cell(_swatch(cells["label"])) + _cell(left, "right")
-                    + f'<td class="left account-roles"{role_title}>{role_content}</td>'
-                    + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
-                    + _cell(_spans(cells["resets"]), "right") + _cell(_spans(cells["credits"]), "right")
-                    + _cell(_spans(cells["enabled"])) + "</tr>")
-        values.append({"account": label.casefold(),
-                       "left": row.weekly_left_percent if isinstance(row.weekly_left_percent, (int, float)) else None,
-                       "used / hour": rate, "empty at": _timestamp(empty), "resets": _timestamp(reset),
-                       "credits": float("inf") if row.credits == "unlimited" else
-                       row.credits if isinstance(row.credits, (int, float)) else None,
-                       "enabled": 1 if row.use_credits else None, "roles": role_text.casefold() or None})
+        account_values: SortValues = {
+            "account": label.casefold(),
+            "left": row.weekly_left_percent if isinstance(row.weekly_left_percent, (int, float)) else None,
+            "used / hour": rate, "empty at": _timestamp(empty), "resets": _timestamp(reset),
+            "credits": float("inf") if row.credits == "unlimited" else
+            row.credits if isinstance(row.credits, (int, float)) else None,
+            "enabled": 1 if row.use_credits else None,
+        }
+        if row.tool == "claude":
+            color = accounts.account_color(labels[label].get("color", ""))
+            targets.append((label, "".join(span["text"] for span in cells["left"]),
+                            color.css if isinstance(color, accounts.AccountColor) else "", cells["left"][0]["tone"]))
+        account_start = (
+            _cell(f'<span title="{dot}" aria-label="{dot}">{_spans(cells["dot"])}</span>')
+            + f'<td class="left" data-account-name>{_spans(cells["label"])}</td>'
+            + _cell(_swatch(cells["label"])) + _cell(left, "right")
+            + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
+        )
+        account_end = (_cell(_spans(cells["resets"]), "right") + _cell(_spans(cells["credits"]), "right")
+                       + _cell(_spans(cells["enabled"])))
+        for index, line in enumerate(_shown_lines(lines)):
+            spans = line["cells"]["roles"]
+            visible_role = [span for span in spans if span["text"] != " ✓"] if spans[0]["text"] != "spare" else []
+            role = visible_role[0]["text"] if visible_role else ""
+            move = moves[label][index]
+            paired = pair_text and move == "auto"
+            rows.append(f'<tr{pair_row if paired else ""} data-account-row="{html.escape(label, quote=True)}">'
+                        + (account_start if index == 0 else _cell("") + '<td class="left" data-account-name></td>'
+                           + _cell("") + _cell("", "right") * 2 + _cell(""))
+                        + _cell(_spans(visible_role)) + _cell(_swatch(visible_role))
+                        + _cell(_tip_target(f"pair-auto-{label}", "next-muted", "", "auto", pair_text) if paired else _next_cell(line, move, labels), "left next-cell")
+                        + (account_end if index == 0 else _cell("", "right") * 2 + _cell("")) + "</tr>")
+            values.append({**account_values, "role": role.casefold() or None, "next": _next_sort_value(move)})
+            labels_in_row_order.append(label)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
-    return _split_card("Accounts", "accounts", "account", ACCOUNT_COLUMNS, rows, values,
-                       descending=("credits", "enabled"),
+    targets_json = html.escape(json.dumps(targets), quote=True)
+    percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
+    descending = ("credits", "enabled")
+    orders = {
+        key: [accounts.AccountRowPlacement(index=index, details=offset == 0
+               or labels_in_row_order[index] != labels_in_row_order[order[offset - 1]])
+              for offset, index in enumerate(order)]
+        for key, order in _sort_orders(values, descending).items()
+    }
+    return _split_card("Accounts", "accounts", "account", ACCOUNT_COLUMNS, rows, orders,
+                       descending=descending,
+                       attributes=(f' data-detail-columns="{ACCOUNT_DETAIL_COLUMNS}"'
+                                   f' data-move-percent="{percent}" data-move-targets="{targets_json}"'),
                        after=f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "")
 
 
-def _role_lines(values: list[str]) -> str:
-    return "".join(f'<div class="role-line">{value}</div>' for value in values)
+def _count_tooltip(cell_id: str, value: str, lines: Sequence[str],
+                   attribute: Literal["data-model-sessions", "data-role-counts"]) -> str:
+    tooltip = html.escape("\n".join(lines), quote=True)
+    label = html.escape(value + ": " + ", ".join(lines), quote=True)
+    return (f' id="{html.escape(cell_id, quote=True)}" tabindex="0" aria-label="{label}"'
+            f' {attribute}="{tooltip}"')
 
 
-def _role_count(assignments: list[tuple[str, accounts.BoardRow]], key: str) -> tuple[str, int | None]:
-    spans = [line["cells"][key] for _, line in assignments]
-    counts = [cell[0]["text"] for cell in spans]
-    total = sum(int(value) for value in counts) if all(value.isdecimal() for value in counts) else None
-    return _role_lines([_spans(cell) for cell in spans]), total
+def _role_count_cell(role: str, assignments: list[tuple[str, accounts.BoardRow]], key: str,
+                     *, show_breakdown: bool, after: str = "") -> tuple[str, int | None]:
+    if not assignments:
+        return _cell(after, "right"), None
+    counts = [(label, line["cells"][key][0]["text"]) for label, line in assignments]
+    total = sum(int(value) for _, value in counts) if all(value.isdecimal() for _, value in counts) else None
+    value = str(total) if total is not None else "unknown" if key == "total" else ""
+    attributes = ""
+    if show_breakdown:
+        lines = [f"{label}: {count or 'unknown'}" for label, count in counts]
+        attributes = _count_tooltip(f"role-count-{role}-{key}", value or key, lines, "data-role-counts")
+    return f'<td class="right"{attributes}>{value}{after}</td>', total
 
 
-def _ordered_role_assignments(role: str, lines: list[tuple[str, accounts.BoardRow]],
-                              selected: dict[str, tuple[str, ...]]) -> list[tuple[str, accounts.BoardRow]]:
-    """Put selected accounts first. The first selected account supplies the default."""
-    return sorted(lines, key=lambda item: role not in selected[item[0]])
+NotRunningNames = dict[str, list[str]]
+
+
+def _not_running(role: str, assignments: list[tuple[str, accounts.BoardRow]],
+                 facts: Mapping[str, accounts.StatusRow]) -> tuple[Counter[str], NotRunningNames]:
+    """The count of each not-running state of one role, and the local names in that state."""
+    counts: Counter[str] = Counter()
+    names: NotRunningNames = {state: [] for state in NOT_RUNNING_STATES}
+    for label, line in assignments:
+        named = facts[label].named_sessions_by_role.get(role, ()) if label in facts else ()
+        for state in NOT_RUNNING_STATES:
+            if (count := line["cells"][state][0]["text"]).isdecimal():
+                counts[state] += int(count)
+                names[state].extend(item.name for item in named if item.state == state)
+    return counts, names
+
+
+def _not_running_text(counts: Counter[str], names: NotRunningNames) -> str:
+    """For example "2 not running: 1 paused (tile), 1 exited (names unknown)"; no session not running gives ""."""
+    parts: list[str] = []
+    for state in NOT_RUNNING_STATES:
+        if not (count := counts[state]):
+            continue
+        known = sorted(names[state], key=lambda name: (name.casefold(), name))[:count]
+        unknown = count - len(known)
+        # A peer machine sends counts without names; never guess them.
+        missing = [] if not unknown else ["names unknown"] if not known else [
+            f"{unknown} {'name' if unknown == 1 else 'names'} unknown"]
+        parts.append(f"{count} {state} ({', '.join([*known, *missing])})")
+    return f"{counts.total()} not running: " + ", ".join(parts) if parts else ""
+
+
+def _not_running_slot(cell_id: str, text: str, icon: str) -> str:
+    """A fixed slot after the total keeps the totals aligned; it holds the icon when sessions are not running."""
+    content = _tip_target(cell_id, "not-running", ' role="img" aria-label="not running"', icon, text) if text else ""
+    return f'<span class="not-running-slot">{content}</span>'
+
+
+def _busy_line(role: str, color: str, samples: Sequence[role_activity.RoleBusySample],
+               now: datetime, zone: tzinfo) -> str:
+    """The role's busy count over the last 24 hours, one point per pixel column at most.
+
+    A sample without the role, or a time gap longer than role_activity.SAMPLE_GAP, breaks the line.
+    """
+    start = now - role_activity.WINDOW
+    window = role_activity.WINDOW.total_seconds()
+    column_time = role_activity.WINDOW / BUSY_LINE_WIDTH
+    top = max([1, *(sample.busy[role] for sample in samples if role in sample.busy)])
+    # Each segment holds (column, count) points; a column ends at its x, and it keeps its largest count.
+    segments: list[list[tuple[int, int]]] = []
+    gap = True
+    previous: datetime | None = None
+    for sample in samples:
+        count = sample.busy.get(role)
+        if previous is not None and sample.at - previous > role_activity.SAMPLE_GAP:
+            gap = True
+        previous = sample.at
+        if count is None:
+            gap = True
+            continue
+        column = min(BUSY_LINE_WIDTH, max(1, -(-(sample.at - start) // column_time)))
+        if gap:
+            segments.append([])
+            gap = False
+        points = segments[-1]
+        if points and points[-1][0] == column:
+            points[-1] = (column, max(points[-1][1], count))
+        else:
+            points.append((column, count))
+    lines = ""
+    for points in segments:
+        text = [f"{column:.1f},{BUSY_LINE_HEIGHT - 1 - count / top * (BUSY_LINE_HEIGHT - 2):.1f}" for column, count in points]
+        # A lone point repeats, so the round cap draws it as a dot.
+        lines += f'<polyline points="{" ".join(text * 2 if len(text) == 1 else text)}"/>'
+    marks: list[str] = []
+    hour = start.astimezone(zone).replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc) + timedelta(hours=1)
+    while hour <= now:
+        x = (hour - start).total_seconds() / window * BUSY_LINE_WIDTH
+        local = hour.astimezone(zone).hour
+        marks.append(f'<text x="{x:.1f}" y="{BUSY_LINE_TOTAL_HEIGHT - 3}">{local}</text>'
+                     if local % BUSY_LINE_LABEL_HOURS == 0 else
+                     f'<line class="busy-tick" x1="{x:.1f}" x2="{x:.1f}" y1="{BUSY_LINE_HEIGHT + 2}" '
+                     + f'y2="{BUSY_LINE_HEIGHT + 2 + BUSY_LINE_TICK}"/>')
+        hour += timedelta(hours=1)
+    return (f'<svg class="busy-line" width="{BUSY_LINE_WIDTH}" height="{BUSY_LINE_TOTAL_HEIGHT}" '
+            f'viewBox="{-BUSY_LINE_EDGE} 0 {BUSY_LINE_WIDTH + 2 * BUSY_LINE_EDGE} {BUSY_LINE_TOTAL_HEIGHT}" '
+            f'role="img" aria-label="{html.escape(role, quote=True)} busy sessions, last 24 hours">'
+            f'<line class="busy-base" x1="0" x2="{BUSY_LINE_WIDTH}" y1="{BUSY_LINE_HEIGHT - .5}" y2="{BUSY_LINE_HEIGHT - .5}"/>'
+            f'<g fill="none" stroke="{color or "currentColor"}" stroke-width="1.5" stroke-linejoin="round" '
+            f'stroke-linecap="round">{lines}</g>{"".join(marks)}</svg>')
 
 
 def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[str, accounts.BoardRow]]],
-                 details: dict[str, accounts.BoardRow], total: accounts.BoardRow | None) -> str:
-    labels = {label: line["cells"]["label"][0] for label, line in details.items()}
+                 labels: dict[str, accounts.BoardSpan], selected: dict[str, tuple[str, ...]],
+                 total: accounts.BoardRow, colors: dict[str, str],
+                 samples: Sequence[role_activity.RoleBusySample]) -> str:
     rows: list[str] = []
     values: list[SortValues] = []
-    for role, assignments in groups.items():
-        first_label, first = assignments[0]
-        role_span = first["cells"]["roles"][:1]
-        move = accounts.account_board_next_move(first, reading.first_next_moves)
-        if isinstance(move, accounts.BoardNextMoveTarget):
-            next_value = move.label.casefold()
-        elif isinstance(move, accounts.NextMovesUnavailable):
-            next_value = "unavailable"
+    facts = {row.label: row for row in reading.rows}
+    role_names = sorted(set(groups) | set(accounts.CLAUDE_GROUPS) | {accounts.CODEX_ROLE})
+    not_running = {role: _not_running(role, groups.get(role, []), facts) for role in role_names}
+    all_counts = sum((counts for counts, _ in not_running.values()), Counter[str]())
+    all_names = {state: [name for _, names in not_running.values() for name in names[state]]
+                 for state in NOT_RUNNING_STATES}
+    all_text = _not_running_text(all_counts, all_names)
+    icon = page_frame.icon_svg("triangle-alert") if all_text else ""
+    for role in role_names:
+        assignments = sorted(groups.get(role, []), key=lambda item: role not in selected[item[0]])
+        role_span = (assignments[0][1]["cells"]["roles"][:1] if assignments
+                     else [accounts.board_role_span(role, colors)])
+        selected_assignment = next(((label, line) for label, line in assignments if role in selected[label]), None)
+        move = (accounts.account_board_next_move(selected_assignment[1], reading.first_next_moves)
+                if selected_assignment else "unselected")
+        next_text = DASH if move == "unselected" else _next_text(move, labels)
+        if selected_assignment is None:
+            name = '<span class="inactive">no account</span>'
+            account_value = None
         else:
-            next_value = None if move == "unselected" else move
-        values.append({"role": role.casefold(), "account": first_label.casefold(), "next": next_value})
-        names = [_spans([labels[label], *line["cells"]["roles"][1:]]) for label, line in assignments]
-        targets = [_next_cell(line, reading, labels) for _, line in assignments]
+            label, line = selected_assignment
+            name = _spans([labels[label], *(span for span in line["cells"]["roles"][1:] if span["text"] != " ✓")])
+            account_value = label.casefold()
+        selected_label = selected_assignment[0] if selected_assignment else None
+        show_breakdown = any(
+            label != selected_label and line["cells"]["total"][0]["text"] not in ("", "0")
+            for label, line in assignments
+        )
+        values.append({"role": role.casefold(), "account": account_value,
+                       "next": _next_sort_value(move)})
         count_cells: list[str] = []
-        for key in accounts.COUNT_COLUMNS:
-            content, count = _role_count(assignments, key)
-            count_cells.append(_cell(content, "right"))
+        for key in ROLE_COUNT_COLUMNS:
+            after = (_not_running_slot(f"role-not-running-{role}", _not_running_text(*not_running[role]), icon)
+                     if key == "total" else "")
+            cell, count = _role_count_cell(role, assignments, key, show_breakdown=show_breakdown, after=after)
+            count_cells.append(cell)
             values[-1][key] = count
-        rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span)) + _cell(_role_lines(names))
-                    + _cell(_role_lines(targets), "left next-cell") + "".join(count_cells) + "</tr>")
-    if total is not None:
-        cells = total["cells"]
-        rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 3
-                    + "".join(_cell(_spans(cells[key]), "right") for key in accounts.COUNT_COLUMNS) + "</tr>")
-
-    targets_with_usage: list[list[str]] = []
-    for row in reading.rows:
-        if row.tool == "claude":
-            label = labels[row.label]
-            quota = details[row.label]["cells"]["left"]
-            color = accounts.account_color(label.get("color", ""))
-            targets_with_usage.append([row.label, "".join(span["text"] for span in quota),
-                                       color.css if isinstance(color, accounts.AccountColor) else "", quota[0]["tone"]])
-    targets_with_usage.sort(key=lambda item: item[0])
-    targets_json = html.escape(json.dumps(targets_with_usage), quote=True)
-    percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
-    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, values, descending=accounts.COUNT_COLUMNS,
-                       attributes=f' data-move-percent="{percent}" data-move-targets="{targets_json}"')
+        color = accounts.account_color(role_span[0].get("color", ""))
+        line_color = color.css if isinstance(color, accounts.AccountColor) else ""
+        rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span))
+                    + _cell(_busy_line(role, line_color, samples, reading.checked_at, reading.zone), "left busy-cell")
+                    + _cell(name) + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
+    cells = total["cells"]
+    rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 4
+                + "".join(_cell(_spans(cells[key]) + (_not_running_slot("role-not-running-total", all_text, icon)
+                                                      if key == "total" else ""), "right")
+                          for key in ROLE_COUNT_COLUMNS) + "</tr>")
+    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, ROLE_COUNT_COLUMNS),
+                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,))
 
 
 def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:
     """Render the account facts, roles, and problems from the same reading."""
-    lines = accounts.status_board(reading)["rows"]
-    details: dict[str, accounts.BoardRow] = {}
+    lines = accounts.status_board(reading, include_empty_total=True)["rows"]
+    rows_by_account: dict[str, list[accounts.BoardRow]] = {}
+    labels: dict[str, accounts.BoardSpan] = {}
     groups: dict[str, list[tuple[str, accounts.BoardRow]]] = {}
     label = ""
     for line in lines[:-1]:
         cells = line["cells"]
         if cells["label"]:
             label = cells["label"][0]["text"]
-            details[label] = line
-        if role := cells["roles"][0]["text"]:
+            labels[label] = cells["label"][0]
+        rows_by_account.setdefault(label, []).append(line)
+        role = cells["roles"][0]["text"]
+        if role and role != "spare":
             groups.setdefault(role, []).append((label, line))
     selected = {row.label: row.selected_roles for row in reading.rows}
-    ordered_groups = {role: _ordered_role_assignments(role, members, selected)
-                      for role, members in sorted(groups.items())}
-    roles_by_account: dict[str, list[accounts.BoardSpan]] = {}
-    for role, assignments in ordered_groups.items():
-        default, line = assignments[0]
-        if role in selected[default]:
-            roles_by_account.setdefault(default, []).append(line["cells"]["roles"][0])
-    return (_accounts_table(reading, details, roles_by_account, alerts or {})
-            + _roles_table(reading, ordered_groups, details, lines[-1] if lines else None))
+    colors = accounts.role_colors()
+    samples = role_activity.read(reading.checked_at)
+    return (_accounts_table(reading, rows_by_account, labels, alerts or {}, colors)
+            + _roles_table(reading, groups, labels, selected, lines[-1], colors, samples))
 
 
 def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> str:
@@ -551,10 +780,8 @@ def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> s
     spans = row["cells"][key]
     attributes = ""
     if names := row["session_names"].get(key):
-        tooltip = html.escape("\n".join(names), quote=True)
-        label = html.escape(f'{spans[0]["text"]}: ' + ", ".join(names), quote=True)
-        cell_id = html.escape(f'model-count-{row["model_name"]}-{row["effort"]}-{key}', quote=True)
-        attributes = f' id="{cell_id}" tabindex="0" aria-label="{label}" data-model-sessions="{tooltip}"'
+        cell_id = f'model-count-{row["model_name"]}-{row["effort"]}-{key}'
+        attributes = _count_tooltip(cell_id, spans[0]["text"], names, "data-model-sessions")
     return f'<td class="{column["align"]}"{attributes}>{_spans(spans)}</td>'
 
 
@@ -563,14 +790,78 @@ def models_board(reading: accounts.StatusReading) -> str:
     head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS)
                    + ('<th class="left"></th>' if column["key"] == "model" else "")
                    for column in accounts.MODEL_COLUMNS)
-    rows = "".join("<tr>" + "".join(
+    rows = "".join(("<tr data-summary>" if index == len(table.rows) - 1 else "<tr>") + "".join(
         _model_cell(row, column)
         + (f'<td class="left">{_swatch(row["cells"]["model"])}</td>' if column["key"] == "model" else "")
-        for column in accounts.MODEL_COLUMNS) + "</tr>" for row in table.rows)
+        for column in accounts.MODEL_COLUMNS) + "</tr>" for index, row in enumerate(table.rows))
     orders = html.escape(json.dumps(table.orders), quote=True)
-    return (f'<section class="card models-card" data-sort-table="models" data-sort-orders="{orders}">'
+    return (f'<section class="card models-card" data-sort-table="models" data-sort-orders="{orders}" '
+            + 'data-detail-columns="0,1">'
             + f'<h2>Models</h2><div class="scroll"><table aria-label="Models"><thead><tr>{head}</tr></thead>'
             + f'<tbody>{rows}</tbody></table></div></section>')
+
+
+def _step_markup(step: token_expiry.RenewalStep) -> str:
+    prose = step.instruction if isinstance(step, token_expiry.CommandStep) else step
+    markup = "".join(f"<code>{html.escape(part)}</code>" if index % 2 else html.escape(part)
+                     for index, part in enumerate(prose.split("`")))
+    if isinstance(step, token_expiry.CommandStep):
+        markup += f'<code class="token-command" tabindex="0">{html.escape(step.command)}</code>'
+    return markup
+
+
+def _token_steps(token: token_expiry.TokenExpiry) -> str:
+    heading = "Replace the token on the Mac" if token.key == token_expiry.MAC_TOKEN else f"Renew {token.name}"
+    content = ("<ol>" + "".join(f"<li>{_step_markup(step)}</li>" for step in token.renewal_steps) + "</ol>"
+               if token.renewal_steps else "<p>Set <code>mac_token.account</code> first.</p>")
+    return (f'<details class="token-steps" data-token="{html.escape(token.key)}">'
+            + f'<summary>{html.escape(heading)}</summary>{content}</details>')
+
+
+def tokens_board(reading: accounts.StatusReading) -> str:
+    mac = mac_fallback_token.read()
+    now, zone = reading.checked_at, reading.zone
+    settings = conf.read("showrunners")
+    try:
+        account = mac_fallback_token.configured_account(settings.values("mac_token.account").get("mac_token.account", ""))
+    except (OSError, ValueError):
+        account = mac_fallback_token.Unknown.VALUE
+
+    try:
+        leads = token_expiry.expiry_days(settings.values("token_expiry.lead_days").get("token_expiry.lead_days", ""))
+    except (OSError, ValueError):
+        leads = ()
+
+    keys = settings.settings if isinstance(settings.settings, dict) else ()
+    tokens = (token_expiry.mac_token(mac, account), *token_expiry.configured_tokens(keys, settings.values))
+    rows: list[str] = []
+    for token in tokens:
+        alerts: list[str] = []
+        if token.key == token_expiry.MAC_TOKEN and isinstance(mac, mac_fallback_token.MacFallbackToken):
+            if isinstance(mac.active_login_failure(now), datetime):
+                alerts.append('<span class="error">Login failed</span>')
+            if not mac.recently_checked(now):
+                alerts.append("Stale token data")
+        end_date, days = token.end_date(zone), token.days_left(now, zone)
+        end = f'<time datetime="{end_date}">{end_date}</time>' if end_date is not None else "Unknown"
+        if token.expired(now, zone):
+            alerts.append('<span class="error">Expired</span>')
+        elif end_date is None:
+            alerts.append("End date unavailable")
+        elif not leads:
+            alerts.append("Expiry schedule unavailable")
+        elif token.expiry_lead(now, zone, leads) is not None:
+            alerts.append('<span class="warning">Renew soon</span>')
+        cells = (_cell(html.escape(token.name)), _cell(html.escape(token.purpose)), _cell(end),
+                 _cell("Unknown" if days is None else str(max(days, 0)), "right"),
+                 _cell("<br>".join(alerts) if alerts else "No active alert"))
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    head = "".join(f'<th class="{align}" scope="col">{heading}</th>' for heading, align in (
+        ("token", "left"), ("purpose", "left"), ("ends", "left"), ("days left", "right"), ("state", "left")))
+    steps = "".join(_token_steps(token) for token in tokens)
+    return ('<section class="card tokens-card"><h2>Tokens</h2><div class="scroll">'
+            f'<table aria-label="Tokens"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>{steps}</section>')
 
 
 def page() -> bytes:
@@ -582,7 +873,7 @@ def page() -> bytes:
     except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
-    body = board(reading, alerts) + models_board(reading)
+    body = board(reading, alerts) + models_board(reading) + tokens_board(reading)
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
@@ -622,21 +913,45 @@ STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
-.models-card{margin-top:24px}
+.models-card,.tokens-card{margin-top:24px}
+.token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
+.token-steps summary{width:fit-content;margin-left:-6px;padding:2px 6px;border-radius:4px;
+font-size:.93rem;font-weight:700;cursor:pointer}
+.token-steps summary::marker{color:var(--ink-2)}
+.token-steps summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.token-steps[open] summary{margin-bottom:5px}
+.token-steps ol{margin:0;padding-left:1.5rem}
+.token-steps li + li{margin-top:5px}
+.token-steps li::marker,.token-steps p{color:var(--ink-2)}
+.token-steps code{overflow-wrap:anywhere}
+.token-steps .token-command{display:block;white-space:pre;overflow-x:auto;overflow-wrap:normal;
+scrollbar-color:var(--ink-2) var(--line);scrollbar-width:thin}
+.token-steps p{margin:0}
 .roles-table td{vertical-align:top}
-.role-line{min-height:1.5em}
+.busy-cell{padding-top:6px;padding-bottom:2px}
+.busy-line{display:block;overflow:visible}
+.busy-line text{font-size:""" + f"{BUSY_LINE_LABEL_PX}px" + """;fill:var(--ink-3);text-anchor:middle}
+.busy-base{stroke:var(--line)}.busy-tick{stroke:var(--ink-3)}
+.not-running-slot{display:inline-block;width:20px;text-align:right}
+.not-running{display:inline-grid;place-items:center;vertical-align:-2px;color:var(--warning);border-radius:4px;cursor:default}
+.not-running svg{width:14px;height:14px}
+/* The codex pair rows keep their tint in every sort; next to each other they show no line between them. */
+tr.auto-pair+tr.auto-pair td{border-top-color:transparent}
 .model-tooltip{position:fixed;width:max-content;padding:7px 11px;background:var(--model-tooltip-bg);
 color:var(--model-tooltip-ink);border-radius:6px;
 font-size:12px;font-weight:500;box-shadow:0 3px 12px #0002;z-index:5;white-space:pre;overflow:auto}
 :root{--model-tooltip-bg:#192339;--model-tooltip-ink:#fff}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--model-tooltip-bg:#e4eaf4;--model-tooltip-ink:#10151e}}
 :root[data-theme="dark"]{--model-tooltip-bg:#e4eaf4;--model-tooltip-ink:#10151e}
-[data-model-sessions]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.model-tooltip.role-counts{text-align:right;font-variant-numeric:tabular-nums}
+.model-tooltip.tip-text{white-space:normal;line-height:1.45}
+:is([data-model-sessions],[data-role-counts],[data-tip]):focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* A tooltip word or icon is smaller than a cell, so its ring sits outside it. */
+span[data-tip]:focus-visible{outline-offset:1px;border-radius:3px}
 table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-numeric:tabular-nums}
 /* Let the last sort arrow use the right padding of the card. */
 .card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
 th,td{padding:5px 0 5px var(--column-gap);white-space:nowrap}th:first-child,td:first-child{padding-left:0}
-.account-roles{max-width:32ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
 th[aria-sort]{cursor:pointer}
 th[aria-sort]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
@@ -646,7 +961,8 @@ left:calc(100% + var(--sort-arrow-gap));transform:translateY(-50%);width:var(--t
 th.right .sort-arrow{left:auto;right:calc(100% + var(--sort-arrow-gap))}
 th[aria-sort=ascending] .sort-arrow,th[aria-sort=descending] .sort-arrow{visibility:visible}
 .left{text-align:left}.right{text-align:right}
-tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
+tbody tr td{border-top:1px solid var(--line)}
+.roles-table tbody tr[data-summary] td{border-top:1px solid var(--ink-3)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
@@ -684,7 +1000,7 @@ background:transparent;color:var(--ink-2);cursor:pointer}
 .next-button:focus-visible{background:var(--hover)}
 .next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
 .move-menu button[aria-checked=true]{background:var(--hover)}
-.move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
+.move-menu{position:fixed;z-index:5;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
 border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
 font-size:.86rem;font-variant-numeric:tabular-nums}
 .move-menu[hidden]{display:none}
@@ -701,7 +1017,7 @@ padding:2px;border:0;border-radius:5px;background:transparent;cursor:pointer}
 .quota-icon:hover{background:var(--hover)}
 .quota-icon[aria-expanded=true]{box-shadow:0 0 0 2px var(--accent)}
 .quota-icon:focus-visible,.quota-panel button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.quota-panel{position:fixed;z-index:1;width:250px;max-width:calc(100vw - 16px);padding:11px 14px;
+.quota-panel{position:fixed;z-index:5;width:250px;max-width:calc(100vw - 16px);padding:11px 14px;
 border:1px solid var(--line);border-radius:11px;background:var(--hover);color:var(--ink);box-shadow:0 4px 20px var(--edge);font-size:.86rem}
 .quota-panel p{color:var(--ink-2);margin:2px 0 10px;font-size:.76rem}
 .quota-panel button{border:0;border-radius:7px;padding:5px 14px;background:var(--filter-selected-bg);
@@ -737,10 +1053,12 @@ SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
 const modelTooltip=document.querySelector('.model-tooltip');
-const modelCell=node=>node instanceof Element ? node.closest('[data-model-sessions]') : null;
-let hoveredModelCell=null, tooltipModelCell=null;
-function positionModelTooltip(){
- const cell=tooltipModelCell;
+const countCell=node=>node instanceof Element ? node.closest('[data-model-sessions],[data-role-counts],[data-tip]') : null;
+// A sentence tooltip wraps at this width; a list tooltip keeps one line per item.
+const tipWidth=320;
+let hoveredCountCell=null, tooltipCountCell=null;
+function positionCountTooltip(){
+ const cell=tooltipCountCell;
  modelTooltip.hidden=true;
  if(!cell?.isConnected) return;
  const box=cell.getBoundingClientRect(), table=cell.closest('table').getBoundingClientRect();
@@ -748,37 +1066,42 @@ function positionModelTooltip(){
  const left=Math.max(table.left,scroll.left,0), right=Math.min(table.right,scroll.right,innerWidth);
  const top=Math.max(table.top,scroll.top,0), bottom=Math.min(table.bottom,scroll.bottom,innerHeight);
  if(box.bottom<=top || box.top>=bottom || box.right<=left || box.left>=right) return;
- modelTooltip.textContent=cell.dataset.modelSessions;
- modelTooltip.style.maxWidth=(right-left)+'px';modelTooltip.style.maxHeight=(bottom-top)+'px';
+ const {roleCounts,modelSessions}=cell.dataset;
+ const tip=cell.hasAttribute('data-tip') ? document.getElementById(cell.getAttribute('aria-describedby'))?.textContent ?? '' : undefined;
+ modelTooltip.classList.toggle('role-counts',roleCounts!==undefined);
+ modelTooltip.classList.toggle('tip-text',tip!==undefined);
+ modelTooltip.textContent=roleCounts ?? modelSessions ?? tip;
+ modelTooltip.style.maxWidth=Math.min(right-left,tip===undefined ? Infinity : tipWidth)+'px';
+ modelTooltip.style.maxHeight=(bottom-top)+'px';
  modelTooltip.hidden=false;
  const size=modelTooltip.getBoundingClientRect();
  const beside=box.right+size.width<=right ? box.right : box.left-size.width;
  modelTooltip.style.left=Math.max(left,Math.min(beside,right-size.width))+'px';
  modelTooltip.style.top=Math.max(top,Math.min(box.top,bottom-size.height))+'px';
 }
-function showModelTooltip(cell){tooltipModelCell=cell;positionModelTooltip();}
+function showCountTooltip(cell){tooltipCountCell=cell;positionCountTooltip();}
 document.addEventListener('pointerover',event=>{
- const cell=modelCell(event.target);
- if(cell && cell!==hoveredModelCell){hoveredModelCell=cell;showModelTooltip(cell);}
+ const cell=countCell(event.target);
+ if(cell && cell!==hoveredCountCell){hoveredCountCell=cell;showCountTooltip(cell);}
 });
 document.addEventListener('pointerout',event=>{
- if(!hoveredModelCell || (modelCell(event.target)!==hoveredModelCell && !modelTooltip.contains(event.target))) return;
- if(modelCell(event.relatedTarget)===hoveredModelCell || modelTooltip.contains(event.relatedTarget)) return;
- const departed=hoveredModelCell;
- hoveredModelCell=null;
- if(tooltipModelCell===departed) showModelTooltip(modelCell(document.activeElement));
+ if(!hoveredCountCell || (countCell(event.target)!==hoveredCountCell && !modelTooltip.contains(event.target))) return;
+ if(countCell(event.relatedTarget)===hoveredCountCell || modelTooltip.contains(event.relatedTarget)) return;
+ const departed=hoveredCountCell;
+ hoveredCountCell=null;
+ if(tooltipCountCell===departed) showCountTooltip(countCell(document.activeElement));
 });
 document.addEventListener('focusin',event=>{
- const cell=modelCell(event.target);
- if(cell) showModelTooltip(cell);
+ const cell=countCell(event.target);
+ if(cell) showCountTooltip(cell);
 });
 document.addEventListener('focusout',event=>{
- if(tooltipModelCell && modelCell(event.target)===tooltipModelCell) showModelTooltip(hoveredModelCell);
+ if(tooltipCountCell && countCell(event.target)===tooltipCountCell) showCountTooltip(hoveredCountCell);
 });
-addEventListener('scroll',event=>{if(event.target!==modelTooltip) positionModelTooltip();},{capture:true,passive:true});
-addEventListener('resize',positionModelTooltip);
+addEventListener('scroll',event=>{if(event.target!==modelTooltip) positionCountTooltip();},{capture:true,passive:true});
+addEventListener('resize',positionCountTooltip);
 document.addEventListener('keydown',event=>{
- if(event.key==='Escape' && !modelTooltip.hidden){hoveredModelCell=null;showModelTooltip(null);}
+ if(event.key==='Escape' && !modelTooltip.hidden){hoveredCountCell=null;showCountTooltip(null);}
 });
 const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('#account-color-value');
 const area=popup.querySelector('[data-color-area]'), hue=popup.querySelector('#account-color-hue');
@@ -867,7 +1190,7 @@ const sortKey=header=>header.dataset.accountSort ?? header.dataset.modelSort ?? 
 const sortTables=new WeakMap();
 const sortChoices=new Map();
 function applySort(card){
- const name=card.dataset.sortTable, models=name==='models';
+ const name=card.dataset.sortTable;
  const headers=[...card.querySelectorAll(sortSelector)];
  if(!sortChoices.has(name)){
   let choice={column:card.dataset.sortDefault ?? 'model',reverse:false};
@@ -880,8 +1203,8 @@ function applySort(card){
  const chosenSort=sortChoices.get(name);
  const table=card.querySelector('table'), body=table.tBodies[0];
  const order=JSON.parse(card.dataset.sortOrders)[chosenSort.column+(chosenSort.reverse ? '-reverse' : '')] ?? [];
- if(models){
-  sortModels(table,body,order);
+ if(card.dataset.detailColumns){
+  sortGroupedRows(table,body,order,card.dataset.detailColumns.split(',').map(Number));
  }else{
   if(!sortTables.has(table)) sortTables.set(table,[...body.rows].filter(row=>!row.hasAttribute('data-summary')));
   const rows=sortTables.get(table), total=body.querySelector('[data-summary]');
@@ -894,23 +1217,25 @@ function applySort(card){
   header.querySelector('.sort-arrow').textContent=descending ? '▼' : '▲';
  }
 }
-function sortModels(table,body,order){
+function sortGroupedRows(table,body,order,columns){
+ const nameCell=columns[0], total=body.querySelector('[data-summary]');
  if(!sortTables.has(table)){
   let group='';
-  sortTables.set(table,[...body.rows].slice(0,-1).map(node=>{
-   group=node.cells[0].textContent || group;
+  sortTables.set(table,[...body.rows].filter(row=>row!==total).map(node=>{
+   group=node.cells[nameCell].textContent || group;
    return {node,group};
   }));
  }
  const sources=sortTables.get(table), details=new Map();
- const columns=[0,1];
- for(const {node,group} of sources) if(node.cells[0].textContent){
+ for(const {node,group} of sources) if(node.cells[nameCell].textContent){
   details.set(group,columns.map(index=>node.cells[index].innerHTML));
  }
- const total=body.lastElementChild;
  for(const place of order){
   const {node,group}=sources[place.index];
-  columns.forEach((index,offset)=>{node.cells[index].innerHTML=place.details ? details.get(group)[offset] : '';});
+  columns.forEach((index,offset)=>{
+   const cell=node.cells[index], content=place.details ? details.get(group)[offset] : '';
+   if(cell.innerHTML!==content) cell.innerHTML=content;
+  });
   node.classList.toggle('account',place.details);body.insertBefore(node,total);
  }
 }
@@ -933,6 +1258,19 @@ document.addEventListener('keydown',event=>{
  if(header && (event.key==='Enter' || event.key===' ')){event.preventDefault();chooseSort(header);}
 });
 applySorts();
+// A refresh keeps each token's renewal steps open or closed as the viewer left them.
+function keepOpenSteps(fresh){
+ const open=new Set([...view.querySelectorAll('details[data-token][open]')].map(node=>node.dataset.token));
+ for(const node of fresh.querySelectorAll('details[data-token]')) node.open=open.has(node.dataset.token);
+}
+// A refresh keeps focus on the same summary or command of a token's renewal steps.
+function keepStepFocus(){
+ const steps=document.activeElement?.closest('details[data-token]');
+ if(!steps) return null;
+ const index=[...steps.querySelectorAll('summary,.token-command')].indexOf(document.activeElement);
+ return ()=>[...view.querySelectorAll('details[data-token]')].find(node=>node.dataset.token===steps.dataset.token)
+  ?.querySelectorAll('summary,.token-command')[index]?.focus({preventScroll:true});
+}
 async function refresh(supersede=false,current=()=>true) {
   if (hold()) return;
   const request = ++newestRequest;
@@ -943,13 +1281,14 @@ async function refresh(supersede=false,current=()=>true) {
   if (request !== newestRequest || !current() || hold()) return;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
-  const restoreFocus = modelCell(document.activeElement) ? restoreFocusAfterRefresh() : null;
+  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus();
+  keepOpenSteps(fresh);
   view.replaceWith(fresh);view = fresh;
   applySorts();
   scrollTo({top, behavior: 'instant'});
-  hoveredModelCell=null;
+  hoveredCountCell=null;
   restoreFocus?.();
-  showModelTooltip(modelCell(document.activeElement));
+  showCountTooltip(countCell(document.activeElement));
   return pageRefreshFacts(page);
 }
 const updates=createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds, hold);

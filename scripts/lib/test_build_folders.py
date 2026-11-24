@@ -24,7 +24,7 @@ from unittest import mock
 from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, FixtureConfigValues, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 
@@ -344,17 +344,17 @@ class FolderFormTests(unittest.TestCase):
                 self.assertTrue(reader.pass_fds)
             self.assertFalse(build_slots.remove_copy(record))
             envrc = copy.path / ".envrc"
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
-                             build_slots.NumberedCopyEnvrc.TRUSTED)
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda source: source == self.root),
+                             folders.NumberedCopyEnvrc.TRUSTED)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: False),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             _ = envrc.write_text("export FIXTURE=changed\n")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
             envrc.unlink()
             envrc.symlink_to(self.root / ".envrc")
-            self.assertEqual(build_slots.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
-                             build_slots.NumberedCopyEnvrc.NEEDS_APPROVAL)
+            self.assertEqual(folders.numbered_copy_envrc(envrc, trusted_source=lambda _: True),
+                             folders.NumberedCopyEnvrc.NEEDS_APPROVAL)
         _ = copy.path.rename(copy.path.with_name("old"))
         copy.path.mkdir()
         self.assertIsInstance(folders.numbered_copy_record(copy.path), folders.UnreadableNumberedCopySource)
@@ -452,6 +452,16 @@ class FolderFormTests(unittest.TestCase):
             path = folders.output_path("hana", "demo", "mac")
             self.assertEqual(path, self.root / "build/hana/demo/mac")
             self.assertEqual(folders.parse_form(path), folders.WorktreeOutput("hana", "demo", "mac"))
+
+    def test_ci_folders_list_only_numbered_directories_in_number_order(self) -> None:
+        self.assertEqual(folders.ci_folders("hana"), [])
+        parent = self.root / "disk/hana/ci"
+        for name in ("10", "2", "0", "03", "-1", "３", "old"):
+            (parent / name).mkdir(parents=True)
+        (parent / "4").touch()
+        (parent / "5").symlink_to(parent / "2", target_is_directory=True)
+        (parent / "6.lock").touch()
+        self.assertEqual(folders.ci_folders("hana"), [(2, parent / "2"), (10, parent / "10")])
 
     def test_paths_refuse_invalid_components_and_numbers(self) -> None:
         for name in ("", ".", "..", "parent/child", "/absolute", "bad\x00name", "probe.lock", "probe.lease.json"):
@@ -860,7 +870,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.addCleanup(_release_folder, held)
         _ = (held / "output").write_text("held output")
         result = self.command("remove", str(held))
-        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((result.returncode, result.stderr), (1, f"build folders: {held}: the folder lock is held\n"))
         self.assertEqual((held / "output").read_text(), "held output")
         self.assertTrue(held.with_name(held.name + ".lease.json").is_file())
         self.assertTrue(held.with_name(held.name + ".lock").is_file())
@@ -878,6 +888,21 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertFalse(local.with_name(local.name + ".lock").exists())
         with self.assertRaises(StopIteration):
             _ = folders.build_folder_lock_fd(local)
+
+    def test_cli_call_releases_the_locks_it_took_and_keeps_the_callers(self) -> None:
+        kept = folders.create_build_folder(folders.UniqueBuildFolder("kept-cli-"))
+        self.addCleanup(_release_folder, kept)
+        locks = cast(dict[int, Path], getattr(folders, "_locks"))
+        before = dict(locks)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(folders.main(["unique", "--prefix", "main-cli-"]), 0)
+        created = Path(output.getvalue().strip())
+        self.assertTrue(created.is_dir())
+        self.assertEqual(locks, before)
+        self.assertEqual(folders.build_folder_state(created), "free")
+        self.assertEqual(folders.build_folder_state(kept), "held")
+        self.assertEqual(folders.main(["remove", str(created)]), 0)
+        self.assertFalse(created.exists())
 
     def test_mkdir_collision_preserves_the_other_creators_folder(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=1,
@@ -1923,7 +1948,7 @@ assert not loaded, loaded
     @unittest.skipUnless(Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK),
                          "the memory filesystem is unavailable")
     def test_explicit_parent_allocates_under_a_private_dev_shm_parent(self) -> None:
-        with tempfile.TemporaryDirectory(dir=folders.tmpfs_temporary_parent()) as temporary:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
             parent = Path(temporary)
             with folders.temporary_build_folder(folders.UniqueBuildFolder(
                     "merge-gate-", folders.ExplicitBuildParent(parent))) as name:
@@ -2137,8 +2162,8 @@ assert not loaded, loaded
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
         settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
+            path = scratch.new("gate:folder-test", "checkout", scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)
@@ -2241,20 +2266,20 @@ assert not loaded, loaded
         self.assertEqual(first.name, "unit-proof-aa")
         self.assertEqual(second.name, "unit-proof-bb")
 
-    def test_nonvisible_scratch_target_uses_the_shared_name_rule(self) -> None:
+    def test_scratch_target_uses_the_shared_name_rule(self) -> None:
         with (mock.patch.object(scratch, "validate_phase_task"),
               mock.patch.object(scratch, "build_folder_path", wraps=folders.build_folder_path) as naming):
-            path = scratch.target("gate:proof", "tree", False)
+            path = scratch.target("gate:proof", "tree")
         naming.assert_called_once()
         self.assertEqual(path.parent, copy_record.root())
         self.assertRegex(path.name, r"^gate-proof-tree-[a-z0-9]{6}$")
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
         copied = self.root / "copied-config"
-        _ = config_environment(copied)
+        _ = config_environment(copied, values=FixtureConfigValues.EXACT)
         config = copied / "build_folders.conf"
         config.unlink()
-        environment = config_environment(config.parent)
+        environment = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
@@ -2272,7 +2297,7 @@ assert not loaded, loaded
             self.assertTrue(path.is_dir())
         self.assertFalse(path.exists())
         _ = config.write_text(original.replace("prefixes.admit-test=admit-test-", "prefixes.admit-test=private-"))
-        _ = config_environment(config.parent)
+        _ = config_environment(config.parent, values=FixtureConfigValues.EXACT)
         self.assertEqual(folders.FOLDER_PREFIXES["admit-test"], "private-")
 
     def test_repository_key_keeps_the_fixed_path_name(self) -> None:
@@ -2707,8 +2732,8 @@ os._exit(0)
         self.assertEqual(list(former.iterdir()), [])
 
     def test_scratch_can_lock_the_record_during_removal(self) -> None:
-        path = self.root / "scratch-source"
-        path.mkdir()
+        path = self.root / "scratch" / "scratch-source"
+        path.mkdir(parents=True)
         write_record = scratch.atomic_record
         request = folders.StableOwnerFolder("late", folders.ExplicitBuildParent(path))
 

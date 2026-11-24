@@ -143,17 +143,21 @@ def counts_rows(record: staff.StaffSnapshot, session_id: str) -> str:
     return "".join(lines)
 
 
-def status_action_count() -> str:
-    """Keep the other rows available if an action count fails."""
-    if for_you is None:
-        return "unavailable"
-    try:
-        system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
-        if system == "Darwin":
-            return for_you.console_action_count()
-        return for_you.global_action_count()
-    except Exception:
-        return "unavailable"
+def status_action_args(*, remote: bool, rebuild: rebuild_row.RebuildAnswer | None = None) -> list[str]:
+    """Pass the waiting rebuild names and other action count to jq."""
+    names = ""
+    count = "unavailable"
+    if for_you is not None:
+        try:
+            actions = (for_you.console_status_line_actions() if remote
+                       else for_you.read_for_status_line(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).status_line_actions())
+            names = rebuild_row.rebuild_names(actions.rebuild_machines)
+            count = str(actions.other_count)
+            if actions.partial:
+                count += "+"
+        except Exception:
+            pass
+    return ["--arg", "for_you", count, "--arg", "rebuild", names]
 
 
 def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
@@ -170,7 +174,8 @@ def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
     rebuild_config = rebuild_row.DEFAULT_CONFIG
     action_args: list[str] = []
     if rebuild is None:
-        action_args = ["--arg", "for_you", status_action_count()]
+        system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
+        action_args = status_action_args(remote=system == "Darwin")
         # The cache can expire during the count. Read it again without reading the needs.
         rebuild = rebuild_row._read_cache(rebuild_config, time.time)  # pyright: ignore[reportPrivateUsage]
     if rebuild.refresh_due:

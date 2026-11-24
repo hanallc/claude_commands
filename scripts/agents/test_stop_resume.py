@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from scripts.agents.test_support import write_machine_config
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, config_environment, write_config_fixture
 
 from scripts.agents import remote
 from scripts.herdr import herdr_types
@@ -37,7 +37,7 @@ from scripts.accounts import accounts, moves, role_map, worker_names
 from scripts.accounts.move_test_support import write_claude_move_credentials
 from scripts.whoami import account, agent_accounts
 from scripts.whoami.account_test_support import write_codex_auth
-from scripts.agents import member_account, producer_transfer, restart, stop_resume, stop_results
+from scripts.agents import member_account, producer_transfer, restart, shutdown_record, stop_resume, stop_results
 from scripts.lib import agent_program, atomic_file, conf, operation_deadline, process_start, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.herdr import worker_panes
@@ -59,7 +59,8 @@ from scripts.notify.push_texts import RenderedPush, render
 from scripts.production import unit_lookup, test_worker
 from scripts.direct import progress_history, step_record
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
-from scripts.agents.test_pane_restore import FakeClient, fixture_launch_transcript
+from scripts.agents.test_pane_record_recovery import FakeClient, fixture_launch_transcript
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 RUN_IN_PANE = herdr.Herdr.run_in_pane
 ROLE_ACCOUNT = accounts.role_account
@@ -239,8 +240,8 @@ class WorkerResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
-        atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     case.fixture.root / "conf/shutdown.conf")
         opened = case.opened()
         _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -277,6 +278,80 @@ class WorkerResumeTests(unittest.TestCase):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_named_producer_stop_holds_until_a_confirmed_resume(self) -> None:
+        row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        identity = str(row.current_session)
+        held = stop_resume.StoppedOnPurpose(row.name)
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.StopFailed(identity, "fixture refused")) as stop,
+              patch.object(stop_resume, "_resume_once", return_value=stop_resume.ResumeFailed(identity, "fixture refused")) as start):
+            self.assertEqual(shutdown.main(["stop", row.name]), 1)
+            self.assertEqual(shutdown_record.read(), [])
+            self.assertIsInstance(staff.snapshot().rows_by_id[row.id].exited, staff.Active)
+            stop.return_value = stop_resume.NotRunning(identity)
+            self.assertEqual(shutdown.main(["stop", row.name]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+            start.assert_not_called()
+
+            self.assertEqual(shutdown.main(["resume", row.name]), 1)
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+            start.return_value = stop_resume.ClaudeUp(identity, "fixture-pane", "claude3")
+            self.assertEqual(shutdown.main(["resume", row.name]), 0)
+            self.assertIsInstance(staff.snapshot().rows_by_id[row.id].exited, staff.Active)
+            self.assertEqual(shutdown_record.read(), [])
+            self.assertIsInstance(stop_resume.resume_for_upkeep(row.id), stop_resume.ClaudeUp)
+
+            self.assertEqual(shutdown.main(["exit", row.name, "--why", "keep stopped"]), 0)
+            self.assertEqual(shutdown_record.read(), [row.id])
+            exited = staff.snapshot().rows_by_id[row.id].exited
+            self.assertIsInstance(exited, staff.Exited)
+            assert isinstance(exited, staff.Exited)
+            self.assertEqual(exited.why, "keep stopped")
+            self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
+
+    def test_remote_producer_exit_stops_on_mac_and_saves_the_hold(self) -> None:
+        row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree("mac", self.root))
+        mac_state = self.root / "mac-shutdown"
+
+        def remote_stop(arguments: list[str], stdin: str, limit: remote.RemoteCallLimit) -> tuple[int, str]:
+            self.assertEqual(arguments, ["_unit-local"])
+            self.assertEqual(limit["kind"], "while link alive")
+            reply = io.StringIO()
+            with (patch.object(shutdown, "local_machine", return_value="mac"),
+                  patch.object(shutdown, "other_machine", return_value="natedev"),
+                  patch.object(remote, "local_machine", return_value="mac"),
+                  patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(mac_state)}),
+                  patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stdout(reply)):
+                code = shutdown.unit_local_command()
+            return code, reply.getvalue()
+
+        def stop_on_mac(reference: str, _kind: str = "") -> stop_resume.Stopped:
+            self.assertEqual(reference, row.id)
+            self.assertEqual(remote.local_machine(), "mac")
+            current = staff.snapshot().rows_by_id[row.id]
+            self.assertIsInstance(current.paused, staff.Paused)
+            self.assertIsInstance(current.exited, staff.Active)
+            return stop_resume.Stopped(str(row.current_session), 123)
+
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(shutdown, "local_machine", return_value="natedev"),
+              patch.object(shutdown, "other_machine", return_value="mac"),
+              patch.object(shutdown, "run_remote", side_effect=remote_stop) as run,
+              patch.object(stop_resume, "_stop", side_effect=stop_on_mac) as stop,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["exit", row.name, "--why", "maintenance"]), 0)
+        run.assert_called_once()
+        stop.assert_called_once()
+        self.assertIn("alpha: exited", output.getvalue())
+        current = staff.snapshot().rows_by_id[row.id]
+        self.assertIsInstance(current.exited, staff.Exited)
+        assert isinstance(current.exited, staff.Exited)
+        self.assertEqual(current.exited.why, "maintenance")
+        self.assertEqual(shutdown_record.read(), [])
+        with patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(mac_state)}):
+            self.assertEqual(shutdown_record.read(), [row.id])
+
     def test_producer_resume_uses_first_admission_after_a_family_change(self) -> None:
         class InterruptedResume(BaseException):
             """The command exits before its next step."""
@@ -3144,8 +3219,8 @@ class StopResumeTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
-        atomic_file.write_text_atomic(case.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                                     case.root / "conf/shutdown.conf")
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
                           current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
@@ -3959,6 +4034,10 @@ class StopResumeTests(unittest.TestCase):
         alpha = fixture_member("producer", name="alpha", runtime_id=self.entry["session_id"])
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         self.add_beta()
+
+        def confirm_start(argv: list[str], **_options: object) -> None:
+            _ = os.write(int(argv[argv.index("--ready-fd") + 1]), b"1")
+
         for platform in ("linux", "darwin"):
             with (self.subTest(platform=platform),
                   patch.object(moves, "store_file", return_value=self.root / platform / "moves.jsonl"),
@@ -3967,7 +4046,7 @@ class StopResumeTests(unittest.TestCase):
                   patch.object(restart, "producer_launch", return_value=("claude", {}, [])),
                   patch.object(sys, "platform", platform),
                   patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run,
-                  patch.object(subprocess, "Popen") as popen):
+                  patch.object(subprocess, "Popen", side_effect=confirm_start) as popen):
                 self.client.rows[0]["agent_session"] = None
                 result = stop_resume.move_sessions(["beta", "alpha"], "claude4", why="limit", warn_seconds=3, cause="auto")
                 self.assertEqual(moves.read_moves(), [])
@@ -3977,16 +4056,18 @@ class StopResumeTests(unittest.TestCase):
                 assert invocation is not None
                 argv = cast(list[str], invocation.args[0])
                 if platform == "linux":
-                    self.assertEqual(argv[:5], ["systemd-run", "--user", "--collect", "--quiet", "--no-block"])
-                    self.assertIn("CLAUDE_CODE_SESSION_ID", argv)
+                    self.assertEqual(argv[:5], ["systemd-run", "--user", "--collect", "--quiet", "--service-type=notify"])
+                    self.assertIn("--property=UnsetEnvironment=CLAUDE_CODE_SESSION_ID", argv)
+                    self.assertLess(argv.index("--notify-systemd"), argv.index("--"))
                 else:
                     self.assertTrue(cast(bool, invocation.kwargs["start_new_session"]))
+                    self.assertLess(argv.index("--ready-fd"), argv.index("--"))
                 self.assertNotIn("CLAUDE_CODE_SESSION_ID", cast(dict[str, str], invocation.kwargs["env"]))
                 self.assertEqual(cast(object, invocation.kwargs["stdin"]), subprocess.DEVNULL)
                 self.assertIn("batch", argv)
                 self.assertEqual(argv[argv.index("--cause") + 1], "auto")
                 self.assertEqual(argv[argv.index("--target") + 1], "claude4")
-                self.assertEqual(argv[-2:], ["sid-beta", alpha.id])
+                self.assertEqual(argv[argv.index("--") + 1:], ["sid-beta", alpha.id])
         self.kill.assert_not_called()
         self.start.assert_not_called()
 
@@ -4018,7 +4099,7 @@ class StopResumeTests(unittest.TestCase):
                 now = Mock(return_value=initial)
                 seed: moves.RequestedMove = {"kind": "requested", "tool": "claude", "at": initial.isoformat(),
                     "subject": "unrelated", "move_id": "earlier", "why": "earlier", "window": "unknown",
-                    "from": "claude2", "to": "claude3"}
+                    "from": "claude2", "to": "claude3", "scope": "session"}
                 if clock_reversed:
                     moves.append_move(seed)
 
@@ -4093,16 +4174,33 @@ class StopResumeTests(unittest.TestCase):
             self.assertIsInstance(latest, moves.LatestMoveRequest)
             _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 
-            with staff.slot_operation(moves.native_row_key(identity), "alpha", join=False):
-                busy = accounts.move("alpha", "claude3")
-                assert isinstance(busy, accounts.MoveStartFailed)
-                self.assertIn("move pending", busy.stderr)
-                self.assertEqual(moves.read_latest_request(identity), latest)
+            holder = ExitStack()
+            _ = holder.enter_context(staff.slot_operation(moves.native_row_key(identity), "alpha", join=False))
+
+            def operation_ends(_seconds: float) -> None:
+                # The move by hand claims the busy row before it waits, so the older handoff cannot win.
+                claim = moves.read_latest_request(identity)
+                assert isinstance(claim, moves.LatestMoveRequest)
+                self.assertNotEqual(claim, latest)
+                self.assertEqual(claim.target, "claude3")
+                holder.close()
+
+            # alpha is on claude3, so the busy move skips the quota check, the same as on a free row.
+            # Only the batch checks the target, before it resumes the stopped session.
+            with (patch("scripts.agents.stop_resume.time.sleep", side_effect=operation_ends) as waited,
+                  patch.object(accounts, "check_move_target", return_value=accounts.MoveTargetReady(
+                      accounts.NamedAccount("claude3", self.root / ".claude3"))) as checked):
+                moved = accounts.move("alpha", "claude3")
+            waited.assert_called_once()
+            checked.assert_called_once()
+            # The fixture has no live process for alpha, so the move by hand resumes it on claude3.
+            self.assertEqual(moved, accounts.MoveStarted(
+                identity, "claude3", f"{identity}: Claude is up on claude3 in w1:p2 (0.0 s)\n", "", 0))
 
             self.assertEqual(accounts.move("alpha", "claude3"),
                              accounts.MoveStarted(identity, "claude3", "alpha: already on claude3\n", "", 0))
             self.assertEqual(stop_resume.main(["batch", "--log", str(log), *argv[1:]]), 1)
-            stopped.assert_not_called()
+            stopped.assert_called_once_with(identity)
         self.assertEqual(account_label, "claude3")
         self.assertFalse(moves.latest_request_path(identity).exists())
         self.assertEqual(log.read_text().count("not moved: a newer move ran"), 1)
@@ -4310,6 +4408,25 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(shown.getvalue(), advice)
         self.assertEqual(legacy.read_text(), report)
         self.assertEqual(moves.pending_move_requests(), ())
+
+    def test_legacy_group_result_and_retry_preserve_the_group(self) -> None:
+        identity = self.entry["session_id"]
+        batch_id = "a" * 32
+        legacy = moves.store_file().parent / "move-results" / f"{batch_id}.json"
+        legacy.parent.mkdir(parents=True)
+        report = json.dumps({"group": "showrunners", "target": "claude3",
+                             "pending": [{"reference": identity, "name": "alpha"}]})
+        _ = legacy.write_text(report)
+        advice = f"alpha: start a new move with {moves.MOVE_COMMAND} batch --group showrunners -- {identity}\n"
+
+        with (patch.object(accounts, "current_move_account", return_value="claude4"),
+              patch.object(stop_resume, "_stop") as stopped):
+            for command in ("result", "retry"):
+                with self.subTest(command=command), redirect_stdout(io.StringIO()) as shown:
+                    self.assertEqual(stop_resume.main([command, batch_id]), 0)
+                    self.assertEqual(shown.getvalue(), advice)
+        stopped.assert_not_called()
+        self.assertEqual(legacy.read_text(), report)
 
     def test_retry_names_an_invalid_file_and_moves_the_valid_member(self) -> None:
         identity = self.entry["session_id"]
@@ -4667,7 +4784,6 @@ class StopResumeTests(unittest.TestCase):
                                  "workspace_id": "w1", "agent_session": {"kind": "id", "value": "sid-gamma"}})
         expected = [(identity, "w1:p2"), ("sid-beta", "w1:p4"), ("sid-gamma", "w1:p6")]
         members = [member for member, _pane in expected]
-        held = {member: ("verify",) for member in members}
         checkout = self.root / "checkout/scripts/production"
         checkout.mkdir(parents=True)
         dependency = checkout / "session_staff.py"
@@ -4677,24 +4793,22 @@ class StopResumeTests(unittest.TestCase):
         _ = dependency.write_bytes(old_dependency)
         _ = dependent.write_bytes(old_dependent)
 
-        def publish_main(seconds: float) -> None:
+        def publish_main(*_args: object) -> None:
             self.assertFalse(self.launched)
             _ = dependency.write_bytes(old_dependency + b"\nBatchRevision = 2\n")
             _ = dependent.write_bytes(old_dependent + b"\nfrom scripts.production.session_staff import BatchRevision\n")
-            self.advance(seconds)
 
         def stop_member(member: str) -> stop_resume.Stopped:
             return stop_resume.Stopped(member, 123)
 
         log = self.root / "batch.log"
         with (patch.object(production, "__path__", [str(checkout), str(Path(session_staff.__file__).parent)]),
-              patch.object(stop_resume, "_build_holders", side_effect=[held, {}]),
               patch.object(stop_resume, "_stop", side_effect=stop_member),
-              patch.object(time, "sleep", side_effect=publish_main) as published):
+              patch.object(stop_resume, "_warn_moves", side_effect=publish_main) as published):
             # The test fixtures import worker. Let the batch load it from the fixture checkout.
             del sys.modules[worker.__name__]
             delattr(production, "worker")
-            status = stop_resume.main(["batch", "--target", "claude4", "--cause", "auto",
+            status = stop_resume.main(["batch", "--target", "claude4", "--cause", "auto", "--warn-seconds", "1",
                                        "--log", str(log), *members])
 
         rows = [cast(dict[str, object], json.loads(line)) for line in log.read_text().splitlines()
@@ -5051,6 +5165,45 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
+
+    def test_resume_launches_in_the_saved_move_destination(self) -> None:
+        from scripts.worktree import worktrees
+
+        old = self.root / "old checkout"
+        new = self.root / "new checkout"
+        (old / "crates").mkdir(parents=True)
+        self.entry["cwd"] = str(old / "crates")
+        pane_record.write("agents", self.entry)
+        identity = worktrees.FolderIdentity.read(old)
+        _ = old.rename(new)
+        move = worktrees.WorktreeMove(old, new, "origin", "alpha", "test", worktrees.MoveOutput.LIVE_UNIT)
+        journal = worktrees.MoveJournal(move, identity, identity, "", Path(".git"), (), worktrees.MoveStage.FINISHED)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            worktrees.write_move(journal)
+            result = stop_resume.resume("alpha", why="worktree move")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(new / "crates"))
+
+    def test_resume_uses_the_saved_folder_with_an_incomplete_move_record(self) -> None:
+        from scripts.worktree import worktrees
+
+        saved = self.root / "saved checkout"
+        saved.mkdir()
+        self.entry["cwd"] = str(saved)
+        pane_record.write("agents", self.entry)
+        with patch.dict(os.environ, {"WORKTREES_STATE_DIR": str(self.root / "worktrees")}):
+            record = worktrees.move_file(saved)
+            record.parent.mkdir(parents=True)
+            _ = record.write_text("{}")
+            result = stop_resume.resume("alpha", why="worktree move")
+            _ = record.write_text(json.dumps({"old": str(saved)}))
+            self.assertEqual(worktrees.moved_launch_folder(saved), saved)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.start.assert_called_once()
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertEqual(command[command.index("resume") + 1], str(saved))
 
     def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
         result = stop_resume.resume("alpha", why="maintenance")
@@ -5735,7 +5888,7 @@ class StopResumeTests(unittest.TestCase):
                         return write(descriptor, data[:-1])
                     return write(descriptor, data)
 
-                def append_request(entry: moves.MoveEntry) -> None:
+                def append_request(entry: moves.MoveWriteEntry) -> None:
                     nonlocal first_id, append_failed
                     append(entry)
                     if fail_read and not append_failed and entry["kind"] == "requested" and entry["subject"] == subject:
@@ -5884,7 +6037,7 @@ class StopResumeTests(unittest.TestCase):
             return results[0] if identity == "bad" else results[1]
 
         append = moves.append_move
-        def fail_one(entry: moves.MoveEntry) -> None:
+        def fail_one(entry: moves.MoveWriteEntry) -> None:
             if entry["kind"] == "confirmed" and entry["subject"] == "bad":
                 raise OSError("TEST receipt write failed")
             append(entry)
@@ -6031,13 +6184,14 @@ class StopResumeTests(unittest.TestCase):
             self.assertNotIn(row.current_session, shown)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()].count("failed"), 20)
 
-    def test_busy_explicit_move_reports_pending_without_retrying(self) -> None:
+    def test_a_move_by_hand_takes_a_busy_row_when_its_operation_ends(self) -> None:
         busy = staff.StaffId("busy")
         rows = staff.StaffSnapshot((
             staff.StaffRow(busy, "showrunner", "busy", staff.StaffRoot(), current_session=busy),
         ))
         original = staff.slot_operation
         attempts = 0
+        stopped: list[str] = []
 
         @contextmanager
         def acquire(key: str, name: str, *, join: bool = True) -> Generator[None]:
@@ -6046,26 +6200,29 @@ class StopResumeTests(unittest.TestCase):
                 attempts += 1
                 if attempts == 1:
                     raise staff.StaffRefused("another move holds this row")
+                # The free row moved before the wait for the busy row.
+                self.assertEqual(stopped, ["available"])
             with original(key, name, join=join):
                 yield
+
+        def stop(identity: str) -> stop_resume.NotRunning:
+            stopped.append(identity)
+            return stop_resume.NotRunning(identity)
 
         up = stop_resume.ClaudeUp("available", "own-pane", "claude4")
         with (patch.object(staff, "initial_snapshot", return_value=rows),
               patch.object(staff, "slot_operation", side_effect=acquire),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
               patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
-              patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning) as stop,
+              patch.object(stop_resume, "_stop", side_effect=stop),
               patch.object(stop_resume, "_resume_move", return_value=up),
               patch.object(stop_resume, "_send_move_push") as send):
-            results = stop_resume.move_sessions([busy, "available"], "claude4", why="move")
-        self.assertEqual(results, [moves.MoveWaitingForRow(busy, "another move holds this row"), up])
-        self.assertEqual(attempts, 1)
-        self.assertEqual(self.clock.elapsed, 0)
-        stop.assert_called_once_with("available")
+            results = stop_resume.move_sessions([busy, "available"], "claude4", why="move", user_command=True)
+        self.assertEqual(results, [up, up])
+        self.assertEqual(attempts, 2)
+        self.assertEqual(stopped, ["available", busy])
         self.detach.assert_not_called()
         send.assert_not_called()
-        assert isinstance(results[0], moves.MoveWaitingForRow)
-        self.assertEqual(results[0].command, moves.batch_move_command(busy, "claude4"))
         self.assertEqual(moves.pending_move_requests(), ())
 
     def test_busy_batch_prints_its_own_target_instead_of_retrying_the_saved_move(self) -> None:
@@ -6204,7 +6361,7 @@ class StopResumeTests(unittest.TestCase):
         stop.assert_called_once_with(row.id)
         self.assertEqual(resume.call_args.args[:2], (row.current_session, "claude3"))
 
-    def test_detached_group_checks_the_destination_after_its_build_wait(self) -> None:
+    def test_detached_group_checks_the_destination_after_its_warning(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed"), "showrunner", "fixture", staff.StaffRoot(),
                              current_session=staff.StaffId("current"))
         destination = self.root / ".claude4"
@@ -6221,7 +6378,7 @@ class StopResumeTests(unittest.TestCase):
         batch_id = "d" * 32
         moves.write_latest_request(row.current_session, moves.LatestMoveRequest(batch_id, "group:showrunners"))
 
-        def wait(_seconds: float) -> None:
+        def wait(*_args: object) -> None:
             _ = destination.rename(self.root / "unavailable")
 
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
@@ -6229,13 +6386,12 @@ class StopResumeTests(unittest.TestCase):
               patch.object(accounts, "check_move_target", wraps=CHECK_MOVE_TARGET) as check,
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
               patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
-              patch.object(stop_resume, "_build_holders", side_effect=[{row.current_session: ("verify",)}, {}]),
-              patch.object(time, "sleep", side_effect=wait),
+              patch.object(stop_resume, "_warn_moves", side_effect=wait),
               patch.object(stop_resume, "_load_batch_modules"),
               patch.object(stop_resume, "_stop") as stop,
               patch.object(stop_resume, "_resume_move") as resume,
               patch.object(stop_resume, "_send_move_push") as send):
-            code = stop_resume.main(["batch", "--group", "showrunners", "--cause", "auto", "--request-id", batch_id, "--staff-member", row.id, "--log", str(log), "--", row.id])
+            code = stop_resume.main(["batch", "--group", "showrunners", "--cause", "auto", "--warn-seconds", "1", "--request-id", batch_id, "--staff-member", row.id, "--log", str(log), "--", row.id])
         self.assertEqual(code, 1)
         check.assert_called_once()
         stop.assert_not_called()
@@ -6257,14 +6413,15 @@ class StopResumeTests(unittest.TestCase):
         self.assertIsInstance(CHECK_MOVE_TARGET("claude4", datetime.now(timezone.utc), repair=False),
                               accounts.MoveTargetReady)
 
-        def lose_sign_in(_selected: list[str]) -> dict[str, tuple[str, ...]]:
+        def lose_sign_in(row: stop_resume.LockedMoveRow, account: str, record: staff.StaffSnapshot, *,
+                         check_presence: bool) -> object:
             _ = (destination / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
                 "refreshTokenExpiresAt": int(datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp() * 1000),
             }}))
-            return {}
+            return REAL_PREPARE_MOVE(row, account, record, check_presence=check_presence)
 
         with (patch.object(accounts, "check_move_target", wraps=CHECK_MOVE_TARGET),
-              patch.object(stop_resume, "_build_holders", side_effect=lose_sign_in),
+              patch.object(stop_resume, "_prepare_move", side_effect=lose_sign_in),
               patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(identity)) as stopped,
               patch.object(stop_resume, "_resume_move", return_value=stop_resume.ClaudeUp(identity, "pane", "claude4"))):
             result = stop_resume.move_sessions([identity], "claude4", why="move", cause="auto")
@@ -6324,43 +6481,63 @@ class StopResumeTests(unittest.TestCase):
         resume.assert_called_once()
 
     def test_handoffs_report_busy_rows_without_sending_them_to_the_child(self) -> None:
-        for self_move in (False, True):
-            with self.subTest(self_move=self_move):
-                rows = tuple(staff.StaffRow(staff.StaffId(name), "showrunner", name, staff.StaffRoot(),
-                                           current_session=staff.StaffId(f"native-{name}"))
-                             for name in ("busy", "available"))
-                busy, available = rows
-                up = stop_resume.ClaudeUp(available.current_session, "fixture-pane", "claude4")
-                parent = True
+        rows = tuple(staff.StaffRow(staff.StaffId(name), "showrunner", name, staff.StaffRoot(),
+                                   current_session=staff.StaffId(f"native-{name}"))
+                     for name in ("busy", "available"))
+        busy, available = rows
+        up = stop_resume.ClaudeUp(available.current_session, "fixture-pane", "claude4")
+        log = self.root / "move.log"
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": available.current_session}),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(available.current_session)) as stop,
+              patch.object(stop_resume, "_resume_move", return_value=up),
+              patch.object(stop_resume, "_load_batch_modules"),
+              patch.object(stop_resume, "_send_move_push") as send):
+            with staff.slot_operation(busy.id, busy.name), staff.mark_row_move(busy.id, "claude3"):
+                results = stop_resume.move_sessions([busy.id, available.id], "claude4", why="move", cause="auto")
+            self.assertIsInstance(results[0], moves.MoveWaitingForRow)
+            self.assertIsInstance(results[1], stop_resume.MoveHandedOff)
+            send.assert_not_called()
+            self.detach.assert_called_once()
+            argv = cast(list[str], self.detach.call_args.args[0])
+            self.assertEqual(argv[argv.index("--") + 1:], [available.current_session])
+            self.assertEqual(stop_resume.main(["batch", "--log", str(log), *argv[1:]]), 0)
+        stop.assert_called_once_with(available.id)
+        send.assert_not_called()
+        self.assertEqual(moves.pending_move_requests(), ())
 
-                def holds(_selected: list[str]) -> dict[str, tuple[str, ...]]:
-                    return {available.current_session: ("verify",)} if parent else {}
-
-                self.detach.reset_mock()
-                log = self.root / f"move-{self_move}.log"
-                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": available.current_session if self_move else ""}),
-                      patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
-                      patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
-                      patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
-                      patch.object(stop_resume, "_build_holders", side_effect=holds),
-                      patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(available.current_session)) as stop,
-                      patch.object(stop_resume, "_resume_move", return_value=up),
-                      patch.object(stop_resume, "_load_batch_modules"),
-                      patch.object(stop_resume, "_send_move_push") as send):
-                    with staff.slot_operation(busy.id, busy.name), staff.mark_row_move(busy.id, "claude3"):
-                        results = stop_resume.move_sessions([busy.id, available.id], "claude4", why="move",
-                            cause="by hand" if self_move else "auto")
-                    self.assertIsInstance(results[0], moves.MoveWaitingForRow)
-                    self.assertIsInstance(results[1], stop_resume.MoveHandedOff)
-                    send.assert_not_called()
-                    self.detach.assert_called_once()
-                    argv = cast(list[str], self.detach.call_args.args[0])
-                    self.assertEqual(argv[argv.index("--") + 1:], [available.current_session])
-                    parent = False
-                    self.assertEqual(stop_resume.main(["batch", "--log", str(log), *argv[1:]]), 0)
-                stop.assert_called_once_with(available.id)
-                send.assert_not_called()
-                self.assertEqual(moves.pending_move_requests(), ())
+    def test_a_self_move_by_hand_sends_its_held_rows_to_the_child_which_gives_the_batch_command(self) -> None:
+        rows = tuple(staff.StaffRow(staff.StaffId(name), "showrunner", name, staff.StaffRoot(),
+                                   current_session=staff.StaffId(f"native-{name}"))
+                     for name in ("busy", "available"))
+        busy, available = rows
+        up = stop_resume.ClaudeUp(available.current_session, "fixture-pane", "claude4")
+        log = self.root / "move.log"
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": available.current_session}),
+              patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning(available.current_session)) as stop,
+              patch.object(stop_resume, "_resume_move", return_value=up),
+              patch.object(stop_resume, "_load_batch_modules"),
+              patch.object(stop_resume, "_hung_holder_seconds", return_value=1.0)):
+            with staff.slot_operation(busy.id, busy.name):
+                results = stop_resume.move_sessions([busy.id, available.id], "claude4", why="move", user_command=True)
+                self.assertTrue(all(isinstance(result, stop_resume.MoveHandedOff) for result in results), results)
+                self.detach.assert_called_once()
+                argv = cast(list[str], self.detach.call_args.args[0])
+                self.assertIn("--user-command", argv)
+                self.assertIn("--waited-seconds", argv)
+                self.assertIsInstance(cast(object, self.detach.call_args.kwargs["log_fd"]), int)
+                self.assertEqual(set(argv[argv.index("--") + 1:]), {busy.current_session, available.current_session})
+                self.assertEqual(stop_resume.main(["batch", "--log", str(log), *argv[1:]]), 1)
+        stop.assert_called_once_with(available.id)
+        text = log.read_text()
+        self.assertIn(moves.batch_move_command(busy.current_session, "claude4", user_command=True), text)
+        self.assertNotIn(moves.RETRY_COMMAND, text)
+        self.assertEqual(moves.pending_move_requests(), ())
 
     def test_a_dead_owner_target_is_not_a_live_move_on_a_busy_row(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed"), "showrunner", "fixture", staff.StaffRoot(),
@@ -6370,38 +6547,6 @@ class StopResumeTests(unittest.TestCase):
             _ = lock.write_text(json.dumps({"at": 1, "pid": 73, "start": "old", "target": "claude4"}))
             with patch.object(process_start, "process_start", return_value=process_start.Started("replacement")):
                 self.assertEqual(staff.row_activity(row.id), staff.RowBusy())
-
-    def test_a_finished_member_releases_its_row_before_the_batch_finishes_waiting(self) -> None:
-        rows = tuple(staff.StaffRow(staff.StaffId(name), "showrunner", name, staff.StaffRoot(),
-                                   current_session=staff.StaffId(f"native-{name}"))
-                     for name in ("available", "building"))
-        polls: list[list[str]] = []
-
-        def holders(selected: list[str]) -> dict[str, tuple[str, ...]]:
-            polls.append(selected)
-            if len(polls) == 1:
-                return {"native-building": ("nextest in /fixture",)}
-            self.assertIsInstance(staff.row_activity("available"), staff.RowAvailable)
-            self.assertEqual(staff.row_activity("building"), staff.RowMoving("claude4"))
-            return {}
-
-        def stopped(session: str) -> stop_resume.NotRunning:
-            self.assertEqual(staff.row_activity(session), staff.RowMoving("claude4"))
-            return stop_resume.NotRunning(session)
-
-        def resumed(session: str, *_args: object) -> stop_resume.ClaudeUp:
-            return stop_resume.ClaudeUp(session, "fixture-pane", "claude4")
-
-        batch = stop_resume._batch_process  # pyright: ignore[reportPrivateUsage]
-        self.addCleanup(batch.reset, batch.set(True))
-        with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(rows)),
-              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
-              patch.object(stop_resume, "_build_holders", side_effect=holders),
-              patch.object(stop_resume, "_stop", side_effect=stopped),
-              patch.object(stop_resume, "_resume_move", side_effect=resumed)):
-            results = stop_resume.move_sessions(["available", "building"], "claude4", why="move", cause="auto")
-        self.assertEqual(polls, [["native-available", "native-building"], ["native-building"]])
-        self.assertEqual(results, [resumed("available"), resumed("building")])
 
     def test_freestanding_resume_failure_uses_the_saved_name(self) -> None:
         identity = self.entry["session_id"]
@@ -6475,24 +6620,13 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(launched["name"], row.name)
 
 
-REAL_BUILD_HOLDERS = stop_resume._build_holders  # pyright: ignore[reportPrivateUsage]
-_BUILD_QUEUE_ISOLATION = ExitStack()
-
-
-def setUpModule() -> None:
-    # No test reads the live build queue; BuildWaitTests calls the real reader against a fake view.
-    _ = _BUILD_QUEUE_ISOLATION.enter_context(patch.object(stop_resume, "_build_holders", return_value={}))
-
-
-def tearDownModule() -> None:
-    _BUILD_QUEUE_ISOLATION.close()
+REAL_PREPARE_MOVE = stop_resume._prepare_move  # pyright: ignore[reportPrivateUsage]
 
 
 @final
-class BuildWaitTests(unittest.TestCase):
-    """An automatic move waits for the build steps a session owns; a move by hand does not."""
+class MoveNowTests(unittest.TestCase):
+    """A move stops and moves each session at once; a move by hand wins over an automatic move on the row."""
     moved: list[list[str]] = []
-    up: dict[str, stop_resume.ClaudeUp] = {}
     root: Path = Path()
 
     @override
@@ -6500,87 +6634,95 @@ class BuildWaitTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = self.root / "config"
         environment = config_environment(configuration)
-        environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN="/nonexistent/herdr")
-        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        environment.update(HOME=str(self.root), STAFF_FILE=str(self.root / "staff.json"), HERDR_BIN=MISSING_HERDR_BIN)
+        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_STOP_MARGIN_SECONDS=3\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "VERIFY_STEPS_DIR": str(self.root / "records"), "VERIFY_PROC_ROOT": str(self.root / "proc"),
-        })))
         self.moved = []
-        self.up = {name: stop_resume.ClaudeUp(name, "w1:p1", "claude3") for name in ("alpha", "beta")}
 
-        def move_now(selected: list[str], *_args: object, **_options: object) -> list[stop_resume.MoveResult]:
+        def move_now(selected: list[str], target: str, **_options: object) -> list[stop_resume.MoveResult]:
             self.moved.append(list(selected))
-            return [self.up[name] for name in selected]
+            return [self.up(name, target) for name in selected]
 
         _ = self.enterContext(patch.object(stop_resume, "_move_now", side_effect=move_now))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         _ = self.enterContext(patch.object(pane_launch, "current_kind", return_value="claude"))
         _ = self.enterContext(patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound))
         _ = self.enterContext(patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()))
+        _ = self.enterContext(patch.object(stop_resume, "_send_move_push"))
         _ = self.enterContext(patch.object(time, "sleep"))
 
-    def batch(self) -> None:
-        token = stop_resume._batch_process.set(True)  # pyright: ignore[reportPrivateUsage]
-        self.addCleanup(stop_resume._batch_process.reset, token)  # pyright: ignore[reportPrivateUsage]
+    @staticmethod
+    def up(name: str, target: str = "claude3") -> stop_resume.ClaudeUp:
+        return stop_resume.ClaudeUp(name, "w1:p1", target)
 
-    def test_a_move_by_hand_never_reads_the_build_queue(self) -> None:
-        with patch.object(stop_resume, "_build_holders", side_effect=AssertionError("queue read")):
-            results = stop_resume.move_sessions(["alpha"], "claude3", why="by hand")
-        self.assertEqual(results, [self.up["alpha"]])
+    def verify_call(self, session: str = "alpha", *, pid: int = 4242, start: str = "123") -> None:
+        record = step_record.StepRecord("v20261116T225500-4242-1", pid, start, Path("/w"), "build",
+            step_record.NamedPackage("hana"), step_record.NatedevOnly("local"),
+            step_record.StepState.ON_NATEDEV, "2026-11-16T22:55:00+00:00")
+        step_record.write(record)
+        process = self.root / "proc" / str(pid)
+        process.mkdir(parents=True, exist_ok=True)
+        _ = (process / "stat").write_text(f"{pid} (bash) S 1 " + "0 " * 17 + start + "\n")
+        _ = (process / "environ").write_bytes(f"CLAUDE_CODE_SESSION_ID={session}\0".encode())
 
-    def test_a_caller_hands_build_owners_to_the_batch_and_moves_the_others(self) -> None:
-        with patch.object(stop_resume, "_build_holders", return_value={"alpha": ("nextest in /w",)}), \
+    def hold_row(self, session: str = "alpha") -> ExitStack:
+        holder = ExitStack()
+        self.addCleanup(holder.close)
+        _ = holder.enter_context(staff.session_operation(session, native_key=moves.native_row_key(session)))
+        return holder
+
+    def test_an_automatic_move_with_a_live_step_moves_at_once(self) -> None:
+        from scripts.build_queue import admission_client
+
+        # A live verify call and a queue row exist; the move reads neither.
+        live_step = {"VERIFY_STEPS_DIR": str(self.root / "records"), "VERIFY_PROC_ROOT": str(self.root / "proc")}
+        with patch.dict(os.environ, live_step):
+            self.verify_call()
+        for cause in ("auto", "refusal", "credits off"):
+            with self.subTest(cause=cause), \
+                    patch.object(admission_client, "view", side_effect=AssertionError("queue read")):
+                self.moved = []
+                results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause=cause)
+                self.assertEqual(results, [self.up("alpha"), self.up("beta")])
+                self.assertEqual(self.moved, [["alpha", "beta"]])
+
+    def test_a_caller_hands_the_whole_batch_to_a_child(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "alpha"}), \
+                patch.object(stop_resume, "_record_launches"), \
                 patch.object(stop_resume, "_handoff_batch") as handoff:
             results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause="auto")
-        self.assertEqual(results, [stop_resume.MoveHandedOff("alpha"), self.up["beta"]])
-        self.assertEqual(handoff.call_args.args[:2], (["alpha"], "claude3"))
-        self.assertEqual(self.moved, [["beta"]])
+        self.assertEqual(results, [stop_resume.MoveHandedOff("alpha"), stop_resume.MoveHandedOff("beta")])
+        self.assertEqual(handoff.call_args.args[:2], (["alpha", "beta"], "claude3"))
+        self.assertEqual(self.moved, [])
 
-    def test_failed_handoff_keeps_the_finished_members_result(self) -> None:
-        with (patch.object(stop_resume, "_build_holders", return_value={"alpha": ("nextest in /w",)}),
-              patch.object(stop_resume, "_handoff_batch", side_effect=OSError("fixture launch failed"))):
+    def test_failed_handoff_reports_each_member(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "alpha"}), \
+                patch.object(stop_resume, "_record_launches"), \
+                patch.object(stop_resume, "_handoff_batch", side_effect=OSError("fixture launch failed")):
             results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="move", cause="auto")
-        self.assertEqual(results, [stop_resume.StopFailed("alpha", "fixture launch failed"), self.up["beta"]])
-        self.assertEqual(self.moved, [["beta"]])
+        self.assertEqual(results, [stop_resume.StopFailed("alpha", "fixture launch failed"),
+                                   stop_resume.StopFailed("beta", "fixture launch failed")])
+        self.assertEqual(self.moved, [])
 
-
-    def test_the_batch_moves_an_owner_when_its_steps_end(self) -> None:
-        self.batch()
-        held = {"alpha": ("nextest in /w",)}
-        with patch.object(stop_resume, "_build_holders", side_effect=[held, held, {}]), \
-                redirect_stdout(io.StringIO()) as shown:
-            results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause="refusal")
-        self.assertEqual(results, [self.up["alpha"], self.up["beta"]])
-        self.assertEqual(self.moved, [["beta"], ["alpha"]])
-        self.assertEqual(shown.getvalue(), "build wait: alpha owns nextest in /w; the move waits for its steps to end\n")
-
-    def test_detached_build_checks_do_not_move_a_replacement_conversation(self) -> None:
-        self.batch()
+    def test_a_replacement_conversation_during_the_warning_is_not_moved(self) -> None:
         row = staff.StaffRow(staff.StaffId("alpha"), "showrunner", "fixture", staff.StaffRoot(),
                              current_session=staff.StaffId("conversation-before"))
-        conversations: list[list[str]] = []
         snapshot = staff.StaffSnapshot((row,))
         request_id = "c" * 32
         moves.write_latest_request(row.current_session, moves.LatestMoveRequest(request_id, "claude3"))
 
-        def holders(selected: list[str]) -> dict[str, tuple[str, ...]]:
+        def warn(*_args: object) -> None:
             nonlocal snapshot
-            conversations.append(selected)
-            self.assertEqual(self.moved, [])
-            self.assertIsInstance(staff.row_activity(moves.native_row_key(selected[0])), staff.RowBusy)
-            if len(conversations) == 1:
-                snapshot = staff.StaffSnapshot((replace(row, current_session=staff.StaffId("conversation-after")),))
-                return {"conversation-before": ("verify",)}
-            return {}
+            self.assertIsInstance(staff.row_activity(moves.native_row_key(row.current_session)), staff.RowBusy)
+            snapshot = staff.StaffSnapshot((replace(row, current_session=staff.StaffId("conversation-after")),))
 
         with (patch.object(staff, "initial_snapshot", side_effect=lambda: snapshot),
-              patch.object(stop_resume, "_build_holders", side_effect=holders)):
-            results = stop_resume.move_sessions([row.id], "claude3", why="move", cause="refusal",
+              patch.object(stop_resume, "_warn_moves", side_effect=warn) as warned):
+            results = stop_resume.move_sessions([row.id], "claude3", why="move", cause="refusal", warn_seconds=1,
                 request=stop_resume.DetachedMoveRequest(request_id, frozenset({row.id})))
         self.assertEqual(results, [moves.MoveWaitingForRow(row.current_session, "the move owner changed while holding its row")])
-        self.assertEqual(conversations, [["conversation-before"]])
+        warned.assert_called_once()
         self.assertEqual(self.moved, [])
         self.assertEqual(moves.read_latest_request(row.current_session), moves.LatestMoveRequest(request_id, "claude3"))
 
@@ -6600,19 +6742,18 @@ root = Path(sys.argv[1])
 production.__path__ = [str(root), *production.__path__]
 from scripts.agents import stop_resume
 
-def replace_module(_seconds):
+def replace_module(*_args):
     (root / "unit_lookup.py").write_text("# This revision lacks LiveSession.\n")
 
 def move_now(selected, target, **_options):
     stop_resume._retire_prompt(selected[0])
     return [stop_resume.ClaudeUp(selected[0], "w1:p1", target)]
 
-with (patch.object(stop_resume, "_build_holders", side_effect=[{"alpha": ("verify",)}, {}]),
-      patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+with (patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
       patch.object(stop_resume, "running_on_account", return_value=stop_resume.sessions.SessionNotLive()),
-      patch.object(stop_resume.time, "sleep", side_effect=replace_module),
+      patch.object(stop_resume, "_warn_moves", side_effect=replace_module),
       patch.object(stop_resume, "_move_now", side_effect=move_now)):
-    raise SystemExit(stop_resume.main(["batch", "--target", "claude3", "--cause", "auto",
+    raise SystemExit(stop_resume.main(["batch", "--target", "claude3", "--cause", "auto", "--warn-seconds", "1",
                                       "--log", str(root / "batch.log"), "alpha"]))
 """
         result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(self.root)], cwd=checkout,
@@ -6625,7 +6766,7 @@ with (patch.object(stop_resume, "_build_holders", side_effect=[{"alpha": ("verif
         cancellation = cast(dict[str, object], json.loads(cancellations[0].read_text()))
         self.assertEqual(cancellation["session_id"], "alpha")
 
-    def test_batch_moves_every_member_when_main_changes_during_build_wait(self) -> None:
+    def test_batch_moves_every_member_when_main_changes_during_its_warning(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         code = """
 import sys
@@ -6646,185 +6787,357 @@ finally:
             capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_memory_wait_defers_at_the_move_deadline(self) -> None:
-        self.batch()
-        held = {"alpha": ("nextest in /w", "check in /w")}
-        with patch.object(stop_resume, "_build_holders", return_value=held), \
-                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 30 * 60.0]), \
-                redirect_stdout(io.StringIO()) as shown:
-            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-        self.assertIsInstance(results[0], stop_resume.StopFailed)
-        self.assertEqual(self.moved, [])
-        self.assertIn("move deferred", shown.getvalue())
+    def test_a_move_by_hand_takes_the_row_of_an_automatic_move(self) -> None:
+        from threading import Event, Thread, current_thread, main_thread
 
-    def test_an_unread_queue_holds_the_owner_until_a_read_proves_its_steps_ended(self) -> None:
-        self.batch()
-        held = {"alpha": ("nextest in /w",)}
-        unread = stop_resume.BuildQueueUnreadable("no socket")
-        with patch.object(stop_resume, "_build_holders", side_effect=[held, unread, {}]), \
-                redirect_stdout(io.StringIO()):
-            _ = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+        for target in ("claude3", "claude4"):
+            with self.subTest(target=target):
+                self.moved = []
+                moves.latest_request_path("alpha").unlink(missing_ok=True)
+                hand: list[list[stop_resume.MoveResult]] = []
+                workers: list[Thread] = []
+
+                def prepare(row: stop_resume.LockedMoveRow, account: str, record: staff.StaffSnapshot, *,
+                            check_presence: bool) -> object:
+                    prepared = REAL_PREPARE_MOVE(row, account, record, check_presence=check_presence)
+                    if current_thread() is main_thread() and not workers:
+                        automatic = moves.read_latest_request("alpha")
+                        worker = Thread(target=lambda: hand.append(
+                            stop_resume.move_sessions(["alpha"], target, why="by hand", user_command=True)))
+                        workers.append(worker)
+                        worker.start()
+                        limit = time.monotonic() + 10
+                        while moves.read_latest_request("alpha") == automatic and time.monotonic() < limit:
+                            _ = Event().wait(0.01)
+                    return prepared
+
+                with patch.object(stop_resume, "_prepare_move", side_effect=prepare):
+                    automatic = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+                    workers[0].join(30)
+                self.assertEqual(automatic, [moves.MoveSuperseded("alpha")])
+                self.assertEqual(hand, [[self.up("alpha", target)]])
+                self.assertEqual(self.moved, [["alpha"]])
+
+    def automatic_move_at_a_poll(self, *, past_limit: bool = False,
+                                 child: stop_resume.DetachedMoveRequest | None = None) -> list[stop_resume.MoveResult]:
+        """The holder ends, and an automatic move tries the row before the next try of the waiting hand move."""
+        holder = self.hold_row()
+        clock = [0.0]
+        automatic: list[list[stop_resume.MoveResult]] = []
+
+        def poll(_seconds: float) -> None:
+            if past_limit:
+                clock[0] = stop_resume._hung_holder_seconds(conf.read("shutdown")) + 1  # pyright: ignore[reportPrivateUsage]
+            if not automatic:
+                holder.close()
+                automatic.append(stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto"))
+
+        with patch.object(stop_resume, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(time, "sleep", side_effect=poll) as sleep:
+            hand = stop_resume.move_sessions(["alpha"], "claude4", why="by hand", user_command=True,
+                                             request=child or stop_resume.NewMoveRequest())
+        sleep.assert_called_once()
+        self.assertEqual(automatic, [[moves.MoveSuperseded("alpha")]])
+        self.assertEqual(self.moved, [["alpha"]])
+        return hand
+
+    def test_an_automatic_move_never_takes_the_row_of_a_waiting_move_by_hand(self) -> None:
+        self.assertEqual(self.automatic_move_at_a_poll(), [self.up("alpha", "claude4")])
+
+    def test_a_waiting_move_by_hand_takes_its_row_at_the_last_try_after_an_automatic_move(self) -> None:
+        self.assertEqual(self.automatic_move_at_a_poll(past_limit=True), [self.up("alpha", "claude4")])
+
+    def test_the_child_of_a_self_move_by_hand_keeps_its_row_from_an_automatic_move(self) -> None:
+        request = stop_resume.DetachedMoveRequest("d" * 32, frozenset())
+        # The parent wrote the claim before the handoff and then ended; the child takes the claim at its first try.
+        parent = moves.ClaimOwner(os.getpid(), "the parent process ended")
+        moves.write_latest_request("alpha", moves.LatestMoveRequest(request.request_id, "claude4", owner=parent))
+        self.assertEqual(self.automatic_move_at_a_poll(child=request), [self.up("alpha", "claude4")])
+
+    def test_the_child_takes_the_claims_of_its_parent_before_it_confirms_its_start(self) -> None:
+        parent = moves.ClaimOwner(os.getpid(), "the parent process ended")
+        moves.write_latest_request("alpha", moves.LatestMoveRequest("d" * 32, "claude3", owner=parent), name="alpha")
+        confirmed: list[moves.LatestMoveRequest | moves.NoLatestMoveRequest] = []
+
+        def confirm(ready_fd: int | None, *, systemd: bool) -> None:
+            self.assertEqual((ready_fd, systemd), (7, True))
+            confirmed.append(moves.read_latest_request("alpha"))
+
+        with patch.object(stop_resume, "notify_ready", side_effect=confirm), \
+                patch.object(stop_resume, "_load_batch_modules"), \
+                patch.object(stop_resume, "move_sessions", return_value=[self.up("alpha")]) as batch:
+            self.assertEqual(stop_resume.main(["batch", "--log", str(self.root / "move.log"), "--ready-fd", "7",
+                                               "--notify-systemd", "--user-command", "--request-id", "d" * 32,
+                                               "--target", "claude3", "--", "alpha"]), 0)
+        claim, = confirmed
+        assert isinstance(claim, moves.LatestMoveRequest)
+        self.assertEqual(claim.owner, moves.own_claim_owner())
+        self.assertTrue(moves.claim_is_live(claim))
+        batch.assert_called_once()
+
+    def test_a_claim_with_no_start_is_live_while_its_pid_exists(self) -> None:
+        with patch.object(process_start, "process_start", return_value=process_start.Unreadable("fixture")) as read:
+            owner = moves.own_claim_owner()
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(owner, moves.ClaimOwner(os.getpid(), ""))
+        ended = subprocess.Popen(["true"])
+        _ = ended.wait()
+        self.assertTrue(moves.claim_is_live(moves.LatestMoveRequest("e" * 32, "claude3", owner=owner)))
+        self.assertFalse(moves.claim_is_live(moves.LatestMoveRequest("e" * 32, "claude3",
+                                                                     owner=moves.ClaimOwner(ended.pid, ""))))
+
+    def test_the_child_counts_the_limit_from_the_start_of_its_parent(self) -> None:
+        limit = stop_resume._hung_holder_seconds(conf.read("shutdown"))  # pyright: ignore[reportPrivateUsage]
+        request = stop_resume.DetachedMoveRequest("d" * 32, frozenset(), waited_seconds=limit)
+        moves.write_latest_request("alpha", moves.LatestMoveRequest(request.request_id, "claude3",
+                                                                    owner=moves.own_claim_owner()))
+        _ = self.hold_row()
+        with patch.object(stop_resume, "monotonic", return_value=0.0), patch.object(time, "sleep") as sleep:
+            waiting, = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True, request=request)
+        # The parent used the whole limit, so the child makes one last try after one poll.
+        sleep.assert_called_once()
+        assert isinstance(waiting, moves.MoveWaitingForRow)
+        self.assertEqual(waiting.command, moves.batch_move_command("alpha", "claude3", user_command=True))
+        self.assertEqual(self.moved, [])
+
+    def test_only_a_live_user_claim_stops_an_automatic_move(self) -> None:
+        ended = subprocess.Popen(["true"])
+        _ = ended.wait()
+        for owner, stops in ((moves.own_claim_owner(), True), (moves.ClaimOwner(os.getpid(), "an older process"), False),
+                             (moves.ClaimOwner(ended.pid, "a killed process"), False)):
+            with self.subTest(owner=owner):
+                self.moved = []
+                claim = moves.LatestMoveRequest("e" * 32, "claude4", owner=owner)
+                moves.write_latest_request("alpha", claim, name="alpha")
+                result = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+                self.assertEqual(result, [moves.MoveSuperseded("alpha")] if stops else [self.up("alpha")])
+                self.assertEqual(self.moved, [] if stops else [["alpha"]])
+
+    def moves_remove_their_requests(self) -> list[Callable[[], None]]:
+        """Like the real _move_now, a success removes the request of its own batch; a hook runs during the move."""
+        hooks: list[Callable[[], None]] = []
+
+        def move_now(selected: list[str], target: str, **_options: object) -> list[stop_resume.MoveResult]:
+            self.moved.append([*selected, target])
+            while hooks:
+                hooks.pop(0)()
+            request_id = stop_resume._move_batch.get().request_id  # pyright: ignore[reportPrivateUsage]
+            for name in selected:
+                moves.remove_latest_request(name, request_id)
+            return [self.up(name, target) for name in selected]
+
+        _ = self.enterContext(patch.object(stop_resume, "_move_now", side_effect=move_now))
+        return hooks
+
+    def test_a_newer_move_by_hand_that_ends_during_a_long_pass_of_an_older_one_wins(self) -> None:
+        hooks = self.moves_remove_their_requests()
+        holder = self.hold_row()
+        newer: list[list[stop_resume.MoveResult]] = []
+
+        def during_beta() -> None:
+            holder.close()
+            newer.append(stop_resume.move_sessions(["alpha"], "claude4", why="by hand 2", user_command=True))
+
+        hooks.append(during_beta)
+        older = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="by hand 1", user_command=True)
+        # Placeholder (x) default: the newer move by hand wins over the older one.
+        self.assertEqual(newer, [[self.up("alpha", "claude4")]])
+        self.assertEqual(older, [moves.MoveSuperseded("alpha"), self.up("beta")])
+        self.assertEqual(self.moved, [["beta", "claude3"], ["alpha", "claude4"]])
+
+    def test_the_claim_stays_live_through_a_long_pass(self) -> None:
+        hooks = self.moves_remove_their_requests()
+        holder = self.hold_row()
+        clock = [0.0]
+        automatic: list[list[stop_resume.MoveResult]] = []
+
+        def during_beta() -> None:
+            # The move of beta ends after the limit; the holder of alpha ends during it.
+            clock[0] = stop_resume._hung_holder_seconds(conf.read("shutdown")) + 5  # pyright: ignore[reportPrivateUsage]
+            holder.close()
+            automatic.append(stop_resume.move_sessions(["alpha"], "claude5", why="auto: head", cause="auto"))
+
+        hooks.append(during_beta)
+        with patch.object(stop_resume, "monotonic", side_effect=lambda: clock[0]):
+            hand = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="by hand", user_command=True)
+        self.assertEqual(automatic, [[moves.MoveSuperseded("alpha")]])
+        self.assertEqual(hand, [self.up("alpha"), self.up("beta")])
+        self.assertEqual(self.moved, [["beta", "claude3"], ["alpha", "claude3"]])
+
+    def test_a_move_by_hand_waits_for_an_operation_in_flight_then_moves(self) -> None:
+        holder = self.hold_row()
+
+        def operation_ends(_seconds: float) -> None:
+            holder.close()
+
+        with patch.object(time, "sleep", side_effect=operation_ends) as sleep:
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
+        self.assertEqual(results, [self.up("alpha")])
+        sleep.assert_called_once()
         self.assertEqual(self.moved, [["alpha"]])
 
-    def test_an_unread_queue_at_the_start_defers_without_a_stop(self) -> None:
-        with patch.object(stop_resume, "_build_holders", return_value=stop_resume.BuildQueueUnreadable("no socket")), \
-                redirect_stdout(io.StringIO()) as shown:
-            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-        self.assertIsInstance(results[0], stop_resume.StopFailed)
+    def test_a_move_by_hand_moves_the_free_rows_before_it_waits(self) -> None:
+        holder = self.hold_row()
+
+        def operation_ends(_seconds: float) -> None:
+            self.assertEqual(self.moved, [["beta"]])
+            self.assertIsInstance(staff.row_activity(moves.native_row_key("beta")), staff.RowAvailable)
+            self.assertEqual(moves.read_latest_request("alpha"), moves.read_latest_request("beta"))
+            holder.close()
+
+        with patch.object(time, "sleep", side_effect=operation_ends) as sleep:
+            results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="by hand", user_command=True)
+        self.assertEqual(results, [self.up("alpha"), self.up("beta")])
+        sleep.assert_called_once()
+        self.assertEqual(self.moved, [["beta"], ["alpha"]])
+
+    def restart_row(self) -> staff.StaffRow:
+        row = staff.StaffRow(staff.StaffId("alpha"), "showrunner", "fixture", staff.StaffRoot(),
+                             current_session=staff.StaffId("conversation-alpha"))
+        _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))))
+        return row
+
+    def test_a_move_by_hand_that_starts_in_a_restart_gap_waits_for_the_start(self) -> None:
+        row = self.restart_row()
+        # The restart stopped the row and holds no row lock now; the row is in its record.
+        shutdown_record.save([row.id])
+        _ = self.enterContext(shutdown_record.active_operation())
+        polls: list[bool] = []
+
+        def restart_runs(_seconds: float) -> None:
+            polls.append(True)
+            self.assertEqual(self.moved, [])
+            self.assertIsInstance(moves.read_latest_request(row.current_session), moves.LatestMoveRequest)
+            # The restart starts the row; it still runs for other rows.
+            shutdown_record.save([])
+
+        with patch.object(time, "sleep", side_effect=restart_runs):
+            results = stop_resume.move_sessions([row.id], "claude3", why="by hand", user_command=True)
+        self.assertEqual(results, [self.up(row.id)])
+        self.assertEqual(len(polls), 1)
+        self.assertEqual(self.moved, [[row.id]])
+
+    def test_a_restart_pauses_only_the_rows_in_its_record(self) -> None:
+        row = self.restart_row()
+        _ = self.enterContext(shutdown_record.active_operation())
+        with patch.object(time, "sleep", side_effect=AssertionError("the move waited")):
+            shutdown_record.save([row.id])
+            waiting, = stop_resume.move_sessions([row.id], "claude3", why="auto: head", cause="auto")
+            assert isinstance(waiting, moves.MoveWaitingForRow)
+            self.assertEqual(waiting.reason, "a restart holds this row")
+            self.assertFalse(moves.latest_request_path(row.current_session).exists())
+            self.assertEqual(self.moved, [])
+
+            shutdown_record.save(["another-row"])
+            results = stop_resume.move_sessions([row.id], "claude3", why="by hand", user_command=True)
+        self.assertEqual(results, [self.up(row.id)])
+        self.assertEqual(self.moved, [[row.id]])
+
+    def test_a_waiting_move_by_hand_ends_when_a_newer_move_by_hand_replaces_its_claim(self) -> None:
+        """The placeholder (x) default: a newer move by hand wins over an older one."""
+        _ = self.hold_row()
+        newer = moves.LatestMoveRequest("e" * 32, "claude4", owner=moves.own_claim_owner())
+
+        def newer_move(_seconds: float) -> None:
+            moves.write_latest_request("alpha", newer)
+
+        with patch.object(time, "sleep", side_effect=newer_move) as sleep:
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
+        self.assertEqual(results, [moves.MoveSuperseded("alpha")])
+        sleep.assert_called_once()
+        self.assertEqual(moves.read_latest_request("alpha"), newer)
         self.assertEqual(self.moved, [])
-        self.assertIn("move deferred", shown.getvalue())
 
-    def verify_call(self, session: str = "alpha", *, pid: int = 4242, start: str = "123") -> None:
-        record = step_record.StepRecord("v20261116T225500-4242-1", pid, start, Path("/w"), "build",
-            step_record.NamedPackage("hana"), step_record.NatedevOnly("local"),
-            step_record.StepState.ON_NATEDEV, "2026-11-16T22:55:00+00:00")
-        step_record.write(record)
-        process = self.root / "proc" / str(pid)
-        process.mkdir(parents=True, exist_ok=True)
-        _ = (process / "stat").write_text(f"{pid} (bash) S 1 " + "0 " * 17 + start + "\n")
-        _ = (process / "environ").write_bytes(f"CLAUDE_CODE_SESSION_ID={session}\0".encode())
+    def test_an_interrupted_move_by_hand_removes_its_claim(self) -> None:
+        _ = self.hold_row()
 
-    def empty_view(self) -> object:
-        from types import SimpleNamespace
-        return SimpleNamespace(view=SimpleNamespace(running=(), waiting=()))
+        def interrupt(_seconds: float) -> None:
+            self.assertTrue(moves.latest_request_path("alpha").exists())
+            raise KeyboardInterrupt
 
-    def test_live_verify_outside_the_snapshot_holds_its_owner(self) -> None:
-        from scripts.build_queue import admission_client
-        self.verify_call()
-        with patch.object(admission_client, "view", return_value=self.empty_view()):
-            self.assertEqual(REAL_BUILD_HOLDERS(["alpha", "beta"]), {"alpha": ("verify.sh build in /w",)})
-
-    def test_token_wait_defers_at_the_move_deadline(self) -> None:
-        from scripts.build_queue import admission_client
-        self.batch()
-        self.verify_call()
-        with patch.object(admission_client, "view", return_value=self.empty_view()), \
-                patch.object(stop_resume, "_build_holders", new=REAL_BUILD_HOLDERS), \
-                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
-                redirect_stdout(io.StringIO()):
-            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-        self.assertIsInstance(results[0], stop_resume.StopFailed)
+        with patch.object(time, "sleep", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            _ = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
+        self.assertFalse(moves.latest_request_path("alpha").exists())
         self.assertEqual(self.moved, [])
 
-    def test_a_workers_waiting_verify_call_holds_its_director(self) -> None:
-        from scripts.build_queue import admission_client
+    def test_an_interrupt_in_the_first_pass_ends_each_claim(self) -> None:
+        _ = self.hold_row()
 
-        self.batch()
-        run = self.root / "run"
-        director = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
-            current_session=staff.StaffId("alpha"), run=staff.OpenRun(run))
-        for identity in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
-            with self.subTest(identity=identity):
-                self.verify_call("worker")
-                _ = (self.root / "proc/4242/environ").write_bytes(
-                    f"{identity}=worker\0UNIT_RUN_DIR={run}\0".encode())
-                with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((director,))), \
-                        patch.object(admission_client, "view", return_value=self.empty_view()), \
-                        patch.object(stop_resume, "_build_holders", new=REAL_BUILD_HOLDERS), \
-                        patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
-                        redirect_stdout(io.StringIO()):
-                    results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-                self.assertIsInstance(results[0], stop_resume.BuildMoveDeferred)
-                self.assertEqual(self.moved, [])
+        def interrupted(*_args: object, **_options: object) -> list[stop_resume.MoveResult]:
+            raise KeyboardInterrupt
 
-    def test_unreadable_staff_with_a_workers_live_verify_call_defers_the_move(self) -> None:
-        from scripts.build_queue import admission_client
+        with patch.object(stop_resume, "_move_now", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            _ = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="by hand", user_command=True)
+        # The held row was never taken; the free row keeps its request for a retry, as a plain request.
+        self.assertFalse(moves.latest_request_path("alpha").exists())
+        pending, = moves.pending_move_requests()
+        self.assertEqual(pending.member.reference, "beta")
+        self.assertIsNone(pending.request.owner)
+        self.assertEqual(stop_resume.move_sessions(["beta"], "claude4", why="auto: head", cause="auto"),
+                         [self.up("beta", "claude4")])
 
-        self.verify_call("worker")
-        run = self.root / "run"
-        _ = (self.root / "proc/4242/environ").write_bytes(
-            f"CLAUDE_CODE_SESSION_ID=worker\0UNIT_RUN_DIR={run}\0".encode())
-        record = self.root / "staff.json"
-        _ = record.write_text("unreadable staff record")
-        with patch.dict(os.environ, {"STAFF_FILE": str(record)}), \
-                patch.object(admission_client, "view", return_value=self.empty_view()), \
-                patch.object(stop_resume, "_build_holders", new=REAL_BUILD_HOLDERS), \
-                redirect_stdout(io.StringIO()) as shown:
-            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
-        self.assertIsInstance(results[0], stop_resume.BuildMoveDeferred)
+    def test_a_failed_move_by_hand_leaves_a_plain_request(self) -> None:
+        with patch.object(stop_resume, "_move_now", return_value=[stop_resume.StopFailed("alpha", "fixture")]):
+            failed, = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
+        self.assertEqual(failed, stop_resume.StopFailed("alpha", "fixture"))
+        pending = moves.read_latest_request("alpha")
+        assert isinstance(pending, moves.LatestMoveRequest)
+        self.assertIsNone(pending.owner)
+
+    def test_a_retry_by_hand_waits_for_a_busy_row(self) -> None:
+        moves.write_latest_request("alpha", moves.LatestMoveRequest("a" * 32, "claude3"), name="alpha")
+        holder = self.hold_row()
+
+        def operation_ends(_seconds: float) -> None:
+            claim = moves.read_latest_request("alpha")
+            assert isinstance(claim, moves.LatestMoveRequest)
+            self.assertIsNotNone(claim.owner)
+            holder.close()
+
+        def stopped(row: stop_resume.LockedMoveRow, *_args: object, **_options: object) -> stop_resume.MoveStopTarget:
+            return stop_resume.MoveStopTarget(row.member, row.identity, stop_resume.StoppedMoveSource())
+
+        with patch.object(time, "sleep", side_effect=operation_ends) as sleep, redirect_stdout(io.StringIO()), \
+                patch.object(stop_resume, "_prepare_move", side_effect=stopped):
+            self.assertEqual(stop_resume._pending_move_command("retry", ""), 0)  # pyright: ignore[reportPrivateUsage]
+        sleep.assert_called_once()
+        self.assertEqual(self.moved, [["alpha"]])
+
+    def test_a_move_by_hand_names_a_hung_holder_after_its_limit(self) -> None:
+        _ = self.hold_row()
+        clock = [0.0]
+
+        def advance(seconds: float) -> None:
+            clock[0] += max(seconds, 1.0)
+
+        with patch.object(stop_resume, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(time, "sleep", side_effect=advance):
+            waiting, = stop_resume.move_sessions(["alpha"], "claude3", why="by hand", user_command=True)
+        assert isinstance(waiting, moves.MoveWaitingForRow)
+        self.assertEqual(waiting.reason, f"another operation holds this row (pid {os.getpid()}: {shlex.join(sys.argv)})")
+        self.assertEqual(waiting.command, moves.batch_move_command("alpha", "claude3", user_command=True))
+        self.assertGreaterEqual(clock[0], stop_resume._hung_holder_seconds(conf.read("shutdown")))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(moves.latest_request_path("alpha").exists())
         self.assertEqual(self.moved, [])
-        self.assertIn("ownership is unreadable", shown.getvalue())
+        # The command at the limit runs as a user command.
+        argv = shlex.split(waiting.command)
+        with patch.object(stop_resume, "move_sessions", return_value=[self.up("alpha")]) as again:
+            self.assertEqual(stop_resume.main(["batch", "--log", str(self.root / "again.log"),
+                                               *argv[argv.index("batch") + 1:]]), 0)
+        self.assertTrue(again.call_args.kwargs["user_command"])
 
-    def test_unread_verify_identity_cannot_prove_the_build_ended(self) -> None:
-        from scripts.build_queue import admission_client
-        self.verify_call()
-        _ = (self.root / "proc/4242/stat").write_text("unreadable identity")
-        with patch.object(admission_client, "view", return_value=self.empty_view()):
-            self.assertIsInstance(REAL_BUILD_HOLDERS(["alpha"]), stop_resume.BuildQueueUnreadable)
+    def test_an_automatic_move_with_the_cause_by_hand_does_not_wait_or_claim(self) -> None:
+        _ = self.hold_row()
+        with patch.object(time, "sleep", side_effect=AssertionError("an automatic move waited")):
+            waiting, = stop_resume.move_sessions(["alpha"], "claude3", why="group completion", cause="by hand")
+        self.assertIsInstance(waiting, moves.MoveWaitingForRow)
+        self.assertFalse(moves.latest_request_path("alpha").exists())
+        self.assertEqual(self.moved, [])
 
-    def test_verify_identity_rechecks_and_preserves_unreadable_evidence(self) -> None:
-        from scripts.build_queue import admission_client
-        from scripts.lib import process_start
-
-        for state in (process_start.Gone(), process_start.Started("999"),
-                      process_start.Zombie("123"), process_start.Unreadable("denied")):
-            with self.subTest(state=type(state).__name__):
-                self.verify_call()
-                with patch.object(admission_client, "view", return_value=self.empty_view()), \
-                        patch.object(process_start, "process_start", side_effect=[process_start.Started("123"), state]):
-                    result = REAL_BUILD_HOLDERS(["alpha"])
-                if isinstance(state, process_start.Unreadable):
-                    self.assertIsInstance(result, stop_resume.BuildQueueUnreadable)
-                else:
-                    self.assertEqual(result, {})
-
-    def test_verify_records_keep_unknown_ownership_and_ignore_other_sessions(self) -> None:
-        from scripts.build_queue import admission_client
-
-        for owner in ("beta", ""):
-            with self.subTest(owner=owner):
-                self.verify_call(owner)
-                with patch.object(admission_client, "view", return_value=self.empty_view()):
-                    result = REAL_BUILD_HOLDERS(["alpha"])
-                if owner:
-                    self.assertEqual(result, {})
-                else:
-                    self.assertIsInstance(result, stop_resume.BuildQueueUnreadable)
-        self.verify_call()
-        (self.root / "proc/4242/environ").unlink()
-        with patch.object(admission_client, "view", return_value=self.empty_view()):
-            self.assertIsInstance(REAL_BUILD_HOLDERS(["alpha"]), stop_resume.BuildQueueUnreadable)
-
-    def test_dead_and_reused_verify_records_do_not_hold_the_director(self) -> None:
-        from scripts.build_queue import admission_client
-
-        self.verify_call()
-        process = self.root / "proc/4242/stat"
-        for stat in ("4242 (bash) S 1 " + "0 " * 17 + "999\n", ""):
-            with self.subTest(stat=stat):
-                if stat:
-                    _ = process.write_text(stat)
-                else:
-                    process.unlink()
-                with patch.object(admission_client, "view", return_value=self.empty_view()):
-                    self.assertEqual(REAL_BUILD_HOLDERS(["alpha"]), {})
-
-    def test_mixed_batch_moves_only_the_free_director_at_the_deadline(self) -> None:
-        self.batch()
-        held = {"alpha": ("build in /w",)}
-        with patch.object(stop_resume, "_build_holders", return_value=held), \
-                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
-                redirect_stdout(io.StringIO()):
+    def test_an_automatic_move_reports_a_busy_row_without_a_wait(self) -> None:
+        _ = self.hold_row()
+        with patch.object(time, "sleep", side_effect=AssertionError("an automatic move waited")):
             results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause="auto")
-        self.assertIsInstance(results[0], stop_resume.StopFailed)
-        self.assertEqual(results[1], self.up["beta"])
+        self.assertIsInstance(results[0], moves.MoveWaitingForRow)
+        self.assertEqual(results[1], self.up("beta"))
         self.assertEqual(self.moved, [["beta"]])
-
-    def test_the_reader_names_running_and_waiting_steps_of_the_selected_sessions(self) -> None:
-        from types import SimpleNamespace
-        from scripts.build_queue import admission_client, admission_protocol
-
-        def step(session: str, name: str, folder: str) -> SimpleNamespace:
-            return SimpleNamespace(session_id=session, step=name, folder=folder)
-
-        reading = SimpleNamespace(view=SimpleNamespace(
-            running=(step("alpha", "nextest", "/w"), step("", "compile", ""), step("gamma", "check", "/g")),
-            waiting=(step("alpha", "clippy", ""),)))
-        with patch.object(admission_client, "view", return_value=reading):
-            self.assertEqual(REAL_BUILD_HOLDERS(["alpha", "beta"]), {"alpha": ("nextest in /w", "clippy")})
-        with patch.object(admission_client, "view", side_effect=admission_protocol.AdmissionUnavailable("no socket")):
-            self.assertEqual(REAL_BUILD_HOLDERS(["alpha"]), stop_resume.BuildQueueUnreadable("no socket"))
-
-
-if __name__ == "__main__":
-    _ = unittest.main()

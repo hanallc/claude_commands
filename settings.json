@@ -365,6 +365,16 @@
             "timeout": 120
           }
         ]
+      },
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-review-hold-send.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -538,7 +548,7 @@
   },
   "feedbackDrafts": "quiet",
   "alwaysThinkingEnabled": true,
-  "autoCompactWindow": 308800,
+  "autoCompactWindow": 283800,
   "askUserQuestionTimeout": "never",
   "remote": {
     "defaultEnvironmentId": "env_01DRVkPj3Ec3qaNwfki4iyms"

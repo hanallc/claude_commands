@@ -13,6 +13,7 @@ from unittest import mock
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.direct import verify_lint_scope_test_support as lint_support
+from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
@@ -303,14 +304,6 @@ release_token
         _ = self.board(board, "release", "same", "cargo", "--pid", str(os.getpid()))
 
 class LintInputIdentityTests(VerifyLintCacheFixture):
-    def assert_lint_calls(self, *, fixes: int = 0) -> None:
-        judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
-        expected = [judgment]
-        if fixes:
-            fix = ["--jobs", "8", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
-            expected = [judgment, *([fix] * fixes), judgment]
-        self.assertEqual(self.calls("clippy"), expected)
-
     def private_scripts(self) -> tuple[Path, Path]:
         scripts = Path(self.environment["HOME"]) / ".claude" / "scripts"
         _ = copy_helpers(Path(self.environment["HOME"]), *VERIFY_HELPERS)
@@ -328,7 +321,7 @@ if arguments[:1] == ["clippy"]:''')
         self.environment.update(TEST_PRIVATE_VERIFY=str(verify), TEST_PRIVATE_INVOKE=str(invoke))
         with mock.patch.object(lint_support, "VERIFY", verify):
             result = self.verify("lint", "sample")
-        self.assert_lint_calls()
+        assert_clippy_calls(self, fix_passes=0)
         self.assertNotIn("tree changed", result.stdout + result.stderr)
 
     def test_script_edit_during_fix_cannot_cache_a_pass_for_the_new_script(self) -> None:
@@ -349,10 +342,10 @@ if arguments[:1] == ["clippy"]:''')
         self.environment["TEST_PRIVATE_INVOKE"] = str(invoke)
         with mock.patch.object(lint_support, "VERIFY", verify):
             _ = self.verify("lint", "sample")
-            self.assert_lint_calls(fixes=1)
+            assert_clippy_calls(self)
             self.assertEqual(list(cache.glob("*.pass")), [], "old loaded code certified the new script")
             _ = self.verify("lint", "sample")
-            self.assert_lint_calls(fixes=1)
+            assert_clippy_calls(self)
             self.assertEqual(len(list(cache.glob("*.pass"))), 1)
             _ = self.verify("lint", "sample")
             self.assertEqual(self.calls("clippy"), [])
@@ -366,7 +359,7 @@ if arguments[:1] == ["clippy"]:''')
         self.assertEqual(list(cache.glob("*.fail")), [])
         self.environment["TEST_CLIPPY_STATUS"] = "0"
         _ = self.verify("lint", "sample")
-        self.assert_lint_calls()
+        assert_clippy_calls(self, fix_passes=0)
 
     def test_a_lint_script_edit_invalidates_a_previously_reused_pass(self) -> None:
         verify, _ = self.private_scripts()
@@ -380,7 +373,7 @@ if arguments[:1] == ["clippy"]:''')
             with verify.open("a") as output:
                 _ = output.write("\n# cache input changed\n")
             _ = self.verify("lint", "sample")
-            self.assert_lint_calls()
+            assert_clippy_calls(self, fix_passes=0)
 
 
 class LintKeyInputTests(unittest.TestCase):

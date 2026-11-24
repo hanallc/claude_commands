@@ -87,9 +87,8 @@ from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.mac_test import floor_claims
 from scripts.mac_test.mirror_root import MacMirrorRoot
+from scripts.lib.sizes import GIB, MIB, gib, mib
 
-GIB = 1 << 30
-MIB = 1 << 20
 DAY_SECONDS = 86_400
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
@@ -168,8 +167,8 @@ class CargoOutputIndex:
     known_trees: dict[str, list[str]] = field(default_factory=dict)
 
     @cached_property
-    def linked_roots(self) -> dict[str, tuple[str, ...]]:
-        """Connected output roots, shared by all lookups in this index."""
+    def connected_roots(self) -> dict[str, tuple[str, ...]]:
+        """Each root with every root that a chain of saved mappings connects to it."""
         connected: dict[str, set[str]] = {}
         for mapping in self.workspaces:
             target, build = str(mapping.target_directory), str(mapping.build_directory)
@@ -178,8 +177,27 @@ class CargoOutputIndex:
                 connected[root] = linked
         return {root: tuple(sorted(linked)) for root, linked in connected.items()}
 
-    def roots_for(self, root: str) -> tuple[str, ...]:
-        return tuple(path for path in self.linked_roots.get(root, (root,)) if os.path.isdir(path))
+    @cached_property
+    def pair_roots(self) -> dict[str, tuple[str, ...]]:
+        """Each root with the target and build folders of the saved mappings that name it."""
+        pairs: dict[str, set[str]] = {}
+        for mapping in self.workspaces:
+            pair = {str(mapping.target_directory), str(mapping.build_directory)}
+            for root in pair:
+                pairs.setdefault(root, set()).update(pair)
+        return {root: tuple(sorted(pair)) for root, pair in pairs.items()}
+
+    def connected_roots_for(self, root: str) -> tuple[str, ...]:
+        """The closure of root's mappings.
+
+        Scan clusters, batch order, group last use, the CI exclusion and the filesystem floor's
+        target list use it. Busy state never uses it.
+        """
+        return tuple(path for path in self.connected_roots.get(root, (root,)) if os.path.isdir(path))
+
+    def pair_roots_for(self, root: str) -> tuple[str, ...]:
+        """One hop: the roots of root's own mappings. Busy state spreads this far only."""
+        return tuple(path for path in self.pair_roots.get(root, (root,)) if os.path.isdir(path))
 
     @cached_property
     def output_owners(self) -> dict[Path, tuple[int, ...]]:
@@ -200,6 +218,17 @@ class CargoOutputIndex:
 
 
 OUTPUT_ROOTS: ContextVar[CargoOutputIndex] = ContextVar("cargo_output_roots", default=CargoOutputIndex())
+
+
+def spread_over_pairs[Use](found: Mapping[str, Use], roots: Collection[str]) -> dict[str, Use]:
+    """A use of one output root counts as a use of the other roots of its own mappings, in roots.
+
+    A root keeps its own use. The spread is one hop.
+    """
+    pairs = OUTPUT_ROOTS.get().pair_roots_for
+    spread = {paired: use for root, use in found.items() for paired in pairs(root) if paired in roots}
+    spread.update(found)
+    return spread
 
 
 @dataclass(frozen=True)
@@ -578,23 +607,15 @@ class OpenPhoneCrossing:
     rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
 
 
-class ReturnPushPolicy(Enum):
-    ALLOWED = "allowed"
-    SUPPRESSED = "suppressed"
-
-
 @dataclass(frozen=True)
-class RecoveringPhoneCrossing:
-    """Retire the fall key before the permitted return delivery."""
+class RetiringPhoneCrossing:
+    """The fall key still needs retirement after recovery."""
 
     identity: str
-    receipt: CrossingReceipt = CrossingReceipt.PENDING
-    retired: bool = False
-    rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
-    return_policy: ReturnPushPolicy = ReturnPushPolicy.ALLOWED
+    rearm: BelowRearmLine | AboveRearmLine
 
 
-PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing | RecoveringPhoneCrossing
+PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing | RetiringPhoneCrossing
 
 
 @dataclass(frozen=True)
@@ -1574,7 +1595,8 @@ def floor_holders(busy: Mapping[str, FloorProtection], sizes: dict[str, int],
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     holders: list[FloorHolder] = []
-    for root, use in busy.items():
+    for root, protection in busy.items():
+        use = direct_use(protection)
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
             continue
         if isinstance(use, UnverifiedSlotLease):
@@ -1904,10 +1926,6 @@ class PairedTrimDeferred:
     roots: tuple[str, ...]
 
 
-class TrimMayProceed(Enum):
-    READY = "trim may proceed"
-
-
 @dataclass(frozen=True)
 class PendingUnlink:
     path: str
@@ -2034,9 +2052,6 @@ class TrimTake:
         return True
 
 
-TRIM_TAKES: ContextVar[dict[str, TrimTake]] = ContextVar("sweep_trim_takes", default={})
-
-
 def trim_intent_path(target: str) -> Path:
     identity = hashlib.sha256(os.path.abspath(target).encode()).hexdigest()
     return floor_record_path().parent / "trims" / (identity + ".json")
@@ -2123,52 +2138,6 @@ def trim_row_recorded(take: TrimTake) -> bool:
                for row in store.locked_rows(path, take.log_offset))
 
 
-@contextmanager
-def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
-                     dry_run: bool, owners: TargetOwnerIndex, *,
-                     lint_settings: conf.ConfigRead, proc: str,
-                     held_slots: Collection[SlotBuildOutput] = ()) -> Generator[TrimMayProceed | PairedTrimDeferred]:
-    """Hold the trim lock and defer recovery while an output is in use."""
-    if dry_run:
-        yield TrimMayProceed.READY
-        return
-    target = os.path.abspath(target)
-    path = trim_intent_path(target)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(".lock").open("a") as guard:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        groups = [group for group in scan.groups if owners.owner(group.build_tree) == TargetOwner(target)]
-        whole_targets = [whole for whole in scan.whole_targets
-                         if cause == "floor take" and whole.target == target]
-        take = TrimTake(target, cause, len(groups) + len(whole_targets),
-                        output_roots=OUTPUT_ROOTS.get().roots_for(target))
-        recovered = True
-        if path.exists():
-            unfinished = load_trim_for_recovery(path)
-            if not isinstance(unfinished, DamagedTrimIntentSetAside):
-                if trim_output_uses(unfinished, lint_settings=lint_settings, proc=proc):
-                    yield PairedTrimDeferred(unfinished.output_roots)
-                    return
-                recovery = unfinished.recover(held_slots=held_slots)
-                if isinstance(recovery, PairedTrimDeferred):
-                    yield recovery
-                    return
-                recovered = unfinished.publish()
-                if not recovered:
-                    take = unfinished
-        active = dict(TRIM_TAKES.get())
-        active.update({group.build_tree: take for group in groups})
-        active.update({whole.target: take for whole in whole_targets})
-        token = TRIM_TAKES.set(active)
-        try:
-            yield TrimMayProceed.READY
-            # A failed append keeps its completed intent for the next invocation.
-            if recovered and path.exists() and not take.publish():
-                return
-        finally:
-            TRIM_TAKES.reset(token)
-
-
 def stamp_newer(root: str, moment: float) -> bool:
     """Return whether the use stamp is newer than moment. A missing stamp returns False."""
     try:
@@ -2193,12 +2162,12 @@ def trim_output_uses(take: TrimTake, *, lint_settings: conf.ConfigRead,
 
 
 def saved_trim_outside(roots: Sequence[str]) -> str | None:
-    """The first root whose own saved trim has output outside roots; recoverable_trim would finish it."""
+    """The first root whose own saved trim has output outside roots; recovery would finish it."""
     for root in roots:
         try:
             take = read_trim_intent(trim_intent_path(os.path.abspath(root)))
         except (OSError, ValueError, KeyError):
-            # No intent; or a damaged one, which recoverable_trim sets aside without a removal.
+            # No intent; or a damaged one, which recovery sets aside without a removal.
             continue
         if not trim_inside(take, roots):
             return root
@@ -2656,14 +2625,6 @@ def prune_doc_index(roots: list[str], budget: int, dry_run: bool, *,
     return 0
 
 
-def gib(size: int) -> str:
-    return f"{size / GIB:.1f} GiB"
-
-
-def mib(size: int) -> str:
-    return f"{size / MIB:.1f} MiB"
-
-
 def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
@@ -2716,12 +2677,12 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
             scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
         return scan
 
-    paired_roots = output_index.roots_for
+    connected_roots = output_index.connected_roots_for
     clusters: list[tuple[str, ...]] = []
     assigned: set[str] = set()
     for root in roots:
         if root not in assigned:
-            cluster = tuple(path for path in paired_roots(root) if path in roots)
+            cluster = tuple(path for path in connected_roots(root) if path in roots)
             clusters.append(cluster)
             assigned.update(cluster)
     if not clusters:
@@ -2984,7 +2945,7 @@ def shrink_floor(
         target_batches.items(),
         key=lambda batch: (max(target_last_use(root, [
             group for group in batch[1] if isinstance(group, Group)
-        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().roots_for(batch[0])), batch[0]),
+        ], scan.discovered_targets) for root in OUTPUT_ROOTS.get().connected_roots_for(batch[0])), batch[0]),
     )
     remaining = dict(scan.links)
     taken: list[tuple[FloorTake, int]] = []
@@ -2995,8 +2956,8 @@ def shrink_floor(
     for root, candidates in batches:
         if left <= budget:
             break
-        paired_roots = OUTPUT_ROOTS.get().roots_for(root)
-        if any(paired in busy for paired in paired_roots):
+        paired_roots = OUTPUT_ROOTS.get().pair_roots_for(root)
+        if first_use(busy, paired_roots) is not None:
             continue
         current_holds = (build_hold_targets(paired_roots, trees, lint_settings=lint_settings, proc=PROC_DIR)
                          if not isinstance(policy, MacFloor) else {})
@@ -3009,8 +2970,7 @@ def shrink_floor(
         current_holds = {path: use for path, use in current_holds.items() if path in paired_roots}
         current_uses = {path: use for path, use in current_uses.items() if path in paired_roots}
         if current_holds or current_uses:
-            busy.update(current_holds)
-            busy.update(current_uses)
+            busy.update(spread_over_pairs({**current_holds, **current_uses}, scan.discovered_targets))
             continue
         with ExitStack() as guards:
             lock = scratch.judgment_lock
@@ -3270,10 +3230,10 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
             since = saved_channels.get("rearm_since")
             rearm = AboveRearmLine(float(since)) if _finite_number(since) else BelowRearmLine()
             try:
-                if "recovery" in saved_channels:
-                    crossing = RecoveringPhoneCrossing(identity, CrossingReceipt(saved_channels.get("recovery")),
-                                                       saved_channels.get("retired") is True, rearm,
-                                                       ReturnPushPolicy(saved_channels.get("return_policy", "allowed")))
+                if saved_channels.get("retiring") is True or "recovery" in saved_channels:
+                    # Old recovery records can already have retired the fall key.
+                    if saved_channels.get("retired") is not True:
+                        crossing = RetiringPhoneCrossing(identity, rearm)
                 else:
                     crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
                                                 CrossingReceipt(saved_channels.get("phone")), rearm)
@@ -3359,8 +3319,7 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         if isinstance(crossing, OpenPhoneCrossing):
             saved_crossing.update(natedev=crossing.natedev.value, phone=crossing.phone.value)
         else:
-            saved_crossing.update(recovery=crossing.receipt.value, retired=crossing.retired,
-                                  return_policy=crossing.return_policy.value)
+            saved_crossing["retiring"] = True
         data["phone_crossing"] = saved_crossing
     if isinstance(record.failure, FailurePending):
         data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
@@ -3957,14 +3916,8 @@ def send_floor_alert(message: str, *,
     return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
 
 
-class FallPushRetirement(Enum):
-    NO_KEPT_PUSH = "no_kept_push"
-    DROPPED_KEPT_PUSH = "dropped_kept_push"
-    FAILED = "failed"
-
-
 def retire_floor_fall(identity: str, *, machine: FloorMachine,
-                      lint_settings: conf.ConfigRead) -> FallPushRetirement:
+                      lint_settings: conf.ConfigRead) -> bool:
     """Retire the fall key on natedev, where silence keeps both machines' pushes."""
     from scripts.notify import silence
 
@@ -3978,14 +3931,11 @@ def retire_floor_fall(identity: str, *, machine: FloorMachine,
                                 timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: cannot retire the fall push: {error}", file=sys.stderr)
-        return FallPushRetirement.FAILED
-    dropped = re.search(r"(?m)^dropped ([0-9]+) kept push(?:es)?$", result.stdout)
+        return False
+    dropped = re.search(r"(?m)^dropped [0-9]+ kept push(?:es)?$", result.stdout)
     if result.returncode or dropped is None:
         print(f"lint sweep: cannot retire the fall push: {result.stderr or result.stdout}", file=sys.stderr)
-    if dropped is None:
-        return FallPushRetirement.FAILED
-    return (FallPushRetirement.DROPPED_KEPT_PUSH if int(dropped.group(1))
-            else FallPushRetirement.NO_KEPT_PUSH)
+    return dropped is not None
 
 
 from scripts.message import sessions
@@ -3998,7 +3948,31 @@ class BuildHoldTarget:
     holder: str
 
 
-FloorProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedSlotLease
+RootProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedSlotLease
+
+
+@dataclass(frozen=True)
+class PairHeld:
+    """A root held only because a root of its own mappings is in use. It makes no other root held."""
+
+    use: RootProtection
+
+
+FloorProtection = RootProtection | PairHeld
+
+
+def direct_use(protection: FloorProtection) -> RootProtection:
+    """The use that protects a root, also when the root is held through its pair."""
+    return protection.use if isinstance(protection, PairHeld) else protection
+
+
+def first_use(busy: Mapping[str, FloorProtection], roots: Iterable[str]) -> RootProtection | None:
+    """The first use among roots. A pair-held root is not in use."""
+    for root in roots:
+        use = busy.get(root)
+        if use is not None and not isinstance(use, PairHeld):
+            return use
+    return None
 
 
 def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]], *,
@@ -4386,7 +4360,7 @@ def _hold_floor(floor: int, dry_run: bool, *,
             if any(root.is_relative_to(ci) for root in pair for ci in ci_roots):
                 excluded_roots.update(pair)
                 for root in pair:
-                    excluded_roots.update(Path(paired) for paired in mappings.roots_for(str(root)))
+                    excluded_roots.update(Path(paired) for paired in mappings.connected_roots_for(str(root)))
         targets = [root for root in targets if not any(Path(root).is_relative_to(excluded)
                                                       for excluded in excluded_roots)]
         filesystems = filesystem_floors(floor, targets, lint_settings=lint_settings)
@@ -4451,55 +4425,17 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
 
     def recover(current: FloorRecord, free: int, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         crossing = current.phone_crossing
-        if isinstance(crossing, AbovePhoneFloor) or (
-                isinstance(crossing, RecoveringPhoneCrossing) and crossing.receipt is CrossingReceipt.ACCEPTED):
+        if isinstance(crossing, AbovePhoneFloor):
             return current
         if free <= phone_rearm:
             return replace(current, phone_crossing=replace(crossing, rearm=BelowRearmLine()))
         now = time.time()
         interval = crossing.rearm if isinstance(crossing.rearm, AboveRearmLine) else AboveRearmLine(now)
-        crossing = replace(crossing, rearm=interval)
-        current = replace(current, phone_crossing=crossing)
         if now - interval.since < rearm_seconds:
-            return current
-        if isinstance(crossing, OpenPhoneCrossing):
-            policy = (ReturnPushPolicy.ALLOWED if crossing.phone is CrossingReceipt.ACCEPTED
-                      else ReturnPushPolicy.SUPPRESSED)
-            crossing = RecoveringPhoneCrossing(crossing.identity, rearm=interval, return_policy=policy)
-            current = replace(current, phone_crossing=crossing)
-        if not save(current):
-            return current
-        if not crossing.retired:
-            return_policy = crossing.return_policy
-            # Save uncertainty before retirement can remove a kept fall push.
-            crossing = replace(crossing, return_policy=ReturnPushPolicy.SUPPRESSED)
-            current = replace(current, phone_crossing=crossing)
-            if not save(current):
-                return current
-            retired = retire_floor_fall(crossing.identity, machine=machine, lint_settings=lint_settings)
-            if retired is FallPushRetirement.FAILED:
-                return current
-            if (retired is FallPushRetirement.DROPPED_KEPT_PUSH
-                    or return_policy is ReturnPushPolicy.SUPPRESSED):
-                return replace(current, phone_crossing=AbovePhoneFloor())
-            crossing = replace(crossing, retired=True, return_policy=return_policy)
-            current = replace(current, phone_crossing=crossing)
-            if not save(current):
-                return current
-        if crossing.receipt is CrossingReceipt.PENDING and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE:
-            if TYPE_CHECKING:
-                from scripts.notify.push_texts import render
-            else:
-                prepare_push_texts()
-                from scripts.notify.push_texts import render
-            phone = render("sweep.disk_floor_recovered", machine=machine.value,
-                           free=gib(free), rearm=gib(phone_rearm), floor=gib(phone_floor))
-            delivery = send_phone_push(phone,
-                repeat=CrossingSendKey(f"phone-recovered:{crossing.identity}",
-                                       lint_settings.number("sweep_crossing_repeat_minutes")), lint_settings=lint_settings)
-            if delivery.accepted:
-                current = replace(current, phone_crossing=replace(crossing, receipt=CrossingReceipt.ACCEPTED))
-            _ = save(current)
+            return replace(current, phone_crossing=replace(crossing, rearm=interval))
+        current = replace(current, phone_crossing=RetiringPhoneCrossing(crossing.identity, interval))
+        if save(current) and retire_floor_fall(crossing.identity, machine=machine, lint_settings=lint_settings):
+            return replace(current, phone_crossing=AbovePhoneFloor())
         return current
 
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
@@ -4517,7 +4453,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                                   else os.path.expanduser("~"))
                 current = recover(current, free, save)
                 crossing = current.phone_crossing
-                if free < phone_floor and isinstance(crossing, (AbovePhoneFloor, RecoveringPhoneCrossing)):
+                if free < phone_floor and isinstance(crossing, (AbovePhoneFloor, RetiringPhoneCrossing)):
                     current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
             except OSError as error:
                 print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)
@@ -4698,9 +4634,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             print(f"lint sweep: cannot clear the lock observation: {error}", file=sys.stderr)
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
-        paired_roots = OUTPUT_ROOTS.get().roots_for
         known_trees = {} if isinstance(policy, MacFloor) else dict(OUTPUT_ROOTS.get().known_trees)
-        targets = (sorted({paired for root in filesystem.targets for paired in paired_roots(root)})
+        targets = (sorted({paired for root in filesystem.targets
+                           for paired in OUTPUT_ROOTS.get().connected_roots_for(root)})
                    if isinstance(filesystem, FilesystemFloor) else
                    target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees))
         all_discovered = sorted(set(targets) | {str(Path(path).expanduser().resolve())
@@ -4720,14 +4656,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             for root in targets:
                 if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
                     uses[root] = LockHeld("remote mirror lease is busy")
-        for root in tuple(hold_targets):
-            for paired in paired_roots(root):
-                if paired in targets:
-                    hold_targets[paired] = hold_targets[root]
-        for root in tuple(uses):
-            for paired in paired_roots(root):
-                if paired in targets:
-                    uses[paired] = uses[root]
+        hold_targets = spread_over_pairs(hold_targets, targets)
+        uses = spread_over_pairs(uses, targets)
         locked_files = held_cargo_lock_files(lint_settings=lint_settings)
         tree_depth = lint_settings.whole("sweep_max_tree_depth")
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
@@ -4790,14 +4720,13 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             idle.append(root)
             tree_targets.update({tree: root for tree in root_trees if owners.owner(tree) == TargetOwner(root)})
         for root in tuple(idle):
-            pair = paired_roots(root)
-            blocked_pair = next((paired for paired in pair if paired in busy), "")
-            if blocked_pair:
-                busy[root] = busy[blocked_pair]
+            pair_use = first_use(busy, OUTPUT_ROOTS.get().pair_roots_for(root))
+            if pair_use is not None:
+                busy[root] = PairHeld(pair_use)
                 idle.remove(root)
         scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered), known_trees, lint_settings=lint_settings)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
-        grouped_roots = {root: paired_roots(root) for root in set(tree_targets.values())}
+        grouped_roots = {root: OUTPUT_ROOTS.get().connected_roots_for(root) for root in set(tree_targets.values())}
         for group in scan.groups:
             for root in grouped_roots[tree_targets[group.build_tree]]:
                 if root in target_groups:
@@ -4814,10 +4743,10 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             busy_bytes = {path: 0 for path in busy if on_floor_filesystem(path)}
             measured = measure_protected_folders(frozenset(
                 path for path, use in busy.items()
-                if not isinstance(policy, MacFloor) and not isinstance(use, BuildHoldTarget)),
+                if not isinstance(policy, MacFloor) and not isinstance(direct_use(use), BuildHoldTarget)),
                 excluded_targets, walk=cache_walk)
             busy_bytes.update(measured.sizes)
-            protected = tuple((path, size) for path, size in measured.sizes if isinstance(busy[path], NoRecordedEvidence))
+            protected = tuple((path, size) for path, size in measured.sizes if isinstance(direct_use(busy[path]), NoRecordedEvidence))
             held_bytes = sum(busy_bytes.values())
             ci_paths: list[str] = []
             for path in lint_settings.words("sweep_ci_targets"):
@@ -4838,7 +4767,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
         # scan reported a 122.6 GiB fall while 123 GiB was freed.
         scanned_free = free_bytes(home)
-        protection_reason = ("because they are protected" if any(isinstance(use, NoRecordedEvidence) for use in busy.values())
+        protection_reason = ("because they are protected" if any(isinstance(direct_use(use), NoRecordedEvidence) for use in busy.values())
                              else "while a build or test run uses them")
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
@@ -4910,7 +4839,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                     if after_free < floor and push_due:
                         holders = floor_holders(busy, busy_bytes, lint_settings=lint_settings)
                         holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
-                                       for root, use in busy.items() if isinstance(use, BuildHoldTarget))
+                                       for root, protection in busy.items()
+                                       if isinstance(use := direct_use(protection), BuildHoldTarget))
                         told = send_floor_holder_messages(holders, after_free, floor, 0, lint_settings=lint_settings)
                         measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"))
@@ -4942,9 +4872,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     finally:
         try:
             if not dry_run:
-                held_targets.update(root for root, use in busy.items() if not isinstance(use, NoRecordedEvidence))
+                held_targets.update(root for root, use in busy.items()
+                                    if not isinstance(direct_use(use), NoRecordedEvidence))
                 for root in tuple(held_targets):
-                    held_targets.update(OUTPUT_ROOTS.get().roots_for(root))
+                    if not isinstance(busy.get(root), PairHeld):
+                        held_targets.update(OUTPUT_ROOTS.get().pair_roots_for(root))
                 notify_floor_problem(replace(outcome, protected=protected, held_targets=tuple(sorted(held_targets)),
                                              targets=target_search),
                                      lint_settings=lint_settings, detail=detail,

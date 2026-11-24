@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 from urllib.request import Request
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import client, decide, evaluate, experiment, questions, records, score_issues
 from scripts.issue_score import test_score_issues as run_support
@@ -107,8 +108,7 @@ class ExperimentRunTests(ConfiguredTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        _ = set_up_fixture(self.addCleanup, self.fixture)
         _ = self.enterContext(mock.patch.object(client, "spend_ledger", return_value=self.fixture.state / "spend.jsonl"))
 
     def test_experiment_is_fresh_tune_only_and_persists_projected_variants_without_poisoning_cache(self) -> None:

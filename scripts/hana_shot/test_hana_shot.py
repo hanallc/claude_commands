@@ -169,10 +169,23 @@ class Fake:
         self.drawn_by_show_registered: bool = False
         self.ray_cast_backfaces_registered: bool = False
         self.fit_moves_camera: bool = False
+        self.fit_animation_reads: int = 0
         self.camera_yaw: float = 0.0
         self.camera_pitch: float = 0.3
         self.camera_radius: float = 6.0
         self.camera_moving_reads: int = 0
+        self.pointer_moved_during_animation: bool = False
+        self.pointer_frame_stall_seconds: float = 0.0
+        self.frame_stalled_until: float = 0.0
+        self.hold_next_frame_sample: bool = False
+        self.tooltip_visibility: dict[int, list[str]] = {}
+        # Hana spawns some help only while the pointer is on its target.
+        self.tooltips_on_hover: dict[int, list[int]] = {}
+        self.hover_point: list[float] = [320.0, 180.0]
+        self.pointer_on_target: bool = False
+        self.tooltips_error_on_target: bool = False
+        self.tooltip_read_frames: list[int] = []
+        self.capture_frames: list[int] = []
         self.camera_viewport: object = None
         self.frame: int = 0
         self.screenshot: str = "ok"
@@ -211,6 +224,20 @@ class Fake:
                 self.camera_yaw = cast(float, fit["yaw"])
                 self.camera_pitch = cast(float, fit["pitch"])
                 self.camera_radius = 6.0 * (1.0 + cast(float, fit["margin"]))
+                self.camera_moving_reads = self.fit_animation_reads
+            if method == "brp_extras/move_mouse":
+                if self.camera_moving_reads:
+                    self.pointer_moved_during_animation = True
+                self.pointer_on_target = params.get("position") == self.hover_point
+                if self.pointer_on_target:
+                    for row in self.named_entities:
+                        if row["entity"] in self.tooltips_on_hover:
+                            row["components"][hana_shot.TOOLTIPS] = self.tooltips_on_hover[row["entity"]]
+                if self.pointer_frame_stall_seconds:
+                    self.frame_stalled_until = time.monotonic() + self.pointer_frame_stall_seconds
+                    self.pointer_frame_stall_seconds = 0.0
+            if method == "brp_extras/screenshot":
+                self.capture_frames.append(self.frame)
             if method == "world.mutate_components" and params.get("component") == WINDOW:
                 width, height = self.window_physical_size
                 if params.get("path") == ".resolution.physical_width":
@@ -226,7 +253,9 @@ class Fake:
                         return {"error": {"code": -32603, "message": "restore refused"}}
                     self.window_level = level
             if method == "brp_extras/get_diagnostics":
-                self.frame += 1
+                if not self.hold_next_frame_sample and time.monotonic() >= self.frame_stalled_until:
+                    self.frame += 1
+                self.hold_next_frame_sample = False
                 return {"result": {"frame_time_ms": {"current": 8.0}, "frame_count": float(self.frame)}}
         if method == "world.query":
             return {"result": query(self, params)}
@@ -238,6 +267,15 @@ class Fake:
                 (row["components"] for row in self.named_entities if row["entity"] == entity), dict[str, object](),
             )
             requested = cast(list[str], params["components"])
+            if self.tooltips_error_on_target and self.pointer_on_target and hana_shot.TOOLTIPS in requested:
+                return {"error": {"code": -32603, "message": "tooltips read failed"}}
+            if hana_shot.VISIBILITY in requested and entity in self.tooltip_visibility:
+                with self.lock:
+                    visibility = self.tooltip_visibility[cast(int, entity)]
+                    value = visibility.pop(0) if len(visibility) > 1 else visibility[0]
+                    self.tooltip_read_frames.append(self.frame)
+                    self.hold_next_frame_sample = True
+                components = {**components, hana_shot.VISIBILITY: value}
             return {"result": {
                 "components": {path: components[path] for path in requested if path in components}, "errors": {},
             }}
@@ -1570,6 +1608,184 @@ class LocateTests(HanaShotTest):
             self.assertEqual(self.fake.methods(method), [])
         self.assertFalse(self.timings.exists())
 
+    def test_hover_shot_waits_for_help_after_the_camera_settles(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        self.fake.named_entities[-1]["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        help_mesh = self.box(2001, "Help", (2.5, 2, 0), (0.5, 1, 0))
+        help_mesh["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        self.fake.named_entities.append(help_mesh)
+        for owner, visibility, error in (
+            (101, ["Hidden", "Inherited"], ""),
+            (100, ["Hidden", "Inherited"], ""),
+            (100, ["Hidden"], "did not become ready to capture within"),
+            (0, [], "has no tooltip controller"),
+        ):
+            with self.subTest(owner=owner, visibility=visibility):
+                self.fake.calls.clear()
+                self.fake.tooltip_read_frames.clear()
+                self.fake.capture_frames.clear()
+                self.fake.fit_moves_camera = True
+                self.fake.fit_animation_reads = 3
+                self.fake.camera_radius = 6.0
+                self.fake.pointer_moved_during_animation = False
+                for row in self.fake.named_entities:
+                    _ = row["components"].pop(hana_shot.TOOLTIPS, None)
+                    if row["entity"] == owner:
+                        row["components"][hana_shot.TOOLTIPS] = [2001]
+                self.fake.tooltip_visibility = {2001: list(visibility)} if visibility else {}
+                result = self.shot("--target", "name:Tool body", "--hover", "name:Tool body", "--crop", "entity")
+                captures = self.fake.methods("brp_extras/screenshot")
+                moves = self.fake.methods("brp_extras/move_mouse")
+                if error:
+                    self.assertEqual(result.returncode, 1 if owner else 2, result.stderr)
+                    self.assertIn(error, result.stderr)
+                    self.assertIn("name:Tool body", result.stderr)
+                    self.assertEqual(captures, [])
+                    if not owner:
+                        self.assertEqual(moves[-1]["position"], [320.0, 180.0])
+                        self.assertIn("within 0.5 s", result.stderr)
+                    continue
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.fake.pointer_moved_during_animation)
+                self.assertGreater(len(moves), 2)
+                start_x, start_y = cast(list[float], moves[0]["position"])
+                self.assertFalse(240 <= start_x <= 400 and 135 <= start_y <= 225)
+                self.assertEqual(moves[-1]["position"], [320.0, 180.0])
+                calls = self.fake.calls
+                move_at = max(index for index, call in enumerate(calls) if call["method"] == "brp_extras/move_mouse")
+                fit_at = next(index for index, call in enumerate(calls) if call["method"] == "world.trigger_event")
+                capture_at = next(index for index, call in enumerate(calls) if call["method"] == "brp_extras/screenshot")
+                reads = [index for index, call in enumerate(calls) if call["method"] == "world.get_components"
+                         and call["params"].get("entity") == 2001]
+                self.assertGreaterEqual(len(reads), len(visibility))
+                self.assertLess(fit_at, move_at)
+                self.assertLess(move_at, reads[0])
+                self.assertLess(reads[-1], capture_at)
+                self.assertIn("brp_extras/get_diagnostics", [call["method"] for call in calls[reads[-1] + 1:capture_at]])
+                frames = self.fake.tooltip_read_frames
+                self.assertTrue(all(after > before for before, after in zip(frames, frames[1:])))
+                [capture_frame] = self.fake.capture_frames
+                self.assertGreater(capture_frame, frames[-1])
+                [capture] = captures
+                self.assertNotIn("entity", capture)
+                rect = cast(hana_shot.RectValue, capture["rect"])
+                self.assertLessEqual(rect["x"], 480)
+                self.assertGreaterEqual(rect["x"] + rect["width"], 960)
+                self.assertLess(rect["width"], self.fake.window_physical_size[0])
+
+    def test_hover_finds_help_that_spawns_only_on_hover(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        self.fake.named_entities[-1]["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        help_mesh = self.box(2001, "Help", (2.5, 2, 0), (0.5, 1, 0))
+        help_mesh["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        self.fake.named_entities.append(help_mesh)
+        self.fake.fit_moves_camera = True
+        self.fake.tooltips_on_hover = {101: [2001]}
+        self.fake.tooltip_visibility = {2001: ["Hidden", "Inherited"]}
+
+        result = self.shot("--target", "name:Tool body", "--hover", "name:Tool body", "--crop", "entity")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.fake.calls
+        hovered_at = max(index for index, call in enumerate(calls) if call["method"] == "brp_extras/move_mouse")
+        reads = [index for index, call in enumerate(calls) if call["method"] == "world.get_components"
+                 and call["params"].get("entity") == 2001]
+        self.assertLess(hovered_at, reads[0])
+        self.assertEqual(len(reads), 2)
+        [capture] = self.fake.methods("brp_extras/screenshot")
+        rect = cast(hana_shot.RectValue, capture["rect"])
+        self.assertGreaterEqual(rect["x"] + rect["width"], 960)
+
+    def test_hover_reports_a_failed_help_read_as_it_is(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        self.fake.fit_moves_camera = True
+        self.fake.tooltips_error_on_target = True
+
+        result = self.shot("--target", "name:Tool body", "--hover", "name:Tool body")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("tooltips read failed", result.stderr)
+        self.assertNotIn("has no tooltip controller", result.stderr)
+        self.assertEqual(self.fake.methods("brp_extras/move_mouse")[-1]["position"], [320.0, 180.0])
+
+    def test_hover_shows_an_error_reply_that_comes_after_the_deadline(self) -> None:
+        self.fake.pointer_on_target = True
+        self.fake.tooltips_error_on_target = True
+        deadline = hana_shot.HoverDeadline("name:Tool body", 0.5, time.monotonic() + 0.5)
+        brp = hana_shot.Brp(self.port, hover_deadline=deadline)
+        # The deadline passes while the error reply is on its way.
+        with mock.patch.object(hana_shot.HoverDeadline, "remaining", side_effect=[0.5, deadline.expired()]):
+            with self.assertRaisesRegex(hana_shot.BrpCallError, "tooltips read failed"):
+                _ = brp.components(101, [hana_shot.TOOLTIPS])
+
+    def test_hover_deadline_stops_a_pointer_step_when_frames_stall(self) -> None:
+        _ = write_config_fixture(self.scratch / "config/hana_shot.conf", "settle_seconds=0.5\n")
+        for has_help in (True, False):
+            with self.subTest(has_help=has_help):
+                self.fake.calls.clear()
+                self.fake.tooltip_read_frames.clear()
+                if has_help:
+                    self.fake.named_entities[-1]["components"][hana_shot.TOOLTIPS] = [2001]
+                else:
+                    _ = self.fake.named_entities[-1]["components"].pop(hana_shot.TOOLTIPS, None)
+                self.fake.tooltip_visibility = {2001: ["Inherited"]}
+                # The stall from the subtest before must not reach this one's camera settle.
+                self.fake.frame_stalled_until = 0.0
+                self.fake.pointer_frame_stall_seconds = 1.0
+
+                result = self.shot("--mode", "home", "--hover", "name:Tool body")
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("help for name:Tool body did not become ready", result.stderr)
+                self.assertNotIn("has no tooltip controller", result.stderr)
+                self.assertEqual(len(self.fake.methods("brp_extras/move_mouse")), 1)
+                self.assertEqual(self.fake.tooltip_read_frames, [])
+                self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_hover_approaches_the_tooltip_owner_from_a_window_edge(self) -> None:
+        for half_width in (3.0, 7.0):
+            with self.subTest(half_width=half_width):
+                self.fake.calls.clear()
+                owner = self.box(100, "Shape", (0, 2, 0), (half_width, half_width, 0))
+                owner["components"][hana_shot.PICKABLE] = {"should_block_lower": False, "is_hoverable": False}
+                owner["components"][hana_shot.TOOLTIPS] = [2001]
+                self.fake.named_entities[0] = owner
+                self.fake.tooltip_visibility = {2001: ["Inherited"]}
+
+                result = self.shot("--mode", "home", "--hover", "name:Tool body")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                moves = self.fake.methods("brp_extras/move_mouse")
+                positions = [cast(list[float], move["position"]) for move in moves]
+                self.assertTrue(all(0 <= x < 640 and 0 <= y < 360 for x, y in positions))
+                start_x, start_y = positions[0]
+                if half_width == 3.0:
+                    self.assertFalse(160 <= start_x <= 480 and 90 <= start_y <= 270)
+                else:
+                    self.assertTrue(start_x <= 1 or start_x >= 639 or start_y <= 1 or start_y >= 359)
+
+    def test_hover_crop_keeps_the_separate_target_aabb(self) -> None:
+        crop_target = self.box(104, "Crop mesh", (2.5, 2, 0), (0.5, 0.5, 0))
+        crop_target["has"] = {hana_shot.OUTSIDE_FIT_BOUNDS: True}
+        self.fake.named_entities[-1]["components"][hana_shot.TOOLTIPS] = [2001]
+        self.fake.named_entities.extend([crop_target, self.box(2001, "Help", (-2.5, 2, 0), (0.5, 1.0, 0))])
+        self.fake.tooltip_visibility = {2001: ["Inherited"]}
+        args = ("--target", "name:Crop mesh", "--mode", "home", "--crop", "entity")
+        before = self.shot(*args)
+        self.assertEqual(before.returncode, 0, before.stderr)
+        [ordinary] = self.fake.methods("brp_extras/screenshot")
+        self.assertEqual(ordinary["entity"], 104)
+
+        hovered = self.shot(*args, "--hover", "name:Tool body")
+
+        self.assertEqual(hovered.returncode, 0, hovered.stderr)
+        _, capture = self.fake.methods("brp_extras/screenshot")
+        rect = cast(hana_shot.RectValue, capture["rect"])
+        self.assertLessEqual(rect["x"], 320)
+        self.assertGreaterEqual(rect["x"] + rect["width"], 960)
+        self.assertLess(rect["width"], self.fake.window_physical_size[0])
+
     def test_scoped_selectors_choose_the_jack_under_the_named_tool_for_locate_and_shot(self) -> None:
         self.fake.named_entities.extend([
             {"entity": 110, "components": {NAME: "Rear Shape Jack", CHILD_OF: 100}},
@@ -2327,23 +2543,24 @@ class ShotTests(HanaShotTest):
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
 
     def test_margin_help_explains_range_and_fraction(self) -> None:
+        max_margin = conf.read("hana_shot").number("max_margin")
         result = self.run_script("shot", "--help")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = " ".join(result.stdout.split())
         margin_help = help_text.split("--margin MARGIN", 2)[-1].split("--", 1)[0]
-        self.assertIn("0 to 0.45", margin_help)
+        self.assertIn(f"0 to {max_margin}", margin_help)
         self.assertRegex(margin_help.lower(), r"fraction|proportion|percent")
         self.assertRegex(margin_help.lower(), r"frame|image|viewport|screen")
 
     def test_margin_refusal_explains_range_and_viewport_fraction_before_any_brp_call(self) -> None:
-        for margin in ("-0.1", "0.46"):
+        max_margin = conf.read("hana_shot").number("max_margin")
+        for margin in ("-0.1", str(math.nextafter(max_margin, math.inf))):
             with self.subTest(margin=margin):
                 result = self.shot("--target", "name:Log", "--margin", margin)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("--margin", result.stderr)
-                self.assertIn("0", result.stderr)
-                self.assertIn("0.45", result.stderr)
+                self.assertIn(f"0 to {max_margin}", result.stderr)
                 self.assertRegex(result.stderr.lower(), r"fraction|proportion|percent")
                 self.assertIn("viewport", result.stderr.lower())
                 self.assertIn("each side", result.stderr.lower())

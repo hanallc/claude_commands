@@ -18,6 +18,7 @@ from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, style_s
 from scripts.style.style_config import (
     ParentUnitRoute, StyleConfigError, StyleRepositoryConfig, StyleShowrunnerRoute, StyleUnitAssignment,
 )
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ class StyleConfigTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.doc = self.repo / "production.md"
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}))
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN}))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.git("init", "-q", "--initial-branch=cargo-liner-style")
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",

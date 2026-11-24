@@ -28,6 +28,7 @@ import unittest
 from unittest import mock
 from urllib.request import Request
 
+from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_protocol, hana_render
 from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
@@ -130,9 +131,7 @@ class HanaRunnerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.fixture = source_tests.HanaSourceTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = set_up_fixture(self.addCleanup, source_tests.HanaSourceTests())
         _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
                                  'loopback.command_timeout_s=600\n')
         self.root = self.fixture.root
@@ -274,7 +273,7 @@ class HanaRunnerTests(unittest.TestCase):
             self.assertEqual(supervisor.outcome(directory), outcome)
 
     def test_command_exit_drains_output_while_a_descendant_holds_both_pipes(self) -> None:
-        slot = build_slots.Slot(self.root, self.root, 'hana', 1, {})
+        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
         read_fd, write_fd = os.pipe()
         with os.fdopen(read_fd, 'rb'), os.fdopen(write_fd, 'wb'):
             script = '''
@@ -301,7 +300,7 @@ raise SystemExit(13)
             self.assertTrue(ready, 'The command did not exit')
 
     def test_command_exit_wins_when_the_runner_resumes_after_its_deadline(self) -> None:
-        slot = build_slots.Slot(self.root, self.root, 'hana', 1, {})
+        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
         execution = linux_runner.LeasedSlotExecution(slot, ())
         command = [sys.executable, '-c', 'import sys; sys.stdin.buffer.read(1); print("done"); sys.exit(13)']
         clock = 1000.0
@@ -324,7 +323,7 @@ raise SystemExit(13)
         self.assertEqual((result.status, result.stdout, result.stderr), (13, b'done\n', b''))
 
     def test_command_exit_reads_only_pending_bytes_from_pipes_with_a_continuous_writer(self) -> None:
-        slot = build_slots.Slot(self.root, self.root, 'hana', 1, {})
+        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
         read_fd, write_fd = os.pipe()
         ready_read, ready_write = os.pipe()
         script = '''
@@ -393,7 +392,7 @@ raise SystemExit(13)
                          (13, payload + b'compiler output\n', b'compiler diagnostic\n'))
 
     def test_command_deadline_leaves_a_live_command_for_the_unit_to_stop(self) -> None:
-        slot = build_slots.Slot(self.root, self.root, 'hana', 1, {})
+        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
         execution = linux_runner.LeasedSlotExecution(slot, ())
         script = '''
 import os, sys

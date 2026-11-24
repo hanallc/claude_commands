@@ -28,8 +28,8 @@ The relay can forward one SendMessage call. It runs sonnet in auto mode (haiku c
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
 removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
-SendMessage tool result in the relay's stream, never from what the model says;
-the last stream per recipient stays in STATE/relay/<to>.jsonl.
+SendMessage tool result in the relay's stream, never from what the model says.
+Relays without the fallback token save the last stream in STATE/relay/<to>.jsonl.
 Staff `worker:` paths deliver through observed panes or their holders.
 Other `codex:` addresses use a reported herdr pane or the shared Codex daemon.
 An absent staff recipient keeps its queue without selecting a session family.
@@ -88,7 +88,8 @@ message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   RETRY: why     keyed delivery in progress; retry later        exit 6
   SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
-                 an emergency push with the key is still live
+                 an emergency push with the key is still live,
+                 or a mac.locked push for a Mac that is off on purpose
   PENDING: why   an earlier send has not confirmed acceptance     exit 5
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
@@ -148,7 +149,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Te
 
 from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
-from scripts.herdr import herdr_types
+from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.production import session_staff, staff, unit_lookup, unit_names
 from scripts.lib import conf, models_registry, process_start
@@ -174,9 +175,11 @@ from scripts.message import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
     from scripts.message import roster
     from scripts.accounts import accounts
+    from scripts.mac_test.mac_test import AskingSession, NoAskingSession
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import push_reference
+from scripts.whoami import mac_fallback_token, token_expiry
 from scripts.message import rca  # noqa: E402
 from scripts.message import repeat_guard  # noqa: E402
 from scripts.notify import review  # noqa: E402
@@ -215,6 +218,10 @@ PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\bcodex_credit_account
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
                      + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
                      + PAID_CREDITS_QUEUED_CALL)
+# A Mac that the user turned off is not locked: mac_test.machine_off_on_purpose stops this push.
+# The session that holds the Mac block still pushes.
+# A sent push also stops when the user turns the Mac off: see mac_locked_check.
+MAC_LOCKED_TEXT = "mac.locked"
 NEEDS_GO_TEXT = "session.needs_go"
 NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
                  + ' --value session=<session> --value machine=<machine> --value "go=<the Go: line to type>"'
@@ -325,6 +332,7 @@ class RelayMismatch(TypedDict):
     to: str | None
     to_truncated: bool
     text_difference: NotRequired[RelayTextDifference]
+    summary_changed: NotRequired[bool]
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -773,6 +781,13 @@ class Result(NamedTuple):
     detail: str
     failure: FailureText = NO_FAILED_PUSH
     receiver: str = ""
+
+
+class RepeatGuardHeld(Result):
+    """The repeat guard took responsibility for the owner notice."""
+
+
+REPEAT_GUARD_REPORT = "SEND_HOLD: repeat-guard"
 
 
 class PaneTextDelivered(Result):
@@ -3429,21 +3444,22 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
             return None, "", ""
 
 
+# The relay guard replaces this text with the approved message, so the model never types the message.
+RELAY_MESSAGE_STAND_IN = "approved text"
+
+
 def relay_prompt(message: Message) -> str:
     lines = [
         "You are a relay that delivers one message. Make exactly one SendMessage call:",
         f"- to: {json.dumps(message.to)}",
         f"- summary: {json.dumps(quote_sender_lines(message.summary))}",
-        "- message: the text between the BEGIN and END lines below, copied exactly. Keep every character, space, "
-        + "line break, backtick and placeholder as written. Add nothing, drop nothing, reword nothing. Leave out "
-        + "the BEGIN and END lines.",
+        f"- message: {json.dumps(RELAY_MESSAGE_STAND_IN)}",
     ]
     if not message.to.startswith("uds:"):
         lines.append("If that call fails because the name matched no session or more than one, call ListAgents once, "
                      + f"then make the call once more with `to` set to the row whose name is exactly "
                      + f"{json.dumps(message.to)}, followed by its [ref]. If no row has that name, stop.")
-    lines += ["Then stop: reply with one line, the SendMessage result. Call no other tool.",
-              "----- BEGIN MESSAGE -----", agent_text(message, via_relay=True), "----- END MESSAGE -----"]
+    lines.append("Then stop: reply with one line, the SendMessage result. Call no other tool.")
     return "\n".join(lines)
 
 
@@ -3508,10 +3524,13 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
-def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
+def _log_relay_mismatch(target: object, sent: object, *, summary_changed: bool) -> None:
+    approved = RELAY_MESSAGE_STAND_IN
     target_limit = 256
     record = RelayMismatch(time=now().isoformat(), to=target[:target_limit] if isinstance(target, str) else None,
                            to_truncated=len(as_str(target)) > target_limit)
+    if summary_changed:
+        record["summary_changed"] = True
     if sent != approved:
         sent_text = as_str(sent)
         first = next((index for index, (before, after) in enumerate(zip(approved, sent_text)) if before != after),
@@ -3525,9 +3544,9 @@ def _log_relay_mismatch(target: object, sent: object, approved: str) -> None:
         print(f"message relay mismatch log: {error}", file=sys.stderr)
 
 
-def read_relay(observed: RelayTransportResponse, text: str, *,
+def read_relay(observed: RelayTransportResponse, text: str, *, summary: str | None = None,
                review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
-    """Check the approved call, its result, and the proxy forward together."""
+    """Check the proxy write and the result for the approved tool ID."""
     events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     sends = [part for event in events if event.get("type") == "assistant"
              for value in as_list(as_dict(event.get("message")).get("content"))
@@ -3535,8 +3554,9 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
     for call in sends:
         inputs = as_dict(call.get("input"))
         target, sent = inputs.get("to"), inputs.get("message")
-        if target != observed.target or sent != text:
-            _log_relay_mismatch(target, sent, text)
+        summary_changed = summary is not None and inputs.get("summary") != summary
+        if target != observed.target or sent != RELAY_MESSAGE_STAND_IN or summary_changed:
+            _log_relay_mismatch(target, sent, summary_changed=summary_changed)
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
@@ -3557,12 +3577,15 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
             return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
         call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
-    if inputs.get("to") != observed.target or inputs.get("message") != text:
+    changed = (inputs.get("to") != observed.target or inputs.get("message") != RELAY_MESSAGE_STAND_IN
+               or (summary is not None and inputs.get("summary") != summary))
+    tool_id = as_str(call.get("id"))
+    approved_forward = forward == RelayRequestForwarded(tool_id, text)
+    if changed and not approved_forward:
         reason = "SendMessage used a different target or payload"
         if isinstance(forward, RelayRequestNotForwarded):
             return RefusedRelayRequest("refused", reason)
         return _unaccepted_relay(forward, reason)
-    tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
                if (part := as_dict(value)).get("type") == "tool_result" and part.get("tool_use_id") == tool_id]
@@ -3571,15 +3594,17 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
     result = results[0]
     answer = result_text(result.get("content"))
     success = as_dict(loads(answer)).get("success")
-    if review_delivery and success is False and forward == RelayRequestForwarded(tool_id, text):
+    if review_delivery and success is False and approved_forward:
         return Result("failed", describe(answer) or "SendMessage rejected the message")
     if result.get("is_error") is True or success is not True:
         rejected = result.get("is_error") is True or success is False
         return _unaccepted_relay(forward, describe(answer) or "SendMessage did not confirm success",
                                  queue_if_unsent=rejected)
-    if forward != RelayRequestForwarded(tool_id, text):
+    if not approved_forward:
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
     detail = f"mode {mode}; verbatim; {describe(answer)}"
+    if changed:
+        detail += "; guard set the approved input"
     if len(sends) > 1:
         detail += f"; forwarded 1 of {len(sends)} SendMessage calls"
     return CheckedRelayAcceptance(tool_id, detail)
@@ -3623,11 +3648,16 @@ try:
     event = json.load(sys.stdin)
     inputs = event["tool_input"]
     tool_id = event["tool_use_id"]
-    if (event["tool_name"] != "SendMessage" or not isinstance(tool_id, str) or not tool_id
-            or any(inputs.get(key) != value for key, value in required.items())):
+    if event["tool_name"] != "SendMessage" or not isinstance(tool_id, str) or not tool_id:
         raise ValueError("unexpected SendMessage input")
+    output = json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": {**inputs, **required},
+    }})
     with Path(sys.argv[2]).open("x") as approval:
         approval.write(tool_id)
+    print(output)
 except Exception:
     sys.exit(2)
 """
@@ -4177,6 +4207,23 @@ def _bound_relay(message: Message, timeout: float, command: list[str], env: dict
         return _unaccepted_relay(write.state, f"cannot relay through the checked socket: {error}")
 
 
+def _relay_token_login(observed: RelayTransportResponse) -> mac_fallback_token.RelayLogin:
+    from scripts.whoami.mac_fallback_token import RelayLogin
+
+    events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
+    for event in events:
+        if event.get("type") == "assistant" and event.get("error") == "authentication_failed":
+            return RelayLogin.FAILED
+        if event.get("type") == "result" and event.get("is_error") is True:
+            message = as_str(event.get("result")).casefold()
+            if message.startswith(("login expired", "login reached its time limit", "api error: 401")):
+                return RelayLogin.FAILED
+    if any(event.get("type") == "assistant" and not event.get("error")
+           and as_list(as_dict(event.get("message")).get("content")) for event in events):
+        return RelayLogin.GOOD
+    return RelayLogin.UNCONFIRMED
+
+
 def relay(message: Message, timeout: float) -> Result:
     attempt = message.claude_attempt
     if not isinstance(attempt, ClaudeDeliveryAttempt):
@@ -4206,15 +4253,11 @@ def relay(message: Message, timeout: float) -> Result:
                "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
-    token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
     try:
-        if token_file.exists():
-            token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
-                                   capture_output=True, text=True, timeout=10, check=False)
-            if token.returncode != 0:
-                return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
+        token_made = mac_fallback_token.prepare_child(env)
         relay_env = models_registry.agent_environment(env)
+    except mac_fallback_token.TokenDecryptFailed:
+        return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return Result("failed", f"cannot prepare the relay: {error}")
     command = [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
@@ -4226,29 +4269,65 @@ def relay(message: Message, timeout: float) -> Result:
     if isinstance(observed, Result):
         return observed
     code, out, err = observed.code, observed.stdout, observed.stderr
-    try:
-        raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
-        raw.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(raw, out + err)
-    except OSError as error:
-        print(f"message relay log: {error}", file=sys.stderr)
-    result = read_relay(observed, agent_text(message, via_relay=True), review_delivery=message.review_delivery)
+    if isinstance(token_made, datetime):
+        login = _relay_token_login(observed)
+        try:
+            mac_fallback_token.record_relay(token_made, login, datetime.now(timezone.utc))
+        except (OSError, ValueError):
+            print("message relay: could not save the Mac token result", file=sys.stderr)
+    else:
+        try:
+            raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(raw, out + err)
+        except OSError as error:
+            print(f"message relay log: {error}", file=sys.stderr)
+    result = read_relay(observed, agent_text(message, via_relay=True), summary=quote_sender_lines(message.summary),
+                        review_delivery=message.review_delivery)
     if isinstance(result, CheckedRelayAcceptance):
+        if isinstance(token_made, datetime):
+            return Result("sent", "the relay confirmed delivery")
         return Result("sent", result.detail)
     if code is None:
         if isinstance(observed.forward, RelayRequestForwarded) and not isinstance(result, UncertainRelayDelivery):
-            return result
+            return (result._replace(detail="the relay did not confirm delivery")
+                    if isinstance(token_made, datetime) else result)
         return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
+    if isinstance(token_made, datetime):
+        return result._replace(detail="the relay did not confirm delivery")
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
 
 
+def _unique_message_owner(conversation: str, registry: sessions.RegistryRead, candidates: list[sessions.SessionRecord]
+                          ) -> _message_proof.MessageOwnerProof:
+    generations = {(row["pid"], row.get("procStart", "")) for row in candidates}
+    if registry.unreadable or len(generations) != 1:
+        return _message_proof.StrictOwnerProof.REQUIRED
+    pid, started = next(iter(generations))
+    if not started:
+        return _message_proof.StrictOwnerProof.REQUIRED
+    for entry in registry.entries:
+        row = entry.record
+        if row["sessionId"] != conversation:
+            continue
+        other_pid, other_started = row["pid"], row.get("procStart", "")
+        if (other_pid, other_started) == (pid, started):
+            continue
+        if not other_started or not isinstance(
+                sessions.process_liveness(other_pid, other_started), sessions.SessionNotLive):
+            return _message_proof.StrictOwnerProof.REQUIRED
+    return _message_proof.ProvedMessageOwner(conversation=conversation, pid=pid, start=started)
+
+
 def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: sessions.RegistryRead,
                           records: list[sessions.SessionRecord]) -> RelayPlan:
     conversation = conversation_recipient(mailbox).conversation
-    checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
     candidates = [record for record in records if record["sessionId"] == conversation]
+    message_owner = _unique_message_owner(conversation, registry, candidates)
+    with _message_proof.message_lookup(message_owner):
+        checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
     if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
         try:
             _ = staff.native_id(conversation)
@@ -4380,6 +4459,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
          reference: push_reference.PushReference = push_reference.NO_REFERENCE, remote_forward: bool = False,
          silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE, user_asked: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
+    if text_id in token_expiry.ALERT_IDS and not push_texts.approval_date(text_id):
+        return Result("refused", "the token alert template needs current approval")
     key = ["--key", message.key] if message.key else []
     selected_priority = decision_priority.priority(need, due)
     command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
@@ -4563,6 +4644,10 @@ def remote(message: Message, host: str, options: Options) -> Result:
     command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
+    error_lines = err.splitlines()
+    repeat_guard_held = REPEAT_GUARD_REPORT in error_lines
+    if repeat_guard_held:
+        err = "\n".join(line for line in error_lines if line != REPEAT_GUARD_REPORT)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
@@ -4579,6 +4664,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
+    if parsed.outcome == "held" and repeat_guard_held:
+        return RepeatGuardHeld("held", f"on {host}: {detail}", failure, receiver)
     return Result(parsed.outcome, f"on {host}: {detail}", failure, receiver)
 
 
@@ -4671,12 +4758,30 @@ def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
     return f"auto-mode:{session}:{hashlib.sha256(joined.encode()).hexdigest()[:12]}"
 
 
+def template_values(options: Options) -> dict[str, str]:
+    """The --value key=value pairs of a template push, by key."""
+    return {key: item for key, _, item in (value.partition("=") for value in options.values)}
+
+
+def mac_locked_check(asking: AskingSession | NoAskingSession, clears_when: str) -> str:
+    """The clear check that a mac.locked push stores.
+
+    It passes when the user turns the Mac off, or when the caller's check passes.
+    """
+    from scripts.mac_test import mac_test
+
+    scripts = Path(__file__).resolve().parents[1]
+    named = [f"--asking={asking.name}"] if isinstance(asking, mac_test.AskingSession) else []
+    off = shlex.join([str(scripts / "lib/py"), str(scripts / "mac_test/mac_test.py"), "off-on-purpose", *named])
+    return f"{off} || {shlex.join(['/bin/sh', '-c', clears_when])}"
+
+
 def reviewed_waits(options: Options) -> Options:
     """Review the waits sentence within the configured budget.
 
     Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
     """
-    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    values = template_values(options)
     if not values.get("waits_line") or review.switched_off():
         return options
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
@@ -4720,7 +4825,7 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 def refusal_report(options: Options) -> rca.Report:
     """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
-    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    values = template_values(options)
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
                       waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
                       key=options.key or "")
@@ -5486,7 +5591,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     elif isinstance(claim_result, RepeatPending):
         new_message_result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
-        new_message_result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
+        new_message_result = RepeatGuardHeld("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif review_error:
         new_message_result = Result("failed", review_error)
     elif isinstance(review_route, review_hold.AlreadyKeptForReview):
@@ -5497,10 +5602,14 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         except OSError as error:
             new_message_result = Result("failed", f"review hold for {destination}: {error}")
         else:
-            new_message_result = Result("kept", f"{options.to} is in a review; delivered at its end")
+            new_message_result = Result("kept", f"{options.to} is in a review; held in "
+                                        + f"{review_hold.held_file(review_session)}, delivered at its end")
 
     def review_transport(batch: review_hold.ReleasedMessages, *, batch_only: bool) -> Message:
-        body = review_hold.render(batch.held if batch_only else batch.messages)
+        """Write the held part to the held messages file; the body names the file."""
+        body = review_hold.file_release(review_session, batch, now().timestamp(), batch_only=batch_only)
+        if not batch_only and isinstance(batch.new_message, review_hold.ReviewMessage):
+            body += "\n\n" + review_hold.numbered_entries((batch.new_message,))
         return replace(message, summary="Messages from the review", text=body, review_batch=True,
                        key=None if batch_only else message.key, urgent=message.urgent and not batch_only)
 
@@ -5660,14 +5769,29 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             batch.accepted_at = now().timestamp()
 
     batch_only = new_message_result is not None
-    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages:
-        result = deliver(review_transport(review_route, batch_only=batch_only), batch_only=batch_only)
+    # With nothing to file (the urgent message replaced every held message), the new message goes plain.
+    if (isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages
+            and (batch_only or review_route.to_file)):
+        try:
+            transport = review_transport(review_route, batch_only=batch_only)
+        except OSError as error:
+            # The release failed, so its messages stay held and the new message fails with it.
+            # A same-key held copy then cannot arrive after the new copy.
+            failure = f"review hold for {destination}: {error}"
+            if new_message_result is None:
+                result = Result("failed", failure)
+            else:
+                print(failure, file=sys.stderr)
+                result = new_message_result
+        else:
+            result = deliver(transport, batch_only=batch_only)
+            confirm_review_delivery(review_route, result)
     elif new_message_result is not None:
         result = new_message_result
     else:
         result = deliver(message)
-    if isinstance(review_route, review_hold.ReleasedMessages):
-        confirm_review_delivery(review_route, result)
+        if isinstance(review_route, review_hold.ReleasedMessages):
+            confirm_review_delivery(review_route, result)
     if new_message_result is not None:
         result = new_message_result
     if result.outcome == "sent" and message.key is not None:
@@ -5841,10 +5965,24 @@ def main(argv: list[str]) -> int:
             if options.to == USER and os.environ.get(PROBE_ENV) == "1":
                 print("not sent: probe sessions never push to the phone")
                 return 0
+            # The host that delivers the push asks; a --machine forward asks again there with --here.
+            if (options.to == USER and options.text_id == MAC_LOCKED_TEXT
+                    and not isinstance(options.scope, NamedMachine)):
+                from scripts.mac_test import mac_test
+                sender = template_values(options).get("sender")
+                asking = mac_test.AskingSession(sender) if sender else mac_test.NO_ASKING_SESSION
+                mac_use = mac_test.machine_off_on_purpose("mac", asking)
+                if isinstance(mac_use, mac_test.OffOnPurpose):
+                    print(f"SKIPPED: the Mac is off on purpose ({mac_use.reason})")
+                    return EXIT["skipped"]
+                if options.clears_when:
+                    options = options._replace(clears_when=mac_locked_check(asking, options.clears_when))
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
             print(f"{outcome.upper()}: {result.detail}")
+            if options.report_recipient and isinstance(result, RepeatGuardHeld):
+                print(REPEAT_GUARD_REPORT, file=sys.stderr)
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):

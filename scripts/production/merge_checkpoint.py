@@ -28,13 +28,14 @@ from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
-from scripts.lib import build_folders
+from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
@@ -184,8 +185,7 @@ def end_pushed_worktrees(production: ProductionDocument) -> None:
 
 @contextmanager
 def merge_lock(checkout: Path, name: str) -> Generator[None]:
-    """Held for a whole merge gate. A unit rename takes it before it writes the merge branch, so
-    neither lands a commit inside the other's run."""
+    """Hold the lock for checkpoint integration and unit renames."""
     common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common.returncode:
         raise OSError(f"{checkout}: no git directory for the merge lock: {common.stderr.strip()}")
@@ -193,7 +193,7 @@ def merge_lock(checkout: Path, name: str) -> Generator[None]:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"merge lock: waiting — a merge gate or a unit rename is writing {name}'s merge branch", flush=True)
+            print(f"merge lock: waiting — another operation holds {name}'s checkpoint lock", flush=True)
             fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -298,8 +298,8 @@ def worktree_in_repo(row: staff.StaffRow, main_checkout: Path) -> bool:
     if not isinstance(location, staff.PresentWorktree) or location.machine != remote.local_machine():
         return False
     try:
-        return worktrees.main_checkout(location.path) == main_checkout
-    except worktrees.Refused:
+        return worktree_records.main_checkout(location.path) == main_checkout
+    except worktree_records.Refused:
         return False
 
 
@@ -336,8 +336,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     selected = next((row for row in rows if row.name == unit_names.name(name)), None)
     selected = selected if selected is not None else unit_lookup.unit_row(name, record)
     try:
-        main_checkout = worktrees.main_checkout(production.checkout)
-    except worktrees.Refused as error:
+        main_checkout = worktree_records.main_checkout(production.checkout)
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     parent_production: Production | StaffParentIsDestination = StaffParentIsDestination()
     if selected.parent != staff.ReportsTo(production.owner.id):
@@ -446,26 +446,45 @@ def merged(request: MergeRequest) -> bool:
                request.production.merge_branch).returncode == 0
 
 
-def ancestry(request: MergeRequest) -> CheckpointOrigin:
+def check_closing_ancestry(request: MergeRequest) -> None:
     checkout = request.production.checkout
+    run_git = partial(git, checkout)
+    _ = good(run_git("fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
+    main_tip = good(run_git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"), "ancestry")
+    closing = good(run_git("rev-list", "--first-parent", "--no-merges", "-n", "1", request.commit), "ancestry")
+    unmerged = good(run_git("rev-list", "--reverse", "--topo-order", "--no-merges",
+                            "--no-commit-header", "--format=%H %P",
+                            f"{request.production.merge_branch}..{request.commit}", f"^{main_tip}"), "ancestry")
+    candidates = [line.split() for line in unmerged.splitlines()]
+    pending = [row for row in candidates if row[0] != closing]
+    if not pending:
+        return
+    commit = pending[0][0]
+    try:
+        target = git_merge_tree.prepare_target(run_git, main_tip)
+        for commit, *parents in pending:
+            if not parents or not git_merge_tree.leaves_target_unchanged(
+                    run_git, commit, target, merge_base=parents[0]):
+                break
+        else:
+            return
+    except OSError as error:
+        raise checkpoint_gate.Stop("ancestry", "failed", f"{commit} against origin/main ({main_tip}): {error}",
+                                   "the showrunner will inspect the failed command") from error
+    subject = good(run_git("show", "-s", "--format=%s", commit), "ancestry")
+    kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
+    raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {commit[:12]}: {subject}",
+                               f"wait for {commit[:12]} to merge, then resend the {kind}")
+
+
+def ancestry(request: MergeRequest) -> CheckpointOrigin:
     origin_branch = on_origin(request)
     if origin_branch is None:
         raise checkpoint_gate.Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = merged(request)
     if not isinstance(request.kind, CodeCheckpoint):
-        _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
-        closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
-                           request.commit), "ancestry")
-        unmerged = good(git(checkout, "rev-list", "--reverse", "--topo-order", "--no-merges",
-                            f"{request.production.merge_branch}..{request.commit}", "^origin/main"), "ancestry").splitlines()
-        pending = [commit for commit in unmerged if commit != closing]
-        if pending:
-            first = pending[0]
-            subject = good(git(checkout, "show", "-s", "--format=%s", first), "ancestry")
-            kind = "shrink" if isinstance(request.kind, ShrinkCommit) else "as-built"
-            raise checkpoint_gate.Stop("ancestry", "held", f"unmerged commit {first[:12]}: {subject}",
-                                       f"wait for {first[:12]} to merge, then resend the {kind}")
+        check_closing_ancestry(request)
     checkpoint_gate.report("ancestry", "ok", f"checkpoint exists and is on {origin_branch}" +
            ("; already merged" if already else ""))
     return CheckpointOrigin(origin_branch.removeprefix("origin/"), already)
@@ -661,6 +680,19 @@ def checkpoint_plan(request: MergeRequest) -> Path:
     return configured_path.with_name(match[1] + ".md") if match else configured_path
 
 
+def _shrink_leaves_main_unchanged(request: MergeRequest) -> bool:
+    run_git = partial(git, request.production.checkout)
+    _, *parents = good(run_git("rev-list", "--parents", "-n", "1", request.commit), "scope").split()
+    if not parents:
+        return False
+    try:
+        return git_merge_tree.leaves_target_unchanged(
+            run_git, request.commit, "refs/remotes/origin/main", merge_base=parents[0])
+    except OSError as error:
+        raise checkpoint_gate.Stop("scope", "failed", f"{request.commit} against origin/main: {error}",
+                                   "the showrunner will inspect the failed command") from error
+
+
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")
     if staged:
@@ -673,7 +705,7 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
         plan = checkpoint_plan(request).as_posix()
         next_items = str(Path(plan).with_name(Path(plan).stem + "-next.md"))
         unexpected = [path for path in paths if path not in (plan, next_items)]
-        if unexpected or plan not in paths:
+        if unexpected or (plan not in paths and (paths or not _shrink_leaves_main_unchanged(request))):
             raise checkpoint_gate.Stop("scope", "held", f"shrink paths must be {plan} and optional {next_items}; got {', '.join(paths)}",
                        "commit only the plan doc and its next-items file, then resend the shrink")
     elif isinstance(request.kind, AsBuiltCommit):
@@ -1455,7 +1487,7 @@ def _external_merge_wait(arguments: list[str]) -> Generator[None, None, None]:
                 finished = subprocess.run([*recorder, "finish-external-wait", "--wait-id", wait_id],
                                           capture_output=True, text=True, check=False)
                 if finished.returncode:
-                    checkpoint_gate.report("wait", "NotRecorded", finished.stderr.strip() or "cannot close merge gate wait")
+                    checkpoint_gate.report("wait", "NotRecorded", finished.stderr.strip() or "cannot close the gate wait")
             except OSError as error:
                 checkpoint_gate.report("wait", "NotRecorded", str(error))
 
@@ -2042,14 +2074,19 @@ def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNot
     return checkpoint_gate.TREE_CHANGED_STATUS if stop.state == "cancelled" else 1
 
 
-def batch_stop_notices(requests: tuple[MergeRequest, ...], stop: checkpoint_gate.Stop) -> Iterable[BatchStopNotice]:
+def batch_stop_notices(requests: tuple[MergeRequest, ...], stop: checkpoint_gate.Stop,
+                       *, held_at: int | None = None) -> Iterable[BatchStopNotice]:
     if isinstance(stop, BatchRed):
         yield from stop.notices
         return
-    for request in requests:
+    for index, request in enumerate(requests):
         label = f"phase {request.phase} ({request.commit[:12]})"
         detail = stop.detail
-        if isinstance(stop, MainConflict):
+        if held_at is not None and index > held_at:
+            held = requests[held_at]
+            detail = f"Not run because {held.unit.name} phase {held.phase} ({held.commit[:12]}) was held."
+            message = detail
+        elif isinstance(stop, MainConflict):
             message = f"{detail}; check your checkpoint against origin/main, resolve any conflict, and resend it"
         else:
             message = f"{detail}; {stop.message}"
@@ -2138,7 +2175,8 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], log: Path,
         stop = error if isinstance(error, checkpoint_gate.Stop) else checkpoint_gate.Stop(
             "run", "failed", str(error), "the showrunner will inspect the failed command")
         rollback = KEEP_BATCH_CHECKOUT if publication_started else batch_checkout
-        return finish_batch_stop(stop, batch_stop_notices(requests, stop), rollback)
+        held_at = len(items) if stop.state == "held" and len(items) < len(requests) else None
+        return finish_batch_stop(stop, batch_stop_notices(requests, stop, held_at=held_at), rollback)
 
 
 def checkpoint_completed(request: MergeRequest, upstream: str) -> bool:

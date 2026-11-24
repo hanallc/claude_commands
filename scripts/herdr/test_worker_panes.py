@@ -26,6 +26,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import ANY, patch
 from weakref import finalize
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import fake_unit_host, staff, worker_admission
 from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
@@ -42,6 +43,7 @@ from scripts.whoami import agent_accounts
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.direct import progress_history
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 
@@ -90,7 +92,7 @@ class PaneWorld(herdr.Herdr):
     """A private pane server supplies process facts to the real shared scan."""
 
     def __init__(self) -> None:
-        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+        with patch.dict(os.environ, {"HERDR_BIN": MISSING_HERDR_BIN}):
             super().__init__("agents")
         self.process_directory = TemporaryDirectory(prefix="pane-world-proc-")
         self.process_cleanup = finalize(self, self.process_directory.cleanup)
@@ -138,9 +140,9 @@ class PaneWorld(herdr.Herdr):
                           + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
                           + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
         write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
-        write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
+        _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
-        write_text_atomic(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
+        _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
@@ -148,11 +150,11 @@ class PaneWorld(herdr.Herdr):
             "HERDR_PROC": str(test.root / "proc"), "HERDR_PLATFORM": "linux",
             "HERDR_PANE_RECORD_DIR": str(test.root / "pane-records"),
             "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),
-            "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
+            "HERDR_BIN": MISSING_HERDR_BIN, "TMPDIR": str(test.root),
             "UNIT_RUN_DIR": str(test.root / "run"), "ROSTER_RUN_ROOT": str(test.root),
             "SHUTDOWN_STATE_DIR": str(test.root / "shutdown"),
         })))
-        _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
+        _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value=MISSING_HERDR_BIN))
         _ = test.enterContext(patch.object(herdr, "Herdr", return_value=self))
         _ = test.enterContext(patch.object(herdr, "native_process", side_effect=self.native_process))
         _ = test.enterContext(patch.object(herdr, "_startup_processes", side_effect=self.descendants))
@@ -550,7 +552,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_fake_pane_server_does_not_need_herdr_on_path(self) -> None:
         with patch.dict(os.environ, {"HERDR_BIN": ""}), patch.object(shutil, "which", return_value=None):
             world = PaneWorld()
-        self.assertEqual(world.binary, "/nonexistent/herdr")
+        self.assertEqual(world.binary, MISSING_HERDR_BIN)
 
     @property
     def parent(self) -> staff.StaffRow:
