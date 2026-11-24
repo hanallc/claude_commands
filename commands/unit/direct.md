@@ -255,8 +255,14 @@ The closed list:
 - **blocked** — a hard stop this command defines: a structural check that blocks
   checkpoint, a refused tool call, a launch failure that survived
   <WorkerLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
-  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (read the send rule in `send.py --help`),
-  and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
+  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s.
+  Read the send rule in `send.py --help`.
+  If you have no showrunner, have the item's producer open the Go ask with
+  `the_list.py ask LN --kind go --target "<staff id>" --what "<change>" --why "<reason>"`.
+  Then send `send.py --to user --text-id session.needs_go
+  --value "session=<session>" --value "item=N"`.
+  Use the number in place of `N`.
+  If the item has several Go boxes, add `--value "ask=<ask id>"`.
   An update to an earlier user push on the same subject reuses that push's `--key`,
   so silence keeps only the newest. A `--need blocked` push with a live earlier one
   on its key is skipped: first `send.py retire --to user --from <sender> --key <key>`.

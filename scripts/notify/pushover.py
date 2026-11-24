@@ -44,6 +44,7 @@ except FileNotFoundError:
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -51,6 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -61,10 +63,11 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
-from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID
+from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID, NEEDS_GO_ASK, NEEDS_GO_TEXT
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
-                         NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
+                         NotificationSession, NO_SESSION_LINE, split_session, session_prefix, typed_texts)
+from scripts.production import staff, the_list
 from scripts.whoami import token_expiry
 
 API_URL = "https://api.pushover.net/1/messages.json"
@@ -218,6 +221,7 @@ def log(source: str, priority: str, title: str, message: str, outcome: str, *,
 
 
 class Arguments(TypedDict):
+    go_ask: NotRequired[GoAskReference]
     silence_policy: silence.SilencePolicy
     user_asked: bool
     reference: push_reference.PushReference
@@ -236,6 +240,72 @@ class Arguments(TypedDict):
     due: str
 
 
+@dataclass(frozen=True)
+class GoAskReference:
+    item: str
+    ask_id: str
+
+    def detail(self) -> str:
+        """Name the exact ask in the kept push and delivery log."""
+        return f"List Go L{self.item}/{self.ask_id}"
+
+
+class GoPushRefused(ValueError):
+    """The List cannot supply a Go action for this push."""
+
+
+class GoListReadFailed(OSError):
+    """The List or its staff record cannot be read."""
+
+
+def validate_needs_go_values(values: dict[str, str]) -> None:
+    required = {"item", "session"}
+    missing = required - values.keys()
+    extra = values.keys() - required - {"ask"}
+    if missing or extra:
+        raise GoPushRefused(f"{NEEDS_GO_TEXT} takes session, item and optional ask. Missing {sorted(missing)}. Extra {sorted(extra)}.")
+    if not re.fullmatch(r"[1-9][0-9]*", values["item"]):
+        raise GoPushRefused(f"{NEEDS_GO_TEXT} needs a positive List item number in --value item")
+    if "ask" in values and not the_list.ASK_ID.fullmatch(values["ask"]):
+        raise GoPushRefused(f"{NEEDS_GO_TEXT} needs a List ask ID such as A1 in --value ask")
+    session = values["session"]
+    if not session.strip() or session.splitlines() != [session]:
+        raise GoPushRefused(f"{NEEDS_GO_TEXT} needs one nonempty line in --value session")
+
+
+def _answerable_go_asks(item: str) -> tuple[the_list.Ask, ...]:
+    try:
+        members = staff.snapshot()
+        keeper = the_list.producer_id(members, "morty")
+    except (OSError, ValueError) as error:
+        raise GoListReadFailed(f"Cannot find the List record for L{item}: {error}") from error
+    path = the_list.folder(keeper) / f"L{item}.md"
+    try:
+        record = the_list.load(keeper, f"L{item}")
+    except (OSError, ValueError) as error:
+        raise GoListReadFailed(f"Cannot read List record {path}: {error}") from error
+    return tuple(ask for ask in the_list.answerable_asks(record, members) if ask.kind == the_list.AskKind.GO)
+
+
+def _resolve_go_ask(values: dict[str, str]) -> tuple[GoAskReference, str]:
+    validate_needs_go_values({key: value for key, value in values.items() if key != "sender"})
+    item, requested = values["item"], values.get("ask")
+    asks = _answerable_go_asks(item)
+    if not asks:
+        raise GoPushRefused(f"List item {item} has no open Go ask that shows a box. Open the ask first with "
+                            + NEEDS_GO_ASK.format(item=item))
+    if requested is None and len(asks) != 1:
+        ids = ", ".join(ask.ask_id for ask in asks)
+        raise GoPushRefused(f"List item {item} has several Go boxes. Select one with --value ask=<ask id>. Available IDs: {ids}")
+    ask = asks[0] if requested is None else next((ask for ask in asks if ask.ask_id == requested), None)
+    if ask is None:
+        raise GoPushRefused(f"List item {item} has no open Go box for ask {requested}")
+    what = " ".join(ask.what.split())
+    if extra_actions := typed_texts(what):
+        raise GoPushRefused(f'{NEEDS_GO_TEXT} gives a second action: the Go ask says to type "{extra_actions[0]}"')
+    return GoAskReference(item, ask.ask_id), what
+
+
 def parse(argv: list[str]) -> Arguments | None:
     """Parse options without exiting, so callers get send()'s usage status."""
     priority = "0"
@@ -250,6 +320,7 @@ def parse(argv: list[str]) -> Arguments | None:
     answerable = False
     text_id = ""
     push_key = ""
+    go_ask: GoAskReference | None = None
     values: dict[str, str] = {}
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
@@ -325,6 +396,10 @@ def parse(argv: list[str]) -> Arguments | None:
     need = "blocked" if priority == "2" else "decision" if priority == "1" or due else "note"
     positionals = argv[index:]
     if text_id:
+        if text_id == NEEDS_GO_TEXT:
+            go_ask, what = _resolve_go_ask(values)
+            _ = values.pop("ask", None)
+            values["what"] = what
         try:
             rendered = push_texts.render(text_id, **values)
         except ValueError:
@@ -352,7 +427,7 @@ def parse(argv: list[str]) -> Arguments | None:
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
-    return {
+    arguments: Arguments = {
         "silence_policy": silence_policy,
         "user_asked": user_asked,
         "reference": reference,
@@ -370,6 +445,9 @@ def parse(argv: list[str]) -> Arguments | None:
         "text_id": text_id,
         "header": header,
     }
+    if go_ask is not None:
+        arguments["go_ask"] = go_ask
+    return arguments
 
 
 def trimmed_body(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE,
@@ -395,7 +473,13 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if "--text-id" not in argv:
         print("pushover: " + push_texts.TEMPLATE_REQUIRED, file=sys.stderr)
         return 2
-    arguments = parse(argv)
+    if silence.on_mac() and any(left == "--text-id" and right == NEEDS_GO_TEXT for left, right in zip(argv, argv[1:])):
+        return via_natedev(argv, "", ask_natedev, source=parent_source(), priority="", title=NEEDS_GO_TEXT, message="")
+    try:
+        arguments = parse(argv)
+    except (GoPushRefused, GoListReadFailed) as error:
+        print(f"pushover: {REFUSED_BEFORE_SENDING}: {error}", file=sys.stderr)
+        return 2
     if arguments is None:
         print(USAGE, file=sys.stderr)
         return 2
@@ -475,6 +559,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     send_anyway = rejected and not template_required and (priority == "2" or registered_text)
     if send_anyway:
         detail = "sent despite failed review: " + ", ".join(outcome.failed_rules if isinstance(outcome, (review.Failed, review.Withheld)) else [])
+    if go_ask := arguments.get("go_ask"):
+        detail = ", ".join(part for part in (go_ask.detail(), detail) if part)
     record: ReviewedPushRecord = {**review.message_record(version), "reviewed": not isinstance(outcome, review.Unreviewed)}
     if arguments["text_id"]:
         record["text_id"] = arguments["text_id"]
@@ -620,6 +706,20 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         from scripts.production import review_regime
         if review_regime.acknowledged():
             reason = "report acknowledged"
+    if push["text_id"] == NEEDS_GO_TEXT:
+        go_ask = re.match(r"List Go L([1-9][0-9]*)/(A[1-9][0-9]*)(?:, |$)", push["detail"])
+        if go_ask is None:
+            reason = "Go ask ID missing"
+        else:
+            item, ask_id = go_ask[1], go_ask[2]
+            try:
+                asks = _answerable_go_asks(item)
+            except GoListReadFailed as error:
+                log(push["source"], push["priority"], push["title"], push["message"], str(error),
+                    key=push["key"], template=push["text_id"], reference=reference)
+                return 1
+            if not any(ask.ask_id == ask_id for ask in asks):
+                reason = f"Go ask L{item}/{ask_id} closed or unavailable"
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
@@ -721,6 +821,9 @@ def main(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         push = silence.parse_push(sys.stdin.read())
         if push is None:
             print("pushover: deliver reads one push as JSON on stdin", file=sys.stderr)
+            return 2
+        if push["text_id"] == NEEDS_GO_TEXT:
+            print(f"pushover: {REFUSED_BEFORE_SENDING}: Send {NEEDS_GO_TEXT} with the List item number.", file=sys.stderr)
             return 2
         return deliver_here(push, keys_file, post)
     return cancel(argv[1:], keys_file, post) if argv[:1] == ["cancel"] else send(argv, keys_file, post)

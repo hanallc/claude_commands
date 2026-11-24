@@ -56,14 +56,14 @@ from scripts.message import repeat_guard
 from scripts.message.relay_identity import publish_relay_identity, relay_session_name
 from scripts.message.relay_test_support import write_relay_record
 from scripts.lib import conf, names, process_start, models_registry
-from scripts.production import fake_unit_host, session_staff, staff, stall_watch, unit_lookup
+from scripts.production import fake_unit_host, session_staff, staff, stall_watch, the_list, unit_lookup
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
 from scripts.message.recipient_test_support import staff_child_command
 from scripts.lib.test_names import fixture_names
 from scripts.message import rca
 
-from scripts.notify import review
+from scripts.notify import pushover, review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.message import postmaster
@@ -7176,11 +7176,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_a_registered_value_that_gives_a_second_action_is_refused(self) -> None:
         self.writer_session()
-        arguments = self.needs_go_arguments(does="removes it; then type /resume in the cargo-liner session")
+        arguments = ["--to", "user", "--text-id", "alert.decision", "--value", "sender=writer",
+                     "--value", "title=Trunk waits", "--value", "action=Choose the next step in the trunk pane",
+                     "--value", "body=Then type /resume in the cargo-liner session"]
         with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
             _ = send.parse(arguments)
-        self.assertIn('session.needs_go gives a second action: the body says to type "/resume"', errors.getvalue())
+        self.assertIn('alert.decision gives a second action: the body says to type "/resume"', errors.getvalue())
         self.assertIn("the body names the cargo-liner pane or session", errors.getvalue())
+        item = self.needs_go_item()
+        _ = self.add_needs_go_ask(item, what="Check the files. Then type /resume in the cargo-liner session")
+        with (mock.patch.object(pushover, "http_post", side_effect=AssertionError("posted")) as post,
+              mock.patch.object(send, "run", side_effect=self.go_channel(post)), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(registered_main(["--here", *self.needs_go_arguments()]), 2)
+        self.assertIn('session.needs_go gives a second action: the Go ask says to type "/resume"', output.getvalue())
+        post.assert_not_called()
 
     def test_only_auto_mode_takes_a_repeated_command_value(self) -> None:
         for arguments in (["--to", "user", "--text-id", "nate.adhoc", "--value", "command=a", "--value", "command=b"],
@@ -7229,39 +7238,83 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                       + "With other work to run, go on with it and leave out --need blocked.", output.getvalue())
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
         self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
-        self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
+        self.assertIn("session.needs_go: a session waits for a Go on a List item.", output.getvalue())
+        self.assertIn('the_list.py ask "L<item number>" --kind go', output.getvalue())
+        self.assertIn('--text-id session.needs_go --value "session=<session>" --value "item=<item number>"', output.getvalue())
+        self.assertIn("Then send session.needs_go with the List item number.", output.getvalue())
         self.assertIn("permission.rca_started: a unit starts to fix the cause of a permission stop or refusal. Sent by"
                       + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
         self.assertIn("permission.rca_fixed: the fix merged; that permission does not stop or refuse the session again."
                       + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
-        values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
-                  "why": "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.",
-                  "does": "removes it from step 130, and trunk goes on"} | changed
+        values = {"session": "trunk", "item": "412"} | changed
         return ["--to", "user", "--text-id", "session.needs_go",
                 *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def needs_go_item(self) -> the_list.ListItem:
+        keeper = staff.StaffId("morty-fixed")
+        self.staff_rows[keeper] = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")})))
+        return the_list.add(keeper, "Check the phase files", owner=the_list.UnassignedOwner.NATE, source="morty",
+                            changes={}, number=412)
+
+    def add_needs_go_ask(self, item: the_list.ListItem, *, what: str = "remove arrange_jacks/ from phases/130/files; 140 owns it",
+                         kind: the_list.AskKind = the_list.AskKind.GO, target: str = "recipient") -> the_list.Ask:
+        return the_list.add_ask(item.producer, item.id, kind=kind, target=staff.StaffId(target), what=what,
+                                why="The phases share a folder.", config=False, requester=item.producer, source="morty")
+
+    def go_channel(self, post: pushover.Post) -> Callable[[list[str], str, float], tuple[int, str, str]]:
+        """Run the same Pushover entry point as the sender subprocess."""
+        def channel(command: list[str], _text: str, _timeout: float) -> tuple[int, str, str]:
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                status = pushover.send(command[2:], self.root / "no-push-keys", post)
+            return status, output.getvalue(), errors.getvalue()
+        return channel
 
     def test_needs_go_template_takes_its_sender_from_this_session(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
         options = local_options(self.needs_go_arguments())
-        self.assertEqual(options.summary, "natedev: trunk waits for your go")
+        self.assertEqual(options.summary, "trunk waits for your go")
         self.assertEqual(options.sender, "natedev")
         self.assertEqual(options.need, "decision")
-        self.assertEqual(options.action, ActionRequired(
-            "On natedev, in the trunk pane, type: Go: remove arrange_jacks/ from phases/130/files; 140 owns it"))
-        # The template gives why its period: a period in the value is not doubled.
-        self.assertEqual(options.text, "Session: trunk\n"
-                         + "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.\n"
-                         + "Your go removes it from step 130, and trunk goes on.")
+        self.assertEqual(options.action, ActionRequired("Press Go on List item 412:"))
+        self.assertEqual(options.text, "Session: trunk\n")
+        item = self.needs_go_item()
+        post = mock.Mock(side_effect=AssertionError("posted"))
+        item_path = the_list.folder(item.producer) / f"{item.id}.md"
+        for case, expected, recovery in (
+            ("no ask", "List item 412 has no open Go ask that shows a box", True),
+            ("approval", "List item 412 has no open Go ask that shows a box", True),
+            ("target missing", "List item 412 has no open Go ask that shows a box", True),
+            ("read failed", f"Cannot read List record {item_path}: access denied", False),
+        ):
+            if case == "approval":
+                _ = self.add_needs_go_ask(item, kind=the_list.AskKind.APPROVAL)
+            elif case == "target missing":
+                _ = self.add_needs_go_ask(item, target="removed-target")
+            with (self.subTest(case=case), mock.patch.object(send, "run", side_effect=self.go_channel(post)),
+                  mock.patch.object(the_list, "load", wraps=the_list.load) as read,
+                  redirect_stdout(io.StringIO()) as output):
+                if case == "read failed":
+                    read.side_effect = PermissionError("access denied")
+                self.assertEqual(registered_main(["--here", *self.needs_go_arguments()]), 2)
+                self.assertTrue(output.getvalue().startswith("REFUSED: "))
+                self.assertIn(expected, output.getvalue())
+                self.assertEqual('the_list.py ask "L412" --kind go' in output.getvalue(), recovery)
+                post.assert_not_called()
+        _ = self.add_needs_go_ask(item)
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
         self.assertEqual(command[command.index("--text-id") + 1], "session.needs_go")
         self.assertIn("sender=natedev", command)
+        self.assertIn("item=412", command)
+        self.assertFalse(any(value.startswith("what=") for value in command))
         for arguments in (self.needs_go_arguments("--value", "sender=someone"), self.needs_go_arguments("--from", "someone"),
-                          self.needs_go_arguments("--machine", "mac"), self.needs_go_arguments(colour="red")):
+                          self.needs_go_arguments("--machine", "mac"), self.needs_go_arguments(colour="red"),
+                          self.needs_go_arguments(item="L412"), self.needs_go_arguments(what="Archive the logs")):
             with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 _ = send.parse(arguments)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
@@ -7272,17 +7325,25 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.writer_session()
         for title, text, action in (("trunk waits", "Steps 130 and 140 clash.", "In the trunk pane, type: Go: remove arrange_jacks/"),
                                     ("trunk stopped", "It does no work until you type the go.", "Answer in the trunk pane"),
-                                    ("trunk waits for your go", "Steps 130 and 140 clash.", "Answer in the trunk pane")):
+                                    ("trunk waits for your go", "Steps 130 and 140 clash.", "Answer in the trunk pane"),
+                                    ("trunk waits", "Steps 130 and 140 clash.", "Press Go on List item 412"),
+                                    ("trunk waits", "Steps 130 and 140 clash.", "Tap Go on List item 412"),
+                                    ("trunk waits", "Steps 130 and 140 clash.", "Click Go on List item 412"),
+                                    ("trunk waits", "Steps 130 and 140 clash.", "Press the Go button on List item 412")):
             with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
                   redirect_stdout(io.StringIO()) as output):
                 code = registered_main(["--here", "--to", "user", "--summary", title, "--need", "decision",
                                   "--action", action, "--key", "go", "--repeat-minutes", "30", "--text", text])
             self.assertEqual(code, 4)
-            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push asks the user to type a go."))
-            self.assertIn("--text-id session.needs_go --value session=<session> --value machine=<machine>", output.getvalue())
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push asks for a Go."))
+            self.assertIn('Open the ask first with ', output.getvalue())
+            self.assertIn('the_list.py ask "L<item number>" --kind go', output.getvalue())
+            self.assertIn('--text-id session.needs_go --value "session=<session>" --value "item=<item number>"', output.getvalue())
             self.assertFalse(self.failure_marker().exists())
             self.assertEqual(self.log()[-1]["outcome"], "held")
         # The hold claims no repeat window: the resend with the template goes out.
+        item = self.needs_go_item()
+        _ = self.add_needs_go_ask(item)
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
             self.assertEqual(send.send(local_options([*self.needs_go_arguments(), "--key", "go", "--repeat-minutes", "30"])).outcome,
                              "sent")

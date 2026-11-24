@@ -653,6 +653,8 @@ Closing a prerequisite preserves its dependents' conditions.
 Closed and removed records remain on disk with their time, closing words, and log.
 The `.next-number` record in morty's List folder stores the next number.
 The sequence is per machine, and the List's machine is the one source.
+The List for Go pushes is on natedev.
+The Mac forwards the Go push request before natedev reads the item and selects the ask.
 If the counter is missing, the allocator reads the record names and the migration log in all existing List folders.
 This scan includes invalid and Closed records and the migration entries for removed records.
 The first number is one more than the highest recorded number.

@@ -1256,8 +1256,8 @@ class LocalReviewTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(review.main(["show", "session.needs_go"]), 0)
         shown = output.getvalue()
-        self.assertIn("Title: {sender}: {session} waits for your go\nSession: {session}\n", shown)
-        self.assertIn("Example (typical):\nTitle: natedev: trunk waits for your go\nSession: trunk\n", shown)
+        self.assertIn("Title: {session} waits for your go\nSession: {session}\n", shown)
+        self.assertIn("Example (typical):\nTitle: trunk waits for your go\nSession: trunk\n", shown)
         self.assertNotIn("{", shown.split("Example (typical):")[1])
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(review.main(["show", "no.such"]), 1)

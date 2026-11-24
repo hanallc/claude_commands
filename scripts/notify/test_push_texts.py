@@ -478,12 +478,17 @@ class PushTextTests(unittest.TestCase):
     def test_needs_go_keeps_the_user_approved_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "session.needs_go")
         self.assertEqual(entry.need, "decision")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "natedev: trunk waits for your go")
-        self.assertEqual(push.message, "Session: trunk\n"
-                         + "Action: On natedev, in the trunk pane, type: Go: remove arrange_jacks/ from phases/130/files; 140 owns it\n"
-                         + "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.\n"
-                         + "Your go removes it from step 130, and trunk goes on.")
+        for example, title, message in (
+            ("typical", "trunk waits for your go", "Session: trunk\n"
+             + "Action: Press Go on List item 412: remove arrange_jacks/ from phases/130/files; 140 owns it\n"),
+            ("delete_worktree", "herdr waits for your go", "Session: herdr\n"
+             + "Action: Press Go on List item 413: delete the herdr-panes worktree and its branch\n"),
+        ):
+            with self.subTest(example=example):
+                values = next(case.values for case in entry.examples if case.name == example)
+                push = push_texts.render_entry(entry, values)
+                self.assertEqual(push.title, title)
+                self.assertEqual(push.message, message)
 
     def test_header_is_fingerprinted_and_cannot_hide_an_action_or_session(self) -> None:
         entry = replace(self.entry(), action=push_texts.NoActionNeeded())
