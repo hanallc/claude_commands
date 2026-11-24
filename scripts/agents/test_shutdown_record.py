@@ -16,6 +16,7 @@ from unittest.mock import patch
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.agents import shutdown_record
+from scripts.lib import conf
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
@@ -29,6 +30,16 @@ class ShutdownRecordTests(ShutdownTestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "HERDR_BIN": MISSING_HERDR_BIN})))
+
+    def test_a_missing_record_lock_key_fails_and_names_the_key_and_path(self) -> None:
+        config = self.root / "config"
+        config.mkdir()
+        source = config / "shutdown.conf"
+        _ = source.write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n")
+        with patch.dict(os.environ, {"CONF_DIR": str(config)}), self.assertRaises(conf.Unusable) as caught:
+            _ = shutdown_record.record_lock_seconds()
+        self.assertEqual(str(caught.exception),
+                         f"{source}: RESTART_RECORD_LOCK_SECONDS is missing; add it to {source}")
 
     def test_shutdown_rerun_after_first_worker_stop(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")

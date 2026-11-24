@@ -66,6 +66,7 @@ def scratch_accounts_config() -> Generator[Path]:
             + "login_renewal_interval_minutes=60\noutage_claim_lease_seconds=900\n"
             + "nixos_repository_root=/etc/nixos\nnotes_directory=~/rust/hanadocs/agents\nhome_nixos_repository_root=~/nixos\n")
         write_credit_accounts(config / "accounts.conf", TEST_CREDIT_ACCOUNTS)
+        _ = write_config_fixture(config / "machines.conf")
         clear_notes_directory_cache()
         try:
             with patch.dict(os.environ, {"CONF_DIR": str(config)}):

@@ -712,6 +712,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture'):
             (self.repo / folder).mkdir(parents=True)
         _ = shutil.copyfile(config / 'build_folders.conf', self.repo / 'config/build_folders.conf')
+        _ = write_config_fixture(self.repo / 'config/copies.conf')
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()
@@ -924,10 +925,10 @@ fi
         result = self.route()
         self.assertIsInstance(result, str)
         self.assertIn(key, str(result))
-        self.assertIn('key is missing', str(result))
+        self.assertIn(f'{key} is missing; add it to {self.registry}', str(result))
         self.assert_guest_clean()
 
-    def test_unreachable_wait_uses_the_committed_value_when_the_key_is_missing(self) -> None:
+    def test_unreachable_wait_refuses_a_missing_key_even_with_a_committed_value(self) -> None:
         registry = self.repo / 'config/build_targets.conf'
         original = self.registry.read_text().replace(
             'settings.mac-linux=mac_linux.conf', f"settings.mac-linux={self.registry.with_name('mac_linux.conf')}")
@@ -936,8 +937,8 @@ fi
         _ = self.git('commit', '-qm', 'Add the target registry')
         key = target_config.UNREACHABLE_WAIT_KEY
         _ = registry.write_text(original.replace(f'{key}=20\n', ''))
-        settings = mac_linux.read_settings(conf.read(registry))
-        self.assertEqual(settings.unreachable_wait_seconds, 20)
+        with self.assertRaisesRegex(conf.Unusable, f'{key} is missing; add it to '):
+            _ = mac_linux.read_settings(conf.read(registry))
 
     def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
         key = target_config.UNREACHABLE_WAIT_KEY

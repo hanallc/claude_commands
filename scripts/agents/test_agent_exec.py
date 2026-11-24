@@ -17,7 +17,7 @@ from typing import TypedDict, cast, override
 import unittest
 from unittest.mock import patch
 
-from scripts.lib import models_registry
+from scripts.lib import conf, models_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 from scripts.production.staff_test_support import (
@@ -169,10 +169,10 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.home / "notes"
         notes.mkdir()
+        config = conf.copy_for_test(SCRIPTS.parent / "config", self.home / "config")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "AGENT_NOTES_DIR": str(notes), "STAFF_FILE": str(self.home / "staff.json"),
-            "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
-            "CONF_DIR": str(SCRIPTS.parent / "config"),
+            "STAFF_CONFIG": str(config / "staff.conf"), "CONF_DIR": str(config),
             **source_environment(self.home / "sources")}, clear=True)))
         _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")

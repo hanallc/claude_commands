@@ -789,7 +789,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "free\nno block\nCI's Mac switch: unknown (network unavailable)\n",
         )
 
-    def test_missing_configuration_recovers_history_and_refuses_without_it(self) -> None:
+    def test_missing_configuration_fails_although_history_holds_it(self) -> None:
         commit_config_fixture(self.config_path)
         for missing_file in (False, True):
             with self.subTest(missing_file=missing_file):
@@ -798,12 +798,11 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                     self.config_path.unlink()
                 else:
                     self.write_config(ci_repo=None)
-                errors = io.StringIO()
-                with mock.patch.dict(os.environ, self.environment), redirect_stderr(errors):
-                    config = mac_test.read_config()
-                self.assertEqual(config.ci_repo, "hanallc/hana")
-                self.assertIn("warning:", errors.getvalue())
-                self.assertIn(str(self.config_path), errors.getvalue())
+                with (mock.patch.dict(os.environ, self.environment), redirect_stderr(io.StringIO()),
+                      self.assertRaises(conf.Unusable) as caught):
+                    _ = mac_test.read_config()
+                self.assertIn(str(self.config_path), str(caught.exception))
+                self.assertIn("is missing", str(caught.exception))
         empty = self.root / "no-history"
         empty.mkdir()
         with mock.patch.dict(os.environ, {"CONF_DIR": str(empty)}), redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):

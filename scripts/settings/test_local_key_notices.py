@@ -13,6 +13,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.settings import local_key_notices as notices
+from scripts.lib import conf
 from scripts.message import session_send
 
 
@@ -28,9 +29,9 @@ class LocalKeyNoticeTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = (config / "send.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+            conf.test_config_path("send").read_text())
         for name in ("postmaster", "codex_daemon"):
-            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
+            source = conf.test_config_path(name)
             _ = (config / source.name).write_text(source.read_text())
         _ = (config / "settings.conf").write_text("local_key_notice_to=fixture-destination\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(config),

@@ -28,7 +28,7 @@ from scripts.worktree import worktrees
 from scripts.production import showrunners
 from scripts.production import production_doc
 
-from scripts.lib import build_folders, main_publish, scratch
+from scripts.lib import build_folders, conf, main_publish, scratch
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -121,10 +121,9 @@ class CheckpointTestFolderTests(unittest.TestCase):
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
     def test_successful_push_lists_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
-        checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
-        _ = config.write_text((checkout / "config/staff.conf").read_text())
+        _ = config.write_text(conf.test_config_path("staff").read_text())
         self.env.update({"WORKTREES_STATE_DIR": str(records), "STAFF_CONFIG": str(config)})
         _ = self.git("remote", "set-head", "origin", "production")
         checkpoint = self.checkpoint()

@@ -131,6 +131,13 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         self.models_config_file = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(self.models_config_file)
+        accounts = self.models_config_file.with_name("accounts.json")
+        _ = accounts.write_text('{"workers": ""}\n', encoding="utf-8")
+        self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root),
+            "CONF_DIR": str(self.config_file.parent),
+            "MODELS_CONFIG_FILE": str(self.models_config_file),
+        }))
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -348,12 +355,11 @@ from unittest.mock import patch
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct import progress_history
 from scripts.direct import pass_record as pass_recorder
-from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
           pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+          {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
 plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
@@ -392,7 +398,7 @@ for number in (1, 2):
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
                 pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+                {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
 '''

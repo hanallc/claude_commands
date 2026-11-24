@@ -241,7 +241,7 @@ class WorkerResumeTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         _ = write_registry(case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
         atomic_file.write_text_atomic(case.fixture.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+            conf.test_config_path("shutdown").read_text())
         opened = case.opened()
         _ = progress_history.begin_dispatch(case.run_dir, slot=opened.row.name, phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
@@ -3220,7 +3220,7 @@ class StopResumeTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
         atomic_file.write_text_atomic(case.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+            conf.test_config_path("shutdown").read_text())
         owner = case.worker("selected-native")
         foreign = replace(owner, id=staff.StaffId("foreign-native"),
                           current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))

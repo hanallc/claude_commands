@@ -18,7 +18,7 @@ from scripts.direct import simplify_daily
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -91,7 +91,7 @@ class DailySimplifyTests(NixFixture):
         with patch.dict(os.environ, self.env):
             write_claude_account("claude1", "unit@example.invalid", 100,
                                  datetime.now(timezone.utc) + timedelta(days=30))
-        registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
+        registry = write_registry(self.root / "models.conf", base_text=conf.test_config_path("models").read_text())
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
         self.env.update(private_slot_config(self.root, repository="origin").environment)

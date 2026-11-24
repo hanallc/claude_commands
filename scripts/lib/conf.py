@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Read live configuration, complete missing default values, and recover invalid values from Git."""
+"""Read live configuration, refuse missing keys and files, and recover invalid values from Git."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 from threading import Lock
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypeVar, override
 
 from scripts.lib import conf_reads
 
@@ -145,9 +145,31 @@ class UnavailableValue:
     """The reason explains why no usable configuration value is available."""
     reason: str
 
+    def unrecovered(self) -> str:
+        """Give the reason after the committed history gave no usable value."""
+        return f"{self.reason}; no usable committed value"
+
+
+@dataclass(frozen=True)
+class MissingValue(UnavailableValue):
+    """The live file or key is missing, so no recovery applies."""
+
+    @override
+    def unrecovered(self) -> str:
+        """Give the reason alone, because no recovery applies to a missing value."""
+        return self.reason
+
 
 class _MissingKey(ValueError):
     """The file has no effective entry for the requested key."""
+
+
+def _missing_key(source: Path, key: str) -> str:
+    return f"{source}: {key} is missing; add it to {source}"
+
+
+def _missing_file(source: Path) -> str:
+    return f"{source}: the file does not exist; add it with its keys"
 
 
 @dataclass(frozen=True)
@@ -167,17 +189,15 @@ class UseConfiguredValue(Enum):
 class ConfigRead:
     """Keep one live file read for the settings used in one pass."""
 
-    file: str | Path
     source: Path
     settings: dict[str, Setting] | _UnreadableFile
-    repository_allowed: bool
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
                  recover_invalid: bool = True, use_file_limits: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
-        bad = "<missing>"
+        bad = "<unreadable>"
 
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
@@ -194,26 +214,19 @@ class ConfigRead:
                 return convert(""), setting.value
             return _converted(setting, convert), setting.value
 
-        repository_allowed = False
         try:
             if isinstance(self.settings, _UnreadableFile):
-                repository_allowed = self.settings.missing
+                if self.settings.missing:
+                    return MissingValue(f"{_missing_key(self.source, key)}; the file does not exist")
                 raise ValueError(self.settings.reason)
             value, _ = read_key(self.settings)
             return UsableLiveValue(value)
+        except _MissingKey:
+            return MissingValue(_missing_key(self.source, key))
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
-            repository_allowed = repository_allowed or isinstance(error, _MissingKey)
             reason = f"{self.source}: {key}={bad!r}: {error}"
-        if not recover_invalid and not repository_allowed:
+        if not recover_invalid:
             return UnavailableValue(reason)
-        if repository_allowed and self.repository_allowed and isinstance(self.file, str):
-            repository = _repository_path(self.file)
-            if repository != self.source:
-                try:
-                    value, _ = read_key(_parse(repository.read_text(encoding="utf-8")))
-                    return RecoveredValue(value, reason)
-                except (OSError, UnicodeError, ValueError, ArithmeticError):
-                    pass
         if warn:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
@@ -252,7 +265,7 @@ class ConfigRead:
         result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
                                recover_invalid=recover_invalid)
         if isinstance(result, UnavailableValue):
-            raise Unusable(f"{result.reason}; no usable committed value" if recover_invalid else result.reason)
+            raise Unusable(result.unrecovered() if recover_invalid else result.reason)
         return result.value
 
     def text(self, key: str, *, recover_invalid: bool = True) -> str:
@@ -302,11 +315,8 @@ class ConfigRead:
         return result
 
     def _recover_file(self, fault: _UnreadableFile) -> dict[str, Setting]:
-        if fault.missing and self.repository_allowed and isinstance(self.file, str):
-            try:
-                return _parse(_repository_path(self.file).read_text(encoding="utf-8"))
-            except (OSError, UnicodeError):
-                pass
+        if fault.missing:
+            raise Unusable(_missing_file(self.source))
         for contents in _committed_files(self.source):
             _warning(f"warning: {self.source}: keys: {fault.reason}")
             return _parse(contents)
@@ -337,7 +347,6 @@ def read_bytes(source: Path) -> ConfigurationBytes:
 def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:
     """Read and parse the live file once; resolve faults when a setting is used."""
     source = path(file)
-    repository_allowed = "CONF_DIR" not in os.environ
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
     try:
         if load is not None:
@@ -353,16 +362,46 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
         else:
             contents = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)),
-                          repository_allowed, stamp)
-    return ConfigRead(file, source, _parse(contents), repository_allowed, stamp)
+        return ConfigRead(source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)), stamp)
+    return ConfigRead(source, _parse(contents), stamp)
 
 
 def read_or_repository(stem: str) -> ConfigRead:
-    """Use the repository file when the fixture has no copy."""
+    """Use the test-owned file when the fixture has no copy."""
     if "CONF_DIR" in os.environ and not path(stem).exists():
-        return read(_repository_path(stem))
+        return read(test_config_path(stem))
     return read(stem)
+
+
+_TEST_CONFIG = Path(__file__).resolve().parents[2] / "test_config"
+
+
+def test_config_path(stem: str) -> Path:
+    """Return the test-owned copy of a repository config file. /tune never changes it."""
+    return _TEST_CONFIG / f"{stem}.conf"
+
+
+def copy_for_test(source: Path, destination: Path) -> Path:
+    """Copy a checkout config folder for a test and keep its links.
+
+    Each top-level .conf file takes the values of its test-owned twin.
+    A file or link that the destination already holds stays.
+    """
+    import shutil
+
+    def present(folder: str, names: list[str]) -> set[str]:
+        target = destination / Path(folder).relative_to(source)
+        return {name for name in names if os.path.lexists(target / name) and not os.path.isdir(target / name)}
+
+    def copy(path: str, target: str) -> str:
+        file = Path(path)
+        owned = test_config_path(file.stem) if file.parent == source and file.suffix == ".conf" else file
+        return shutil.copyfile(owned if owned.is_file() else file, target)
+
+    # A new destination holds nothing to keep, so it skips the per-entry check.
+    keep = present if destination.exists() else None
+    return Path(shutil.copytree(source, destination, symlinks=True, ignore=keep, copy_function=copy,
+                                dirs_exist_ok=True))
 
 
 def directory() -> Path:
@@ -377,12 +416,6 @@ def path(file: str | Path) -> Path:
     if not file or Path(file).name != file or file.endswith(".conf"):
         raise Unusable(f"{file}: file: expected a configuration stem")
     return directory() / f"{file}.conf"
-
-
-def _repository_path(stem: str) -> Path:
-    """Return the repository configuration file for a validated stem."""
-    conf_reads.record(stem)
-    return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
 
 
 def _parse(source: str) -> dict[str, Setting]:
@@ -528,7 +561,7 @@ def known_host_names() -> frozenset[str]:
     try:
         machines = _parse(source.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        machines = _parse(_repository_path("machines").read_text(encoding="utf-8"))
+        raise Unusable(_missing_file(source)) from None
     aliases = machines.get("aliases")
     hosts = {_local_host_name().casefold()}
     if aliases is not None:

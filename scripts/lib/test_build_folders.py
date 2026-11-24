@@ -2275,7 +2275,7 @@ assert not loaded, loaded
         self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
             if source.name != ADMISSION_CONFIG_FIXTURE.name:
-                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
+                self.assertEqual((config.parent / source.name).read_bytes(), conf.test_config_path(source.stem).read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -2303,19 +2303,11 @@ assert not loaded, loaded
         self.assertNotEqual(folders.repository_key(first), folders.repository_key(second))
         self.assertEqual(folders.repository_key(first), folders.repository_key(alias))
 
-    def test_private_config_without_folder_rules_uses_repository_without_git(self) -> None:
+    def test_private_config_without_folder_rules_uses_the_test_owned_file_without_git(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         original = config.read_text()
-        fallback = self.root / "fallback/build_folders.conf"
-        _ = write_config_fixture(fallback, "prefixes.verify-hold=verify-hold.{owner}.\n", template="build_folders")
         config.unlink()
-        original_path = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
-
-        def repository_path(stem: str) -> Path:
-            return fallback if stem == "build_folders" else original_path(stem)
-
-        with (mock.patch.object(conf, "_repository_path", side_effect=repository_path),
-              mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run"))):
+        with mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run")):
             self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
             path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
         self.assertTrue(path.is_dir())
@@ -2325,7 +2317,7 @@ assert not loaded, loaded
         self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "private.{owner}.")
 
     def test_folder_rules_keep_the_live_config_reader_without_a_private_override(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
+        settings = conf.read(conf.test_config_path("build_folders"))
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("CONF_DIR", None)
             with mock.patch.object(conf, "read", return_value=settings) as read:

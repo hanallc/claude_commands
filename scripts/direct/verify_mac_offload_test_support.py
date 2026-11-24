@@ -1187,8 +1187,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         claude = self.home / ".claude"
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
-        _ = copy_helpers(self.home, *VERIFY_HELPERS)
-        _ = shutil.copytree(VERIFY.parent.parent.parent / "config", claude / "config")
+        _ = copy_helpers(self.home, *VERIFY_HELPERS, "config")
         log = scripts / "buildlog"
         # Keep the recorder's import interface while the command records fixture observations.
         record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()

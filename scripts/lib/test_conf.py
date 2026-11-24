@@ -1,4 +1,4 @@
-"""Configuration reads at use, validates limits, and recovers from git history."""
+"""Configuration reads at use, validates limits, refuses missing keys, and recovers invalid values from git history."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -31,15 +31,6 @@ class ConfTests(unittest.TestCase):
         self.directory = self.root / "config"
         self.directory.mkdir()
         self.path = self.directory / "example.conf"
-        repository = self.root / "repository-config"
-        _ = write_config_fixture(repository / "accounts.conf",
-                                 "usage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
-        original = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
-
-        def repository_path(stem: str) -> Path:
-            return repository / "accounts.conf" if stem == "accounts" else original(stem)
-
-        _ = self.enterContext(mock.patch.object(conf, "_repository_path", side_effect=repository_path))
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.directory), "HOME": str(self.root / "home"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -81,7 +72,6 @@ from scripts.lib import conf, conf_reads
 conf.path('example')
 conf_reads.read_text(Path(os.environ['CONF_DIR']) / 'example.conf')
 conf.path(Path(os.environ['CONF_DIR']) / 'example.conf')
-conf._repository_path('example')
 conf.read('example').text('value')
 os.environ['CONF_READ_LOG'] = os.environ['CONF_READ_LOG'] + '.other'
 conf.read_or_repository('example').text('value')
@@ -186,23 +176,22 @@ conf_reads.record('disabled')
             self.fail("The invalid live setting must identify history recovery")
         self.assertEqual(origin.value, 8)
 
-    def test_missing_file_defers_recovery_until_a_setting_is_used(self) -> None:
+    def test_missing_file_fails_at_use_and_never_reads_history(self) -> None:
         self.history()
         self.commit("# whole: 1..10\ncount=3\n")
         self.path.unlink()
         warning = io.StringIO()
         with redirect_stderr(warning), mock.patch.object(
-            conf, "_git", side_effect=AssertionError("History must be read at use"),
+            conf, "_git", side_effect=AssertionError("A missing file must not read history"),
         ):
             settings = conf.read(self.path)
+            with self.assertRaises(conf.Unusable) as caught:
+                _ = settings.whole("count")
+            with self.assertRaises(conf.Unusable):
+                _ = settings.value("count", int, default=4)
+        self.assertEqual(str(caught.exception),
+                         f"{self.path}: count is missing; add it to {self.path}; the file does not exist")
         self.assertEqual(warning.getvalue(), "")
-        self.commit("# whole: 1..10\ncount=8\n")
-        self.write("# whole: 1..10\ncount=9\n")
-        with redirect_stderr(warning):
-            self.assertEqual(settings.whole("count"), 8)
-        self.assertEqual(len(warning.getvalue().splitlines()), 1)
-        self.assertIn(str(self.path), warning.getvalue())
-        self.assertIn("count", warning.getvalue())
 
     def test_values_and_origin_share_the_live_read_with_host_overrides(self) -> None:
         self.write("[settings]\nlabel=first\nlabel=duplicate\nlabel.testhost=local\noptional=\n"
@@ -326,17 +315,27 @@ conf_reads.record('disabled')
         self.write("# whole: ..\ncount=11\n")
         self.assertEqual(conf.read("example").whole("count"), 11)
 
-    def test_temp_home_without_config_reads_the_repository_accounts_value(self) -> None:
+    def test_temp_home_without_config_fails_and_names_the_live_path(self) -> None:
         home = self.root / "home"
         home.mkdir()
+        live = home / ".claude/config/accounts.conf"
+        readers: tuple[Callable[[conf.ConfigRead], object], ...] = (
+            lambda settings: settings.whole("usage_stale_minutes"),
+            lambda settings: settings.text("usage_stale_minutes"),
+            lambda settings: settings.words("usage_stale_minutes"),
+            lambda settings: settings.values(),
+        )
         with (mock.patch.dict(os.environ), redirect_stderr(io.StringIO()) as warning,
               mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery"))):
             del os.environ["CONF_DIR"]
-            self.assertEqual(conf.read("accounts").whole("usage_stale_minutes"), 10)
-            self.assertEqual(conf.read("accounts").text("usage_stale_minutes"), "10")
-            self.assertEqual(conf.read("accounts").words("usage_stale_minutes"), ("10",))
-            self.assertEqual(conf.read("accounts").values()["usage_stale_minutes"], "10")
-            self.assertEqual(conf.path("accounts"), home / ".claude/config/accounts.conf")
+            self.assertEqual(conf.path("accounts"), live)
+            for reader in readers:
+                with self.subTest(reader=reader), self.assertRaises(conf.Unusable) as caught:
+                    _ = reader(conf.read("accounts"))
+                self.assertIn(str(live), str(caught.exception))
+            origin = conf.read("accounts").origin("usage_stale_minutes", int)
+        self.assertIsInstance(origin, conf.UnavailableValue)
+        self.assertIn(f"{live}: usage_stale_minutes is missing", origin.reason if isinstance(origin, conf.UnavailableValue) else "")
         self.assertEqual(warning.getvalue(), "")
         self.assertEqual(list(home.iterdir()), [])
 
@@ -353,22 +352,39 @@ conf_reads.record('disabled')
         self.assertEqual(conf.read("accounts").whole("usage_stale_minutes"), 23)
         self.assertEqual(conf.read("accounts").values(), {"usage_stale_minutes": "23"})
 
-    def test_missing_live_key_uses_repository_without_changing_live_values(self) -> None:
+    def test_missing_live_key_without_a_default_fails_and_names_the_key_and_path(self) -> None:
         del os.environ["CONF_DIR"]
         source = self.root / "home/.claude/config/accounts.conf"
         source.parent.mkdir(parents=True)
         contents = "# whole: 1..\nusage_stale_minutes=23\n"
         _ = source.write_text(contents)
         self.assertEqual(conf.read("accounts").whole("usage_stale_minutes"), 23)
-        with mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery")):
-            self.assertEqual(conf.read("accounts").text("notes_directory"), "~/rust/hanadocs/agents")
-            origin = conf.read("accounts").origin("notes_directory", str)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, "~/rust/hanadocs/agents")
+        warning = io.StringIO()
+        with (redirect_stderr(warning), self.assertRaises(conf.Unusable) as caught,
+              mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery"))):
+            _ = conf.read("accounts").text("notes_directory")
+        self.assertEqual(str(caught.exception), f"{source}: notes_directory is missing; add it to {source}")
+        origin = conf.read("accounts").origin("notes_directory", str)
+        self.assertIsInstance(origin, conf.MissingValue)
+        self.assertEqual(origin.reason if isinstance(origin, conf.MissingValue) else "", str(caught.exception))
+        self.assertEqual(warning.getvalue(), "")
         self.assertEqual(source.read_text(), contents)
 
-    def test_missing_override_key_refuses_repository_values(self) -> None:
+    def test_missing_key_with_a_code_default_uses_the_default(self) -> None:
+        self.write("# whole: 1..\ncount=2\n")
+        with mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery")):
+            self.assertEqual(conf.read("example").value("absent", str, default="fallback"), "fallback")
+            self.assertEqual(conf.read("example").value("count", int, default=9), 2)
+
+    def test_missing_file_with_a_code_default_fails_and_names_the_key_and_path(self) -> None:
+        with (mock.patch.object(conf, "_git", side_effect=AssertionError("unexpected Git recovery")),
+              self.assertRaises(conf.Unusable) as caught):
+            _ = conf.read("example").value("absent", str, default="fallback")
+        self.assertEqual(str(caught.exception),
+                         f"{self.path}: absent is missing; add it to {self.path}; the file does not exist")
+        self.assertIsInstance(conf.read("example").origin("absent", str), conf.MissingValue)
+
+    def test_missing_override_key_fails(self) -> None:
         source = self.directory / "accounts.conf"
         contents = "# whole: 1..\nusage_stale_minutes=23\n"
         _ = source.write_text(contents)
@@ -378,28 +394,7 @@ conf_reads.record('disabled')
         self.assertIsInstance(conf.read("accounts").origin("notes_directory", str), conf.UnavailableValue)
         self.assertEqual(source.read_text(), contents)
 
-    def test_missing_accounts_key_uses_git_before_repository(self) -> None:
-        self.history()
-        source = self.directory / "accounts.conf"
-        _ = source.write_text("# whole: 1..\nusage_stale_minutes=23\n")
-        _ = self.git("add", "config/accounts.conf")
-        _ = self.git("commit", "-qm", "accounts configuration revision")
-        _ = source.write_text("other=2\n")
-        with redirect_stderr(io.StringIO()):
-            self.assertEqual(conf.read("accounts").whole("usage_stale_minutes"), 23)
-        origin = conf.read("accounts").origin("usage_stale_minutes", int)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, 23)
-
-    def test_value_origin_uses_repository_for_an_absent_file(self) -> None:
-        del os.environ["CONF_DIR"]
-        origin = conf.read("accounts").origin("usage_stale_minutes", int)
-        self.assertIsInstance(origin, conf.RecoveredValue)
-        if isinstance(origin, conf.RecoveredValue):
-            self.assertEqual(origin.value, 10)
-
-    def test_existing_invalid_key_and_explicit_missing_path_do_not_use_repository(self) -> None:
+    def test_existing_invalid_key_and_explicit_missing_path_fail_without_history(self) -> None:
         del os.environ["CONF_DIR"]
         source = self.root / "home/.claude/config/accounts.conf"
         source.parent.mkdir(parents=True)
@@ -549,12 +544,14 @@ conf_reads.record('disabled')
         # Git reads the checkout, the history, and each of the three revisions.
         self.assertEqual(history_reads.call_count, 5)
 
-    def test_missing_current_key_recovers_from_history_and_host_override_is_validated(self) -> None:
+    def test_missing_current_key_fails_although_history_holds_it(self) -> None:
         self.history()
         self.commit("# whole: ..\namount=3\n# whole: 1..9\namount.testhost=7\n")
         self.write("other=0\n")
-        with mock.patch("socket.gethostname", return_value="testhost.example"), redirect_stderr(io.StringIO()):
-            self.assertEqual(conf.read("example").whole("amount"), 7)
+        with (mock.patch("socket.gethostname", return_value="testhost.example"), redirect_stderr(io.StringIO()),
+              self.assertRaises(conf.Unusable) as caught):
+            _ = conf.read("example").whole("amount")
+        self.assertEqual(str(caught.exception), f"{self.path}: amount is missing; add it to {self.path}")
 
     def test_no_good_revision_raises_instead_of_using_a_code_default(self) -> None:
         self.history()
@@ -592,7 +589,7 @@ conf_reads.record('disabled')
         _ = self.path.write_bytes(b"host=\xff\n")
         _ = self.git("add", "config/example.conf")
         _ = self.git("commit", "-qm", "damaged encoding")
-        for damage in ("missing", "encoding", "directory"):
+        for damage in ("encoding", "directory"):
             with self.subTest(damage=damage):
                 self.path.unlink(missing_ok=True)
                 if damage == "encoding":
@@ -609,20 +606,27 @@ conf_reads.record('disabled')
                 if damage == "directory":
                     self.path.rmdir()
 
+    def test_map_refuses_a_missing_file_without_history(self) -> None:
+        self.history()
+        self.commit("host=mac\n")
+        self.path.unlink()
+        warning = io.StringIO()
+        with (redirect_stderr(warning), self.assertRaises(conf.Unusable) as caught,
+              mock.patch.object(conf, "_git", side_effect=AssertionError("A missing file must not read history"))):
+            _ = conf.read("example").values()
+        self.assertEqual(warning.getvalue(), "")
+        self.assertEqual(str(caught.exception), f"{self.path}: the file does not exist; add it with its keys")
+
     def test_map_refuses_when_no_committed_file_decodes(self) -> None:
-        for history in (False, True):
-            with self.subTest(history=history):
-                if history:
-                    self.history()
-                    _ = self.path.write_bytes(b"host=\xff\n")
-                    _ = self.git("add", "config/example.conf")
-                    _ = self.git("commit", "-qm", "damaged encoding")
-                self.path.unlink(missing_ok=True)
-                warning = io.StringIO()
-                with redirect_stderr(warning), self.assertRaises(conf.Unusable) as caught:
-                    _ = conf.read("example").values()
-                self.assertEqual(len(warning.getvalue().splitlines()), 1)
-                self.assertIn(str(self.path), str(caught.exception))
+        self.history()
+        _ = self.path.write_bytes(b"host=\xff\n")
+        _ = self.git("add", "config/example.conf")
+        _ = self.git("commit", "-qm", "damaged encoding")
+        warning = io.StringIO()
+        with redirect_stderr(warning), self.assertRaises(conf.Unusable) as caught:
+            _ = conf.read("example").values()
+        self.assertEqual(len(warning.getvalue().splitlines()), 1)
+        self.assertIn(str(self.path), str(caught.exception))
 
     def test_map_key_faults_keep_history_recovery_and_optional_empty_entries(self) -> None:
         self.history()
@@ -710,6 +714,7 @@ conf_reads.record('disabled')
                         _ = conf.editable_line(stem, key)
 
     def test_editable_line_keeps_each_dotted_model_key_independent(self) -> None:
+        _ = write_config_fixture(self.directory / "machines.conf")
         source = self.directory / "statusline.conf"
         keys = ("model.gpt-6", "model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
         for order in (keys, keys[::-1]):
@@ -717,6 +722,15 @@ conf_reads.record('disabled')
                 _ = source.write_text("".join(f"{key}=#123456\n" for key in order), encoding="utf-8")
                 for line, key in enumerate(order):
                     self.assertEqual(conf.editable_line("statusline", key), (line, "#123456"))
+
+    def test_known_host_names_fail_without_a_live_machines_file(self) -> None:
+        source = self.directory / "machines.conf"
+        with self.assertRaises(conf.Unusable) as caught:
+            _ = conf.known_host_names()
+        self.assertEqual(str(caught.exception), f"{source}: the file does not exist; add it with its keys")
+        _ = source.write_text("aliases=fixture\nfixture.hosts=Fixture-Host.local\n")
+        with mock.patch("socket.gethostname", return_value="local.example"):
+            self.assertEqual(conf.known_host_names(), frozenset({"local", "fixture", "fixture-host"}))
 
     def test_installed_script_refuses_conf_dir_override(self) -> None:
         from scripts.build_hold import override_guard
@@ -740,7 +754,7 @@ conf_reads.record('disabled')
         if not isinstance(live, conf.UsableLiveValue):
             self.fail("The valid live limit must identify live permission")
         self.assertEqual(live.value, Decimal("20"))
-        for source in ("other=1\n", "# range: 0..\namount=broken\n",
+        for source in ("# range: 0..\namount=broken\n",
                        "# range: 0..\namount=-1\n"):
             with self.subTest(source=source), redirect_stderr(io.StringIO()):
                 self.write(source)
@@ -788,6 +802,94 @@ class HanaConfigurationTests(unittest.TestCase):
             self.assertNotIn(key, settings)
         self.assertEqual(sum(line.startswith('free_floor_gib=')
             for line in self.source.read_text().splitlines()), 1)
+
+
+LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:")
+
+
+def twin_faults(config: Path, twin: Callable[[str], Path]) -> list[str]:
+    """Return one line for each file or key where a test-owned twin differs in shape from config."""
+    def keys(path: Path) -> dict[str, str]:
+        return {key: setting.limit if setting.limit.startswith(LIMIT_PREFIXES) else ""
+                for key, setting in conf.settings(path.read_text(encoding="utf-8")).items()}
+
+    stems = sorted(path.stem for path in config.glob("*.conf"))
+    faults: list[str] = []
+    for stem in stems:
+        source, owned = config / f"{stem}.conf", twin(stem)
+        name = owned.name
+        if not owned.is_file():
+            faults.append(f"{name}: no twin: add the file to test_config/{name}")
+            continue
+        expected, actual = keys(source), keys(owned)
+        for key in sorted(expected.keys() | actual.keys()):
+            if key not in actual:
+                faults.append(f"{name}: {key}: add the key to test_config/{name}")
+            elif key not in expected:
+                faults.append(f"{name}: {key}: remove the key from test_config/{name}")
+            elif expected[key] != actual[key]:
+                faults.append(f"{name}: {key}: copy the limit comment to test_config/{name}")
+    faults.extend(f"{path.name}: no config/ file: remove test_config/{path.name}"
+                  for path in sorted(twin("").parent.glob("*.conf")) if path.stem not in stems)
+    return faults
+
+
+class TestOwnedConfigTests(unittest.TestCase):
+    def test_each_config_file_has_a_test_owned_twin_with_the_same_keys(self) -> None:
+        faults = twin_faults(Path(conf.__file__).resolve().parents[2] / "config", conf.test_config_path)
+        self.assertEqual(faults, [], "\n".join(faults))
+
+    def test_twin_check_names_each_file_and_key(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config, owned = root / "config", root / "test_config"
+        config.mkdir()
+        owned.mkdir()
+        rows: tuple[tuple[str, str | None, list[str]], ...] = (
+            ("same keys, other values", "a=1\n# whole: 1 to 9\nb=2\n", []),
+            ("missing key", "a=1\n", ["case.conf: b: add the key to test_config/case.conf"]),
+            ("host key", "a=1\n# whole: 1 to 9\nb=2\nb.natedev=3\n",
+             ["case.conf: b.natedev: remove the key from test_config/case.conf"]),
+            ("limit", "a=1\n# whole: 1 to 8\nb=2\n", ["case.conf: b: copy the limit comment to test_config/case.conf"]),
+            ("no twin", None, ["case.conf: no twin: add the file to test_config/case.conf"]),
+        )
+        _ = (config / "case.conf").write_text("a=0\n# whole: 1 to 9\nb=5\n", encoding="utf-8")
+        for label, text, expected in rows:
+            with self.subTest(label):
+                twin = owned / "case.conf"
+                twin.unlink(missing_ok=True)
+                if text is not None:
+                    _ = twin.write_text(text, encoding="utf-8")
+                self.assertEqual(twin_faults(config, lambda stem: owned / f"{stem}.conf"), expected)
+        _ = (owned / "extra.conf").write_text("a=1\n", encoding="utf-8")
+        self.assertIn("extra.conf: no config/ file: remove test_config/extra.conf",
+                      twin_faults(config, lambda stem: owned / f"{stem}.conf"))
+
+    def test_fixture_helpers_take_values_from_the_test_owned_file(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        owned = root / "test_config"
+        owned.mkdir()
+        _ = (owned / "example.conf").write_text("value=test-owned\n", encoding="utf-8")
+        fixture = root / "fixture"
+        fixture.mkdir()
+
+        def owned_path(stem: str) -> Path:
+            return owned / f"{stem}.conf"
+
+        _ = self.enterContext(mock.patch.object(conf, "test_config_path", side_effect=owned_path))
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(fixture)}))
+
+        def written() -> str:
+            _ = write_config_fixture(fixture / "example.conf")
+            return conf.read("example").text("value")
+
+        rows: tuple[tuple[str, Callable[[], str]], ...] = (
+            ("read_or_repository", lambda: conf.read_or_repository("example").text("value")),
+            ("write_config_fixture", written),
+        )
+        for label, read in rows:
+            with self.subTest(label):
+                (fixture / "example.conf").unlink(missing_ok=True)
+                self.assertEqual(read(), "test-owned")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_test_runner, direct_test_fixture_environment
 
-from contextlib import ExitStack, redirect_stderr
+from collections.abc import Callable
+from contextlib import ExitStack, chdir, redirect_stderr
 from io import StringIO
 from dataclasses import dataclass
 import errno
@@ -26,6 +27,7 @@ from unittest.mock import patch
 
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib import conf
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -377,40 +379,149 @@ print(os.environ['CONFIG_TEST_NEXT_HOOK'])
                     self.assertEqual(result.stdout, "loaded\n")
                     self.assertEqual(result.stderr, "")
 
-    def test_runner_rejects_a_caught_write_in_a_python_child(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        home = root / "fixture-home"
-        protected = home / ".claude" / "config"
-        protected.mkdir(parents=True)
-        config = protected / "console.conf"
-        _ = config.write_text("original\n")
-        child = """
+    def test_runner_rejects_a_caught_write_or_read_in_a_python_child(self) -> None:
+        for access in ('Path(sys.argv[1]).write_text("changed")', "Path(sys.argv[1]).read_text()"):
+            with self.subTest(access=access):
+                # Each run keeps its hook in this process, so each run has its own root.
+                root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                protected = root / "fixture-home" / ".claude" / "config"
+                protected.mkdir(parents=True)
+                config = protected / "console.conf"
+                _ = config.write_text("original\n")
+                child = f"""
 from pathlib import Path
 import sys
 try:
-    Path(sys.argv[1]).write_text("changed")
+    {access}
 except AssertionError:
     print("refused")
 """
-        children: list[subprocess.CompletedProcess[str]] = []
+                children: list[subprocess.CompletedProcess[str]] = []
 
-        def fixture_test() -> None:
-            shim = Path(module_run.__file__).resolve().parents[1] / "lib" / "py"
-            for program in (sys.executable, str(shim)):
-                children.append(subprocess.run([program, "-c", child, str(config)], cwd=root,
-                                               capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS))
+                def fixture_test() -> None:
+                    shim = Path(module_run.__file__).resolve().parents[1] / "lib" / "py"
+                    for program in (sys.executable, str(shim)):
+                        children.append(subprocess.run([program, "-c", child, str(config)], cwd=root,
+                                                       capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS))
 
-        suite = unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
-        with (patch.object(Path, "home", return_value=home),
-              patch.dict(os.environ, {"CLAUDE_PYTHON": sys.executable}),
-              patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
-              patch.object(unittest.defaultTestLoader, "loadTestsFromNames", return_value=suite),
-              redirect_stderr(StringIO())):
-            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
-                module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
-        self.assertEqual([(child.returncode, child.stdout, child.stderr) for child in children],
-                         [(0, "refused\n", ""), (0, "refused\n", "")])
-        self.assertEqual(config.read_text(), "original\n")
+                suite = unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
+                with (patch.object(module_run, "live_config_folder", return_value=protected),
+                      patch.dict(os.environ, {"CLAUDE_PYTHON": sys.executable}),
+                      patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
+                      patch.object(unittest.defaultTestLoader, "loadTestsFromNames", return_value=suite),
+                      redirect_stderr(StringIO())):
+                    with self.assertRaisesRegex(AssertionError, "Test attempted to read or write live configuration"):
+                        module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
+                self.assertEqual([(child.returncode, child.stdout, child.stderr) for child in children],
+                                 [(0, "refused\n", ""), (0, "refused\n", "")])
+                self.assertEqual(config.read_text(), "original\n")
+
+    def test_guard_refuses_reads_in_the_live_folder_and_allows_others(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        protected = root / "config"
+        protected.mkdir()
+        config = protected / "console.conf"
+        _ = config.write_text("live\n")
+        private = root / "private.conf"
+        _ = private.write_text("private\n")
+        (root / "alias").symlink_to(protected, target_is_directory=True)
+        (root / "link.conf").symlink_to(config)
+        (root / "nested").mkdir()
+        # The AWS guest links the live folder to the config/ of the checkout under test.
+        checkout = root / "checkout" / "config"
+        checkout.mkdir(parents=True)
+        tested = checkout / "gate.conf"
+        _ = tested.write_text("checkout\n")
+        linked = root / "home" / ".claude" / "config"
+        linked.parent.mkdir(parents=True)
+        linked.symlink_to(checkout, target_is_directory=True)
+
+        def relative() -> str:
+            with chdir(root):
+                return Path("config/console.conf").read_text()
+
+        def relative_from_the_folder() -> str:
+            with chdir(protected):
+                return Path("console.conf").read_text()
+
+        def relative_open(mode: str) -> Callable[[], str]:
+            def access() -> str:
+                with chdir(root), open("config/console.conf", mode, encoding="utf-8"):
+                    return ""
+            return access
+
+        def checkout_write() -> str:
+            _ = tested.write_text("changed\n")
+            return ""
+
+        # Each row: label, live folder, access, and the text the access returns, or None when the guard refuses it.
+        rows: tuple[tuple[str, Path, Callable[[], str], str | None], ...] = (
+            ("absolute", protected, config.read_text, None),
+            ("relative", protected, relative, None),
+            ("relative from the folder", protected, relative_from_the_folder, None),
+            ("parent step", protected, (root / "nested" / ".." / "config" / "console.conf").read_text, None),
+            ("folder link", protected, (root / "alias" / "console.conf").read_text, None),
+            ("file link", protected, (root / "link.conf").read_text, None),
+            ("bytes", protected, lambda: open(os.fsencode(config), encoding="utf-8").read(), None),
+            ("relative r+", protected, relative_open("r+"), None),
+            ("relative a", protected, relative_open("a"), None),
+            ("elsewhere", protected, private.read_text, "private\n"),
+            ("checkout read through a home link", linked, tested.read_text, "checkout\n"),
+            ("checkout write through a home link", linked, checkout_write, None),
+        )
+        for index, (label, folder, access, expected) in enumerate(rows):
+            with self.subTest(label):
+                # Each guard keeps its hook in this process, so each row has its own startup folder.
+                startup = root / f"startup-{index}"
+                startup.mkdir()
+                log = root / f"violations-{index}"
+                guard = module_run.guard_live_config(folder, startup, log, checkout_config=checkout)
+                if expected is None:
+                    with self.assertRaisesRegex(AssertionError, "set CONF_DIR to a fixture folder"):
+                        with guard:
+                            with self.assertRaisesRegex(AssertionError, "read or write live configuration"):
+                                _ = access()
+                    # The log holds the absolute path, also for a relative open.
+                    self.assertTrue(log.read_text().startswith(str(root) + os.sep))
+                else:
+                    with guard:
+                        self.assertEqual(access(), expected)
+                    self.assertFalse(log.exists())
+        self.assertEqual((config.read_text(), tested.read_text()), ("live\n", "checkout\n"))
+
+    def test_private_run_roots_copies_the_test_owned_config(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        checkout = RUNNER.parents[2] / "config"
+        owned = root / "owned"
+        owned.mkdir()
+        _ = (owned / "console.conf").write_text("page.list.owner=test-owned\n")
+
+        def owned_path(stem: str) -> Path:
+            return owned / f"{stem}.conf"
+
+        sources = {path: path.read_bytes() for path in (checkout / "console.conf", owned / "console.conf")}
+        fixture = root / "fixture"
+        rows: tuple[tuple[str, dict[str, str]], ...] = (("no CONF_DIR", {}), ("set CONF_DIR", {"CONF_DIR": str(fixture)}))
+        for index, (label, environment) in enumerate(rows):
+            with self.subTest(label), patch.object(conf, "test_config_path", side_effect=owned_path), patch.dict(os.environ):
+                _ = os.environ.pop("CONF_DIR", None)
+                os.environ.update(environment)
+                module = root / f"module-{index}"
+                module.mkdir()
+                with module_run.private_run_roots(module_run.GateModuleLease(module)) as run_root:
+                    folder = Path(os.environ["CONF_DIR"])
+                    if environment:
+                        self.assertEqual(folder, fixture)
+                        self.assertFalse((run_root / "config").exists())
+                    else:
+                        self.assertEqual(folder, run_root / "config")
+                        self.assertEqual((folder / "console.conf").read_text(), "page.list.owner=test-owned\n")
+                        self.assertEqual((folder / "gate.conf").read_bytes(), (checkout / "gate.conf").read_bytes())
+                        self.assertEqual(os.readlink(folder / "merge_gate.conf"), "gate.conf")
+                        _ = (folder / "console.conf").write_text("changed\n")
+                self.assertEqual(os.environ.get("CONF_DIR"), environment.get("CONF_DIR"))
+                self.assertEqual(list(module.iterdir()), [])
+        self.assertEqual({path: path.read_bytes() for path in sources}, sources)
 
     def test_child_guard_expires_when_the_runner_removes_the_hook(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -431,7 +542,7 @@ hook.unlink()
 config.write_text("expired")
 """
         log = root / "violations"
-        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+        with self.assertRaisesRegex(AssertionError, "Test attempted to read or write live configuration"):
             with module_run.guard_live_config(protected, root, log):
                 result = subprocess.run([sys.executable, "-c", child, str(root / "sitecustomize.py"), str(config)],
                                         cwd=root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
@@ -546,7 +657,7 @@ config.write_text("expired")
         directory_alias.symlink_to(protected, target_is_directory=True)
         empty = protected / "empty"
         empty.mkdir()
-        with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+        with self.assertRaisesRegex(AssertionError, "Test attempted to read or write live configuration"):
             with module_run.guard_live_config(protected, root, log):
                 with self.assertRaises(AssertionError):
                     _ = (directory_alias / config.name).rename(root / "moved")
@@ -584,11 +695,11 @@ config.write_text("expired")
                 _ = (alias / "console.conf").write_text("page.list.owner=fixture\n")
             return unittest.TestSuite([unittest.FunctionTestCase(fixture_test)])
 
-        with (patch.object(Path, "home", return_value=home),
+        with (patch.object(module_run, "live_config_folder", return_value=protected),
               patch.object(sys, "argv", ["module_run.py", str(root), "test_*.py"]),
               patch.object(unittest.defaultTestLoader, "loadTestsFromNames", side_effect=discover),
               redirect_stderr(StringIO())):
-            with self.assertRaisesRegex(AssertionError, "Test attempted to write live configuration"):
+            with self.assertRaisesRegex(AssertionError, "Test attempted to read or write live configuration"):
                 module_run.run_module(module_run.NoConfigReadLog(), root, root / "violations")
 
         self.assertEqual(console.read_text(), "page.list.owner=original\n")

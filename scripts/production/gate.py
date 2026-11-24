@@ -1260,7 +1260,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     config_violation = config_marker.is_file()
     if config_violation:
         path = config_marker.read_text(encoding="utf-8", errors="replace").partition("\n")[0]
-        captured += f"\n{job.module}: a test attempted to write live configuration at {path or '(path unavailable)'}\n"
+        captured += f"\n{job.module}: a test attempted to read or write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
     try:

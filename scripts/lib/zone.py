@@ -177,7 +177,7 @@ def set_zone(name: str) -> int:
     if platform.system() == "Darwin":
         raise Refusal("run /zone on natedev: the Mac pulls ~/.claude main from there")
     zone = resolve(name)
-    conf = Path(user_zone.CONF)
+    conf = Path(user_zone.settings_path())
     if conf.resolve() != config.path(STEM).resolve():
         raise Refusal(f"{conf} is not the live settings file {config.path(STEM)}")
     checkout = checkout_of(conf)
@@ -217,7 +217,7 @@ def set_zone(name: str) -> int:
 
 def show() -> int:
     print(f"zone: {describe(user_zone.user_zone_name())}")
-    checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+    checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.settings_path()))
     for line in drain(checkout, pulled=None):
         print(line)
     return 0
@@ -231,7 +231,7 @@ def main(arguments: list[str]) -> int:
             case ["set", name]:
                 return set_zone(name)
             case ["drain"] | ["drain", "--pulled", _]:
-                checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+                checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.settings_path()))
                 pulled = PurePosixPath(arguments[2]) if len(arguments) == 3 else None
                 for line in drain(checkout, pulled=pulled):
                     print(line)

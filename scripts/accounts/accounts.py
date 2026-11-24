@@ -6609,10 +6609,7 @@ class SessionModelReader:
         try:
             return registry_rows.parse_registry(models_registry.registry_text())
         except (OSError, ValueError):
-            try:
-                return registry_rows.parse_registry((REPOSITORY_ROOT / models_registry.REGISTRY_PATH).read_text())
-            except (OSError, ValueError):
-                return {}
+            return {}
 
     def _resolve(self, family: Literal["claude", "codex"], home: Path, model: str) -> str:
         if not model or _full_session_model(model):

@@ -352,9 +352,12 @@ def extract_facts(text: str, path: str) -> SourceFacts:
             for part in node.values) for node in ast.walk(tree)):
         config_reads.add("*")
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "copytree" and node.args
-                and any(isinstance(part, ast.Constant) and part.value == "config" for part in ast.walk(node.args[0]))):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        name = (node.func.attr if isinstance(node.func, ast.Attribute)
+                else node.func.id if isinstance(node.func, ast.Name) else "")
+        if name in {"copytree", "copy_for_test"} and any(
+                isinstance(part, ast.Constant) and part.value == "config" for part in ast.walk(node.args[0])):
             config_reads.add("*")
     return SourceFacts(tuple(imports), tokens, frozenset(config_reads), scan_scopes=source_scan_scopes(tree))
 
@@ -976,12 +979,13 @@ def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
         cached = read_fact_cache(cache_path) if cache_path is not None else {}
         before = set(cached)
         graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=True)
-        config_paths = {path for path in changed if path.startswith("config/") and path.endswith(".conf")}
+        # A test-owned twin in test_config/ selects the same readers as its config/ file.
+        config_paths = {path for path in changed if path.startswith(("config/", "test_config/")) and path.endswith(".conf")}
         configs = {Path(path).name.removesuffix(".conf") for path in config_paths}
         recorded = latest_module_reads() if changed else {}
         has_folder_records = any(isinstance(reads.folder_scans, RecordedFolderScans) for reads in recorded.values())
         has_content_records = any(isinstance(reads.content_reads, RecordedContentReads) for reads in recorded.values())
-        content_changes = {path for path in changed if not path.startswith("config/")}
+        content_changes = {path for path in changed if not path.startswith(("config/", "test_config/"))}
         base_blobs = revision_files(repo, base.commit) if has_folder_records else {}
         scanned_parents: set[str] = changed_path_parents(repo, changed, set(base_blobs)) if has_folder_records else set()
         retained = source_blobs(paths | dirty, blobs)

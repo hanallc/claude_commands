@@ -956,7 +956,7 @@ class BuildLimitsTests(unittest.TestCase):
 
         with self.subTest(routes="one unreadable Hana route"):
             targets = tuple(target_config.SshTarget(name, "linux", transport.settings) for name in (route.target, alias.target))
-            config = conf.ConfigRead("fixture", Path("fixture.conf"), {}, False)
+            config = conf.ConfigRead(Path("fixture.conf"), {})
             with (mock.patch.object(conf, "read", return_value=config),
                   mock.patch.object(target_config, "read_targets", return_value=targets),
                   mock.patch.object(target_config, "read_execution_transport", return_value=transport),

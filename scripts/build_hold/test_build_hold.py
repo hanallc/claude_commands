@@ -36,7 +36,7 @@ from scripts.build_hold.build_hold_test_support import (
 from scripts.direct import step_record
 from scripts.build_queue import admission_protocol, admission_service
 from scripts.build_queue.admission_test_support import only_admitted
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, test_hang_guard
 from scripts.message.send_result import SEND_ABSENT_EXIT, SEND_CLOSED_EXIT
 from scripts.production.cli_fixture import process_boundary
 
@@ -440,7 +440,8 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(SCRIPT.parent.parent.parent / "config"),
+            "CONF_DIR": str(conf.copy_for_test(SCRIPT.parent.parent.parent / "config",
+                                               Path(self.enterContext(tempfile.TemporaryDirectory())) / "config")),
         }))
 
     def test_remote_commands_refuse_without_state_changes(self) -> None:

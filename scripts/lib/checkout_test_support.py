@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 
+from scripts.lib import conf
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, startup_pythonpath
 
 
@@ -24,7 +25,7 @@ sys.modules["_devtools_python_startup"]._descends_from_gate_module = lambda: Fal
 def runtime_files() -> tuple[Path, ...]:
     """List runtime files without compiled files or unrelated test modules."""
     helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
-    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
+    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config", "test_config")
                  for path in sorted((SOURCE / folder).rglob("*"))
                  if (path.is_file() or path.is_symlink() and path.is_dir()) and "__pycache__" not in path.parts
                  and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
@@ -45,14 +46,19 @@ def copy_with_bytecode(source: Path, destination: Path) -> None:
 
 
 def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
-    """Copy missing runtime files and keep the fixture's existing tools."""
+    """Copy missing runtime files and keep the fixture's existing tools.
+
+    The config files take their values from the test-owned copies.
+    """
     for relative in runtime_files():
-        if not configuration and relative.parts[0] == "config":
+        if relative.parts[0] == "config" or not configuration and relative.parts[0] == "test_config":
             continue
         destination = checkout / relative
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
             copy_with_bytecode(SOURCE / relative, destination)
+    if configuration:
+        _ = conf.copy_for_test(SOURCE / "config", checkout / "config")
 
 
 def copy_startup(checkout: Path) -> None:

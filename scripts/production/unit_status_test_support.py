@@ -23,6 +23,7 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message.sessions_test_support import copy_session_modules
@@ -153,7 +154,7 @@ class UnitStatusFixture(unittest.TestCase):
         _ = shutil.copy2(SCRIPT.parents[1] / "message/process_table.py", message / "process_table.py")
         (root / "config").mkdir()
         _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
-        _ = shutil.copy2(SCRIPT.parents[2] / "config/staff.conf", root / "config/staff.conf")
+        _ = shutil.copy2(conf.test_config_path("staff"), root / "config/staff.conf")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()

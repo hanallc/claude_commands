@@ -145,7 +145,7 @@ def _workload(configuration: Path | conf.ConfigRead) -> tuple[conf.ConfigRead, d
 
 
 def _resolved_read(path: Path, text: str, stamp: conf.ConfigRead) -> conf.ConfigRead:
-    return conf.ConfigRead(path, path, conf.settings(text), False, stamp.stamp)
+    return conf.ConfigRead(path, conf.settings(text), stamp.stamp)
 
 
 def _listed_files(checkout: Path, manifest: Path) -> tuple[RenderedGuestFile, ...]:

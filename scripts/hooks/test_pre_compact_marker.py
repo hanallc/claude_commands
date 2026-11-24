@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast, override
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import conf
 
 
 HOOK = Path(__file__).with_name("pre-compact-marker.py")
@@ -29,7 +30,7 @@ class PreCompactMarkerTests(unittest.TestCase):
         self.folder = self.root / ".local/state/compaction"
         self.config = self.root / "config"
         self.config.mkdir()
-        source = HOOK.resolve().parents[2] / "config/compaction_marker.conf"
+        source = conf.test_config_path("compaction_marker")
         _ = (self.config / source.name).write_text(source.read_text())
 
     def run_hook(self, family: str, payload: str) -> subprocess.CompletedProcess[str]:

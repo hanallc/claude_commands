@@ -104,7 +104,8 @@ def paired_trial():
                         environment = test_module_environment(work, dict(os.environ))
                         if warming:
                             environment.pop('TEST_TIMES_OUT', None)
-                        environment['CONF_DIR'] = str(repo / 'config')
+                        # The module runner copies the tree's config with the test-owned values only when CONF_DIR is unset.
+                        environment.pop('CONF_DIR', None)
                         home = work / 'home'
                         (home / '.claude').mkdir(parents=True)
                         (home / '.claude/config').symlink_to(repo / 'config', target_is_directory=True)

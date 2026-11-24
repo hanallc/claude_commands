@@ -30,8 +30,6 @@ def routing_setting(file: str, key: str, *, sources: list[Path] | None = None) -
     result = settings.origin(key, str)
     if isinstance(result, conf.UsableLiveValue):
         return result.value
-    if isinstance(result, conf.RecoveredValue) and not settings.source.exists():
-        return result.value
     raise ValueError(result.reason)
 
 
