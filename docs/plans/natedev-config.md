@@ -23,7 +23,7 @@ devtools of sdlc wrote P807. sdlc sends you the hand-over from devtools.
 Use Codex workers, not subagents (nate, 11-23 14:04 PST). claude_commands gate and test runs name --targets natedev,mac-linux until slice 1 is on main.
 Send the showrunner the time for the first step and for the full item.
 
-Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; step 4 → Phases 4 and 5; step 3 → Phase 6; step 5 → Phase 7; step 6 → Phase 8; step 7 → Phases 10 to 13; step 8 → Phase 14. Phase 9 is an add-on from Phase 1 (showrunner, 11-23 17:52 PST).
+Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; step 4 → Phases 4 and 5; step 3 → Phase 6; step 5 → Phase 7; step 6 → Phase 8; step 7 → Phases 10 to 13; step 8 → Phase 14. Phase 9 is an add-on from Phase 1 (showrunner, 11-23 17:52 PST). Phase 15 is an add-on from Phase 3 (showrunner, 11-23 19:16 PST).
 
 ## Delegation Context
 
@@ -126,91 +126,57 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Ruled out:** a second pair validator in `conf.py` (an inline copy of the checks gave other answers than `/default_models`).
 
 ### Phase 3 — Code checks and the literal inventory  · status: done
-**Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** `test_config_form.py` also refuses a new raw config reader, a new per-file config environment variable and a new module-level tunable literal, and its allow lists name each case of today with the phase that removes it.
-
-**Spec:**
-
-1. **One reader check.** Non-test Python and shell code under `scripts/` reads a file in `config/` only through `conf.read`, `conf.read_or_repository` or `conf_value`, or through the `config/models.conf` parser (`scripts/lib/models_registry.py`, `scripts/lib/registry_rows.py`, `scripts/agents/models_config.sh`, `scripts/agents/sync_codex_catalog.sh`). Find raw reads with an AST scan for `tomllib`, `configparser` and `conf_reads.read_text`, and a scan for string constants that name a `config/` file or a `.conf` or `.toml` file name. Allow list, each with the phase that removes it:
-   - "Raw readers to conf.read": `scripts/notify/review.py`, `scripts/buildlog/rust_release.py`, `scripts/production/stall_watch.py`, `scripts/message/repeat_guard.py`, `scripts/build_hold/cargo`, `scripts/hooks/mac_files.py`, `scripts/lib/user_zone.py`, `scripts/statusline/rebuild_row.py`, `scripts/statusline/statusline.sh`. `scripts/mac_test/nextest_log.py` already reads through `conf.read` and needs no row.
-   - `NO_REMOVAL_PHASE`: `scripts/hooks/stop-context-deferral.py`. `config/context_deferral.conf` is a rule list with `kind: value` rows and repeated kinds, so `conf.read` cannot read it. Its form waits for a showrunner decision. `check_format` reports each `.conf` line that is not blank, a comment, a `[section]` line or a `key=value` row; `config/context_deferral.conf` has a `FORMAT_FILES` row with `NO_REMOVAL_PHASE`.
-   - "TOML tunables to .conf": `scripts/maintenance/settings.py`, `scripts/maintenance/herdr_upkeep.py`, `scripts/message/session_records.py`, `scripts/accounts/accounts.py`.
-   - "Remove section lines": `scripts/astra/design_roles.py`.
-   - `permanent`: each reader of a data file (rule 10), with the file it reads.
-   - `permanent`, reason "shared config reader or writer": the shared modules that read or rewrite config text for any stem to check or update rows: `scripts/lib/conf.py`, `scripts/lib/conf.sh`, `scripts/lib/conf_reads.py`, `scripts/lib/live_settings.py`, `scripts/lib/waiting_rows.py`. The reply names each other module of this kind that the scan finds.
-2. **Environment variable check.** Non-test code reads no environment variable that names a config file, except `CONF_DIR`. Find names that end in `_CONFIG` or `_CONFIG_FILE` in `os.environ`, `os.getenv` and shell `$NAME` or `${NAME}` reads. `MODELS_CONFIG_PUBLISH` does not match the suffix scan and needs no row. Allow list:
-   - "Raw readers to conf.read": `SEND_REPEAT_CONFIG`, `STALL_WATCH_CONFIG`.
-   - "Per-file config environment variables to CONF_DIR": `MODELS_CONFIG_FILE`, `COPIES_CONFIG`, `STAFF_CONFIG`, `AWS_TARGET_CONFIG`, `BUILD_TARGETS_CONFIG`, `SHOWRUNNERS_CONFIG`, `LINT_CONFIG_FILE`.
-   - `permanent`, reason "not a config file": `CODEX_CONFIG_FILE` (the Codex CLI file `~/.codex/config.toml`).
-   - "TOML tunables to .conf": `HERDR_UPKEEP_CONFIG`, `AGENT_NOTES_JOB_CONFIG`.
-   - "Remove section lines": `DESIGN_ROLES_CONFIG`.
-3. **Literal check.** Find module-level constants in non-test Python under `scripts/` whose name matches `*_MAX*`, `MAX_*`, `*_ATTEMPTS*`, `*_LIMIT*`, `*_BYTES`, `*_CHARS` or `*_RETRIES`, and whose value is a number literal or an arithmetic expression of number literals (`64 * 1024`). Skip `test_*.py`, `*_test_support.py` and `fixtures/`. Skip each wait limit (Delegation Context invariant): a name that matches a wait pattern, or a value that is a time. List item 277 owns them; this check makes no list of them. A constant that is not on the allow list fails the test.
-4. **Literal inventory.** Classify each found constant in `scripts/lib/config_form_exceptions.py` as one of these row types. The row types are the contract between the two workers; `impl` writes them first:
-   - `ReaderException(path, reads, reason, until)` — a file that may read config text by hand, and the base names of the config files it reads (`*` for a path the code computes). A row covers only reads of the files in `reads` (Spec item 1).
-   - `VariableException(name, reason, until)` — a config environment variable that code may read (Spec item 2).
-   - `TunableLiteral(path, name, value, stem, key, limit, batch: RemoveInPhase)`, `ExternalLiteral(path, name, reason)`, `InternalLiteral(path, name, reason)` — the literal classes below. Only `TunableLiteral` has a stem, key, limit and removal phase.
-
-   The classes:
-   - `tunable` — a value a person may tune. The row holds the proposed stem and key (rule 4, with its unit), the limit line, and the batch. Use the existing stem of the area when one exists, for example `config/notify.conf` for `scripts/notify/`.
-   - `external` — a fact set outside this repository. Example: `scripts/notify/pushover.py:79` `TITLE_MAX = 250` is a Pushover API limit. The reason names the source.
-   - `internal` — a fixed fact of the code that a person never tunes, for example a protocol size. The reason says why.
-
-   Batches, by the folder under `scripts/`:
-   - "Build tool literals to config": `buildlog`, `build_queue`, `build_targets`, `build_hold`, `mac_test`, `lint`, `copies`.
-   - "Message and notice literals to config": `notify`, `message`, `hooks`, `usage`, `whoami`, `maintenance`.
-   - "AWS and review tool literals to config": `aws_target`, `review_links`, `style`, `screen_record`, `shot_report`, and each folder not named in another batch.
-   - "Production and direct literals to config": `production`, `direct`, `herdr`, `agents`, `accounts`, `worktree`, `bevy_upgrade`, `history`, `orphans`, `prioritize`, `lib`.
-5. **Data name parts** (showrunner, 11-23 17:52 PST). Add one line to rule 4 in `config/README.md`: "A part that is a name the code looks up, such as a repository, program, build step, path, model or ID, is spelled as that name, like a machine part." The `KEY_FORM_KEYS` rows whose reason names such parts (repository, program, step, path, role and model, and UUID names; 113 rows after Phase 1) change `until` to `ExceptionLifetime.PERMANENT`. The 91 rows with the reason "The keys use uppercase names." stay `NO_REMOVAL_PHASE`: sdlc owns that rename. Change no key name. The 16 `COMMENT_LIMIT_FILES` rows change `until` to `RemoveInPhase("Comments and limit lines for every setting")`.
-6. **Reply.** The reply lists the `tunable` rows as one table for each batch: file and line, constant, value, proposed `<stem>.<key>`, limit line. No wait limit is in a table. The director sends these tables to the showrunner for bob's working names of the new keys.
+- `scripts/lib/test_config_form.py` has three code checks in the Phase 1 form, over the tracked non-test files under `scripts/`. One parse of each source file (`_CodeScan`) serves all three.
+  - `check_config_readers` (rule `reader`): a Python or shell read of a `config/` file outside `conf.read`, `conf.read_or_repository`, `conf_value` and the `config/models.conf` parser. The shell scan (`_SHELL_READ`) finds a line with `awk`, `cat`, `cut`, `grep`, `head`, `mapfile`, `rg`, `sed`, `source` or `tail`, or a `<` redirect, whose operand names a config file directly or through a variable assigned earlier in the file. It does not find `jq --rawfile` or `--slurpfile` reads.
+  - `check_config_variables` (rule `variable`): an environment variable read whose name ends in `_CONFIG` or `_CONFIG_FILE`, except `CONF_DIR`.
+  - `check_tunable_literals` (rule `literal`): a module-level number constant named `*_MAX*`, `MAX_*`, `*_ATTEMPTS*`, `*_LIMIT*`, `*_BYTES`, `*_CHARS` or `*_RETRIES`. Wait limits are skipped; list item 277 owns them.
+- `check_format` also reports each `.conf` line that is not blank, a comment, a `[section]` line or a `key=value` row.
+- `scripts/lib/config_form_exceptions.py` holds the row types and their lists. Each row has `until: ExceptionLifetime | RemoveInPhase`; `test_repository_form` fails on a stale row.
+  - `ReaderException(path, reads, reason, until)`: `reads` holds the base names of the config files the reader reads, or `*` for a path the code computes. A row covers only reads of those files.
+  - `VariableException(name, reason, until)`.
+  - `TunableLiteral(path, name, value, stem, key, limit, batch: RemoveInPhase)`, `ExternalLiteral(path, name, reason)` and `InternalLiteral(path, name, reason)` in `LITERAL_INVENTORY`: 35 tunable, 8 external and 24 internal rows. Each tunable row holds bob's working stem and key (11-23 19:17 PST); upper limits use the form `max_<thing>_<unit>`.
+- Permanent reader rows also cover `scripts/accounts/new_account.py` (statusline.conf), `scripts/aws_target/hana_render.py` (four files for a guest host), `scripts/direct/pass_record.py` (hashes models.conf and direct.conf), `scripts/lint/lint_config.sh` (lint.conf), `scripts/lib/waiting_rows.py` (models.conf) and the data readers.
+- `config/README.md` rule 4: a key part that is a name the code looks up is spelled as that name. Those `KEY_FORM_KEYS` rows are permanent; the uppercase-key rows stay `NO_REMOVAL_PHASE` (sdlc owns that rename).
 
 **Files:**
-- `scripts/lib/test_config_form.py` — the three code checks, a tree test and a planted fixture for each
-- `scripts/lib/config_form_exceptions.py` — the row types, the reader, variable and literal allow lists, the permanent data name rows
-- `config/README.md` — the rule 4 line of Spec item 5
+- `scripts/lib/test_config_form.py` — the three code checks, the format row rule, their tree test and planted fixtures
+- `scripts/lib/config_form_exceptions.py` — the row types, the reader, variable and literal allow lists
+- `config/README.md` — the rule 4 data name line
 
-**Workers:** 1 writer + 1 tester — the inventory and the checks are separate files; each slot keeps the file it wrote in Phase 1.
-- `impl` — `scripts/lib/config_form_exceptions.py`: the row types first, the reader and variable rows from Spec items 1 and 2, the classified literal inventory from Spec items 3 and 4, and Spec item 5 with `config/README.md`; hub: `scripts/lib/config_form_exceptions.py` (`test` messages this slot for a row it needs)
-- `test` — `scripts/lib/test_config_form.py`: the three checks, their tree tests and planted fixtures
+**Binds later work:** each phase that converts a reader, removes a variable or moves a literal removes its row in the same change. The `config/context_deferral.conf` `FORMAT_FILES` row and the `stop-context-deferral.py` reader row belong to "Context deferral rules to the common form". The 16 `COMMENT_LIMIT_FILES` rows belong to "Comments and limit lines for every setting".
 
-**State:** none
+**Gotchas:**
+- `test_repository_form` takes 6 to 12 s; the floor is `ast.parse` of about 181 files.
+- The `user_zone.py`, `stall_watch.py` and `rebuild_row.py` reader rows read `*`: each finds its file through an environment variable or a computed constant.
+- `scripts/buildlog/rust_release.py` reads `config/lint.conf`.
 
-**Constraints from prior phases:**
-- Phase 1 created `scripts/lib/test_config_form.py` and `scripts/lib/config_form_exceptions.py`. The tree test fails on a stale row.
-- `config_form_exceptions.py` row types: `FileException(path, reason, until)` and `KeyException(path, key, reason, until)`, frozen dataclasses. `until` is `ExceptionLifetime | RemoveInPhase`: `ExceptionLifetime.PERMANENT`, `ExceptionLifetime.NO_REMOVAL_PHASE` (an exception that no plan phase removes), or `RemoveInPhase("<exact plan phase title>")`. New row types of this phase use the same `until` type. Each row this phase adds names the phase that removes it, or `PERMANENT`.
-- `test_config_form.py` form: `Violation(path, line_number, rule, line)` (a `NamedTuple` with `diagnostic()`), and one `check_<rule>(root: Path, files: Sequence[Path]) -> list[Violation]` for each rule. `test_repository_form` collects the violations of each rule, matches the allow list rows, and reports each stale row; `test_planted_violations` is one table of `(check, file name, source, line number, rule, line)`. The new code checks follow this form; their file list is the tracked non-test files under `scripts/`.
-- `scripts/lib/test_models_registry.py` imports `check_blank_lines` from `test_config_form.py`. Keep its name and signature.
-
-**Acceptance gate:**
-- `test_config_form.py` passes on the tree. Each new planted fixture gives exactly one violation.
-- Each found constant has one class, and each `tunable` row has a stem, key, limit line and batch.
-- README rule 4 names data name parts. Only the uppercase-key rows of `KEY_FORM_KEYS` keep `NO_REMOVAL_PHASE`; each `COMMENT_LIMIT_FILES` row names the phase "Comments and limit lines for every setting".
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:** a token-rule redesign of the literal scan (the AST scan with scope analysis is correct and fast enough).
 
 ### Phase 4 — Raw readers to conf.read  · status: todo
 **Depends on:** Phase 3
 
 #### Work Order
 
-**Goal:** Nine modules that parse config text by hand read through `conf.read` or `conf_value`, three per-file environment variables go away, and `scripts/notify/review.py` and `scripts/lib/user_zone.py` have no code default.
+**Goal:** Eight modules that parse config text by hand read through `conf.read`, the status line finds its files through `CONF_DIR`, three per-file environment variables go away, `scripts/notify/review.py` and `scripts/lib/user_zone.py` have no code default, and the reader check also finds `jq` file reads.
 
 **Spec:**
 
-1. `scripts/notify/review.py` — the raw parse of `REVIEW_TIMEOUT_SECONDS` from `config/notify.conf` (lines 63-71) becomes a `conf.read("notify")` read at use. Remove the fallback to 60 when the read fails (line 73). A bad or missing value now uses the Git recovery of `conf.read`. Keep the key name `REVIEW_TIMEOUT_SECONDS`; a rename is a key change and is not in this plan.
-2. `scripts/buildlog/rust_release.py` — the raw text parse near line 208 becomes `conf.read(<stem>)`.
-3. `scripts/production/stall_watch.py` — the raw text parse near line 666 becomes `conf.read("stall_watch")`. Remove `STALL_WATCH_CONFIG`; its tests set `CONF_DIR`.
-4. `scripts/message/repeat_guard.py` — the path read near line 38 becomes `conf.read("send_repeat_guard")`. Remove `SEND_REPEAT_CONFIG` (line 71) from it and from `scripts/message/notifier.sh`; the tests set `CONF_DIR`.
-5. `scripts/build_hold/cargo` — `cargo_output_roots` (near line 96) parses `config/build_folders.conf` by hand. Read `roots.build`, `roots.workspace` and their host overrides through `conf_value build_folders <key>`. The wrapper runs on each cargo call: time the fast path before and after, and name the added cost in the reply. If the cost is more than 10 ms for each call, post blocked with the numbers.
+1. `scripts/notify/review.py` — the raw parse of `REVIEW_TIMEOUT_SECONDS` from `config/notify.conf` (lines 63-71) becomes a `conf.read("notify")` read at use. Remove the fallback to 60 when the read fails (line 73). A bad or missing value now uses the Git recovery of `conf.read`. Keep the key name `REVIEW_TIMEOUT_SECONDS`; a rename is a key change and is not in this plan. Replace the old fallback comment at `config/notify.conf:2` with the limit line `# range: 5e-324..` directly above the key; `number` needs it. Remove the `config/notify.conf` row of `COMMENT_LIMIT_FILES` when its last violation is gone. Test recovery from a bad live value.
+2. `scripts/buildlog/rust_release.py` — `free_floor_gib` (line 205) reads `sweep_free_floor_gib` with `conf.read("lint")`. Keep the host override (`config/lint.conf` sets only `sweep_free_floor_gib.natedev`) and the no-floor result when neither key exists.
+3. `scripts/production/stall_watch.py` — `watch_config` (line 658) becomes `conf.read("stall_watch")`. Remove `STALL_WATCH_CONFIG`; its tests set `CONF_DIR`. Keep the contract of `sender_configuration` (line 804): a bad live value never stops pending work, prints a diagnostic and gives pass result 1. Git recovery of `conf.read` replaces the packaged-defaults read (`packaged_only`): read with `ConfigRead.origin`, and a `RecoveredValue` is the fallback case. The existing sender test covers a bad live value.
+4. `scripts/message/repeat_guard.py` — the path read near line 38 becomes `conf.read("send_repeat_guard")`. Remove `SEND_REPEAT_CONFIG` (line 71) from it and from `scripts/message/notifier.sh`; the tests set `CONF_DIR`. `configuration` (line 69) reads the nine `Limits` keys with `whole`. Limit lines in `config/send_repeat_guard.conf` carry its checks: `# whole: 1..` above each key, `# whole: 3..` above `repeat_count`. If the file then has no comment or limit violation, remove its `COMMENT_LIMIT_FILES` row. The guard still fails open: when a key has no usable value (`conf.Unusable`), it warns and returns `GuardUnavailable`, and delivery stays enabled. A bad live value now uses Git recovery. The reader ignores keys it does not read; a repeated key follows `conf.read`. The existing fail-open test covers the change.
+5. `scripts/build_hold/cargo` — `cargo_output_roots` (near line 96) parses `config/build_folders.conf` by hand. Read `roots.build`, `roots.workspace` and their host overrides through `conf_value build_folders <key>`. The wrapper runs on each cargo call: time the fast path before and after, and name the added cost in the reply. If the cost is more than 10 ms for each call, post blocked with the numbers. Also read `repo_word.claude_commands`, which the wrapper uses to find a claude_commands build folder. Keep the repository fallback when a fixture has no `build_folders.conf`. Test that the fast path finds a claude_commands build folder.
 6. `scripts/hooks/mac_files.py` — the parse of `production.conf` text (line 39) becomes `conf.read("production")`.
-7. `scripts/lib/user_zone.py` — the raw read of `config/user_zone.conf` (lines 23-30) becomes `conf.read("user_zone")`. Remove `USER_ZONE_CONF` from it and from `scripts/statusline/statusline.sh`; the tests set `CONF_DIR`. Remove the code default `DEFAULT_ZONE`: a missing or bad value uses the Git recovery of `conf.read`, as in item 1. The `USER_ZONE` value variable stays.
-8. `scripts/statusline/rebuild_row.py` — `DEFAULT_CONFIG` (line 25) and the line parse near line 252 become `conf.read("statusline")`.
-9. `scripts/statusline/statusline.sh` — the hand reads of `config/statusline.conf` (line 28) and `config/user_zone.conf` (line 34) become `conf_value`. The status line runs on each prompt: time it before and after, and name the added cost in the reply.
+7. `scripts/lib/user_zone.py` — the raw read of `config/user_zone.conf` (lines 23-30) becomes `conf.read("user_zone").value("zone", <check>)`. The check raises `conf.Unusable` for an unknown IANA name, so Git recovery covers a missing, bad or unknown value, as in item 1. Remove `USER_ZONE_CONF`, `CONF`, `stored_zone` and the code default `DEFAULT_ZONE`; the tests set `CONF_DIR`. The `USER_ZONE` value variable stays. Change their users: `scripts/lib/zone.py` (lines 105, 180, 220 and 234; the file path is `conf.path("user_zone")`), `scripts/review_links/review_page.py` (line 25 imports `CONF`), `scripts/production/gate_rename_deploy/deploy_gate_rename.py` (line 38 passes `USER_ZONE_CONF` on), and the tests that set or patch either name.
+8. `scripts/statusline/rebuild_row.py` — the line parse near line 252 becomes `conf.read("statusline")` for the default source and `conf.read(<path>)` for an explicit `--config` path. Keep `--config`: `scripts/statusline/assignment.py` (lines 172-182) and the review pages pass it. `DEFAULT_CONFIG` (line 25) becomes `conf.path("statusline")`. Test both sources.
+9. `scripts/statusline/statusline.sh` keeps its hand reads of `config/statusline.conf` (line 28, read by `jq --rawfile` at line 51) and `config/user_zone.conf` (line 34). It runs under `/bin/sh` on each prompt, `conf_value` needs bash or zsh, and `scripts/statusline/statusline.jq` looks up color keys by name in the whole file. Change only the paths: both files come from `${CONF_DIR:-<repository config folder>}`, and `USER_ZONE_CONF` goes. Its `ReaderException` row becomes `PERMANENT`, with `reads=("statusline.conf", "user_zone.conf")` and that reason. Time the status line before and after, and name the added cost in the reply.
 10. Each read happens at use. No module-level copy. Values and key names stay the same.
 11. Tests write fixtures with `write_config_fixture` in `CONF_DIR`. A test that used a code default now writes the key in its fixture.
-12. Remove these nine files and the three variable names from the allow lists in `scripts/lib/config_form_exceptions.py`. `USER_ZONE_CONF` has no row: the variable scan does not match its suffix.
+12. Remove the `READER_EXCEPTIONS` rows of the eight converted files, and the `SEND_REPEAT_CONFIG` and `STALL_WATCH_CONFIG` rows of `VARIABLE_EXCEPTIONS`. `USER_ZONE_CONF` has no row (the variable scan does not match its suffix); remove it from code and tests. Item 9 makes the `statusline.sh` row permanent.
+13. **Reader check.** The shell reader scan in `scripts/lib/test_config_form.py` (`_SHELL_READ`) also finds `jq --rawfile NAME PATH` and `jq --slurpfile NAME PATH` reads of a config file. Add a planted row that reports the config file and the source line. The tree scan then finds `scripts/statusline/statusline.sh:51` (`statusline.conf`), which the permanent row of item 9 covers.
 
 **Files:**
 - `scripts/notify/review.py`, `scripts/notify/test_review.py`
@@ -219,26 +185,32 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/hooks/mac_files.py`, `scripts/hooks/test_mac_files.py`
 - `scripts/production/stall_watch.py`, `scripts/production/test_stall_watch.py`
 - `scripts/message/repeat_guard.py`, `scripts/message/test_repeat_guard.py`, `scripts/message/notifier.sh`
-- `scripts/lib/user_zone.py`, `scripts/lib/test_user_zone.py`
-- `scripts/statusline/rebuild_row.py`, `scripts/statusline/statusline.sh`, `scripts/statusline/test_statusline.py`
-- `scripts/**/test_*.py` — only the tests that set `USER_ZONE_CONF`
-- `scripts/lib/config_form_exceptions.py` — rows removed
+- `scripts/lib/user_zone.py`, `scripts/lib/test_user_zone.py`, `scripts/lib/zone.py`, `scripts/lib/test_zone.py`, `scripts/review_links/review_page.py`, `scripts/production/gate_rename_deploy/deploy_gate_rename.py`, `scripts/direct/recorder_fixture.py`
+- `scripts/statusline/rebuild_row.py`, `scripts/statusline/assignment.py`, `scripts/statusline/statusline.sh`, `scripts/statusline/test_statusline.py`
+- `scripts/**/test_*.py` — only the tests that set or patch `USER_ZONE_CONF` or `user_zone.CONF`
+- `config/notify.conf`, `config/send_repeat_guard.conf` — limit lines
+- `scripts/lib/test_config_form.py` — the `jq` read in the shell reader scan
+- `scripts/lib/config_form_exceptions.py` — rows removed; the `statusline.sh` row permanent
 
 **Workers:** 2 writers — split by module group.
-- `impl` — `scripts/notify/`, `scripts/buildlog/`, `scripts/build_hold/` and `scripts/hooks/` files above; hub: `scripts/lib/config_form_exceptions.py` (both groups remove rows)
-- `test` opens as impl — `scripts/production/stall_watch.py`, `scripts/message/repeat_guard.py`, `scripts/message/notifier.sh`, `scripts/lib/user_zone.py`, `scripts/statusline/` files above, their tests, and the tests that set `USER_ZONE_CONF`
+- `impl` — `scripts/notify/`, `scripts/buildlog/`, `scripts/build_hold/` and `scripts/hooks/` files above, `config/notify.conf`; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row changes here)
+- `test` opens as impl — `scripts/production/stall_watch.py`, `scripts/message/repeat_guard.py`, `scripts/message/notifier.sh`, `config/send_repeat_guard.conf`, the user zone files above, the `scripts/statusline/` files above, `scripts/lib/test_config_form.py`, their tests, and the tests that set `USER_ZONE_CONF`
 
 **State:** none
 
 **Constraints from prior phases:**
 - Phase 3 put these nine readers and `SEND_REPEAT_CONFIG` and `STALL_WATCH_CONFIG` on the allow lists in `scripts/lib/config_form_exceptions.py` under "Raw readers to conf.read". The tree test fails on a stale row, so each removed reader also leaves the list.
-- Phase 3 found that `scripts/mac_test/nextest_log.py` already reads through `conf.read`; it is not in this phase. `scripts/hooks/stop-context-deferral.py` is not in this phase: `config/context_deferral.conf` is a rule list that `conf.read` cannot read.
+- Phase 3 found that `scripts/mac_test/nextest_log.py` already reads through `conf.read`; it is not in this phase. `scripts/hooks/stop-context-deferral.py` is not in this phase: Phase 15 moves `config/context_deferral.conf` to the common form.
+- `ReaderException(path, reads, reason, until)`: `reads` holds the base names of the config files the reader reads, or `*` for a path the code computes. The rows of `scripts/lib/user_zone.py`, `scripts/production/stall_watch.py` and `scripts/statusline/rebuild_row.py` have `reads=("*",)`; the `rust_release.py` row reads `lint.conf`. The tree test fails on a stale row and on a read of a file that no row lists.
+- The shell reader scan finds a line with `awk`, `cat`, `cut`, `grep`, `head`, `mapfile`, `rg`, `sed`, `source` or `tail`, or a `<` redirect, whose operand names a config file directly or through a variable assigned earlier in the file.
+- `check_format` reports each `.conf` line that is not blank, a comment, a `[section]` line or a `key=value` row. `test_repository_form` takes 6 to 12 s.
 
 **Acceptance gate:**
 - Each changed module's tests pass on `CONF_DIR` fixtures. `CONF_READ_LOG` shows each stem read.
 - `test_config_form.py` passes with the rows removed.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - The reply names the added cost of the cargo wrapper fast path and of the status line.
+- The sender test of `stall_watch.py` and the fail-open test of `repeat_guard.py` pass. The planted `jq --rawfile` row gives exactly one violation.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on `scripts/message/notifier.sh`, `scripts/build_hold/cargo` and `scripts/statusline/statusline.sh`.
 
 ### Phase 5 — Per-file config environment variables to CONF_DIR  · status: todo
@@ -256,19 +228,19 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 3. **Not a config file.** If a variable names a file outside `config/`, leave it. Move its allow list row to `permanent` with the reason "not a config file" and name it in the reply.
 4. **Runtime use.** If a variable carries a purpose beyond tests, keep that purpose and name it in the reply. Example to check first: `scripts/lib/models_registry.py` `_snapshot` (line 66) may pin a launched process to a registry snapshot through `MODELS_CONFIG_FILE`. A launched worker must read the same registry that it reads today. If the purpose needs the variable, keep the variable and move its row to `permanent` with the reason.
 5. `scripts/lib/models_registry.py` `registry_path` (line 262) is the one place that resolves the `models.conf` path. The other sources call it: `scripts/direct/assign.py`, `scripts/direct/pass_record.py`, `scripts/direct/assign_claude.py`, `scripts/direct/claude_worker.py`, `scripts/lib/waiting_rows.py`, `scripts/whoami/quota_alert.py`, `scripts/agents/models_config.sh`, `scripts/agents/sync_codex_catalog.sh`.
-6. Source files for the other variables: `COPIES_CONFIG` in `scripts/lib/build_folders.py` and `scripts/copies/copies.py`; `STAFF_CONFIG` in `scripts/production/staff.py`; `AWS_TARGET_CONFIG` in `scripts/aws_target/config.py`; `BUILD_TARGETS_CONFIG` in `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh`, `scripts/mac_test/mac_test.py` and `scripts/buildlog/record.py`; `SHOWRUNNERS_CONFIG` in `scripts/production/showrunners.py`; `LINT_CONFIG_FILE` in no source on the plan base: only test files set it (`scripts/build_queue/admission_test_support.py`, `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/review_launcher_test_support.py` and their tests). A test that writes `lint.conf` through it writes the fixture into `CONF_DIR`.
+6. Source files for the other variables: `COPIES_CONFIG` in `scripts/lib/build_folders.py` and `scripts/copies/copies.py`; `STAFF_CONFIG` in `scripts/production/staff.py`; `AWS_TARGET_CONFIG` in `scripts/aws_target/config.py`; `BUILD_TARGETS_CONFIG` in `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh`, `scripts/mac_test/mac_test.py` and `scripts/buildlog/record.py`; `SHOWRUNNERS_CONFIG` in `scripts/production/showrunners.py`; `LINT_CONFIG_FILE` in `scripts/lint/lint_config.sh` (line 22, reads and writes `lint.conf`) and `scripts/direct/verify.sh` (line 743, a build input), and in test files (`scripts/build_queue/admission_test_support.py`, `scripts/direct/assign_launcher_test_support.py`, `scripts/direct/review_launcher_test_support.py` and their tests). A test that writes `lint.conf` through it writes the fixture into `CONF_DIR`.
 7. Test files: list them with `grep -rlw <NAME> scripts`. On the plan base: `MODELS_CONFIG_FILE` 42 files, `COPIES_CONFIG` 20, `STAFF_CONFIG` 21, `AWS_TARGET_CONFIG` 4, `BUILD_TARGETS_CONFIG` 15, `SHOWRUNNERS_CONFIG` 13. `MODELS_CONFIG_PUBLISH=0` stays in tests (`scripts/direct/recorder_fixture.py:196-198`).
 8. Remove each removed variable from the allow list in `scripts/lib/config_form_exceptions.py`.
 
 **Files:**
 - `scripts/lib/models_registry.py`, `scripts/direct/assign.py`, `scripts/direct/pass_record.py`, `scripts/direct/assign_claude.py`, `scripts/direct/claude_worker.py`, `scripts/lib/waiting_rows.py`, `scripts/whoami/quota_alert.py`, `scripts/agents/models_config.sh`, `scripts/agents/sync_codex_catalog.sh`, `scripts/direct/recorder_fixture.py`
-- `scripts/lib/build_folders.py`, `scripts/copies/copies.py`, `scripts/production/staff.py`, `scripts/aws_target/config.py`, `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh`, `scripts/mac_test/mac_test.py`, `scripts/buildlog/record.py`, `scripts/production/showrunners.py`
+- `scripts/lib/build_folders.py`, `scripts/copies/copies.py`, `scripts/production/staff.py`, `scripts/aws_target/config.py`, `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh`, `scripts/mac_test/mac_test.py`, `scripts/buildlog/record.py`, `scripts/production/showrunners.py`, `scripts/lint/lint_config.sh`, `scripts/direct/verify.sh`
 - `scripts/**/test_*.py`, `scripts/**/*_test_support.py` — the files that set each variable (Spec item 7)
 - `scripts/lib/config_form_exceptions.py` — rows removed
 
 **Workers:** 2 writers — split by variable.
-- `impl` — `MODELS_CONFIG_FILE`: its sources, `scripts/direct/recorder_fixture.py` and its tests; hub: `scripts/lib/config_form_exceptions.py` (both slots remove rows)
-- `test` opens as impl — `COPIES_CONFIG`, `STAFF_CONFIG`, `AWS_TARGET_CONFIG`, `BUILD_TARGETS_CONFIG`, `SHOWRUNNERS_CONFIG`, `LINT_CONFIG_FILE`: their sources and tests
+- `impl` — `MODELS_CONFIG_FILE`: its sources, `scripts/direct/recorder_fixture.py` and its tests, and `scripts/direct/assign_launcher_test_support.py` with both of its fixture changes (`MODELS_CONFIG_FILE` and `LINT_CONFIG_FILE`); hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
+- `test` opens as impl — `COPIES_CONFIG`, `STAFF_CONFIG`, `AWS_TARGET_CONFIG`, `BUILD_TARGETS_CONFIG`, `SHOWRUNNERS_CONFIG`, `LINT_CONFIG_FILE`: their sources (with `scripts/lint/lint_config.sh` and `scripts/direct/verify.sh`) and tests, except `scripts/direct/assign_launcher_test_support.py`
 
 **State:** none
 
@@ -292,7 +264,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-0. **Wait.** Start only after nate's go for the eight-row move below, typed in this unit's session or sent by the showrunner as nate's words.
+0. **Wait.** Start only after nate's go for the eight-row move below, typed in this unit's session or sent by the showrunner as nate's words. If nate refuses this move, the `TAIL_BYTES` literal of item 8 returns to the production and direct batch with a new working name from bob.
 1. **New file.** Create `config/cli.conf` with these rows, values byte for byte from `config/models.conf`, one blank line between blocks:
 
    ```
@@ -330,6 +302,10 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
    # Largest sum of program file bytes that the hand made check reads; more is refused.
    # whole: 1..
    hand_made.max_script_bytes=65536
+
+   # Bytes of program output that the hand made check keeps for its offline review.
+   # whole: 1..
+   hand_made.output_tail_bytes=65536
    ```
 
    Rename map (full names): `[cli.codex] merge_branch` → `cli.merge_branch.codex.model`; `[cli.codex] interactive` → `cli.interactive.codex.model`; `[cli.claude] merge_branch` → `cli.merge_branch.claude.model`; `[cli.claude] interactive` → `cli.interactive.claude.model`; `[cli.hand_made] claude.model` → `cli.hand_made.claude.model`; `[cli.hand_made] claude.role` → `cli.hand_made.claude.role`; `[cli.hand_made] check_time_limit_seconds` → `cli.hand_made.check_time_limit_seconds`; `[cli.hand_made] max_script_bytes` → `cli.hand_made.max_script_bytes`.
@@ -337,7 +313,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 3. **Readers.**
    - `scripts/lib/models_registry.py` `launch_settings` (line 185): a `cli` key reads `conf.read("cli")` key `<task>.<family>.model`.
    - `scripts/agents/models_config.sh` (the resolver near line 640) and `scripts/cli_agent/cli_agent.sh`: read `conf_value cli <task>.<family>.model`.
-   - `scripts/production/hand_made.py` `read_settings` (lines 136-162): read `conf.read("cli")` keys `hand_made.claude.model`, `hand_made.claude.role`, `hand_made.check_time_limit_seconds`, `hand_made.max_script_bytes`. Remove the checks that the limit lines now make (model:effort form, role choice, number and more than 0). Keep the `model:effort` check of `hand_made.claude.model`: the `# agent: claude` limit accepts a bare model, and `scripts/notify/review.py` `structured_call` always passes `--effort`. Its refusal names the key: `cli.hand_made.claude.model must be model:effort`. Keep each refusal message clear; a `conf` limit error becomes a `Refused` with the key name. Remove `SECTION`.
+   - `scripts/production/hand_made.py` `read_settings` (lines 136-162): read `conf.read("cli")` keys `hand_made.claude.model`, `hand_made.claude.role`, `hand_made.check_time_limit_seconds`, `hand_made.max_script_bytes`. Remove the checks that the limit lines now make (model:effort form, role choice, number and more than 0). Keep the `model:effort` check of `hand_made.claude.model`: the `# agent: claude` limit accepts a bare model, and `scripts/notify/review.py` `structured_call` always passes `--effort`. Its refusal names the key: `cli.hand_made.claude.model must be model:effort`. Add no new limit form (showrunner, 11-23 19:37 PST). `/tune` accepts a bare model that this check refuses; that gap exists today and stays. Keep each refusal message clear; a `conf` limit error becomes a `Refused` with the key name. Remove `SECTION`.
 4. **Writer.** `/default_models` runs `scripts/agents/default_models.sh`, which lists and edits rows through `scripts/agents/models_config.sh` and `models_registry_edit`. For the `cli` task these paths read and write `config/cli.conf` rows `<task>.<family>.model`, not the `[cli.<family>]` sections:
    - listing: `default_models.sh` (line 41, `_models_config_section_values "$fn.$family"`) and `agents_list_function` (line 706);
    - one row: `agents_set_row` (line 1022);
@@ -348,18 +324,20 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 5. **Docs.** `commands/default_models.md`: the examples and the paragraph at lines 106-111 name `config/cli.conf` keys, not `[cli.claude]`. `commands/build/hand_made.md`: name `config/cli.conf`. `config/README.md`: rule 6 adds "`# agent: claude` or `# agent: codex` checks an `agent[:effort]` value against that family in `config/models.conf`."; rule 11 adds "The `cli` rows live in `config/cli.conf`."; the `## models.conf` section drops the cli rows; add a `## cli.conf` section with the key form `<tool>.<family>.<field>` or `<tool>.<setting>`, and "A new CLI tool copies a block and changes `<tool>`; it adds a `.role` row only when its code reads one."
 6. **Tests.** Fixtures write `cli.conf` in `CONF_DIR`: `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/production/test_hand_made.py` and the other `scripts/production/test_hand_made_*.py` that build a registry, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`. Add cases through `default_models.sh`: `/default_models cli.merge_branch sonnet` writes `merge_branch.claude.model` in `cli.conf`; the status listing shows the `cli` rows; `/default_models cli claude` changes only `[assignments] cli`; a model replace across functions changes the matching `cli.conf` rows; a value with a line separator is refused and leaves both files unchanged; `hand_made.claude.model=opus` (no effort) is refused by the hand made reader with the key name.
 7. **Proof.** Record `bash scripts/cli_agent/cli_agent.sh --status` before the change. After the change it prints the same agents.
+8. **Output tail.** `scripts/production/hand_made_limit.py` `TAIL_BYTES` (line 44, `64 * 1024`) becomes the `hand_made.output_tail_bytes=65536` row above (bob's working name `cli.hand_made.output_tail_bytes`), read at use. Its `TunableLiteral` row (batch "config/cli.conf") leaves the inventory. No test reads the live value; each test writes its own fixture config.
 
 **Files:**
 - `config/cli.conf` — new
 - `config/models.conf` — `[cli.*]` sections removed
 - `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`
-- `scripts/production/hand_made.py`
+- `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`
+- `scripts/lib/config_form_exceptions.py` — the `TAIL_BYTES` row removed
 - `commands/default_models.md`, `commands/build/hand_made.md`, `config/README.md`
 - `scripts/whoami/quota_alert_test_support.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/production/test_hand_made.py`, `scripts/production/test_hand_made_guest.py`, `scripts/production/test_hand_made_limit.py`, `scripts/production/test_hand_made_mac.py`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`
 
 **Workers:** 2 writers — the launcher side and the hand made side.
 - `impl` — `config/cli.conf`, `config/models.conf`, `scripts/lib/models_registry.py`, `scripts/agents/models_config.sh`, `scripts/agents/default_models.sh`, `scripts/cli_agent/cli_agent.sh`, `commands/default_models.md`, `config/README.md`, `scripts/lib/test_models_registry.py`, `scripts/lib/test_models_registry_fixture.py`, `scripts/agents/test_agent_exec.py`, `scripts/agents/test_agent_exec.sh`, `scripts/whoami/quota_alert_test_support.py`; hub: `config/cli.conf` (both sides read it)
-- `test` opens as impl — `scripts/production/hand_made.py`, `commands/build/hand_made.md`, `scripts/production/test_hand_made*.py`
+- `test` opens as impl — `scripts/production/hand_made.py`, `scripts/production/hand_made_limit.py`, `scripts/lib/config_form_exceptions.py`, `commands/build/hand_made.md`, `scripts/production/test_hand_made*.py`
 
 **State:** none
 
@@ -417,7 +395,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `scripts/lib/config_form_exceptions.py`, `config/README.md`
 
 **Workers:** 2 writers — split by file pair.
-- `impl` — the `agent_notes` and `herdr_upkeep` files and their readers and tests; hub: `scripts/lib/config_form_exceptions.py` (both slots remove rows)
+- `impl` — the `agent_notes` and `herdr_upkeep` files and their readers and tests; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
 - `test` opens as impl — the `session_retries` and `accounts` files and their readers and tests, `config/README.md`
 
 **State:** none
@@ -448,7 +426,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 3. **Readers first.** Confirm how each reader reads its file. Candidates from a plan-base scan (confirm each): `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/limits_view.py`, `scripts/lint/memory_admit.py`, `scripts/worktree/worktrees.py`, `scripts/astra/design_roles.py`, `scripts/herdr/worker_panes.py`, `scripts/buildlog/rust_release.py`, `scripts/build_targets/build_targets.py`, `scripts/buildlog/report.py`, `scripts/mac_test/eligibility.py`, `scripts/history/rounds.py`, `scripts/style/style_plan.py`. A reader that reads by section changes to `conf.read` on the same key.
 4. **design_roles.** `scripts/astra/design_roles.py` uses `configparser`. It changes to `conf.read("design_roles")` keys `host` and `new_open`. `host` keeps both uses: routing and the local authority check. `new_open` gets the limit line `# one of: true, false`; the code reads `true` as open. Today `getboolean(..., fallback=True)` (line 825) also accepts `yes`, `on` and `1` and opens when the key is missing; after the change a missing or other value is a `conf.read` refusal, with Git recovery, like every key (rule 7: no default in code). The live value is `true`, so behavior stays the same. Remove `DESIGN_ROLES_CONFIG`; tests use `CONF_DIR`, and `scripts/astra/design_role_test_support.py` writes the fixture.
 5. **Proof.** Before the change, a script reads every key of each file with `conf.read` and with each section-aware reader, and saves the values. After the change the same script gives the same values.
-6. Remove the seven files from the sections allow list, and `design_roles.py` and `DESIGN_ROLES_CONFIG` from the reader and variable allow lists.
+6. Remove the seven files from the sections allow list. Replace the `design_roles.py` reader row with a `PERMANENT` row for `designer.md` only: line 710 still reads `config/design_roles/designer.md` as data. Remove `DESIGN_ROLES_CONFIG` from `VARIABLE_EXCEPTIONS`.
 7. **README.** Update the sections of `config/README.md` that show these files with `[section]` lines (for example `## lint.conf`).
 
 **Files:**
@@ -459,7 +437,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Workers:** 2 writers — split by file group.
 - `impl` — `config/build_admission.conf`, `config/build_folders.conf`, `config/build_steps.conf`, `config/lint.conf` and their readers and tests
-- `test` opens as impl — `config/gate_rename_deploy.conf`, `config/copies.conf`, `config/design_roles.conf`, `scripts/astra/design_roles.py`, `scripts/astra/design_role_test_support.py`, `scripts/herdr/worker_panes.py` and their tests, `config/README.md`; hub: `scripts/lib/config_form_exceptions.py` (both slots remove rows)
+- `test` opens as impl — `config/gate_rename_deploy.conf`, `config/copies.conf`, `config/design_roles.conf`, `scripts/astra/design_roles.py`, `scripts/astra/design_role_test_support.py`, `scripts/herdr/worker_panes.py` and their tests, `config/README.md`; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
 
 **State:** none
 
@@ -485,7 +463,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-1. **Files.** The `FileException` rows of `COMMENT_LIMIT_FILES` in `scripts/lib/config_form_exceptions.py` at the phase start. After Phase 1 there were 16 files and 207 violations: `config/build_folders.conf` 49, `config/build_steps.conf` 49, `config/console.conf` 35, `config/models.conf` 30, `config/copies.conf` 10, `config/send_repeat_guard.conf` 9, `config/statusline.conf` 7, `config/build_targets.conf` 4, `config/stall_watch.conf` 4, `config/aws_target.conf` 2, `config/design_roles.conf` 2, `config/mac_linux.conf` 2, `config/lint.conf` 1, `config/memory_feed.conf` 1, `config/notify.conf` 1, `config/production.conf` 1. Phases 6 and 8 remove some. List the lines with `check_comment_limits` from `scripts/lib/test_config_form.py`.
+1. **Files.** The `FileException` rows of `COMMENT_LIMIT_FILES` in `scripts/lib/config_form_exceptions.py` at the phase start. After Phase 1 there were 16 files and 207 violations: `config/build_folders.conf` 49, `config/build_steps.conf` 49, `config/console.conf` 35, `config/models.conf` 30, `config/copies.conf` 10, `config/send_repeat_guard.conf` 9, `config/statusline.conf` 7, `config/build_targets.conf` 4, `config/stall_watch.conf` 4, `config/aws_target.conf` 2, `config/design_roles.conf` 2, `config/mac_linux.conf` 2, `config/lint.conf` 1, `config/memory_feed.conf` 1, `config/notify.conf` 1, `config/production.conf` 1. Phases 4, 6 and 8 remove some. List the lines with `check_comment_limits` from `scripts/lib/test_config_form.py`.
 2. **Comments.** Put a comment line above each key block that has none. It says what the keys control; read the reader code to say it. Keep one blank line between blocks (rule 12).
 3. **Limits.** Put a `# whole: A..B` or `# range: A..B` line directly above each key whose value is a number. Put `# one of: a, b` above a key whose reader accepts a closed set of words. The limit states what the reader accepts today; read its checks. When the reader checks nothing, use the limit the code needs to work, for example `# whole: 1..` for a count, and name each such choice in the reply. Every live value passes its limit.
 4. **No key or value changes.** `git diff -U0 -- config/` adds only comment lines and blank lines. A limit line on an existing wait-time key states today's check; it adds no key and no name (Delegation Context wait-limit invariant).
@@ -509,12 +487,12 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `conf.py` reads a limit line only directly above its key and checks the value on each read, so a wrong limit makes the read fail.
 - Phase 1: the registry writers apply `registry_rows.space_groups` on each write.
 - Phase 2: `# agent: claude` and `# agent: codex` are limit kinds for agent values.
-- Phase 6 removed the `[cli.*]` sections from `config/models.conf`. Phase 8 put `# <section>` comments in place of the `[section]` lines of five of these files, and removed the rows of the files that it made pass.
+- Phase 4 put limit lines in `config/notify.conf` and `config/send_repeat_guard.conf`. Phase 6 removed the `[cli.*]` sections from `config/models.conf`. Phase 8 put `# <section>` comments in place of the `[section]` lines of five of these files, and removed the rows of the files that it made pass.
 
 **Acceptance gate:**
 - `test_config_form.py` passes, and `COMMENT_LIMIT_FILES` is gone.
 - `git diff -U0 -- config/` shows only added comment and blank lines.
-- A script reads each changed stem with `conf.read`, and each read succeeds on the live values.
+- A script reads each changed ordinary stem with `conf.read`, and each read succeeds on the live values. `config/models.conf` is checked by section through the model registry reader.
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file; `bash -n` passes on each changed shell file.
 
@@ -527,13 +505,13 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-0. **Wait.** The merge waits for bob's working names of this batch's new keys (the inventory tables from Phase 3), sent by the showrunner. The work can start before it.
+0. **Names.** The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST). The batch merges with them; nate reviews the names later, and a later change is a rename.
 1. Batch folders: `scripts/buildlog`, `scripts/build_queue`, `scripts/build_targets`, `scripts/build_hold`, `scripts/mac_test`, `scripts/lint`, `scripts/copies`.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the working name that bob sent through the showrunner.
+2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply.
 3. The code reads the key with `conf.read(stem)` at use. Delete the constant. A value that a function default or a module-level object used now comes from the read at use.
 4. Values stay the same. A move of an unchanged value needs no value approval; the new name uses bob's working name.
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. Tests that patched a constant now write the key in a `CONF_DIR` fixture.
+6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
@@ -541,7 +519,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `config/*.conf` — the stems that get keys
 
 **Workers:** 2 writers — split by folder.
-- `impl` — `scripts/buildlog`, `scripts/build_queue`, `scripts/copies` and their stems; hub: `scripts/lib/config_form_exceptions.py` (both slots remove rows)
+- `impl` — `scripts/buildlog`, `scripts/build_queue`, `scripts/copies` and their stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
 - `test` opens as impl — `scripts/build_targets`, `scripts/build_hold`, `scripts/mac_test`, `scripts/lint` and their stems
 
 **State:** none
@@ -565,13 +543,13 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-0. **Wait.** The merge waits for bob's working names of this batch's new keys, sent by the showrunner. The work can start before it.
+0. **Names.** The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST). The batch merges with them; nate reviews the names later, and a later change is a rename.
 1. Batch folders: `scripts/notify`, `scripts/message`, `scripts/hooks`, `scripts/usage`, `scripts/whoami`, `scripts/maintenance`. Examples from P807: `scripts/notify/auto_silence.py:54` `JOB_TIMEOUT_SECONDS = 300`. `scripts/notify/pushover.py:79` `TITLE_MAX` is `external` and stays.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the working name that bob sent through the showrunner.
+2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply.
 3. The code reads the key with `conf.read(stem)` at use. Delete the constant.
 4. Values stay the same.
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. Tests that patched a constant now write the key in a `CONF_DIR` fixture.
+6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 7. Hooks run on each tool call. A hook reads its key once for each run, never at import.
 
 **Files:**
@@ -580,7 +558,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `config/*.conf` — the stems that get keys
 
 **Workers:** 2 writers — split by folder.
-- `impl` — `scripts/notify`, `scripts/message`, `scripts/maintenance` and their stems; hub: `scripts/lib/config_form_exceptions.py` (both slots remove rows)
+- `impl` — `scripts/notify`, `scripts/message`, `scripts/maintenance` and their stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
 - `test` opens as impl — `scripts/hooks`, `scripts/usage`, `scripts/whoami` and their stems
 
 **State:** none
@@ -605,13 +583,13 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-0. **Wait.** The merge waits for bob's working names of this batch's new keys, sent by the showrunner. The work can start before it.
+0. **Names.** The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST). The batch merges with them; nate reviews the names later, and a later change is a rename.
 1. Batch folders: `scripts/aws_target`, `scripts/review_links`, `scripts/style`, `scripts/screen_record`, `scripts/shot_report`, and each folder that no other batch names.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the working name that bob sent through the showrunner.
+2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply.
 3. The code reads the key with `conf.read(stem)` at use. Delete the constant.
 4. Values stay the same.
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
-6. Tests that patched a constant now write the key in a `CONF_DIR` fixture.
+6. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
@@ -619,7 +597,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - `config/*.conf` — the stems that get keys
 
 **Workers:** 2 writers — split by folder.
-- `impl` — `scripts/aws_target`, `scripts/review_links` and their stems; hub: `scripts/lib/config_form_exceptions.py` (both slots remove rows)
+- `impl` — `scripts/aws_target`, `scripts/review_links` and their stems; hub: `scripts/lib/config_form_exceptions.py` (this slot owns every edit to it; the other slot sends its row removals here)
 - `test` opens as impl — `scripts/style`, `scripts/screen_record`, `scripts/shot_report`, the other folders of the batch, and their stems
 
 **State:** none
@@ -643,14 +621,14 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Spec:**
 
-0. **Wait.** Start only after item 229 is on main (`scripts/production/the_list.py`, `config/the_list.conf`) and devtools phases busywrite and rundone are on main (`scripts/production/worker.py`, `scripts/direct/assign.py`, `scripts/agents/detached_runs.py`). Merge main first. The merge waits for bob's working names of this batch's new keys, sent by the showrunner.
+0. **Wait.** Start only after item 229 is on main (`scripts/production/the_list.py`, `config/the_list.conf`) and devtools phases busywrite and rundone are on main (`scripts/production/worker.py`, `scripts/direct/assign.py`, `scripts/agents/detached_runs.py`). Merge main first. The `TunableLiteral` rows hold bob's working names (11-23 19:17 PST); the batch merges with them.
 1. Batch folders: `scripts/production`, `scripts/direct`, `scripts/herdr`, `scripts/agents`, `scripts/accounts`, `scripts/worktree`, `scripts/bevy_upgrade`, `scripts/history`, `scripts/orphans`, `scripts/prioritize`, `scripts/lib`. Examples from P807: `scripts/direct/phase_reservation.py:114` `CHECK_TIMEOUT_SECONDS = 90`, `scripts/production/worker_capacity.py:37` `LOCK_WAIT_SECONDS = 60`.
-2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the working name that bob sent through the showrunner. A List key uses the key form that item 229 put on main for `config/the_list.conf`.
+2. For each `tunable` row of this batch in `scripts/lib/config_form_exceptions.py`: add the key to its stem with a comment that says what it controls and its limit line, one blank line between blocks. Use the stem and key of the row. The config text is the numeric result of `TunableLiteral.value` (`1 << 20` is `1048576`); check that the typed reader returns the original number. A literal of the batch that is a wait limit stays in the code for item 277; name it in the reply. A List key uses the key form that item 229 put on main for `config/the_list.conf`.
 3. The code reads the key with `conf.read(stem)` at use. Delete the constant.
 4. Values stay the same.
 5. Remove the moved rows from the allow list. `external` and `internal` rows stay.
 6. **the_list.conf.** Insert one blank line before each comment line that directly follows a key row in `config/the_list.conf`. Change nothing else. Before the row goes, run the item 229 writer (`listadd`, `scripts/production/the_list.py`) on a fixture copy and run `check_blank_lines` on its output. If the writer breaks the form, fix the writer and add a test row that runs it and then `check_blank_lines`. Remove its row from the blank-line allow list. Remove the absent-file case for `config/the_list.conf` from the stale-row loop of `test_repository_form` in `scripts/lib/test_config_form.py`.
-7. Tests that patched a constant now write the key in a `CONF_DIR` fixture.
+7. Tests that patched a constant now write the key in a `CONF_DIR` fixture. No test reads the live value of a moved key; each test writes its own fixture config.
 
 **Files:**
 - `scripts/lib/config_form_exceptions.py` — the batch rows name each source file; the rows leave the list
@@ -670,6 +648,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - Phase 3 wrote the literal inventory; each `tunable` row of batch "Production and direct literals to config" holds the proposed stem, key, limit line.
 - Phase 1 put `config/the_list.conf` on the blank-line allow list. `test_repository_form` does not report that row as stale while the file is absent; that case is code in the test, near the stale-row check of the file exceptions.
 - Phase 5 changed `scripts/direct/assign.py`, `scripts/direct/claude_worker.py` and `scripts/production/staff.py` for `CONF_DIR`.
+- The `TAIL_BYTES` row of `scripts/production/hand_made_limit.py` belongs to the `config/cli.conf` phase (Phase 6), not to this batch.
 
 **Acceptance gate:**
 - Each changed module's tests pass.
@@ -688,13 +667,12 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 1. **Paths.** `accounts.json` and `accounts.lock` go to `~/.local/state/accounts/`. No code uses `config/showrunners.lock`: `scripts/production/showrunners.py` keeps its state under `scripts/lib/showrunner_state.state_root()`. Remove the `/config/showrunners.lock` line from `.gitignore`, and delete a stale `config/showrunners.lock` on each machine in the live check. If the area already keeps state in another `~/.local/state/` folder, use that folder and name it in the reply.
 2. **Readers and writers.** Find each with `grep -rln 'accounts\.json\|accounts\.lock\|showrunners\.lock' scripts`. On the plan base, `accounts.json` appears in `scripts/accounts/worker_names.py`, `scripts/whoami/quota_alert_test_support.py` and `scripts/agents/codex_test_support.py`; `scripts/accounts/accounts.py` owns the lock. One function gives each path.
-3. **Switch.** At no time may two live processes use different paths for the same lock or state file. A short lock hold does not prevent this, and a reader that caches the role map can return old data. The switch:
-   1. While `config/accounts.lock` exists, the new code takes the old lock first and then the new lock, so old and new code serialize on the old lock. It never creates the old lock file.
-   2. Under both locks, when the new `accounts.json` is missing, the new code moves the old file to the new path with an atomic rename.
-   3. A reader that caches the role map reads it again after the move.
-   4. The live check runs after both machines pull and every long-lived process that reads accounts restarts. Then it deletes `config/accounts.lock`, and the new code takes only the new lock.
+3. **Switch.** At no time may two live processes use different paths for the same lock or state file. A process started before the merge reads the old path without the new lock (`_local_role_map`), and it reads a missing file as an empty role map. So the file moves only after no such process runs:
+   1. One function gives the live state path: the new path when it exists, else the old path. The lock follows the live file: `config/accounts.lock` while the old file is live, the new lock after. After the code takes a lock, it checks that its file is still the live one; if not, it releases the lock and resolves the path again.
+   2. The move is one command in `scripts/accounts/accounts.py`. The live check runs it after both machines pull and every long-lived process that reads accounts restarts. Under the old lock it renames the old file to the new path, then deletes `config/accounts.lock`.
+   3. A reader that caches the role map reads it again when the live path changes.
 
-   Tests: the same worker account selection before and after the move; a fresh write after the move takes the new lock and writes the new path; with the old lock held, the new code waits.
+   Tests: the same worker account selection before and after the move; before the move a write takes the old lock and writes the old path; after the move a write takes the new lock and writes the new path; a writer that waits on the old lock during the move resolves the new path after it.
 4. **Cleanup.** After the switch, no old file stays in `config/`. Remove `config/accounts.json` from `.gitignore` (line 23 on the plan base) when nothing writes it.
 5. **Format rule.** The form test's format check also fails on a `.json` or `.lock` runtime file in `config/` on disk that is not tracked. Test: a fixture Git checkout with an untracked `config/x.json` and `config/x.lock`; the repository check finds both by itself, with no path given by the test.
 6. **Live check.** After the merge and the Mac pull, the director checks on natedev and the Mac that the accounts table reads, the worker account selection is unchanged, and no `config/accounts.json`, `config/accounts.lock` or `config/showrunners.lock` remains.
@@ -721,3 +699,42 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 - The live check of Spec item 6 passes on both machines.
+
+### Phase 15 — Context deferral rules to the common form  · status: todo
+**Depends on:** Phase 4
+
+#### Work Order
+
+**Goal:** `config/context_deferral.conf` holds only the `window` key as a commented, limit-checked `key=value` row, the hook's phrase patterns live in a data file, and the hook reads `window` through `conf.read`.
+
+**Spec:**
+
+0. **Wait.** Start only after nate's go for this move (Move 4 of the question; showrunner, 11-23 19:16 PST), typed in this unit's session or sent by the showrunner as nate's words.
+1. **window.** `config/context_deferral.conf` keeps one row, `window=200`, with its comment and the limit line `# whole: 1..`. The key name and the value stay.
+2. **Patterns.** The `action`, `marker`, `state`, `later` and `exclude` rows move with their comments, in order and byte for byte, to the data file `config/context_deferral_patterns.txt` (rule 10). Each line is `<kind>: <regular expression>`; a kind can repeat.
+3. **Reader.** `scripts/hooks/stop-context-deferral.py` (line 44 reads `conf.path("context_deferral")` by hand) reads `window` with `conf.read("context_deferral").whole("window")` at use. It parses the pattern file as data from the same folder (`conf.directory()`), so a test sets both with `CONF_DIR`. The hook runs on each stop: time it before and after, and name the added cost in the reply.
+4. **Allow lists.** Remove the `FORMAT_FILES` row of `config/context_deferral.conf`. Replace the `stop-context-deferral.py` reader row with a `PERMANENT` row that reads `context_deferral_patterns.txt` as data. Add `config/context_deferral_patterns.txt` to `DATA_FILES`.
+5. **README.** Update the `## context_deferral.conf` section of `config/README.md` (line 159), and name the data file.
+6. **Tests.** `scripts/hooks/test_stop_context_deferral.py` writes `context_deferral.conf` with `write_config_fixture` and a pattern file in `CONF_DIR`. The same transcripts give the same decisions before and after.
+
+**Files:**
+- `config/context_deferral.conf`, `config/context_deferral_patterns.txt` — new data file
+- `scripts/hooks/stop-context-deferral.py`, `scripts/hooks/test_stop_context_deferral.py`
+- `scripts/lib/config_form_exceptions.py`, `config/README.md`
+
+**Workers:** 1 writer + 1 tester — the hook and its data are one change.
+- `impl` — `config/context_deferral.conf`, `config/context_deferral_patterns.txt`, `scripts/hooks/stop-context-deferral.py`, `config/README.md`; hub: `scripts/lib/config_form_exceptions.py`
+- `test` — `scripts/hooks/test_stop_context_deferral.py`: the fixture form and the before-and-after decision rows
+
+**State:** none
+
+**Constraints from prior phases:**
+- Phase 3 put `config/context_deferral.conf` on `FORMAT_FILES` and `scripts/hooks/stop-context-deferral.py` on the reader allow list (`reads=("context_deferral.conf",)`), both with `RemoveInPhase("Context deferral rules to the common form")`.
+- Phase 4 made `conf.read` the reader pattern; tests use `CONF_DIR` with `write_config_fixture`.
+- Phase 1 rules: a limit line directly above each number key; a blank line between blocks. `check_format` reports a `.conf` line that is not blank, a comment, a section line or a `key=value` row.
+
+**Acceptance gate:**
+- The hook tests pass, and the same transcripts give the same decisions.
+- `test_config_form.py` passes with the `FORMAT_FILES` row removed.
+- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
+- basedpyright reports zero errors and zero warnings on each changed Python file.
