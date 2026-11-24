@@ -33,7 +33,7 @@ from typing import ClassVar, cast, override
 
 from scripts.lint import memory_admit as gate
 
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
+from scripts.lint.memory_test_support import admission_policy_fixture, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
@@ -401,10 +401,9 @@ class AdmissionFixture(ExitStack):
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        if configuration := os.environ.get("CONF_DIR"):
-            _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         try:
+            self.enter_context(mock.patch.dict(os.environ, gate_isolation_environment(self.root)))
             self.temporary: Path = self.root / "tmp"
             self.temporary.mkdir(parents=True, exist_ok=True)
             # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
@@ -427,7 +426,7 @@ class AdmissionFixture(ExitStack):
                        "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
                       if (self.root / "meminfo").exists() else fake_memory_readings(
                           self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
-            environment = {**gate_isolation_environment(self.root), **memory,
+            environment = {**memory,
                 "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
                 "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
                 "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),

@@ -650,11 +650,34 @@ class CargoFolderTests(unittest.TestCase):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_saved_placement_rejects_missing_assignment(self) -> None:
+        state = service.ServiceState({}, {}, {}, records.ReadyToStart(), current_assignments={"episode": "attempt"})
+        with self.assertRaisesRegex(ValueError, "missing assignment"):
+            _ = service.parse_service_state(wire.encode_record(state))
+
     def test_scaler_reconciles_only_pending_expired_bookings_on_the_worker(self) -> None:
         self.check_worker_reconcile(guest=False)
 
     def test_mac_linux_reconciles_only_pending_held_attempts_on_the_worker(self) -> None:
         self.check_worker_reconcile(guest=True)
+
+    def test_guest_reconcile_checks_slot_after_resolving_method(self) -> None:
+        reconcile = mock.Mock()
+        slot_released = threading.Event()
+
+        class Provider:
+            settlement: mock.Mock = mock.Mock(return_value=placement.Pending("guest end unknown"))
+
+            @property
+            def reconcile_unproven(self) -> mock.Mock:
+                slot_released.set()
+                return reconcile
+
+        with mock.patch.object(service, "mac_linux_provider", return_value=Provider()):
+            result = service.guest_settlement("episode", 1, holds_slot=lambda: not slot_released.is_set())
+        self.assertIsInstance(result, placement.DispatchPathPending)
+        self.assertTrue(slot_released.is_set())
+        reconcile.assert_not_called()
 
     def check_worker_reconcile(self, *, guest: bool) -> None:
         class SingleReadWorker(service.HostEvidenceWorker):
@@ -669,13 +692,13 @@ class PlacementTests(unittest.TestCase):
                 reading.set()
 
         pending = placement.Pending("launch unknown")
-        for result, supports_reconcile, release_slot, expected_calls in (
+        for result, supports_reconcile, report_during_read, expected_calls in (
                 (pending, True, False, 1),
                 (placement.Settled(), True, False, 0),
                 (pending, False, False, 0),
-                (pending, True, True, 0)):
+                (pending, True, True, int(guest))):
             with (self.subTest(result=result, supports_reconcile=supports_reconcile,
-                               release_slot=release_slot),
+                               report_during_read=report_during_read),
                   PlacementFixture(private_child_starts=True) as fixture):
                 request = mac_linux_and_natedev_request(fixture) if guest else scaler_gate_request(fixture)
                 key = publish_candidate(fixture, request).key
@@ -694,7 +717,7 @@ class PlacementTests(unittest.TestCase):
                     reconcile_threads.append(threading.current_thread())
 
                 def read_settlement(_episode: str, _attempt: int) -> placement.Pending | placement.Settled:
-                    if release_slot:
+                    if report_during_read:
                         reading.set()
                         guard.event(released)
                     return result
@@ -712,7 +735,7 @@ class PlacementTests(unittest.TestCase):
                         _ = fixture.run_pass()
                     worker = fixture.server.host_readers[key].worker
                     assert isinstance(worker, SingleReadWorker)
-                    if release_slot:
+                    if report_during_read:
                         try:
                             guard.event(reading)
                             outcome = placement.AttemptCompleted(0) if guest else placement.AttemptDeclined("ended")
@@ -720,7 +743,7 @@ class PlacementTests(unittest.TestCase):
                                 execution_identity.ExecutionNotStarted(), outcome,
                                 placement.DispatchPathSettled())
                             _ = fixture.server.handle_request(report)
-                            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                            self.assertEqual(assignment.episode in fixture.server.current_assignments, guest)
                         finally:
                             released.set()
                     guard.join(worker.thread)
@@ -730,6 +753,38 @@ class PlacementTests(unittest.TestCase):
                 if expected_calls:
                     reconcile.assert_called_once_with(*exact_attempt)
                     self.assertEqual(reconcile_threads, [worker.thread])
+
+    def test_guest_settlement_refuses_unused_permission(self) -> None:
+        for owner_exits in (False, True):
+            with self.subTest(owner_exits=owner_exits), PlacementFixture(private_child_starts=True) as fixture:
+                request = mac_linux_and_natedev_request(fixture)
+                _ = publish_candidate(fixture, request)
+                guest = assignment_for(fixture, request)
+                probe = wire.SettlementRequest(guest)
+                self.assertIsInstance(fixture.server.handle_request(probe)[0], wire.Refused)
+                if owner_exits:
+                    fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+                    _ = fixture.run_pass()
+                    self.assertNotIn(guest.episode, fixture.server.current_assignments)
+                else:
+                    holder = guest_gate(fixture, guest)
+                    self.assertIsInstance(consume_guest_permission(fixture, guest, holder)[0], wire.FirstAuthorization)
+                    self.assertIsInstance(fixture.server.handle_request(probe)[0], wire.Ok)
+
+    def test_restart_clears_legacy_settlement_on_unused_guest_permission(self) -> None:
+        with PlacementFixture(private_child_starts=True) as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            _ = publish_candidate(fixture, request)
+            guest = assignment_for(fixture, request)
+            key = execution_identity.attempt_key(guest.episode, guest.attempt)
+            saved = fixture.server.assignments[key]
+            legacy = placement.TerminalAttemptReport(service.GUEST_SETTLEMENT_REQUESTED,
+                placement.DispatchPathPending("launch settlement is pending"), fixture.clock.now())
+            fixture.server.assignments[key] = replace(saved, terminal_report=legacy)
+            fixture.server.persist()
+            fixture.restart()
+            holder = guest_gate(fixture, guest)
+            self.assertIsInstance(consume_guest_permission(fixture, guest, holder)[0], wire.FirstAuthorization)
 
     def test_pending_scaler_settlement_blocks_reassignment_across_restart(self) -> None:
         with PlacementFixture(private_child_starts=True) as fixture:
@@ -886,7 +941,7 @@ class PlacementTests(unittest.TestCase):
                         self.assertIsInstance(server.handle_request(report, service.Connection(outbound))[0],
                                               wire.DispatchStatus)
                         persist.assert_called_once()
-                self.assertNotIn(assignment.episode, server.current_assignments)
+                self.assertEqual(assignment.episode in server.current_assignments, guest)
 
     def test_gate_uses_guest_when_local_waits_and_aws_has_no_quota(self) -> None:
         for mode in ("allowed", "fixed exclusion", "Mac block"):
@@ -1048,6 +1103,14 @@ class PlacementTests(unittest.TestCase):
                 with PlacementFixture():
                     pass
             self.assertEqual(list(Path(outside).iterdir()), [])
+
+    def test_a_placement_fixture_uses_only_its_own_configuration(self) -> None:
+        with TemporaryDirectory() as outside:
+            inherited = Path(outside) / "not-a-directory"
+            _ = inherited.write_text("fixture")
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}), PlacementFixture() as fixture:
+                self.assertEqual(conf.directory(), fixture.root)
+            self.assertEqual(list(Path(outside).iterdir()), [inherited])
 
     def test_gate_constraints_name_the_guest_and_natedev(self) -> None:
         from scripts.build_targets import build_targets
@@ -1591,7 +1654,7 @@ class PlacementTests(unittest.TestCase):
     def test_ending_a_remote_start_releases_only_the_heads_claim(self) -> None:
         hold_seconds = 600
         deadline_cases = ("deadline with a newer slot", "deadline with no initial claim")
-        for ending in (*deadline_cases, "lost local eligibility", "missing assignment"):
+        for ending in (*deadline_cases, "lost local eligibility", "cancelled assignment"):
             with self.subTest(ending=ending), PlacementFixture() as fixture:
                 fixture.configure(remote_start_hold_seconds=hold_seconds)
                 run = fixture.run_owner()
@@ -1630,9 +1693,10 @@ class PlacementTests(unittest.TestCase):
                     reply, = fixture.connect(retry).replies()
                     self.assertIsInstance(reply, wire.Assignment)
                 else:
-                    key = execution_identity.attempt_key(remote.episode, remote.attempt)
-                    del fixture.server.assignments[key]
+                    cancel = wire.CancelPlacement("cancel", head.episode, head.owner, "coordinator cancelled")
+                    self.assertIsInstance(fixture.server.handle_request(cancel)[0], wire.Ok)
                     _ = fixture.run_pass()
+                    self.assertNotIn(head.episode, fixture.server.current_assignments)
 
                 self.assertNotIn(head.episode, fixture.server.waiters)
                 if slot_key:
@@ -1889,9 +1953,12 @@ class PlacementTests(unittest.TestCase):
         # The gate ends before copies.py reports the claim failure. The last system reading can still show the gate.
         from scripts.build_queue.test_admission_service import FixedSystemReader
 
-        with PlacementFixture() as fixture:
+        settle = mock.Mock(return_value=placement.Pending("guest end unknown"))
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(settlement=settle)),
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             request = mac_linux_and_natedev_request(fixture)
-            _ = publish_candidate(fixture, request)
+            key = publish_candidate(fixture, request).key
             assignment = assignment_for(fixture, request)
             gate_process = guest_gate(fixture, assignment)
             granted, = consume_guest_permission(fixture, assignment, gate_process)
@@ -1909,13 +1976,26 @@ class PlacementTests(unittest.TestCase):
             fixture.server.system_reader = FixedSystemReader(reading)
             settled, = fixture.server.handle_request(wire.ClaimFailure("gate-ended", assignment, MAC_LINUX_NO_ANSWER))
             assert isinstance(settled, wire.DispatchStatus), settled
-            self.assertEqual(settled.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(settled.state, placement.CurrentAssignment())
             self.assertIsInstance(settled.permission, placement.PermissionConsumed)
             self.assertEqual(settled.retry, placement.RetryAt(fixture.clock.now()))
-            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            settle.assert_called_once_with(assignment.episode, int(assignment.attempt, 16))
+            _ = fixture.run_pass()
+            self.assertIn(assignment.episode, fixture.server.current_assignments)
+            settle.return_value = placement.Settled()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
+            attempt_key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            self.assertNotEqual(fixture.server.current_assignments.get(assignment.episode), attempt_key)
+            saved = fixture.server.assignments[attempt_key]
+            self.assertEqual(saved.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
 
     def test_guest_execution_outlives_holder_and_arbitrary_refusal_keeps_assignment(self) -> None:
-        with PlacementFixture() as fixture:
+        with PlacementFixture(private_child_starts=True) as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
@@ -1937,7 +2017,10 @@ class PlacementTests(unittest.TestCase):
             self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
 
     def test_observed_guest_survives_both_owners_until_settlement(self) -> None:
-        with PlacementFixture() as fixture:
+        settle = mock.Mock(return_value=placement.Pending("guest end unknown"))
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(settlement=settle)),
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
@@ -1961,8 +2044,21 @@ class PlacementTests(unittest.TestCase):
                 placement.AttemptCompleted(0), placement.DispatchPathSettled())
             reply, = fixture.server.handle_request(settled)
             assert isinstance(reply, wire.DispatchStatus), reply
-            self.assertEqual(reply.state, placement.ClosedAssignment("completed"))
+            self.assertEqual(reply.state, placement.CurrentAssignment())
+            _ = fixture.run_pass()
+            key = fixture.server.host_evidence_key(request, assignment.destination)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            settle.assert_called_once_with(assignment.episode, int(assignment.attempt, 16))
+            _ = fixture.run_pass()
+            self.assertIn(assignment.episode, fixture.server.current_assignments)
+            settle.return_value = placement.Settled()
+            self.assertEqual(worker.probe_next(), key)
+            _ = fixture.run_pass()
             self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+            saved = fixture.server.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
+            self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
 
     def test_guest_exit_80_waits_for_exact_settlement(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
@@ -2051,11 +2147,21 @@ class PlacementTests(unittest.TestCase):
                                  execution_identity.attempt_key(assignment.episode, assignment.attempt))
                 return request, assignment
 
-            _, reported = ended_gate()
+            report_request, reported = ended_gate()
             settled, = fixture.server.handle_request(wire.ClaimFailure("gate-ended", reported, MAC_LINUX_NO_ANSWER))
             assert isinstance(settled, wire.DispatchStatus), settled
-            self.assertEqual(settled.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+            self.assertEqual(settled.state, placement.CurrentAssignment())
             self.assertEqual(settled.retry, placement.RetryAt(fixture.clock.now()))
+            _ = fixture.run_pass()
+            key = fixture.server.host_evidence_key(report_request, reported.destination)
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            settle.assert_called_once_with(reported.episode, int(reported.attempt, 16))
+            _ = fixture.run_pass()
+            self.assertNotEqual(fixture.server.current_assignments.get(reported.episode),
+                execution_identity.attempt_key(reported.episode, reported.attempt))
+            settle.reset_mock()
 
             request, silent = ended_gate()
             fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
