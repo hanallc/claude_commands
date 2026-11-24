@@ -295,7 +295,7 @@ The service sets the remote `started_at` from the consume time, so `memory_feed.
 A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
 The Machine cell shows one bright Apple icon with a 🐧 badge.
-The Apple icon uses the Mac color in light and dark modes.
+The Apple icon has a white fill and a black outline in light and dark modes.
 The cell adds `not confirmed` until the queue confirms the run.
 The tooltip shows `Runs on` and `Named targets`.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
