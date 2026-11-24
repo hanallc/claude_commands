@@ -66,7 +66,7 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 ## Phases
 
-### Phase 1 — Common form rule and config file check  · status: todo
+### Phase 1 — Common form rule and config file check  · status: done
 **Depends on:** none
 
 #### Work Order

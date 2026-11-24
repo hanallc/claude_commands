@@ -391,7 +391,7 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
         previous = _git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n"
         if not registry_rows.changes(previous, contents):
             return False
-        commit = _registry_commit(repo, base, contents, description)
+        commit = _registry_commit(repo, base, registry_rows.space_groups(contents), description)
         try:
             landed = land_main.land(repo, commit, branch)
         except (OSError, land_main.LandError) as error:
@@ -511,7 +511,8 @@ def save_registry(registry: Path, before: str, after: str, description: str, *,
             replay = _catalog_replay(latest, result, changes)
         changed = registry_rows.values(latest) != registry_rows.values(result)
         if changed:
-            result = after if latest == before and not additive_catalog else result
+            if latest == before and not additive_catalog:
+                result = registry_rows.space_groups(after)
             write_text_atomic(path, result)
     if not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve():
         return SavedRegistry(result, changed, RegistryPublication.LOCAL_ONLY)

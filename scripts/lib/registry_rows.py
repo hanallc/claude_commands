@@ -95,6 +95,20 @@ def additive_line(change: RowChange, current: dict[tuple[str, str], RegistryRow]
     return f"{change.key}={value}"
 
 
+def space_groups(text: str) -> str:
+    """Put a blank line between a key row and the next comment or section."""
+    lines: list[str] = []
+    previous_is_key = False
+    for line in text.splitlines(keepends=True):
+        content = line.partition("#")[0].strip()
+        section = content.startswith("[") and content.endswith("]")
+        if previous_is_key and (section or line.lstrip().startswith("#")):
+            lines.append("\n")
+        lines.append(line)
+        previous_is_key = not section and "=" in content
+    return "".join(lines)
+
+
 def replay(text: str, edits: list[RowChange], additive_catalog: bool) -> str:
     source = text.splitlines()
     current: dict[tuple[str, str], RegistryRow] = {}
@@ -135,4 +149,4 @@ def replay(text: str, edits: list[RowChange], additive_catalog: bool) -> str:
         lines.extend(new_rows.get(index, ()))
     for section, section_rows in new_sections.items():
         lines.extend(["", f"[{section}]", *section_rows])
-    return "\n".join(lines) + "\n"
+    return space_groups("\n".join(lines) + "\n")
