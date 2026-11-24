@@ -70,7 +70,8 @@ remote=${@[-1]}
 placed_run=0
 if [[ $command == ssh && $remote == *smoke-work* ]]; then
     outer=("${(@Q)${(z)remote}}")
-    work=${outer[3]%$'\n'printf *}
+    work=${outer[-1]#*$'\n'}
+    work=${work%$'\nbuiltin printf '*}
     printf '%s\0' "$work" >> "$state/placed-commands"
     words=("${(@Q)${(z)work}}")
     lease=${words[-1]}
@@ -127,12 +128,13 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
 fi
 
 if (( placed_run )); then
-    export MAC_SMOKE_COOKIE=${words[2]#MAC_SMOKE_COOKIE=}
     exec "$MAC_RUN_PYTHON" -c '
 import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ["MAC_RUN_STUB_STATE"])
 os.setsid()
+with os.fdopen(os.dup(0), "rb", buffering=0) as incoming:
+    cookie = incoming.readline().strip().decode("ascii")
 print("HEAD=" + os.environ["MAC_RUN_SHA"], flush=True)
 if os.environ.get("MAC_RUN_CHECKOUT_CLEANUP"):
     os.chdir(os.environ["MAC_RUN_CHECKOUT"])
@@ -140,6 +142,7 @@ if os.environ.get("MAC_RUN_CHECKOUT_CLEANUP"):
         "touch \"$MAC_RUN_STUB_STATE/build-started\"; cat \"$MAC_RUN_STUB_STATE/hold-build\"",
         "exec \"$MAC_RUN_CHECKOUT_CLEANUP\" cleanup-copy \"$1\" \"$MAC_RUN_LAUNCH\""], check=False)
     sys.exit(0)
+assert sys.stdin.readline().strip() == cookie
 if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
     (state / "build-started").touch()
     _ = sys.stdin.read()
@@ -148,7 +151,6 @@ if os.environ.get("MAC_RUN_HOLD_BUILD") == "1":
     sys.exit(0)
 else:
     (state / "cleanup-called").touch()
-    cookie = os.environ["MAC_SMOKE_COOKIE"]
     print("mac_smoke_complete=" + cookie, flush=True)
     _ = sys.stdin.read()
     (state / "input-closed").touch()

@@ -37,6 +37,10 @@ cleanup_legacy_scratch() {
     print -u2 -r -- "mac_run: invalid scratch state $state"
     return 4
   fi
+  if [[ -z $clone && -n $clone_task ]]; then
+    print -u2 -r -- "kept for a manual removal list: $state (scratch, task $clone_task has no checkout path)"
+    return 4
+  fi
   if [[ -n $clone ]]; then
     clone_arg=${(q)clone}
     remote="
@@ -215,7 +219,7 @@ prepare = ""
 if ref := env["MAC_RUN_BUNDLE_REF"]:
     bundle = quote(env["MAC_RUN_BUNDLE"])
     prepare = (
-        f"git -C {source} fetch -q --no-tags --no-write-fetch-head -- {bundle} {quote(ref)}\n"
+        f"git -C {source} fetch -q --no-tags --no-write-fetch-head -- {bundle} {quote(ref)} </dev/null\n"
         + "status=$?\n"
         + f"rm -f -- {bundle}\n"
         + "(( status == 0 )) || exit 5\n"
