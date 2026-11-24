@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -25,7 +25,7 @@ from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
+from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
 from scripts.review_links import image_store, new_item_dialog, page_frame, reply_tokens, review_events, review_link
@@ -133,10 +133,22 @@ class SubmissionMove(NativeSubmissionDestination):
 
 
 @dataclass(frozen=True)
+class ListCommandAssignee:
+    """The staff member the command names for the List row."""
+
+    id: staff.StaffId
+
+
+class ListWindowAssignee(Enum):
+    RECIPIENT = "recipient"
+
+
+@dataclass(frozen=True)
 class InitialDelivery:
     """Request the first message after the native record exists."""
 
     evidence_origin: str = ""
+    list_assignee: ListCommandAssignee | ListWindowAssignee = ListWindowAssignee.RECIPIENT
 
 
 @dataclass(frozen=True)
@@ -145,6 +157,14 @@ class NoInitialDelivery:
 
 
 NO_INITIAL_DELIVERY = NoInitialDelivery()
+
+
+def list_command_assignee(value: object) -> ListCommandAssignee:
+    if not isinstance(value, str):
+        raise SubmissionError("Invalid List assignee ID.")
+    identity = staff.StaffId(value)
+    check_recipient_id(identity)
+    return ListCommandAssignee(identity)
 
 
 type NativeSubmittedRecord = update_registration.QuestionRecord | Issue | investigation.Investigation
@@ -245,11 +265,26 @@ class ListDraftFiling:
 
 
 @dataclass(frozen=True)
+class RequestedListPreview:
+    """A preview the sender selected for the List draft."""
+
+    key: str
+
+
+class NoRequestedListPreview(Enum):
+    ABSENT = "no requested preview"
+
+
+type ListPreviewRequest = RequestedListPreview | NoRequestedListPreview
+
+
+@dataclass(frozen=True)
 class ListDraftSend:
-    """A List draft with fields to read only if no saved item exists."""
+    """A List draft with fields to read for filing or retry comparison."""
 
     request_id: str
     prepare: Callable[[], ListDraftFiling]
+    preview: ListPreviewRequest = NoRequestedListPreview.ABSENT
 
 
 @dataclass(frozen=True)
@@ -444,8 +479,16 @@ def _image_fingerprints(uploads: tuple[_ImageUpload, ...]) -> tuple[tuple[str, s
     return tuple((upload.extension, hashlib.sha256(upload.data).hexdigest()) for upload in uploads)
 
 
-def _fingerprint(payload: list[object]) -> str:
+def _fingerprint(payload: list[object], *,
+                 notice: new_item_dialog.Notice = new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW) -> str:
+    if isinstance(notice, new_item_dialog.SubmissionNotice):
+        payload = [*payload, asdict(notice)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _legacy_draft_fingerprint(request_id: str, request: NewItemRequest, words: str,
+                              uploads: tuple[_ImageUpload, ...]) -> str:
+    return _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)], notice=request.notice)
 
 
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
@@ -454,10 +497,10 @@ def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[
         payload.append(request.page)
     if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
-    return _fingerprint(payload)
+    return _fingerprint(payload, notice=request.notice)
 
 
-def _write_request_file(path: Path, fields: dict[str, str]) -> None:
+def _write_request_file(path: Path, fields: Mapping[str, object]) -> None:
     atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
 
 
@@ -981,6 +1024,119 @@ def _stage_initial_delivery(folder: Path, address: SubmissionAddress,
         atomic_file.sync_folder(folder)
 
 
+class ListFilingRoute(TypedDict):
+    keeper: staff.StaffId
+    owner: staff.StaffId
+    producer: staff.StaffId
+    unit: str
+    source: str
+
+
+@dataclass(frozen=True)
+class ListFilingUnavailable:
+    """The List row has no producer that can take it."""
+
+    reason: str
+
+
+def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
+                         ) -> staff.StaffRow | ListFilingUnavailable:
+    """Use the nearest map row or producer on the owner chain without Git recovery."""
+    config = conf.read(producer_map.STEM)
+    if not isinstance(config.settings, dict) and config.settings.missing:
+        repository = Path(__file__).resolve().parents[2] / "config" / f"{producer_map.STEM}.conf"
+        config = conf.read(repository)
+    if not isinstance(config.settings, dict):
+        return ListFilingUnavailable(f"Cannot read the producer map at {config.source}: {config.settings.reason}")
+
+    keys = {key.lower(): key for key in config.settings}
+    producers = {row.id: row for row in staff.active(members, "producer")}
+    for candidate in investigation.owner_chain(member.id, members):
+        holder = members.by_id(candidate)
+        if holder is None:
+            continue
+        if holder.kind == "producer":
+            if candidate in producers:
+                return producers[candidate]
+            break
+        key = keys.get(candidate.lower())
+        if key is None:
+            continue
+        try:
+            name = config.value(key, str, recover_invalid=False, allow_blank=True)
+        except conf.Unusable as error:
+            return ListFilingUnavailable(f"Cannot read the producer map at {error}")
+        identity = staff.StaffId(name.lower())
+        if identity in producers:
+            return producers[identity]
+        stale = members.by_id(identity)
+        return ListFilingUnavailable(producer_map.StaleRow(holder, stale.name if stale is not None else identity).reason())
+    return ListFilingUnavailable(f"{member.name} has no producer yet.")
+
+
+def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipient: staff.StaffRow,
+                      members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
+    keeper = producer_map.find_member("morty", members, ("producer",))
+    if isinstance(keeper, producer_map.UnknownMember) or keeper.name != "morty":
+        return ListFilingUnavailable("The List needs one active producer named morty.")
+    member = recipient
+    source = "nate via New item"
+    if isinstance(assignee, ListCommandAssignee):
+        member = producer_map.find_member(assignee.id, members, producer_map.ASSIGNEE_KINDS)
+        if (isinstance(member, producer_map.UnknownMember) or member.id != assignee.id
+                or recipient.id not in investigation.owner_chain(member.id, members)):
+            raise SubmissionConflict("The List assignee or recipient changed. Run /new_item again.")
+        source = "nate via /new_item"
+    producer = _list_filing_producer(member, members)
+    if isinstance(producer, ListFilingUnavailable):
+        return producer
+    unit = member.name if member.kind == "unit" else ""
+    return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
+                           unit=unit, source=source)
+
+
+@dataclass(frozen=True)
+class NoListFiling:
+    """This request has no List row to write or skip."""
+
+
+def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
+    """Read the List filing plan for the first Send."""
+    folder = _request_folder(saved.request_id)
+    try:
+        routing = (folder / "list-filing.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return NoListFiling()
+    fields = cast(object, json.loads(routing))
+    if not isinstance(fields, dict):
+        raise OSError(f"Invalid List route for request {saved.request_id}.")
+    values = cast(dict[str, object], fields)
+    if isinstance(values.get("skipped"), str):
+        return NoListFiling()
+    reason = values.get("unavailable")
+    if isinstance(reason, str):
+        return ListFilingUnavailable(reason)
+    keeper, owner, producer = values.get("keeper"), values.get("owner"), values.get("producer")
+    unit, source = values.get("unit"), values.get("source")
+    if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
+            and isinstance(unit, str) and isinstance(source, str)):
+        raise OSError(f"Invalid List route for request {saved.request_id}.")
+    return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
+                           unit=unit, source=source)
+
+
+def list_filing_reservation(saved: SavedSubmission) -> Path:
+    """Return the number reservation for the saved request."""
+    return _request_folder(saved.request_id) / "list-number"
+
+
+def skip_list_filing(saved: SavedSubmission, reason: str) -> None:
+    """Record the skipped row before the delivery claim."""
+    list_filing_reservation(saved).unlink(missing_ok=True)
+    _write_request_file(_request_folder(saved.request_id) / "list-filing.json", {"skipped": reason})
+    print(f"Review List filing {saved.id}: {reason}", file=sys.stderr)
+
+
 @dataclass(frozen=True)
 class PendingInitialDelivery:
     """The request and evidence origin saved before its native write."""
@@ -1441,6 +1597,8 @@ def _discard_unfiled_send(folder: Path) -> None:
         shutil.rmtree(images)
     (folder / "pending.json").unlink(missing_ok=True)
     (folder / "first-message.json").unlink(missing_ok=True)
+    (folder / "list-filing.json").unlink(missing_ok=True)
+    (folder / "list-preview.json").unlink(missing_ok=True)
     atomic_file.sync_folder(folder)
 
 
@@ -1452,31 +1610,80 @@ def _check_capture_target(target: ScopedSubmissionKey | new_item_dialog.NoBoundC
 
 
 def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidence,
-                          uploads: tuple[_ImageUpload, ...], screenshot: new_item_dialog.SubmissionScreenshot) -> str:
+                          uploads: tuple[_ImageUpload, ...], screenshot: new_item_dialog.SubmissionScreenshot,
+                          delivery: InitialDelivery | NoInitialDelivery) -> str:
     digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
-    return _fingerprint([request.kind, request.recipient_id, words, new_item_dialog.evidence_fields(evidence),
-                         _image_fingerprints(uploads), request.page, request.page_recipient,
-                         asdict(request.page_state) if request.page_state else None, digest])
+    fields: list[object] = [request.kind, request.recipient_id, words, new_item_dialog.evidence_fields(evidence),
+                            _image_fingerprints(uploads), request.page, request.page_recipient,
+                            asdict(request.page_state) if request.page_state else None, digest]
+    if isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee):
+        fields.append(delivery.list_assignee.id)
+    return _fingerprint(fields, notice=request.notice)
 
 
-def _matches_list_capture_retry(send: ListDraftSend, intent: new_item_dialog.SubmissionCaptureIntent,
-                                item: LocatedSubmission) -> bool:
-    original = item.details.capture_intent
-    if (not isinstance(original, new_item_dialog.DeferredCaptureIntent)
-            or not isinstance(intent, new_item_dialog.DeferredCaptureIntent)
-            or original.capture_key != intent.capture_key):
+@dataclass(frozen=True)
+class CommittedListPreview:
+    """Identify the screenshot that the first List Send attached."""
+
+    key: str
+    digest: str
+
+
+class NoCommittedListPreview(Enum):
+    ABSENT = "no committed preview"
+
+
+def _committed_list_preview(folder: Path) -> CommittedListPreview | NoCommittedListPreview:
+    try:
+        fields = cast(object, json.loads((folder / "list-preview.json").read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoCommittedListPreview.ABSENT
+    if isinstance(fields, dict):
+        values = cast(dict[str, object], fields)
+        key = new_item_dialog.read_capture_key(values.get("key"))
+        digest = values.get("digest")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            return CommittedListPreview(key, digest)
+    raise OSError("Cannot read the committed List screenshot.")
+
+
+def _matches_list_retry(folder: Path, send: ListDraftSend, intent: new_item_dialog.SubmissionCaptureIntent,
+                        item: LocatedSubmission, delivery: InitialDelivery | NoInitialDelivery) -> bool:
+    if item.details.capture_intent != intent:
         return False
     try:
         filing = send.prepare()
         request = filing.request
         if request.kind == SubmissionKind.PROPOSAL:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
-        if request.page != "list" or request.request_id != send.request_id:
+        if request.page != "list" or request.request_id != send.request_id or filing.refusal is not None:
             return False
         evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
         words = read_words(request.words, "Your words", kind=request.kind)
-        return item.destination.payload_hash == _browser_payload_hash(
-            request, words, evidence, _decode_images(request.images), filing.screenshot)
+        screenshot = filing.screenshot
+        committed = _committed_list_preview(folder)
+        requested = send.preview
+        if isinstance(committed, CommittedListPreview):
+            if not isinstance(requested, RequestedListPreview) or requested.key != committed.key:
+                return False
+            if isinstance(screenshot, new_item_dialog.NoPageScreenshot):
+                screenshot = new_item_dialog.FiledPageScreenshot(committed.digest)
+            elif screenshot.digest != committed.digest:
+                return False
+        elif isinstance(requested, RequestedListPreview) and isinstance(screenshot, new_item_dialog.NoPageScreenshot):
+            return False
+        uploads = _decode_images(request.images)
+        fingerprint = _browser_payload_hash(request, words, evidence, uploads, screenshot, delivery)
+        if item.destination.payload_hash == fingerprint:
+            return True
+        if (isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee)
+                and isinstance(request.notice, new_item_dialog.SubmissionNotice) and request.notice.from_command
+                and isinstance(item.details.notice, new_item_dialog.DefaultSubmissionNotice)):
+            # An earlier command sent the assignee without the notice.
+            legacy = replace(request, notice=item.details.notice)
+            return item.destination.payload_hash == _browser_payload_hash(
+                legacy, words, evidence, uploads, screenshot, delivery)
+        return False
     except SubmissionError:
         return False
 
@@ -1495,7 +1702,7 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                 if item.details.page != "list":
                     raise SubmissionConflict("This draft belongs to another page.")
                 _check_capture_target(capture_target, item.destination)
-                edited = not _matches_list_capture_retry(send, capture_intent, item)
+                edited = not _matches_list_retry(folder, send, capture_intent, item, initial_delivery)
                 return _complete_receipt(folder, item.destination, lookup.hint, item.record, edited=edited)
         alias = folder / "list-receipt-key"
         try:
@@ -1516,26 +1723,36 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
             raise SubmissionError("Invalid List draft request.")
         return _submit(request, members=members, screenshot=filing.screenshot,
                        capture_requested=filing.capture_requested, refusal=filing.refusal,
-                       capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
+                       capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery,
+                       list_preview=send.preview)
 
 
 def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
-                      members: staff.StaffSnapshot | None, *, request_kind: str) -> SavedSubmission | None:
-    """Recover old List filings when the original words, kind, images and recipient match."""
+                      members: staff.StaffSnapshot | None, *, request: NewItemRequest) -> SavedSubmission | None:
+    """Recover old List filings when the fingerprint and recipient match."""
     legacy_id = "r2-" + address.request_id[3:]
-    fingerprint = _fingerprint([legacy_id, request_kind, words, _image_fingerprints(uploads)])
-    folder = _request_folder(f"r4-{fingerprint}")
-    if not folder.is_dir():
-        return None
+    exact = _legacy_draft_fingerprint(legacy_id, request, words, uploads)
+    fingerprints = [exact]
+    default_notice = new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    if request.notice == new_item_dialog.SubmissionNotice("feedback"):
+        # Older List drafts sent Feedback as an investigation without a notice.
+        old_request = replace(request, notice=default_notice)
+        fingerprints.append(_legacy_draft_fingerprint(legacy_id, old_request, words, uploads))
     address = replace(address, request_id=legacy_id)
-    with exclusive(folder / ".lock"):
-        for candidate in _list_draft_candidates(folder, address, fingerprint):
-            with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
-                item = _saved_draft(lookup, list_recipient=address.recipient_id)
-                if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
-                    continue
-                saved = item.destination
-                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
+    for fingerprint in fingerprints:
+        folder = _request_folder(f"r4-{fingerprint}")
+        if not folder.is_dir():
+            continue
+        with exclusive(folder / ".lock"):
+            for candidate in _list_draft_candidates(folder, address, fingerprint):
+                with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
+                    item = _saved_draft(lookup, list_recipient=address.recipient_id)
+                    if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
+                        continue
+                    if fingerprint != exact and item.details.notice != default_notice:
+                        continue
+                    saved = item.destination
+                    return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
     return None
 
 
@@ -1597,11 +1814,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             screenshot: new_item_dialog.SubmissionScreenshot, capture_requested: bool,
             refusal: SubmissionError | None, capture_intent: new_item_dialog.SubmissionCaptureIntent,
             capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget,
-            initial_delivery: InitialDelivery | NoInitialDelivery) -> SavedSubmission:
+            initial_delivery: InitialDelivery | NoInitialDelivery,
+            list_preview: ListPreviewRequest = NoRequestedListPreview.ABSENT) -> SavedSubmission:
     check_recipient_id(request.recipient_id)
     request_id = read_request_id(request.request_id)
     submitted_draft_id = request_id
     kind = SubmissionKind.INVESTIGATION if request.kind == "enhancement" else read_kind(request.kind)
+    notice = request.notice
+    if isinstance(notice, new_item_dialog.DefaultSubmissionNotice) and request.kind == "enhancement":
+        notice = new_item_dialog.SubmissionNotice("enhancement")
     if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
@@ -1620,7 +1841,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
     if list_draft:
-        previous = _legacy_list_draft(address, words, uploads, members, request_kind=request.kind)
+        previous = _legacy_list_draft(address, words, uploads, members, request=request)
         if previous is not None:
             _check_capture_target(capture_target, previous)
             alias = _request_folder(request_id) / "list-receipt-key"
@@ -1637,9 +1858,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
 
     payload_hash = ""
     if browser_draft:
-        payload_hash = _browser_payload_hash(request, words, evidence, uploads, screenshot)
+        payload_hash = _browser_payload_hash(request, words, evidence, uploads, screenshot, initial_delivery)
     elif legacy_draft:
-        payload_hash = _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)])
+        payload_hash = _legacy_draft_fingerprint(request_id, request, words, uploads)
     else:
         payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
@@ -1734,12 +1955,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             destination = proposal_folder(recipient, current) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
             if kind == SubmissionKind.PROPOSAL and isinstance(destination, NoNativeFolder):
                 raise SubmissionError("Select a recipient with a native proposal folder.")
+            route: ListFilingRoute | ListFilingUnavailable | NoListFiling = NoListFiling()
+            if request.page == "list" and isinstance(initial_delivery, InitialDelivery):
+                route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
             proof = reply_tokens.mint()
             details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
-                                       reply_token_nonce=proof.nonce)
+                                       reply_token_nonce=proof.nonce, notice=notice)
             title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []
             staging_started = False
@@ -1769,6 +1993,13 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 if list_draft and saved.has_capture_intent:
                     _write_location(_request_folder(submitted_draft_id) / "list-capture-target.json", saved)
                 _write_location(pending_file, saved)
+                if isinstance(route, dict):
+                    _write_request_file(folder / "list-filing.json", route)
+                elif isinstance(route, ListFilingUnavailable):
+                    _write_request_file(folder / "list-filing.json", {"unavailable": route.reason})
+                if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):
+                    _write_request_file(folder / "list-preview.json",
+                                        {"key": list_preview.key, "digest": screenshot.digest})
                 _stage_initial_delivery(folder, address, initial_delivery)
                 destinations[:] = [saved]
 

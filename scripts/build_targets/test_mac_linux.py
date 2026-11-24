@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from threading import Event, Timer
+from threading import Event, Thread, Timer
 import time
 from types import CodeType
 from typing import cast, override
@@ -831,7 +831,7 @@ fi
         self.assertEqual((report_row.assignment, report_row.claim), (self.placed, self.consumed[0][0].claim))
         assert isinstance(report_row.evidence, execution_identity.ObservedExecution)
         identity = report_row.evidence.identity
-        assert isinstance(identity, execution_identity.CloudExecution)
+        assert isinstance(identity, execution_identity.GuestExecution)
         self.assertEqual((identity.target, identity.attempt), (mac_linux.TARGET, self.placed.attempt))
 
     def test_guest_without_a_start_line_reports_no_execution(self) -> None:
@@ -1090,7 +1090,15 @@ fi
         self.assert_guest_clean()
 
     def test_the_gate_holds_its_launch_permission_before_the_guest_starts(self) -> None:
-        result = self.route()
+        report_received = Event()
+
+        def receive_report(_request: wire.ExecutionReport, **_timing: float) -> wire.DispatchStatus:
+            report_received.set()
+            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        with patch.object(mac_linux, 'send_guest_execution', side_effect=receive_report) as report_start:
+            result = self.route()
+            self.assertTrue(report_received.wait(2))
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         (request, trace, held), = self.consumed
@@ -1104,7 +1112,76 @@ fi
         self.assertTrue(request.claim.claim_id.startswith(mac_test.MAC_LINUX_CLAIM_ID_PREFIX))
         self.assertTrue(held)
         self.assertEqual(trace, '')
+        report_start.assert_called_once()
+        reported = cast(wire.ExecutionReport, report_start.call_args.args[0])
+        self.assertEqual((reported.assignment, reported.claim), (self.placed, request.claim))
+        decoded = wire.parse_request(wire.encode_request(reported))
+        assert isinstance(decoded, wire.ExecutionReport)
+        self.assertEqual(decoded.evidence, execution_identity.ObservedExecution(execution_identity.GuestExecution(
+            mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/caller/1'), str(self.guest_home))))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def check_folder_report_stream(self) -> None:
+        attempt = self.placed.attempt
+        marker = mac_linux.guest_start_line(attempt, self.repo, self.guest_home)
+        command = [sys.executable, '-c',
+                   "import sys; print(sys.argv[1], file=sys.stderr); sys.stderr.write('x' * 131072); print('result')",
+                   marker]
+        armed = mac_linux.ArmedGuestAttempt(attempt, 'f' * 32, 'boot-id', 10, 'guest', str(self.repo))
+        with mac_linux.guest_link() as link:
+            result = mac_linux.stream_guest_bundle(self.repo, command, b'', 2, link, armed, self.guest_dispatch())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b'result\n')
+        self.assertEqual(result.stderr, marker.encode() + b'\n' + b'x' * 131072)
+
+    def test_a_blocked_folder_report_does_not_discard_the_completed_command(self) -> None:
+        report_started = Event()
+        release_report = Event()
+        report_finished = Event()
+
+        def publish(request: wire.ExecutionReport, **_timing: float) -> wire.DispatchStatus:
+            self.assertIsInstance(request.evidence, execution_identity.ObservedExecution)
+            if isinstance(request.evidence, execution_identity.ObservedExecution):
+                self.assertIsInstance(request.evidence.identity, execution_identity.GuestExecution)
+            report_started.set()
+            _ = release_report.wait()
+            report_finished.set()
+            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        try:
+            with patch.object(mac_linux, 'send_guest_execution', publish):
+                started = time.monotonic()
+                self.check_folder_report_stream()
+                self.assertLess(time.monotonic() - started, 0.5, 'The guest result waited for the report deadline.')
+                self.assertTrue(report_started.wait(2))
+                self.assertFalse(report_finished.is_set())
+        finally:
+            release_report.set()
+            if report_started.is_set():
+                self.assertTrue(report_finished.wait(2))
+
+    def test_a_folder_publisher_start_failure_preserves_the_command_output(self) -> None:
+        self.check_folder_report_thread_failure('report')
+
+    def test_a_report_preparation_start_failure_preserves_the_command_output(self) -> None:
+        self.check_folder_report_thread_failure('prepare')
+
+    def check_folder_report_thread_failure(self, failing_target: str) -> None:
+        start_refused = Event()
+
+        class UnavailableThread(Thread):
+            @override
+            def start(self) -> None:
+                start_refused.set()
+                raise RuntimeError('fixture thread cannot start')
+
+        def new_thread(*, target: Callable[[], None], daemon: bool) -> Thread:
+            thread = UnavailableThread if target.__name__ == failing_target else Thread
+            return thread(target=target, daemon=daemon)
+
+        with patch.object(mac_linux, 'Thread', side_effect=new_thread):
+            self.check_folder_report_stream()
+            self.assertTrue(start_refused.wait(2))
 
     def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
         refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),

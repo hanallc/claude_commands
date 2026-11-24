@@ -227,6 +227,30 @@ class ReviewSubmissionTests(unittest.TestCase):
                 _ = submissions.submit(different)
         self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
 
+    def test_a_notice_change_is_not_an_exact_retry(self) -> None:
+        original = request(submissions.SubmissionKind.INVESTIGATION)
+        feedback = replace(original, notice=new_item_dialog.SubmissionNotice("feedback"))
+        standard = submissions.submit(feedback)
+        self.assertEqual(submissions.submit(feedback).key, standard.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
+            _ = submissions.submit(original)
+
+        legacy = replace(feedback, request_id="r2-" + "a" * 32)
+        first_legacy = submissions.submit(legacy)
+        changed_legacy = submissions.submit(replace(legacy, notice=new_item_dialog.SubmissionNotice("efficiency")))
+        self.assertNotEqual(changed_legacy.key, first_legacy.key)
+        self.assertEqual(submissions.submit(legacy).key, first_legacy.key)
+
+        browser = replace(feedback, request_id="r6-" + "b" * 32)
+        first_browser = submissions.submit(browser)
+        retry = submissions.submit(browser)
+        self.assertEqual(retry.key, first_browser.key)
+        self.assertNotIsInstance(retry, submissions.EditedSubmission)
+        changed_browser = submissions.submit(replace(browser, notice=new_item_dialog.SubmissionNotice("feedback", True)))
+        self.assertIsInstance(changed_browser, submissions.EditedSubmission)
+        self.assertEqual(changed_browser.key, first_browser.key)
+        self.assertEqual(changed_browser.details.notice, browser.notice)
+
     def test_concurrent_draft_sends_reuse_each_recipient_item(self) -> None:
         first = replace(request(), request_id="r2-" + "a" * 32)
         second = replace(first, recipient_id=PRODUCER)

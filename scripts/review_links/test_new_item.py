@@ -1,4 +1,4 @@
-"""The /new_item command files through a fake console server, resolves each assignee and makes its List item."""
+"""Test how /new_item sends a request and reports the List number."""
 from __future__ import annotations
 
 import io
@@ -9,16 +9,12 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Literal, NoReturn, cast, override
 from unittest import mock
 
-from scripts.production import producer_map, staff, the_list
+from scripts.production import staff
 from scripts.lib import main_publish
 from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions
-
-ListItemCall = tuple[str, str, staff.StaffId, staff.StaffRow, producer_map.MappedProducer]
-
 
 def member(identity: str, kind: staff.Kind, name: str, parent: staff.StaffRow | None = None) -> staff.StaffRow:
     reports: staff.ReportsTo | staff.StaffRoot = staff.ReportsTo(parent.id) if parent is not None else staff.StaffRoot()
@@ -39,8 +35,6 @@ SPACETIME_STYLE = member("10000000-0000-4000-8000-000000000009", "unit", "style"
 MORTY = member("01a18dbb-7e8f-7641-b3dd-bb2071ab9d7a", "producer", "morty")
 ROWS = (DWIGHT, BOB, SPACETIME, MODELS, NATEDEV, POSTMASTER, CARGO, TILE, HIDDEN, CARGO_STYLE, SPACETIME_STYLE)
 MEMBERS = staff.StaffSnapshot(ROWS, retired_producers=(MORTY,))
-# The List store tests need morty active, because only morty's folder allocates List numbers.
-LIST_MEMBERS = staff.StaffSnapshot((*ROWS, MORTY))
 TO_ROW = (SPACETIME, NATEDEV, CARGO, DWIGHT, BOB)
 ADDRESS = for_you.ConsoleAddress("192.0.2.1", 8765)
 EXCHANGE = new_item.exchange
@@ -68,7 +62,8 @@ class FakeServer:
     def __init__(self) -> None:
         self.posts: list[dict[str, object]] = []
         self.reads: int = 0
-        self.key: str = "fixture-key"
+        self.list_number: int | None = 3
+        self.review_key: str | None = "fixture-key"
 
     def exchange(self, _address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
                  body: bytes = b"") -> new_item.ServerReply:
@@ -79,10 +74,11 @@ class FakeServer:
                 {"id": row.id, "name": row.name, "proposal": row.kind != "producer"} for row in TO_ROW]})
         assert target == review_page.NEW_ITEM_PATH
         self.posts.append(cast(dict[str, object], json.loads(body)))
-        # The reply has no List row: the server files the Review item only.
         fields: dict[str, object] = {"id": "I7", "version": "1"}
-        if self.key:
-            fields["key"] = self.key
+        if self.review_key is not None:
+            fields["key"] = self.review_key
+        if self.list_number is not None:
+            fields["list_number"] = self.list_number
         return new_item.ServerReply(200, fields)
 
 
@@ -98,7 +94,8 @@ class ServerFixture(unittest.TestCase):
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.folder / "producer_map.conf"
         _ = self.config.write_text("# The producer of a showrunner or of a unit.\n", encoding="utf-8")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.folder)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.folder),
+                                                                        "XDG_STATE_HOME": str(self.folder / "state")})))
         self.server = FakeServer()
         _ = self.enterContext(mock.patch.object(new_item, "exchange", side_effect=self.server.exchange))
         _ = self.enterContext(mock.patch.object(for_you, "console_address", return_value=ADDRESS))
@@ -116,20 +113,10 @@ class ServerFixture(unittest.TestCase):
 
 
 class NewItemTests(ServerFixture):
-    list_items: list[ListItemCall] = []
-
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=MEMBERS))
-        self.list_items = []
-
-        def add_list_item(review_key: str, words: str, recipient: new_item.Recipient, assignee: staff.StaffRow,
-                          mapped: producer_map.MappedProducer, _members: staff.StaffSnapshot) -> the_list.ListItem:
-            self.list_items.append((review_key, words, recipient.id, assignee, mapped))
-            return cast(the_list.ListItem, cast(object, SimpleNamespace(number=3)))
-
-        _ = self.enterContext(mock.patch.object(new_item, "add_list_item", side_effect=add_list_item))
 
     def test_no_arguments_print_the_usage(self) -> None:
         code, output, _ = self.run_main()
@@ -155,6 +142,7 @@ class NewItemTests(ServerFixture):
                 self.assertEqual(code, 0)
                 self.assertEqual(output, f"{item_type.value.capitalize()} \u2192 bob. List item 3.\n")
                 self.assertEqual(self.server.posts[-1]["kind"], new_item.FILED_KINDS[item_type])
+                self.assertEqual(self.server.posts[-1]["notice"], {"kind": item_type.value, "from_command": True})
                 words = "Efficiency: Check the chart." if item_type == new_item.ItemType.EFFICIENCY else "Check the chart."
                 self.assertEqual(self.server.posts[-1]["words"], words)
         with self.assertRaises(SystemExit):
@@ -164,8 +152,7 @@ class NewItemTests(ServerFixture):
         code, output, _ = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, output), (0, "Bug \u2192 bob. List item 3.\n"))
         self.assertEqual(self.server.posts[0]["recipient_id"], BOB.id)
-        self.assertEqual(self.list_items, [("fixture-key", "A waiting row has no drag grip.", BOB.id, BOB,
-                                            producer_map.MappedProducer(BOB, BOB))])
+        self.assertEqual(self.server.posts[0]["list_assignee"], BOB.id)
 
     def test_a_showrunner_with_a_row_files_nate_extra_words_as_written(self) -> None:
         self.map_row(SPACETIME, DWIGHT)
@@ -174,8 +161,7 @@ class NewItemTests(ServerFixture):
         self.assertEqual(code, 0)
         self.assertEqual(output, "Question \u2192 spacetime. Producer: dwight (set for spacetime). List item 3.\n")
         self.assertEqual(self.server.posts[0]["words"], "Can the server start with no saved world?\n\nAnswer by Monday.")
-        self.assertEqual([call[2:] for call in self.list_items],
-                         [(SPACETIME.id, SPACETIME, producer_map.MappedProducer(DWIGHT, SPACETIME))])
+        self.assertEqual(self.server.posts[0]["list_assignee"], SPACETIME.id)
 
     def test_a_unit_uses_its_showrunner_row(self) -> None:
         self.map_row(SPACETIME, DWIGHT)
@@ -183,8 +169,7 @@ class NewItemTests(ServerFixture):
         self.assertEqual(code, 0)
         self.assertEqual(output, "Bug \u2192 models, a unit of spacetime. Producer: dwight (from spacetime). List item 3.\n")
         self.assertEqual(self.server.posts[0]["recipient_id"], SPACETIME.id)
-        self.assertEqual([call[2:] for call in self.list_items],
-                         [(SPACETIME.id, MODELS, producer_map.MappedProducer(DWIGHT, SPACETIME))])
+        self.assertEqual(self.server.posts[0]["list_assignee"], MODELS.id)
 
     def test_a_unit_row_wins_over_its_showrunner_row(self) -> None:
         self.map_row(NATEDEV, DWIGHT)
@@ -194,8 +179,7 @@ class NewItemTests(ServerFixture):
         self.assertEqual(output,
                          "Proposal \u2192 postmaster, a unit of natedev. Producer: bob (set for postmaster). List item 3.\n")
         self.assertEqual(self.server.posts[0]["recipient_id"], NATEDEV.id)
-        self.assertEqual([call[2:] for call in self.list_items],
-                         [(NATEDEV.id, POSTMASTER, producer_map.MappedProducer(BOB, POSTMASTER))])
+        self.assertEqual(self.server.posts[0]["list_assignee"], POSTMASTER.id)
 
     def test_an_item_for_this_session_says_so(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
@@ -265,6 +249,17 @@ class NewItemTests(ServerFixture):
         self.assertEqual((code, output), (1, ""))
         self.assertTrue(errors.startswith("new_item: cannot find the console server address: "), errors)
 
+        self.map_row(POSTMASTER, MORTY)
+        cases = (
+            ("cargo-liner", "cargo-liner has no producer yet. Which producer?"),
+            ("postmaster", "The row of postmaster names morty, who is not active. Which producer for postmaster?"),
+        )
+        for assignee, question in cases:
+            with self.subTest(assignee=assignee), mock.patch.object(for_you, "console_address", side_effect=lookup):
+                result = self.run_main("bug", assignee, "Fix the chart.")
+                self.assertEqual(result, (new_item.Outcome.NO_PRODUCER, f"{question}\ndwight / bob\n", ""))
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
+
     def test_a_post_without_a_reply_says_to_check_the_list(self) -> None:
         with mock.patch("scripts.review_links.new_item.HTTPConnection", new=SilentConnection):
             cases: tuple[tuple[Literal["GET", "POST"], bool], ...] = (("POST", True), ("GET", False))
@@ -277,14 +272,15 @@ class NewItemTests(ServerFixture):
         arguments = ["bug", "models", "Fix the chart.", "Today."]
         output = io.StringIO()
         with (mock.patch("platform.system", return_value="Darwin"),
-                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CLAUDE_CODE_SESSION_ID": "mac-session"}),
+                mock.patch.dict(os.environ, {"ZONE_SSH": "fixture-ssh", "CODEX_THREAD_ID": "",
+                                             "CLAUDE_CODE_SESSION_ID": "mac-session"}),
                 mock.patch.object(main_publish, "forward", return_value=0) as forward, redirect_stdout(output)):
             self.assertEqual(new_item.main(arguments), 0)
             self.assertEqual(new_item.main([]), new_item.Outcome.USAGE)
         forward.assert_called_once_with("review_links/new_item.py", [*arguments, "--session", "mac-session"],
                                         label="new_item", ssh_program="fixture-ssh")
         self.assertEqual(output.getvalue(), new_item.usage() + "\n")
-        self.assertEqual((self.server.reads, self.server.posts, self.list_items), (0, [], []))
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
 
     def test_post_body_has_the_window_fields(self) -> None:
         self.map_row(MODELS, BOB)
@@ -295,80 +291,69 @@ class NewItemTests(ServerFixture):
         self.assertTrue(review_submissions.is_draft_id(request_id))
         self.assertEqual(body, {
             "token": "fixture-token", "kind": "proposal", "recipient_id": SPACETIME.id,
+            "notice": {"kind": "proposal", "from_command": True},
             "words": "Add a chart.\n\nNext week.", "evidence": {"kind": "none"}, "images": [],
-            "page": "list", "page_recipient": "selected"})
+            "page": "list", "page_recipient": "selected", "list_assignee": MODELS.id})
         request = new_item_dialog.read_request({**body, "request_id": request_id})
         self.assertEqual((request.kind, request.recipient_id, request.page_recipient),
                          (new_item_dialog.SubmissionKind.PROPOSAL, SPACETIME.id, new_item_dialog.PageRecipient.SELECTED))
 
 
-class NewItemListTests(ServerFixture):
-    """The command makes the List item itself in a temporary List store."""
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        # The List store checks its producers against the staff record.
-        staff_file = self.folder / "staff.json"
-        _ = staff_file.write_text(staff.StaffSnapshot((DWIGHT, BOB, MORTY)).encode(), encoding="utf-8")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.folder), "STAFF_FILE": str(staff_file),
-            "SHOWRUNNER_STATE_DIR": str(self.folder / "state")})))
-        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=LIST_MEMBERS))
-        self.map_row(SPACETIME, DWIGHT)
-
-    def items(self) -> list[the_list.ListItem]:
-        return the_list.records(MORTY.id, include_closed=True)
-
-    def test_a_reply_without_a_list_key_makes_the_list_item(self) -> None:
-        code, output, errors = self.run_main("bug", "models", "The frame time graph has a gap.", "Today.")
+    def test_a_reply_without_a_list_number_reports_the_saved_review_item(self) -> None:
+        self.server.list_number = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
-        self.assertEqual(output, "Bug \u2192 models, a unit of spacetime. Producer: dwight (from spacetime). List item 1.\n")
-        item, = self.items()
-        words = "The frame time graph has a gap.\n\nToday."
-        evidence = review_page.PAGE_PATH + "?show=all#show=open&jump=fixture-key"
-        self.assertEqual((item.number, item.title, item.owner, item.producer, item.unit),
-                         (1, "The frame time graph has a gap.", SPACETIME.id, DWIGHT.id, "models"))
-        self.assertEqual((item.latest_status, item.evidence, item.reviews), (words, evidence, ("fixture-key",)))
-
-    def test_a_list_write_failure_after_filing_exits_filed(self) -> None:
-        with mock.patch.object(the_list, "add", side_effect=OSError("No space left on device")):
-            code, output, errors = self.run_main("bug", "models", "The frame time graph has a gap.")
-        self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
-        self.assertEqual(output, "Bug \u2192 models, a unit of spacetime. Producer: dwight (from spacetime). "
-                         + "Filed as I7, but no List item exists: No space left on device\n")
-        self.assertEqual(self.items(), [])
+        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
 
     def test_enhancement_with_no_producer_saves_nothing(self) -> None:
         code, output, errors = self.run_main("enhancement", "tile", "Show the next check in the row.")
         self.assertEqual((code, errors), (new_item.Outcome.NO_PRODUCER, ""))
         self.assertIn("Which producer?", output)
-        self.assertEqual((self.server.reads, self.server.posts, self.items()), (0, [], []))
+        self.assertEqual((self.server.reads, self.server.posts), (0, []))
+        drafts = (self.folder / "state/new-item").glob("*")
+        self.assertEqual([draft for draft in drafts if draft.suffix != ".lock"], [])
 
-    def test_each_review_item_gets_the_next_list_number(self) -> None:
-        code, output, _ = self.run_main("bug", "bob", "A waiting row has no drag grip.")
-        self.assertEqual((code, output), (new_item.Outcome.FILED, "Bug \u2192 bob. List item 1.\n"))
-        self.server.key = "another-key"
-        code, output, _ = self.run_main("bug", "bob", "A waiting row has no drag grip.")
-        self.assertEqual((code, output), (new_item.Outcome.FILED, "Bug \u2192 bob. List item 2.\n"))
-        self.assertEqual([(item.owner, item.producer, item.unit, item.reviews) for item in self.items()],
-                         [(BOB.id, BOB.id, "", ("fixture-key",)), (BOB.id, BOB.id, "", ("another-key",))])
+    def test_a_reply_without_a_review_key_reports_the_list_number(self) -> None:
+        self.server.review_key = None
+        code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
+        self.assertEqual((code, output, errors), (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
 
-    def test_a_link_failure_names_the_list_item_without_its_link(self) -> None:
-        with mock.patch.object(the_list, "link", side_effect=OSError("No space left on device")):
-            code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
-        self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
-        self.assertEqual(output, "Bug \u2192 bob. List item 1 exists without its Review link: No space left on device\n")
-        item, = self.items()
-        self.assertEqual((item.number, item.reviews), (1, ()))
-
-    def test_a_reply_without_a_review_key_exits_filed(self) -> None:
-        self.server.key = ""
+    def test_a_reply_without_a_review_key_or_list_number_exits_filed(self) -> None:
+        self.server.review_key = ""
+        self.server.list_number = None
         code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
-        self.assertEqual(output, "Bug \u2192 bob. Filed as I7, but no List item exists: "
-                         + "the console server sent no Review item key\n")
-        self.assertEqual(self.items(), [])
+        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
+
+    def test_each_review_item_reports_its_own_list_number(self) -> None:
+        self.server.list_number = 1
+        self.assertEqual(self.run_main("bug", "bob", "A waiting row has no drag grip."),
+                         (new_item.Outcome.FILED, "Bug → bob. List item 1.\n", ""))
+        self.server.review_key = "another-key"
+        self.server.list_number = 2
+        self.assertEqual(self.run_main("bug", "bob", "A waiting row has no drag grip."),
+                         (new_item.Outcome.FILED, "Bug → bob. List item 2.\n", ""))
+        first, second = self.server.posts
+        self.assertNotEqual(first["request_id"], second["request_id"])
+
+    def test_a_list_write_failure_after_filing_keeps_the_draft(self) -> None:
+        def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
+                     body: bytes = b"") -> new_item.ServerReply:
+            reply = self.server.exchange(address, method, target, body)
+            if method == "POST" and len(self.server.posts) <= 2:
+                return new_item.ServerReply(503, {"error": "No space left on device"})
+            return reply
+
+        arguments = ("bug", "bob", "A waiting row has no drag grip.")
+        with mock.patch.object(new_item, "exchange", side_effect=exchange):
+            code, output, errors = self.run_main(*arguments)
+            self.assertEqual((code, output), (new_item.Outcome.FAILED, ""))
+            self.assertIn("No space left on device", errors)
+            self.assertEqual(self.run_main(*arguments),
+                             (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
+        self.assertEqual(len(self.server.posts), 3)
+        self.assertEqual(self.server.posts, [self.server.posts[0]] * 3)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

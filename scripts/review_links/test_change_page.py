@@ -34,10 +34,11 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
-from scripts.review_links.browser_test_support import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, scratch, urgency
+from scripts.lib.process_group import run_process_group
 from scripts.message import send_result
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -851,7 +852,9 @@ class ChangePageTests(unittest.TestCase):
     def write_delivery_config(self, tries: int = 3, pause: int = 0) -> None:
         _ = write_config_fixture(self.temporary / "config/review_links.conf",
                                  f"delivery_tries={tries}\ndelivery_pause_seconds={pause}\nfeedback_rows=5\n"
-                                 + "changes_first_root=natedev\nunrouted_alert_retry_seconds=60\npage_refresh_seconds=15\n")
+                                 + "changes_first_root=natedev\nunrouted_alert_retry_seconds=60\npage_refresh_seconds=15\n"
+                                 # Undo is off, so each send saves at once; test_send_hold and test_serve check the wait.
+                                 + "undo_seconds=0\n")
 
     def fail_all_but_alerts(self, calls: list[str]) -> Callable[[str, str, str], None]:
         def send(recipient: str, sender: str, message: str, **_options: str) -> None:
@@ -1805,9 +1808,9 @@ class ChangePageTests(unittest.TestCase):
             try:
                 profile = self.temporary / 'copy-profile'
                 profile.mkdir()
-                result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                result = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--screenshot', str(self.temporary / 'copy.png'), f'http://127.0.0.1:{server.server_port}/'],
-                    capture_output=True, text=True, timeout=30)
+                    timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
             finally:
                 server.shutdown()
@@ -3853,8 +3856,8 @@ class ChangePageTests(unittest.TestCase):
   const stubSave=outcome=>{
    let sent;
    window.fetch=async(url,request)=>{
-    if(request.method!=='POST') return {ok:false};
-    sent=request.body;return {ok:true,json:async()=>({answer:outcome})};
+    if(request.method!=='POST') return {headers:new Headers(),ok:false};
+    sent=request.body;return {headers:new Headers(),ok:true,json:async()=>({answer:outcome})};
    };
    return ()=>sent;
   };
@@ -3973,7 +3976,7 @@ class ChangePageTests(unittest.TestCase):
    check(current!==row && row.dataset.pending==='false','Does not work shows the next change before the server answers');
    check(!saveNotice.hidden && saveNotice.textContent==='Saving review.','the notice says the review is saving');
    const shown=current;
-   answer({ok:false,json:async()=>({reason:'Fixture save failed.'})});await saving;
+   answer({headers:new Headers(),ok:false,json:async()=>({reason:'Fixture save failed.'})});await saving;
    check(current===shown,'a failed save does not move the shown change');
    check(row.dataset.pending==='true' && !form.hidden,'a failed save puts the change back in the list');
    check(field.value==='Keep <these> words','failed save keeps the text');
@@ -4053,9 +4056,9 @@ class ChangePageTests(unittest.TestCase):
             try:
                 profile = self.temporary / "browser-profile"
                 profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile),
                                       "--window-size", "390,1200", "--screenshot", str(self.temporary / "browser.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"], capture_output=True, text=True, timeout=45)
+                                      f"http://127.0.0.1:{server.server_port}/"], timeout=45)
                 for kind, mode in cases:
                     with self.subTest(kind=kind, mode=mode):
                         self.assertEqual(run.returncode, 0, run.stderr)
@@ -4064,6 +4067,55 @@ class ChangePageTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_undo_puts_an_early_answer_back_in_the_list_and_skip_sends_no_hold(self) -> None:
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const realFetch=window.fetch.bind(window),host=window.top.document,posts=[];
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ window.fetch=async(url,request={})=>{
+  if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+  if(request.method!=='POST') return new Promise(()=>{});
+  const held=new Headers(request.headers).get('X-Undo-Hold');
+  posts.push([request.body.get('outcome'),held]);
+  if(held==='1') return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  return Response.json({answer:''});
+ };
+ try{
+  if(!current) show();
+  const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');
+  field.value='Keep these words.';
+  const saving=save(row,form,'not works');
+  check(current!==row && row.dataset.pending==='false','Does not work shows the next change during the hold.');
+  await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+  check(host.querySelector('[data-send-undo] span').textContent==='Sent to page-owner and builder-unit.',
+   'The toast names both receivers.');
+  host.querySelector('[data-send-undo] button').click();
+  await saving;
+  check(row.dataset.pending==='true' && !form.hidden && field.value==='Keep these words.',
+   'After Undo the change is back in the list with its words.');
+  check(saveNotice.textContent==='Undone: '+row.dataset.shown+'. It is back in the list. Open it',
+   'The notice says that the undone change is back in the list.');
+  const open=saveNotice.querySelector('button');
+  check(open?.textContent==='Open it','The notice has an Open it button.');
+  open?.click();
+  check(current===row,'Open it shows the change again.');
+  await save(row,form,'skip');
+  check(JSON.stringify(posts)===JSON.stringify([['not works','1'],['skip',null]]),'Skip sends no hold header.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = self.browser("changes")[2].replace('</body>', probe + '</body>')
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     def test_submit_writes_through_verdict_and_a_fresh_get_reads_the_saved_record(self) -> None:
         reply = self.request(self.page_path, self.answer())

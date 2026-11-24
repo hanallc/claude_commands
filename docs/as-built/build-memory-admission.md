@@ -438,15 +438,22 @@ Each Builds page row and each queue wait line shows `<owner>: <what>`, such as `
 `snapshot_codec.ROW_SEPARATOR` is `: `. A row with no usable "what" shows only the owner.
 On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start and the small line under it. A row with a unit starts with the unit.
 A unit at the row start always shows in the unit color, by its role, also when it has no staff entry. `StaffNames.unit_open` makes the opening tag of that span with `role_span_open`, the same code as `StaffNames.html`. The feed sends it as `unit_open`, and `staffNames.unit(text)` in the shared script adds the name.
-A row with no unit starts with its owner, the text before `: ` in its name. The text after `: ` goes in Step.
+A row with no unit starts with its owner. Mac rows carry the owner and step in separate fields.
+For other rows with no unit, the text before `: ` gives the owner. The text after `: ` goes in Step.
 An owner with a staff entry, such as a showrunner, shows in its staff color. Another owner, such as hana CI, shows in plain ink.
 A row with no unit has no small line, because the line would repeat the owner.
-A Mac row with no unit has a `started_by` field instead, so it shows in the same form as a unit row. Its owner starts the row (a staff owner, then the launcher). Its repository is the small text, and its step is in Step.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
-`snapshot_codec.owner_name` gives the owner of local, remote, cloud and Mac rows, in this order:
+`snapshot_codec.owner_name` gives the owner of local, remote, and cloud rows in this order.
 1. The recorded unit, then the staff unit.
 2. The staff showrunner, or the session name for a session with no production.
-3. The stored caller name, then the Mac launcher, then the repository or package.
+3. The fallback names from the caller.
+
+Mac rows use this owner lookup order.
+1. Use the submitting session or source checkout from the placement. After the placement ends, use the completed Verify call and its host. A known Verify call that is not yet in SQLite shows `unregistered session` until the next refresh after the index update. The steps below do not apply to it.
+2. If there is no source record, use the Mac process session or checkout to find the staff owner.
+3. If the Mac staff lookup gives no owner, use a claim that matches the checkout or submitting session.
+4. Use the checkout folder name if the staff owner is unavailable. Prefer the source checkout when available.
+
 A CI row uses `hana CI` as the owner.
 A gate job that the feed cannot read shows only its owner, from `owner_name`, on a local, remote or cloud row.
 So each of these rows removes the showrunner prefix in the same way, for example `merge-gate` for `sdlc-merge-gate`.
@@ -2337,7 +2344,20 @@ The badge is CSS text from the icon's `data-badge`, so it is not page text.
 Each icon has its machine name as its accessible name (`role="img"` and `aria-label`).
 A running row's `Machine` cell shows one bright icon in a faint box: the machine that runs the step.
 The feed's `machine` field is the one source for that machine.
-The row hover says `Runs on` with that machine, and lists the other machines that the step named under `Named targets`.
+The row hover names the running machine under `Runs on`.
+The `Folder` field follows `Runs on` and shows the full working path.
+The page shortens the machine's home directory to `~`.
+The path preserves spaces and wraps only at slashes.
+The feed carries the local, Mac, and confirmed Mac Linux working paths in `run_folder`.
+Between steps and on remote runs without a working path, the field shows `not reported yet`.
+Mac Linux gates report their numbered copy paths and account homes at start.
+The gate continues to read SSH output while the queue accepts the report.
+The queue saves the start report with the consumed assignment and restores it after restart.
+The folder appears once the queue confirms that attempt.
+The page fits and positions the open hover again after a feed refresh.
+The AWS progress record has no working path.
+The CI summary and hand-made Mac Linux runs have no `Folder` field.
+The hover lists the other machines that the step named under `Named targets`.
 A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
 A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
@@ -2425,19 +2445,19 @@ The recorded project directory identifies the run; a compiler's crate directory 
 The step name uses the command's package, then the repository when the command has no package.
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
-A Mac row with a unit starts with the unit, with the showrunner under it.
-The Mac reader records the launcher of each cargo run. It walks the parent process chain of the run and takes the first program that `queue_view.MAC_LAUNCHER_PROGRAMS` names:
-1. `claude` is a Claude session. The session id comes from the run's `CLAUDE_CODE_SESSION_ID`, then from the session marker in the copy record.
-2. `Runner.Worker` or `Runner.Listener` is hana CI. The CI origin uses the same walk.
-3. `rust-analyzer` is rust-analyzer.
-A program name can have a version suffix, such as `rust-analyzer-2026-11-02`.
-A session marker with no launcher program is a Claude session. A run with no launcher program and no marker is `terminal`.
-`memory_feed.mac_launcher_name` gives the shown launcher: the staff name of a known Claude session, `Claude session` for an unknown one, `hana CI`, `rust-analyzer` or `terminal`.
-A Mac row with no unit starts with its owner, from `owner_name`. A known staff owner comes first, then the launcher. The repository is the small text, and the step is in Step.
-The staff name shows in its staff color; the other launcher names show in plain text. The row hover names the owner in a `Started by` field.
-A reading from before the launcher field has no launcher, so its row keeps the old name that starts with the repository.
+The feed uses the source checkout and submitting session from the placement to find the owner in the staff records.
+After the placement leaves the queue, the feed reads the Verify calls in one SQLite query.
+When the index lacks a call, the row shows `unregistered session` until a refresh finds the call.
+The Mac reader records the Verify call ID from `BUILDLOG_CALL_ID`.
+It reads the session from the copy record or the process environment.
+The decoder also accepts `launcher_session` from older readings when the shared session field is empty or absent.
+A Mac unit row shows the unit in its unit color and the showrunner below it.
+A showrunner's own row shows the showrunner in the showrunner color.
+If the feed finds no staff row, the row shows the checkout folder name with no small line.
+The Step column uses the shared layout.
+The Mac reader identifies hana CI by a `Runner.Worker` or `Runner.Listener` process ancestor.
 A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
-A `user`, `hana-ci` or `unplaced` run adds that label to its name.
+The Mac build field in the hover shows gate labels such as `user`, `unplaced`, and `hana-ci`.
 The stage uses a test counter or a running test binary as evidence for `testing`.
 The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
 It embeds the shared Cargo folder reader in the same Mac reading.
