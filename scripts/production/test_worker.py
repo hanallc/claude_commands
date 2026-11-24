@@ -1487,7 +1487,8 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(shutdown.main(["resume", "--production", owner.name]), 0, lifecycle_errors.getvalue())
         self.assertIsInstance(self.fixture.parent.paused, staff.Active)
         send_message.assert_called_with(f"session:{parent.current_session}", "agents lifecycle",
-                                        "Continue where you stopped. Resume your existing workers. Do not open new workers.")
+                                        "Continue where you stopped. Resume your existing workers. Do not open new workers.",
+                                        key=ANY, recipient_kind=None, once_per_key=True)
         state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
         self.assertIsInstance(state, worker_panes.StoppedWorker)
         notices = len(self.fixture.prompts())
