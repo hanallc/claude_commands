@@ -51,9 +51,7 @@ class VerifyCheckNoLibraryTests(DevFeatureFixture):
         marker.parent.mkdir(parents=True)
         marker.touch()
         self.assert_rejects_missing_manifest(
-            "claude_commands: From the worktree root, run ~/.claude/scripts/lib/py "
-            "~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- "
-            "./scripts/lib/py scripts/production/gate.py --affected")
+            "claude_commands: From the worktree root, run ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected")
 
 
 if __name__ == "__main__":
