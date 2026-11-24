@@ -157,14 +157,23 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
         except (OSError, ValueError) as error:
             print(f"mac_test: cannot start nextest with a log: {error}", file=sys.stderr)
             return None
-        try:
-            if status:
-                os.utime(log.fileno(), None)
-            replay_log(log, path, status, limits, output)
-            if status == 0:
-                path.unlink()
-        except (OSError, conf.Unusable) as error:
-            print(f"mac_test: cannot replay the nextest log: {error}", file=sys.stderr)
+        with conf.diagnostics(report=False) as diagnostics:
+            try:
+                if status:
+                    os.utime(log.fileno(), None)
+                replay_log(log, path, status, limits, output)
+                if status == 0:
+                    path.unlink()
+            except (OSError, conf.Unusable) as error:
+                diagnostics.append(f"mac_test: cannot replay the nextest log: {error}")
+        if diagnostics:
+            try:
+                lines = "".join(" ".join(message.splitlines()) + "\n" for message in diagnostics)
+                _ = output.write(lines.encode("utf-8", errors="replace"))
+                output.flush()
+            except OSError:
+                for message in diagnostics:
+                    print(message, file=sys.stderr)
     return 128 - status if status < 0 else status
 
 

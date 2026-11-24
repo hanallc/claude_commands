@@ -28,6 +28,7 @@ from scripts.buildlog import index
 from scripts.buildlog import mac_outcome
 from scripts.buildlog import moments, report, holds, health
 from scripts.buildlog.cgroup_test_support import GIB, slice_reading
+from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.buildlog import rust_release, sync
 from scripts.buildlog import store
@@ -1211,7 +1212,7 @@ class ReportTests(unittest.TestCase):
                 with closing(index.read_only()) as connection:
                     groups = report.profile_step_durations(
                         connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC),
-                        report.RebuildClasses.read(),
+                        report.RebuildClasses(),
                     )
                 self.assertEqual(groups[("nextest", "verify", label)], [20.0])
                 self.assertNotIn(("nextest", "verify", other_label), groups)
@@ -1236,7 +1237,7 @@ class ReportTests(unittest.TestCase):
         with closing(index.read_only()) as connection:
             groups = report.profile_step_durations(
                 connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC),
-                report.RebuildClasses.read(),
+                report.RebuildClasses(),
             )
         self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
         self.assertNotIn(("nextest", "verify", "first build here (1–49 crates)"), groups)
@@ -1250,6 +1251,9 @@ class ReportTests(unittest.TestCase):
         )
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("before-change", started_at="2026-10-01T12:00:00Z", ended_at="2026-10-01T12:00:00Z",
+                        caller="verify", crates_compiled=4, duration_s=50.0,
+                        argv=["cargo", "nextest", "run", "--workspace", "--tests"]),
             cargo_build("warm-edited", caller="verify", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(warm)"]),
             cargo_build("warm-cascade", caller="verify", crates_compiled=4, duration_s=40.0, finished_s=20.0,
                         argv=["cargo", "nextest", "run", "--workspace", "--tests", "-E", "package(warm-cascade)"]),
@@ -1257,13 +1261,38 @@ class ReportTests(unittest.TestCase):
                         argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(first)"]),
             cargo_build("first-cascade", caller="verify", target_dir="/fresh/two", crates_compiled=4, duration_s=711.0, finished_s=700.0),
         )
-        for maximum, edited_label, cascade_label, edited_times, cascade_times in (
-            (3, "edited crate (1–3 crates)", "cascade (4–49 crates)", [20.0], [40.0]),
-            (4, "edited crate (1–4 crates)", "cascade (5–49 crates)", [20.0, 40.0], []),
+        config = Path(os.environ["CONF_DIR"])
+        moment = moments.BuildMoment(datetime(2026, 10, 2, tzinfo=UTC), "fixture change", "all")
+        read_whole = conf.ConfigRead.whole
+        for maximum, maximum_after_read, edited_label, cascade_label, edited_times, cascade_times, p50_row in (
+            (3, 3, "edited crate (1–3 crates)", "cascade (4–49 crates)", [20.0], [40.0],
+             "| nextest | verify.sh (agents) | cascade (4–49 crates) | 1 | 50.0 s | 1 | 40.0 s | — |"),
+            (4, 4, "edited crate (1–4 crates)", "cascade (5–49 crates)", [20.0, 40.0], [],
+             "| nextest | verify.sh (agents) | edited crate (1–4 crates) | 1 | 50.0 s | 2 | 20.0 s | — |"),
+            (4, 3, "edited crate (1–4 crates)", "cascade (5–49 crates)", [20.0, 40.0], [],
+             "| nextest | verify.sh (agents) | edited crate (1–4 crates) | 1 | 50.0 s | 2 | 20.0 s | — |"),
         ):
-            with self.subTest(maximum=maximum):
-                write_edited_crate_maximum(Path(os.environ["CONF_DIR"]), maximum)
-                section = self.rebuilds_lines()
+            with self.subTest(maximum=maximum, maximum_after_read=maximum_after_read):
+                write_edited_crate_maximum(config, maximum)
+                reads = 0
+
+                def read_and_update(settings: conf.ConfigRead, key: str) -> int:
+                    nonlocal reads
+                    value = read_whole(settings, key)
+                    if key == "report.edited_crate_max_crates":
+                        reads += 1
+                        if reads == 1 and maximum_after_read != maximum:
+                            write_edited_crate_maximum(config, maximum_after_read)
+                    return value
+
+                with (
+                    mock.patch.object(conf.ConfigRead, "whole", autospec=True, side_effect=read_and_update),
+                    mock.patch.object(moments, "MOMENTS", (moment,)),
+                ):
+                    text = self.render("2026-10-02")
+                section = self.section_lines(text, "### Rebuilds")
+                self.assertIn(p50_row, self.section_lines(text, "### Before and after"))
+                self.assertEqual(reads, 1)
                 for prefix in (f"| {edited_label} | {len(edited_times)} |",
                                f"| {cascade_label} | {len(cascade_times)} |", "| first build here (1–49 crates) | 2 |"):
                     self.assertTrue(any(line.startswith(prefix) for line in section), section)
@@ -1275,10 +1304,11 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(packages, expected_packages)
                 self.assertTrue(any(line.startswith(f"Source: warm nextest steps that compiled 1–{maximum} crates")
                                     for line in section), section)
+                write_edited_crate_maximum(config, maximum)
                 with closing(index.read_only()) as connection:
                     groups = report.profile_step_durations(
                         connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC),
-                        report.RebuildClasses.read(),
+                        report.RebuildClasses(),
                     )
                 self.assertCountEqual(groups[("nextest", "verify", edited_label)], edited_times)
                 self.assertEqual(groups.get(("nextest", "verify", cascade_label), []), cascade_times)

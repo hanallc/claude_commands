@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import UTC, datetime
 import io
 from pathlib import Path
@@ -371,26 +371,36 @@ exit "$CLEANUP_TEST_STATUS"
         write_shell(lint, 'cat "$CLEANUP_TEST_DIR/nextest-out" >&2\nexit "$CLEANUP_TEST_STATUS"\n')
         limits = ((nextest_log.TAIL_BYTES, str(len(fragment))), (nextest_log.SUMMARY_BYTES, "52"))
         logs = self.home_directory / nextest_log.DIRECTORY
+        config = self.root / "config/mac_test.conf"
+        key_problem = f"{config}: nextest.summary_scan_bytes='1048577': outside range 1..1048576"
+        cases = (
+            (96, summary[:52] + "\n"),
+            (1048577, f"warning: {key_problem}\n"
+             + f"mac_test: cannot replay the nextest log: {key_problem}; no usable committed value\n"),
+        )
         for shell in (["/bin/sh"], ["zsh", "-f"]):
-            with self.subTest(shell=shell):
-                failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
-                self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout + failed.stderr)
-                self.assertEqual((failed.returncode, failed.stderr), (0, ""))
-                log, = logs.iterdir()
-                self.assertRegex(log.name, nextest_log.LOG_NAME)
-                self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
-                self.assertEqual(log.read_text(), output)
-                self.assertEqual(failed.stdout, (
-                    f"mac_test: full nextest log: {log}\n"
-                    + f"mac_test: tail fragment: {fragment}\n{summary[:52]}\n"
-                    + "mac_exit=42\nmac_cleanup=skipped\n"
-                ))
+            for scan_bytes, expected_replay in cases:
+                with self.subTest(shell=shell, scan_bytes=scan_bytes), ExitStack() as cleanup:
+                    _ = write_config_fixture(config, f"nextest.summary_scan_bytes={scan_bytes}\n")
+                    failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
+                    self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout + failed.stderr)
+                    self.assertEqual(failed.returncode, 0, failed.stderr)
+                    log, = logs.iterdir()
+                    _ = cleanup.callback(log.unlink)
+                    self.assertRegex(log.name, nextest_log.LOG_NAME)
+                    self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+                    self.assertEqual(log.read_text(), output)
+                    self.assertEqual(failed.stdout, (
+                        f"mac_test: full nextest log: {log}\n"
+                        + f"mac_test: tail fragment: {fragment}\n{expected_replay}"
+                        + "mac_exit=42\nmac_cleanup=skipped\n"
+                    ))
+                    self.assertEqual(failed.stderr, "")
 
-                passed = self.run_remote(shell, 0, ("--target-dir=other-target",), budget_values=limits)
-                self.assertEqual((passed.returncode, passed.stderr), (0, ""))
-                self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
-                self.assertEqual(list(logs.iterdir()), [log])
-                log.unlink()
+                    passed = self.run_remote(shell, 0, ("--target-dir=other-target",), budget_values=limits)
+                    self.assertEqual((passed.returncode, passed.stderr), (0, ""))
+                    self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
+                    self.assertEqual(list(logs.iterdir()), [log])
 
     def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
         minutes = 3

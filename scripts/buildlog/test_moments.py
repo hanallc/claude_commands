@@ -103,7 +103,7 @@ class MomentTests(unittest.TestCase):
 
     def section(self, *records: Record, day: str = "2026-10-13") -> list[str]:
         with closing(self.connection(*records)) as connection:
-            return report.moments_section(connection, day)
+            return report.moments_section(connection, day, report.RebuildClasses())
 
     def test_hana_membership_uses_direct_fields_majority_sessions_calls_and_exclusions(self) -> None:
         direct_fields = ("repo", "repo_path", "repo_identity", "cwd", "worktree", "branch",
@@ -292,7 +292,7 @@ class MomentTests(unittest.TestCase):
             mock.patch.object(moments, "window_rates", wraps=moments.window_rates) as measured,
             mock.patch.object(report, "profile_step_durations", wraps=report.profile_step_durations) as grouped,
         ):
-            lines = report.moments_section(connection, "2026-10-11")
+            lines = report.moments_section(connection, "2026-10-11", report.RebuildClasses())
         self.assertEqual([(entry.args[1], entry.args[2]) for entry in measured.call_args_list],
                          [(at - timedelta(days=7), at), (at, now)])
         self.assertEqual([(entry.args[1], entry.args[2]) for entry in grouped.call_args_list],
@@ -342,7 +342,7 @@ class MomentTests(unittest.TestCase):
         )) as connection:
             ids = moments.hana_step_ids(connection, START, END)
             rates = moments.window_rates(connection, START, END)
-            groups = report.profile_step_durations(connection, START, END, report.RebuildClasses.read(), hana_only=True)
+            groups = report.profile_step_durations(connection, START, END, report.RebuildClasses(), hana_only=True)
         self.assertEqual(ids, frozenset({"direct-offset", "call-offset"}))
         self.assertEqual(rates.totals["nextest"], 2)
         self.assertAlmostEqual(rates.totals["run_hours_hana"], 0.05)
@@ -403,7 +403,7 @@ class MomentTests(unittest.TestCase):
                     mock.patch.object(moments, "window_rates", wraps=moments.window_rates) as rates,
                     mock.patch.object(moments, "phase_events", wraps=moments.phase_events) as phases,
                 ):
-                    lines = report.moments_section(connection, "2026-10-12")
+                    lines = report.moments_section(connection, "2026-10-12", report.RebuildClasses())
         phases.assert_called_once()
         comparisons = [line for line in lines if line.startswith("Before ")]
         self.assertEqual(len(comparisons), 3)
@@ -502,10 +502,21 @@ class MomentTests(unittest.TestCase):
             mock.patch.object(moments, "MOMENTS", self.configured_moments),
             closing(self.connection(build("measured", 3600, repo="hana"))) as connection,
         ):
-            expected = report.moments_section(connection, "2026-10-30")
+            expected = report.moments_section(connection, "2026-10-30", report.RebuildClasses())
         result = read_only_cli(self, ["moments", "2026-10-30"])
         self.assertEqual(result.stdout.splitlines(), expected)
 
+    def test_moments_command_shows_profile_without_a_usable_rebuild_limit(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        report_fixtures.write_edited_crate_maximum(config, 49)
+        at = "2026-10-01T12:00:00Z"
+        with closing(self.connection(sample(at, power_profile="performance", power_profile_since=at))):
+            pass
+
+        result = read_only_cli(self, ["moments", "2026-10-11"])
+        self.assertIn("### Before and after", result.stdout)
+        self.assertIn("Profile now: performance, since 2026-10-01 12:00:00 UTC.", result.stdout)
+        self.assertNotIn("| Before p50 |", result.stdout)
 
 
 class MemoryMomentTests(unittest.TestCase):
@@ -578,7 +589,7 @@ assert isinstance(kills, list), kills
 print(json.dumps([(kill.is_build, kill.outside_build_gate) for kill in kills]))
 moments.MOMENTS = (moments.MemoryMoment(start, "fixture budget raise"),)
 with index.read_only() as connection:
-    print("\\n".join(report.moments_section(connection, "2026-10-11")))
+    print("\\n".join(report.moments_section(connection, "2026-10-11", report.RebuildClasses())))
 '''
         result = subprocess.run(
             [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", program], capture_output=True, text=True, check=False,
@@ -611,7 +622,7 @@ with index.read_only() as connection:
             memory_rows = report.memory_window_rows(connection, START, END)
             build_lines = report.moment_rate_table(before, after, build_moment)
             memory_lines = report.memory_moment_table(memory_rows, memory_rows, before.days, after.days)
-            section = report.moments_section(connection, "2026-10-11")
+            section = report.moments_section(connection, "2026-10-11", report.RebuildClasses())
         expected = "Before: 1.500 days (thin); after: 2.000 days."
         self.assertIn(expected, build_lines)
         self.assertIn(expected, memory_lines)
@@ -640,7 +651,7 @@ with index.read_only() as connection:
         ):
             before = {row.key: row for row in report.memory_window_rows(connection, at - timedelta(days=7), at)}
             after = {row.key: row for row in report.memory_window_rows(connection, at, END)}
-            lines = report.moments_section(connection, "2026-10-11")
+            lines = report.moments_section(connection, "2026-10-11", report.RebuildClasses())
         self.assertAlmostEqual(cast(float, before["builds"].value), 1)
         self.assertAlmostEqual(before["builds"].outside_build_gate, 1 / 7)
         self.assertAlmostEqual(cast(float, before["others"].value), 2 / 7)

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from decimal import Decimal
+from functools import cached_property
 import time
 from typing import Literal, NamedTuple, cast
 from zoneinfo import ZoneInfo
@@ -662,20 +663,20 @@ def warm_step_clause() -> str:
     )
 
 
-@dataclass(frozen=True)
 class RebuildClasses:
-    edited_crate_max: int
-    edited_label: str
-    cascade_label: str
+    """Keep one edited-crate limit for the sections of a report."""
 
-    @classmethod
-    def read(cls) -> RebuildClasses:
-        edited_crate_max = conf.read("buildlog").whole("report.edited_crate_max_crates")
-        return cls(
-            edited_crate_max,
-            f"edited crate ({EDITED_CRATE_MIN_CRATES}–{edited_crate_max} crates)",
-            f"cascade ({edited_crate_max + 1}–{CASCADE_MAX_CRATES} crates)",
-        )
+    @cached_property
+    def edited_crate_max(self) -> int:
+        return conf.read("buildlog").whole("report.edited_crate_max_crates")
+
+    @cached_property
+    def edited_label(self) -> str:
+        return f"edited crate ({EDITED_CRATE_MIN_CRATES}–{self.edited_crate_max} crates)"
+
+    @cached_property
+    def cascade_label(self) -> str:
+        return f"cascade ({self.edited_crate_max + 1}–{CASCADE_MAX_CRATES} crates)"
 
     def labels(self) -> tuple[str, ...]:
         return (NO_REBUILD_LABEL, self.edited_label, self.cascade_label, FIRST_BUILD_LABEL, COLD_BUILD_LABEL)
@@ -1529,7 +1530,7 @@ def memory_overlap_lines(window: moments.ComparisonWindow, events: Sequence[mome
     return lines
 
 
-def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
+def moments_section(connection: sqlite3.Connection, day: str, classes: RebuildClasses) -> list[str]:
     """One comparison window rule for build interventions and observed profiles."""
     end = report_end(day, datetime.now(UTC))
     profiles = [change for change in profile_changes(connection) if call_time(change.at) < end]
@@ -1568,7 +1569,6 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",
         ]
     phases = moments.phase_events() if any(isinstance(window.moment, moments.BuildMoment) for window in windows) else ()
-    classes = RebuildClasses.read()
     rates: dict[tuple[datetime, datetime], moments.WindowRates] = {}
     p50_groups: dict[tuple[datetime, datetime, bool], dict[tuple[str, str, str], list[float]]] = {}
 
@@ -1621,7 +1621,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
 
 def power_profile_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Compatibility entry point for the generalized comparison section."""
-    return moments_section(connection, day)
+    return moments_section(connection, day, RebuildClasses())
 
 
 def day_range(day: str) -> tuple[str, str]:
@@ -2585,7 +2585,7 @@ def linked_steps_section(connection: sqlite3.Connection, day: str) -> list[str]:
 @target_predicate_scope()
 def report(connection: sqlite3.Connection, day: str, *,
            day_selection: ReportDaySelection = ReportDaySelection.EXPLICIT_DATE) -> str:
-    classes = RebuildClasses.read()
+    classes = RebuildClasses()
     found = kinds(connection, day)
     hosts = cast(
         int,
@@ -2617,7 +2617,7 @@ def report(connection: sqlite3.Connection, day: str, *,
     lines += (
         calls
         + test_builds_section(connection, day)
-        + moments_section(connection, day)
+        + moments_section(connection, day, classes)
         + tests_by_target_lines(test_calls)
         + mac_section(connection, day)
         + aws_section(connection, day, day_selection=day_selection)
