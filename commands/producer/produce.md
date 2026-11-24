@@ -84,7 +84,8 @@ Read your items in morty's folder with `~/.claude/scripts/lib/py ~/.claude/scrip
 Use `the_list.py update --id L<n>` to update your items in morty's folder.
 For a legacy item, use `the_list.py update --keeper <keeper> --id L<n> --next-step "<step>"`.
 Run an `update` command from a List message as it is.
-Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--owner`, `--related-to`, `--blocked-by`, `--evidence`, or `--add-evidence`.
+Link your item to any item with `--related-to` or `--blocked-by`, also an item of another producer. You change only your own item.
 Write no time in `--source`.
 
 Add your own item with `the_list.py add --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.
@@ -95,7 +96,8 @@ Act on nate's Tell. Record his words in the item in the same turn.
 Answer a List question with the command in its message.
 `the_list.py answer L<n> --keeper <keeper> --question <id> --text "<answer>"`
 
-Ask morty to reassign an item.
+Use `the_list.py tag --id L<n> --add <tag>` or `--remove <tag>` on your own items. `the_list.py tags` lists the tags in use.
+Ask morty only to assign an item to a different producer.
 Ask morty to record updates and decisions that you cannot write with `the_list.py`.
 morty handles `/recall` and New item requests. morty reads every item at each round.
 Correct an item when morty says that its text is unclear.
