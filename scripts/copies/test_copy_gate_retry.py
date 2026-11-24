@@ -64,7 +64,9 @@ class CopyGateRetryTests(unittest.TestCase):
                 copies.COMMAND_LOCKS.reset(token)
 
     def run_gate(self, *, report_failure: bool) -> tuple[int, bytes, bytes]:
-        script = self.root / "gate.py"
+        gate_path = "scripts/production/gate.py"
+        script = self.tree / gate_path
+        script.parent.mkdir(parents=True)
         _ = script.write_text(dedent("""\
             import os
             from pathlib import Path
@@ -78,7 +80,7 @@ class CopyGateRetryTests(unittest.TestCase):
             assert Path.cwd() == Path(sys.argv[2])
             assert Path(os.environ["BUILDLOG_PREPARED_COPY"]) == Path.cwd()
             with os.fdopen(int(os.environ["BUILDLOG_PREPARED_GATE_FD"]), "rb") as handoff:
-                assert handoff.read(1) == b"1"
+                assert handoff.read(32) == f"{os.getpid()}\\n".encode("ascii")
             assert os.environ["COPIES_STEP_OWNER"] == "fixture"
             os.fstat(int(os.environ["COPIES_COMMAND_LEASE_FDS"]))
             path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
@@ -97,7 +99,7 @@ class CopyGateRetryTests(unittest.TestCase):
             raise SystemExit(7)
             """))
         repository = Path(__file__).resolve().parents[2]
-        command = (sys.executable, str(script), str(repository), "{tree}", str(self.runs),
+        command = (sys.executable, gate_path, str(repository), "{tree}", str(self.runs),
                    "report" if report_failure else "no-report")
 
         remote = placement.PlacementDestination("ssh", "mac-linux", "fixture-guest", claim_state.WHOLE_MAC, 1)
