@@ -20,6 +20,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.lib import conf_reads
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -575,7 +576,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             _ = stream.write("repeat_count=9\n")
         reads = folder / "reads"
         errors = io.StringIO()
-        with patch.dict(os.environ, {"CONF_READ_LOG": str(reads)}), redirect_stderr(errors):
+        with conf_reads.record_reads(reads), redirect_stderr(errors):
             self.assertEqual([self.persist(self.attempt(at=index)).held for index in range(4)],
                              [False, False, False, True])
         self.assertIn("repeat_count='2'", errors.getvalue())

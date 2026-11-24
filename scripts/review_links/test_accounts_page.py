@@ -1710,7 +1710,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 with self.subTest(refresh_seconds=seconds):
                     _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
                     with (patch.object(accounts, "read_status", return_value=reading) as status,
-                          patch.dict(os.environ, {"CONF_DIR": temporary})):
+                          patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "UTC"})):
                         page = accounts_page.page().decode()
                     source: object = status.call_args.kwargs["source"]  # pyright: ignore[reportAny]
                     self.assertIsInstance(source, accounts.StoredUsageOnly)
@@ -1745,7 +1745,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 with self.subTest(refresh_seconds=seconds):
                     _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
                     with (patch.object(accounts, "read_status", return_value=reading),
-                          patch.dict(os.environ, {"CONF_DIR": temporary})):
+                          patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "UTC"})):
                         page = accounts_page.page().decode()
                     assert_status_states(self, page, seconds)
 

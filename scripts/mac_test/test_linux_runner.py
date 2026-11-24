@@ -202,6 +202,7 @@ class LinuxShellTests(unittest.TestCase):
         self.source.mkdir(parents=True)
         self.settings = self.root / "linux.conf"
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
+        _ = write_config_fixture(self.root / "user_zone.conf")
         _ = write_config_fixture(self.settings,
             "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
@@ -643,7 +644,7 @@ class LinuxShellTests(unittest.TestCase):
         result = self.execute(self.request())
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("mac_cleanup=kept", result.stdout)
+        self.assertIn("mac_cleanup=kept", result.stdout, result.stderr)
         self.assert_budget_review(result, self.mirror / "target")
         self.assertTrue(old.exists())
         self.assertTrue(recent.exists())

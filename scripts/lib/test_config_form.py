@@ -11,7 +11,7 @@ import tempfile
 from typing import NamedTuple, cast
 import unittest
 
-from scripts.lib import conf, config_form_exceptions as exceptions
+from scripts.lib import conf, config_form_exceptions_test_support as exceptions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 

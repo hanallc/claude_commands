@@ -61,6 +61,7 @@ class RebootTests(unittest.TestCase):
             "REBOOT_LOG_FOLDER=reboot\n# range: 0.001..10\nREBOOT_SPINNER_SECONDS=0.1\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config),
+            "USER_ZONE": "UTC",
             "XDG_STATE_HOME": str(self.root / "state"),
             "XDG_CONFIG_HOME": str(config),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),

@@ -4221,7 +4221,9 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_whole_read_observer_keeps_the_actual_configuration_file(self) -> None:
         configured = conf.read("accounts")
-        other = conf.read(conf.path("accounts"))
+        copied = self.home / "accounts.conf"
+        _ = copied.write_bytes(configured.source.read_bytes())
+        other = conf.read(copied)
         with observe_whole_reads() as read:
             self.assertEqual(configured.whole("usage_stale_minutes"), other.whole("usage_stale_minutes"))
         self.assertEqual(read.call_args_list, [call("accounts", "usage_stale_minutes"),

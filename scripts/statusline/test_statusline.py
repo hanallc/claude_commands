@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import accounts, new_account
 from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
@@ -2229,7 +2229,7 @@ class RebuildRowTests(unittest.TestCase):
                     + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\nrebuild.eval_timeout=41\nrebuild.eval_retry_seconds=301\n")
             _ = write_config_fixture(default, text.replace("interval=17", "interval=34"))
             _ = write_config_fixture(path, text, template="statusline")
-            with patch.dict(os.environ, {"CONF_DIR": str(root), "CONF_READ_LOG": str(reads)}):
+            with patch.dict(os.environ, {"CONF_DIR": str(root)}), conf_reads.record_reads(reads):
                 self.assertEqual(rebuild_row.RebuildSettings.read().interval, 34)
                 settings = rebuild_row.RebuildSettings.read(path)
                 self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41, 301))

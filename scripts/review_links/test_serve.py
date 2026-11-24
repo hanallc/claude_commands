@@ -7110,6 +7110,9 @@ class ServerAddressHealthTests(unittest.TestCase):
     def setUp(self) -> None:
         root = self.enterContext(tempfile.TemporaryDirectory(prefix="review-address-test-"))
         folder = Path(root)
+        configuration = folder / "config"
+        _ = write_config_fixture(configuration / "review_links.conf", "tailscale_check_seconds=60\n")
+        _ = write_config_fixture(configuration / "statusline.conf", f"rebuild.cache={folder / 'rebuilds'}\n")
         staff_file = folder / "staff.json"
         _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
         self.elapsed = 100.0
@@ -7118,6 +7121,7 @@ class ServerAddressHealthTests(unittest.TestCase):
         self.stderr = self.enterContext(redirect_stderr(StringIO()))
         _ = self.enterContext(redirect_stdout(StringIO()))
         _ = cast(dict[str, str], self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(configuration),
             "REVIEW_LINKS_ROOT": root,
             "STAFF_FILE": str(staff_file),
             "CHANGE_REVIEW_DIR": str(folder / "changes"),

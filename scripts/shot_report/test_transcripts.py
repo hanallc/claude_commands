@@ -39,6 +39,7 @@ from scripts.shot_report.transcripts import CachedScanEvidence
 def setUpModule() -> None:
     config = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())) / "config"
     _ = write_config_fixture(config / "shot_report.conf", "# whole: 1..\ntranscripts.parallel_scan_bytes=1000000000\n")
+    _ = write_config_fixture(config / "user_zone.conf")
     _ = unittest.enterModuleContext(cast(AbstractContextManager[object], patch.dict(os.environ, {"CONF_DIR": str(config)})))
 
 

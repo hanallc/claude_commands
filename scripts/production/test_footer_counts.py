@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import copy_config_file_fixture
+from scripts.lint.memory_test_support import copy_config_file_fixture, write_config_fixture
 from scripts.agents import remote
 
 import contextlib
@@ -418,6 +418,7 @@ class FooterCountsTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[2] / "config/change_review.conf"
         _ = copy_config_file_fixture(source, config / "change_review.conf")
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        _ = write_config_fixture(config / "user_zone.conf")
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
         listing = self.root / "change-review - top.md"
         doc = self.root / "top-production.md"
@@ -478,6 +479,7 @@ class FooterCountsTests(unittest.TestCase):
         _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\nchanges_first_root=top\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={self.root}\nreview_links_directory={self.root / 'links'}\n")
+        _ = write_config_fixture(config / "user_zone.conf")
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config)}),
               mock.patch.object(page_review, "lists_directory", return_value=self.root)):
             for document in (self.root / "missing-production.md", doc):

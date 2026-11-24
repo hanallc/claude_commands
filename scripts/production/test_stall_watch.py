@@ -57,6 +57,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
 from scripts.agents import pane_record
 from scripts.production import session_staff, unit_lookup
+from scripts.lib import conf_reads
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
@@ -361,6 +362,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         overrides = {"prompt_grace_seconds": "0", **values}
         _ = write_config_fixture(path, WATCH_DEFAULTS + "".join(f"{key}={value}\n" for key, value in overrides.items()))
         return path
+
+    def write_grace_fault(self, setting: str) -> None:
+        config = self.watch_settings(prompt_grace_seconds="invalid")
+        if setting == "missing":
+            _ = config.write_text(config.read_text().replace("prompt_grace_seconds=invalid\n", ""))
 
     def test_prompt_alert_seconds_reads_changed_config(self) -> None:
         path = self.root / "production.conf"
@@ -1241,8 +1247,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(len(self.prompt_notices()), 2)
 
     def test_a_prompt_tells_its_owner_once_then_alerts_only_after_the_configured_grace(self) -> None:
-        config = self.root / "stall_watch.conf"
-        _ = config.write_text("prompt_grace_seconds=120\n")
+        _ = self.watch_settings(prompt_grace_seconds="120")
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         self.assertEqual(self.tick(START).returncode, 0)
@@ -1324,7 +1329,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(self.prompt_followups(), [])
 
     def test_a_prompt_answered_during_the_owner_grace_never_pushes(self) -> None:
-        _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=120\n")
+        _ = self.watch_settings(prompt_grace_seconds="120")
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
@@ -1338,8 +1343,7 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertFalse(self.prompt_state().exists())
 
     def test_the_grace_is_reread_from_the_person_edited_file(self) -> None:
-        config = self.root / "stall_watch.conf"
-        _ = config.write_text("prompt_grace_seconds=600\n")
+        _ = self.watch_settings(prompt_grace_seconds="600")
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
@@ -1347,13 +1351,13 @@ runpy.run_path(str(script), run_name='__main__')
         told = START + 60
         self.assertEqual(self.tick(told + 120).returncode, 0)
         self.assertEqual(self.prompt_followups(), [])
-        _ = config.write_text("prompt_grace_seconds=120\n")
+        _ = self.watch_settings(prompt_grace_seconds="120")
         self.assertEqual(self.tick(told + 120).returncode, 0)
         self.assertEqual([item["to"] for item in self.prompt_followups()], ["user"])
         self.assertEqual(len(self.prompt_notices()), 1)
 
     def test_a_permanently_failed_owner_notice_cannot_delay_the_user_alert(self) -> None:
-        _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=120\n")
+        _ = self.watch_settings(prompt_grace_seconds="120")
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
@@ -1373,15 +1377,11 @@ runpy.run_path(str(script), run_name='__main__')
     def test_invalid_or_missing_grace_alerts_a_still_blocked_prompt(self) -> None:
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
-        for setting in ("prompt_grace_seconds=invalid\n", "missing"):
+        for setting in ("invalid", "missing"):
             with self.subTest(setting=setting):
                 self.prompt_state().unlink(missing_ok=True)
                 _ = self.tick(START)
-                config = self.root / "stall_watch.conf"
-                if setting == "missing":
-                    config.unlink(missing_ok=True)
-                else:
-                    _ = config.write_text(setting)
+                self.write_grace_fault(setting)
                 before = len(self.prompt_followups())
                 result = self.tick(START + 60)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1606,7 +1606,7 @@ runpy.run_path(str(script), run_name='__main__')
             self.assertEqual(len(list(self.state.glob("*.prompt.cancel.json"))), 2)
 
     def test_slow_inspection_does_not_move_the_prompts_escalation_deadline(self) -> None:
-        _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=120\n")
+        _ = self.watch_settings(prompt_grace_seconds="120")
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
@@ -1641,13 +1641,9 @@ runpy.run_path(str(script), run_name='__main__')
             _ = self.tick(START + 60)
         self.panes["unit-one"]["agent_status"] = "idle"
         self.panes["unit-one"]["pane"] = "— done: answered\n"
-        for setting in ("prompt_grace_seconds=invalid\n", "missing"):
+        for setting in ("invalid", "missing"):
             with self.subTest(setting=setting):
-                config = self.root / "stall_watch.conf"
-                if setting == "missing":
-                    config.unlink()
-                else:
-                    _ = config.write_text(setting)
+                self.write_grace_fault(setting)
                 result = self.tick(START + 120)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("using zero prompt grace", result.stderr)
@@ -3261,6 +3257,7 @@ runpy.run_path(str(script), run_name='__main__')
                            capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         _ = commit_repository(self.root, "Set sender limits", "stall_watch.conf", env=git_environment)
         reads = self.root / "reads"
+        self.enterContext(conf_reads.record_reads(reads))
         self.environment["CONF_READ_LOG"] = str(reads)
         for key in ("sender_cleanup_seconds", "sender_batch_seconds"):
             for value in ("oops", "nan", "0"):

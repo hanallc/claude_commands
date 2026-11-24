@@ -141,8 +141,9 @@ REAL_CURRENT_CLAUDE_RECORD = unit_lookup.current_claude_record
 
 
 def write_send_config(path: Path, values: str) -> int:
-    """Keep timing settings when a test writes its own send settings."""
-    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production"):
+    """Write the settings that the send fixture uses."""
+    for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production", "notify",
+                 "user_zone"):
         _ = write_config_fixture(path.parent / f"{name}.conf")
     write_configs(path.parent)
     return write_config_fixture(path, values)
@@ -2576,6 +2577,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertIn("Read the phase report.", self.held_text())
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
+        _ = write_config_fixture(self.root / "config/send_repeat_guard.conf", "repeat_count=3\n")
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
             results = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100") for _ in range(5)]
         outcomes = [result.outcome for result in results]
@@ -4812,6 +4814,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 2)
 
     def test_flood_guard_counts_a_staff_recipient_across_session_restarts(self) -> None:
+        _ = write_config_fixture(self.root / "config/send_repeat_guard.conf", "repeat_count=3\n")
         outcomes: list[str] = []
         for identity in ("first", "second", "third"):
             self.session(identity, "resources")

@@ -74,6 +74,7 @@ class MacRunTests(unittest.TestCase):
         self.configure_limit(1)
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root), "COPIES_CONFIG": str(copies_config),
+            "USER_ZONE": "UTC",
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         }))
         _ = self.enterContext(mock.patch.object(claim_state, "submitting_session", return_value=NoOwningSession()))
