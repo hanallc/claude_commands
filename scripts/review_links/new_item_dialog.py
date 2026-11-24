@@ -25,6 +25,7 @@ MAX_PAGE_SECTIONS = 16
 MAX_PAGE_SECTION_ROWS = 128
 MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
+BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
 
 
@@ -101,13 +102,16 @@ class MemorySegment:
     label: str
     gib: float
     tone: MemoryTone
+    text: str | None = None
 
 
 @dataclass(frozen=True)
 class MemoryReading:
-    free_for_next_gib: float
-    queue_cap_gib: float
+    free_for_next_gib: float | None
+    queue_cap_gib: float | None
     segments: tuple[MemorySegment, ...]
+    free_text: str | None = None
+    cap_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,7 +182,17 @@ def evidence_fields(evidence: Evidence) -> dict[str, object]:
     """Preserve the fields used by existing request digests."""
     if isinstance(evidence, PageDataEvidence):
         return {**evidence.page_data(), "kind": evidence.kind}
-    return cast(dict[str, object], asdict(evidence))
+    fields = cast(dict[str, object], asdict(evidence))
+    if isinstance(evidence, BuildStepEvidence):
+        # Keep the digest of requests saved before display text was added.
+        memory = cast(dict[str, object], fields["memory"])
+        for field_name in ("free_text", "cap_text"):
+            if memory[field_name] is None:
+                del memory[field_name]
+        for segment in cast(tuple[dict[str, object], ...], memory["segments"]):
+            if segment["text"] is None:
+                del segment["text"]
+    return fields
 
 
 @dataclass(frozen=True)
@@ -432,6 +446,14 @@ def _gib(value: object) -> float:
     return float(cast(float, value))
 
 
+def _optional_gib(value: object) -> float | None:
+    return None if value is None else _gib(value)
+
+
+def _optional_memory_text(value: object) -> str | None:
+    return None if value is None else _text(value, "Displayed memory", 32)
+
+
 def _time(value: str) -> datetime:
     result = datetime.fromisoformat(value)
     if result.utcoffset() is None:
@@ -450,12 +472,12 @@ def _tip_entry(value: object) -> TipEntry:
     row = _mapping(value, "Tooltip entry")
     match row.get("kind"):
         case "caption":
-            return TipCaption(_text(row.get("text"), "Tooltip caption", 4000))
+            return TipCaption(_text(row.get("text"), "Tooltip caption", BUILD_EVIDENCE_LIMITS["text"]))
         case "field":
-            return TipField(_text(row.get("label"), "Tooltip label", 200),
-                            _text(row.get("value"), "Tooltip value", 4000, allow_empty=True))
+            return TipField(_text(row.get("label"), "Tooltip label", BUILD_EVIDENCE_LIMITS["label"]),
+                            _text(row.get("value"), "Tooltip value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
         case "detail":
-            return TipDetail(_text(row.get("text"), "Tooltip detail", 4000))
+            return TipDetail(_text(row.get("text"), "Tooltip detail", BUILD_EVIDENCE_LIMITS["text"]))
         case _:
             raise SubmissionError("Select a valid tooltip entry type.")
 
@@ -488,25 +510,28 @@ def read_evidence(value: object) -> Evidence:
             captured_at = _text(data.get("captured_at"), "Capture time", 80)
             _ = _time(captured_at)
             cells = tuple(
-                BuildCell(_text(cell.get("label"), "Cell label", 200),
-                          _text(cell.get("value"), "Cell value", 4000, allow_empty=True))
+                BuildCell(_text(cell.get("label"), "Cell label", BUILD_EVIDENCE_LIMITS["label"]),
+                          _text(cell.get("value"), "Cell value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
                 for entry in _entries(data.get("cells"), "Row cells", 32)
                 for cell in (_mapping(entry, "Row cell"),))
             memory = _mapping(data.get("memory"), "Memory reading")
             segments = tuple(
-                MemorySegment(_text(segment.get("label"), "Memory label", 200),
-                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")))
+                MemorySegment(_text(segment.get("label"), "Memory label", BUILD_EVIDENCE_LIMITS["label"]),
+                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")),
+                              _optional_memory_text(segment.get("text")))
                 for entry in _entries(memory.get("segments"), "Memory segments", 32)
                 for segment in (_mapping(entry, "Memory segment"),))
             return BuildStepEvidence(
-                captured_at, _text(data.get("step_id"), "Step ID", 300),
-                _text(data.get("title"), "Step title", 300),
-                _text(data.get("owner"), "Step owner", 300, allow_empty=True), cells,
-                MemoryReading(_gib(memory.get("free_for_next_gib")), _gib(memory.get("queue_cap_gib")),
-                              segments),
-                _text(data.get("tip_title"), "Tooltip title", 300),
-                _text(data.get("tip_status"), "Tooltip status", 300, allow_empty=True),
-                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", 64)))
+                captured_at, _text(data.get("step_id"), "Step ID", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("title"), "Step title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("owner"), "Step owner", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True), cells,
+                MemoryReading(_optional_gib(memory.get("free_for_next_gib", "")),
+                              _optional_gib(memory.get("queue_cap_gib", "")),
+                              segments, _optional_memory_text(memory.get("free_text")),
+                              _optional_memory_text(memory.get("cap_text"))),
+                _text(data.get("tip_title"), "Tooltip title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("tip_status"), "Tooltip status", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True),
+                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", BUILD_EVIDENCE_LIMITS["tipEntries"])))
         case _:
             raise SubmissionError("Select a valid evidence type.")
 
@@ -764,7 +789,7 @@ KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
 
 
 def render() -> str:
-    """Render the dialog that the page owner button opens."""
+    """Render the dialog that the page owner button and window.reviewNewItem.open() open."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
         + f'<span data-button-face>{page_frame.icon_svg(icon)}<span data-kind-label>{label}</span></span></label>'
@@ -774,7 +799,7 @@ def render() -> str:
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
                          "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
                          "sectionRows": MAX_PAGE_SECTION_ROWS,
-                         "pageUrlLength": MAX_PAGE_URL_LENGTH})
+                         "pageUrlLength": MAX_PAGE_URL_LENGTH, "buildEvidence": BUILD_EVIDENCE_LIMITS})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
@@ -786,6 +811,7 @@ def render() -> str:
     placeholder="Type your words. You can paste an image." required></textarea>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
+    <div class="new-item-evidence" data-evidence hidden></div>
     <div data-bug-page-state hidden>
      <dl class="page-state"></dl>
      <p data-visible-text>Page data and visible text</p>
@@ -893,9 +919,49 @@ STYLE = '''
 #review-new-item .sent-details h4 { margin: 0 0 11px; }
 #review-new-item [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
 #review-new-item [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
-#review-new-item .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
+#review-new-item .sent-details p:not(.new-item-evidence p) { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
 #review-new-item .sent-details .new-item-page-capture { font-size: 14px; }
 #review-new-item .sent-details .new-item-previews { margin-top: 10px; }
+#review-new-item .new-item-evidence {
+ background: #141413; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
+ padding: 10px; font-size: 12px; min-width: 0; overflow-wrap: anywhere;
+}
+#review-new-item .new-item-evidence h4 { font-size: inherit; margin: 0 0 4px; }
+#review-new-item .new-item-evidence-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 8px; }
+#review-new-item .new-item-muted { color: #c3c2b7; }
+#review-new-item .new-item-cells {
+ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 10px; margin: 7px 0 10px;
+}
+#review-new-item .new-item-cells div { min-width: 0; max-width: 100%; }
+#review-new-item .new-item-cells dt { font-weight: 600; color: #c3c2b7; }
+#review-new-item .new-item-cells dd, #review-new-item .new-item-tip dd { margin: 0; white-space: pre-wrap; }
+#review-new-item .new-item-memory { padding: 8px 0; border-block: 1px solid #34332f; margin-bottom: 8px; }
+#review-new-item .new-item-memory p { margin: 0; }
+#review-new-item .new-item-memory strong { font-size: 16px; }
+#review-new-item .new-item-cap { color: #ef7372; font-weight: 650; }
+#review-new-item .new-item-memory-bar { display: flex; height: 12px; margin: 6px 0; }
+#review-new-item .new-item-memory-bar span { min-width: 0; background: var(--segment); border-radius: 2px; }
+#review-new-item .new-item-memory-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; color: #c3c2b7; }
+#review-new-item .new-item-memory-legend span::before {
+ content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 4px;
+ border-radius: 2px; background: var(--segment);
+}
+#review-new-item [data-tone="build"] { --segment: #3987e5; }
+#review-new-item [data-tone="free"] { --segment: #199e70; }
+#review-new-item [data-tone="tools"] { --segment: #c98500; }
+#review-new-item [data-tone="system"] { --segment: #9585e0; }
+#review-new-item [data-tone="other"] { --segment: #6c6b66; }
+#review-new-item .new-item-tip {
+ background: #242422; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
+ padding: 10px 12px; font-size: .85rem; line-height: 1.45;
+}
+#review-new-item .new-item-tip dl { margin: 0; }
+#review-new-item .new-item-tip dl > div {
+ display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px;
+}
+#review-new-item .new-item-tip dd { text-align: right; font-variant-numeric: tabular-nums; }
+#review-new-item .new-item-tip p { margin: 3px 0; color: #c3c2b7; white-space: pre-wrap; }
+#review-new-item .new-item-tip h4 { font-weight: 700; }
 #review-new-item .capture-slot {
  position: relative; width: min(320px, 100%); aspect-ratio: 1440 / 1000; margin-top: 10px;
  overflow: hidden; background: var(--card); border-radius: 7px; border: 1px solid var(--line);
@@ -939,6 +1005,7 @@ STYLE = '''
 @media (max-width: 480px) {
  #review-new-item footer { padding-bottom: 14px; }
  #review-new-item .new-item-body { gap: 14px; }
+ #review-new-item .new-item-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(42px, 1fr)); }
 }
 '''
 
@@ -958,6 +1025,7 @@ SCRIPT = r'''(() => {
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
+ const evidenceBox = sentDetails.querySelector('[data-evidence]');
  const slot = dialog.querySelector('[data-capture-slot]'), shot = slot.querySelector('[data-shot]');
  const preview = shot.querySelector('img'), taking = slot.querySelector('[data-taking]');
  const fallback = sentDetails.querySelector('[data-fallback]');
@@ -977,12 +1045,96 @@ SCRIPT = r'''(() => {
  let selectedRecipient = '';
  let pageOwner = '';
  let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
+ // A Builds row sends its own evidence. Each row and each page keeps its own unsent draft.
+ const drafts = new Map();
+ let draftSource = '', evidence = {kind: 'none'}, tipPreview = null;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
   element.textContent = text;
   if (css) element.className = css;
   return element;
+ }
+
+ function captionAndValue(label, value) {
+  const row = node('div');
+  row.append(node('dt', label), node('dd', value));
+  return row;
+ }
+
+ function showEvidence() {
+  evidenceBox.replaceChildren();
+  evidenceBox.hidden = evidence.kind !== 'build-step';
+  if (evidenceBox.hidden) return;
+  const heading = node('div', '', 'new-item-evidence-heading');
+  heading.append(node('h4', evidence.title), node('span', evidence.owner, 'new-item-muted'));
+  const cells = node('dl', '', 'new-item-cells');
+  for (const cell of evidence.cells) cells.append(captionAndValue(cell.label, cell.value));
+
+  const memory = node('div', '', 'new-item-memory');
+  memory.append(node('h4', 'Overall memory'));
+  const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
+  free.append(node('strong', evidence.memory.free_text || 'unavailable'), ' Free for the next step');
+  figures.append(free, node('p', 'Queue cap ' + (evidence.memory.cap_text || 'unavailable'), 'new-item-cap'));
+  memory.append(figures);
+  const bar = node('div', '', 'new-item-memory-bar');
+  bar.setAttribute('aria-hidden', 'true');
+  const legend = node('div', '', 'new-item-memory-legend');
+  for (const segment of evidence.memory.segments) {
+   const section = node('span'), key = node('span', segment.label + ' ' + (segment.text || 'unavailable'));
+   section.dataset.tone = key.dataset.tone = segment.tone;
+   section.style.flexGrow = String(segment.gib);
+   bar.append(section);
+   legend.append(key);
+  }
+  if (legend.childElementCount) memory.append(bar, legend);
+
+  if (tipPreview) {
+   evidenceBox.append(heading, cells, memory, tipPreview);
+   return;
+  }
+  const tip = node('div', '', 'new-item-tip'), tipHeading = node('div', '', 'new-item-evidence-heading');
+  tipHeading.append(node('h4', evidence.tip_title), node('strong', evidence.tip_status));
+  tip.append(tipHeading);
+  let table = null;
+  for (const entry of evidence.tip) {
+   if (entry.kind === 'field') {
+    if (!table) { table = node('dl'); tip.append(table); }
+    table.append(captionAndValue(entry.label, entry.value));
+   } else {
+    table = null;
+    tip.append(node('p', entry.text));
+   }
+  }
+  evidenceBox.append(heading, cells, memory, tip);
+ }
+
+ // Park the open draft under its source and bring back the draft of the new source.
+ function switchDraft(source, capture, shownTip) {
+  if (source === draftSource) return;
+  if (keepDraft) {
+   drafts.set(draftSource, {draftId, selectedRecipient, words: words.value, kind: form.elements.kind.value,
+    includePage: includePage.checked, error: error.textContent, images, pendingItem, pendingEdited,
+    deferredCapture, evidence, tipPreview});
+  }
+  draftSource = source;
+  const draft = drafts.get(source);
+  drafts.delete(source);
+  keepDraft = Boolean(draft);
+  ({draftId, deferredCapture, pendingItem} = draft ?? {});
+  pendingEdited = draft?.pendingEdited ?? false;
+  selectedRecipient = draft?.selectedRecipient ?? '';
+  evidence = draft?.evidence ?? structuredClone(capture);
+  tipPreview = draft ? draft.tipPreview : shownTip;
+  images = draft?.images ?? [];
+  previews.replaceChildren(...images.map(image => image.row));
+  previews.hidden = !images.length;
+  if (!draft) return;
+  form.reset();
+  words.value = draft.words;
+  form.elements.kind.value = draft.kind;
+  includePage.checked = draft.includePage;
+  setError(draft.error);
  }
 
  function setError(reason) {
@@ -1135,7 +1287,7 @@ SCRIPT = r'''(() => {
   token = data.token;
   sendNotice.textContent = data.send_disabled || '';
   sendNotice.hidden = !data.send_disabled;
-  includePage.closest('label').hidden = !sendNotice.hidden;
+  includePage.closest('label').hidden = !pageContext || !sendNotice.hidden;
   recipients = data.recipients;
   pageOwner = data.page_owner || '';
   ownerReasonText.textContent = data.page_owner_reason || '';
@@ -1283,7 +1435,7 @@ SCRIPT = r'''(() => {
   const bug = isPageBug();
   dialog.toggleAttribute('data-page-bug', Boolean(bug));
   words.rows = bug ? 3 : 4;
-  bugStateBox.hidden = !bug;
+  bugStateBox.hidden = !bug || !pageContext;
   fallback.textContent = bug ? 'Screenshot unavailable.' : fallbackText;
   if (!bug || !pageContext) return;
   const {state} = pageContext;
@@ -1306,7 +1458,7 @@ SCRIPT = r'''(() => {
 
  function showSentDetails() {
   const image = captureSession?.image;
-  const include = includePage.checked && sendNotice.hidden;
+  const include = Boolean(pageContext) && includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
   slot.hidden = !include || unavailable;
   taking.hidden = !!image;
@@ -1462,11 +1614,13 @@ SCRIPT = r'''(() => {
   updateSend();
  }
 
- async function open(trigger, page) {
+ async function open(trigger, page, {kind = 'bug', recipientName = '', evidence: capture = {kind: 'none'},
+                                     tipPreview: shownTip = null} = {}) {
   if (dialog.open || sending) return;
+  switchDraft(capture.kind === 'build-step' ? 'step:' + capture.step_id : 'page:' + page, capture, shownTip);
   if (pendingItem) page = pendingItem.page;
   ownerPage = page;
-  pageContext = collectPageContext();
+  pageContext = page ? collectPageContext() : null;
   launcher = trigger;
   token = '';
   if (ownerPage === 'list' && !draftId) {
@@ -1479,7 +1633,7 @@ SCRIPT = r'''(() => {
   const newDraft = !keepDraft && !draftId;
   if (newDraft) selectedRecipient = '';
   sendNotice.hidden = true;
-  includePage.closest('label').hidden = false;
+  includePage.closest('label').hidden = !pageContext;
   recipients = null;
   recipientChips.replaceChildren();
   pageOwner = '';
@@ -1487,10 +1641,11 @@ SCRIPT = r'''(() => {
   if (!keepDraft) {
    form.reset();
    setError('');
-   form.elements.kind.value = 'bug';
+   form.elements.kind.value = kind;
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
+  showEvidence();
   showBugPage();
   showSentDetails();
   updateSend();
@@ -1503,7 +1658,10 @@ SCRIPT = r'''(() => {
   try {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (newDraft) selectedRecipient = data.page_owner || '';
+   if (newDraft) {
+    selectedRecipient = (ownerPage ? data.page_owner
+     : data.recipients.find(recipient => recipient.name === recipientName)?.id) || '';
+   }
    setOptions(data);
    startCapture();
    showSentDetails();
@@ -1527,7 +1685,7 @@ SCRIPT = r'''(() => {
   if (!recipient) throw new Error('Select a recipient.');
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
-                   page: ownerPage, page_recipient: 'selected'};
+                   ...(ownerPage && {page: ownerPage, page_recipient: 'selected'})};
   storeListDraft();
   let key = '';
   if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
@@ -1536,8 +1694,9 @@ SCRIPT = r'''(() => {
    if (!key) throw new Error('The screenshot is unavailable.');
   }
   const bug = isPageBug();
-  const data = bug || deferredCapture || !fallback.hidden ? pageContext.data : {kind: 'none'};
-  const state = bug && pageContext.state;
+  const data = evidence.kind !== 'none' ? evidence
+   : pageContext && (bug || deferredCapture || !fallback.hidden) ? pageContext.data : {kind: 'none'};
+  const state = bug && pageContext?.state;
   const files = await Promise.all(images.map(image => pastedData(image.file)));
   if (deferredCapture && captureSession?.capture === deferredCapture) captureSession.sent = true;
   const item = {...payload, evidence: data, images: files,
@@ -1623,6 +1782,11 @@ SCRIPT = r'''(() => {
   }
  });
 
+ window.reviewNewItem = {
+  open: ({trigger, kind = 'question', recipientName, evidence: capture, tipPreview: shownTip} = {}) =>
+   open(trigger, '', {kind, recipientName, evidence: capture, tipPreview: shownTip}),
+  evidenceLimits: Object.freeze(limits.buildEvidence)
+ };
  document.addEventListener('click', event => {
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;

@@ -429,6 +429,36 @@ class MemoryRoomRulesTests(unittest.TestCase):
         self.assertEqual(reading.room, 6 * GIB)
         self.assertEqual(reading.used, 3 * GIB)
 
+    def test_build_reserve_share_applies_only_to_room_to_grow(self) -> None:
+        # User 2026-11-17: most build reserve is held and not used, so a share of growth is kept aside.
+        policy = admission_policy_fixture()
+        unread = admission_records.RunUseUnavailable("scope memory.stat is missing")
+        for case, run, share, kept in (
+            ("share 100 keeps all growth", admission_records.RunMemory("run", 12 * GIB, admission_records.AnonymousRunUse(2 * GIB)), 100, 10 * GIB),
+            ("share 80 keeps most growth", admission_records.RunMemory("run", 12 * GIB, admission_records.AnonymousRunUse(2 * GIB)), 80, 8 * GIB),
+            ("share 0 keeps no growth", admission_records.RunMemory("run", 12 * GIB, admission_records.AnonymousRunUse(2 * GIB)), 0, 0),
+            ("held between steps stays whole", admission_records.RunMemory("run", 8 * GIB, admission_records.AnonymousRunUse(3 * GIB), held=6 * GIB), 80, 10 * GIB),
+            ("no use reading keeps the whole need", admission_records.RunMemory("run", 12 * GIB, unread), 80, 12 * GIB),
+            ("a share rounds up to the byte", admission_records.RunMemory("run", 3, admission_records.AnonymousRunUse(0)), 50, 2),
+        ):
+            with self.subTest(case=case):
+                reading = gate.memory_room(admission_records.HostMemory(20 * GIB, 64 * GIB), [run],
+                                           replace(policy, build_reserve_share_percent=share))
+                assert isinstance(reading, admission_records.MemoryRoom)
+                self.assertEqual(reading.kept, kept)
+                self.assertEqual(reading.runs[0].bytes, kept)
+                parts = admission_records.keep_aside_parts(run, share)
+                self.assertEqual(parts.bytes, kept)
+                self.assertEqual(reading.signed_room, 17 * GIB - kept)
+
+    def test_room_records_the_swap_that_the_share_applies_to(self) -> None:
+        host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, 22 * GIB, build_and_ci_swap=4 * GIB,
+                                            swap_in_window_bytes=9 * GIB, swap_in_window_seconds=600)
+        reading = gate.memory_room(host, [], replace(admission_policy_fixture(), agent_swap_share_percent=20))
+        assert isinstance(reading, admission_records.MemoryRoom)
+        self.assertEqual(reading.returning_swap, 6 * GIB)
+        self.assertEqual(reading.agent_swap_demand, (6 * GIB * 20 + 99) // 100)
+
     def test_unavailable_host_memory_cannot_publish_room(self) -> None:
         missing = admission_records.ReadingUnavailable("meminfo is missing")
         reading = gate.memory_room(missing, [], admission_policy_fixture())

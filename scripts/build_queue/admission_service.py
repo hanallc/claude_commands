@@ -44,6 +44,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import memory_trace
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot
 from scripts.build_targets import target_config
@@ -308,7 +309,8 @@ class SystemReadings:
             host = gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
             window = conf.read("build_admission").whole("agent_swap_window_seconds")
             returning = self.swap_in.read(Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat")), time.monotonic(), window)
-            return replace(host, swap_in_window_bytes=returning) if isinstance(returning, int) else returning
+            return (replace(host, swap_in_window_bytes=returning, swap_in_window_seconds=window)
+                    if isinstance(returning, int) else returning)
         except (OSError, ValueError, conf.Unusable) as error:
             return records.ReadingUnavailable(str(error) or "memory reading unavailable")
 
@@ -1102,7 +1104,8 @@ class OperatingSystemReader:
     """One thread publishes complete readings at the existing pass cadence."""
 
     def __init__(self, plan: SystemReadingPlan, initial: SystemEvidence,
-                 readings: Readings, proc: Proc, clock: Clock, wake: int) -> None:
+                 readings: Readings, proc: Proc, clock: Clock, wake: int, *,
+                 traces: memory_trace.TraceCapture | memory_trace.TracesOff = memory_trace.TRACES_DISABLED) -> None:
         self.plan: SystemReadingPlan = plan
         self.reading: SystemEvidence = initial
         self.readings: Readings = readings
@@ -1112,6 +1115,8 @@ class OperatingSystemReader:
         self.lock: threading.Lock = threading.Lock()
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
+        self.traces: memory_trace.TraceWorker | memory_trace.TracesOff = (
+            memory_trace.TraceWorker(traces) if isinstance(traces, memory_trace.TraceCapture) else traces)
         self.failure: Exception | NoReadingFailure = NoReadingFailure()
         self.thread: threading.Thread = threading.Thread(target=self._read, name="admission-readings", daemon=True)
         self.thread.start()
@@ -1129,7 +1134,35 @@ class OperatingSystemReader:
                 self.requested.set()
 
     def request_read(self) -> None:
-        self.requested.set()
+        with self.lock:
+            self.requested.set()
+
+    def register_trace(self, record: ReservationRecord, argv: tuple[str, ...], host: str, wall: float) -> None:
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
+                and record.repo == "hana" and record.repo_identity and record.step == "nextest"
+                and record.sidecar and record.need > 0 and argv):
+            width = records.UnspecifiedTestWidth() if isinstance(record.test_width, records.NoTestWidth) else record.test_width
+            shape = memory_trace.HanaTraceShape(host, record.repo_identity, argv, width)
+            self.traces.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
+                                                       wall, self.clock.monotonic()))
+
+    def release_trace(self, record: ReservationRecord, ending: ReservationEnding,
+                      wall: float) -> None:
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
+                and record.repo == "hana" and record.step == "nextest" and record.sidecar):
+            status = ending.status if isinstance(ending, ReleaseStatus) else memory_trace.ExitStatusUnavailable()
+            self.traces.release(record.reservation_id, wall, status)
+
+    def record_trace_reserves(self, explanation: records.QueueExplanation) -> None:
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            running = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
+            reserves = {row["reservation_id"]: entry.promise for row, entry in
+                        zip(explanation.decided_from.reservations, running, strict=True)
+                        if row["repo"] == "hana" and row["step"] == "nextest" and row.get("scoped", False)
+                        and "reservation_id" in row and isinstance(entry.step.measured, records.MeasuredMemory)
+                        and isinstance(entry.step.measured.peak_history, records.TestPhaseStarted)}
+            if reserves:
+                self.traces.submit(reserves)
 
     def raise_failure(self) -> None:
         with self.lock:
@@ -1138,15 +1171,17 @@ class OperatingSystemReader:
             raise failure
 
     def _read(self) -> None:
+        last_read = self.clock.monotonic()
         while not self.stopped.is_set():
             with self.lock:
                 plan = self.plan
             interval = plan.config.waiting_pass_seconds if plan.waiting else plan.config.running_pass_seconds
-            _ = self.requested.wait(interval)
-            self.requested.clear()
+            full_deadline = last_read + interval
+            _ = self.requested.wait(max(0.0, full_deadline - self.clock.monotonic()))
             if self.stopped.is_set():
-                return
+                break
             with self.lock:
+                self.requested.clear()
                 plan = self.plan
             try:
                 reading = read_system(plan, self.readings, self.proc, self.clock)
@@ -1157,11 +1192,14 @@ class OperatingSystemReader:
                 with self.lock:
                     self.reading = reading
             os.eventfd_write(self.wake, 1)
+            last_read = self.clock.monotonic()
 
     def close(self) -> None:
         self.stopped.set()
         self.requested.set()
         self.thread.join()
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            self.traces.close()
 
 
 @dataclass(frozen=True)
@@ -1745,7 +1783,8 @@ class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
-                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 trace_policy: memory_trace.MemoryTracePolicy | memory_trace.TracesOff = memory_trace.TRACES_DISABLED) -> None:
         state_dir = state_dir.resolve()
         self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
         self.writes.require()
@@ -1821,6 +1860,7 @@ class AdmissionServer:
         self.durable_encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         self.published: PublishedReplies | NoPass = NoPass()
         self.system_reader: SystemReader | NoSystemReader = NoSystemReader()
+        self.trace_policy: memory_trace.MemoryTracePolicy | memory_trace.TracesOff = trace_policy
         self.system_evidence: SystemEvidence | NoPass = NoPass()
         self.owner_confirmation_reading: object = object()
         self.owner_confirmations: dict[int, OwnerStartReading] = {}
@@ -3318,6 +3358,9 @@ class AdmissionServer:
         ordered = self._published_queue_order(ordered)
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        if (isinstance(self.trace_policy, memory_trace.MemoryTracePolicy)
+                and isinstance(self.system_reader, OperatingSystemReader)):
+            self.system_reader.record_trace_reserves(reading.explanation)
         local = {path: replace(step, verify=row.get("verify", step.verify))
                  for (path, row), step in zip(reading.ordered, reading.view.waiting, strict=True)}
         held_reasons = {records.waiter_owner(self.waiters[episode].row): reason
@@ -3570,6 +3613,10 @@ class AdmissionServer:
         # Save every grant before sending any reply for the group.
         self.persist()
         for waiting, reply in zip(waiters, replies, strict=True):
+            request = waiting.request
+            if isinstance(reply, wire.Admitted) and isinstance(request, wire.AdmitRequest) and isinstance(
+                    self.system_reader, OperatingSystemReader):
+                self.system_reader.register_trace(self.reservations[request.episode], request.argv, self.host, now)
             self._remove_waiter(waiting, reply)
 
     def _end(self, episode: str, ending: ReservationEnding) -> None:
@@ -3598,6 +3645,8 @@ class AdmissionServer:
             self._clear_wait_rank(record.owner, record.queue_waiter["since"], episode)
         ended_at = (step_estimator.epoch(record.finalization["ended_at"])
                     if isinstance(record.finalization, dict) else self.clock.now())
+        if isinstance(self.system_reader, OperatingSystemReader):
+            self.system_reader.release_trace(record, ending, ended_at)
         if record.episode.startswith("uid:"):
             self._sample_runner(record, 0, ended_at)
         self.progress_history.finish(record.reservation_id, ended_at, ended_at - step_estimator.HISTORY_DAYS * 86400)
@@ -6188,12 +6237,17 @@ done
             initial = self.system_evidence
             if not isinstance(initial, SystemEvidence):
                 initial = read_system(plan, self.readings, self.proc, self.clock)
-            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock, self.reading_events)
+            traces = (memory_trace.TraceCapture(memory_trace.TraceStore(self.state_dir / "memory_traces", self.trace_policy),
+                        self.progress_captures.root, self.boot_id, self.clock)
+                      if isinstance(self.trace_policy, memory_trace.MemoryTracePolicy) else self.trace_policy)
+            self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock,
+                                                       self.reading_events, traces=traces)
             for descriptor, watch in list(self.watchers.items()):
                 if isinstance(watch, ScopeWatch):
                     self._unwatch(descriptor)
 
     def serve_forever(self) -> None:
+        self.start()
         self.start_reader()
         watchdog = int(os.environ.get("WATCHDOG_USEC", "0"))
         timeout = watchdog / 2_000_000 if watchdog > 0 else float("inf")
@@ -6443,7 +6497,8 @@ def main() -> int:
         if args.command == "export-priority":
             export_priority(args.state_dir)
             return 0
-        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc())
+        server = AdmissionServer(args.state_dir, SystemClock(), SystemReadings(), SystemProc(),
+                                 trace_policy=memory_trace.read_policy())
         try:
             server.serve_forever()
         finally:

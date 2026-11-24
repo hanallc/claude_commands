@@ -98,9 +98,11 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
 #quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
 #quota-help li + li { margin-top: 4px; }
-#quota-help a { color: var(--ink); overflow-wrap: anywhere; }
-#quota-help p { margin: 0; color: var(--ink-2); }
+#quota-help a, #quota-requests a { color: var(--ink); overflow-wrap: anywhere; }
+#quota-help p, .quota-requests p { margin: 0; color: var(--ink-2); }
 #quota-help p + p { margin-top: 4px; }
+#quota-requests > p { margin: 8px 0; color: var(--ink-2); }
+.quota-requests h3 { font-size: 1rem; margin: 0 0 4px; }
 </style>
 </head>
 <body>
@@ -140,6 +142,7 @@ __PAGE_TITLE__
     <span><span class="swatch dearest" aria-hidden="true"></span>Most expensive of each price measure</span>
   </p>
   <ul class="snapshot" id="snapshot"></ul>
+  <div id="quota-requests">__AWS_QUOTA_REQUESTS__</div>
   <details id="quota-help">
     <summary>How to open the quota cases in AWS</summary>
     __AWS_QUOTA_HELP__
@@ -755,6 +758,9 @@ async function loadAws(supersede = false, current = () => true) {
     markRegions = configureRegionFilter();
     markRegions();
   }
+  const requests = page.getElementById("quota-requests");
+  const displayed = document.getElementById("quota-requests");
+  if (requests && displayed && displayed.innerHTML !== requests.innerHTML) displayed.innerHTML = requests.innerHTML;
   drawLaunchState();
   drawSpend();
   draw();
