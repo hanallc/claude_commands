@@ -360,8 +360,8 @@ buildlog_token_phase_context() {
 
 buildlog_finish_memory() {
     local status=$1 sampler_pid=$2 sampler_input=$3
-    if [[ -n "$sampler_input" ]]; then
-        exec {sampler_input}>&-
+    if [[ "$sampler_input" =~ ^[0123456789]+$ ]]; then
+        eval "exec $sampler_input>&-"
     fi
     if [[ -n "$sampler_pid" ]]; then
         wait "$sampler_pid" 2>/dev/null || true
