@@ -3311,6 +3311,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 self.assertEqual((item.owner, item.producer, item.state, item.log[0].source),
                                                  (owner, morty.id if owner == morty.id else producer.id,
                                                   the_list.ItemState.SCHEDULED, "nate via /new_item"))
+                                origin = item.new_item_draft_id
+                                assert isinstance(origin, review_submissions.NewItemDraft)
+                                self.assertEqual((origin.id.value, item.evidence), (scheduled["request_id"], ""))
                                 series = item.schedule
                                 assert isinstance(series, the_list.ScheduledSeries)
                                 self.assertEqual((series.first.words, series.rule.rrule),
@@ -3517,18 +3520,20 @@ class ReviewLinksServerTests(unittest.TestCase):
             add = the_list.add
             intervening: list[str] = []
 
-            def displace_number(keeper: staff.StaffId, title: str, *, owner: the_list.ItemOwner,
-                                source: str, changes: the_list.ItemChanges,
-                                number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE) -> the_list.ListItem:
+            def add_after_intervening_item(keeper: staff.StaffId, title: str, *, owner: the_list.ItemOwner,
+                                          source: str, changes: the_list.ItemChanges,
+                                          new_item_draft_id: review_submissions.ListDraftOrigin,
+                                          before_save: Callable[[int], None] | None) -> the_list.ListItem:
                 if not intervening:
                     other = add(keeper, "Intervening item", owner=owner, source=source, changes={})
                     intervening.append(other.id)
-                return add(keeper, title, owner=owner, source=source, changes=changes, number=number)
+                return add(keeper, title, owner=owner, source=source, changes=changes,
+                           new_item_draft_id=new_item_draft_id, before_save=before_save)
 
-            with self.subTest(allocation="displaced"):
+            with self.subTest(allocation="intervening item"):
                 draft = "s1-" + uuid4().hex
                 body = json.dumps({**scheduled, "request_id": draft}).encode()
-                with patch.object(the_list, "add", displace_number):
+                with patch.object(the_list, "add", add_after_intervening_item):
                     response = self.new_item_http(body, finished=True)
                 self.assertEqual(response.status, 200, response.body)
                 saved_id = cast(dict[str, str], json.loads(response.body))["id"]
@@ -3550,7 +3555,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     body = json.dumps({**scheduled, "request_id": draft}).encode()
                     before = {item.id for item in the_list.records(morty.id)}
                     notices.clear()
-                    with (patch.object(the_list, "add", side_effect=OSError("The List write failed."))
+                    with (patch.object(record_store.NumberedRecords, "write", side_effect=OSError("The List write failed."))
                           if failure == "List write" else patch.object(review_submissions, "_publish_receipt", fail_receipt)):
                         reply = self.new_item_http(body, finished=True)
                     self.assertEqual(reply.status, 503, reply.body)
@@ -3581,8 +3586,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(tuple(review_submissions.committed_page_captures()), ())
             self.assertEqual(diagnostics.getvalue(), "")
 
-            for retry_kind in ("original", "edited", "native"):
-                with self.subTest(retry_kind=retry_kind):
+            for retry_kind, lose_index_receipt in (("original", False), ("edited", False), ("native", False),
+                                                   ("original", True), ("record without draft field", True)):
+                with self.subTest(retry_kind=retry_kind, lose_index_receipt=lose_index_receipt):
                     draft = "s1-" + uuid4().hex
                     submitted = {**scheduled, "request_id": draft}
                     before = {item.id for item in the_list.records(morty.id)}
@@ -3590,18 +3596,33 @@ class ReviewLinksServerTests(unittest.TestCase):
                         failed = self.new_item_http(json.dumps(submitted).encode(), finished=True)
                     self.assertEqual(failed.status, 503, failed.body)
                     existing, = {item.id for item in the_list.records(morty.id)} - before
-                    shutil.rmtree(self.submission_draft_folder(draft))
+                    draft_folder = self.submission_draft_folder(draft)
+                    shutil.rmtree(draft_folder)
+                    evidence = "Keep the source report."
+                    if lose_index_receipt:
+                        (index_folder(draft_folder) / "receipt.json").unlink()
+                        _ = the_list.update(morty.id, existing, {"evidence": evidence}, source="morty")
+                    if retry_kind == "record without draft field":
+                        store = record_store.NumberedRecords(morty.id, "list", "L", "list item", the_list.ListError)
+                        header, record_body = store.read(existing)
+                        del header["new_item_draft_id"]
+                        store.write(existing, header, record_body)
                     damaged = the_list.folder(morty.id) / "L9999.md"
                     _ = damaged.write_bytes(b"\xff")
                     try:
                         if retry_kind == "native":
                             retry_body = self.new_item_body(replace(bug, request_id=draft, page="list"))
                         else:
-                            words = scheduled["words"] if retry_kind == "original" else "Try different words."
+                            words = "Try different words." if retry_kind == "edited" else scheduled["words"]
                             retry_body = json.dumps({**submitted, "words": words}).encode()
                         retry = self.new_item_http(retry_body, finished=True)
                     finally:
                         damaged.unlink()
+                    if retry_kind == "record without draft field":
+                        self.assertEqual(retry.status, 503, retry.body)
+                        self.assertEqual({item.id for item in the_list.records(morty.id)}, before | {existing})
+                        self.assertEqual(the_list.load(morty.id, existing).evidence, evidence)
+                        continue
                     response = cast(dict[str, object], json.loads(retry.body))
                     self.assertEqual(response["id"], existing)
                     if retry_kind == "original":
@@ -3611,6 +3632,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                     else:
                         self.assertEqual((retry.status, response["code"]), (409, "already_filed"))
                     self.assertEqual({item.id for item in the_list.records(morty.id)}, before | {existing})
+                    if lose_index_receipt:
+                        recovered_item = the_list.load(morty.id, existing)
+                        recovered_origin = recovered_item.new_item_draft_id
+                        assert isinstance(recovered_origin, review_submissions.NewItemDraft)
+                        self.assertEqual(response["readback"], list(recovered_origin.claim.readback))
+                        self.assertEqual(recovered_item.evidence, evidence)
 
             for level in ("root", "draft", "index"):
                 with self.subTest(failure=f"{level} parent sync"):

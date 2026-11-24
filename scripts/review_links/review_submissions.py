@@ -25,7 +25,7 @@ from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, proposal_issue, record_store, staff, the_list, update_registration
+from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
 from scripts.review_links import image_store, new_item_dialog, page_frame, reply_tokens, review_events, review_link
@@ -475,6 +475,24 @@ class ListDraftClaim:
 
 
 @dataclass(frozen=True)
+class NewItemDraft:
+    """Identify the Scheduled draft that created a List item."""
+
+    id: new_item_dialog.ScheduledDraftId
+    claim: ListDraftClaim
+
+    def stored(self) -> str:
+        return json.dumps({"request_id": self.id.value, **self.claim.fields()}, ensure_ascii=False)
+
+
+class NoNewItemDraft(Enum):
+    ABSENT = "no New item draft"
+
+
+type ListDraftOrigin = NewItemDraft | NoNewItemDraft
+
+
+@dataclass(frozen=True)
 class ListItemDestination:
     id: str
     claim: ListDraftClaim
@@ -483,6 +501,9 @@ class ListItemDestination:
     @property
     def payload_hash(self) -> str:
         return self.claim.payload_hash
+
+    def store(self) -> record_store.NumberedRecords:
+        return record_store.NumberedRecords(self.claim.keeper, "list", "L", "list item", ValueError)
 
 
 class DraftAlreadyFiled(SubmissionConflict):
@@ -508,12 +529,14 @@ type FilingDestination = NativeSubmissionDestination | ListItemDestination
 type RequestFile = FilingDestination | PendingFiling | NoRequestFile | UnreadableRequestFile
 
 
-def _list_request_file(path: Path, fields: dict[str, object], payload_hash: str) -> ListItemDestination:
+def _read_list_draft_claim(fields: dict[str, object], payload_hash: str) -> ListDraftClaim:
     keeper, assignment, readback = (fields.get(key) for key in ("keeper", "assignment", "readback"))
     warning = fields.get("notice_warning", "")
     if not (isinstance(keeper, str) and isinstance(assignment, str) and isinstance(warning, str)
             and isinstance(readback, list)):
         raise ValueError("Invalid List draft details.")
+    if not keeper or Path(keeper).name != keeper or keeper in (".", ".."):
+        raise ValueError("Invalid List keeper staff ID.")
     lines = cast(list[object], readback)
     if len(lines) != 2 or not isinstance(lines[0], str) or not isinstance(lines[1], str):
         raise ValueError("Invalid List readback.")
@@ -531,8 +554,27 @@ def _list_request_file(path: Path, fields: dict[str, object], payload_hash: str)
                 or role not in ("producer", "showrunner")):
             raise ValueError("Invalid List draft notice.")
         notices.append(ListAssignmentNotice(staff.StaffId(recipient), role, message, producer_name))
-    claim = ListDraftClaim(payload_hash, the_list.staff_id(keeper, "List keeper"), assignment,
-                           (lines[0], lines[1]), tuple(notices), warning)
+    return ListDraftClaim(payload_hash, staff.StaffId(keeper), assignment, (lines[0], lines[1]), tuple(notices), warning)
+
+
+def read_list_draft(header: dict[str, str]) -> ListDraftOrigin:
+    """Read the Scheduled draft claim from a List item header."""
+    stored = header.get("new_item_draft_id")
+    if stored is None:
+        return NoNewItemDraft.ABSENT
+    raw = cast(object, json.loads(stored))
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid New item draft.")
+    fields = cast(dict[str, object], raw)
+    draft_id = new_item_dialog.read_scheduled_draft_id(fields.get("request_id"))
+    payload_hash = fields.get("payload_hash")
+    if not isinstance(payload_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", payload_hash):
+        raise ValueError("Invalid List draft fingerprint.")
+    return NewItemDraft(draft_id, _read_list_draft_claim(fields, payload_hash))
+
+
+def _list_request_file(path: Path, fields: dict[str, object], payload_hash: str) -> ListItemDestination:
+    claim = _read_list_draft_claim(fields, payload_hash)
     identity = fields.get("id")
     confirmed = fields.get("confirmed", [])
     if (path.name not in ("pending.json", "receipt.json") or not isinstance(identity, str)
@@ -1117,7 +1159,7 @@ def locate_native_submission(address: SubmissionAddress, hint: RequestFile,
 
 def _publish_receipt(folder: Path, saved: FilingDestination) -> None:
     # Sync the saved record directory before publishing the receipt.
-    record_folder = saved.path.parent if isinstance(saved, NativeSubmissionDestination) else the_list.folder(saved.claim.keeper)
+    record_folder = saved.path.parent if isinstance(saved, NativeSubmissionDestination) else saved.store().folder()
     atomic_file.sync_folder(record_folder)
     receipt = folder / "receipt.json"
     try:
@@ -1592,11 +1634,6 @@ def _sync_draft_parents(folder: Path) -> None:
     atomic_file.sync_folder(folder.parent)
 
 
-def list_draft_evidence(request_id: new_item_dialog.ScheduledDraftId, claim: ListDraftClaim) -> str:
-    """Save the recovery data in the List creation log with the item."""
-    return f"New item draft {request_id.value}\n" + json.dumps(claim.fields(), separators=(",", ":"))
-
-
 @dataclass(frozen=True)
 class UnclaimedDraft:
     """The draft has no filing claim."""
@@ -1638,24 +1675,25 @@ def _write_draft_index(folder: Path, filing: ClaimedDraft | NativeDraftAwaitingR
 
 @dataclass(frozen=True)
 class NoListRecordForClaim:
-    """The selected List number has no record for this draft."""
+    """The reserved List number has no record."""
 
 
 def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> FiledDraft | NoListRecordForClaim:
-    path = the_list.folder(planned.claim.keeper) / f"{planned.id}.md"
-    marker = f"New item draft {draft_id}"
+    store = planned.store()
+    path = store.path(planned.id)
     try:
-        if marker.encode() not in path.read_bytes():
-            return NoListRecordForClaim()
+        _ = path.stat()
     except FileNotFoundError:
         return NoListRecordForClaim()
-    item = the_list.load(planned.claim.keeper, planned.id)
-    added = item.log[0].what
-    evidence = added.fields.get("evidence") if isinstance(added, the_list.FieldChange) and added.action == "Added" else ""
-    if isinstance(evidence, str) and evidence.startswith(marker + "\n"):
-        atomic_file.sync_folder(path.parent)
-        return FiledDraft(planned)
-    return NoListRecordForClaim()
+    try:
+        header, _ = store.read(planned.id, path=path)
+        draft = read_list_draft(header)
+    except ValueError as error:
+        raise OSError(f"Cannot read the saved List draft at {path}.") from error
+    if not isinstance(draft, NewItemDraft) or draft.id.value != draft_id or draft.claim != planned.claim:
+        raise OSError(f"{planned.id}: the saved List draft differs from the filing claim.")
+    atomic_file.sync_folder(path.parent)
+    return FiledDraft(ListItemDestination(planned.id, draft.claim))
 
 
 def _draft_filing(folder: Path, *, repair_index: bool = True) -> DraftFiling:
@@ -1724,7 +1762,7 @@ def _publish_recovered_native_draft(folder: Path, saved: NativeSubmissionDestina
 
 
 class ListDraftWriter(Protocol):
-    def __call__(self, claim_number: Callable[[int], None]) -> the_list.ListItem: ...
+    def __call__(self, claim_number: Callable[[int], None]) -> str: ...
 
 
 def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: str, *,
@@ -1757,7 +1795,7 @@ def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: st
                         _write_draft_index(folder, ClaimedDraft(planned))
                         _write_location(pending, planned)
 
-                    saved = ListItemDestination(save(claim_number).id, claim)
+                    saved = ListItemDestination(save(claim_number), claim)
             except SubmissionError:
                 pending.unlink(missing_ok=True)
                 (_draft_index(folder) / "pending.json").unlink(missing_ok=True)

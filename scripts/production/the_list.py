@@ -40,7 +40,7 @@ from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.production import delivery_state, record_store, repeat_rule, session_pane, staff
-from scripts.review_links import change_page, page_question, question_record
+from scripts.review_links import change_page, page_question, question_record, review_submissions
 
 
 class ListError(ValueError):
@@ -562,6 +562,7 @@ class ListItem:
     questions: tuple[question_record.Question, ...] = ()
     schedule: Schedule = NoSchedule.UNSET
     run_deliveries: tuple[RunDelivery, ...] = ()
+    new_item_draft_id: review_submissions.ListDraftOrigin = review_submissions.NoNewItemDraft.ABSENT
 
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
@@ -1665,7 +1666,7 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
                         fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
                         delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
-                        _read_run_deliveries(fields))
+                        _read_run_deliveries(fields), review_submissions.read_list_draft(fields))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -1702,6 +1703,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
     if item.schedule is not NoSchedule.UNSET:
         fields["schedule"] = json.dumps(_schedule_fields(item.schedule), ensure_ascii=False)
+    if isinstance(item.new_item_draft_id, review_submissions.NewItemDraft):
+        fields["new_item_draft_id"] = item.new_item_draft_id.stored()
     check = _scheduled_check(item)
     if isinstance(check, ScheduledCheckAt):
         fields["scheduled_check"] = check.time.isoformat()
@@ -1858,8 +1861,10 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         changes: ItemChanges,
         number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = _CREATION_DEFAULTS["requested_by"],
         assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+        new_item_draft_id: review_submissions.ListDraftOrigin = review_submissions.NoNewItemDraft.ABSENT,
+        before_save: Callable[[int], None] | None = None,
         ) -> ListItem:
-    """Create an item without reusing an existing record number."""
+    """Create an item. Call before_save with its reserved number under the allocation lock."""
     store = _store(keeper)
     def read_reference(number: int) -> ListItem:
         identity = f"L{number}"
@@ -1885,7 +1890,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         defaults = _CREATION_DEFAULTS.copy()
         defaults["requested_by"] = requested_by
         item = ListItem(chosen, title, owner, keeper, unread_since=moment, opened=moment, updated=moment,
-                        closed=NoTimestamp.UNSET, log=(), **defaults)
+                        closed=NoTimestamp.UNSET, log=(), new_item_draft_id=new_item_draft_id, **defaults)
         if changes:
             item = replace(item, **changes)
         initial: LogFields = {"title": item.title, "owner": item.owner, "producer": item.producer,
@@ -1898,6 +1903,8 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         _check_links(read_reference, item.number, changes)
         _require_active_open_producers((item,))
         store.reserve_number(chosen)
+        if before_save is not None:
+            before_save(chosen)
         _save(store, item)
         return item
 

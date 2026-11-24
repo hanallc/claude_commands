@@ -161,6 +161,7 @@ class NewItemTests(unittest.TestCase):
             row.to_json() for row in staff.active(members, "producer")
         ]}))
         _ = (folder / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
+        _ = (folder / "review_links.conf").write_text("review_attachments_root=review-attachments\n")
         self.map_row(NATEDEV, DWIGHT)
         self.map_row(POSTMASTER, BOB)
         notices: list[tuple[staff.StaffId, str]] = []
@@ -214,7 +215,8 @@ class NewItemTests(unittest.TestCase):
              "2026-11-30T09:00:00-08:00", "FREQ=DAILY;COUNT=730", "Repeats: Daily for 730 runs"),
         )
         with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(folder / "state"),
-                                          "STAFF_FILE": str(staff_file), "USER_ZONE": "America/Los_Angeles"}),
+                                          "STAFF_FILE": str(staff_file), "USER_ZONE": "America/Los_Angeles",
+                                          "REVIEW_LINKS_ROOT": str(folder / "review")}),
               mock.patch.object(staff, "snapshot", return_value=members),
               mock.patch.object(the_list, "_send_assignment_notice", side_effect=send),
               mock.patch.object(the_list, "now", return_value=now)):
@@ -229,6 +231,7 @@ class NewItemTests(unittest.TestCase):
                     self.assertEqual(code, 0)
                     item = the_list.load(MORTY.id, f"L{number}")
                     self.assertIs(item.state, the_list.ItemState.SCHEDULED)
+                    self.assertIs(item.new_item_draft_id, review_submissions.NoNewItemDraft.ABSENT)
                     schedule = item.schedule
                     if isinstance(schedule, the_list.ScheduledSeries):
                         run, rrule = schedule.first, schedule.rule.rrule
@@ -263,6 +266,21 @@ class NewItemTests(unittest.TestCase):
                         self.assertEqual(preview.splitlines()[0], "Starts: Fri Nov 27 2026 13:00 PST (16:00 EST)")
                     self.assertEqual(output.splitlines()[:2], preview.splitlines())
                     self.assertIn(f"List item {number}.", output.splitlines()[2])
+            with self.subTest(recovery="closed Scheduled item"):
+                before = the_list.records(MORTY.id, include_closed=True)
+                draft_id = new_item_dialog.ScheduledDraftId("s1-" + "c" * 32)
+                request = new_item_dialog.ScheduledSubmission(
+                    draft_id, MORTY.id, f"{words} {monday}", "list")
+                saved = new_item.submit_scheduled(request)
+                closed = the_list.close(MORTY.id, saved.id, "The user cancelled this item.", source="morty")
+                receipts = list((folder / "review-attachments").glob(f"**/{draft_id.value}/receipt.json"))
+                self.assertEqual(len(receipts), 2)
+                for receipt in receipts:
+                    receipt.unlink()
+                self.assertEqual(new_item.submit_scheduled(request), saved)
+                self.assertEqual(the_list.load(MORTY.id, saved.id), closed)
+                self.assertEqual(closed.new_item_draft_id, review_submissions.NewItemDraft(draft_id, saved.claim))
+                self.assertCountEqual(the_list.records(MORTY.id, include_closed=True), [*before, closed])
         self.assertEqual((self.server.reads, self.server.posts, self.assignee_updates), (0, [], []))
 
     def test_scheduled_refuses_past_times_and_repeats_outside_the_menu(self) -> None:

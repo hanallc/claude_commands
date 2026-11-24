@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.lib import conf, main_publish
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
-from scripts.production import investigation, producer_map, record_store, repeat_rule, staff, the_list, unrouted_alert
+from scripts.production import investigation, producer_map, repeat_rule, staff, the_list, unrouted_alert
 from scripts.review_links import change_page, for_you, new_item_dialog, review_page, review_submissions
 
 SOURCE = "nate via /new_item"
@@ -255,7 +255,7 @@ def read_schedule(text: str, *, now: datetime, zone: ZoneInfo) -> Scheduled:
     limit = the_list.series_run_limit()
     if isinstance(rule.end, repeat_rule.RunCount) and rule.end.count > limit:
         raise ValueError(f"The repeat exceeds the series limit of {limit} runs.")
-    return the_list.ScheduledSeries(run, rule)
+    return the_list.ScheduledSeries(run, rule, limit)
 
 
 def schedule_lines(schedule: Scheduled) -> tuple[str, str]:
@@ -489,16 +489,6 @@ def _checked_schedule(words: str) -> Scheduled:
         raise FilingRefused(FilingRefusal.INVALID_SCHEDULE, str(error)) from error
 
 
-class DirectScheduledFiling(StrEnum):
-    CLI = "direct CLI filing"
-
-
-@dataclass(frozen=True)
-class ScheduledDraftFiling:
-    request_id: new_item_dialog.ScheduledDraftId
-    claim: review_submissions.ListDraftClaim
-
-
 @dataclass(frozen=True)
 class ScheduledFiling:
     keeper: staff.StaffId
@@ -513,15 +503,14 @@ class ScheduledFiling:
         run = self.schedule.first if isinstance(self.schedule, the_list.ScheduledSeries) else self.schedule
         return " ".join(run.words.split())
 
-    def save(self, draft: ScheduledDraftFiling | DirectScheduledFiling = DirectScheduledFiling.CLI, *,
-             number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE) -> the_list.ListItem:
+    def save(self, *, new_item_draft_id: review_submissions.ListDraftOrigin = review_submissions.NoNewItemDraft.ABSENT,
+             before_save: Callable[[int], None] | None = None) -> the_list.ListItem:
         changes: the_list.ItemChanges = {
             "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
             "unit": self.member.name if self.member.kind == "unit" else "",
         }
-        if isinstance(draft, ScheduledDraftFiling):
-            changes["evidence"] = review_submissions.list_draft_evidence(draft.request_id, draft.claim)
-        return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes, number=number)
+        return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes,
+                            new_item_draft_id=new_item_draft_id, before_save=before_save)
 
 
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot) -> ScheduledFiling:
@@ -610,23 +599,10 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
             filing = prepare_scheduled(owner, request.words, members)
             notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
-            draft = ScheduledDraftFiling(request.request_id, claim)
+            draft = review_submissions.NewItemDraft(request.request_id, claim)
 
-            def save(claim_number: Callable[[int], None]) -> the_list.ListItem:
-                store_for = cast(Callable[[staff.StaffId], record_store.NumberedRecords], getattr(the_list, "_store"))
-                store = store_for(filing.keeper)
-                while True:
-                    with store.list_allocation():
-                        number = store.next_number()
-                        claim_number(number)
-                    try:
-                        return filing.save(draft, number=number)
-                    except the_list.ListError as error:
-                        # List reports a displaced number with these allocation errors.
-                        message = str(error)
-                        if (message != f"L{number}: the item already exists"
-                                and re.fullmatch(fr"L{number}: the next available number is L[1-9][0-9]*", message) is None):
-                            raise
+            def save(claim_number: Callable[[int], None]) -> str:
+                return filing.save(new_item_draft_id=draft, before_save=claim_number).id
 
             yield claim, save
 

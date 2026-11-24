@@ -29,7 +29,7 @@ from scripts.lib import atomic_file, conf, main_publish
 from scripts.message import send_result, session_send
 from scripts.production import change_review, delivery_state, investigation, record_store, repeat_rule, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import change_page, list_page, question_record, review_items
+from scripts.review_links import change_page, list_page, new_item_dialog, question_record, review_items, review_submissions
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -234,16 +234,33 @@ class TheListTests(unittest.TestCase):
     def test_scheduled_items_round_trip_and_list_their_next_run(self) -> None:
         start = "2026-11-30T09:00[America/Los_Angeles]"
         stamp = "2026-11-30T09:00:00-08:00[America/Los_Angeles]"
-        for options, detail in (
-            ((), "Does not repeat"),
-            (("--repeat", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH"), "Repeats: Every 2 weeks on Monday and Thursday"),
+        draft = review_submissions.NewItemDraft(new_item_dialog.ScheduledDraftId("s1-" + "a" * 32), review_submissions.ListDraftClaim(
+            "b" * 64, MORTY.id, "Assign to the runner.", ("Starts on Monday.", "Does not repeat"),
+            (review_submissions.ListAssignmentNotice(RUNNER.id, "showrunner", "Read the figures.", "morty"),)))
+        for options, detail, origin in (
+            ((), "Does not repeat", review_submissions.NoNewItemDraft.ABSENT),
+            (("--repeat", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH"), "Repeats: Every 2 weeks on Monday and Thursday",
+             review_submissions.NoNewItemDraft.ABSENT),
+            ((), "Does not repeat", draft),
         ):
-            with self.subTest(detail=detail):
-                code, output, errors = self.add_scheduled(start, *options)
-                self.assertEqual((code, errors), (0, ""))
-                description, identity = output.splitlines()
-                self.assertEqual(description, detail)
+            with self.subTest(detail=detail, origin=origin):
+                if isinstance(origin, review_submissions.NewItemDraft):
+                    start_time = datetime(2026, 11, 30, 9, tzinfo=ZoneInfo("America/Los_Angeles"))
+                    chosen: list[int] = []
+                    saved = the_list.add(MORTY.id, "Check the predictions", owner=RUNNER.id, source="nate",
+                                         changes={"state": the_list.ItemState.SCHEDULED,
+                                                  "schedule": the_list.ScheduledRun(start_time, "Read the figures.\nSend the total."),
+                                                  "evidence": "Read the source report."},
+                                         new_item_draft_id=origin, before_save=chosen.append)
+                    self.assertEqual(chosen, [saved.number])
+                    identity = saved.id
+                else:
+                    code, output, errors = self.add_scheduled(start, *options)
+                    self.assertEqual((code, errors), (0, ""))
+                    description, identity = output.splitlines()
+                    self.assertEqual(description, detail)
                 item = the_list.load(MORTY.id, identity)
+                self.assertEqual(item.new_item_draft_id, origin)
                 schedule = item.schedule
                 self.assertIs(item.state, the_list.ItemState.SCHEDULED)
                 self.assertIs(item.parked_until, the_list.NoTimestamp.UNSET)
@@ -264,6 +281,10 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(event.fields.get("schedule"), schedule)
                 page = list_page.render(self.root, include_counts=False).decode()
                 self.assertIn("Check the predictions", page)
+                if isinstance(origin, review_submissions.NewItemDraft):
+                    self.assertEqual(item.evidence, "Read the source report.")
+                    self.assertNotIn(origin.id.value, shown)
+                    self.assertNotIn(origin.id.value, page)
 
         second = datetime(2026, 11, 30, 17, tzinfo=UTC) + timedelta(days=1)
         moved = second + timedelta(hours=1)
