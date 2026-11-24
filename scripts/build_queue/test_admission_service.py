@@ -50,7 +50,7 @@ from scripts.buildlog import record as buildlog_record
 from scripts.build_hold import override_guard
 from scripts.build_hold.owning_session import OwningSession
 
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
@@ -529,15 +529,15 @@ class PlacementStatusTests(unittest.TestCase):
 
     def test_placement_poll_sees_an_expired_attempt_retry_after_the_timer_pass(self) -> None:
         from scripts.build_queue.test_placement import (
-            PlacementFixture, assignment_for, mac_linux_and_natedev_request, publish_candidate,
+            PlacementFixture, assignment_for, placement_request, publish_candidate,
         )
 
         with PlacementFixture() as fixture:
             fixture.configure(waiting_pass_seconds=10)
-            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            request = placement_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
-            closed, = fixture.server.handle_request(wire.ClaimFailure("guest-refusal", assignment, placement.MAC_LINUX_NO_ANSWER))
+            closed, = fixture.server.handle_request(wire.ClaimFailure("mac-refusal", assignment, "lost"))
             assert isinstance(closed, wire.DispatchStatus)
             assert isinstance(closed.retry, placement.RetryAt)
             fixture.clock.advance(closed.retry.deadline - fixture.clock.now() - 1)
@@ -4554,6 +4554,80 @@ class PlacementRestartTests(unittest.TestCase):
 
 
 class CloudAdmissionTests(unittest.TestCase):
+    def test_aws_grant_requires_a_registered_enabled_scaler_with_slots_and_daily_room(self) -> None:
+        from scripts.aws_target import ledger
+        from scripts.build_queue.test_placement import PlacementFixture, aws_gate_request, read_aws_gate_evidence
+
+        for cause in ("off", "slots", "daily", "absent", "ready"):
+            with self.subTest(cause=cause), PlacementFixture() as fixture:
+                fixture.configure(cloud_gate_slots=16)
+                if cause == "slots":
+                    for _ in range(16):
+                        _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+                request = aws_gate_request(fixture, enabled=cause != "off", daily_room=cause != "daily")
+                if cause == "absent":
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\n")
+                directory = fixture.root / "queue-target-state"
+                book = ledger.CostLedger(directory / "aws")
+                saved = book.path.read_bytes()
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                    _ = read_aws_gate_evidence(fixture, request)
+                    reply, = fixture.server.handle_request(request)
+                    if cause == "ready":
+                        assert isinstance(reply, wire.Assignment)
+                        self.assertEqual(reply.assignment.destination.target, "claude-aws")
+                        self.assertEqual(fixture.server.current_assignments[request.episode],
+                            execution_identity.attempt_key(request.episode, reply.assignment.attempt))
+                    else:
+                        self.assertNotIsInstance(reply, wire.Assignment)
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                        candidate, = fixture.server.placement_eligibility[request.episode]
+                        self.assertNotIsInstance(candidate.eligibility, placement.AllowedHost)
+                self.assertEqual(book.path.read_bytes(), saved)
+
+    def test_aws_grants_count_against_daily_room_until_the_worker_books(self) -> None:
+        from decimal import Decimal
+        from scripts.aws_target import ledger
+        from scripts.aws_target.ledger_test_support import override_fixture_settings
+        from scripts.build_queue.test_placement import PlacementFixture, aws_gate_request, read_aws_gate_evidence
+
+        with PlacementFixture() as fixture:
+            directory = fixture.root / "queue-target-state"
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
+                                              "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                first = aws_gate_request(fixture)
+                second = aws_gate_request(fixture)
+                gate_settings = fixture.root / "cloud_gate.conf"
+                override_fixture_settings(gate_settings, "# range: 0..\nattempt_allowance_usd=20\n")
+                _ = read_aws_gate_evidence(fixture, first)
+                _ = read_aws_gate_evidence(fixture, second)
+                reply, = fixture.server.handle_request(first)
+                self.assertIsInstance(reply, wire.Assignment)
+                assert isinstance(reply, wire.Assignment)
+                self.assertNotIsInstance(fixture.server.handle_request(second)[0], wire.Assignment)
+                blocked, = fixture.server.placement_eligibility[second.episode]
+                self.assertEqual(blocked.eligibility, placement.TemporaryExclusion("daily_limit"))
+
+                assert isinstance(first.local, wire.LocalAdmissionContext)
+                binding = ledger.GateDispatchBinding.read(ledger.gate_dispatch_binding_path(Path(first.local.sidecar)))
+                holder = placement.ClaimHolderIdentity(first.owner.host, first.owner.pid, first.owner.start_time)
+                journal = ledger.GateDispatchJournal(binding.journal)
+                journal.begin(binding, holder)
+                permission, = fixture.server.handle_request(wire.ConsumePermission("consume", reply.assignment, binding.claim, holder))
+                self.assertIsInstance(permission, wire.FirstAuthorization)
+                folder = fixture.root / "worker"
+                journal.register(binding.claim, holder, folder)
+                book = ledger.CostLedger(binding.directory)
+                now = int(fixture.clock.now())
+                with book.transaction() as evidence:
+                    evidence.gate_reservations.append(ledger.GateReservation(folder.name, now, now + 60,
+                                                                             Decimal(0), Decimal(20)))
+                override_fixture_settings(gate_settings, "attempt_allowance_usd=10\n")
+                _ = read_aws_gate_evidence(fixture, second)
+                self.assertIsInstance(fixture.server.handle_request(second)[0], wire.Assignment)
+                self.assertEqual(len(book.read_snapshot().gate_reservations), 1)
+
     def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
         from scripts.build_queue import cloud_progress
 
@@ -6056,7 +6130,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(saved.identity.step, request.profile.step)
 
     def assert_reload_hash_journal(self, journal: str, next_check: float) -> str:
-        schedule, ready, revision = journal.splitlines()
+        provision, schedule, ready, revision = journal.splitlines()
+        self.assertEqual(provision, f"memory admission: Mac Linux state root ready at {Path.home() / '.local/state/build-targets'}")
         self.assertEqual(schedule, f"memory admission: source watch checks 1 paths first at monotonic {next_check:.3f}")
         self.assertRegex(ready, r"^memory admission: reload ready, source hash [a-f0-9]{64}$")
         self.assertEqual(revision, "memory admission: ready with git revision unavailable")
@@ -6369,6 +6444,20 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(fixture.server.handle_request(request), [wire.Refused("owner no longer exists")])
             self.assertFalse(fixture.server.waiters)
             self.assertFalse(fixture.server.reservations)
+
+    def test_admission_fixture_leaves_an_inherited_config_folder_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            inherited = Path(directory)
+            existing = inherited / "build_targets.conf"
+            contents = b"# Caller configuration\n"
+            _ = existing.write_bytes(contents)
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}):
+                with AdmissionFixture() as fixture:
+                    self.assertEqual(Path(os.environ["CONF_DIR"]), fixture.root)
+                    self.assertTrue((fixture.root / existing.name).is_file())
+                self.assertEqual(Path(os.environ["CONF_DIR"]), inherited)
+            self.assertEqual(list(inherited.iterdir()), [existing])
+            self.assertEqual(existing.read_bytes(), contents)
 
     def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
         with tempfile.TemporaryDirectory(prefix="admit-long-", dir="/tmp") as root:
@@ -6782,6 +6871,48 @@ class ServiceTests(unittest.TestCase):
             fixture.server.run_once(0)
             self.assertTrue(fixture.server.stopped)
 
+    def test_start_provisions_the_mac_linux_state_root_before_ready(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            root = fixture.root / "target-state" / "guest-state"
+            server = fixture.new_server(start=False)
+            try:
+                with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
+                      mock.patch.object(atomic_file, "sync_folder", wraps=atomic_file.sync_folder) as sync,
+                      mock.patch.object(service, "_notify") as notify,
+                      redirect_stderr(io.StringIO()) as journal):
+                    def ready(message: str) -> None:
+                        self.assertEqual(message, "READY=1")
+                        self.assertTrue(root.is_dir())
+                        self.assertEqual(sync.call_args_list, [mock.call(root.parent), mock.call(fixture.root)])
+
+                    notify.side_effect = ready
+                    self.assertFalse(root.exists())
+                    server.start()
+                    server.start()
+                    notify.assert_called_once_with("READY=1")
+                self.assertEqual(journal.getvalue().splitlines()[0],
+                                 f"memory admission: Mac Linux state root ready at {root}")
+            finally:
+                server.close()
+
+    def test_start_continues_after_mac_linux_state_setup_fails(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            root = fixture.root / "guest-state"
+            root.mkdir()
+            failure = OSError(errno.EIO, "fixture parent sync failed")
+            with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
+                  mock.patch.object(atomic_file, "sync_folder", side_effect=failure) as sync,
+                  redirect_stderr(io.StringIO()) as journal):
+                fixture.server = fixture.new_server()
+            self.assertTrue(root.is_dir())
+            sync.assert_called_once_with(root.parent)
+            self.assertEqual(journal.getvalue().splitlines()[0],
+                             f"memory admission: Cannot prepare the Mac Linux state root {root}: {failure}. "
+                             + "Run build_targets.py setup-mac-linux on natedev.")
+            self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+
     def test_serve_binds_the_environment_socket_without_listen_fds(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.server.close()
@@ -6819,6 +6950,8 @@ class ServiceTests(unittest.TestCase):
                     ["git", "-C", str(Path(service.__file__).resolve().parent), "rev-parse", "HEAD"],
                     text=True).strip()
                 ready_revision = f"memory admission: ready with git revision {revision}"
+                state_root = fixture.root / ".local/state/build-targets"
+                state_ready = f"memory admission: Mac Linux state root ready at {state_root}"
                 original_watch = ""
                 changed_at = fixture.clock.monotonic()
 
@@ -6853,7 +6986,7 @@ class ServiceTests(unittest.TestCase):
                         _ = service.main()
                     reload_marker = os.environ.get(service.ADMISSION_SOURCE_RELOAD, "")
                 self.assertEqual(journal.getvalue().splitlines(),
-                    [original_watch, ready_revision,
+                    [state_ready, original_watch, ready_revision,
                      f"memory admission: source watch detected changes at monotonic {changed_at:.3f} in {source}",
                      "memory admission: source watch will reload after the changes settled",
                      f"memory admission: reload for changed source {source}"])
@@ -6869,6 +7002,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(len(states), 2)
                 self.assertEqual(states[0], "READY=1")
                 self.assertRegex(states[1], r"^RELOADING=1\nMONOTONIC_USEC=\d+$")
+                state_root.rmdir()
                 with mock.patch.dict(os.environ, {**environment, service.ADMISSION_SOURCE_RELOAD: reload_marker}), \
                      mock.patch.object(service, "LISTEN_FD", os.dup(listener.fileno())), \
                      redirect_stderr(io.StringIO()) as journal:
@@ -6879,7 +7013,8 @@ class ServiceTests(unittest.TestCase):
 
                     def notify_before_journal(message: str) -> None:
                         self.assertEqual(message, "READY=1")
-                        self.assertEqual(journal.getvalue().splitlines(), [replacement_watch])
+                        self.assertTrue(state_root.is_dir())
+                        self.assertEqual(journal.getvalue().splitlines(), [state_ready, replacement_watch])
                         notify(message)
 
                     try:
@@ -6889,7 +7024,8 @@ class ServiceTests(unittest.TestCase):
                         version = admission_code.reload_source_version(replacement.source_root)
                         self.assertRegex(version, r"^[0-9a-f]{64}$")
                         self.assertEqual(journal.getvalue().splitlines(),
-                            [replacement_watch, f"memory admission: reload ready, source hash {version}", ready_revision])
+                            [state_ready, replacement_watch, f"memory admission: reload ready, source hash {version}",
+                             ready_revision])
                         self.assertNotIn(service.ADMISSION_SOURCE_RELOAD, os.environ)
                     finally:
                         replacement.close()
@@ -9413,6 +9549,171 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(fixture.queue_pids(), [other.owner.pid, second.owner.pid])
             self.assertFalse(service.read_state(fixture.state_dir).run_places)
 
+    def test_returning_run_sorts_by_its_first_wait_start(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate")
+            _ = fixture.finish_step(first, end_owner=True)
+            fixture.allow_next_start()
+            fixture.restart()
+            saved, = service.read_state(fixture.state_dir).run_places.values()
+            fixture.hold_starts()
+            peers = [fixture.request(step="gate", owner=fixture.fixture_owner(pid, "4000"))
+                     for pid in (700001, 700002)]
+            for peer in peers:
+                self.assertIsInstance(fixture.server.handle_request(peer)[0], wire.Wait)
+            returning = fixture.request(run=run, step="gate")
+            self.assertIsInstance(fixture.server.handle_request(returning)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [returning.owner.pid, *(peer.owner.pid for peer in peers)])
+            row, = (row for _, row in self.reading(fixture).ordered if row["pid"] == returning.owner.pid)
+            self.assertEqual(row["since"], returning.since)
+            self.assertEqual(row.get("order_since"), first.since)
+            self.assertTrue(saved.move_id)
+            self.assertEqual(saved.repository, "fixture")
+            self.assertNotEqual(row.get("move_id"), saved.move_id)
+
+    def test_tied_waiter_keeps_the_first_step_at_the_head(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate", owner=fixture.fixture_owner(700001, "4000"))
+            _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            fixture.restart()
+            fixture.hold_starts()
+            peer = fixture.request(step="gate", since=first.since,
+                                   owner=fixture.fixture_owner(700002, "4000"))
+            self.assertIsInstance(fixture.server.handle_request(peer)[0], wire.Wait)
+            returning = fixture.request(run=run, step="gate", owner=fixture.fixture_owner(700003, "4000"))
+            self.assertIsInstance(fixture.server.handle_request(returning)[0], wire.Wait)
+            self.assertGreater(returning.since, peer.since)
+            rows = [row for _, row in self.reading(fixture).ordered]
+            self.assertEqual([row.get("order_since") for row in rows], [first.since, first.since])
+            self.assertEqual([row["pid"] for row in rows], [returning.owner.pid, peer.owner.pid])
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {returning.episode})
+
+    def test_replacement_gate_saves_its_move_id_with_the_inherited_arrival(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            old = fixture.request(run=fixture.run_owner(), step="gate")
+            old = replace(old, identity=replace(old.identity, unit="queue", job=StepJob("test-affected")))
+            self.assertIsInstance(fixture.server.handle_request(old)[0], wire.Wait)
+            fixture.clock.advance(10)
+            run = fixture.run_owner()
+            new = fixture.request(run=run, step="gate")
+            new = replace(new, identity=replace(new.identity, unit=old.identity.unit, job=old.identity.job))
+            peer = fixture.connect(new)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            row = fixture.server.waiters[new.episode].row
+            move_id = row.get("move_id", "")
+            self.assertTrue(move_id)
+            fixture.free(60 * GIB)
+            fixture.allow_next_start()
+            _ = fixture.server.run_pass()
+            _ = only_admitted(peer.replies())
+            saved = service.read_state(fixture.state_dir).run_places[records.run_owner(run.pid, run.start_time)]
+            self.assertEqual((saved.since, saved.move_id, saved.repository), (old.since, move_id, "fixture"))
+
+    def test_returning_gate_uses_its_current_units_priority(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate")
+            first = replace(first, identity=replace(first.identity, unit="former"))
+            _ = fixture.finish_step(first)
+            saved, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertEqual(saved.unit, "former")
+            fixture.hold_starts()
+            priority = ("former", "peer", "current")
+            fixture.server.priority = records.QueuePriority(tuple(
+                {"unit": unit, "why": "fixture", "set_at": fixture.clock.now(), "set_by": "fixture"}
+                for unit in priority))
+            peer = fixture.request(step="gate")
+            peer = replace(peer, identity=replace(peer.identity, unit="peer"))
+            returning = fixture.request(run=run, step="gate", need=first.profile.peak.bytes * 2)
+            returning = replace(returning, identity=replace(returning.identity, unit="current"))
+            for request in (peer, returning):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            self.assertEqual([records.waiter_priority(row) for _, row in gate.ranked_queue_waiters(inputs)],
+                             [records.PriorityUnit("peer", 1), records.PriorityUnit("current", 2)])
+            fixture.allow_next_start()
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {peer.episode})
+
+    def test_younger_run_logs_once_when_it_starts_in_a_gate_gap(self) -> None:
+        with AdmissionFixture() as fixture:
+            first_run, second_run = fixture.run_owner(), fixture.run_owner()
+            first = fixture.request(run=first_run, step="gate")
+            first_grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            second = fixture.request(run=second_run, step="gate")
+            second_grant = only_admitted(fixture.server.handle_request(second))
+            fixture.release(first_grant)
+            fixture.release(second_grant)
+            fixture.allow_next_start()
+            self.assertEqual(len(fixture.server.slots), 2)
+            younger_run = fixture.run_owner()
+            younger = fixture.request(run=younger_run, step="gate")
+            with redirect_stderr(io.StringIO()) as journal:
+                grant = only_admitted(fixture.server.handle_request(younger))
+                self.assertEqual(only_admitted(fixture.server.handle_request(younger)), grant)
+                _ = fixture.run_pass()
+            lines = [line for line in journal.getvalue().splitlines() if "started in the gate gap" in line]
+            expected = (f"memory admission: run {younger_run.pid}:{younger_run.start_time} "
+                        f"started in the gate gap of {first_run.pid}:{first_run.start_time} "
+                        f"for fixture on {fixture.server.host}")
+            self.assertEqual(lines, [expected])
+
+    def test_old_run_place_loads_with_empty_move_id_and_repository(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run), end_owner=True)
+            saved = cast(dict[str, object], json.loads(fixture.state_text()))
+            places = cast(dict[str, dict[str, object]], saved["run_places"])
+            place, = places.values()
+            _ = place.pop("move_id", None)
+            _ = place.pop("repository", None)
+            _ = (fixture.state_dir / "state.json").write_text(json.dumps(saved))
+            restored, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertEqual(restored.move_id, "")
+            self.assertEqual(restored.repository, "")
+
+    def test_main_892cb2d74f_loads_run_place_with_new_fields(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+            place, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertTrue(place.move_id)
+            self.assertEqual(place.repository, "fixture")
+            baseline = fixture.root / "baseline"
+            baseline.mkdir()
+            for name in ("admission_protocol.py", "admission_wire.py", "admission_service.py", "snapshot_codec.py"):
+                source = subprocess.check_output(
+                    ("git", "-C", str(repository), "show", f"892cb2d74f:scripts/build_queue/{name}"),
+                    timeout=5)
+                _ = (baseline / name).write_bytes(source)
+            check = """
+import sys
+from pathlib import Path
+import scripts.build_queue
+scripts.build_queue.__path__ = [sys.argv[1], *scripts.build_queue.__path__]
+from scripts.build_queue import admission_service, admission_protocol
+place, = admission_service.read_state(Path(sys.argv[2])).run_places.values()
+assert type(place) is admission_protocol.RunPlace
+assert place.run.pid == int(sys.argv[3])
+assert not hasattr(place, 'move_id')
+assert not hasattr(place, 'repository')
+"""
+            result = subprocess.run((sys.executable, "-c", check, str(baseline),
+                                     str(fixture.state_dir), str(run.pid)),
+                                    capture_output=True, text=True, check=False, timeout=8)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_run_exit_between_steps_removes_the_idle_watch_and_saved_place(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
@@ -9610,6 +9911,14 @@ class RunPlaceTests(unittest.TestCase):
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_admission_fixture_leaves_an_inherited_config_folder_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inherited = Path(temporary) / "inherited-conf"
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}), AdmissionFixture() as fixture:
+                self.assertEqual(os.environ["CONF_DIR"], str(fixture.root))
+                self.assertTrue((fixture.root / "build_folders.conf").is_file())
+                self.assertFalse(inherited.exists())
+
     def test_invalid_remote_start_hold_is_refused_during_configuration_read(self) -> None:
         for value in (None, "invalid", "86401"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
