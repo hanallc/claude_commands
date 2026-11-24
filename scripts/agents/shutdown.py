@@ -8,9 +8,13 @@ except FileNotFoundError:
 
 import sys
 
+SET_MODEL_EXAMPLE = "agents {command} producers fable high"
+
+
 def _usage() -> str:
     from scripts.agents import set_model
 
+    example = SET_MODEL_EXAMPLE.format(command=set_model.COMMAND)
     return f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
@@ -29,7 +33,7 @@ def _usage() -> str:
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
   agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: {example})
 """
 
 if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
@@ -157,6 +161,23 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         if not waiting:
             return
         time.sleep(1)
+
+
+def _row_at_path(path: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Select one row by its full staff path, or by a path under a showrunner, such as assembly/fix2.
+
+    Return None when no row has the path, so that the caller can try a native session name.
+    """
+    found: dict[staff.StaffId, str] = {}
+    for full in (path, *(f"{root.name}/{path}" for root in record.rows if root.kind in ("showrunner", "producer"))):
+        if (row := record.by_path(full)) is not None:
+            _ = found.setdefault(row.id, full)
+    if len(found) == 1:
+        return record.rows_by_id[next(iter(found))]
+    if found:
+        paths = ", ".join(sorted(found.values()))
+        raise staff.StaffRefused(f"{path}: several staff rows match: {paths}; use the full path or the staff id")
+    return None
 
 
 def _result_code(result: StopResult | ResumeResult) -> int:
@@ -588,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments == ["_unit-local"]:
         return unit_local_command()
     parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
-    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    commands = parser.add_subparsers(prog=parser.prog, dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")
     selection = command.add_mutually_exclusive_group(required=True)
     _ = selection.add_argument("session", nargs="?")
@@ -608,7 +629,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
     _ = command.add_argument("--job", default="")
-    command = commands.add_parser(set_model.COMMAND)
+    example = SET_MODEL_EXAMPLE.format(command=set_model.COMMAND)
+    command = commands.add_parser(set_model.COMMAND, description=f"Example: {example}")
     _ = command.add_argument("role", metavar="ROLE")
     _ = command.add_argument("model", metavar="MODEL")
     _ = command.add_argument("effort", metavar="EFFORT", nargs="?", default="")
@@ -767,24 +789,28 @@ def main(argv: list[str] | None = None) -> int:
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
-        member = record.by_member_reference(options.session)
-        matches = [member for member in record.rows if member.name == options.session]
-        named = matches[0] if len(matches) == 1 else None
-        row = member or record.by_path(options.session) or named
+        session = options.session
+        row = _row_at_path(session, record) if "/" in session else None
+        if row is not None:
+            target = row
+            session = str(row.id)
+        else:
+            matches = [member for member in record.rows if member.name == session]
+            target = record.by_member_reference(session) or (matches[0] if len(matches) == 1 else None)
+            row = target or record.by_path(session)
         if options.dry_run:
-            target = stop_resume.stop_target(options.session)
-            if isinstance(target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
-                return _result_code(target)
+            stop_target = stop_resume.stop_target(session)
+            if isinstance(stop_target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
+                return _result_code(stop_target)
             if row is not None and row.kind in ("unit", "showrunner"):
                 for child in record.find(kind="worker", parent=row.id):
                     print(f"{child.name}: would stop")
-            print(f"{row.name if row is not None else options.session}: would stop")
+            print(f"{row.name if row is not None else session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
         deadline = worker_lifecycle.effective_deadline()
-        target = member or named
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
-                  if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
+                  if target is not None and target.kind == "producer" else stop_resume.stop(session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
     except herdr.RebootLockBusy as error:
         print(error, file=sys.stderr)
