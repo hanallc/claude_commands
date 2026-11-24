@@ -49,6 +49,10 @@ The count excludes type checks.
 Older guest gate code can return its result without sending progress records.
 If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
 The queue can then give the gate to the next named target.
+For a placed gate, `copies.py run` keeps the copy lease and uses its original placement request again.
+The gate must exit with status 79 and write a claim failure that matches the current assignment.
+After the queue settles that attempt, the gate starts with the replacement assignment.
+If the claim failure is missing or invalid, `copies.py run` reports `Gate placement blocked` and returns status 79.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
 A stream failure reports its status and up to 1200 characters from standard error.
 A stream timeout reports the diagnostics it received before the deadline.
