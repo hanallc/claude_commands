@@ -213,6 +213,9 @@ def provision_mac_linux_state_root(root: Path) -> None:
     home = Path.home().absolute()
     boundary = home if root.is_relative_to(home) else Path(root.anchor)
     folders = (root, *root.parents)
+    for folder in reversed(folders[:folders.index(boundary)]):
+        if folder.is_symlink():
+            raise OSError(f"The Mac Linux state root path {folder} is a symbolic link. Use a real directory")
     for folder in reversed(folders):
         if not folder.is_dir():
             folder.mkdir(exist_ok=True)

@@ -1760,6 +1760,25 @@ fi
             self.assertEqual(build_targets.main(), 0)
         self.assertEqual(sync.call_args_list, [call(root.parent), call(root.parent.parent), call(self.root)])
 
+    def test_setup_mac_linux_refuses_a_symbolic_link_in_the_state_root_path(self) -> None:
+        target = self.root / 'fresh-state'
+        target.mkdir()
+        link = self.root / 'state-link'
+        link.symlink_to(target, target_is_directory=True)
+        root = link / 'build-targets'
+
+        with (patch.dict(os.environ, {'HOME': str(self.root)}),
+              patch.object(Path, 'mkdir') as mkdir,
+              patch.object(atomic_file, 'sync_folder') as sync,
+              self.assertRaises(OSError) as raised):
+            target_config.provision_mac_linux_state_root(root)
+
+        self.assertEqual(str(raised.exception),
+                         f'The Mac Linux state root path {link} is a symbolic link. Use a real directory')
+        mkdir.assert_not_called()
+        sync.assert_not_called()
+        self.assertFalse((target / root.name).exists())
+
     def test_a_failed_journal_directory_sync_does_not_consume_permission(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
         fsync = os.fsync
