@@ -28,6 +28,10 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
 
+_LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:", "# agent:")
+_CONF_WHITESPACE = " \t\n\v\f\r"
+
+
 _warning_sink: ContextVar[Callable[[str, bool], None] | None] = ContextVar("configuration_warning_sink", default=None)
 
 
@@ -190,9 +194,9 @@ class ConfigRead:
             bad = setting.value
             if not use_file_limits:
                 return convert(setting.value), setting.value
-            if allow_blank and not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if allow_blank and not setting.value and not setting.limit.startswith(_LIMIT_PREFIXES):
                 return convert(""), setting.value
-            return _converted(setting, convert), setting.value
+            return _converted(setting, convert, self.source, key), setting.value
 
         repository_allowed = False
         try:
@@ -219,7 +223,7 @@ class ConfigRead:
         current_limit = ""
         if use_file_limits and isinstance(self.settings, dict):
             current = self.settings.get(self.effective_key(key))
-            if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if current is not None and current.limit.startswith(_LIMIT_PREFIXES):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
@@ -229,12 +233,13 @@ class ConfigRead:
                 continue
             if not current_limit:
                 return RecoveredValue(value, reason)
-            if fallback is None:
+            # A recovered agent must pass the current catalog check.
+            if fallback is None and not current_limit.startswith("# agent:"):
                 fallback = RecoveredValue(value, reason)
             if raw_value is None:
                 continue
             try:
-                _limits(current_limit, raw_value)
+                _limits(current_limit, raw_value, self.source, key)
             except (ValueError, ArithmeticError):
                 continue
             return RecoveredValue(value, reason)
@@ -291,11 +296,11 @@ class ConfigRead:
                 setting = _setting(settings, key)
             except _MissingKey:
                 continue
-            if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if not setting.value and not setting.limit.startswith(_LIMIT_PREFIXES):
                 result[key] = setting.value
                 continue
             try:
-                _limits(setting.limit, setting.value)
+                _limits(setting.limit, setting.value, self.source, key)
                 result[key] = setting.value
             except ValueError:
                 result[key] = self.text(key)
@@ -360,9 +365,13 @@ def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None 
 
 def read_or_repository(stem: str) -> ConfigRead:
     """Use the repository file when the fixture has no copy."""
+    return read(_repository_override(stem))
+
+
+def _repository_override(stem: str) -> str | Path:
     if "CONF_DIR" in os.environ and not path(stem).exists():
-        return read(_repository_path(stem))
-    return read(stem)
+        return _repository_path(stem)
+    return stem
 
 
 def directory() -> Path:
@@ -389,12 +398,13 @@ def _parse(source: str) -> dict[str, Setting]:
     settings: dict[str, Setting] = {}
     previous = ""
     for index, raw in enumerate(source.splitlines()):
-        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
+        line = re.split(r"(?:^|\s)#", raw, maxsplit=1, flags=re.ASCII)[0].strip(_CONF_WHITESPACE)
         if line and not line.startswith("["):
             key, separator, value = line.partition("=")
             if separator:
-                _ = settings.setdefault(key.strip(), Setting(value.strip(), previous, index))
-        previous = raw.strip()
+                _ = settings.setdefault(key.strip(_CONF_WHITESPACE),
+                                        Setting(value.strip(_CONF_WHITESPACE), previous, index))
+        previous = raw.strip(_CONF_WHITESPACE)
     return settings
 
 
@@ -420,23 +430,40 @@ def _setting(settings: dict[str, Setting], key: str) -> Setting:
         raise _MissingKey("key is missing") from None
 
 
-def _limits(limit: str, value: str) -> None:
-    if not value.strip():
+def _limits(limit: str, value: str, source: Path, key: str) -> None:
+    if limit.startswith("# agent:"):
+        _agent_limit(limit.removeprefix("# agent:").strip(_CONF_WHITESPACE), value, source, key)
+        return
+    if not value.strip(_CONF_WHITESPACE):
         raise ValueError("value is empty")
     if limit.startswith("# one of:"):
-        choices = tuple(word.strip() for word in limit.removeprefix("# one of:").split(","))
+        choices = tuple(word.strip(_CONF_WHITESPACE) for word in limit.removeprefix("# one of:").split(","))
         if value not in choices:
             raise ValueError(f"expected one of {', '.join(choices)}")
     elif limit.startswith(("# whole:", "# range:")):
         form = "# whole:" if limit.startswith("# whole:") else "# range:"
-        bounds = limit.removeprefix(form).strip().split("..")
+        bounds = limit.removeprefix(form).split("..")
         if len(bounds) != 2:
             raise ValueError(f"invalid limit {limit}")
         convert = _whole if form == "# whole:" else decimal
         number = convert(value)
-        low, high = (bound.strip() for bound in bounds)
+        low, high = (bound.strip(_CONF_WHITESPACE) for bound in bounds)
         if (low and number < convert(low)) or (high and number > convert(high)):
             raise ValueError(f"outside range {low}..{high}")
+
+
+def _agent_limit(family: str, value: str, source: Path, key: str) -> None:
+    if family not in ("claude", "codex"):
+        raise ValueError(f"unknown agent family {family!r}")
+
+    # The registry imports the configuration reader through build_folders.
+    from scripts.lib import models_registry
+
+    registry = path(_repository_override("models"))
+    try:
+        models_registry.check_agent_value(registry, f"{source.stem}.{key}", family, value)
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"cannot check {family} agent value: {error}") from error
 
 
 def decimal(value: str) -> Decimal:
@@ -501,14 +528,14 @@ def _committed_files(source: Path) -> Iterator[str]:
             yield committed.stdout
 
 
-def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
+def _converted(setting: Setting, convert: Callable[[str], Result], source: Path, key: str) -> Result:
     whole = convert is _whole or convert is positive_whole or convert is positive_whole_seconds
     if whole and not setting.limit.startswith("# whole:"):
         raise ValueError("expected a # whole: limit")
     if convert is _number and not setting.limit.startswith("# range:"):
         raise ValueError("expected a # range: limit")
     result = convert(setting.value)
-    _limits(setting.limit, setting.value)
+    _limits(setting.limit, setting.value, source, key)
     return result
 
 
@@ -588,7 +615,7 @@ def check(file: str | Path, key: str, value: str) -> None:
     source = path(file)
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
-        _limits(setting.limit, value)
+        _limits(setting.limit, value, source, key)
     except (OSError, UnicodeError, ValueError) as error:
         raise Unusable(f"{source}: {key}={value!r}: {error}") from error
 
