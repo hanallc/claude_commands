@@ -29,6 +29,450 @@ class KeyException:
     until: ExceptionLifetime | RemoveInPhase
 
 
+@dataclass(frozen=True)
+class ReaderException:
+    path: str
+    reads: tuple[str, ...]
+    reason: str
+    until: ExceptionLifetime | RemoveInPhase
+
+
+@dataclass(frozen=True)
+class VariableException:
+    name: str
+    reason: str
+    until: ExceptionLifetime | RemoveInPhase
+
+
+@dataclass(frozen=True)
+class TunableLiteral:
+    path: str
+    name: str
+    value: str
+    stem: str
+    key: str
+    limit: str
+    batch: RemoveInPhase
+
+
+@dataclass(frozen=True)
+class ExternalLiteral:
+    path: str
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class InternalLiteral:
+    path: str
+    name: str
+    reason: str
+
+
+_RAW_READER_PHASE = RemoveInPhase("Raw readers to conf.read")
+_FILE_VARIABLE_PHASE = RemoveInPhase("Per-file config environment variables to CONF_DIR")
+_TOML_PHASE = RemoveInPhase("TOML tunables to .conf")
+_SECTION_PHASE = RemoveInPhase("Remove section lines")
+
+READER_EXCEPTIONS: tuple[ReaderException, ...] = (
+    ReaderException(
+        "scripts/accounts/accounts.py", ("accounts.toml",),
+        "Read tunables from config/accounts.toml.", _TOML_PHASE,
+    ),
+    ReaderException(
+        "scripts/accounts/new_account.py", ("statusline.conf",),
+        "Read the original rows of config/statusline.conf before adding an account color.",
+        ExceptionLifetime.PERMANENT,
+    ),
+    ReaderException(
+        "scripts/astra/design_roles.py", ("design_roles.conf", "designer.md"),
+        "Read config/design_roles.conf by section and load config/design_roles/designer.md.",
+        _SECTION_PHASE,
+    ),
+    ReaderException(
+        "scripts/aws_target/hana_render.py", ("build_folders.conf", "build_targets.conf", "copies.conf", "hana_aws.conf"),
+        "Read build_folders.conf, build_targets.conf, copies.conf and hana_aws.conf to render settings for a guest host.",
+        ExceptionLifetime.PERMANENT,
+    ),
+    ReaderException(
+        "scripts/build_hold/cargo", ("build_folders.conf",),
+        "Parse layout keys in config/build_folders.conf.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/buildlog/rust_release.py", ("lint.conf",), "Parse config/lint.conf directly.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/direct/pass_record.py", ("direct.conf", "models.conf"),
+        "Hash the exact bytes of config/models.conf and config/direct.conf.",
+        ExceptionLifetime.PERMANENT,
+    ),
+    ReaderException(
+        "scripts/hooks/mac_files.py", ("production.conf",),
+        "Parse config/production.conf to find the Mac.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/hooks/stop-context-deferral.py", ("context_deferral.conf",),
+        "Parse the rule list in config/context_deferral.conf; its form waits for a showrunner decision.",
+        ExceptionLifetime.NO_REMOVAL_PHASE,
+    ),
+    ReaderException(
+        "scripts/lib/user_zone.py", ("*",), "Parse the selected user zone config file.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/lint/lint_config.sh", ("lint.conf",),
+        "Read config/lint.conf without a subshell and preserve its rows during edits.",
+        ExceptionLifetime.PERMANENT,
+    ),
+    ReaderException(
+        "scripts/maintenance/herdr_upkeep.py", ("herdr_upkeep.toml",),
+        "Read tunables from config/herdr_upkeep.toml.", _TOML_PHASE,
+    ),
+    ReaderException(
+        "scripts/maintenance/settings.py", ("agent_notes.toml",),
+        "Read tunables from config/agent_notes.toml.", _TOML_PHASE,
+    ),
+    ReaderException(
+        "scripts/message/repeat_guard.py", ("send_repeat_guard.conf",),
+        "Parse config/send_repeat_guard.conf directly.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/message/session_records.py", ("session_retries.toml",),
+        "Read tunables from config/session_retries.toml.", _TOML_PHASE,
+    ),
+    ReaderException(
+        "scripts/notify/review.py", ("notify.conf",), "Parse config/notify.conf directly.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/production/stall_watch.py", ("*",), "Parse the selected stall watch config file.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/statusline/rebuild_row.py", ("*",), "Parse the selected statusline config file.", _RAW_READER_PHASE,
+    ),
+    ReaderException(
+        "scripts/statusline/statusline.sh", ("user_zone.conf",),
+        "Parse config/user_zone.conf directly.", _RAW_READER_PHASE,
+    ),
+    *(
+        ReaderException(path, (file.rsplit("/", 1)[-1],), f"Read {file} as data.", ExceptionLifetime.PERMANENT)
+        for path, file in (
+            ("scripts/direct/simplify_result.py", "config/review/simplify.md"),
+            ("scripts/hooks/post-tool-use-random-ack.sh", "config/acknowledgements.txt"),
+            ("scripts/hooks/session-start-ste.py", "config/simplified-technical-english.md"),
+            ("scripts/lib/names.py", "config/names.toml"),
+            ("scripts/lint/folder_audit.py", "config/rust_roots.txt"),
+            ("scripts/lint/style_review.py", "config/review/style.md"),
+            ("scripts/mac_test/mac_gate.py", "config/mac_gate_modules.txt"),
+            ("scripts/orphans/orphans.py", "config/orphans_expected.json"),
+        )
+    ),
+    *(
+        ReaderException(path, ("*",), "Read or write the requested config file.", ExceptionLifetime.PERMANENT)
+        for path in (
+            "scripts/lib/conf.py",
+            "scripts/lib/conf.sh",
+            "scripts/lib/conf_reads.py",
+            "scripts/lib/live_settings.py",
+        )
+    ),
+    ReaderException(
+        "scripts/lib/waiting_rows.py", ("models.conf",),
+        "Read models.conf to validate model colors during registry recovery.", ExceptionLifetime.PERMANENT,
+    ),
+)
+
+VARIABLE_EXCEPTIONS: tuple[VariableException, ...] = (
+    VariableException("SEND_REPEAT_CONFIG", "Select config/send_repeat_guard.conf.", _RAW_READER_PHASE),
+    VariableException("STALL_WATCH_CONFIG", "Select config/stall_watch.conf.", _RAW_READER_PHASE),
+    VariableException("MODELS_CONFIG_FILE", "Select config/models.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("COPIES_CONFIG", "Select config/copies.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("STAFF_CONFIG", "Select config/staff.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("AWS_TARGET_CONFIG", "Select config/aws_target.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("BUILD_TARGETS_CONFIG", "Select config/build_targets.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("LINT_CONFIG_FILE", "Select config/lint.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("SHOWRUNNERS_CONFIG", "Select config/showrunners.conf.", _FILE_VARIABLE_PHASE),
+    VariableException("HERDR_UPKEEP_CONFIG", "Select config/herdr_upkeep.toml.", _TOML_PHASE),
+    VariableException("AGENT_NOTES_JOB_CONFIG", "Select config/agent_notes.toml.", _TOML_PHASE),
+    VariableException("DESIGN_ROLES_CONFIG", "Select config/design_roles.conf.", _SECTION_PHASE),
+    VariableException("CODEX_CONFIG_FILE", "not a config file", ExceptionLifetime.PERMANENT),
+)
+
+_BUILD_TOOL_BATCH = RemoveInPhase("Build tool literals to config")
+_MESSAGE_BATCH = RemoveInPhase("Message and notice literals to config")
+_PRODUCTION_BATCH = RemoveInPhase("Production and direct literals to config")
+_AWS_REVIEW_BATCH = RemoveInPhase("AWS and review tool literals to config")
+
+LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...] = (
+    InternalLiteral(
+        "scripts/accounts/accounts.py", "MODEL_TAIL_BLOCK_BYTES",
+        "Read each transcript tail in fixed chunks.",
+    ),
+    InternalLiteral(
+        "scripts/accounts/accounts.py", "_MODEL_EDGE_BYTES",
+        "Hash a fixed sample at each end of the cached prefix.",
+    ),
+    InternalLiteral(
+        "scripts/accounts/accounts.py", "_MODEL_CACHE_ENTRY_BYTES",
+        "Keep a fixed size ceiling for each cached scan entry.",
+    ),
+    InternalLiteral(
+        "scripts/agents/detached_runs.py", "LIVE_RUN_LIMIT_REACHED",
+        "The detached runner returns this status when it reaches the live run limit.",
+    ),
+    TunableLiteral(
+        "scripts/agents/inventory.py", "_LAST_STEP_BYTES", "262_144",
+        "production", "inventory.last_step_scan_bytes", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/agents/pane_record.py", "ANCESTOR_LIMIT",
+        "Bound the process walk that identifies a pane.",
+    ),
+    TunableLiteral(
+        "scripts/aws_target/gpu_size_trial.py", "NEXTEST_LOG_TAIL_BYTES", "1024 * 1024",
+        "cloud_gate", "gpu_size_trial.nextest_log_tail_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/aws_target/gpu_size_trial.py", "NEXTEST_LOG_TAIL_CHUNK_BYTES",
+        "Read the nextest tail in fixed chunks.",
+    ),
+    InternalLiteral(
+        "scripts/aws_target/hana_protocol.py", "CONTROL_MAX_BYTES",
+        "The Hana control message format has a fixed size limit.",
+    ),
+    InternalLiteral(
+        "scripts/aws_target/hana_protocol.py", "COMMAND_ENVELOPE_RESERVE_BYTES",
+        "Reserve space for the Hana control envelope.",
+    ),
+    InternalLiteral(
+        "scripts/aws_target/hana_result.py", "RESULT_MAX_BYTES",
+        "The Hana result sender and receiver share this message size limit.",
+    ),
+    ExternalLiteral(
+        "scripts/aws_target/ledger.py", "SPOT_PLACEMENT_AWS_24_HOUR_CONFIGURATION_LIMIT",
+        "AWS sets the daily Spot placement configuration limit.",
+    ),
+    ExternalLiteral(
+        "scripts/aws_target/plan_run.py", "INLINE_TEMPLATE_LIMIT",
+        "AWS CloudFormation sets the inline template body size limit.",
+    ),
+    InternalLiteral(
+        "scripts/aws_target/quota_requests.py", "MAX_REQUESTED_VCPUS",
+        "Validate AWS response counts against both limits in cloud_gate.conf.",
+    ),
+    InternalLiteral(
+        "scripts/build_queue/admission_records.py", "FAMILY_LIMIT",
+        "Bound the process walk that identifies the caller.",
+    ),
+    InternalLiteral(
+        "scripts/build_queue/admission_wire.py", "ASSIGNMENT_MAX_BYTES",
+        "The assignment file format has a fixed size limit.",
+    ),
+    InternalLiteral(
+        "scripts/build_queue/admission_wire.py", "CLEANUP_STRING_MAX",
+        "The cleanup protocol uses this bound in its packet size calculation.",
+    ),
+    InternalLiteral(
+        "scripts/build_queue/admission_wire.py", "CLEANUP_STATUS_MAX",
+        "The cleanup protocol stores status in a signed 64-bit range.",
+    ),
+    TunableLiteral(
+        "scripts/build_queue/head_stall.py", "TIMES_TAIL_BYTES", "1 << 20",
+        "build_admission", "head_stall.times_tail_bytes", "# whole: 1..", _BUILD_TOOL_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/build_queue/memory_feed.py", "PROCESS_DEPTH_LIMIT",
+        "Bound the process walk that collects memory readings.",
+    ),
+    TunableLiteral(
+        "scripts/buildlog/disk.py", "MIN_OUTSIDE_DIRECTORY_BYTES", "1 << 30",
+        "buildlog", "disk.min_outside_directory_bytes", "# whole: 1..", _BUILD_TOOL_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/buildlog/index.py", "MARK_BYTES",
+        "Use a fixed sample to identify an unchanged log prefix.",
+    ),
+    InternalLiteral(
+        "scripts/buildlog/launches.py", "MARK_BYTES",
+        "Use a fixed sample for the saved launch scan cursor.",
+    ),
+    TunableLiteral(
+        "scripts/buildlog/report.py", "EDITED_CRATE_MAX_CRATES", "3",
+        "buildlog", "report.edited_crate_max_crates", "# whole: 1..", _BUILD_TOOL_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/direct/plan_history.py", "RATE_FACTOR_LIMIT", "2.0",
+        "direct", "plan_history.rate_factor_limit", "# range: 1..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/direct/progress_history.py", "BOARD_NOTE_CHARS", "72",
+        "direct", "board.note_chars", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/hooks/context_usage.py", "TAIL_BYTES", "512 * 1024",
+        "context_usage", "transcript.tail_bytes", "# whole: 1..", _MESSAGE_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/lib/python_startup/sitecustomize.py", "_GATE_ANCESTOR_LIMIT",
+        "Bound the gate ancestor scan during Python startup.",
+    ),
+    InternalLiteral(
+        "scripts/lib/python_startup/sitecustomize.py", "_GATE_ENVIRONMENT_LIMIT",
+        "Bound environment reads during Python startup.",
+    ),
+    TunableLiteral(
+        "scripts/mac_test/nextest_log.py", "SUMMARY_SCAN_BYTES", "8192",
+        "mac_test", "nextest.summary_scan_bytes", "# whole: 1..", _BUILD_TOOL_BATCH,
+    ),
+    ExternalLiteral(
+        "scripts/message/postmaster.py", "MAX_SAFE_INTEGER",
+        "JavaScript Number.MAX_SAFE_INTEGER limits exact integer exchange with the browser.",
+    ),
+    ExternalLiteral(
+        "scripts/message/send.py", "CLAUDE_RELAY_MAX_BYTES",
+        "Claude Code caps relay requests at one Mi UTF-16 code units.",
+    ),
+    ExternalLiteral(
+        "scripts/notify/pushover.py", "TITLE_MAX",
+        "The Pushover Message API sets the title character limit.",
+    ),
+    ExternalLiteral(
+        "scripts/notify/pushover.py", "MESSAGE_MAX",
+        "The Pushover Message API sets the message character limit.",
+    ),
+    TunableLiteral(
+        "scripts/notify/pushover.py", "SOURCE_MAX", "80",
+        "notify", "pushover.source_max_chars", "# whole: 1..", _MESSAGE_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/orphans/orphans.py", "MAXIMUM_CORPUS_FILE_BYTES", "2_000_000",
+        "orphans", "corpus.max_file_bytes", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    ExternalLiteral(
+        "scripts/prioritize/strip_generated.py", "PACKET_DATA_LIMIT",
+        "Git pkt-line sets the payload limit after the four-byte header.",
+    ),
+    TunableLiteral(
+        "scripts/production/gate.py", "RERUN_LIMIT", "8",
+        "gate", "rerun.max_failed_modules", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/production/gate.py", "NIGHTLY_TYPE_LINE_BYTES", "512",
+        "gate", "nightly.type_line_bytes", "# whole: 3..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/production/hand_made_limit.py", "TAIL_BYTES", "64 * 1024",
+        "cli", "hand_made.output_tail_bytes", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/production/hand_made_route.py", "CHUNK_BYTES",
+        "Copy command output in fixed chunks.",
+    ),
+    TunableLiteral(
+        "scripts/production/record_store.py", "_HISTORY_LIMIT", "128",
+        "production", "record_store.history_cache_entries", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/production/worker.py", "WORKER_HISTORY_BYTES", "64 * 1024",
+        "production", "worker.history_bytes", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/production/worker_capacity.py", "STOP_ATTEMPTS", "2",
+        "shutdown", "worker.stop_attempts", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_WORDS_LENGTH", "40_000",
+        "review_links", "new_item.max_words_chars", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_REQUEST_ID_LENGTH",
+        "Bound the request ID that identifies a submission.",
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_IMAGES", "4",
+        "review_links", "new_item.max_images", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_IMAGE_BYTES", "5 * 1024 * 1024",
+        "review_links", "new_item.max_image_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_TOTAL_IMAGE_BYTES", "12 * 1024 * 1024",
+        "review_links", "new_item.max_total_image_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_DATA_BYTES", "64 * 1024",
+        "review_links", "new_item.max_page_data_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_ROWS", "48",
+        "review_links", "new_item.max_page_rows", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_SECTIONS", "16",
+        "review_links", "new_item.max_page_sections", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_SECTION_ROWS", "128",
+        "review_links", "new_item.max_page_section_rows", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_BUG_PAGE_STATE_BYTES", "512 * 1024",
+        "review_links", "new_item.max_bug_page_state_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/review_links/new_item_dialog.py", "MAX_PAGE_URL_LENGTH", "8192",
+        "review_links", "new_item.max_page_url_chars", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/review_links/reply_tokens.py", "KEY_BYTES",
+        "Reply tokens use a fixed 32-byte key.",
+    ),
+    TunableLiteral(
+        "scripts/review_links/serve.py", "MAX_PAGE_CAPTURES", "8",
+        "review_links", "page_capture.max_active", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/screen_record/screen_record.py", "MAX_BYTES", "500_000_000",
+        "screen_record", "recording.max_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/screen_record/screen_record.py", "DIRECTORY_LIMIT", "2_147_483_648",
+        "screen_record", "retention.max_directory_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/shot_report/transcripts.py", "PARALLEL_SCAN_BYTES", "1_000_000_000",
+        "shot_report", "transcripts.parallel_scan_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/style/style_footprint.py", "FILE_CHANGED_LINE_LIMIT",
+        "Check 5 of docs/style_production.md fixes the size threshold.",
+    ),
+    TunableLiteral(
+        "scripts/style/style_ledger.py", "LOCK_ATTEMPTS", "3",
+        "style_ledger", "write.lock_attempts", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/test_times/module_cost.py", "OUTPUT_REPLAY_LIMIT_BYTES", "1024 * 1024",
+        "test_times", "module_cost.output_replay_limit_bytes", "# whole: 1..", _AWS_REVIEW_BATCH,
+    ),
+    ExternalLiteral(
+        "scripts/usage/collect.py", "MAX_SQLITE_INTEGER",
+        "SQLite INTEGER uses a signed 64-bit range.",
+    ),
+    InternalLiteral(
+        "scripts/usage/context_economy_cache.py", "ANCHOR_BYTES",
+        "Use a fixed sample to verify the cached scan position.",
+    ),
+    TunableLiteral(
+        "scripts/usage/waste_watch.py", "WAIT_SHARE_LIMIT", "0.10",
+        "waste_watch", "alert.wait_share_limit", "# range: 0..1", _MESSAGE_BATCH,
+    ),
+    TunableLiteral(
+        "scripts/whoami/codex_pacer.py", "MAX_STEP", "3.0",
+        "codex_pacer", "sampling.max_step_percent", "# range: 0..100", _MESSAGE_BATCH,
+    ),
+)
+
+
 DATA_FILES: tuple[FileException, ...] = tuple(
     FileException(path, "data, rule 10", ExceptionLifetime.PERMANENT)
     for path in (
@@ -56,14 +500,22 @@ PENDING_TOML_FILES: tuple[FileException, ...] = tuple(
     )
 )
 
+FORMAT_FILES: tuple[FileException, ...] = (
+    FileException(
+        "config/context_deferral.conf",
+        "A rule list with repeated kind: value rows that conf.read cannot read; its form waits for a showrunner decision.",
+        ExceptionLifetime.NO_REMOVAL_PHASE,
+    ),
+)
+
 KEY_FORM_FILES: tuple[FileException, ...] = (
     FileException("config/models.conf", "Catalog keys use model IDs.", ExceptionLifetime.PERMANENT),
 )
 
 KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
-    KeyException(f"config/{stem}.conf", key, reason, ExceptionLifetime.NO_REMOVAL_PHASE)
-    for stem, reason, keys in (
-        ("build_admission", "The build queue uses hyphenated program and repository names.", (
+    KeyException(f"config/{stem}.conf", key, reason, until)
+    for stem, reason, until, keys in (
+        ("build_admission", "The build queue uses hyphenated program and repository names.", ExceptionLifetime.PERMANENT, (
             "max_runs.natedev.cargo-liner",
             "peak_hold_seconds.test-affected",
             "program_first_peak_gib.hand-made",
@@ -71,7 +523,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "program_first_peak_gib.test-affected",
             "program_probe_arguments.rust-analyzer",
         )),
-        ("build_folders", "The folder rules use hyphenated repository and build names.", (
+        ("build_folders", "The folder rules use hyphenated repository and build names.", ExceptionLifetime.PERMANENT, (
             "patterns.legacy-stable",
             "patterns.legacy-unique",
             "prefixes.admit-sock",
@@ -106,7 +558,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "slots.Nates-MacBook-Pro-2023.cargo-liner.max",
             "slots.natedev.cargo-liner.max",
         )),
-        ("build_steps", "The build steps use hyphenated step names.", (
+        ("build_steps", "The build steps use hyphenated step names.", ExceptionLifetime.PERMANENT, (
             "about.between-steps",
             "about.build-step",
             "about.cargo-bench",
@@ -153,7 +605,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "owned.ci-default",
             "owned.showrunner-default",
         )),
-        ("buildlog", "The keys use uppercase names.", (
+        ("buildlog", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "DISK_WALK_HOUR",
             "DISK_WALK_MINUTES",
             "INDEX_READ_WAIT_SECONDS",
@@ -162,7 +614,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "INDEX_UNUSED_DAYS",
             "TOP_COST_RECENT_DAYS",
         )),
-        ("copies", "The allow list uses script paths as keys.", (
+        ("copies", "The allow list uses script paths as keys.", ExceptionLifetime.PERMANENT, (
             "allow.agents/shutdown.py",
             "allow.bevy_migration_plan/bevy_migration_ensure_repo.sh",
             "allow.copies/copies.py",
@@ -172,7 +624,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "allow.worktree/make_worktree.sh",
             "allow.worktree/worktrees.py",
         )),
-        ("detached_runs", "The keys use uppercase names.", (
+        ("detached_runs", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "LIVE_RUN_LIMIT",
             "PROCESS_CHECK_SECONDS",
             "RESULT_LINE_CHARS",
@@ -180,7 +632,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "RESULT_PUSH_RETRY_SECONDS",
             "RESULT_TEXT_CHARS",
         )),
-        ("direct", "The keys use uppercase names.", (
+        ("direct", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "ASTRA_AFTER_FAILED_FIXES",
             "CLAUDE_WORKER_POLL_SECS",
             "CLAUDE_WORKER_REGISTER_WAIT_SECS",
@@ -213,30 +665,30 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "WORKER_SETTLE_SECONDS",
             "WORKER_SPLIT_RATIO",
         )),
-        ("disks", "The drive labels use mount paths as keys.", (
+        ("disks", "The drive labels use mount paths as keys.", ExceptionLifetime.PERMANENT, (
             "name./",
             "name./build",
         )),
-        ("gate", "The keys use uppercase names.", (
+        ("gate", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "GATE_TIME_LIMIT_FACTOR",
         )),
-        ("mac_test", "The Mac test rules use repository names.", (
+        ("mac_test", "The Mac test rules use repository names.", ExceptionLifetime.PERMANENT, (
             "linux_only..claude",
             "linux_only.cargo-liner",
             "offload_exclude..claude",
         )),
-        ("merge_checkpoint", "The keys use uppercase names.", (
+        ("merge_checkpoint", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "MAC_PULL_RETRY_SECONDS",
             "MAC_PULL_TRIES",
         )),
-        ("merge_gate", "The keys use uppercase names.", (
+        ("merge_gate", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "GATE_TIME_LIMIT_FACTOR",
         )),
-        ("notify", "The keys use uppercase names.", (
+        ("notify", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "REVIEW_TIMEOUT_SECONDS",
             "TEXT_ASK_MINUTES",
         )),
-        ("producer_map", "The producer map uses project UUIDs as keys.", (
+        ("producer_map", "The producer map uses project UUIDs as keys.", ExceptionLifetime.PERMANENT, (
             "20b0427d-945b-4c40-bb24-a6bec83dd648",
             "439f9cfc-4aef-41ce-931a-c7abac39327e",
             "450ac99b-caed-49ba-8c6f-29016df421ab",
@@ -247,7 +699,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "e404d92e-8cc6-4714-952f-528c8de5cb7c",
             "e46c8ba2-9fde-4b71-b1ee-c1d87ad1f850",
         )),
-        ("production", "The keys use uppercase names.", (
+        ("production", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "PROMPT_ALERT_SECONDS",
             "RENAME_COMMAND_TIMEOUT_SECONDS",
             "RENAME_LIVE_WAIT_SECONDS",
@@ -258,7 +710,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "RETIRE_TERM_WAIT_SECONDS",
             "UNIT_ANOMALIES_TO",
         )),
-        ("shutdown", "The keys use uppercase names.", (
+        ("shutdown", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "HOLDER_EXIT_SECONDS",
             "KILL_GRACE_SECONDS",
             "MOVE_ALERT_REPEAT_MINUTES",
@@ -275,13 +727,13 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "STOP_GRACE_SECONDS",
             "UPKEEP_ROW_WAIT_SECONDS",
         )),
-        ("staff", "The keys use uppercase names.", (
+        ("staff", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "OPERATION_LOCK_SECONDS",
             "PRODUCER_FOLDER_ROOT",
             "PRODUCER_WORKSPACE",
             "REMOTE_SECONDS",
         )),
-        ("statusline", "The colors use role, background, and model names.", (
+        ("statusline", "The colors use role, background, and model names.", ExceptionLifetime.PERMANENT, (
             "background.codex-pair",
             "model.claude-fable-5-1",
             "model.claude-opus-5-5",
@@ -291,7 +743,7 @@ KEY_FORM_KEYS: tuple[KeyException, ...] = tuple(
             "role.astra-reviewer",
             "role.unit-director",
         )),
-        ("test_times", "The keys use uppercase names.", (
+        ("test_times", "The keys use uppercase names.", ExceptionLifetime.NO_REMOVAL_PHASE, (
             "COVERAGE_LEAF_PROGRAMS",
             "GATE_FAILURE_LOG_KIB",
             "MODULE_COST_LEFTOVER_S",
@@ -326,7 +778,7 @@ SECTION_FILES: tuple[FileException, ...] = (
 )
 
 COMMENT_LIMIT_FILES: tuple[FileException, ...] = tuple(
-    FileException(f"config/{stem}.conf", reason, ExceptionLifetime.NO_REMOVAL_PHASE)
+    FileException(f"config/{stem}.conf", reason, RemoveInPhase("Comments and limit lines for every setting"))
     for stem, reason in (
         ("aws_target", "Some numeric rows lack a limit line."),
         ("build_folders", "Some key blocks lack a comment."),

@@ -27,6 +27,7 @@
      Put a comment above the row to explain the difference.
    - Use the exact machine or host name, as in `enabled.mac-linux` and `slots.Nates-MacBook-Pro-2023.hana.max`.
      Keep the host override form `<key>.<short-host>`.
+   - Use the exact name for a repository, program, build step, path, model, ID, or other name that the code looks up.
    - Approved examples include `machines.window_days`, `enabled.mac`, and `slots.<host>.<repo>.max`.
 
 5. **Groups.** Use dots in keys and a plain comment to name a group of keys.
