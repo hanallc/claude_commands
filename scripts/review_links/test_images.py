@@ -1936,9 +1936,12 @@ class ImagesServerTests(ImagesFixture):
             if release.wait(TEST_HANG_GUARD_SECS):
                 recover(status)
 
+        def list_recovered(_ledger: Path) -> None:
+            completed.set()
+
         with (patch.object(change_page, 'recover_pending', side_effect=recover_after_first_read),
               patch.object(change_page.change_review, 'lists_directory', return_value=self.temporary / 'empty'),
-              patch.object(list_page, 'recover_pending', side_effect=completed.set),
+              patch.object(list_page, 'recover_pending', side_effect=list_recovered),
               serve.ReviewLinksServer(('127.0.0.1', 0), self.root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
             thread.start()

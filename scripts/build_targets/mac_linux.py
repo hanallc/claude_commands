@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
+from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
@@ -191,7 +192,7 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
                               assignment: PlacementAssignment) -> ProviderClaimReference:
     """Consume the launch permission of the gate assignment before the guest run starts.
 
-    The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
+    The gate process holds the permission until the gate ends.
     A refused consume, or a queue that does not answer, raises GuestTookNoRun: the guest starts nothing.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
@@ -212,7 +213,7 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
         raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
         raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
-    return reference
+    return permission.claim
 
 
 @dataclass(frozen=True)
@@ -369,6 +370,10 @@ def tree_mismatches(repo: Path, tree: str, files: Mapping[str, bytes]) -> list[s
 
 def run_start_line(attempt: str) -> str:
     return f'{RUN_START} {attempt}'
+
+
+def guest_start_line(attempt: str, folder: Path, home: Path) -> str:
+    return f'{run_start_line(attempt)} {json.dumps({"folder": str(folder), "home": str(home)})}'
 
 
 def run_locked_line(attempt: str) -> str:
@@ -1093,11 +1098,19 @@ def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: 
 
 
 def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
-                       deadline: float, timeout: float) -> None:
-    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+                       deadline: float, timeout: float, folder_payload: bytes = b'') -> None:
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
 
     assignment = dispatch.assignment
-    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
+    execution: execution_identity.CloudExecution | execution_identity.GuestExecution
+    if folder_payload:
+        fields = ledger.mapping(cast(object, json.loads(folder_payload)))
+        folder, home = fields.get('folder'), fields.get('home')
+        if not isinstance(folder, str) or not isinstance(home, str):
+            raise ValueError('the guest start report lacks a folder or home')
+        execution = execution_identity.GuestExecution(TARGET, assignment.attempt, folder, home)
+    else:
+        execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
     request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
                                    execution_identity.ObservedExecution(execution),
                                    code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
@@ -1112,8 +1125,8 @@ def warn_guest_report(reason: str) -> None:
 
 
 def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
-                       reports: ExitStack) -> None:
-    """Read the timeout before starting the report worker. Bound both waits."""
+                       reports: ExitStack, *, folder_payload: bytes) -> None:
+    """Start the report worker. Collect only reports from bare start lines."""
     started = monotonic()
     preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
     ready: Future[Callable[[], None]] = Future()
@@ -1132,18 +1145,27 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
                 try:
                     if monotonic() >= dispatch_deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
-                    report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+                    report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout, folder_payload=folder_payload)
                     if monotonic() >= deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
                 except Exception as error:
-                    result.set_exception(error)
+                    if folder_payload:
+                        warn_guest_report(str(error) or type(error).__name__)
+                    else:
+                        result.set_exception(error)
                 else:
                     result.set_result(None)
 
             worker = Thread(target=report, daemon=True)
             worker.start()
         except Exception as error:
-            ready.set_exception(error)
+            if folder_payload:
+                warn_guest_report(str(error) or type(error).__name__)
+            else:
+                ready.set_exception(error)
+            return
+
+        if folder_payload:
             return
 
         def collect_report() -> None:
@@ -1154,8 +1176,8 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
 
         ready.set_result(collect_report)
 
-    preparation = Thread(target=prepare, daemon=True)
     try:
+        preparation = Thread(target=prepare, daemon=True)
         preparation.start()
     except RuntimeError as error:
         warn_guest_report(str(error))
@@ -1171,7 +1193,8 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
         except Exception as error:
             warn_guest_report(str(error) or type(error).__name__)
 
-    _ = reports.callback(collect)
+    if not folder_payload:
+        _ = reports.callback(collect)
 
 
 def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
@@ -1194,10 +1217,11 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
 
     def observe_start(line: bytes) -> None:
         nonlocal started
-        if started or line.rstrip(b'\r') != start_line:
+        line = line.rstrip(b'\r')
+        if started or (line != start_line and not line.startswith(start_line + b' ')):
             return
         started = True
-        start_guest_report(armed, dispatch, deadline, reports)
+        start_guest_report(armed, dispatch, deadline, reports, folder_payload=line[len(start_line) + 1:])
 
     def read_reply(data: bytes) -> None:
         nonlocal last_counter
@@ -2002,6 +2026,7 @@ def run_guest(request_path: Path) -> int:
                 return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
+            environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
             reply = os.dup(1)
             try:
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
@@ -2073,8 +2098,8 @@ def run_copy(request_path: Path, reply: int) -> None:
     selection = request['selection']
     # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
     token = copies.COMMAND_LOCKS.set(descriptors)
-    # natedev reads this line: a failure before it lets natedev take the gate.
-    print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
+    home = Path(os.environ.pop('MAC_LINUX_GUEST_HOME'))
+    print(guest_start_line(request['attempt'], repo, home), file=sys.stderr, flush=True)
     try:
         with (build_folders.inherit_build_lock(RUN_LOCK_FD),
               os.fdopen(reply, 'w', encoding='utf-8') as output):

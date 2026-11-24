@@ -1,5 +1,6 @@
 """Identify assigned source and report execution evidence."""
 from dataclasses import dataclass
+from typing import Literal
 import uuid
 
 
@@ -36,7 +37,20 @@ class CloudExecution:
     attempt: str
 
 
-ExecutionIdentity = ProcessExecution | CloudExecution
+@dataclass(frozen=True)
+class GuestExecution:
+    """The guest start report names the assigned attempt and its execution folder."""
+    target: Literal["mac-linux"]
+    attempt: str
+    folder: str
+    home: str
+
+    def __post_init__(self) -> None:
+        if any(not path.startswith("/") or "\0" in path for path in (self.folder, self.home)):
+            raise ValueError("The guest start report needs absolute folder and home paths.")
+
+
+ExecutionIdentity = ProcessExecution | CloudExecution | GuestExecution
 
 
 @dataclass(frozen=True)
