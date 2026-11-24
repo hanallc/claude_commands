@@ -31,6 +31,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
+from uuid import uuid4
 
 from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
@@ -814,14 +815,11 @@ def merge(request: MergeRequest, *, batch_checkout: ResetBatchCheckout | KeepBat
 
 def undo_unpushed_merge(production: ProductionDocument, merge_head: str, before_merge_tip: str = "") -> None:
     checkout = production.checkout
-    head = good(git(checkout, "rev-parse", "HEAD"), "red")
-    if head != merge_head:
-        raise checkpoint_gate.Stop("red", "failed", f"HEAD moved from unpushed merge {merge_head}",
-                   "the showrunner will inspect the merge branch")
-    if git(checkout, "merge-base", "--is-ancestor", head,
+    if git(checkout, "merge-base", "--is-ancestor", merge_head,
            f"origin/{production.merge_branch}").returncode == 0:
         raise checkpoint_gate.Stop("red", "failed", "merge is already pushed; cannot reset it",
                    "the showrunner will inspect the merge branch")
+    _ = require_tested_tip(production, merge_head)
     _ = good(git(checkout, "reset", "--keep", before_merge_tip or f"{merge_head}^1"), "red")
 
 
@@ -861,7 +859,7 @@ def run_checkpoint_tests(production: ProductionDocument, paths: tuple[str, ...],
     """
     try:
         return checkpoint_gate.run_checkpoint_test_steps(production, paths, merge_tests, flakes, flaky_tests, log,
-                                                         ledger=ledger)
+                                                         ledger=ledger, merge_head=merge_head)
     except checkpoint_gate.RedCheckpointTests as error:
         undo_unpushed_merge(production, merge_head, before_merge_tip)
         if not base_tip:
@@ -880,15 +878,19 @@ def base_red_check(production: ProductionDocument, red: checkpoint_gate.RedCheck
     Main merges as it did in the tested tree. A main conflict leaves the red as the unit's red.
     """
     checkout = production.checkout
+    base = base_tip
     main = git(checkout, "rev-parse", "-q", "--verify", "refs/remotes/origin/main")
+    _ = require_tested_tip(production, base_tip)
     try:
         if main.returncode == 0:
             merge_main_commit(production, main.stdout.strip())
         base = good(git(checkout, "rev-parse", "HEAD"), "red")
-        split = checkpoint_gate.split_base_red(red, checkpoint_gate.test_steps(production, paths, merge_tests), log)
+        split = checkpoint_gate.split_base_red(red, checkpoint_gate.test_steps(production, paths, merge_tests), log,
+                                              merge_head=base)
     except MainConflict:
         return red
     finally:
+        _ = require_tested_tip(production, base)
         _ = good(git(checkout, "reset", "--keep", base_tip), "red")
     if not split.base:
         return red
@@ -902,14 +904,17 @@ def base_red_check(production: ProductionDocument, red: checkpoint_gate.RedCheck
                                 + "and runs your checkpoint again, so send nothing")
 
 
-def undo_failed_push(production: ProductionDocument, old_origin: str, before_merge_tip: str) -> bool:
+def undo_failed_push(production: ProductionDocument, old_origin: str, before_merge_tip: str,
+                     expected_tip: str) -> bool:
     """Return whether Git restored the original tip."""
     checkout = production.checkout
     if git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        _ = require_tested_tip(production, expected_tip)
         _ = good(git(checkout, "merge", "--abort"), "push")
     if old_origin and not push_origin_matches(production, old_origin):
         return False
-    _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
+    if require_tested_tip(production, expected_tip, restored_tip=before_merge_tip) != before_merge_tip:
+        _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
     return True
 
 
@@ -1014,26 +1019,63 @@ def merge_main_commit(production: ProductionDocument, main_commit: str, *,
         batch_checkout.finish_merge(good(git(checkout, "rev-parse", "HEAD"), "test"))
 
 
+class TestedTipMoved(checkpoint_gate.Stop):
+    """Preserve the checkout when its tip moves during testing."""
+
+    def __init__(self, checkout: Path, tested_tip: str) -> None:
+        super().__init__("test", "cancelled",
+                         f"publication cancelled because the tree changed after testing {tested_tip} in {checkout}",
+                         "resubmit this checkpoint after your edits are done")
+
+
+def require_tested_tip(production: ProductionDocument, tested_tip: str, *, restored_tip: str = "") -> str:
+    ref = f"refs/heads/{production.merge_branch}"
+    head = git(production.checkout, "symbolic-ref", "-q", "HEAD")
+    if head.returncode or head.stdout.strip() != ref:
+        raise TestedTipMoved(production.checkout, tested_tip)
+    tips = good(git(production.checkout, "rev-parse", "--revs-only", "HEAD", ref), "test").splitlines()
+    if tips == [tested_tip, tested_tip]:
+        return tested_tip
+    if restored_tip and tips == [restored_tip, restored_tip]:
+        return restored_tip
+    raise TestedTipMoved(production.checkout, tested_tip)
+
+
+@dataclass
+class PushRollback:
+    expected_tip: str
+
+
 @contextmanager
 def push_rollback(production: ProductionDocument, before_merge_tip: str, *,
-                  batch_checkout: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT) -> Generator[None]:
+                  expected_tip: str = "",
+                  batch_checkout: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT) -> Generator[PushRollback]:
     """Restore the original tip if preparation or publication fails before the push."""
     ref = f"refs/remotes/origin/{production.merge_branch}"
     old_origin = ""
+    if before_merge_tip and isinstance(batch_checkout, KeepBatchCheckout) and not expected_tip:
+        expected_tip = good(git(production.checkout, "rev-parse", "HEAD"), "push")
+    rollback = PushRollback(expected_tip)
     try:
         _ = good(git(production.checkout, "fetch", "origin", f"+refs/heads/{production.merge_branch}:{ref}"), "push")
         old_origin = good(git(production.checkout, "rev-parse", ref), "push")
         if isinstance(batch_checkout, ResetBatchCheckout):
             batch_checkout.published_tip = old_origin
-        yield
+        yield rollback
     except (checkpoint_gate.Stop, OSError, ValueError) as error:
-        if before_merge_tip and isinstance(batch_checkout, KeepBatchCheckout):
+        if (before_merge_tip and isinstance(batch_checkout, KeepBatchCheckout)
+                and not isinstance(error, TestedTipMoved)):
+            tip = rollback.expected_tip
+            if isinstance(error, ValidationPushFailed) and error.formatter_tip:
+                tip = error.formatter_tip
             try:
-                rollback_completed = undo_failed_push(production, old_origin, before_merge_tip)
-            except (checkpoint_gate.Stop, OSError, ValueError) as rollback:
+                rollback_completed = undo_failed_push(production, old_origin, before_merge_tip, tip)
+            except TestedTipMoved:
+                raise
+            except (checkpoint_gate.Stop, OSError, ValueError) as rollback_error:
                 if isinstance(error, ValidationPushFailed):
-                    detail = " ".join(str(rollback).splitlines())
-                    raise ValidationPushFailed(f"{error.detail} — rollback failed: {detail}", frozenset()) from rollback
+                    detail = " ".join(str(rollback_error).splitlines())
+                    raise ValidationPushFailed(f"{error.detail} — rollback failed: {detail}", frozenset()) from rollback_error
                 raise
             if isinstance(error, ValidationPushFailed):
                 error.rollback_completed = rollback_completed
@@ -1051,12 +1093,13 @@ def prepare_checkpoint(production: ProductionDocument, merge_head: str, *, publi
     return tuple(output.splitlines())
 
 
-def push_git(production: ProductionDocument, may_undo: bool) -> str:
+def push_git(production: ProductionDocument, tested_tip: str | bool) -> str:
+    """Push a fixed commit. A boolean selects rollback for a direct call."""
     checkout = production.checkout
-    before_merge_tip = good(git(checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
-    with push_rollback(production, before_merge_tip):
-        tip = good(git(checkout, "rev-parse", "HEAD"), "push")
-        _ = good(git(checkout, "push", "origin", production.merge_branch), "push")
+    tip = tested_tip if isinstance(tested_tip, str) else good(git(checkout, "rev-parse", "HEAD"), "push")
+    before_merge_tip = good(git(checkout, "rev-parse", f"{tip}^1"), "push") if tested_tip is True else ""
+    with push_rollback(production, before_merge_tip, expected_tip=tip):
+        _ = good(git(checkout, "push", "origin", f"{tip}:refs/heads/{production.merge_branch}"), "push")
     checkpoint_gate.report("push", "ok", f"{production.merge_branch} pushed at {tip}")
     end_pushed_worktrees(production)
     return tip
@@ -1082,15 +1125,18 @@ def settings_commits_only(checkout: Path, main_commit: str, tested_tip: str) -> 
 @contextmanager
 def tested_main_push(production: ProductionDocument, tested_tip: str,
                      retest: Callable[[tuple[str, ...], str], None], before_merge_tip: str,
-                     *, follow_main: bool = True,
+                     *, follow_main: bool = True, checkout_tip: str = "",
                      batch_checkout: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT) -> Generator[str]:
     """Hold the main lock through retests, the push, and main promotion.
 
-    A main move made only of settings commits merges with no retest (nate, 2026-11-14).
+    A main move with only settings commits needs no retest when the checkout is at the tested tip.
+    A resumed promotion can start with a local tip that differs from the published tip.
     """
     checkout = production.checkout
+    expected_tip = checkout_tip or tested_tip
     with ExitStack() as publication_lock:
-        with push_rollback(production, before_merge_tip, batch_checkout=batch_checkout):
+        with push_rollback(production, before_merge_tip, expected_tip=expected_tip,
+                           batch_checkout=batch_checkout) as rollback:
             _ = publication_lock.enter_context(
                 main_push_lock.main_push_lock(checkout, "merge_checkpoint.tested_main_push"))
             while follow_main:
@@ -1098,9 +1144,11 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
                 main_commit = good(git(checkout, "rev-parse", "refs/remotes/origin/main"), "push")
                 if git(checkout, "merge-base", "--is-ancestor", main_commit, tested_tip).returncode == 0:
                     break
-                settings_only = settings_commits_only(checkout, main_commit, tested_tip)
+                _ = require_tested_tip(production, expected_tip)
+                settings_only = expected_tip == tested_tip and settings_commits_only(checkout, main_commit, tested_tip)
                 merge_main_commit(production, main_commit, batch_checkout=batch_checkout)
                 tip = good(git(checkout, "rev-parse", "HEAD"), "test")
+                rollback.expected_tip = tip
                 if isinstance(batch_checkout, ResetBatchCheckout):
                     batch_checkout.expected_tip = tip
                 if settings_only:
@@ -1108,7 +1156,8 @@ def tested_main_push(production: ProductionDocument, tested_tip: str,
                 else:
                     paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())
                     retest(paths, tip)
-                tested_tip = tip
+                tested_tip = expected_tip = tip
+            _ = require_tested_tip(production, expected_tip)
             require_closed_batch_merge(checkout, batch_checkout)
         yield tested_tip
 
@@ -1124,7 +1173,7 @@ def refresh_pushed_tip(production: ProductionDocument, tip: str) -> str:
                              test_tip, listed_names(lines, "Known flaky tests"), before_merge_tip=tip)
 
     with tested_main_push(production, tip, retest, tip) as tested_tip:
-        return push_git(production, False) if tested_tip != tip else tip
+        return push_git(production, tested_tip) if tested_tip != tip else tip
 
 
 def pushed_state(production: ProductionDocument, checkpoint: str) -> PushedTip | NotYetPushed:
@@ -1144,6 +1193,7 @@ class ValidationPushFailed(checkpoint_gate.Stop):
         super().__init__("push", "failed", detail, "the showrunner will inspect the failed command")
         self.paths: frozenset[Path] = paths
         self.rollback_completed: bool = False
+        self.formatter_tip: str = ""
 
 
 def validation_push_failure(checkout: Path, log: Path, status: int,
@@ -1200,8 +1250,25 @@ def validation_push_failure(checkout: Path, log: Path, status: int,
     return ValidationPushFailed(f"{cause} — log {log}", frozenset(paths))
 
 
+def validation_formatter_tip(production: ProductionDocument, start_tip: str, action: str) -> str:
+    """Identify the last formatter commit when this validator owns every ref update after the start."""
+    ref = f"refs/heads/{production.merge_branch}"
+    result = git(production.checkout, "reflog", "show", "--format=%H%x09%gs", ref)
+    if result.returncode:
+        return ""
+    tip = ""
+    for entry in result.stdout.splitlines():
+        commit, _, subject = entry.partition("\t")
+        if commit == start_tip:
+            return tip
+        if not subject.startswith(action + ": "):
+            break
+        tip = tip or commit
+    return ""
+
+
 def push_validate(production: ProductionDocument, fix_commit: str, may_undo: bool, log: Path,
-                  cancel_prior: bool = False) -> str:
+                  cancel_prior: bool = False, *, tested_tip: str = "") -> str:
     script = checkpoint_gate.tool("validate_and_push.sh", Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh",
                   "MERGE_CHECKPOINT_VALIDATE_AND_PUSH")
     command = [script, "--quick", "--to", production.merge_branch,
@@ -1209,19 +1276,26 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
     if cancel_prior:
         command.append("--cancel-prior")
     before_merge_tip = good(git(production.checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
-    with push_rollback(production, before_merge_tip):
+    with push_rollback(production, before_merge_tip, expected_tip=tested_tip) as rollback:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a+", encoding="utf-8", errors="replace") as output:
             _ = output.write("\n=== validate_and_push.sh ===\n")
             output.flush()
             attempt = output.tell()
-            with subprocess.Popen(command, cwd=production.checkout,
-                                  env=main_push_lock.held_environment(production.checkout),
+            if tested_tip:
+                _ = require_tested_tip(production, tested_tip)
+            action = f"checkpoint validation {uuid4().hex}"
+            environment = main_push_lock.held_environment(production.checkout)
+            environment["GIT_REFLOG_ACTION"] = action
+            with subprocess.Popen(command, cwd=production.checkout, env=environment,
                                   stdout=output, stderr=subprocess.STDOUT) as process:
                 status = process.wait()
             if status:
                 _ = output.seek(attempt)
-                raise validation_push_failure(production.checkout, log, status, output)
+                error = validation_push_failure(production.checkout, log, status, output)
+                if rollback.expected_tip:
+                    error.formatter_tip = validation_formatter_tip(production, rollback.expected_tip, action)
+                raise error
     tip = good(git(production.checkout, "rev-parse", "HEAD"), "push")
     checkpoint_gate.report("push", "ok", f"validated and pushed {tip}")
     end_pushed_worktrees(production)
@@ -1643,13 +1717,14 @@ def check_publication_sources(request: MergeRequest, commits: list[change_review
                    "The staff record is unreadable; nothing was pushed; repair the staff record and send the checkpoint again.") from error
 
 
-def publish_checkpoint(request: MergeRequest, log_folder: Path) -> str:
+def publish_checkpoint(request: MergeRequest, log_folder: Path, tested_tip: str) -> str:
     """Publish the tested tip through the production's selected push command."""
     if isinstance(request.push, GitPush):
-        return push_git(request.production, False)
+        return push_git(request.production, tested_tip)
     return push_validate(request.production,
                          f"ci({request.production.name}): format fixes after {request.unit.name} phase {request.phase}",
-                         False, log_folder / f"merge_{request.commit[:7]}_push.log", request.cancel_prior)
+                         False, log_folder / f"merge_{request.commit[:7]}_push.log", request.cancel_prior,
+                         tested_tip=tested_tip)
 
 
 def finish_checkpoint(request: MergeRequest, merge_head: str, tests_green: str) -> None:
@@ -1795,7 +1870,8 @@ def run(request: MergeRequest, *, push_scope: StandaloneCheckpointPush | Resumed
                                 return changed_paths(row, base)
 
                             batch_checkout.expected_tip = test_tip
-                            tests_green = run_batch_tests(request, paths, batch_rows, paths_for_row, batch_log)
+                            tests_green = run_batch_tests(request, paths, batch_rows, paths_for_row, batch_log,
+                                                          merge_head=test_tip)
                         elif isinstance(pushed, PushedTip):
                             tests_green = checkpoint_tests(request.production, paths, request.commit, request.merge_tests,
                                                            request.flakes, request.scratch, test_tip, request.flaky_tests,
@@ -1827,20 +1903,20 @@ def run(request: MergeRequest, *, push_scope: StandaloneCheckpointPush | Resumed
                     rollback_tip = pushed.tip if isinstance(pushed, PushedTip) else before_merge_tip
                     with tested_main_push(request.production, published_tip, retest, rollback_tip,
                                           follow_main=not isinstance(pushed, PushedTip) or not promotion_done.exists(),
-                                          batch_checkout=batch_checkout) as tested_tip:
+                                          checkout_tip=test_tip, batch_checkout=batch_checkout) as tested_tip:
                         batch_checkout = KEEP_BATCH_CHECKOUT
                         if isinstance(pushed, PushedTip):
                             tip = pushed.tip
                             if tested_tip != tip:
-                                tip = push_git(request.production, False)
+                                tip = push_git(request.production, tested_tip)
                             checkpoint_gate.report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")
                             end_pushed_worktrees(request.production)
                         else:
                             push_base = before_merge_tip if not already else ""
                             if isinstance(push_scope, ResumedBatchPush):
                                 push_base = push_scope.before_batch_tip
-                            with push_rollback(request.production, push_base):
-                                tip = publish_checkpoint(request, request.scratch)
+                            with push_rollback(request.production, push_base, expected_tip=tested_tip):
+                                tip = publish_checkpoint(request, request.scratch, tested_tip)
                         if request.bump:
                             paths = tuple(good(git(request.production.checkout, "diff", "--name-only",
                                                    before_merge_tip, tip), "test").splitlines())
@@ -2002,7 +2078,7 @@ def selected_commands(steps: Iterable[checkpoint_gate.CheckpointTestStep]) -> fr
 
 def run_batch_tests(reference: MergeRequest, paths: tuple[str, ...],
                     requests: Iterable[MergeRequest], paths_for_row: Callable[[MergeRequest], tuple[str, ...]],
-                    log: Path) -> str:
+                    log: Path, *, merge_head: str) -> str:
     steps = checkpoint_gate.test_steps(reference.production, paths, reference.merge_tests)
     row_commands: list[tuple[MergeRequest, frozenset[CheckpointCommand] | UnknownRowCommands]] = []
     for row in requests:
@@ -2015,7 +2091,8 @@ def run_batch_tests(reference: MergeRequest, paths: tuple[str, ...],
         row_commands.append((row, commands))
     try:
         return checkpoint_gate.run_test_steps(reference.parent_production, steps, reference.flakes,
-                                              reference.flaky_tests, log, retry_failed_steps=False)
+                                              reference.flaky_tests, log, retry_failed_steps=False,
+                                              merge_head=merge_head)
     except checkpoint_gate.RedCheckpointTests as error:
         red_commands = selected_commands(red.step for red in error.red)
         notices: list[BatchStopNotice] = []
@@ -2038,7 +2115,7 @@ def finish_batch_stop(stop: checkpoint_gate.Stop, notices: Iterable[BatchStopNot
                       record_results: bool = True) -> int:
     """Attempt rollback, send all notices, and record the results."""
     rollback_warnings: list[str] = []
-    if isinstance(rollback, ResetBatchCheckout):
+    if isinstance(rollback, ResetBatchCheckout) and not isinstance(stop, TestedTipMoved):
         try:
             reset_batch(rollback, rollback_warnings)
         except (checkpoint_gate.Stop, OSError, ValueError) as error:
@@ -2113,7 +2190,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], log: Path,
                                                             item.request.unit.name, item.request.commit))
                 batch_checkout.expected_tip = test_tip
                 tests_green = run_batch_tests(reference, tuple(sorted(test_paths)), requests,
-                                              lambda row: paths_by_commit[row.commit], log)
+                                              lambda row: paths_by_commit[row.commit], log, merge_head=test_tip)
 
         remote = f"refs/remotes/origin/{shared.production.merge_branch}"
         _ = good(git(shared.production.checkout, "fetch", "origin",
@@ -2125,10 +2202,11 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], log: Path,
         retest(paths, test_tip)
         try:
             try:
-                with tested_main_push(shared.production, test_tip, retest, start_tip, batch_checkout=batch_checkout):
-                    with push_rollback(shared.production, start_tip):
+                with tested_main_push(shared.production, test_tip, retest, start_tip,
+                                      batch_checkout=batch_checkout) as tested_tip:
+                    with push_rollback(shared.production, start_tip, expected_tip=tested_tip):
                         publication_started = True
-                        tip = publish_checkpoint(shared, log.parent)
+                        tip = publish_checkpoint(shared, log.parent, tested_tip)
                     resume_record.retire()
                     promote(shared, tip, local_only=True)
                     for item in items:
@@ -2557,9 +2635,11 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         try:
             follow_main = isinstance(request.promotion, production_doc.PromoteTo) and not checkpoint_step_record(
                 checkout, delivery.merge_head, "handoff-promotion").exists()
-            with tested_main_push(request.production, tip, retest, tip, follow_main=follow_main) as tested_tip:
+            checkout_tip = good(git(checkout, "rev-parse", "HEAD"), "test")
+            with tested_main_push(request.production, tip, retest, tip, follow_main=follow_main,
+                                  checkout_tip=checkout_tip) as tested_tip:
                 if tested_tip != tip:
-                    tip = push_git(request.production, False)
+                    tip = push_git(request.production, tested_tip)
                 promote_handoff(request, delivery.merge_head, tip)
             finish_handoff_promotion(request, delivery.merge_head)
         finally:
@@ -2588,28 +2668,34 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         merge_head = delivery.merge_head
         if pending_tests.exists():
             paths = merge_paths(checkout, f"{merge_head}^1", checkpoint)
-    if isinstance(delivery, NotMerged) or pending_tests.exists():
+    needs_tests = isinstance(delivery, NotMerged) or pending_tests.exists()
+    if needs_tests:
         paths = prepare_checkpoint(request.production, merge_head)
-        test_tip = good(git(checkout, "rev-parse", "HEAD"), "test")
+    test_tip = good(git(checkout, "rev-parse", "HEAD"), "test")
+    if needs_tests:
         before_merge_tip = good(git(checkout, "rev-parse", f"{merge_head}^1"), "merge")
         retest(paths, test_tip)
-        pending_tests.unlink()
     tip = ""
     try:
-        test_tip = good(git(checkout, "rev-parse", "HEAD"), "test")
         before_merge_tip = good(git(checkout, "rev-parse", f"{merge_head}^1"), "push")
-        with tested_main_push(request.production, test_tip, retest, before_merge_tip):
-            with push_rollback(request.production, before_merge_tip if isinstance(delivery, NotMerged) else ""):
+        with tested_main_push(request.production, test_tip, retest, before_merge_tip) as tested_tip:
+            if needs_tests:
+                pending_tests.unlink()
+            with push_rollback(request.production, before_merge_tip if isinstance(delivery, NotMerged) else "",
+                               expected_tip=tested_tip):
                 if isinstance(request.push, GitPush):
-                    tip = push_git(request.production, False)
+                    tip = push_git(request.production, tested_tip)
                 else:
                     tip = push_validate(request.production,
                                         f"ci({request.production.name}): format fixes after {request.child.name} style hand-off",
-                                        False, request.scratch / f"merge_{checkpoint[:7]}_push.log")
+                                        False, request.scratch / f"merge_{checkpoint[:7]}_push.log", tested_tip=tested_tip)
             if isinstance(request.promotion, production_doc.NoPromotion):
                 promote(request, tip)
             promote_handoff(request, merge_head, tip)
         finish_handoff_promotion(request, merge_head)
+    except TestedTipMoved:
+        pending_tests.touch()
+        raise
     finally:
         if tip:
             record_handoff_publication(request, merge_head, tip)

@@ -90,11 +90,13 @@ class AdmissionSourceCopy:
 
 ADMISSION_SOURCE_COPIES: ContextVar[tuple[AdmissionSourceCopy, ...]] = ContextVar("admission_source_copies", default=())
 
+COPY_ERROR_STATUS = 2
+
 
 class CopyError(Exception):
     """An invalid request or an unavailable checkout."""
 
-    exit_code: int = 2
+    exit_code: int = COPY_ERROR_STATUS
 
 
 # Git's exit status when `git remote get-url` names no configured remote.
@@ -2683,6 +2685,12 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             if tool in (("cargo",), ("cargo-nextest",)) or isinstance(command_job(command), StepJob):
                 selection = PublicationSelection.AVAILABLE
         publish_files(tree, args.publish, before, command_exit, selection=selection, captured=captured)
+        if (command_exit in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
+                and command_program(command) in GATE_SCRIPTS):
+            try:
+                scope.close()
+            except Exception as error:
+                print(f"Gate cleanup failed. {error}", file=sys.stderr, flush=True)
         return command_exit
 
 
@@ -3138,7 +3146,7 @@ def main(argv: list[str] | None = None) -> int:
     except (CopyError, first_step.FirstStepRefused, OSError, scratch.ScratchError, build_folders.InvalidFolderForm,
             SlotGitFailure, conf.Unusable, subprocess.SubprocessError) as error:
         print(f"copies: {error}", file=sys.stderr)
-        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else 2
+        return error.exit_code if isinstance(error, (CopyError, first_step.FirstStepRefused)) else COPY_ERROR_STATUS
     return 0
 
 

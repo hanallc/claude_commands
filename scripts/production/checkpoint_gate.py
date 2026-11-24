@@ -125,19 +125,48 @@ def checkpoint_gate_targets(command: Sequence[str], folder: Path) -> tuple[str, 
         raise Stop("test", "blocked", reason, reason) from error
 
 
-def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
+def gate_program_start(command: Sequence[str]) -> int:
+    """Skip the env prefix and its assignments before identifying a gate."""
+    if not command or Path(command[0]).name != "env":
+        return 0
+    start = 1
+    while start < len(command) and "=" in command[start]:
+        start += 1
+    return start
+
+
+def gate_copy_command(command: Sequence[str]) -> list[str]:
+    """Point the gate at the copy that copies.py prepares."""
+    arguments = list(command)
+    for index, word in enumerate(command):
+        option, equals, _ = word.partition("=")
+        if option in ("--checkout", "--repo"):
+            if equals:
+                arguments[index] = f"{option}={{tree}}"
+            elif index + 1 < len(arguments):
+                arguments[index + 1] = "{tree}"
+    return arguments
+
+
+def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
+                     raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
     submitted = command
-    targets = checkpoint_gate_targets(command, folder)
-    if targets:
-        scripts = Path(__file__).resolve().parents[1]
+    scripts = Path(__file__).resolve().parents[1]
+    start = gate_program_start(command)
+    use_copy = bool(merge_head) and command_program(command[start:]) in GATE_SCRIPTS
+    if use_copy:
+        submitted = [*command[:start], str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "run",
+                     "--repo", str(folder.resolve()), "--commit", merge_head, "--",
+                     *gate_copy_command(command[start:])]
+    elif targets := checkpoint_gate_targets(command, folder):
         submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
                      "--repo", str(folder.resolve()), "--targets", ",".join(targets),
                      *(word for fd in locks for word in ("--lease-fd", str(fd))), "--", *command]
     try:
         return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)
     except OSError as error:
-        if raise_start_errors:
+        if raise_start_errors and not use_copy:
             raise
         return subprocess.CompletedProcess(command, 127, "", f"{error}\n")
 
@@ -190,7 +219,8 @@ class SplitRed(NamedTuple):
     base: tuple[RedStep, ...]
 
 
-def split_base_red(red: RedCheckpointTests, base_steps: Sequence[CheckpointTestStep], log: Path) -> SplitRed:
+def split_base_red(red: RedCheckpointTests, base_steps: Sequence[CheckpointTestStep], log: Path, *,
+                   merge_head: str) -> SplitRed:
     """Run each red command on the checked-out base, limited to its red names, and split the names.
 
     A command that the base does not select, such as a package the checkpoint adds, stays the unit's red.
@@ -207,7 +237,8 @@ def split_base_red(red: RedCheckpointTests, base_steps: Sequence[CheckpointTestS
                 unit.append(red_step)
                 continue
             try:
-                result = run_test_command(narrowed(red_step).command, step.folder, raise_start_errors=True)
+                result = run_test_command(narrowed(red_step).command, step.folder, merge_head=merge_head,
+                                          raise_start_errors=True)
             except OSError as error:
                 # A command that cannot start on the base, such as a package the merge adds, is the unit's red.
                 _ = output.write(f"{step.label.replace(' ', '_')}_BASE_EXIT=not started: {error}\n")
@@ -216,7 +247,7 @@ def split_base_red(red: RedCheckpointTests, base_steps: Sequence[CheckpointTestS
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{step.label.replace(' ', '_')}_BASE_EXIT={result.returncode}\n")
             output.flush()
-            stop_test_without_result(step, result, log)
+            stop_test_without_result(step, result, log, merge_head=merge_head)
             if test_passed(result):
                 unit.append(red_step)
             elif not red_step.names:
@@ -234,36 +265,43 @@ def red_labels(red: Sequence[RedStep]) -> str:
     return ", ".join(item.step.label + (f" ({', '.join(sorted(item.names))})" if item.names else "") for item in red)
 
 
-def stop_test_without_result(step: CheckpointTestStep, result: subprocess.CompletedProcess[str], log: Path) -> None:
+def stop_test_without_result(step: CheckpointTestStep, result: subprocess.CompletedProcess[str], log: Path, *,
+                             merge_head: str) -> None:
     if result.returncode == TREE_CHANGED_STATUS:
         raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
-    if (result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
-            and command_program(step.command) in GATE_SCRIPTS):
+    if command_program(step.command[gate_program_start(step.command):]) not in GATE_SCRIPTS:
+        return
+    if result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
         raise Stop("test", "blocked", f"{step.label} ended with gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
+    if merge_head and result.returncode in (copies.COPY_ERROR_STATUS, os.EX_TEMPFAIL, 127):
+        raise Stop("test", "blocked", f"{step.label} could not start. Copy status {result.returncode}. Log {log}",
+                   f"Check the gate copy and placement in {log}.")
 
 
 def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, ...],
                               merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str],
                               flaky_tests: frozenset[str], log: Path, *,
-                              ledger: ProductionDocument | None = None) -> str:
+                              ledger: ProductionDocument | None = None, merge_head: str = "") -> str:
     """Select checkpoint commands and run them with the flake rules."""
-    return run_test_steps(ledger or production, test_steps(production, paths, merge_tests), flakes, flaky_tests, log)
+    return run_test_steps(ledger or production, test_steps(production, paths, merge_tests), flakes, flaky_tests, log,
+                          merge_head=merge_head)
 
 
 def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTestStep], flakes: frozenset[str],
-                   flaky_tests: frozenset[str], log: Path, *, retry_failed_steps: bool = True) -> str:
+                   flaky_tests: frozenset[str], log: Path, *, retry_failed_steps: bool = True,
+                   merge_head: str = "") -> str:
     """Run checkpoint tests with the caller's retry policy."""
     log.parent.mkdir(parents=True, exist_ok=True)
     failed: list[tuple[CheckpointTestStep, frozenset[str], frozenset[str]]] = []
     with log.open("a", encoding="utf-8") as output:
         for count, step in enumerate(steps, 1):
-            result = run_test_command(step.command, step.folder)
+            result = run_test_command(step.command, step.folder, merge_head=merge_head)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{step.label.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
-            stop_test_without_result(step, result, log)
+            stop_test_without_result(step, result, log, merge_head=merge_head)
             if not test_passed(result):
                 output_text = result.stdout + result.stderr
                 names = red_names(step.command, output_text)
@@ -277,10 +315,10 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
         # Run only the known flaky tests when they cause the failure.
         alone = bool(tests) and tests <= flaky_tests
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, folder)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder, merge_head=merge_head)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
-        stop_test_without_result(step, result, log)
+        stop_test_without_result(step, result, log, merge_head=merge_head)
         package = name.removeprefix("package ")
         if test_passed(result) and (alone or package in flakes):
             note = (f"known flaky tests {', '.join(sorted(tests))}: red in {name}, green alone" if alone
