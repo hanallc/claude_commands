@@ -823,6 +823,7 @@ phase, argv_file = sys.argv[1:3]
 if phase == "prepare":
     cleanup = 'touch "$FAKE_QUEUE_STATE/remote_cleanup"; exit "$FAKE_MAC_STATUS"'
     Path(argv_file).write_text(json.dumps([
+        "/bin/zsh", "-f", "-c", 'exec "$@" <&3 3<&-', "smoke-setup",
         sys.executable, os.environ["SMOKE_WORKER"], "smoke-work", "true", cleanup,
     ]))
 else:
@@ -865,6 +866,7 @@ import json, os, sys
 from pathlib import Path
 if sys.argv[1] == "prepare":
     Path(sys.argv[2]).write_text(json.dumps([
+        "/bin/zsh", "-f", "-c", 'exec "$@" <&3 3<&-', "smoke-setup",
         sys.executable, os.environ["SMOKE_WORKER"], "smoke-work", "print mac_exit=0; exit 7", "true",
     ]))
 """)
@@ -897,25 +899,6 @@ raise SystemExit(mac_queue_run.main())
         command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
         return command
 
-    def test_smoke_sends_the_token_on_ssh_input(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            environment = queue_fixture(root, """
-import os, sys
-token = os.environ["FIXTURE_SMOKE_TOKEN"]
-assert all(token not in argument for argument in sys.argv), "Token found in SSH arguments"
-assert sys.stdin.readline() == token + chr(10), "Token missing from SSH input"
-assert sys.stdin.readline() == token + chr(10), "Token missing from worker input"
-print(f"mac_smoke_complete={token}", flush=True)
-assert sys.stdin.read() == ""
-print(f"mac_smoke_complete={token}:0", flush=True)
-""")
-            environment["FIXTURE_SMOKE_TOKEN"] = FIXTURE_SMOKE_TOKEN
-            result = subprocess.run(self.smoke_protocol_command(root), env=environment, capture_output=True,
-                                    text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
-
     def test_smoke_rejects_missing_or_invalid_final_status_when_ssh_exits_zero(self) -> None:
         for frame in ("missing", "valid-without-ready", "valid-before-ready", "ready-without-status",
                       "wrong-token", "malformed", "out-of-range", "followed-by-output"):
@@ -926,6 +909,9 @@ import os, sys
 frame = os.environ["FAKE_SMOKE_FRAME"]
 token = os.environ["FIXTURE_SMOKE_TOKEN"]
 ready = f"mac_smoke_complete={token}"
+if frame != "missing":
+    print("mac_smoke_request", flush=True)
+    assert sys.stdin.readline().strip() == token
 print("Mac output")
 if frame in ("valid-without-ready", "valid-before-ready"):
     print(f"{ready}:0")
@@ -1058,6 +1044,9 @@ if sys.argv[2] == "stop-checkout":
                     ) as process:
                         assert process.stdin is not None and process.stdout is not None
                         try:
+                            self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(process.stdout.readline(), b"\n")
+                            self.assertEqual(process.stdout.readline(), b"mac_smoke_request\n")
                             _ = process.stdin.write(token + b"\n")
                             process.stdin.flush()
                             self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0])

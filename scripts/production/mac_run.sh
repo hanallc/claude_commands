@@ -220,14 +220,16 @@ if ref := env["MAC_RUN_BUNDLE_REF"]:
     bundle = quote(env["MAC_RUN_BUNDLE"])
     prepare = (
         f"git -C {source} fetch -q --no-tags --no-write-fetch-head -- {bundle} {quote(ref)} </dev/null\n"
-        + "status=$?\n"
+        + "fetch_status=$?\n"
         + f"rm -f -- {bundle}\n"
-        + "(( status == 0 )) || exit 5\n"
+        + "(( fetch_status == 0 )) || exit 5\n"
     )
 command = [
     "/bin/zsh", "-c",
+    # Restore SSH input after shell startup and bundle setup.
     prepare + f"exec{py}{copies}run --repo {source} --owner " + quote(env["MAC_RUN_COPY_OWNER"])
-    + " --commit " + env["MAC_RUN_SHA"] + f" --{py}{runner}smoke-work " + quote(work) + " " + quote(cleanup),
+    + " --commit " + env["MAC_RUN_SHA"] + f" --{py}{runner}smoke-work " + quote(work) + " " + quote(cleanup)
+    + " <&3 3<&-",
 ]
 Path(sys.argv[1]).write_text(json.dumps(command))
 ' "$argv_file"
