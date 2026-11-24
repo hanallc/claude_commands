@@ -966,11 +966,12 @@ function stepTooltip(key, data) {
   const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && row.kind !== 'cloud' && row.head_room?.unavailable);
-  const guestFields = guestRow(row) ? [machineField('Runs on', row.machine),
-    field('Guest attempt', row.guest_run?.attempt || guestState(row))] : [];
+  const guest = guestRow(row);
+  const guestFields = guest ? [machineField('Runs on', row.machine),
+    field('Guest attempt', row.guest_run?.attempt || guestState(row)), ...progressRows(row)] : [];
   const namesGuest = row.targets?.includes('mac-linux');
-  const namedTargets = !waiting && namesGuest
-    ? [machineField('Named targets', row.runs_on), ...becauseRows(row.because || '')] : [];
+  const namedTargets = !waiting && (guest || namesGuest)
+    ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || ''), ...becauseRows(row.because || '')] : [];
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
     : stepTitle(row, unavailable && !guestRow(row) ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
@@ -1030,7 +1031,7 @@ function stepTooltip(key, data) {
     }
   } else {
     const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(machineField('Runs on', machine), ...namedTargets);
+    rows.push(...(guest ? guestFields : [machineField('Runs on', machine)]), ...namedTargets);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
@@ -1046,7 +1047,7 @@ function stepTooltip(key, data) {
         : recorded(row.used) ? [field('Uses', ramAmount(row.used * GIB))] : [];
       rows.push(...groupRows(memory));
     }
-    rows.push(...progressRows(row));
+    if (!guest) rows.push(...progressRows(row));
   }
   rows.push(...callFields);
   return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
@@ -1176,9 +1177,9 @@ function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, 
     `<span class="owner">${owner ? staffName(owner) : esc(repository)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
-function rowMemory(tip, bars = "") {
-  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
-    `<div class="amounts"></div></div>`;
+function rowMemory(tip, note = "") {
+  return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}"></div>` +
+    `<div class="amounts">${esc(note)}</div></div>`;
 }
 function cloudStatus(row, tip) {
   return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
@@ -1905,9 +1906,9 @@ function renderWalk(d) {
     (running ? '<th scope="col" class="tokens">Tokens</th>' : "");
   // A step that runs shows the bright icon of its machine; the row tooltip names the other targets.
   // A step that waits shows a dim icon for each machine that can take it.
-  const targetCell = (machine, named) => {
+  const targetCell = (machine, named, state) => {
     const icons = machine ? machineIcon(machine, "run") : (named || []).map(name => machineIcon(name, "dim")).join("");
-    return `<td class="machine">${icons || "—"}</td>`;
+    return `<td class="machine">${icons || "—"}${state ? ` ${esc(state)}` : ""}</td>`;
   };
   // A waiting step can wrap, but only between words: a word such as "cargo-style" never breaks at its hyphen.
   const stepText = (step, waiting) => waiting && step.includes(" ")
@@ -1930,10 +1931,12 @@ function renderWalk(d) {
   rows.push(...ordered.map(r => {
     const labels = queueRowLabels(r);
     const idleCI = r.ci && visibleDetail(r) === "idle";
+    const guest = guestRow(r);
+    const target = targetCell(r.machine, undefined, guest ? guestState(r) : undefined);
     cells(stageText(r), labels, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "",
-      r.pid, targetCell(r.machine, r.targets?.includes("mac-linux") ? r.targets : undefined), r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens);
+      r.pid, target, r.vcpus, `row:${r.key}`, "", doneText(r), r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(labels)}` +
-      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
+      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`, guest ? `on ${r.machine}` : "")) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
   const columnClasses = ["place", "done", "duration", "verify", "step", "pid", "machine", "vcpus", "tokens"];
@@ -1956,7 +1959,7 @@ function renderWalk(d) {
     const state = w.move && (w.move.row_id === lifted ? " queue-lift"
       : w.move.row_id === highlighted ? " queue-highlight" : "") || "";
     const rowClass = `wait${i === 0 ? " wait-first" : ""}${state}`;
-    const target = targetCell("", w.machine ? [w.machine] : w.targets || []);
+    const target = targetCell("", w.targets?.length ? w.targets : w.machine ? [w.machine] : []);
     const labels = queueRowLabels(w);
     cells(place, labels, ago(w.since, d.read_at), w.pid, target, null, tip, rowClass);
     const reason = w.order_note
@@ -2197,6 +2200,7 @@ function placeMemoryBars(d) {
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const run = d.walk.find(run => run.key === row.dataset.run);
+    if (guestRow(run)) continue;
     const amount = shown.walk.find(run => run.key === row.dataset.run);
     let bars = "";
     const amounts = [];
@@ -2383,21 +2387,27 @@ async function loadReport(version,current) {
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
 }
-let pageStamp = null;
+const pageVersion = document.querySelector('meta[name="builds-page-version"]')?.content;
+let pageReloading = false;
 async function reloadWhenPageChanges() {
-  if (consoleHidden() || paused) return;
+  if (consoleHidden() || paused || pageReloading) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
-    const stamp = r.headers.get("Last-Modified");
-    if (paused) return;
-    if (pageStamp && stamp && stamp !== pageStamp) location.reload();
-    pageStamp = stamp || pageStamp;
+    if (!r.ok || consoleHidden() || paused || pageReloading) return;
+    const version = r.headers.get("X-Builds-Page-Version");
+    if (pageVersion && version && version !== pageVersion) {
+      pageReloading = true;
+      location.reload();
+    }
   } catch (e) { /* The reading status already reports a lost server. */ }
 }
 const pageRefresh=createPageRefresh(tick,()=>paused ? 0 : SECONDS,()=>paused ? 'Press space to resume.' : '');
 void pageRefresh.refresh();
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void reloadWhenPageChanges();
+});
 addEventListener("message", event => {
   if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
     reloadWhenPageChanges();

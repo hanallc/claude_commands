@@ -41,6 +41,7 @@ from unittest.mock import ANY, Mock, call, patch
 from typing import TextIO, cast, override
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 from scripts.aws_target import aws_page, machines_page
@@ -50,6 +51,7 @@ from scripts.build_queue import memory_feed
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
+from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, update_registration,
@@ -182,7 +184,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending")):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         server.review_cache.synchronize()
         self._server = server
         review_posts = self.review_posts
@@ -201,7 +203,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         server.RequestHandlerClass = ReviewFixtureHandler
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 5)
@@ -791,7 +792,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200, response.body)
                 self.assertNotIn("content-security-policy", response.headers)
                 self.assertIn(b'<main id="stage"></main>', response.body)
-                self.assertIn(b'<aside id="panel"><div class="page-heading"><h1>' + heading + b'</h1>', response.body)
+                self.assertIn(b'<aside id="panel"><div class="page-heading-actions" data-page-actions>', response.body)
+                self.assertIn(b'</div></div><div class="page-heading"><h1>' + heading + b'</h1>'
+                              + page_frame.HEADING_MEASURE.encode() + b'</div></aside>', response.body)
                 self.assertIn(b'data-page-owner="placement_disk"', response.body)
 
     def test_placement_disk_file_expands_the_home_folder(self) -> None:
@@ -1909,6 +1912,40 @@ class ReviewLinksServerTests(unittest.TestCase):
                               f"http://127.0.0.1:{self.port}/console/review.html#owner=builds",
                               new_item_dialog.PageViewport(1280, 800, True), 1.5, (), (), "Owner builds", screenshot))
         return case.root / "page-states", cache, request
+
+    def test_published_builds_page_versions_each_write_in_one_second(self) -> None:
+        from scripts.build_queue import memory_files
+
+        output = self.root / "builds"
+        output.mkdir()
+        _ = conf.path("memory_feed").write_text(f"output_folder={output}\n", encoding="utf-8")
+        page = output / memory_files.PAGE_NAME
+        route = f"/builds/{memory_files.PAGE_NAME}"
+        source = memory_files.PAGE_SOURCE.read_bytes()
+        versions: list[str] = []
+        for offset in (100_000_000, 200_000_000):
+            with self.subTest(offset=offset):
+                _ = page.write_bytes(source)
+                mark = 1_700_000_000_000_000_000 + offset
+                os.utime(page, ns=(mark, mark))
+                reply = self.request(route)
+                self.assertEqual(reply.status, 200)
+                version = reply.headers.get("x-builds-page-version", "")
+                self.assertTrue(version)
+                self.assertIn(f'<meta name="builds-page-version" content="{version}">'.encode(), reply.body)
+                versions.append(version)
+                with (socket.create_connection(("127.0.0.1", self.port), TEST_HANG_GUARD_SECS) as client,
+                      client.makefile("rb") as head_reply):
+                    client.sendall((f"HEAD {route} HTTP/1.0\r\n"
+                                    "Host: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+                    raw = head_reply.read()
+                head, delimiter, body = raw.partition(b"\r\n\r\n")
+                self.assertTrue(delimiter)
+                status_line, _, raw_headers = head.partition(b"\r\n")
+                self.assertEqual(status_line.split()[1:2], [b"200"])
+                self.assertEqual(parse_headers(BytesIO(raw_headers))["X-Builds-Page-Version"], version)
+                self.assertEqual(len(body), 0, "HEAD sent a response body")
+        self.assertEqual(len(set(versions)), 2)
 
     def test_only_the_published_aws_machines_path_matches_the_console_page(self) -> None:
         output = self.root / "AWS reports"
@@ -3561,10 +3598,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                 card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': key}))
             self.assertEqual(card.status, 200)
 
-    def request(self, path: str) -> HttpReply:
+    def request(self, path: str, *, method: str = "GET") -> HttpReply:
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request("GET", path)
+            connection.request(method, path)
             response = connection.getresponse()
             headers = {name.lower(): value for name, value in response.getheaders()}
             return HttpReply(response.status, headers.get("content-type", ""), response.read(), headers)
@@ -3697,7 +3734,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
-            server = self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.root, initialize_review=True))
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
         server.review_cache.synchronize()
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
         self.port = server.server_port
@@ -4519,10 +4556,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             native_write(before)
 
         def project_question(before: update_registration.QuestionRecord, members: staff.StaffSnapshot,
-                             *, unowned: bool = False) -> review_items.ReviewItem:
+                             *, unowned: bool = False, zone: ZoneInfo | None = None) -> review_items.ReviewItem:
             if before.path == path:
                 reply()
-            return project(before, members, unowned=unowned)
+            return project(before, members, unowned=unowned, zone=zone)
 
         with patch.object(update_registration, 'write_question_record', write), patch.object(
                 review_items, 'question_item', project_question):
@@ -5628,7 +5665,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = (other / "draft.txt").write_text("still served", encoding="utf-8")
         errors = StringIO()
         with patch.object(shutil, "rmtree", side_effect=PermissionError("cannot delete snapshot")), redirect_stderr(errors):
-            with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+            with started_review_server(("127.0.0.1", 0), self.root) as server:
                 # handle_request serves one disposable connection without a background service.
                 thread = threading.Thread(target=server.handle_request)
                 thread.start()
@@ -6847,7 +6884,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
                 errors = StringIO()
                 with patch.object(Path, "is_dir", new=checked_is_dir), redirect_stderr(errors):
-                    with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+                    with started_review_server(("127.0.0.1", 0), self.root) as server:
                         self.port = server.server_port
                         thread = threading.Thread(target=server.handle_request)
                         thread.start()
@@ -7110,17 +7147,17 @@ class SnapshotSweepTests(unittest.TestCase):
         with (patch.object(time, "time", return_value=now),
               patch.object(time, "monotonic", return_value=100.0) as elapsed,
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server):
+              started_review_server(("127.0.0.1", 0), self.root) as server):
             self.assertFalse(expired_at_start.exists())
             self.assertFalse(flat_at_start.exists())
             expires_later = self.snapshot("session", "expires-later", now - 8 * 24 * 60 * 60)
             flat_later = self.snapshot("", "def456", now - 8 * 24 * 60 * 60)
             elapsed.return_value = 100.0 + 3599.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertTrue(expires_later.exists())
             self.assertTrue(flat_later.exists())
             elapsed.return_value = 100.0 + 3600.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertFalse(expires_later.exists())
             self.assertFalse(flat_later.exists())
 
@@ -7244,7 +7281,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.load_module(self.module_file)
 
     def start_server(self) -> serve.ReviewLinksServer:
-        return self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.checkout / "snapshots"))
+        return self.enterContext(started_review_server(("127.0.0.1", 0), self.checkout / "snapshots"))
 
     def load_module(self, path: Path) -> None:
         spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -7268,17 +7305,17 @@ class ServerCodeHealthTests(unittest.TestCase):
 
         with patch.object(conf, "read", count_service_reads):
             self.elapsed = 104.0
-            server.service_actions()
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_not_called()
             self.elapsed = 105.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_called_once_with("review_links")
             self.elapsed = 109.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             read.assert_called_once_with("review_links")
             self.elapsed = 110.0
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
             self.assertEqual(read.call_count, 2)
 
     def test_a_module_imported_through_a_file_symlink_keeps_its_target_stamp(self) -> None:
@@ -7298,7 +7335,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.module_file.unlink()
         self.elapsed = 105.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(self.module_file), str(changed.exception))
 
     def test_a_module_loaded_after_start_joins_the_checks_without_a_restart(self) -> None:
@@ -7308,11 +7345,11 @@ class ServerCodeHealthTests(unittest.TestCase):
         os.utime(late_module, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
         self.load_module(late_module)
         self.elapsed = 105.0
-        server.service_actions()
+        serve.ReviewLinksServer.service_actions(server)
         _ = late_module.write_text("VALUE = 'changed later'\n")
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(late_module), str(changed.exception))
 
     def test_a_newly_seen_module_modified_after_process_start_requires_a_restart(self) -> None:
@@ -7323,7 +7360,7 @@ class ServerCodeHealthTests(unittest.TestCase):
         self.load_module(late_module)
         self.elapsed = 105.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(late_module), str(changed.exception))
 
     def test_an_active_verdict_defers_restart_and_keeps_the_recorded_stamps(self) -> None:
@@ -7335,12 +7372,12 @@ class ServerCodeHealthTests(unittest.TestCase):
         _ = self.module_file.write_text("VALUE = 'changed during the verdict'\n")
         os.utime(self.module_file, ns=(serve.STARTED_NS - 1_000_000_000, serve.STARTED_NS - 1_000_000_000))
         self.elapsed = 105.0
-        server.service_actions()
+        serve.ReviewLinksServer.service_actions(server)
         self.assertEqual(server.module_stamps, stamps)
         status.record(change_page.MessageDelivery(page, "C1", (), "", attempt))
         self.elapsed = 110.0
         with self.assertRaises(serve.CodeChanged) as changed:
-            server.service_actions()
+            serve.ReviewLinksServer.service_actions(server)
         self.assertIn(str(self.module_file), str(changed.exception))
 
     def test_a_running_send_replay_defers_restart_until_the_holds_stop(self) -> None:

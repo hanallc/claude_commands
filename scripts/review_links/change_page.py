@@ -53,6 +53,7 @@ from scripts.production.production_doc import (
     Refusal as Refusal, production_field, read_production,
 )
 from scripts.feature_log import feature_log
+from scripts.review_links.question_path import AnswerTime, NO_ANSWER_TIME, answer_log_id
 from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
                                   reply_tokens, review_link)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
@@ -129,6 +130,7 @@ class StoredAnsweredQuestion(TypedDict):
 
 class StoredDeliverySlots(TypedDict, total=False):
     handed_at: str
+    answered_at: str
     waiting_why: str
     validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
@@ -142,14 +144,18 @@ CHANGE_HANDOFFS = frozenset(("validate", "question", "feedback"))
 VALIDATION_QUESTION = "validation-question"
 
 
-def read_handed_at(path: Path) -> str | None:
-    """Read the saved hand-off field without changing its value."""
+def saved_delivery_times(path: Path) -> dict[str, str]:
+    """Read the saved handoff and answer times."""
     try:
-        fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        fields = delivery_state.read_fields(path)
     except (FileNotFoundError, ValueError):
-        return None
-    saved = cast(dict[str, object], fields).get("handed_at") if isinstance(fields, dict) else None
-    return saved if isinstance(saved, str) else None
+        return {}
+    return {key: value for key in ("handed_at", "answered_at")
+            if isinstance(value := fields.get(key), str)}
+
+
+def read_handed_at(path: Path) -> str | None:
+    return saved_delivery_times(path).get("handed_at")
 
 
 def require_user_turn(slots: DeliverySlots) -> None:
@@ -1402,7 +1408,8 @@ class DeliveryStatus:
             return ReviewMessagePage(page.review_list, page.production, page.rows, page.token, fields['review_message'])
         return page
 
-    def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots, *, new_handoff: bool = False) -> None:
+    def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots, *,
+                    new_handoff: bool = False, answered_at: AnswerTime = NO_ANSWER_TIME) -> None:
         """Write both slots while the caller holds the delivery lock."""
         fields: StoredDeliverySlots = {}
         if slots.waiting_why:
@@ -1434,10 +1441,16 @@ class DeliveryStatus:
             saved_question["kind"] = "feedback"
         path = self.path(page, row)
         if fields and re.fullmatch(r"C\d+", row):
+            saved_times = {} if new_handoff else saved_delivery_times(path)
             if new_handoff:
                 fields["handed_at"] = datetime.fromtimestamp(time.time(), user_zone()).isoformat()
-            elif (saved := read_handed_at(path)) is not None:
+            elif (saved := saved_times.get("handed_at")) is not None:
                 fields["handed_at"] = saved
+            if isinstance(question, AnsweredQuestion):
+                if isinstance(answered_at, datetime):
+                    fields["answered_at"] = answered_at.isoformat()
+                elif (saved := saved_times.get("answered_at")) is not None:
+                    fields["answered_at"] = saved
         published = False
         try:
             if fields:
@@ -1558,6 +1571,10 @@ class DeliveryStatus:
 
     def answer_question(self, page: ReviewPage, row: str, question_id: str, text: str) -> bool:
         """Save an answer once and preserve the delivery record's other slots."""
+        return isinstance(self.save_question_answer(page, row, question_id, text), datetime)
+
+    def save_question_answer(self, page: ReviewPage, row: str, question_id: str, text: str) -> AnswerTime:
+        """Return the saved reply time when a new answer is written."""
         if not text.strip():
             raise question_record.AnswerRefused("enter an answer")
         text = text.strip()
@@ -1565,7 +1582,7 @@ class DeliveryStatus:
             slots = self.slots(page, row)
             question = self.question_for_reply(page, row, question_id, text)
             if isinstance(question, AnsweredQuestion) and question.answer == text:
-                return False
+                return NO_ANSWER_TIME
             if not isinstance(question, OpenQuestion):
                 raise question_record.AnswerRefused("this row has no open question")
             record = answer_row(page, row)
@@ -1579,9 +1596,10 @@ class DeliveryStatus:
                 if not any(event.matches_feedback(question.question_id, question.text) for event in events):
                     change_review.record_review_log(page.review_list, row, "feedback: " + question.text, production,
                                                     feedback_request_id=question.question_id)
-            with change_review.clear_change_later(page.review_list, row):
-                self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)))
-            return True
+            answered_at = datetime.now(user_zone())
+            self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)),
+                             answered_at=answered_at)
+            return answered_at
 
     def question_for_reply(self, page: ReviewPage, row: str, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
         """Apply the existing exchange identity rule to each Review type."""
@@ -2282,6 +2300,13 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
                 intent = status.ask_locked(page, row_id, slots, feedback, recipients,
                                             "feedback" if request_feedback else "question",
                                             question_id=question_id, during_validation=during_validation)
+                if not request_feedback:
+                    try:
+                        change_review.record_review_log(page.review_list, row_id, "question: " + intent.text,
+                                                        message_page.production, feedback_request_id=intent.question_id)
+                    except BaseException:
+                        del status.request_attempts[intent.attempt]
+                        raise
                 attempt = intent.attempt
                 message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback,
                                            sender=sender)
@@ -3209,10 +3234,12 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)
         page = ReviewPage(source.path,source.assignment.production,(source.row['#'],),'')
-        changed = status.answer_question(page,source.row['#'],question_id,words)
-        if changed:
-            change_review.record_review_log(source.path,source.row['#'],'Answer: '+words,page.production,who)
-        return changed
+        answered_at = status.save_question_answer(page, source.row['#'], question_id, words)
+        if not isinstance(answered_at, datetime):
+            return False
+        change_review.record_review_log(source.path, source.row['#'], 'Answer: ' + words, page.production, who,
+                                        feedback_request_id=answer_log_id(question_id), event_time=answered_at)
+        return True
     raise question_record.AnswerRefused('this item cannot receive an answer')
 
 

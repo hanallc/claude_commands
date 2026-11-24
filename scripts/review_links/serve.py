@@ -1206,9 +1206,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         identity = published_console_page(root, decoded)
         if identity:
+            version = ""
             with stream:
-                content = owned_document(stream.read(), identity)
-            self.html_response(200, content)
+                content = stream.read()
+                if identity == "builds":
+                    stat = os.fstat(stream.fileno())
+                    version = f"{stat.st_ino:x}-{stat.st_mtime_ns:x}-{stat.st_ctime_ns:x}-{stat.st_size:x}"
+            if version:
+                marker = f'<meta name="builds-page-version" content="{version}">\n'
+                content = content.replace(b"</head>", marker.encode() + b"</head>", 1)
+            self.html_response(200, owned_document(content, identity), builds_version=version)
             return None
         try:
             stat = os.fstat(stream.fileno())
@@ -1254,7 +1261,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             for value in self.headers.get_all("If-None-Match", [])
         )
 
-    def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None) -> None:
+    def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None,
+                      builds_version: str = "") -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
@@ -1262,8 +1270,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         if delivery_pending is not None:
             self.send_header("X-Item-Delivery-Pending", str(delivery_pending).lower())
+        if builds_version:
+            self.send_header("X-Builds-Page-Version", builds_version)
         self.end_headers()
-        _ = self.wfile.write(content)
+        if self.command != "HEAD":
+            _ = self.wfile.write(content)
 
     def review_response(self, content: bytes, content_type: str, prepared: bytes = b'', *,
                         version: str = '', status: int = 200) -> None:

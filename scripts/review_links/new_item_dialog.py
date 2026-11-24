@@ -1293,7 +1293,8 @@ function bindDraft(dialog, fresh = false) {
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
   const data = visiblePageData();
   return {
-   place: location.pathname + location.search + location.hash,
+   // The page frame adds the open window under New item, so the screenshot shows it.
+   place: window.pageCapturePlace?.(dialog) ?? location.pathname + location.search + location.hash,
    viewport: viewport(),
    data,
    state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
@@ -1476,7 +1477,11 @@ function bindDraft(dialog, fresh = false) {
  }
 
  async function open(trigger, page) {
-  if (dialog.open || sending) return;
+  if (dialog.open) {
+   words.focus({preventScroll: true});
+   return;
+  }
+  if (sending) return;
   if (pendingItem) page = pendingItem.page;
   ownerPage = page;
   pageContext = collectPageContext();
@@ -1675,8 +1680,10 @@ function bindDraft(dialog, fresh = false) {
  document.addEventListener('click', event => {
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
-  if (!page || drafts.some(draft => draft.dialog.open)) return;
-  const draft = drafts.findLast(draft => !draft.sending) || newDraft();
+  if (!page) return;
+  const active = drafts.find(draft => draft.dialog.open && draft.dialog.contains(trigger));
+  if (!active && drafts.some(draft => draft.dialog.open)) return;
+  const draft = active || drafts.findLast(draft => !draft.sending) || newDraft();
   void draft.open(trigger, page);
  });
 })();'''

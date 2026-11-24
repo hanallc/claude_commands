@@ -8,20 +8,23 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast, override
 from unittest.mock import patch
-from typing import override
 
-from scripts.review_links import page_frame, review_submissions, serve
 from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.review_links import page_frame, review_submissions, serve
 from scripts.review_links.browser_test_support import STATUS_PAGES, firefox_probe_results, status_configuration
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-STICKY_HEADING = re.compile(rb':is\(\.page-heading,main>\.page-heading-actions\)\{[^}]*\}')
+STICKY_ACTIONS = b'position:sticky;top:var(--page-actions-space);'
 PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", staff.STAFF_ROOT,
                             current_session=staff.StaffId("session-owner"))
 
@@ -71,7 +74,10 @@ class PageStatusTests(unittest.TestCase):
               patch.object(subprocess, "Popen", side_effect=AssertionError("The owner launched a process."))):
             page = serve.owned_document(b'<html><head></head><body><main><h1>The List</h1></main></body></html>', "list")
         self.assertIn(b'data-page-owner="list"', page)
-        self.assertIn(b'<div class="page-heading"><h1>The List</h1><div class="page-heading-actions">', page)
+        self.assertIn(b'<main><div class="page-heading-actions" data-page-actions><div class="page-owner" data-page-owner="list">',
+                      page)
+        self.assertIn(b'</div></div><div class="page-heading"><h1>The List</h1>' + page_frame.HEADING_MEASURE.encode()
+                      + b'</div></main>', page)
         self.assertIn(page_frame.HEADING_STYLE.encode(), page)
         self.assertIn(b'class="staff-name" data-color-text="role.showrunner"', page)
         self.assertIn(b'aria-label="New item for Current &amp; name" title="New item for Current &amp; name"', page)
@@ -108,7 +114,7 @@ class PageStatusTests(unittest.TestCase):
   frameElement.style.height='800px';
   const button=document.querySelector('[data-owner-new]');
   const owner=button.closest('.page-owner'), name=owner.querySelector('.page-owner-name');
-  const heading=document.querySelector('.page-heading');
+  const actions=document.querySelector('[data-page-actions]'), heading=document.querySelector('.page-heading');
   const reference=document.createElement('iframe');
   reference.style.cssText='position:fixed;left:-10000px;top:0;border:0;height:800px';
   const referenceReady=new Promise(resolve=>reference.addEventListener('load',resolve,{once:true}));
@@ -127,7 +133,7 @@ class PageStatusTests(unittest.TestCase):
   const view=createRecordTable({content:()=>document.querySelector('[data-test-list]'),
    shows:['all'],defaultShow:'all',visible:()=>true,applied:()=>{detail.hidden=false;}});
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const boxes=doc=>['.page-owner-name','[data-owner-new]'].map(selector=>{
+  const boxes=doc=>['.page-owner-name','[data-owner-new]','h1'].map(selector=>{
    const {x,y,width,height}=doc.querySelector(selector).getBoundingClientRect();
    return [x,y,width,height];
   });
@@ -136,7 +142,6 @@ class PageStatusTests(unittest.TestCase):
    return [left,width];
   }));
   const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
-  const line=()=>getComputedStyle(heading).boxShadow, lineColor=getComputedStyle(button).borderTopColor;
   const opaque=color=>{const parts=color.match(/[0-9.]+/g);return parts!==null && (parts.length===3 || Number(parts[3])===1);};
   const statusCovered=()=>{
    const box=banner.getBoundingClientRect(), top=Math.max(box.top,0);
@@ -149,18 +154,17 @@ class PageStatusTests(unittest.TestCase):
    reference.style.width=width+'px';
    scrollTo({top:0,behavior:'instant'});
    await painted();
-   const first=JSON.stringify(boxes(document)), layout=columns(), headingHeight=heading.getBoundingClientRect().height;
+   const first=JSON.stringify(boxes(document)), layout=columns(), titleTop=title.getBoundingClientRect().top;
    verify(first===JSON.stringify(boxes(reference.contentDocument)),
-    'The name and button match the original heading at scroll zero.');
-   const background=getComputedStyle(heading).backgroundColor;
+    'The name, the button and the title match the page without the sticky rule at scroll zero.');
+   const background=getComputedStyle(owner).backgroundColor;
    verify(opaque(background) && background===getComputedStyle(document.body).backgroundColor,
-    'The heading row has the opaque page background.');
-   verify(line()==='none' && !heading.hasAttribute('data-page-heading-stuck'),'The heading row has no line at scroll zero.');
-   const statusEnd=Math.ceil(banner.getBoundingClientRect().bottom+headingHeight);
+    'The owner control has the opaque page background.');
+   const statusEnd=Math.ceil(banner.getBoundingClientRect().bottom+owner.getBoundingClientRect().height);
    for(let top=0;top<=statusEnd;top+=2){
     scrollTo({top,behavior:'instant'});
     await painted();
-    if(statusCovered()){verify(false,'The heading row covers the Late status at scroll '+top+'.');break;}
+    if(statusCovered()){verify(false,'The action area covers the Late status at scroll '+top+'.');break;}
    }
    for(const top of [1,Math.floor(bottom()/2),bottom()]){
     scrollTo({top,behavior:'instant'});
@@ -171,21 +175,20 @@ class PageStatusTests(unittest.TestCase):
    const nameBox=name.getBoundingClientRect(), buttonBox=button.getBoundingClientRect();
    verify(innerWidth===width && scrollY>innerHeight && scrollY===bottom(),'The page scrolls to the bottom of the long row.');
    const state=banner.querySelector('.page-status-state').getBoundingClientRect();
-   verify(Math.abs(status.top-headingBox.bottom)<1 && reason.getBoundingClientRect().top>=state.bottom,
-    'The sticky status spans two lines directly below the heading row.');
-   verify(Math.abs(headingBox.top-8)<1 && heading.contains(title),'The heading row sticks 8 px below the top.');
-   verify(Math.abs(last.right-headingBox.right)<1 && last.top>=headingBox.top && last.bottom<=status.top
-    && last.bottom<=innerHeight,'The owner stays at the top right above the status.');
+   verify(Math.abs(status.top-last.bottom)<1 && reason.getBoundingClientRect().top>=state.bottom,
+    'The sticky status spans two lines directly below the action area.');
+   verify(Math.abs(last.top-8)<1 && actions.contains(owner),'The action area sticks 8 px below the top.');
+   verify(Math.abs(title.getBoundingClientRect().top-(titleTop-scrollY))<1 && headingBox.bottom<0,
+    'The title scrolls with the page.');
+   verify(Math.abs(last.right-headingBox.right)<1 && last.bottom<=status.top+0.5 && last.bottom<=innerHeight,
+    'The owner stays at the top right above the status.');
    verify(nameBox.width>0 && Math.abs(buttonBox.left-nameBox.right-8)<0.1 && buttonBox.width===36,
     'The name stays beside the full button.');
-   verify(detail.getBoundingClientRect().top<headingBox.top,'The open row scrolls under the heading row.');
-   verify(heading.hasAttribute('data-page-heading-stuck') && line().includes(lineColor) && line().includes('0px 1px 0px'),
-    'The stuck heading row shows the header line.');
-   verify(headingBox.height===headingHeight,'The line does not change the heading row height.');
+   verify(detail.getBoundingClientRect().top<last.top,'The open row scrolls under the action area.');
    let hidden=true;
    for(let x=Math.ceil(last.left);x<last.right-1;x+=4){
     for(let y=Math.ceil(last.top);y<last.bottom-1;y+=4){
-     hidden=hidden && heading.contains(document.elementFromPoint(x,y));
+     hidden=hidden && owner.contains(document.elementFromPoint(x,y));
     }
    }
    verify(hidden,'No table text shows under the owner.');
@@ -194,13 +197,13 @@ class PageStatusTests(unittest.TestCase):
     && button.contains(document.elementFromPoint(x,buttonBox.bottom-1)),'The whole button is clickable.');
    scrollTo({top:0,behavior:'instant'});
    await painted();
-   verify(JSON.stringify(boxes(document))===first && line()==='none','The original heading returns at scroll zero.');
+   verify(JSON.stringify(boxes(document))===first,'The original heading returns at scroll zero.');
    verify(view.revealMatchingItem('open'),'The item jump finds the row.');
    await painted();
    verify(document.activeElement===row.querySelector('button') && scrollY>0 &&
     row.getBoundingClientRect().top>=banner.getBoundingClientRect().bottom &&
-    banner.getBoundingClientRect().top>=heading.getBoundingClientRect().bottom,
-    'The item jump from scroll zero focuses the row below the heading row and the status.');
+    banner.getBoundingClientRect().top>=owner.getBoundingClientRect().bottom-0.5,
+    'The item jump from scroll zero focuses the row below the action area and the status.');
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -216,14 +219,12 @@ class PageStatusTests(unittest.TestCase):
   frameElement.style.height='800px';
   document.querySelector('[data-detail]').hidden=false;
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const heading=document.querySelector('.page-heading'), banner=document.querySelector('[data-page-status]');
+  const owner=document.querySelector('.page-owner'), banner=document.querySelector('[data-page-status]');
   const name=document.querySelector('.page-owner-name'), button=document.querySelector('[data-owner-new]');
-  const main=document.querySelector('main'), table=document.querySelector('table');
+  const main=document.querySelector('main'), table=document.querySelector('table'), title=document.querySelector('h1');
   const reason=banner.querySelector('[data-status-reason]');
   const bottom=()=>document.scrollingElement.scrollHeight-innerHeight;
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
-  const background=getComputedStyle(document.body).backgroundColor;
-  const opaque=color=>{const parts=color.match(/[0-9.]+/g);return parts!==null && (parts.length===3 || Number(parts[3])===1);};
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
   const layout=()=>JSON.stringify([main,table].map(element=>{
    const {top,left,width}=element.getBoundingClientRect();
    return [top+scrollY,left,width];
@@ -241,7 +242,6 @@ class PageStatusTests(unittest.TestCase):
    return box.top>=0 && box.bottom<=innerHeight && [box.left+2,(box.left+box.right)/2,box.right-2]
     .every(x=>[box.top+1,(box.top+box.bottom)/2,box.bottom-1].every(y=>banner.contains(document.elementFromPoint(x,y))));
   };
-  const band=()=>getComputedStyle(heading,'::before');
   for(const [state,text] of [['Late','The feed has stopped.'],['Failed','The read failed with HTTP 502.']]){
    banner.dataset.state=state;
    banner.querySelector('[data-status-word]').textContent=state;
@@ -263,36 +263,25 @@ class PageStatusTests(unittest.TestCase):
     for(const top of positions){
      scrollTo({top,behavior:'instant'});
      await painted();
-     const row=heading.getBoundingClientRect(), status=banner.getBoundingClientRect();
-     const stuck=heading.hasAttribute('data-page-heading-stuck');
+     const row=owner.getBoundingClientRect(), status=banner.getBoundingClientRect();
      verify(scrollY===top && innerWidth===width,'The page scrolls to the position.',top);
      verify(clear(name,1),'The owner name is fully in view and not covered.',top);
      verify(clear(button,3),'The New item button is fully in view and not covered.',top);
-     verify(statusShown(),'The status line is fully in view and not covered by the row.',top);
-     verify(row.bottom<=status.top+0.5,'The row stays above the status line.',top);
+     verify(statusShown(),'The status line is fully in view and not covered by the action area.',top);
+     verify(row.bottom<=status.top+0.5,'The action area stays above the status line.',top);
+     verify(row.top>=space-0.5,'The action area stays at least 8 px below the top.',top);
      verify(layout()===start,'The content does not move.',top);
      if(previous){
       // Each part moves up by at most the scroll distance and never moves down, so nothing steps.
       const distance=top-previous.top;
       verify([[row.top,previous.row],[status.top,previous.status]].every(([now,before])=>before-now>=-0.5 && before-now<=distance+0.5),
-       'The row and the status line move by no more than the scroll distance.',top);
+       'The action area and the status line move by no more than the scroll distance.',top);
      }
      previous={top,row:row.top,status:status.top};
-     if(top===0) verify(!stuck && band().content==='none','The row is not stuck and has no space band at scroll zero.',top);
-     if(stuck){
-      verify(Math.abs(row.top-space)<1,'The stuck row is 8 px below the top.',top);
-      const fill=band().backgroundColor;
-      verify(band().content!=='none' && parseFloat(band().height)===space && opaque(fill) && fill===background,
-       'The stuck row has an opaque 8 px band above it.',top);
-      verify(heading.contains(document.elementFromPoint((row.left+row.right)/2,row.top-space/2)),
-       'The band covers the content above the stuck row.',top);
-     }else{
-      verify(band().content==='none','A row that is not stuck has no space band.',top);
-     }
     }
-    verify(heading.hasAttribute('data-page-heading-stuck') && Math.abs(heading.getBoundingClientRect().top-space)<1
-     && Math.abs(banner.getBoundingClientRect().top-heading.getBoundingClientRect().bottom)<1,
-     'At the bottom the row sticks 8 px below the top and the status line sticks directly below it.',bottom());
+    verify(Math.abs(owner.getBoundingClientRect().top-space)<1 && title.getBoundingClientRect().bottom<0
+     && Math.abs(banner.getBoundingClientRect().top-owner.getBoundingClientRect().bottom)<1,
+     'At the bottom the title is out of view, the action area sticks 8 px below the top and the status line sticks directly below it.',bottom());
    }
   }
  }catch(error){failures.push(String(error));}
@@ -301,7 +290,7 @@ class PageStatusTests(unittest.TestCase):
         self.assertEqual(firefox_probe_results(long_open_row_page().replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the AWS region filter.")
-    def test_aws_region_filter_sticks_below_the_heading_row(self) -> None:
+    def test_aws_region_filter_sticks_below_the_action_area(self) -> None:
         from scripts.review_links import console_theme
 
         source = console_theme.with_theme((SCRIPTS / "aws_target" / "aws_prices.html").read_text(encoding="utf-8"))
@@ -316,7 +305,7 @@ class PageStatusTests(unittest.TestCase):
   document.querySelector('main').insertAdjacentHTML('beforeend','<div style="height:4000px"></div>');
   document.querySelector('#geographies').textContent='Geography';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const heading=document.querySelector('.page-heading'), regions=document.querySelector('nav.regions');
+  const owner=document.querySelector('.page-owner'), regions=document.querySelector('nav.regions');
   const banner=document.querySelector('[data-page-status]');
   for(const state of ['Live','Late']){
    for(const width of [1440,320]){
@@ -324,12 +313,12 @@ class PageStatusTests(unittest.TestCase):
     banner.dataset.state=state;
     scrollTo({top:2000,behavior:'instant'});
     await painted();
-    const bar=regions.getBoundingClientRect(), row=heading.getBoundingClientRect();
-    // A Late status line sticks directly below the heading row, so the filter sticks below the status line.
+    const bar=regions.getBoundingClientRect(), row=owner.getBoundingClientRect();
+    // A Late status line sticks directly below the action area, so the filter sticks below the status line.
     const above=state==='Late' ? banner.getBoundingClientRect().bottom : row.bottom;
     const hit=document.elementFromPoint((bar.left+bar.right)/2,bar.top+1);
     if(scrollY<1000 || Math.abs(bar.top-above)>=1 || bar.bottom>innerHeight || !regions.contains(hit)){
-     failures.push(width+' px, '+state+': the region filter must stick fully in view below the heading row and the status and take a click at its top.');
+     failures.push(width+' px, '+state+': the region filter must stick fully in view below the action area and the status and take a click at its top.');
     }
    }
   }
@@ -355,7 +344,7 @@ class PageStatusTests(unittest.TestCase):
         for width in (1440, 320):
             with self.subTest(width=width):
                 self.assertTrue(firefox_screenshot(still, width, 800) == firefox_screenshot(main_heading(still), width, 800),
-                                "At scroll zero the paused page must match the page without the sticky heading row.")
+                                "At scroll zero the paused page must match the page without the sticky action area.")
         probe = b'''<script>
 (async()=>{
  const failures=[];
@@ -581,9 +570,9 @@ def long_open_row_page() -> bytes:
 
 
 def main_heading(page: bytes) -> bytes:
-    """Remove the sticky heading row, so the page shows the heading as it was before."""
-    assert STICKY_HEADING.search(page) is not None
-    return STICKY_HEADING.sub(b'', page.replace(page_frame.HEADING_POSITION.encode(), b'', 1))
+    """Remove the sticky rule of the action area, so the page shows the heading as it is before a scroll."""
+    assert page.count(STICKY_ACTIONS) == 1
+    return page.replace(STICKY_ACTIONS, b'', 1)
 
 
 def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
@@ -678,6 +667,376 @@ def assert_component_states(case: unittest.TestCase, markup: str) -> None:
     done = subprocess.run([node, '-e', source], capture_output=True, text=True, timeout=20)
     case.assertEqual(done.returncode, 0, done.stdout + done.stderr)
     case.assertEqual(done.stdout.strip(), 'PASS')
+
+
+# A probe helper for the page window rule. A press is what a person does: the element on top at the center of
+# the New item button takes the focus and the click. A modal window makes the page under it inert, so without
+# the rule the press finds the window backdrop.
+WINDOW_PROBE = r'''
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const nested=window.parent!==window && window.parent.parent!==window.parent;
+const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+async function until(test,description){
+ for(let tries=0;tries<250;tries++){if(test()) return;await new Promise(resolve=>setTimeout(resolve,20));}
+ throw new Error('Timed out: '+description);
+}
+const captures=[],realFetch=window.fetch;
+if(!nested) window.fetch=async(path,options={})=>{
+ if(!String(path).startsWith('/console/review/new-item')) return realFetch(path,options);
+ if(!options.body) return Response.json({token:'fixture',page_owner:'owner',
+  recipients:[{id:'owner',name:'Page owner',proposal:true}]});
+ const body=JSON.parse(options.body);
+ if(body.words) return Response.json({id:'Q7'});
+ if(body.page_capture) captures.push(body.page_capture);
+ return Response.json({});
+};
+const newItem=()=>document.querySelector('#review-new-item');
+const actionsBottom=()=>Math.max(...[...document.querySelector('[data-page-actions]').children]
+ .map(control=>control.getBoundingClientRect().bottom));
+function onTop(element){
+ const box=element.getBoundingClientRect();
+ return element.contains(document.elementFromPoint((box.left+box.right)/2,(box.top+box.bottom)/2));
+}
+function pressNewItem(description){
+ const button=document.querySelector('[data-page-actions]:not([data-page-window-actions]) [data-owner-new]');
+ const box=button.getBoundingClientRect();
+ check(box.top>=0 && box.bottom<=innerHeight && box.left>=0 && box.right<=innerWidth,
+  'The New item button is in view '+description+'.');
+ const hit=document.elementFromPoint((box.left+box.right)/2,(box.top+box.bottom)/2)?.closest('button');
+ check(Boolean(hit?.matches('[data-owner-new]')),'The New item button is on top at its place '+description+'.');
+ if(!hit?.matches('[data-owner-new]')) return null;
+ const label=hit.getAttribute('aria-label');
+ check(label===button.getAttribute('aria-label') && label.startsWith('New item'),'The button keeps its label '+description+'.');
+ hit.focus();
+ check(document.activeElement===hit,'The New item button takes the focus '+description+'.');
+ hit.click();
+ return hit;
+}
+async function newItemOver(under,description){
+ await until(()=>captures.length>0,'the New item screenshot request over '+description);
+ const dialog=newItem();
+ check(dialog.open && dialog.matches(':modal') && onTop(dialog),'New item opens on top of '+description+'.');
+ check(under.open,description+' stays open under New item.');
+ return captures.at(-1);
+}
+async function closeNewItem(under,description){
+ newItem().querySelector('[data-cancel]').click();
+ await painted();
+ check(!newItem().open && under.open && under.contains(document.activeElement),
+  'Closing New item leaves '+description+' open with the focus in it.');
+}
+// The screenshot service loads the address and takes the picture at the load event.
+async function opensAgain(place,ready,description){
+ const frame=document.createElement('iframe');
+ frame.style.cssText='border:0;width:'+innerWidth+'px;height:'+innerHeight+'px';
+ const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+ frame.src=place;document.body.append(frame);
+ await loaded;
+ check(ready(frame.contentDocument),'The screenshot address opens '+description+' by the load event.');
+ check(!frame.contentWindow.location.hash.includes('console-window'),'The page removes the window name from its address.');
+ frame.remove();
+}
+async function report(){await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});}
+'''
+
+
+def window_probe_results(documents: dict[str, bytes], start: str, browser: str) -> list[list[str]]:
+    """Serve the documents, show the start path in a 1100 x 700 frame and return the failure lists of the probe."""
+    results: list[list[str]] = []
+    complete = threading.Event()
+    outer = (f'<!doctype html><body style="margin:0"><iframe src="{html.escape(start, quote=True)}" '
+             + 'style="border:0;width:1100px;height:700px"></iframe><img hidden src="/complete"></body>').encode()
+
+    class WindowProbe(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            path = self.path.partition('?')[0]
+            if path == '/complete':
+                _ = complete.wait(TEST_HANG_GUARD_SECS)
+                body, kind = b'', 'image/png'
+            elif path == '/':
+                body, kind = outer, 'text/html; charset=utf-8'
+            elif path in documents:
+                body = documents[path]
+                kind = 'image/svg+xml' if path.endswith('.svg') else 'text/html; charset=utf-8'
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            _ = self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            if self.path == '/results':
+                results.append(cast(list[str], json.loads(body)))
+                complete.set()
+            self.send_response(204)
+            self.end_headers()
+
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with tempfile.TemporaryDirectory(prefix='page-window-') as temporary, \
+            ThreadingHTTPServer(('127.0.0.1', 0), WindowProbe) as server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        thread.start()
+        url = f'http://127.0.0.1:{server.server_port}/'
+        try:
+            # Each browser takes its screenshot after the load event, and /complete holds that event for the results.
+            profile, shot = Path(temporary) / 'profile', Path(temporary) / 'page.png'
+            profile.mkdir()
+            command = (['google-chrome', '--headless', '--no-sandbox', '--disable-gpu', '--no-first-run',
+                        f'--user-data-dir={profile}', '--window-size=1440,900', f'--screenshot={shot}', url]
+                       if browser == 'chrome' else
+                       ['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                        '--window-size', '1440,900', '--screenshot', str(shot), url])
+            done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            if done.returncode or not complete.is_set():
+                raise AssertionError(f'{browser} did not report the window probe: {done.stderr}')
+        finally:
+            server.shutdown()
+            thread.join(TEST_HANG_GUARD_SECS)
+    return results
+
+
+PICTURE = (b'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">'
+           + b'<rect width="400" height="300" fill="#c33"/></svg>')
+WINDOW_BROWSERS = tuple(name for name in ('chrome', 'firefox') if shutil.which('google-chrome' if name == 'chrome' else name))
+
+
+def window_page(probe: str, actions: tuple[str, ...] = (), before_title: str = '', after_title: str = '') -> bytes:
+    """Render a long owned page with a picture link, the New item window, the page actions and a probe."""
+    from scripts.review_links import change_page, console_theme, new_item_dialog
+
+    filler = ''.join(f'<p>Page line {index}</p>' for index in range(120))
+    content = (before_title + page_frame.title('Images', 'images') + after_title
+               + '<p><a href="/fixture/picture.svg" data-image-zoom><img src="/fixture/picture.svg" alt="A red picture" '
+               + 'width="80" height="60"></a></p>' + filler)
+    markup = change_page.document(content, 'Images').replace(
+        b'<html', b'<html data-theme="dark"', 1).replace(b'</head>', b'<style>' + console_theme.CSS.encode()
+                                                         + b'</style></head>', 1)
+    page = page_frame.with_owner(markup, 'images', PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)),
+                                 new_item_dialog.render, actions=actions)
+    return page.replace(b'</body>', b'<script>' + WINDOW_PROBE.encode() + probe.encode() + b'</script></body>', 1)
+
+
+class PageWindowTests(unittest.TestCase):
+    """While a page window is open, the action area stays above it and New item works."""
+
+    def run_window_probe(self, probe: str, actions: tuple[str, ...] = (), before_title: str = '',
+                         after_title: str = '') -> None:
+        if not WINDOW_BROWSERS:
+            self.skipTest('Chrome or Firefox is required for the window rule.')
+        with status_configuration():
+            page = window_page(probe, actions, before_title, after_title)
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({'/fixture/page.html': page, '/fixture/picture.svg': PICTURE},
+                                                      '/fixture/page.html', browser), [[]])
+
+    def test_new_item_opens_above_a_picture_and_its_screenshot_shows_the_picture(self) -> None:
+        self.run_window_probe(r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const link=document.querySelector('a[data-image-zoom]');
+  // The copy keeps the layout of the area when the window opens. The full width layout above the title is
+  // the case where the copy is a strip across the window.
+  document.querySelector('[data-page-actions]').removeAttribute('data-page-actions-beside');
+  link.click();
+  const picture=document.querySelector('[data-image-zoom-dialog]');
+  await painted();
+  check(picture.open,'The picture opens.');
+  const strip=picture.querySelector('[data-page-window-actions]');
+  const name=strip.querySelector('.page-owner-name').getBoundingClientRect();
+  check(strip.getBoundingClientRect().left<name.left-40
+   && document.elementFromPoint(name.left-20,(name.top+name.bottom)/2)===picture,
+   'A click left of the owner name reaches the window backdrop.');
+  check([...picture.querySelectorAll('[data-page-window-actions]>*')].every(control=>
+   getComputedStyle(control).boxShadow==='none' && getComputedStyle(control).backgroundColor==='rgba(0, 0, 0, 0)'),
+   'The copy in the window has no plate and no ring around its controls.');
+  check(pressNewItem('over the picture')!==null,'The press reaches New item.');
+  const capture=await newItemOver(picture,'the picture');
+  check(capture.place===location.pathname+'#console-window='+encodeURIComponent('/fixture/picture.svg'),
+   'The screenshot address names the open picture: '+capture.place);
+  await closeNewItem(picture,'the picture');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-image-zoom-dialog]')?.open===true,'the picture');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();''')
+
+    def test_new_item_stays_usable_while_new_item_is_open(self) -> None:
+        self.run_window_probe(r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  check(pressNewItem('with no window open')!==null,'The first press reaches New item.');
+  await until(()=>captures.length>0,'the first New item screenshot request');
+  const dialog=newItem();
+  check(dialog.open && onTop(dialog),'New item opens.');
+  check(captures[0].place===location.pathname,'With no other window open the screenshot address is the page.');
+  const copy=pressNewItem('over New item');
+  check(copy!==null && dialog.contains(copy),'The New item button over New item belongs to its window.');
+  await painted();
+  check(dialog.open && dialog.matches(':modal') && onTop(dialog),'A second press keeps New item open on top.');
+  const words=dialog.querySelector('textarea[name="words"]');
+  check(document.activeElement===words,'A second press moves the focus to the words box.');
+  words.value='A saved item.';
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  const send=dialog.querySelector('[type="submit"]');
+  await until(()=>!send.disabled,'Send');
+  let saved;
+  dialog.addEventListener('review-item-created',event=>{saved=event.detail.id;},{once:true});
+  send.click();
+  await until(()=>saved==='Q7','the saved item ID');
+  check(!dialog.open && !document.querySelector('[data-page-window-actions]'),'Send closes New item and removes the copy.');
+  check(document.activeElement===document.querySelector('[data-page-actions] [data-owner-new]'),
+   'Focus returns to the New item button on the page.');
+  // On a phone, New item is taller than the view. It stays centered, and its height clears the copy.
+  Object.assign(frameElement.style,{width:'390px',height:'844px'});
+  await painted();
+  check(pressNewItem('at 390 px')!==null,'The press reaches New item at 390 px.');
+  await until(()=>dialog.open,'New item at 390 px');
+  await painted();
+  for(const [name,control] of [['Close',dialog.querySelector('[data-close]')],['The words box',words],['Send',send]])
+   check(onTop(control),'At 390 px the New item control is on top: '+name+'.');
+  const box=dialog.getBoundingClientRect();
+  check(Math.abs(box.top-(innerHeight-box.bottom))<1 && box.top>=actionsBottom(),
+   'At 390 px New item stays centered below the action area.');
+  // A picture load or a resize measures New item again. The measure keeps the scroll of its body.
+  const body=dialog.querySelector('.new-item-body');
+  words.style.minHeight='1000px';
+  body.scrollTop=1e4;
+  await painted();
+  const end=body.scrollTop;
+  check(end>0,'At 390 x 844 the New item body scrolls: '+end+'.');
+  document.dispatchEvent(new Event('load'));
+  dispatchEvent(new Event('resize'));
+  await painted();
+  check(body.scrollTop===end,'A picture load and a resize keep the scroll of the New item body: '+end+' became '+body.scrollTop+'.');
+  // On a desktop, the copy is beside New item, so New item keeps the place and the height of main.
+  Object.assign(frameElement.style,{width:'1440px',height:'900px'});
+  await painted();
+  const wide=dialog.getBoundingClientRect();
+  check(Math.abs(wide.top-(innerHeight-wide.bottom))<1 && getComputedStyle(dialog).maxHeight===(innerHeight-32)+'px'
+   && (Math.abs(wide.top-16)<1 || wide.height<innerHeight-32),
+   'At 1440 x 900 New item has the place and the height limit of main: '+JSON.stringify(wide));
+  dialog.querySelector('[data-cancel]').click();
+  // A 24-letter owner name makes the controls wider. At 900 px a 10-letter name does not meet New item; this one does.
+  document.querySelector('[data-page-actions] .page-owner-name').textContent='Review and console admin';
+  Object.assign(frameElement.style,{width:'900px',height:'700px'});
+  await painted();
+  check(pressNewItem('with a long owner name')!==null,'The press reaches New item with a long owner name.');
+  await until(()=>dialog.open,'New item with a long owner name');
+  await painted();
+  const long=dialog.getBoundingClientRect();
+  check(onTop(dialog.querySelector('[data-close]')) && long.top>=actionsBottom()
+   && Math.abs(long.top-(innerHeight-long.bottom))<1,
+   'With a long owner name at 900 px, Close is on top and New item stays centered below the action area.');
+  dialog.querySelector('[data-cancel]').click();
+ }catch(error){failures.push(String(error));}
+ await report();
+})();''')
+
+    def test_a_page_action_sits_before_new_item_and_opens_its_dialog_over_a_window(self) -> None:
+        report = page_frame.page_action_button('report', 'list-checks', 'Report', 'report-dialog')
+        with self.assertRaisesRegex(ValueError, 'reserved page action: new-item'):
+            _ = page_frame.page_action_button('new-item', 'list-checks', 'New item', 'report-dialog')
+        dialog = page_frame.console_dialog('report-dialog', 'report-title', 'Report', '<p>The report.</p>')
+        self.run_window_probe(r'''
+document.body.insertAdjacentHTML('beforeend',REPORT_DIALOG);
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const owner=document.querySelector('[data-page-actions] .page-owner');
+  const order=[...owner.children].map(control=>control.matches('.page-owner-name') ? 'name'
+   : control.matches('[data-page-action="report"]') ? 'report' : control.matches('[data-owner-new]') ? 'new' : '?');
+  check(order.join()==='name,report,new','The page action sits between the owner name and New item: '+order.join());
+  document.querySelector('a[data-image-zoom]').click();
+  const picture=document.querySelector('[data-image-zoom-dialog]');
+  await painted();
+  const home=owner.querySelector('[data-page-action]').getBoundingClientRect();
+  const hit=document.elementFromPoint((home.left+home.right)/2,(home.top+home.bottom)/2)?.closest('button');
+  check(picture.open && Boolean(hit) && picture.contains(hit) && hit.matches('[data-page-action="report"]')
+   && hit.getAttribute('aria-label')==='Report','The open picture has a copy of the page action on top at its place.');
+  if(!hit) throw new Error('The press does not reach the page action.');
+  hit.focus();
+  hit.click();
+  const dialog=document.querySelector('#report-dialog');
+  await painted();
+  check(dialog.open && onTop(dialog) && picture.open,'The page action opens its dialog above the picture.');
+  const own=document.elementFromPoint((home.left+home.right)/2,(home.top+home.bottom)/2)?.closest('button');
+  check(Boolean(own) && dialog.contains(own) && own.matches('[data-page-action="report"]'),
+   'The open dialog has its own copy of the page action on top.');
+  own?.focus();
+  own?.click();
+  await painted();
+  check(dialog.open && document.activeElement===dialog.querySelector('[data-close]'),
+   'A press on the copy inside its own open dialog moves the focus to the first control of the dialog.');
+  dialog.querySelector('[data-close]').click();
+  await painted();
+  check(!dialog.open && picture.open && document.activeElement===hit,
+   'Closing the dialog leaves the picture open with the focus on the page action copy.');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''.replace('REPORT_DIALOG', json.dumps(dialog).replace('<', '\\u003c')), (report,))
+
+    def test_the_heading_row_is_right_before_the_script_and_does_not_move_on_load(self) -> None:
+        # The hook records the column width when the script in the heading row measures it the first time.
+        hook = ('<script>{const measure=measurePageActions;window.measurePageActions=()=>{'
+                + 'window.columnAtMeasure??=getComputedStyle(document.querySelector(\'main\')).maxWidth;measure();};}'
+                + '</script>')
+        parsed = ('<script>window.besideAtParse=document.querySelector(\'[data-page-actions]\')'
+                  + '.hasAttribute(\'data-page-actions-beside\');</script>')
+        self.run_window_probe(r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const area=document.querySelector('[data-page-actions]'), title=document.querySelector('h1');
+  check(window.besideAtParse===true && area.hasAttribute('data-page-actions-beside'),
+   'The area is beside the title before the browser reads the content after the title.');
+  check(window.columnAtMeasure==='1124px' && getComputedStyle(document.querySelector('main')).maxWidth==='1124px',
+   'The measure script sees the final column width: '+window.columnAtMeasure);
+  // Read the layout at once: the frame script measures again before the next frame.
+  area.removeAttribute('data-page-actions-beside');
+  const controls=Math.max(...[...area.children].map(control=>control.getBoundingClientRect().bottom));
+  check(title.getBoundingClientRect().top>=controls,'Without the script the controls stay above the title.');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();''', before_title=hook, after_title=parsed)
+
+    def test_only_the_action_area_stays_in_view_at_the_end_of_a_long_page(self) -> None:
+        self.run_window_probe(r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const title=document.querySelector('h1'),area=document.querySelector('[data-page-actions]');
+  const name=area.querySelector('.page-owner-name'),button=area.querySelector('[data-owner-new]');
+  const before=[title,name,button].map(element=>element.getBoundingClientRect());
+  check(Math.abs(before[0].top-before[2].top-(before[2].height-before[0].height)/2)<1.5,
+   'At scroll zero the title and the button share one row.');
+  scrollTo({top:document.scrollingElement.scrollHeight,behavior:'instant'});
+  await painted();
+  check(scrollY>2000,'The page scrolls far.');
+  check(title.getBoundingClientRect().bottom<0,'The title scrolls out of view.');
+  const after=button.getBoundingClientRect();
+  check(Math.abs(after.top-8)<1 && Math.abs(after.right-before[2].right)<1,'The New item button sticks 8 px below the top.');
+  check(onTop(name),'The owner name stays in view and on top.');
+  check(pressNewItem('at the end of the page')!==null,'The press reaches New item at the end of the page.');
+  await until(()=>captures.length>0,'the New item screenshot request');
+  check(newItem().open && onTop(newItem()),'New item opens at the end of the page.');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();''')
 
 
 if __name__ == '__main__':
