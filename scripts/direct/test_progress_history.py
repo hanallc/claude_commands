@@ -2780,6 +2780,54 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual([(event["checkpoint_commit"], event["event_id"])
                           for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
 
+    def test_checkpoint_wait_matches_a_late_checkpoint_in_the_moved_worktree(self) -> None:
+        session = self.start_run("moved-late-checkpoint", 1000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 1010)
+        self.finish_numbered_phase(session, 1020, "--phase-id", "6")
+        started, = self.phase_events(session.name, "phase_started")
+        commit = self.fixture_commit("late checkpoint in moved worktree")
+        row = unit_runs.run_owner(self.read_state(session), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
+        moved = self.root / "moved-worktree"
+        _ = self.working_dir.rename(moved)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), moved), expected=row.worktree)
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--closed",
+                             "--phase-id", "6", "--commit", commit, at=1030)
+        checkpoint, = self.phase_events(session.name, "checkpoint")
+        self.assertEqual(checkpoint["working_dir"], str(moved))
+        self.assertEqual(started["working_dir"], str(self.working_dir))
+        wait_id = self.run_command("start-checkpoint-wait", "--commit", commit, "--working-dir", str(moved),
+                                   "--phase-id", "6", "--owner-session", "receiver", at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        wait, = cast(list[dict[str, object]], report["waits"])
+        self.assertEqual((wait["wait_id"], wait["run_id"], wait["phase_instance_id"], wait["working_dir"]),
+                         (wait_id, session.name, started["phase_instance_id"], str(moved)))
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            old_path = progress_history.resolve_checkpoint(commit, self.working_dir, "6")
+        self.assertIsInstance(old_path, progress_history.UnresolvedWaitAttribution)
+
+    def test_checkpoint_wait_records_unresolved_attribution_for_an_invalid_stored_path(self) -> None:
+        session = self.covered_wait_phase("invalid-checkpoint-path")
+        self.finish_numbered_phase(session, 1020, "--phase-id", "6")
+        commit = self.fixture_commit("checkpoint with invalid path")
+        _ = self.run_command("checkpoint", "--session-dir", str(session), "--closed",
+                             "--phase-id", "6", "--commit", commit, at=1030)
+        events = self.read_events(session.name)
+        checkpoint = events[-1]
+        self.assertEqual(checkpoint["event_type"], "checkpoint")
+        checkpoint["working_dir"] = str(self.working_dir) + "\0"
+        history = self.history_dir / "runs" / f"{session.name}.jsonl"
+        _ = history.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+        wait_id = self.run_command("start-checkpoint-wait", "--commit", commit, "--working-dir", str(self.working_dir),
+                                   "--phase-id", "6", "--owner-session", "receiver", at=1040)
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1050)))
+        self.assertEqual(report["waits"], [])
+        missing, = cast(list[dict[str, object]], report["missing"])
+        self.assertEqual(missing["wait_id"], wait_id)
+        self.assertEqual(missing["wait_record_state"],
+                         {"state": "NotRecorded", "reason": f"checkpoint {commit} has 1 records and 0 valid phase matches"})
+
     def test_checkpoint_of_a_transferred_unit_checks_its_current_folder_when_the_old_folder_remains(self) -> None:
         session = self.start_run("transferred-checkpoint", 1000, unit_owned=True)
         self.start_numbered_phase(session, "6", 1010)
@@ -2818,6 +2866,68 @@ print('two homes isolated; recorder lock retained; caller restored')
                                         "--commit", commit, at=1020)
         self.assertEqual([(event["checkpoint_commit"], event["event_id"])
                           for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
+
+    def test_checkpoint_closed_records_both_phases_and_uses_the_newest_instance(self) -> None:
+        session = self.covered_wait_phase("closed-checkpoints")
+        for phase_id, at in (("s4-coverage", 1020), ("s4-coverage", 1040), ("s4-sites-regex", 1060)):
+            self.start_numbered_phase(session, phase_id, at)
+            self.finish_numbered_phase(session, at + 5, "--phase-id", phase_id)
+        state_file = session / unit_runs.STATE_FILE
+        state_before = state_file.read_bytes()
+        finished = {event["phase_id"]: event for event in self.phase_events(session.name, "phase_finished")}
+        history_report = load_phases(self.read_events(session.name))
+        with patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.history_dir)}):
+            for phase_id, at in (("s4-coverage", 1080), ("s4-sites-regex", 1090)):
+                with self.subTest(phase_id=phase_id):
+                    commit = self.fixture_commit(phase_id)
+                    phase_args = ("--session-dir", str(session), "--phase", phase_id)
+                    timeline = self.run_command("timeline", *phase_args, at=at)
+                    trial = self.run_command("review-trial", *phase_args, at=at)
+                    command = ("checkpoint", "--session-dir", str(session), "--closed",
+                               "--phase-id", phase_id, "--commit", commit)
+                    recorded = self.run_command(*command, at=at)
+                    event = self.read_events(session.name)[-1]
+                    end = finished[phase_id]
+                    self.assertEqual((event["event_type"], event["event_id"], event["checkpoint_commit"]),
+                                     ("checkpoint", recorded, commit))
+                    for field in ("phase_id", "phase_instance_id", "phase_title", "phase_started_at"):
+                        self.assertEqual(event[field], end[field])
+                    self.assertEqual(event["timestamp_epoch"], at)
+                    history = self.history_dir / "runs" / f"{session.name}.jsonl"
+                    before = history.read_bytes()
+                    self.assertEqual(self.run_command(*command, at=at + 1), recorded)
+                    self.assertEqual(history.read_bytes(), before)
+                    resolved = progress_history.resolve_checkpoint(commit, self.working_dir, phase_id)
+                    assert isinstance(resolved, progress_history.ResolvedCheckpointPhase), resolved
+                    self.assertEqual(resolved.identity["event_id"], recorded)
+                    self.assertEqual(self.run_command("timeline", *phase_args, at=at), timeline)
+                    self.assertEqual(self.run_command("review-trial", *phase_args, at=at), trial)
+        self.assertEqual(load_phases(self.read_events(session.name)), history_report)
+        self.assertEqual(self.open_phase_ids(session), ["6"])
+        self.assertEqual(state_file.read_bytes(), state_before)
+
+    def test_checkpoint_closed_refuses_invalid_requests(self) -> None:
+        session = self.covered_wait_phase("closed-checkpoint-refusals")
+        self.start_numbered_phase(session, "7", 1020)
+        self.finish_numbered_phase(session, 1030, "--phase-id", "7")
+        self.start_numbered_phase(session, "7", 1040)
+        self.start_numbered_phase(session, "8", 1050)
+        self.finish_numbered_phase(session, 1060, "--phase-id", "8")
+        commit = self.fixture_commit("real checkpoint")
+        missing = "4d38667805cd7cdb0f8a0b8e2e6e1c4d3dc3e4f0"
+        for phase_args, value, message in (
+            ((), commit, "checkpoint --closed requires --phase-id"),
+            (("--phase-id", "7"), commit, "Phase 7 is open. Use checkpoint without --closed."),
+            (("--phase-id", "9"), commit, "Phase 9 has no finished instance"),
+            (("--phase-id", "8"), commit[:7], "checkpoint requires a full commit hash"),
+            (("--phase-id", "8"), missing, f"checkpoint refused: {missing} is not a commit in {self.working_dir}"),
+        ):
+            with self.subTest(message=message):
+                result = self.run_failing_command("checkpoint", "--session-dir", str(session), "--closed",
+                                                  *phase_args, "--commit", value, at=1070)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr.splitlines(), [message])
+        self.assertEqual(self.phase_events(session.name, "checkpoint"), [])
 
     def test_void_in_one_run_leaves_another_runs_checkpoint_of_the_same_commit(self) -> None:
         first = self.covered_wait_phase("void-run-a")
