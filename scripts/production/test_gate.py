@@ -196,7 +196,7 @@ class DirectGatePlacementTests(unittest.TestCase):
         self.assertIn("child finished", events.read_text().splitlines() if events.exists() else [], errors)
         return code
 
-    def test_direct_gate_uses_the_replacement_grant_after_settlement(self) -> None:
+    def test_direct_gate_requests_settlement_without_replacement(self) -> None:
         for flag, mode in (("--tests-only", gate.SuiteMode.GATE), ("--affected", gate.SuiteMode.TARGETED)):
             for blocked in (False, True):
                 with self.subTest(flag=flag, blocked=blocked), tempfile.TemporaryDirectory() as folder:
