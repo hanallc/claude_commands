@@ -657,17 +657,12 @@ COMMENT_LIMIT_FILES: tuple[FileException, ...] = tuple(
         ("aws_target", "Some numeric rows lack a limit line."),
         ("build_folders", "Some key blocks lack a comment."),
         ("build_steps", "Some key blocks lack a comment."),
-        ("build_targets", "Some numeric rows lack a limit line."),
         ("console", "Some key blocks lack a comment."),
         ("copies", "Some key blocks lack comments or numeric limits."),
         ("design_roles", "Some key blocks lack a comment."),
-        ("lint", "Some numeric rows lack a limit line."),
-        ("mac_linux", "Some numeric rows lack a limit line."),
         ("memory_feed", "Some numeric rows lack a limit line."),
         ("models", "Some key blocks lack comments or numeric limits."),
         ("production", "Some numeric rows lack a limit line."),
-        ("stall_watch", "Some numeric rows lack a limit line."),
-        ("statusline", "Some numeric rows lack a limit line."),
     )
 )
 

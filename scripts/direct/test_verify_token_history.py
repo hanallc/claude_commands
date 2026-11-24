@@ -5,9 +5,12 @@ import subprocess
 import unittest
 from typing import cast
 from pathlib import Path
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.recorder_fixture import record_wait_workers
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_pressure_reading
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 
@@ -16,6 +19,7 @@ class VerifyTokenHistoryTests(VerifyTokenWaitFixture):
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
         board = self.root / "board"
         self.record_phase(board)
+        admission = caller_admission(self, self.root, self.environment)
         runner = staff.caller_identity()
         if runner:
             record_wait_workers(self.root, board, self.environment, {"fixture-second": "thread-second"},
@@ -47,11 +51,22 @@ exit 0
         self.started_groups.add(first.pid)
         try:
             self.wait_for_running(self.root / "running", first)
+            admission.hold_starts()
+            prior_waits = len(self.phase_waits(board))
             second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                       env=second_environment, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
             self.started_groups.add(second.pid)
             try:
+                def memory_wait_recorded() -> bool:
+                    return any(row["event_type"] == "wait_started" and row["wait_reason"] == "memory admission"
+                               for row in self.phase_waits(board)[prior_waits:])
+
+                wait_until(lambda: memory_wait_recorded() or second.poll() is not None,
+                           self.root / "history/runs", processes=(second,), watch_writes=True)
+                self.assertTrue(memory_wait_recorded(), "second verify never recorded its memory wait")
+                write_pressure_reading(admission.readings.pressure_path)
+                admission.server.wake_loop()
                 self.wait_for_running(waiting, second)
                 self.assertIsNone(second.poll(), "second verify exited before the token was released")
                 self.assertEqual(len(self.records()), 0)
@@ -87,7 +102,7 @@ exit 0
         self.assertGreater(second_wait, first_wait)
         starts = [row for row in self.phase_waits(board) if row["event_type"] == "wait_started"]
         finished = [row for row in self.phase_waits(board) if row["event_type"] == "wait_finished"]
-        # The second call waits for its start time after the first start, then for the token.
+        # The second call waits for memory admission, then for the token.
         self.assertEqual([(row["wait_kind"], row["wait_reason"], row["phase_id"]) for row in starts],
                          [("WaitingForMemoryOrSlot", "memory admission", "6"),
                           ("WaitingForMemoryOrSlot", "cargo token", "6")], second_output)

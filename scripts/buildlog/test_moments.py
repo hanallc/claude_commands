@@ -24,6 +24,7 @@ from scripts.buildlog import test_report as report_fixtures
 from scripts.buildlog import test_memory_window as memory_fixtures
 from scripts.buildlog.test_index import Record, call, sample, step
 from scripts.buildlog.test_memory_window import write_lint_config
+from scripts.lib import conf
 
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
@@ -632,11 +633,12 @@ with index.read_only() as connection:
         target = memory_fixtures.cargo_output(self.journal.base / "cargo-output")
         at = START + timedelta(days=1)
         moment = moments.MemoryMoment(at, "fixture budget raise")
-        before_messages = [memory_fixtures.earlyoom_message(number) for number in range(6)]
+        adjustment = conf.read("lint").whole("build_oom_score_adj")
+        before_messages = [memory_fixtures.earlyoom_message(number, adj=adjustment) for number in range(6)]
         before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline=f"{target}/debug/test"))
         before_messages.extend((memory_fixtures.earlyoom_message(11, adj=200, cmdline="/usr/bin/editor"),
                                 memory_fixtures.earlyoom_message(12, adj=None)))
-        after_messages = [memory_fixtures.earlyoom_message(20),
+        after_messages = [memory_fixtures.earlyoom_message(20, adj=adjustment),
                           memory_fixtures.earlyoom_message(21, adj=200, cmdline=f"{target}/debug/test"),
                           memory_fixtures.earlyoom_message(22, adj=100, cmdline=f"{target}/release/test"),
                           memory_fixtures.earlyoom_message(23, adj=None)]
@@ -680,7 +682,7 @@ with index.read_only() as connection:
         self.assertEqual(cells["Memory wait p90"]["After"], "1.0 min")
         self.assertEqual(cells["Memory-kill retries/day"]["After"], "5.0 [1.0 stopped]")
         self.assertFalse(any(line.startswith(("| Rate |", "| Kind |")) for line in lines))
-        for definition in ("oom_score_adj 500", "stall_full_us", "zero waits included", "sum(mem_kills)"):
+        for definition in (f"oom_score_adj {adjustment}", "stall_full_us", "zero waits included", "sum(mem_kills)"):
             self.assertEqual(sum(definition in line for line in lines), 1)
 
     def test_memory_and_build_windows_cut_only_at_their_own_track_and_name_overlaps(self) -> None:
@@ -725,8 +727,9 @@ with index.read_only() as connection:
     def test_short_memory_window_marks_thin_and_normalizes_kills_by_elapsed_days(self) -> None:
         at = END - timedelta(hours=6)
         moment = moments.MemoryMoment(at, "fixture short trial")
+        adjustment = conf.read("lint").whole("build_oom_score_adj")
         self.journal.stub_journal(early=[memory_fixtures.journal_entry(
-            at + timedelta(minutes=1), memory_fixtures.earlyoom_message(30))], kernel=[])
+            at + timedelta(minutes=1), memory_fixtures.earlyoom_message(30, adj=adjustment))], kernel=[])
         with mock.patch.object(moments, "MOMENTS", (moment,)):
             lines = self.fixture.section(day="2026-10-11")
         self.assertIn("Before: 7.000 days; after: 0.250 days (thin).", lines)

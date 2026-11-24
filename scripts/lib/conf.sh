@@ -89,7 +89,39 @@ conf_value() {
             fi
         fi
     fi
-    if [[ "$valid" == 1 ]]; then printf '%s\n' "$value"
+    if [[ "$valid" == 1 ]]; then
+        if [[ -n "${CONF_SHIFT_READ_LOG:-}" ]]; then
+            name="$key"
+            [[ "$host_seen" != 1 ]] || name="$key.$_CONF_HOST"
+            conf_record_shift "$folder/$file.conf" "$name" "$value"
+        fi
+        printf '%s\n' "$value"
     else "$_CONF_LIB/py" "$_CONF_LIB/conf.py" get "$file" "$key"
     fi
+}
+
+
+# Scan the selected key only when the caller traces config reads.
+conf_record_shift() {
+    local path="$1" selected="$2" value="$3"
+    local raw line key previous="" before_limit="" mark
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        line="${raw%%[[:space:]]\#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$line" != \#* && "$line" == *=* ]]; then
+            key="${line%%=*}"
+            key="${key%"${key##*[![:space:]]}"}"
+            if [[ "$key" == "$selected" ]]; then
+                if [[ ( "$previous" == '# whole:'* || "$previous" == '# range:'* ) &&
+                      "$before_limit" == '# test config shift: '*" $value" ]]; then
+                    mark="${before_limit#'# test config shift: '}"
+                    { printf '%s:%s: %s -> %s\n' "${path##*/}" "$key" "${mark%% *}" "$value" >> "$CONF_SHIFT_READ_LOG"; } 2>/dev/null || :
+                fi
+                return 0
+            fi
+        fi
+        before_limit="$previous"
+        previous="${raw#"${raw%%[![:space:]]*}"}"
+        previous="${previous%"${previous##*[![:space:]]}"}"
+    done 2>/dev/null < "$path" || :
 }

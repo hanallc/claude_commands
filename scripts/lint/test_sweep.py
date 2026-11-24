@@ -463,6 +463,11 @@ class LastUseTests(SweepCase):
 
 
 class DepInfoTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(conf.path("lint"), "sweep_dep_info_head_bytes=4096\n")
+
     def test_names_the_copy_in_its_directory(self) -> None:
         target = self.target()
         directory = str(target.tree / "examples")
@@ -1690,6 +1695,7 @@ def cut_stamp(seconds: float) -> str:
 FLOOR_TEST_SETTINGS = (
     "sweep_cold_crates=50\nsweep_measurement_paths=3\nsweep_alert_interval_seconds=3600\n"
     + "sweep_delete_stamp_grace_seconds=2\n"
+    + "sweep_unexplained_fall_bytes=10737418240\nsweep_growth_window_seconds=1800\n"
 )
 
 
@@ -5128,6 +5134,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_crossing_names_the_largest_choice_when_no_choice_frees_enough(self) -> None:
         with self.crossing_delivery({}) as delivery:
+            _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=1024\n")
             _ = write_config_fixture(conf.path("lint"), "sweep_alert_folder_count=5\n")
             measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
                 sweep.OutsideCacheDirectory("/tmp/claude/largest", 60 * GIB, 0, sweep.NoLargestGrowingChild()),
@@ -5177,7 +5184,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         ):
             with self.subTest(event=event), self.crossing_delivery({}) as delivery:
                 _ = write_config_fixture(conf.path("lint"),
-                    "sweep_alert_folder_count=3\nsweep_message_path_widths=80 40\n")
+                    "sweep_alert_folder_count=3\nsweep_message_limit=1024\nsweep_message_path_widths=80 40\n")
                 paths = {name: f"/private/folder-list/{name}"
                          for name in ("largest", "second", "third", "fourth", "fifth", "empty")}
                 if event in ("long path", "text limit"):
@@ -5378,6 +5385,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_protected_recommendation_names_its_folder_among_several_choices(self) -> None:
         with self.crossing_delivery({}) as delivery:
+            _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=500\n")
             with self.measured_output_roots(("/private/larger", "/private/smaller")):
                 self.finalize_crossing(140, protected=(("/private/larger", 27 * GIB), ("/private/smaller", 20 * GIB)))
             recommendation = ("Review /private/larger first (recommended): deleting it frees 27.0 GiB, "
@@ -6247,7 +6255,7 @@ raise SystemExit(int(os.environ[variable]))
 
     def test_holder_message_uses_the_first_configured_path_width_and_reports_removal(self) -> None:
         _ = write_config_fixture(conf.path("lint"),
-                                 "sweep_message_path_widths=24 16\n")
+                                 "sweep_message_path_widths=24 16\nsweep_message_limit=365\n")
         holder = sweep.FloorHolder("/phase46/" + "a" * 70 + "/target", 2 * GIB, 46,
                                    "maps build output", "phase46")
 
@@ -6343,6 +6351,8 @@ raise SystemExit(int(os.environ[variable]))
         self.assertNotIn("-2.0 GiB", message)
 
     def test_long_paths_fit_phone_and_keep_each_last_component(self) -> None:
+        _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=1024\n"
+                                 + "sweep_message_path_widths=256 128 96 72 56 40 24 16\n")
         now = time.time()
         directories = [
             sweep.OutsideCacheDirectory(
@@ -7830,11 +7840,14 @@ class LockHolderTests(unittest.TestCase):
         def never_held(*_args: object, **_kwargs: object) -> io.StringIO:
             return io.StringIO(other)
 
+        settings = base / "lint.conf"
+        _ = write_config_fixture(settings, "sweep_proc_locks_reads=2\n")
+        lint_settings = conf.read(settings)
         with mock.patch.object(file_lock, "open", create=True, side_effect=skip_once):
-            self.assertEqual(sweep.lock_holder(str(lock), "locks"), 4242)
+            self.assertEqual(sweep.lock_holder(str(lock), "locks", lint_settings=lint_settings), 4242)
         with mock.patch.object(file_lock, "open", create=True, side_effect=never_held) as opened:
-            self.assertIsNone(sweep.lock_holder(str(lock), "locks"))
-        self.assertEqual(opened.call_count, conf.read("lint").whole("sweep_proc_locks_reads"))
+            self.assertIsNone(sweep.lock_holder(str(lock), "locks", lint_settings=lint_settings))
+        self.assertEqual(opened.call_count, 2)
 
     @unittest.skipUnless(os.path.isfile(sweep.PROC_LOCKS), "the lock holder is read from /proc/locks")
     def test_a_live_flock_names_this_process(self) -> None:

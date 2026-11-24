@@ -46,8 +46,11 @@ A held target admits only work that its hold rules permit.
 A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
 The caller checks the targets in `targets` in the order the file lists them.
 It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-The current rules permit natedev and `mac-linux` for a full gate and for nightly suites.
-Named module tests and promotion without tests use natedev.
+The current rules permit natedev and `mac-linux` for full gates, named module tests, and nightly suites.
+Named module tests on `mac-linux` use `run.time_limit_seconds` from the guest settings.
+A nested named gate always reuses its live parent reservation on natedev.
+For named gates, `BUILDLOG_GATE_TARGETS` applies only to standalone runs.
+Promotion without tests uses natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 Hana gates have no repository default.
 The Builds page shows both candidates while a gate with both targets waits or runs.
@@ -614,10 +617,20 @@ No package selects the whole workspace.
 | `example [<package>] [--name <name>]` | Workspace or named example selection. |
 | `final [<package>] [--saved] [--tree <tree>]` | Workspace check and selected tests, or a saved-pass query. |
 | `test,lint,doc [<package>]` | Run a comma list of `test`, `lint`, and `doc` in the given order. |
+| `check + lint + test hana + test hana_diegetic + doc --mac "Mac-only docs"` | Run a step list in the given order. |
 
-A verb list accepts one optional package and no verb flags. The first failure ends the list with its status.
-On Linux, the parent initializes `BUILDLOG_RUN` once. Each verb inherits it and uses its own call record.
-Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
+A comma list accepts one optional package and no verb flags. A lone `+` cannot be the package.
+A step list uses a lone `+` between `check`, `test`, `lint`, and `doc` steps.
+The splitter keeps `+` when a flag expects a value.
+Each step uses its own package and flags. A routing flag applies only to its step.
+Verify checks the argument form of every step before it starts the list. A usage error exits 2.
+Each step checks its package when it runs.
+The first failure ends either list with its status.
+On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
+Both list forms keep the queue place during checkout for steps that share the slot.
+A `doc` step with its own slot uses `NO_RUN` in its placement request.
+A standalone step with its own checkout slot also uses `NO_RUN`.
+Steps with `NO_RUN` can leave their grants without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.
@@ -681,6 +694,7 @@ A wall-clock jump can move a retry deadline because that offset is read once.
 A content key ignores touch-only changes.
 
 A lint key includes the compiler, mend, nightly rustfmt, clippy, and Taplo versions.
+Plain lint shares one key across packages. Verify checks a named package before it returns a cached lint result.
 Per-call version files avoid repeated probes.
 Unknown or empty tool versions prevent reuse and publication.
 `lint_code_key` covers verify.sh, the installed invoke.sh, and the selected lint configuration.

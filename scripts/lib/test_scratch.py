@@ -1890,7 +1890,8 @@ print(scratch.target('gate:proof', 'tree'))
         result = subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", probe], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()).parent, copy_record.root())
-        self.assertRegex(Path(result.stdout.strip()).name, r"^gate-proof-tree-[a-z0-9]{6}$")
+        suffix_length = conf.read("scratch").whole("suffix_length")
+        self.assertRegex(Path(result.stdout.strip()).name, rf"^gate-proof-tree-[a-z0-9]{{{suffix_length}}}$")
 
     def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
         path = self.copy()
@@ -2818,17 +2819,20 @@ print(scratch.target('gate:proof', 'tree'))
         self.assertRegex(path.name, r"^proof-[a-z0-9]+$")
 
     def test_no_task_lasts_a_day_and_until_ends_at_its_time(self) -> None:
-        path = scratch.new(now=1_000_000.0)
+        now = 1_000_000.0
+        expires_at = now + conf.read("scratch").whole("default_life_seconds")
+        minute_boundary = expires_at - expires_at % 60
+        path = scratch.new(now=now)
         record = scratch.task_of(path)
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         task = record.task
-        deadline = scratch.task_end(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds"))
+        deadline = scratch.task_end(task, minute_boundary)
         self.assertIsInstance(deadline, scratch.Ended)
         assert isinstance(deadline, scratch.Ended)
-        self.assertEqual(deadline.at, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds") - 40)
-        self.assertFalse(scratch.ended(task, 1_000_000.0))
-        self.assertTrue(scratch.ended(task, 1_000_000.0 + conf.read("scratch").whole("default_life_seconds")))
+        self.assertEqual(deadline.at, minute_boundary)
+        self.assertFalse(scratch.ended(task, minute_boundary - 1))
+        self.assertTrue(scratch.ended(task, minute_boundary))
         self.assertFalse(scratch.ended(RUN, 9e12))
         self.assertTrue(scratch.parsed_until("2026-10-28 09:30").startswith("until:2026-10-28T"))
         with self.assertRaises(scratch.ScratchError):
@@ -2873,7 +2877,8 @@ print(scratch.target('gate:proof', 'tree'))
     def test_new_makes_a_recorded_folder_for_its_task(self) -> None:
         path = scratch.new(RUN, "gate")
         self.assertEqual(path.parent, self.base / "scratch")
-        self.assertRegex(path.name, r"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{6}$")
+        suffix_length = conf.read("scratch").whole("suffix_length")
+        self.assertRegex(path.name, rf"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{{{suffix_length}}}$")
         record = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
         self.assertEqual((record["task"], record["maker"]), (RUN, MAKER_ID))
 
@@ -2890,6 +2895,7 @@ print(scratch.target('gate:proof', 'tree'))
             peer_paths: list[Path] = []
             jobs = ((worker, ""), (worker, "clone"), (peer, ""))
             program = Path(__file__).resolve().parents[2] / "scripts/lib/py"
+            suffix_length = conf.read("scratch").whole("suffix_length")
 
             def create(job: tuple[staff.StaffRow, str]) -> subprocess.CompletedProcess[str]:
                 owner, name = job
@@ -2904,7 +2910,8 @@ print(scratch.target('gate:proof', 'tree'))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     path = Path(result.stdout.strip())
                     self.assertEqual(path.parent, parent)
-                    self.assertRegex(path.name, rf"^sdlc-hierarchies-{owner.name}-[a-z0-9]{{6}}" + ("-clone$" if name else "$"))
+                    self.assertRegex(path.name, rf"^sdlc-hierarchies-{owner.name}-[a-z0-9]{{{suffix_length}}}"
+                                     + ("-clone$" if name else "$"))
                     record = scratch.task_of(path)
                     self.assertIsInstance(record, copy_record.Registered)
                     assert isinstance(record, copy_record.Registered)

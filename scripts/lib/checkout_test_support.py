@@ -46,13 +46,18 @@ def copy_with_bytecode(source: Path, destination: Path) -> None:
 
 def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
     """Copy missing runtime files and keep the fixture's existing tools."""
+    from scripts.lint.memory_test_support import copy_config_file_fixture
+
     for relative in runtime_files():
         if not configuration and relative.parts[0] == "config":
             continue
         destination = checkout / relative
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            copy_with_bytecode(SOURCE / relative, destination)
+            if relative.parts[0] == "config" and relative.suffix == ".conf":
+                _ = copy_config_file_fixture(SOURCE / relative, destination)
+            else:
+                copy_with_bytecode(SOURCE / relative, destination)
 
 
 def copy_startup(checkout: Path) -> None:
