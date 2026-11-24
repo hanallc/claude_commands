@@ -663,7 +663,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             with release.open("rb+", buffering=0) as pipe:
                 self.assertEqual(pipe.write(b"x"), 1)
                 self.assertTrue(candidate_ended.wait(COPY_FIXTURE_WAIT_SECONDS), "the copy candidate did not end")
-        self.assertFalse(self.candidate_active())
+        self.wait_until(lambda: not self.candidate_active(), "candidacy to end")
         values = self.finish_watcher(terminate=True)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual((values["copy"], values["copy_count"]), ("declined", "1"))
