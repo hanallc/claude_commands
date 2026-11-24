@@ -2688,7 +2688,7 @@ def main(argv: list[str] | None = None) -> int:
                               add_evidence=add_evidence or "")
             if isinstance(changed, UnchangedEdit):
                 return 0
-            return _notify_producer_assignment(changed.item, changed.before.producer, morty, caller=caller.id)
+            return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
         if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "unpark", "close", "reopen"):
             raise ListError(f"only morty can run {name}")
         assert source is not None

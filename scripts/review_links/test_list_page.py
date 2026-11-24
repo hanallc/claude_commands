@@ -7455,6 +7455,164 @@ window.fetch=async(path,options={})=>{
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
 
+    def test_assigned_producer_receives_and_answers_a_legacy_list_question(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        keeper = staff.StaffId("legacy-keeper")
+        for recover in (False, True):
+            with self.subTest(recover=recover):
+                item = self.add("Check the legacy List item")
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                legacy = the_list.folder(keeper)
+                legacy.mkdir(parents=True, exist_ok=True)
+                source = legacy / f"{item.id}.md"
+                _ = (the_list.folder(MORTY.id) / source.name).rename(source)
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(status.root))
+                with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+                    asked = list_page.submit(status.root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action="question",
+                        words="Which check passed?", until="")), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                claimed = delivery.job.record
+                self.assertEqual(claimed.recipient_id, DWIGHT.id)
+                self.assertEqual(claimed.source.path, str(source.resolve()))
+                path = status.path(delivery.page, delivery.row)
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                    if recover:
+                        with status.locked():
+                            change_page.advance_question_attempt(path, claimed, replace(
+                                claimed, state=delivery_state.QuestionSendState.READY,
+                                owner=delivery_state.NoQuestionSendOwner()))
+                        _ = delivery.job.release()
+                        change_page.recover_review_messages(status)
+                    else:
+                        list_page.deliver(asked)
+                with self.subTest(check="delivery"):
+                    send.assert_called_once_with(DWIGHT.id, claimed.message, claimed.message_id)
+                    self.assertIs(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+                command = claimed.message.split("Answer with this command: ", 1)[1].splitlines()[0]
+                arguments = ["The smoke test passed." if word == "<answer>" else word
+                             for word in shlex.split(command)[2:]]
+                with (patch.object(staff, "caller_identity", return_value=DWIGHT.current_session),
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+                    result = the_list.main(arguments)
+                self.assertEqual(result, 0, errors.getvalue())
+                answered = the_list.load(keeper, item.id)
+                answer = answered.questions[0].answer
+                assert isinstance(answer, question_record.Answer)
+                self.assertEqual(answer.text, "The smoke test passed.")
+                self.assertEqual(answered.log[-1].source, DWIGHT.name)
+                self.assertEqual(answered.unread_since, NOW)
+
+    def test_list_question_delivery_accepts_a_keeper_folder_symlink(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        legacy_keeper = staff.StaffId("legacy-keeper")
+        for keeper in (MORTY.id, legacy_keeper):
+            folder = the_list.folder(keeper)
+            folder.parent.mkdir(parents=True, exist_ok=True)
+            external = self.root / ("external-" + keeper)
+            external.mkdir()
+            folder.symlink_to(external, target_is_directory=True)
+        for mode in ("direct", "recovery", "old recovery"):
+            with self.subTest(mode=mode):
+                keeper = MORTY.id if mode == "old recovery" else legacy_keeper
+                item = self.add("Check the linked List folder")
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                source = the_list.folder(keeper) / f"{item.id}.md"
+                if keeper != MORTY.id:
+                    _ = (the_list.folder(MORTY.id) / source.name).rename(source)
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(status.root))
+                with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+                    asked = list_page.submit(status.root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action="question",
+                        words="Which check passed?", until="")), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                claimed = delivery.job.record
+                self.assertEqual(claimed.source.path, str(source.resolve()))
+                self.assertEqual(claimed.recipient_id, DWIGHT.id)
+                path = status.path(delivery.page, delivery.row)
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                    if mode == "direct":
+                        list_page.deliver(asked)
+                    else:
+                        with status.locked():
+                            change_page.advance_question_attempt(path, claimed, replace(
+                                claimed, state=delivery_state.QuestionSendState.READY,
+                                owner=delivery_state.NoQuestionSendOwner()))
+                            if mode == "old recovery":
+                                fields = delivery_state.read_fields(path)
+                                attempt = cast(dict[str, object], fields["question_attempt"])
+                                saved_source = cast(dict[str, object], attempt["source"])
+                                _ = saved_source.pop("keeper", None)
+                                _ = path.write_text(json.dumps(fields) + "\n")
+                        _ = delivery.job.release()
+                        change_page.recover_review_messages(change_page.DeliveryStatus(status.root))
+                send.assert_called_once_with(DWIGHT.id, claimed.message, claimed.message_id)
+                delivered = change_page.read_question_attempt(path)
+                self.assertIs(delivered.state, delivery_state.QuestionSendState.SENT)
+                self.assertEqual(delivered.message_id, claimed.message_id)
+                fields = delivery_state.read_fields(path)
+                attempt = cast(dict[str, object], fields["question_attempt"])
+                saved_source = cast(dict[str, object], attempt["source"])
+                if mode == "old recovery":
+                    self.assertNotIn("keeper", saved_source)
+                else:
+                    self.assertEqual(saved_source["keeper"], keeper)
+
+    def test_restart_recovers_an_old_question_through_mortys_list_link(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        folder = the_list.folder(MORTY.id)
+        linked = the_list.folder(OTHER.id)
+        linked.mkdir(parents=True)
+        folder.parent.mkdir(parents=True)
+        folder.symlink_to(linked, target_is_directory=True)
+        item = self.add("Check the linked List folder")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+            asked = list_page.submit(status.root, urlencode(self.fields(
+                item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        claimed = delivery.job.record
+        self.assertEqual(claimed.source.path, str(linked / f"{item.id}.md"))
+        self.assertIn(f" --keeper {MORTY.id} ", claimed.message)
+        path = status.path(delivery.page, delivery.row)
+        with status.locked():
+            change_page.advance_question_attempt(path, claimed, replace(
+                claimed, source=replace(claimed.source, keeper=delivery_state.NoSavedListKeeper()),
+                state=delivery_state.QuestionSendState.READY, owner=delivery_state.NoQuestionSendOwner()))
+        _ = delivery.job.release()
+
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            change_page.recover_review_messages(change_page.DeliveryStatus(status.root))
+        send.assert_called_once_with(DWIGHT.id, claimed.message, claimed.message_id)
+        self.assertIs(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+
+    def test_item_action_notices_go_to_the_keeper_when_the_producer_differs(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check the notice recipient")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        for action, until in (("park", "2026-12-03"), ("unpark", ""), ("remove", "")):
+            with self.subTest(action=action):
+                fields = self.fields(item, action, until=until)
+                with patch.object(change_page, "send_to_staff") as send:
+                    list_page.deliver(list_page.submit(root, urlencode(fields)))
+                item = the_list.load(MORTY.id, item.id)
+                notice = the_list.feedback_requests(item)[fields["request"]]
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[0], MORTY.id)
+                self.assertEqual(notice.recipient_id(MORTY.id), MORTY.id)
+                self.assertEqual(notice.state, "sent")
+
     def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
         root = self.root / "reviews"
         for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):

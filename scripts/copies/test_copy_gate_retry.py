@@ -77,6 +77,8 @@ class CopyGateRetryTests(unittest.TestCase):
 
             assert Path.cwd() == Path(sys.argv[2])
             assert Path(os.environ["BUILDLOG_PREPARED_COPY"]) == Path.cwd()
+            with os.fdopen(int(os.environ["BUILDLOG_PREPARED_GATE_FD"]), "rb") as handoff:
+                assert handoff.read(1) == b"1"
             assert os.environ["COPIES_STEP_OWNER"] == "fixture"
             os.fstat(int(os.environ["COPIES_COMMAND_LEASE_FDS"]))
             path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])
@@ -145,7 +147,7 @@ class CopyGateRetryTests(unittest.TestCase):
 
         self.assertEqual(status, 7, errors)
         self.assertEqual(self.runs.read_text().splitlines(), ["guest-attempt", "local-attempt"])
-        retry = "placement: retry — fixture-guest (mac-linux) did not answer. Requesting placement again.\n"
+        retry = "placement: retry — fixture-guest (mac-linux) did not answer. Received a replacement assignment.\n"
         self.assertEqual(output, b"guest-attempt stdout\xff\n" + retry.encode("utf-8") + b"local-attempt stdout\xff\n")
         self.assertEqual(errors, b"guest-attempt stderr\xfe\nlocal-attempt stderr\xfe\n")
 

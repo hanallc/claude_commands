@@ -13,8 +13,13 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
-// Use --queue-rows as the third argument for the dark desktop queue screenshot and the card right edge shot; a fourth argument names the before page.
+// Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
+// Use the fourth argument to select the older page.
+// Use --guest-tip after the output folder for the guest row tooltip screenshot.
 // Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
+// Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
+// Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
+// Add --awscosts as the fourth argument for the AWS costs proof and images.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -50,17 +55,42 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
 const gateMode = args[0] === '--gate';
 if (gateMode) args.shift();
-const [callerFolder, previousPage, comparison] = args;
+const [callerFolder, ...comparisonArgs] = args;
+const awsCostShots = !gateMode && comparisonArgs[0] === '--aws-cost-shots';
+const liveAwsCostSource = awsCostShots ? comparisonArgs[1] : undefined;
+const approvedAwsCostShot = awsCostShots && !liveAwsCostSource;
+const [previousPage, comparison] = awsCostShots ? [] : comparisonArgs;
+const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
+const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || standingProof;
+const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
-const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens'];
-const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU'];
+const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
+const queuedHeaders = ['#','Done','Waiting','Verify','Step','Pid','Machine','vCPU','Moved'];
+
+function waitForMoveHandle(evaluate, rowId) {
+  return evaluate(`new Promise((resolve, reject) => {
+    const walk = document.querySelector('#walk');
+    const selector = '.queue-grip[data-move-id="' + CSS.escape(${JSON.stringify(rowId)}) + '"]';
+    if (walk.querySelector(selector)) return resolve(true);
+    const observer = new MutationObserver(() => {
+      if (!walk.querySelector(selector)) return;
+      observer.disconnect();
+      clearTimeout(timeout);
+      resolve(true);
+    });
+    const timeout = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error('The waiting row has no move handle: ' + selector));
+    }, 3000);
+    observer.observe(walk, {childList:true, subtree:true});
+  })`);
+}
 
 // nate's standing orders for the Builds page (docs/plans/builds-page-standing-orders.md), checked at 1440 px and 900 px
 // on the served reading, which has rows in the shape of the live feed. The path names the page to check.
@@ -196,11 +226,12 @@ async function assertRowCenters(evaluate) {
       const key = table.dataset.tip;
       const chart = document.querySelector('.wrow[data-tip="' + key + '"]');
       const track = chart.querySelector('.track');
+      const held = key.startsWith('held:');
       const marks = Object.fromEntries([...table.cells].flatMap(cell => {
         const line = firstText(cell);
         return line ? [['column ' + cell.className, center(line)]] : [];
       }));
-      for (const [index, bar] of [...track.querySelectorAll('.b, .progress-track')].entries()) {
+      for (const [index, bar] of [...(held ? [] : track.querySelectorAll('.b, .progress-track'))].entries()) {
         marks['bar ' + index] = center(bar.getBoundingClientRect());
       }
       marks.name = center(firstText(chart.querySelector('.name')));
@@ -208,7 +239,7 @@ async function assertRowCenters(evaluate) {
         const line = firstText(element);
         return line ? [line.top] : [];
       });
-      return {key, track: center(track.getBoundingClientRect()), marks, detailTops};
+      return {key, track: held ? marks.name : center(track.getBoundingClientRect()), marks, detailTops};
     });
   })()`);
   assert.ok(rows.some(row => row.key.startsWith('row:')));
@@ -223,11 +254,11 @@ async function assertRowCenters(evaluate) {
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+  const fixtureOutput = liveAwsCostSource ? '' : execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture()))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
-  const page = await readFile(join(folder, 'memory_live.html'));
+  const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
+  const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
   const beforePath = queueRowsProof || standingProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
@@ -243,44 +274,99 @@ try {
   const waitTipComparison = comparison === '--wait-tip';
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
-  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
-  const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
-  const fixtureTime = readings.good.read_at;
-  for (const reading of Object.values(readings)) {
-    const shift = fixtureTime - reading.read_at;
-    for (const row of reading.walk) {
-      if (row.started_at) row.started_at += shift;
-      if (row.read_at) row.read_at += shift;
-      for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
-    }
-    for (const waiter of reading.waiters) waiter.since += shift;
-    reading.read_at = fixtureTime;
-  }
+  const awsCostsComparison = comparison === '--awscosts';
+  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || requestedShot);
+  const readings = liveAwsCostSource
+    ? {good: JSON.parse(await readFile(join(liveAwsCostSource, 'memory.json'), 'utf8'))}
+    : JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const base = readings.good;
-  base.waiters = structuredClone(readings.spacing.waiters);
-  base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
-  base.walk.find(row => row.queued).unit = 'handler';
-  base.walk.find(row => row.queued).showrunner = 'sdlc';
-  const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
-    category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
-  const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
-    'outside', {owner_count:1}));
-  const smaller = swapOwners.slice(base.swap_rows);
-  const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
-  const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
-  base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
-    reserve_share_percent:50};
-  base.swap_by = [...swapOwners.slice(0,base.swap_rows),
-    swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
-      {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
-    swapRow('Unclassified groups', 'ungrouped', 1024),
-    swapRow('Not attributed', 'unattributed', 7),
-    swapRow('All swap used', 'total', swapUsed, 'all')];
-  readings.shrink = structuredClone(base);
-  const extra = structuredClone(base.walk.find(row => row.queued));
-  extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
-  readings.shrink.walk.unshift(extra);
-  readings.shrink.waiters = [];
+  const queueShot = queueRowsProof && !beforePage;
+  const liveFixtureTime = queueShot || guestTipProof;
+  const fixtureTime = approvedAwsCostShot ? Date.parse('2026-11-23T20:00:00Z') / 1000
+    : liveFixtureTime ? Math.floor(Date.now() / 1000) : base.read_at;
+  const clockTime = liveAwsCostSource ? Date.now() : fixtureTime * 1000;
+  if (liveAwsCostSource) {
+    base.report = JSON.parse(await readFile(join(liveAwsCostSource, 'report.json'), 'utf8'));
+  } else {
+    await prepareFixtures();
+  }
+
+  async function prepareFixtures() {
+    const costs = JSON.parse(await readFile(join(folder, 'aws_cost_fixture.json'), 'utf8'));
+    if (approvedAwsCostShot) prepareApprovedAwsCosts(costs);
+    readings.aws_costs = {...structuredClone(readings.good), report_version:'aws-cost-proof',
+      report:{...readings.good.report, aws_costs:costs}};
+    for (const reading of Object.values(readings)) {
+      const shift = fixtureTime - reading.read_at;
+      for (const row of reading.walk) {
+        if (row.started_at) row.started_at += shift;
+        if (row.read_at) row.read_at += shift;
+        for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
+      }
+      for (const waiter of reading.waiters) waiter.since += shift;
+      if (liveFixtureTime) reading.fresh_until += shift;
+      reading.read_at = fixtureTime;
+    }
+    base.waiters = structuredClone(readings.spacing.waiters);
+    base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
+    base.walk.find(row => row.queued).unit = 'handler';
+    base.walk.find(row => row.queued).showrunner = 'sdlc';
+    const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
+      category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
+    const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
+      'outside', {owner_count:1}));
+    const smaller = swapOwners.slice(base.swap_rows);
+    const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
+    const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
+    base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
+      reserve_share_percent:50};
+    base.swap_by = [...swapOwners.slice(0,base.swap_rows),
+      swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
+        {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
+      swapRow('Unclassified groups', 'ungrouped', 1024),
+      swapRow('Not attributed', 'unattributed', 7),
+      swapRow('All swap used', 'total', swapUsed, 'all')];
+    readings.shrink = structuredClone(base);
+    const extra = structuredClone(base.walk.find(row => row.queued));
+    extra.name = 'second nextest'; extra.pid = 222; extra.key += '-second';
+    readings.shrink.walk.unshift(extra);
+    readings.shrink.waiters = [];
+  }
+  function prepareApprovedAwsCosts(costs) {
+    Object.assign(costs, {zone:'America/Los_Angeles', today:'2026-11-23', price_day:'2026-11-18',
+      read_at:Date.parse('2026-11-19T18:43:00Z') / 1000,
+      next_read_at:Date.parse('2026-11-20T18:43:00Z') / 1000, read_error:'AWS refuses the key'});
+    const daysWithoutRuns = [23,22,21,20].map(day => {
+      const amount = day === 20 ? '2.00' : '0.94';
+      return {day:'2026-11-' + day, state:'estimate', amount_usd:amount, runs:0, jobs:[], hana:null,
+        units:[], unrecorded_compute_usd:'0.00', no_run_usd:amount, runs_list:[]};
+    });
+    const [nov19, nov18] = costs.days;
+    Object.assign(nov18, {state:'billed', amount_usd:'7.73'});
+    Object.assign(nov19, {amount_usd:'5.53', runs:194, no_run_usd:'1.71'});
+    Object.assign(nov19.hana, {cost_usd:'0.70', idle_usd:'0.69', idle_seconds:8572});
+    const attempts = nov19.runs_list.filter(run => run.kind === 'hana');
+    const gates = nov19.runs_list.filter(run => run.kind === 'gate');
+    gates.push({...gates.at(-1), id:'fixture-extra'});
+    function setGroup(runs, job, cents) {
+      const share = Math.floor(cents / runs.length), extra = cents % runs.length;
+      runs.forEach((run, index) => {
+        run.job = job;
+        run.cost_usd = ((share + Number(index < extra)) / 100).toFixed(2);
+      });
+    }
+    setGroup(gates.slice(0,66), 'test affected', 107);
+    setGroup(gates.slice(66), 'test all', 205);
+    setGroup(attempts, null, 1);
+    attempts.forEach((run, index) => Object.assign(run, {
+      seconds:[0,0,0,44,47,41,50][index], region:'us-east-2', machine:'m7a.4xlarge',
+    }));
+    nov19.runs_list = [...gates, ...attempts];
+    for (const day of costs.days) {
+      for (const run of day.runs_list) run.unit = null;
+    }
+    costs.days.unshift(...daysWithoutRuns);
+  }
   function pngPixels(buffer) {
     let width, height, channels;
     const chunks = [];
@@ -319,9 +405,19 @@ try {
   let servedReading = base;
   let currentFixture = base;
   let queueFixture = null;
-  let unnamedPlace = 0;
+  let unnamedPlace = -1;
   let confirmedQueueLine = null;
   const undoAnchors = new Map();
+  function setQueueWaiters(rows) {
+    let place = 0;
+    queueFixture.waiters = rows.map(row => row.kind === 'cloud' ? row : {...row, place:++place});
+  }
+  const unnamed = {row_id:'unnamed-wait'};
+  const fixtureMoveLine = reading => {
+    const members = reading.waiters.filter(row => row.move).map(row => row.move);
+    if (unnamedPlace >= 0) members.splice(unnamedPlace, 0, unnamed);
+    return {revision:reading.move_revision, members, kept_runs:[]};
+  };
   const server = createServer(async (req, res) => {
     if (req.url === '/console/builds/queue-move') {
       const json = (status, result) => {
@@ -337,10 +433,8 @@ try {
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
-      const members = ordered.map(row => row.move);
-      const unnamed = {row_id:'unnamed-wait'};
-      members.splice(unnamedPlace, 0, unnamed);
-      const line = () => ({revision:queueFixture.move_revision, members});
+      const {members} = fixtureMoveLine(queueFixture);
+      const line = () => ({revision:queueFixture.move_revision, members, kept_runs:[]});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
       const undo = request.kind === 'QueueUndoRequest';
       if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
@@ -363,15 +457,22 @@ try {
       unnamedPlace = members.indexOf(unnamed);
       const byId = new Map(ordered.map(row => [row.move.row_id, row]));
       const shown = members.filter(item => byId.has(item.row_id)).map(item => byId.get(item.row_id));
-      let place = 0;
-      queueFixture.waiters = rows.map(item => item.move ? shown[place++] : item);
+      let indexShown = 0;
+      setQueueWaiters(rows.map(item => item.move ? shown[indexShown++] : item));
       queueFixture.move_revision += '1';
       confirmedQueueLine = line();
       return json(200, {line:confirmedQueueLine});
     }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify(servedReading) : isReport ? JSON.stringify(base.report)
+    let reading = servedReading;
+    if (isData && reading.move_revision?.startsWith('fixture')) {
+      const move_line = fixtureMoveLine(reading);
+      const places = new Map(move_line.members.map((member, index) => [member.row_id, index + 1]));
+      reading = {...reading, move_line, waiters:reading.waiters.map(row =>
+        row.move ? {...row, place:places.get(row.move.row_id)} : row)};
+    }
+    res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(awsCostShots ? servedReading.report : base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
   });
   try {
@@ -451,7 +552,7 @@ try {
         await call('Emulation.setScrollbarsHidden', {hidden:true});
         await call('Page.addScriptToEvaluateOnNewDocument', {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
-            + 'Date.now = () => ' + fixtureTime * 1000 + ';'});
+            + 'Date.now = () => ' + clockTime + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
         const navigate = async path => {
@@ -476,6 +577,14 @@ try {
           fitLabels();
           })()`);
         };
+        if (awsCostShots) {
+          servedReading = liveAwsCostSource ? base : readings.aws_costs;
+          await navigate('memory_live.html');
+          const shots = approvedAwsCostShot ? await captureApprovedAwsCosts(evaluate, call)
+            : await captureAwsCosts(evaluate, call, base.report.aws_costs.today);
+          console.log(JSON.stringify({shots,output:folder}));
+          break browserProof;
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
@@ -620,13 +729,14 @@ try {
           console.log(JSON.stringify({pass:true,views}));
           break browserProof;
         }
-        if (queueRowsProof || !focusedProof) {
+        if (queueRowsProof || guestTipProof || !focusedProof) {
           // nate, 2026-11-21 and 2026-11-23: the unit starts the row with the showrunner under it. The Machine column
           // shows icons: one bright icon where a step runs, and one dim icon for each machine that can take a waiting step.
           // The gate checks these rows too; only --queue-rows takes the shot.
           // A fourth argument names a published page to shoot as the before view.
           // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
           const shootBefore = queueRowsProof && beforePage;
+          const guestTipShot = join(folder, 'guesttip-dark-4.png');
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
@@ -635,7 +745,8 @@ try {
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
           const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
-            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'guest-attempt'},
+            changes:'report/keep-all-long-tooltip-values-inside-the-builds-page-at-desktop-and-narrow-widths',
+            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'82ba556d347749b08184ad3ab38ea22a'},
             targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
@@ -644,14 +755,56 @@ try {
             machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
           reading.walk = [rust, guest, mac, ci];
           reading.waiters = [waiting];
+          const runAgeMinutes = 3;
+          const pacificTime = new Intl.DateTimeFormat('en-US', {
+            timeZone:'America/Los_Angeles', hourCycle:'h23', hour:'2-digit', minute:'2-digit', timeZoneName:'short',
+          });
+          const clock = seconds => pacificTime.format(seconds * 1000);
+          const runStart = reading.read_at - runAgeMinutes * 60;
+          const bumpTime = clock(runStart - 3 * 60);
+          const keptUntil = clock(reading.read_at + 12 * 60);
+          if (!shootBefore) {
+            reading.move_revision = 'shot-queue';
+            rust.started_at = runStart;
+            rust.last_move = {kind:'bump', who:'nate', from_place:31, to_place:1, at:bumpTime};
+            waiting.place = 2;
+            waiting.move = {row_id:'shot-admin-console', movable:true, kept_before:1};
+            reading.held_places = [{kind:'held', key:'proof-kept', unit:'admin-console',
+              position:1, failed_step:'test affected', kept_until:keptUntil, targets:['natedev','hana-aws']}];
+            reading.move_line = {revision:reading.move_revision, members:[waiting.move], kept_runs:['proof-kept']};
+          }
           reading.queued_priority_units = [];
+          if (guestTipProof) {
+            guest.started_at = reading.read_at - 4 * 60;
+            reading.walk[2] = {...mac, started_at:reading.read_at - 3 * 60, read_at:reading.read_at};
+            waiting.since = reading.read_at - 90;
+            await call('Emulation.setTimezoneOverride', {timezoneId:'America/Los_Angeles'});
+          }
           servedReading = reading;
+          const navigateQueueRows = async width => {
+            const showHandle = !shootBefore && width === 1440;
+            // The narrow layout checks use the read-only view.
+            queueFixture = showHandle ? reading : null;
+            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            if (showHandle) await waitForMoveHandle(evaluate, waiting.move.row_id);
+          };
+          const machineGraphics = {
+            'natedev':['🐧', null],
+            'mac':['#machine-apple', null],
+            'mac-linux':['#machine-apple', '🐧'],
+            'aws':['#machine-cloud', '🐧'],
+            'hana-aws':['#machine-cloud', '🌸'],
+            'hana-gpu':['#machine-cloud', '⚡'],
+          };
+          const expectedIcon = name => [name, name, ...machineGraphics[name]];
+          const runningIcon = name => [...expectedIcon(name), 'img', 'run'];
+          const waitingIcons = ['natedev','hana-aws'].map(name => [...expectedIcon(name), 'img', 'dim']);
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           // At 800 px the walk uses compact gaps. At 900 px the font metrics determine the gaps.
           let rows;
           for (const width of shootBefore ? [1440] : [1440, 900, 800]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
-            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            await navigateQueueRows(width);
             rows = await evaluate(`(() => {
               const walk = document.querySelector('#walk');
               const name = row => row.querySelector('.name').textContent;
@@ -661,26 +814,41 @@ try {
               const keys = [...latest.walk.map(row => 'row:' + row.key), 'wait:' + latest.waiters[0].key];
               const lines = element => Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight));
               const box = walk.closest('.card').getBoundingClientRect();
+              const keptChart = chart('held:proof-kept'), keptTable = table('held:proof-kept');
+              const keptDeadline = keptTable?.querySelector('.duration');
+              const deadlineRange = document.createRange();
+              if (keptDeadline) deadlineRange.selectNodeContents(keptDeadline);
               const scroll = walk.closest('.walk-scroll');
               const waitingName = chart(keys[4]).querySelector('.name');
+              const handle = chart(keys[4]).querySelector('.queue-grip');
+              const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
+                icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
+                icon?.getAttribute('data-badge')];
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
+                keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
+                  .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
+                keptDeadline:keptDeadline?.textContent,
+                keptDeadlineLines:deadlineRange.getClientRects().length,
+                runAge:table(keys[0]).querySelector('.duration').textContent,
+                heading:walk.querySelector('.walk-chart .queue-title').firstElementChild.textContent,
                 walkOverflow:scroll.scrollWidth - scroll.clientWidth,
                 trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
                   table(key).querySelector('.step').textContent]),
                 icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
-                  [icon.getAttribute('aria-label'), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
+                  [...iconDetails(icon), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
                 wrappedIcons:[...walk.querySelectorAll('tbody td.machine')].filter(cell =>
                   new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
-                  [key.textContent, key.querySelector('.machine-icon')?.dataset.machine]),
+                  [key.lastChild.textContent, ...iconDetails(key.querySelector('.machine-icon'))]),
                 colors:[chart(keys[0]),chart(keys[2]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
                 waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
+                handleFits:handle?.getBoundingClientRect().right <= waitingName.getBoundingClientRect().left,
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                   return label.scrollWidth > label.clientWidth;
@@ -697,12 +865,20 @@ try {
               assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
                 ['queue','builds','','gate'],['trunk','hana','','nextest'],['hana CI','','',''],
                 ['admin-console','builds','','test affected']]);
-              assert.deepEqual(rows.icons, [[['natedev','img','run']],[['mac-linux','img','run']],[['mac','img','run']],
-                [['natedev','img','run']],[['natedev','img','dim'],['hana-aws','img','dim']]]);
+              assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
+                [runningIcon('natedev')],waitingIcons]);
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
-              assert.deepEqual(rows.legend, ['natedev','mac','mac-linux','aws','hana-aws','hana-gpu'].map(name => [name, name]));
+              assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
               assert.deepEqual(rows.colors, Array.from({length:3},()=>['role.unit-director','role.showrunner']));
+              assert.equal(rows.heading, 'Waiting, in queue order');
+              assert.equal(rows.runAge, `${runAgeMinutes} min`);
+              assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
+              if (width === 1440) {
+                assert.equal(rows.keptDeadlineLines, 1, 'The kept place deadline wraps at 1440 px.');
+                assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut at 1440 px.');
+              }
               if (width === 900) {
+                assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
                 assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);
                 assert.equal(rows.waitingNameCut, false, 'The waiting unit name is cut at 900 px.');
@@ -718,19 +894,112 @@ try {
               assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
                 'The mac-linux icon has no mac color.');
               if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+              if (width >= 900) {
+                const pointer = await evaluate(`(() => {
+                  const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                  icon.scrollIntoView({block:'center',inline:'nearest'});
+                  const box = icon.getBoundingClientRect();
+                  return {x:box.left + box.width/2, y:box.top + box.height/2};
+                })()`);
+                await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+                const hover = await evaluate(`(() => {
+                  const tooltip = document.querySelector('#tip.on > .tip');
+                  const box = tooltip.getBoundingClientRect();
+                  const viewport = document.documentElement;
+                  const range = document.createRange();
+                  const clipped = Array.from(tooltip.children).filter(cell => {
+                    range.selectNodeContents(cell);
+                    const bounds = cell.getBoundingClientRect();
+                    return [...range.getClientRects()].some(rect =>
+                      rect.left < Math.max(box.left, bounds.left) - 1 || rect.right > Math.min(box.right, bounds.right) + 1
+                      || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1);
+                  }).map(cell => cell.textContent);
+                  const labels = [...tooltip.querySelectorAll('dt')];
+                  const fields = Object.fromEntries(labels.map(cell => [cell.textContent, cell.nextElementSibling.textContent]));
+                  range.selectNodeContents(labels.find(cell => cell.textContent === 'Changes').nextElementSibling);
+                  const changesLines = range.getClientRects().length;
+                  const card = document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  const left = Math.min(card.left, box.left), top = Math.min(card.top, box.top);
+                  const right = Math.max(card.right, box.right), bottom = Math.max(card.bottom, box.bottom);
+                  return {fields, clipped, changesLines,
+                    visible:box.left >= 0 && box.right <= viewport.clientWidth
+                      && box.top >= 0 && box.bottom <= viewport.clientHeight,
+                    clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+                })()`);
+                assert.equal(hover.fields.Changes, guest.changes);
+                assert.ok(hover.changesLines > 1, `Changes does not wrap at ${width} px.`);
+                assert.equal(hover.fields.Showrunner, guest.showrunner);
+                assert.equal(hover.fields['Runs on'], guest.machine);
+                assert.ok(hover.visible, `The guest row tooltip is outside the viewport at ${width} px.`);
+                assert.deepEqual(hover.clipped, [], `The guest row tooltip clips text at ${width} px.`);
+                if (guestTipProof && width === 1440) {
+                  const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:hover.clip});
+                  await writeFile(guestTipShot, Buffer.from(shot.data,'base64'));
+                }
+                await evaluate('hideTip()');
+              }
+              if (width === 1440) {
+                const {guest_run:_guestRun, ...pending} = guest;
+                pending.pid = {kind:'PidNotRecorded'};
+                pending.vcpus = {kind:'UnknownCpuCount'};
+                const guestStates = [
+                  {...pending, guest_unconfirmed:'starting'},
+                  {...pending, guest_unconfirmed:'not confirmed'},
+                  guest,
+                ];
+                const guestCells = await evaluate(`(() => {
+                  const data = latest;
+                  const cells = ${JSON.stringify(guestStates)}.map(state => {
+                    renderWalk({...data, walk:data.walk.map(row => row.key === state.key ? state : row)});
+                    const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                    const machine = row.querySelector('td.machine');
+                    return [machine.querySelector('.machine-icon.run')?.dataset.machine, machine.textContent.trim(),
+                      row.querySelector('td.pid').textContent, row.querySelector('td.vcpus').textContent];
+                  });
+                  renderWalk(data);
+                  return cells;
+                })()`);
+                assert.deepEqual(guestCells, [
+                  ['mac-linux','starting','—','—'],
+                  ['mac-linux','not confirmed','—','—'],
+                  ['mac-linux','',String(guest.pid),String(guest.vcpus)],
+                ]);
+              }
             }
             if (queueRowsProof) {
               const output = join(folder, shootBefore ? 'before.png' : width === 1440 ? 'after.png' : `after-${width}.png`);
               const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:rows.clip});
               await writeFile(output, Buffer.from(shot.data,'base64'));
+              if (!shootBefore && width === 1440) {
+                const bump = await evaluate(`(() => {
+                  const card = document.querySelector('#walk').closest('.card');
+                  card.scrollIntoView({block:'center'});
+                  const mark = card.querySelector('td.moved .move-mark');
+                  showTip(mark.dataset.tip, 0, 0, mark);
+                  const tip = document.querySelector('#tip');
+                  const box = card.getBoundingClientRect(), bounds = tip.getBoundingClientRect();
+                  return {text:tip.innerText, fits:bounds.left >= box.left && bounds.right <= box.right &&
+                    bounds.top >= box.top && bounds.bottom <= box.bottom,
+                    clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
+                })()`);
+                assert.match(bump.text, /Moved by\s+nate/);
+                assert.ok(bump.text.includes(bumpTime), 'The bump tooltip shows the wrong time.');
+                assert.ok(bump.fits, 'The bump tooltip extends outside the card.');
+                const withBump = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:bump.clip});
+                await writeFile(join(folder, 'moved-dark-5.png'), Buffer.from(withBump.data,'base64'));
+              }
             }
+          }
+          if (guestTipProof) {
+            console.log(JSON.stringify({pass:true,shot:guestTipShot,captureClock:new Date(fixtureTime * 1000).toISOString()}));
+            break browserProof;
           }
           // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
           // scrollbars, so one more load shows them. At 1440 px the sideways scroll box has no scrollbar and no overflow.
           await call('Emulation.setScrollbarsHidden', {hidden:false});
           try {
             await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
-            await navigate(shootBefore ? 'before.html' : 'memory_live.html');
+            await navigateQueueRows(1440);
             const scroll = await evaluate(`(() => {
               const box = document.querySelector('.walk-scroll');
               const card = box.closest('.card').getBoundingClientRect();
@@ -745,7 +1014,92 @@ try {
             }
             if (!shootBefore) assert.deepEqual(scroll.bars, {right:0, bottom:0, down:0, sideways:0},
               'The Running/Queued scroll box shows a scrollbar.');
+            if (!shootBefore) {
+              const pointer = await evaluate(`(() => {
+                const style = document.createElement('style');
+                style.textContent = 'html { overflow-y: scroll; } html::-webkit-scrollbar { width: 15px; }';
+                document.head.append(style);
+                const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
+                icon.scrollIntoView({block:'center', inline:'nearest'});
+                const box = icon.getBoundingClientRect();
+                return {x:box.left+box.width/2, y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+              const before = await evaluate("document.querySelector('#tip.on > .tip').getBoundingClientRect().toJSON()");
+              await call('Emulation.setDeviceMetricsOverride', {width:390,height:300,deviceScaleFactor:1,mobile:false});
+              const resized = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const viewport = document.documentElement;
+                const box = document.querySelector('#tip.on > .tip');
+                return {box:box.getBoundingClientRect().toJSON(), viewport:{width:viewport.clientWidth,height:viewport.clientHeight},
+                  innerWidth, overflow:box.scrollHeight-box.clientHeight, key:tips.key()};
+              })()`);
+              const {box, viewport} = resized;
+              assert.equal(resized.key, 'row:shot-guest');
+              assert.ok(before.right > viewport.width && box.left < before.left,
+                'The tooltip did not move after resize with a stationary pointer.');
+              assert.ok(resized.innerWidth > viewport.width, 'The proof needs a classic scrollbar.');
+              assert.ok(box.left >= 8 && box.right <= viewport.width-8, 'The tooltip exceeds the visible width.');
+              assert.ok(box.top >= 8 && box.bottom <= viewport.height-8, 'The tooltip exceeds the visible height.');
+              assert.ok(resized.overflow > 0, 'The tooltip has no content below its visible area.');
+
+              const rowPoint = await evaluate(`(() => {
+                const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                row.scrollIntoView({block:'center', inline:'nearest'});
+                const bounds = row.getBoundingClientRect();
+                const x = Math.max(bounds.left, ${box.left}) + 12;
+                const y = bounds.top + bounds.height/2;
+                row.addEventListener('click', () => { row.dataset.proofClicked = 'yes'; }, {once:true});
+                return {x, y};
+              })()`);
+              assert.ok(rowPoint.x > box.left && rowPoint.x < box.right && rowPoint.y > box.top && rowPoint.y < box.bottom,
+                'The guest row click is outside the tooltip.');
+              const click = async point => {
+                await call('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
+                await call('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});
+              };
+              await click(rowPoint);
+              assert.equal(await evaluate(`document.querySelector('tr[data-tip="row:shot-guest"]').dataset.proofClicked`),
+                'yes', 'The tooltip blocks the guest row click.');
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'The trigger click did not close the tooltip.');
+
+              await click(rowPoint);
+              assert.deepEqual(await evaluate("[tips.key(), getComputedStyle(document.querySelector('#tip')).pointerEvents]"),
+                ['row:shot-guest', 'none'], 'The click should open a pointer-transparent tooltip.');
+              await call('Input.dispatchKeyEvent', {type:'keyDown', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              await call('Input.dispatchKeyEvent', {type:'keyUp', key:'Escape', code:'Escape', windowsVirtualKeyCode:27});
+              assert.equal(await evaluate('Boolean(tips.key())'), false, 'Escape did not close the tooltip.');
+
+              await call('Emulation.setDeviceMetricsOverride', {width:800,height:1100,deviceScaleFactor:1,mobile:false});
+              const bumpBefore = await evaluate(`(async () => {
+                setPaused(true);
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const mark = document.querySelector('#walk td.moved .move-mark');
+                mark.scrollIntoView({block:'center', inline:'nearest'});
+                mark.focus({preventScroll:true});
+                return {left:mark.getBoundingClientRect().left, key:mark.dataset.tip,
+                  open:tips.key(), tight:document.querySelector('#walk').classList.contains('tight')};
+              })()`);
+              assert.equal(bumpBefore.open, bumpBefore.key, 'Focus did not open the bump tooltip.');
+              assert.ok(bumpBefore.tight, 'The bump resize proof needs compact gaps at 800 px.');
+
+              await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+              const bumpAfter = await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const mark = document.querySelector('#walk td.moved .move-mark').getBoundingClientRect();
+                const tip = document.querySelector('#tip.on > .tip').getBoundingClientRect();
+                return {left:mark.left, gap:Math.max(mark.left - tip.right, tip.left - mark.right),
+                  topDifference:tip.top - mark.top, open:tips.key(),
+                  tight:document.querySelector('#walk').classList.contains('tight')};
+              })()`);
+              assert.equal(bumpAfter.open, bumpBefore.key, 'Resize closed the bump tooltip.');
+              assert.ok(!bumpAfter.tight && Math.abs(bumpAfter.left - bumpBefore.left) > 8,
+                'Resize did not move the bump mark out of the compact layout.');
+              assert.ok(Math.abs(bumpAfter.gap - 8) <= 1 && Math.abs(bumpAfter.topDifference + 4) <= 1,
+                'The tooltip is outside the expected position beside the resized bump mark.');
+            }
           } finally {
+            queueFixture = null;
             await call('Emulation.setScrollbarsHidden', {hidden:true});
           }
           if (queueRowsProof) {
@@ -790,7 +1144,7 @@ try {
       async function checkQueueDrag(navigate, evaluate, call) {
         const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
         const units = ['natemerge', 'unit-board', 'aws', 'postmaster', 'typesafe'];
-        unnamedPlace = 0;
+        unnamedPlace = -1;
         queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture',
           waiters:units.map((unit, index) => ({...template, key:unit, unit, detail:unit,
             name:queueDragProof ? 'test affected' : `${unit} test affected`, title:{unit, step:'test affected'},
@@ -805,15 +1159,7 @@ try {
         servedReading = queueFixture;
         await navigate('memory_live.html');
         await evaluate('window.render = window.renderReading; true');
-        await evaluate(`new Promise(resolve => {
-          const walk = document.querySelector('#walk');
-          const ready = () => walk.querySelector('[data-move-id="typesafe"]');
-          if (ready()) return resolve(true);
-          const observer = new MutationObserver(() => {
-            if (ready()) { observer.disconnect(); resolve(true); }
-          });
-          observer.observe(walk, {childList:true, subtree:true});
-        })`);
+        await waitForMoveHandle(evaluate, 'typesafe');
         const snapshot = () => evaluate(`({
           handles:[...document.querySelectorAll('.queue-grip')].map(button => button.dataset.moveId),
           lifted:document.querySelector('.wrow.queue-lift .queue-grip')?.dataset.moveId,
@@ -861,6 +1207,9 @@ try {
         await evaluate("document.querySelector('#queue-action').click(); true");
         await waitForLine('typesafe · test affected moved from 2 to 5');
         assert.deepEqual((await snapshot()).handles, units);
+        unnamedPlace = 0;
+        queueFixture.move_revision += 'head';
+        await evaluate('pageRefresh.refresh(true)');
         await evaluate(`(() => {
           const button = document.querySelector('[data-move-id="unit-board"]');
           button.focus();
@@ -870,12 +1219,15 @@ try {
         })()`);
         assert.equal((await snapshot()).line, 'Place 1');
         await evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))`);
-        await waitForLine('unit-board · test affected moved from 2 to 1');
+        await waitForLine('unit-board · test affected moved from 3 to 1');
         assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
           ['unit-board', 'unnamed-wait', 'natemerge']);
         assert.deepEqual((await snapshot()).handles, ['unit-board', 'natemerge', 'aws', 'postmaster', 'typesafe']);
         await evaluate("document.querySelector('#queue-action').click(); true");
-        await waitForLine('unit-board · test affected moved from 1 to 2');
+        await waitForLine('unit-board · test affected moved from 1 to 3');
+        unnamedPlace = -1;
+        queueFixture.move_revision += 'named';
+        await evaluate('pageRefresh.refresh(true)');
         await evaluate(`(() => {
           const button = document.querySelector('[data-move-id="unit-board"]');
           button.focus();
@@ -892,9 +1244,9 @@ try {
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...moveTarget, button:'left', buttons:1});
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
-        queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
+        setQueueWaiters([{...template, key:'remote-start', pid:651,
           name:'remote startup', machine:'mac', targets:['mac'], reason:'remote startup',
-          move:{row_id:'remote-start', movable:false}});
+          move:{row_id:'remote-start', movable:false}}, ...queueFixture.waiters]);
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
         assert.deepEqual((await snapshot()).handles, []);
@@ -903,9 +1255,9 @@ try {
         await evaluate('pageRefresh.refresh(true)');
         assert.deepEqual((await snapshot()).handles, ['natemerge', 'aws', 'unit-board', 'postmaster', 'typesafe']);
         queueFixture.move_revision += 'new-unit';
-        queueFixture.waiters.splice(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
+        setQueueWaiters(queueFixture.waiters.toSpliced(2, 0, {...template, key:'new-unit', unit:'new-unit', pid:650,
           name:'test affected', since:fixtureTime - 60, title:{unit:'new-unit', step:'test affected'},
-          move:{row_id:'new-unit'}});
+          move:{row_id:'new-unit'}}));
         await evaluate('pageRefresh.refresh(true)');
         const retryStart = await grip('typesafe');
         const retryTarget = await cell('new-unit', 'machine');
@@ -920,8 +1272,8 @@ try {
         const nextTarget = await cell('postmaster', 'machine');
         await call('Input.dispatchMouseEvent',{type:'mousePressed', ...nextStart, button:'left', buttons:1, clickCount:1});
         await call('Input.dispatchMouseEvent',{type:'mouseMoved', ...nextTarget, button:'left', buttons:1});
-        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left',
-          waiters:queueFixture.waiters.filter(row => row.key !== 'remote-start')};
+        queueFixture = {...queueFixture, move_revision:queueFixture.move_revision + 'left'};
+        setQueueWaiters(queueFixture.waiters.filter(row => row.key !== 'remote-start'));
         servedReading = queueFixture;
         await evaluate('pageRefresh.refresh(true)');
         assert.ok(await evaluate('!latest.waiters.some(row => row.key === "remote-start")'));
@@ -932,10 +1284,10 @@ try {
 
         queueFixture.move_revision += 'mac-only';
         // The waiting row uses its eligible targets to select the dim icons.
-        queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
+        setQueueWaiters(queueFixture.waiters.toSpliced(3, 0, {...template, key:'mac-only', pid:652,
           name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', targets:['mac'], reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
-          move:{row_id:'mac-only', movable:false}});
+          move:{row_id:'mac-only', movable:false}}));
         await evaluate('pageRefresh.refresh(true)');
         const macStart = await grip('typesafe');
         const macTarget = await cell('natemerge', 'machine');
@@ -962,11 +1314,11 @@ try {
           document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
           return true;
         })()`);
-        await waitForLine('typesafe · test affected moved from 1 to 2');
+        await waitForLine('typesafe · test affected moved from 1 to 3');
         assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
           ['unnamed-wait', 'natemerge', 'typesafe']);
         await evaluate("document.querySelector('#queue-action').click(); true");
-        await waitForLine('typesafe · test affected moved from 2 to 1');
+        await waitForLine('typesafe · test affected moved from 3 to 1');
         assert.deepEqual(confirmedQueueLine.members.slice(0, 3).map(member => member.row_id),
           ['typesafe', 'unnamed-wait', 'natemerge']);
         assert.deepEqual((await snapshot()).handles.slice(0, 2), ['typesafe', 'natemerge']);
@@ -1055,6 +1407,250 @@ try {
             })()`), {truncated:true, count:'(2)', countFits:true});
           }
         }
+      }
+
+      async function captureApprovedAwsCosts(evaluate, call) {
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1400,deviceScaleFactor:1,mobile:false});
+        const shown = await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          const row = date => pane.querySelector('tr[data-period="day-' + date + '"]');
+          row('2026-11-23').querySelector('button').click();
+          row('2026-11-19').querySelector('button').click();
+          const detail = pane.querySelector('[data-aws-day="2026-11-19"]');
+          const hana = [...detail.querySelectorAll('[data-aws-group] button')]
+            .find(button => button.textContent.trim() === 'Hana check and lint');
+          hana.click();
+          const box = pane.getBoundingClientRect();
+          return {text:pane.innerText, counts:[23,22,21].map(day =>
+            [...row('2026-11-' + day).cells].slice(1,3).map(cell => cell.textContent.trim())),
+            fits:[...pane.querySelectorAll('.aws-scroll')].every(box => box.scrollWidth <= box.clientWidth + 1),
+            clip:{x:0,y:Math.floor(box.top+scrollY)-16,width:innerWidth,height:Math.ceil(box.height)+32,scale:1}};
+        })()`);
+        assert.match(shown.text, /In Pacific time, a day starts at 4:00 PM/);
+        assert.match(shown.text, /No AWS read since Nov 19: AWS refuses the key/);
+        assert.deepEqual(shown.counts, Array.from({length:3}, () => ['0','~$0.94']));
+        assert.match(shown.text, /Hana machine with no run[^\n]*\s+2 h 22 min 52 s/);
+        assert.ok(shown.fits, 'The AWS tables fit inside the pane.');
+        const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
+        const name = 'awscosts-main-dark.png';
+        await writeFile(join(folder,name), Buffer.from(shot.data,'base64'));
+        return [name];
+      }
+
+      async function captureAwsCosts(evaluate, call, liveDay = null) {
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1400,deviceScaleFactor:1,mobile:false});
+        const capture = async name => {
+          const clip = await evaluate(`(() => {
+            const r = document.querySelector('#aws-costs').getBoundingClientRect();
+            return {x:r.left+scrollX, y:r.top+scrollY, width:r.width, height:r.height, scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
+        };
+        if (liveDay) {
+          const result = await evaluate(`(() => {
+            const pane = document.querySelector('#aws-costs');
+            const detail = pane.querySelector('[data-aws-day="' + ${JSON.stringify(liveDay)} + '"]');
+            const day = awsCostReport.days.find(day => day.day === detail.dataset.awsDay);
+            const dayCents = awsCents(day.amount_usd);
+            const select = group => detail.querySelector('[data-aws-group-by="' + group + '"]').click();
+            const tableTotal = group => {
+              select(group);
+              const rows = [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')];
+              const total = rows.pop();
+              const cents = row => awsCents(row.cells[3].textContent.replace(/[~$,]/g, ''));
+              const sum = rows.reduce((amount, row) => amount + cents(row), 0);
+              return {sum, displayed:cents(total)};
+            };
+            const totals = Object.fromEntries(['region', 'machine', 'job'].map(group => [group, tableTotal(group)]));
+            const hana = [...detail.querySelectorAll('tr[data-aws-group] button')]
+              .find(button => button.textContent.trim() === 'Hana check and lint');
+            const hanaCells = hana.closest('tr').cells;
+            const groupTime = hanaCells[2].textContent;
+            const hanaRuns = day.runs_list.filter(run => run.kind === 'hana');
+            const expectedGroupTime = hanaRuns.length
+              ? awsRunTime(hanaRuns.reduce((total, run) => total + run.seconds, 0)) : '—';
+            const perRun = hanaCells[4].textContent;
+            const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
+            hana.click();
+            const expanded = detail.querySelector('.aws-group-detail');
+            const rows = [...expanded.querySelectorAll('.aws-run-scroll > table > tbody > tr')];
+            const idle = rows.filter(row => row.cells[0].textContent === 'Hana machine with no run');
+            const csv = awsRunsCsv(awsCostReport.days).split('\\r\\n');
+            const ids = awsCostReport.days.flatMap(day => day.runs_list.map(run => run.id));
+            pane.scrollIntoView({block:'start'});
+            return {group:hana.textContent.trim(), runs:rows.length - idle.length, expectedRuns:day.hana.runs,
+              groupTime, expectedGroupTime, perRun, totalTime, idleTimes:idle.map(row => row.cells[row.cells.length - 2].textContent),
+              expectedIdleTime:day.hana.idle_seconds == null ? '—' : awsRunTime(day.hana.idle_seconds),
+              idleRows:idle.length, expectedIdleRows:Number(awsCents(day.hana.idle_usd) !== 0), dayCents, totals,
+              csvHeader:csv[0], csvRows:csv.length - 2,
+              recordedRuns:new Set(ids).size, hasRunIds:ids.every(Boolean),
+              fits:[...pane.querySelectorAll('.aws-scroll')].every(box => box.scrollWidth <= box.clientWidth + 1)};
+          })()`);
+          const reconciled = Object.values(result.totals).every(({sum, displayed}) =>
+            sum === result.dayCents && displayed === result.dayCents);
+          if (!reconciled || !result.fits || result.runs !== result.expectedRuns || result.idleRows !== result.expectedIdleRows ||
+              result.groupTime !== result.expectedGroupTime || result.idleTimes.some(time => time !== result.expectedIdleTime) ||
+              !result.hasRunIds || result.csvRows !== result.recordedRuns) {
+            throw new Error('The live Day image or CSV is incomplete. ' + JSON.stringify(result));
+          }
+          const name = 'aws-cost-day-live-dark-6';
+          await capture(name);
+          console.log(JSON.stringify({day:liveDay, ...result}));
+          const historical = await evaluate(`(() => {
+            const current = ${JSON.stringify(liveDay)};
+            const day = '2026-11-07';
+            const periodButton = date => document.querySelector('tr[data-period="day-' + date + '"] button');
+            periodButton(current).click();
+            if (!periodButton(day)) document.querySelector('#aws-older').click();
+            periodButton(day).click();
+            const detail = document.querySelector('[data-aws-day="' + day + '"]');
+            return [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')].map(row =>
+              [row.cells[0].textContent.trim(), row.cells[3].textContent]);
+          })()`);
+          const historicalName = 'aws-cost-nov7-dark';
+          await capture(historicalName);
+          console.log(JSON.stringify({day:'2026-11-07', charges:historical}));
+          return [name + '.png', historicalName + '.png'];
+        }
+        await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          pane.scrollIntoView({block:'start'});
+          const date = pane.querySelector('[data-tip="aws-cost:day-2026-11-16"]');
+          const bounds = date.getBoundingClientRect();
+          showTip(date.dataset.tip, bounds.right, bounds.top);
+          const tip = document.querySelector('#tip');
+          showTip(date.dataset.tip, bounds.right + 22 + tip.offsetWidth / 2, bounds.bottom + tip.offsetHeight);
+        })()`);
+        await capture('aws-cost-day-dark');
+        await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          pane.querySelector('[data-aws-view="month"]').click();
+          pane.querySelector('tr[data-period^="week-"] button').click();
+          pane.querySelector('[data-tip="aws-cost:day-2026-11-17"]').click();
+        })()`);
+        await capture('aws-cost-month-open-dark');
+        return ['aws-cost-day-dark.png', 'aws-cost-month-open-dark.png'];
+      }
+
+      async function checkAwsCosts(evaluate, drillDown) {
+        const summary = await evaluate(`(() => {
+          const pane = document.querySelector('#aws-costs');
+          const lines = [...pane.querySelectorAll('.aws-total-value')].map(tile => tile.textContent.trim());
+          const body = pane.innerText.replace(/\\s+/g, ' ');
+          return {lines, body, fits:pane.scrollWidth <= pane.clientWidth,
+            days:pane.querySelectorAll('tr[data-period]').length, open:pane.querySelector('.aws-toggle').getAttribute('aria-expanded')};
+        })()`);
+        assert.deepEqual(summary.lines, ['~$5.25 of $35.00 limit','~$9.03','~$104.47 of $400.00 limit']);
+        assert.equal(summary.days,14);
+        assert.equal(summary.open,'true');
+        assert.ok(summary.fits, 'The AWS history scrolls inside the pane.');
+        assert.match(summary.body, /AWS amounts read Wed Nov 18, 1:43 PM EST/);
+        assert.match(summary.body, /Thu Nov 19 · started Wed 7:00 PM EST · ends Thu 7:00 PM EST/);
+        assert.match(summary.body, /In Eastern time, a day starts at 7:00 PM on the day before and ends at 7:00 PM\./);
+        assert.match(summary.body, /The next AWS read is due Thu Nov 19, 12:43 PM EST/);
+        assert.match(summary.body, /Group by.*Download CSV.*Hana check and lint.*Costs with no run.*Total 193/);
+        assert.match(summary.body, /Kept resources now cost \$28.20 each month/);
+        assert.doesNotMatch(summary.body, /\bgate\b|targeted test/i);
+        if (!drillDown) return;
+        const result = await evaluate(`(async () => {
+          const pane = document.querySelector('#aws-costs');
+          const select = view => pane.querySelector('[data-aws-view="' + view + '"]').click();
+          const content = pane.querySelector('.aws-rule');
+          renderReport(structuredClone(latest.report));
+          const sameContent = content === pane.querySelector('.aws-rule');
+          const row = id => pane.querySelector('tr[data-period="' + id + '"]');
+          const open = id => row(id).querySelector('button').click();
+          const fields = key => {
+            const trigger = pane.querySelector('[data-tip="aws-cost:' + key + '"]');
+            const box = trigger.getBoundingClientRect();
+            showTip(trigger.dataset.tip, box.left, box.bottom);
+            return [...document.querySelectorAll('#tip dl.tip dt')].map(term => [term.textContent, term.nextElementSibling.textContent]);
+          };
+          const dayLimit = fields('day-limit');
+          const monthLimit = fields('month-limit');
+          const dayTip = fields('day-2026-11-19');
+          hideTip();
+          pane.querySelector('#aws-older').click();
+          const count = pane.querySelectorAll('tr[data-period]').length;
+          const missing = row('day-2026-11-03').cells[2].textContent.trim();
+          const zero = [row('day-2026-11-02').cells[2], row('day-2026-11-02').cells[4]].map(cell => cell.textContent.trim());
+          pane.querySelector('#aws-older').click();
+          const detail = pane.querySelector('[data-aws-day="2026-11-19"]');
+          const groupBy = group => detail.querySelector('[data-aws-group-by="' + group + '"]').click();
+          const groupButton = label => [...detail.querySelectorAll('tr[data-aws-group] button')]
+            .find(button => button.textContent.trim() === label);
+          groupButton('integrate').click();
+          const runCount = detail.querySelectorAll('.aws-group-detail tbody tr').length;
+          const runFields = [...detail.querySelector('.aws-group-detail tbody tr').cells].slice(1).map(cell => cell.textContent);
+          groupButton('integrate').click();
+          groupButton('Hana check and lint').click();
+          const hanaCells = groupButton('Hana check and lint').closest('tr').cells;
+          const hanaTime = hanaCells[2].textContent;
+          const hanaPerRun = hanaCells[4].textContent;
+          const totalTime = detail.querySelector('.aws-total-row').cells[2].textContent;
+          const hanaDetails = [...detail.querySelectorAll('.aws-group-detail tbody tr')].map(row => row.cells[7].textContent);
+          const groupNames = () => [...detail.querySelectorAll('tr[data-aws-group] button')].map(button => button.textContent.trim());
+          const idleCharge = () => [...detail.querySelectorAll('.aws-group-scroll > table > tbody > tr')]
+            .find(row => row.cells[0].textContent === 'Hana machine with no run').cells[2].textContent;
+          groupBy('region');
+          const regions = groupNames();
+          const idleTimes = [idleCharge()];
+          groupBy('machine');
+          const machines = groupNames();
+          idleTimes.push(idleCharge());
+          groupBy('unit');
+          const units = groupNames();
+          idleTimes.push(idleCharge());
+          groupBy('none');
+          const rawRows = detail.querySelectorAll('.aws-run-scroll tbody tr').length;
+          groupBy('job');
+          open('day-2026-11-19');
+          select('week');
+          const week = [...row('week-2026-11-16').cells].slice(1,3).map(cell => cell.textContent);
+          select('month');
+          const month = [...row('month-2026-11-01').cells].slice(1,3).map(cell => cell.textContent);
+          open('week-2026-11-16');
+          open('day-2026-11-17');
+          const billed = pane.querySelector('.aws-day-detail').innerText.replace(/\\s+/g, ' ');
+          select('year');
+          const year = [...row('year-2026-01-01').cells].slice(1,3).map(cell => cell.textContent);
+          select('day');
+          const savedDay = row('day-2026-11-19').querySelector('button').getAttribute('aria-expanded');
+          select('month');
+          const savedMonthDay = row('day-2026-11-17').querySelector('button').getAttribute('aria-expanded');
+          select('day');
+          open('day-2026-11-19');
+          return {sameContent,dayLimit,monthLimit,dayTip,count,missing,zero,runCount,runFields,hanaTime,hanaPerRun,hanaDetails,
+            totalTime,regions,machines,units,idleTimes,rawRows,week,month,year,billed,savedDay,savedMonthDay};
+        })()`);
+        assert.equal(result.sameContent,true);
+        assert.deepEqual(result.dayLimit, [['Daily limit',''],['Limit','$35.00'],['New work stops at','$32.00'],
+          ['Starts again','Thu Nov 19, 7:00 PM EST']]);
+        assert.deepEqual(result.monthLimit, [['Monthly limit',''],['Limit','$400.00'],['New work stops at','$397.00'],
+          ['Starts again','Mon Nov 30, 7:00 PM EST']]);
+        assert.deepEqual(result.dayTip, [['Thu Nov 19 (UTC)',''],['Starts','Wed Nov 18, 7:00 PM EST'],
+          ['Ends','Thu Nov 19, 7:00 PM EST']]);
+        assert.deepEqual([result.count,result.missing,result.runCount,result.rawRows], [18,'no record',84,196]);
+        assert.deepEqual(result.zero, ['$0.00','Billed, not final']);
+        assert.deepEqual(result.runFields, ['integrate','report','us-east-1','us-east-1a','c7i.8xlarge','Spot','9 min 34 s','~$0.02']);
+        assert.equal(result.hanaTime, '21 s');
+        assert.equal(result.hanaPerRun, '—');
+        assert.equal(result.totalTime, '29 h 39 min 45 s');
+        assert.deepEqual(result.hanaDetails, ['0 s','1 s','2 s','3 s','4 s','5 s','6 s','2 h 22 min 55 s']);
+        assert.deepEqual(result.idleTimes, Array(3).fill('2 h 22 min 55 s'));
+        assert.deepEqual(result.regions, ['us-east-1','us-west-2']);
+        assert.deepEqual(result.machines, ['c7i.8xlarge','m7a.8xlarge']);
+        assert.deepEqual(result.units, ['report','Unit not recorded']);
+        assert.deepEqual(result.week,['934','~$19.87']);
+        assert.deepEqual(result.month,['2,986','~$104.47']);
+        assert.deepEqual(result.year,result.month);
+        assert.match(result.billed,/Job not recorded/);
+        assert.match(result.billed,/Runs before Thu Nov 19 have no unit record\./);
+        assert.doesNotMatch(result.billed,/Our estimate before the AWS amount/);
+        assert.deepEqual([result.savedDay,result.savedMonthDay],['false','true']);
       }
 
       async function checkPage(navigate, evaluate, call) {
@@ -1254,7 +1850,11 @@ try {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.aws_costs);
+            await checkAwsCosts(evaluate, theme === 'dark' && width === 1400);
             await show(base);
+            await evaluate(`renderAwsCosts(undefined)`);
+            assert.equal(await evaluate(`document.querySelector('#aws-cost-content').textContent`), 'no record');
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
             await evaluate('scrollTo(0,0)');
             const timeCells = await evaluate(`({
@@ -1452,12 +2052,15 @@ try {
             const tokenColumn=await evaluate(`(()=>{
               const table=document.querySelector('.walk-table');
               const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
+              const tokensIndex=table.querySelector('thead th.tokens').cellIndex;
               const box=${comparisonImages} ? table.getBoundingClientRect() : null;
               const bottom=box ? rows.at(-1).getBoundingClientRect().bottom : 0;
-              return {tokens:rows.map(row=>row.querySelector('.tokens').textContent),
+              return {tokens:rows.map(row=>{
+                  const cell=row.cells[tokensIndex];
+                  return cell?.matches('td.tokens') ? cell.textContent : null;
+                }),
                 pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
                 poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
-                lastColumns:rows.map(row=>[...row.children].slice(-2).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
                 clip:box ? {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1} : undefined};
@@ -1465,7 +2068,6 @@ try {
             assert.deepEqual(tokenColumn.tokens,['6','—']);
             assert.deepEqual(tokenColumn.pool,[['Total','31'],['Available','4']]);
             assert.deepEqual(tokenColumn.poolAlignment,['right','right']);
-            assert.deepEqual(tokenColumn.lastColumns,[['vcpus','tokens'],['vcpus','tokens']]);
             assert.equal(tokenColumn.overflow,false);
             if(comparisonImages&&theme==='dark'&&width===1400) {
               await saveScreenshot('token-column-dark-desktop',{captureBeyondViewport:true,clip:tokenColumn.clip});
@@ -2264,6 +2866,7 @@ try {
             position:getComputedStyle(line).position});
           const good=async()=>{
             reading.read_at=now/1000;
+            reading.fresh_until=reading.read_at+ageLimit;
             window.fetch=async()=>({ok:true,json:async()=>reading});
             await refresh.refresh(); fitLabels();
           };
@@ -3291,6 +3894,12 @@ try {
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');
         await capture('gate-tooltip-dark-desktop','#tip');
+        if (awsCostsComparison) {
+          servedReading = readings.aws_costs;
+          await navigate('memory_live.html');
+          await show(readings.aws_costs);
+          await captureAwsCosts(evaluate, call);
+        }
         if (comparisonImages) {
           await show(base);
           await evaluate('hideTip()');

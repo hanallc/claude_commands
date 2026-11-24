@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import unittest
 from typing import cast
@@ -14,9 +13,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import target_config
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS as TARGETS, RUNNER as RUNNER
-from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_functions
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyCallShellTests(unittest.TestCase):
@@ -57,18 +54,7 @@ printf '%s\n' "$VERIFY_CALL_TEXT"
 
 class VerifyStepRoutesTests(VerifyStepRoutesFixture):
     def test_verb_list_runs_in_order_with_one_run_identity(self) -> None:
-        git = shutil.which("git")
-        assert git is not None
-        stub = self.fixture.bin_directory / "git"
-        stub.unlink()
-        stub.symlink_to(git)
-        git_config = self.fixture.root / "git-config"
-        _ = git_config.write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /nonexistent/fixture-gpg\n")
-        self.fixture.environment.update({"GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1"})
-        _ = subprocess.run([git, "init", "-q", "-b", "main"], cwd=self.fixture.root,
-                           env=self.fixture.environment, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
-        _ = commit_repository(self.fixture.root, "fixture", "Cargo.toml", "src", env=self.fixture.environment)
-        _ = (self.fixture.root / ".git/info/exclude").write_text("/*\n!/Cargo.toml\n!/src/\n")
+        self.prepare_repository()
         admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
         previous = admission.server.handle_request
         requests: dict[str, wire.PlacementRequest] = {}
@@ -79,9 +65,6 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
                 _ = requests.setdefault(request.identity.step, request)
             return previous(request, connection)
 
-        metadata = cast(dict[str, object], json.loads(self.fixture.environment["TEST_METADATA"]))
-        metadata["target_directory"] = str(self.fixture.root / "target")
-        self.fixture.environment["TEST_METADATA"] = json.dumps(metadata)
         self.fixture.environment["BUILDLOG_OFF"] = "0"
         with mock.patch.object(admission.server, "handle_request", side_effect=handle):
             result = self.run_verify("test,lint,doc", "sample")

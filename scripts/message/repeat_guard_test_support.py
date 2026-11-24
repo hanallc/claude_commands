@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import os
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -22,6 +21,7 @@ from unittest.mock import patch
 
 from scripts.message import repeat_guard
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 
@@ -74,7 +74,7 @@ def install_notice_test_config(home: Path) -> Path:
     config = home / ".claude/config"
     config.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).resolve().parents[2] / "config/send.conf"
-    _ = shutil.copyfile(source, config / "send.conf")
+    _ = copy_config_file_fixture(source, config / "send.conf")
     return config
 
 
