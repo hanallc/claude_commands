@@ -90,7 +90,8 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
+    affected_modules, change_review, land_runs, nightly_schedule, session_staff, showrunners, staff,
+    unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
@@ -2617,35 +2618,6 @@ def nightly_check_values(result: GateRun) -> dict[str, str]:
     }
 
 
-def nightly_next_run() -> str:
-    """Read the next timer start and show it in the user's time zone."""
-    environment = {key: value for key, value in os.environ.items() if key != "TZ"} | {"LC_ALL": "C"}
-    try:
-        timer = subprocess.run(["systemctl", "--user", "--timestamp=unix", "show",
-            "--property=NextElapseUSecRealtime,TimersCalendar", "claude-nightly.timer"],
-            capture_output=True, text=True, check=True, timeout=5, env=environment)
-        properties = dict(line.split("=", 1) for line in timer.stdout.splitlines() if "=" in line)
-        now = datetime.now(UTC)
-        timestamp = re.fullmatch(r"@(\d+)", properties.get("NextElapseUSecRealtime", ""))
-        scheduled = datetime.fromtimestamp(int(timestamp[1]), UTC) if timestamp else None
-        if scheduled is None or scheduled <= now:
-            # The timer can still show the elapsed start while the service runs.
-            calendars = re.findall(r"OnCalendar=([^;]+?)\s+;\s+next_elapse=", properties.get("TimersCalendar", ""))
-            if not calendars:
-                return "unavailable"
-            next_times = subprocess.run(["systemd-analyze", "calendar", f"--base-time=@{int(now.timestamp())}", *calendars],
-                capture_output=True, text=True, check=True, timeout=5, env=environment)
-            utc_date = (r"(?m)^\s*(?:Next elapse:|\(in UTC\):)\s+[A-Za-z]{3} "
-                        + r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC$")
-            dates = [match[1] for match in re.finditer(utc_date, next_times.stdout)]
-            if not dates:
-                return "unavailable"
-            scheduled = datetime.strptime(min(dates), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
-        return "unavailable"
-    return scheduled.astimezone(user_zone()).strftime("%a %m-%d %H:%M %Z")
-
-
 def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> None:
     try:
         from scripts.message import send_budget
@@ -2655,7 +2627,7 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
         if config.text("nightly_result_push") == "off":
             return
         if isinstance(result, Exception):
-            values = {"action": "", "reason": "", "next_run": nightly_next_run()}
+            values = {"action": "", "reason": "", "next_run": nightly_schedule.nightly_next_run()}
             empty = push_texts.render("nightly.not_run", **values)
             reason = " ".join(str(result).split()).rstrip(".") or type(result).__name__
             room = phone_message_limit(empty.sender, empty.id) - len(empty.message)

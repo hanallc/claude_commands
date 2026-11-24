@@ -5,6 +5,7 @@ from functools import partial
 from scripts.notify.gpu_xid import XID_MEANINGS
 from scripts.notify.push_texts import (ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate,
                                        TemplateValues, decision_values, display_values)
+from scripts.production import nightly_schedule
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -48,12 +49,11 @@ def nightly_not_run_values(given: dict[str, str]) -> TemplateValues:
     """Accept the legacy values that the installed timer sends."""
     if given.keys() != {"branch", "time", "reason", "action"}:
         return display_values(given)
-    from scripts.production.gate import nightly_next_run
-
     action = given["action"]
     if action == "None. The next nightly run tries again.":
         action = ""
-    return TemplateValues({"reason": given["reason"], "action": action, "next_run": nightly_next_run()}, dict(given))
+    return TemplateValues({"reason": given["reason"], "action": action,
+                           "next_run": nightly_schedule.nightly_next_run()}, dict(given))
 
 
 def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
