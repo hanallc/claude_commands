@@ -1425,7 +1425,8 @@ The hourly task can retry the exchange.
 ### Build hold (`scripts/build_hold/build_hold.py`, `commands/build/hold.md`)
 
 **Holder files.** `BUILD_HOLD_DIR` defaults to `~/.local/state/build-hold/`.
-Each holder has one file with one JSON line: `{holder, since, for, release_eta, keep}`.
+Each holder has one file with one JSON line `{holder, since, for, release_eta, keep, user_words}`.
+`user_words` stores Nate's exact request. Older files can omit it.
 `release_eta` stores the release instant; old `"unknown"` values remain readable.
 `keep` holds PID/start-time pairs and defaults to empty for old files.
 Installed scripts refuse directory overrides or a changed `HOME`.
@@ -1436,14 +1437,14 @@ An unreadable or malformed regular file remains a hold.
 The types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, and `Holder(name, since, purpose, release, key, keep)`.
 `ReleaseEta = KnownReleaseEta | UnknownReleaseEta` describes the release time.
 `ReleaseRequest = NoReleaseEta | ClockReleaseEta | DatedReleaseEta` describes the request.
-`write_hold` and `start_hold` take the resolved identity.
+`write_hold` and `start_hold` take the resolved identity and refuse missing or blank user words.
 Holder files supply state to status and Rust release checks.
 `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle.
 Every present holder file remains in force, including when the cycle has `released_at` or `release_started_at`.
 There is no releasing state.
 Only removal ends the holder's hold.
 
-**Drain.** `build_hold.py drain --for '<why>' --release-eta HH:MM --zone IANA` keeps the natedev runs that work until they finish.
+**Drain.** `build_hold.py drain --for '<why>' --user-words '<exact request>' --release-eta HH:MM --zone IANA` keeps active natedev runs until they finish.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
@@ -1524,7 +1525,7 @@ The Builds page shows the count, limit, repository, and machine for a run-limit 
 The snapshot codec writes the gate wait as `BehindHead` with a `_run_limit` field, and current readers restore it.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
-**Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
+**Clear.** `build_hold.py clear --for '<why>' --user-words '<exact request>' --release-eta HH:MM --zone IANA` stops queued gates and running work outside the hold's allow rules.
 It retains explicit keep entries and their children.
 The command leaves the target held until release.
 `clear` and `drain` accept an optional positional target before their options.
