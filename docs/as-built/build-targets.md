@@ -45,11 +45,14 @@ A held target admits only work that its hold rules permit.
 
 A gate from the claude repository reads the targets in registry order.
 It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-Direct full and nightly gates use natedev or `mac-linux`.
-The prepared gate wrappers can use AWS when the queue grants an AWS assignment.
-Named module tests and promotion without tests use natedev.
+Standalone named module tests use the same default targets as full gates.
+Direct gates can use natedev or `mac-linux`.
+The prepared gate wrappers can also use AWS when the queue grants an AWS assignment.
+Named module tests on `mac-linux` use `run.time_limit_seconds` for each module and the full run.
+A nested named gate reuses its live parent reservation on natedev.
+Copy wrappers apply this rule before target overrides.
+Promotion without tests uses natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
-A nested named module can use its parent reservation.
 A gate that does not request placement uses natedev.
 
 The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.

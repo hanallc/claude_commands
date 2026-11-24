@@ -3178,7 +3178,9 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
-                            help="stop a module after this many seconds (default: 1800). Runs with --module have no time limit.")
+                            help="stop a module after this many seconds (default: 1800). "
+                                 + "Named modules on natedev have no time limit. "
+                                 + "Named modules on mac-linux use run.time_limit_seconds.")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
                             help="run only this suite/module with shared admission or the parent's reservation")
@@ -3438,7 +3440,7 @@ class MacLinuxGateRoute(Protocol):
     GuestEndUnproven: type[RuntimeError]
 
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection,
+              module_time_limit_s: float | None, selected: AllModules | TreeSelection,
               gate_job: StepJob | GateJobNotRecorded, type_dirs: Sequence[str],
               assignment: placement.PlacementAssignment) -> GateRun | GuestNotStartedOutcome | GuestGateBlocked | str: ...
 
@@ -3503,7 +3505,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         local_types = nightly_types and bool(type_dirs) and not guest_has_type_tools(guest)
         try:
             outcome = guest.route(repo, mode=mode, full=full,
-                                  module_time_limit_s=sys.float_info.max if named else module_time_limit_s,
+                                  module_time_limit_s=None if named else module_time_limit_s,
                                   selected=selection, gate_job=gate_job, type_dirs=() if local_types else type_dirs,
                                   assignment=assignment)
         except guest.GuestEndUnproven as error:

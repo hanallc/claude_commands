@@ -328,12 +328,16 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
         return ()
+    from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets, uses_parent_reservation
+
+    arguments = tuple(command)
+    if uses_parent_reservation(arguments):
+        return ()
     names = requested or os.environ.get('BUILDLOG_GATE_TARGETS', '')
     if names:
         return tuple(dict.fromkeys(name for value in names.split(',') if (name := value.strip())))
-    from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets
 
-    selected = eligible_gate_targets(source, tuple(command))
+    selected = eligible_gate_targets(source, arguments)
     if isinstance(selected, NoEnabledTarget):
         raise FirstStepRefused(selected.reason)
     return selected

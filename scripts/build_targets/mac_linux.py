@@ -2285,12 +2285,13 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
                            bundle_reason=reply.bundle_reason, module_skips=skips)
 
 
-def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
+def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float | None,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
           assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | GuestGateBlocked | str:
     """Run a gate on the assigned guest.
 
     The assignment is the one the gate checked at its start. The route consumes its launch permission.
+    A None module limit uses the configured full-run limit.
     """
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import mac_run, placement
@@ -2338,6 +2339,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             return GuestNotStarted(f'The Mac Linux state root {root} must be a directory. '
                                    + 'The admission service creates it at startup. '
                                    + 'To repair it, run build_targets.py setup-mac-linux on natedev.')
+        run_time_limit_seconds = settings.run_time_limit_seconds
+        if module_time_limit_s is None:
+            module_time_limit_s = run_time_limit_seconds
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()
@@ -2354,7 +2358,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
-                               module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
+                               module_time_limit_s=module_time_limit_s, run_time_limit_seconds=run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:

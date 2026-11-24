@@ -149,8 +149,6 @@ def _count(arguments: Sequence[str], name: str) -> int:
 
 def gate_natedev_only_flag(arguments: Sequence[str]) -> str | None:
     """Return the gate option that requires natedev."""
-    if _count(arguments, "--module"):
-        return "--module"
     if "--promote-only" in arguments:
         return "--promote-only"
     return None
