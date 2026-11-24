@@ -613,6 +613,9 @@ class QueueMoveTests(unittest.TestCase):
             assert isinstance(moved, wire.QueueMoved)
             self.assertEqual(ids(moved.line), [first, hidden, last, third, hidden_tail])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
+            # A move publishes the new order at once (89154086cf).
+            self.assertEqual(move_line(fixture), moved.line)
+            _ = fixture.run_pass()
             self.assertEqual(move_line(fixture), moved.line)
 
             lifted, = fixture.server.handle_request(wire.QueueMoveRequest(
@@ -624,9 +627,81 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(undone.line), [first, hidden, last, third, hidden_tail])
             self.assertEqual(fixture.server.queue_pins, (QueuePin(last, QueueRowAnchor(hidden)),))
 
+    def test_a_waiting_mac_linux_copy_counts_for_the_kept_place_after_a_move(self) -> None:
+        from scripts.build_queue.test_placement import mac_linux_candidate, mac_linux_fixture
+
+        with AdmissionFixture(private=True) as fixture:
+            backoff = mac_linux_fixture(fixture)
+            now = fixture.clock.now()
+            _ = backoff.write_text(str(now + 100))
+            os.utime(backoff, (now, now))
+            with patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                parent = fixture.request(run=fixture.run_owner())
+                self.assertIsInstance(fixture.server.handle_request(parent)[0], wire.Admitted)
+                fixture.free(0)
+                fixture.hold_starts()
+                copy = placement_request(fixture, since=now - 30)
+                copy = replace(copy, purpose=placement.SpeculativeCopy(parent.episode, now),
+                               constraints=replace(copy.constraints, candidates=(mac_linux_candidate(),)))
+                self.assertIsInstance(fixture.server.handle_request(copy)[0], wire.PlacementWait)
+                for since in (now - 25, now - 10):
+                    self.assertIsInstance(fixture.server.handle_request(fixture.request(since=since))[0], wire.Wait)
+                fixture.server.held_places = (records.HeldPlace("queue", "fixture", "lint", now - 20,
+                    now, now + 100, "4242-99", ("natedev",), 1, "failed"),)
+                _ = fixture.run_pass()
+                before = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+                self.assertEqual(before.view.waiting[0].pid, copy.owner.pid)
+                self.assertIsInstance(before.view.waiting[0].reason, records.MachineChoiceWait)
+                self.assertEqual(before.held_places[0].position, 3)
+                line = move_line(fixture)
+                fixed, first, second = line.members
+                self.assertFalse(fixed.movable)
+                moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                    "move-beside-copy", second.row_id, line.revision, wire.QueueDrop(first.row_id, "before")))
+                assert isinstance(moved, wire.QueueMoved)
+                self.assertEqual(moved.line.members, (fixed, second, first))
+                self.assertEqual(moved.line.members[1].kept_before, 1)
+                confirmed = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+                self.assertEqual((confirmed.view.move_line, confirmed.held_places[0].position), (moved.line, 2))
+                _ = fixture.run_pass()
+                after = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+                self.assertEqual((after.view.move_line, after.held_places), (moved.line, confirmed.held_places))
+
+    def test_cached_placement_wait_returns_the_new_place_after_a_move(self) -> None:
+        with AdmissionFixture(private=True) as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            waiting = fixture.request(since=now - 1)
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            request = placement_request(fixture, since=now)
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(local_candidate(fixture),)))
+            first, = fixture.server.handle_request(request)
+            assert isinstance(first, wire.PlacementWait)
+            self.assertEqual(first.position, 2)
+            self.assertEqual(fixture.connect(request).replies(), [first])
+
+            line = move_line(fixture)
+            earlier, later = line.members
+            moved, = fixture.connect(wire.QueueMoveRequest(
+                "move-placement", later.row_id, line.revision, wire.QueueHeadDrop())).replies()
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(moved.line.members, (later, earlier))
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            snapshot = queue_snapshot.read_view_snapshot(fixture.state_dir).reading
+            self.assertEqual(view.reading, snapshot)
+            self.assertEqual(snapshot.view.move_line, moved.line)
+            self.assertEqual([row.pid for row in snapshot.view.waiting], [request.owner.pid, waiting.owner.pid])
+            after, = fixture.server.handle_request(request)
+            assert isinstance(after, wire.PlacementWait)
+            self.assertEqual(after.position, 1)
+            self.assertEqual(fixture.connect(request).replies(), [after])
+
     def test_head_drop_goes_ahead_of_a_leading_unnamed_wait(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -650,7 +725,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
             finally:
                 _ = feed.doCleanups()
@@ -658,8 +733,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(page.get("move_revision"), moved.line.revision)
 
     def test_undo_restores_the_head_ahead_of_an_unnamed_wait_after_restart(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -693,7 +768,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
             finally:
                 _ = feed.doCleanups()
@@ -734,8 +809,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual(ids(undone.line), [first, second, third])
 
     def test_unstarted_scoped_grant_shows_once_and_keeps_its_memory_charge(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with AdmissionFixture() as fixture:
             request = fixture.request()
@@ -753,7 +828,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
             finally:
                 _ = feed.doCleanups()
@@ -1297,8 +1372,8 @@ class QueueMoveTests(unittest.TestCase):
 
     def check_builds_table(self, fixture: PlacementFixture, requests: tuple[wire.PlacementRequest, ...],
                           mac: wire.PlacementRequest) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         _ = fixture.run_pass()
         reply, = fixture.server.handle_request(wire.ViewRequest())
@@ -1306,7 +1381,7 @@ class QueueMoveTests(unittest.TestCase):
         feed = MemoryFeedTests()
         feed.setUp()
         try:
-            with patch.object(admission_client, "view", return_value=reply.reading):
+            with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                 table = memory_feed.reading()["waiters"]
         finally:
             _ = feed.doCleanups()
@@ -1519,8 +1594,8 @@ class QueueMoveTests(unittest.TestCase):
             self.assertEqual([member.row_id for member in move_line(fixture).members], [after, before])
 
     def test_builds_table_reports_a_hold_and_the_speculative_copy_rule(self) -> None:
-        from scripts.build_queue import admission_client, memory_feed
-        from scripts.build_queue.test_memory_feed import MemoryFeedTests
+        from scripts.build_queue import memory_feed, queue_snapshot
+        from scripts.build_queue.test_memory_feed import MemoryFeedTests, fixture_published_view
 
         with PlacementFixture() as fixture:
             fixture.free(0)
@@ -1543,7 +1618,7 @@ class QueueMoveTests(unittest.TestCase):
             feed = MemoryFeedTests()
             feed.setUp()
             try:
-                with patch.object(admission_client, "view", return_value=reply.reading):
+                with patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     table = {row["pid"]: row for row in memory_feed.reading()["waiters"]}
             finally:
                 _ = feed.doCleanups()
