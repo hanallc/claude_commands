@@ -859,7 +859,11 @@ async function loadDisks(supersede=false,current=()=>true){
   await Promise.all([readData(current),readBuilds(current)]);
   if(!current()) return;
   try{if(!measuring) await askMeasure(current);}
-  catch(error){if(current()) showActionFailure(measureFailure,error.message);}
+  catch(error){
+    if(!current()) return;
+    if(!data) throw error;
+    showActionFailure(measureFailure,error.message);
+  }
   if(!current()) return;
   if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
    busy:measuring ? 'Measuring…' : ''};

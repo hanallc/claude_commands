@@ -1607,11 +1607,13 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                 class Probe(serve.ReviewLinksHandler):
                     @override
                     def html_response(self, status: int, content: bytes, *,
-                                      delivery_pending: bool | None = None, builds_version: str = "") -> None:
+                                      delivery_pending: bool | None = None, builds_version: str = "",
+                                      content_security_policy: str = "", cache_gzip: bool = False) -> None:
                         if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
                         super().html_response(status, content, delivery_pending=delivery_pending,
-                                              builds_version=builds_version)
+                                              builds_version=builds_version,
+                                              content_security_policy=content_security_policy, cache_gzip=cache_gzip)
 
                     @override
                     def review_response(self, content: bytes, content_type: str, prepared: bytes = b"", *,
@@ -4125,6 +4127,32 @@ window.fetch=async(_path,options={})=>{
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_reopening_an_expired_park_retries_the_original_request(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-12-02T13:00:00Z');
+ Date.now=()=>now;
+ show('all');
+ const toggle=form.querySelector('[data-later-toggle]'),choose=form.querySelector('[data-later-choose]');
+ const time=form.querySelector('[data-later-time]'),save=form.querySelector('[value="park"]');
+ toggle.click();choose.click();
+ time.value='19:30';time.dispatchEvent(new Event('input',{bubbles:true}));
+ const draft=form.elements.until.value;
+ save.click();
+ const first=requests[0];
+ check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save uses the selected time');
+ await loseParkPost();
+ losePost();await flush();await finishRowMotion();
+ now=Date.parse('2026-12-05T13:00:00Z');
+ toggle.click();choose.click();
+ check(form.elements.until.value===draft && time.value==='19:30','The picker keeps the unconfirmed draft');
+ check(!save.disabled,'Save remains enabled for the unconfirmed Park');
+ save.click();
+ check(requests.length===3 && requests[2]?.toString()===first?.toString(),
+  'Save sends the original request after the deadline');
+ if(requests.length===3){finishPost({parked:'false',parked_until:''});await flush();}
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_refusal_restores_focus(self) -> None:
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
@@ -4164,19 +4192,21 @@ window.fetch=async(_path,options={})=>{
  toggle.click();
  form.querySelector('[data-later-choose]').click();
  const entry=grid.querySelector('button:not(:disabled)[tabindex="0"]');
- check(entry?.dataset.date==='2026-12-16','The calendar selects tomorrow after the draft expires');
+ check(entry?.dataset.date==='2026-12-15','The calendar makes today reachable after the draft expires');
+ check(grid.querySelector('[aria-selected="true"]')?.dataset.date==='2026-12-03',
+  'The calendar keeps the unconfirmed date selected');
  check(entry===document.activeElement && !save.disabled,'The calendar focuses the date and enables Save');
  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
  now=Date.parse('2027-01-02T13:00:00Z');
  toggle.click();
  form.querySelector('[data-later-choose]').click();
  const nextMonth=grid.querySelector('button:not(:disabled)[tabindex="0"]');
- check(nextMonth?.dataset.date==='2027-01-03','The calendar opens on tomorrow in the new month');
+ check(nextMonth?.dataset.date==='2027-01-02','The calendar opens on today in the new month');
  if(nextMonth){
   nextMonth.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
-  check(document.activeElement.dataset.date==='2027-01-04','ArrowRight selects a new date from the focused day');
+  check(document.activeElement.dataset.date==='2027-01-03','ArrowRight selects a new date from the focused day');
   save.click();
-  check(requests[2]?.get('request')!==first.get('request') && requests[2]?.get('until')?.startsWith('2027-01-04'),
+  check(requests[2]?.get('request')!==first.get('request') && requests[2]?.get('until')?.startsWith('2027-01-03'),
    'The new date sends a new request');
   if(requests.length===3){finishPost({parked:'true'});await flush();}
  }

@@ -347,6 +347,22 @@ START
 """
         self.assert_status_scenario(scenario)
 
+    def test_a_refused_first_measure_shows_failed_without_data(self) -> None:
+        self.assert_status_scenario(r"""
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>url==='measure'
+ ? {ok:false,status:503,json:async()=>({reason:'Measure refused.'})}
+ : {ok:false,status:404};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ if(line.dataset.state!=='Failed' || parts.reason.textContent!=='Measure refused.' || !measureIssue.hidden)
+  throw new Error('A refused first measure must show its reason in the Failed status.');
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
     def test_the_first_measure_keeps_its_data_age_when_the_next_read_stalls(self) -> None:
         self.assert_status_scenario(r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
