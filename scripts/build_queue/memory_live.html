@@ -395,7 +395,9 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 /* The table is measured at its own width, not cut to the walk. */
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
 /* Narrow the column gaps to keep the chart beside the table. */
-.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 7px; }
+.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 6px; }
+/* The last machine badge extends 7 px past its icon. */
+.walk.tight .walk-table td.machine:has(> .machine-icon[data-badge]:last-child) { padding-right: 7px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
