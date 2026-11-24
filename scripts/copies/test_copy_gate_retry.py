@@ -77,6 +77,8 @@ class CopyGateRetryTests(unittest.TestCase):
 
             assert Path.cwd() == Path(sys.argv[2])
             assert Path(os.environ["BUILDLOG_PREPARED_COPY"]) == Path.cwd()
+            with os.fdopen(int(os.environ["BUILDLOG_PREPARED_GATE_FD"]), "rb") as handoff:
+                assert handoff.read(1) == b"1"
             assert os.environ["COPIES_STEP_OWNER"] == "fixture"
             os.fstat(int(os.environ["COPIES_COMMAND_LEASE_FDS"]))
             path = Path(os.environ["BUILDLOG_PLACEMENT_FILE"])

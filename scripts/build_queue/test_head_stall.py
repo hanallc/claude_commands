@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
-from scripts.buildlog import cli, mac_idle, machine_facts, sample
+from scripts.buildlog import cli, machine_facts, machine_watch, sample
 from scripts.lib import conf
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, write_config_fixture
 
@@ -413,8 +413,8 @@ class WatchTests(unittest.TestCase):
             raise OSError("fixture cannot write alert state")
 
         with (mock.patch.object(sample, "sample", return_value=sample.SampleTaken(NOW, "natedev")),
-              mock.patch.object(mac_idle, "watch_once"),
-              mock.patch.object(mac_idle, "watch_paths"),
+              mock.patch.object(machine_watch, "watch_once"),
+              mock.patch.object(machine_watch, "watch_paths"),
               mock.patch.object(machine_facts, "sample_once"),
               mock.patch.object(head_stall, "default_paths", return_value=self.paths),
               mock.patch.object(head_stall, "write_text_atomic", side_effect=fail_write),

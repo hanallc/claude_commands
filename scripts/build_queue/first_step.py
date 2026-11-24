@@ -82,8 +82,7 @@ class FirstStepAdmission:
 
     def _hand_gate(self, grant: GatePlacement) -> None:
         # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
-        # The gate ends that reservation after the check, before it takes its own (gate.gate_start_target).
-        # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
+        # The gate uses the reservation for its suites. The cancel returns an unused reservation.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
         if isinstance(grant.request.local, wire.LocalAdmissionContext):

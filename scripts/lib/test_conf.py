@@ -400,6 +400,15 @@ conf_reads.record('disabled')
         with mock.patch("socket.gethostname", return_value="unknown.example.invalid"):
             self.assertEqual(conf.read("example").whole("count"), 1)
 
+    def test_an_ignored_host_override_reads_the_key_as_written(self) -> None:
+        self.write("# whole: ..\ncount=1\n# whole: ..\ncount.testhost=7\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example.invalid"):
+            settings = conf.read("example")
+            ignored = conf.HostOverride.IGNORED
+            self.assertEqual(settings.value("count", conf.positive_whole, host_override=ignored), 1)
+            self.assertEqual(settings.value("count.testhost", conf.positive_whole, host_override=ignored), 7)
+            self.assertEqual(settings.value("count.other", conf.positive_whole, default=3, host_override=ignored), 3)
+
     def test_home_config_is_used_when_conf_dir_is_not_set(self) -> None:
         home_config = self.root / "home/.claude/config"
         home_config.mkdir(parents=True)

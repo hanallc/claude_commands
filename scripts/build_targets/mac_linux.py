@@ -43,7 +43,9 @@ from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import (
+    AllModules, GateJobKind, GateResultUnknown, GateRun, ModuleCoverage, SuiteMode, TreeSelection,
+)
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
@@ -106,8 +108,6 @@ OWNED_FOLDERS = (Path('/etc'), Path('/bin'), Path('/usr'), Path('/sbin'))
 STORE = Path('/nix/store')
 # The run sees its attempt temp folder at this path, and TMPDIR names it.
 TEMP = Path('/tmp')
-# The socket of the private sccache server of the run, in the attempt temp folder.
-SCCACHE_SOCKET = TEMP / 'sccache.sock'
 # The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
 CARGO_LOCKS = ('.package-cache', '.package-cache-mutate', '.global-cache')
 # The key of the bwrap status line that gives the exit status of the program.
@@ -1429,8 +1429,10 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
-                detail = stream_diagnostic(error.stderr if isinstance(error.stderr, bytes) else b'')
-                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds: {detail}') from error
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b''
+                started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
+                failure = GuestResultUnavailable if started else GuestUnavailable
+                raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 
@@ -1548,9 +1550,13 @@ def stream_diagnostic(stderr: bytes) -> str:
     return ' '.join(stderr.decode(errors='replace').split())[-1200:] or 'no diagnostic'
 
 
+class GuestResultUnavailable(GuestUnavailable):
+    """The guest started tests and supplied no usable result."""
+
+
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
-    return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
+    return (GuestResultUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -1833,6 +1839,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(' '.join((str(error), *notes)))
+    except (GuestEndUnproven, GuestResultUnavailable) as error:
+        notes = cast(list[str], getattr(error, '__notes__', []))
+        raise GateResultUnknown(f'{TARGET}: ' + ' '.join((str(error), *notes))) from error
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
@@ -2040,12 +2049,10 @@ def read_paths(environment: Mapping[str, str], kept: Sequence[Path]) -> list[Pat
 
 
 def written_paths(checkout: Path, environment: Mapping[str, str]) -> list[Path]:
-    """The paths of the program environment that the run reads and writes, the checkout first: the cargo registry
-    and git folders, the cargo lock files, and the sccache folder."""
+    """Return the checkout, the Cargo registry and git folders, and the Cargo lock files."""
     home = home_folder(environment)
     cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
-    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS),
-            Path(environment.get('SCCACHE_DIR') or home / '.cache' / 'sccache')]
+    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS)]
 
 
 def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Path, read: Iterable[Path],
@@ -2067,8 +2074,11 @@ def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Pa
             if bindable(item, home, read=option == '--ro-bind'):
                 words += [option, str(item), str(item)]
     # The root of the limit is not writable, so a write to a folder that is not bound fails at once.
-    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'SCCACHE_SERVER_UDS',
-            str(SCCACHE_SOCKET), '--setenv', 'CARGO_NET_OFFLINE', 'true', '--chdir', str(checkout), '--']
+    # Empty wrapper values turn off the Cargo config wrapper.
+    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'CARGO_NET_OFFLINE', 'true',
+            '--setenv', 'RUSTC_WRAPPER', '', '--setenv', 'CARGO_BUILD_RUSTC_WRAPPER', '',
+            '--unsetenv', 'SCCACHE_DIR', '--unsetenv', 'SCCACHE_CACHE_SIZE', '--unsetenv', 'SCCACHE_SERVER_UDS',
+            '--chdir', str(checkout), '--']
 
 
 def setup_failed(status: int, status_fd: int) -> bool:
@@ -2092,9 +2102,9 @@ def limited_command(bwrap: str, status_fd: int, tmp: Path, copy: Path, environme
                     attempt: str, argv: Sequence[str]) -> list[str]:
     """The bwrap words that start the argv of a hand made run in the numbered copy under the read limit.
 
-    The program reads and writes the copy, which holds the run home and the build output, the cargo folders and
-    the sccache folder of its environment, and the attempt temp folder, which it sees as /tmp. home is the account
-    home of the guest: the limit binds no path that holds it. START_SHELL prints the start line in the limit.
+    The program writes the copy and its Cargo folders. The copy holds the run home and the build output.
+    The program sees the attempt temp folder as /tmp.
+    The limit binds no path that holds the guest account home. START_SHELL prints the start line in the limit.
     """
     write = [*written_paths(copy, environment), output_folder(copy, environment)]
     words = limit_words(bwrap, status_fd, tmp, copy, home, read_paths(environment, [tmp, copy]), write)

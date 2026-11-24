@@ -417,7 +417,7 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "sample":
         from scripts.buildlog import sample
-        from scripts.buildlog import mac_idle
+        from scripts.buildlog import machine_watch
 
         if rest:
             print("usage: buildlog sample", file=sys.stderr)
@@ -425,9 +425,9 @@ def main(argv: list[str]) -> int:
         taken = sample.sample()
         if taken.host == "natedev":
             try:
-                mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
+                machine_watch.watch_once(machine_watch.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
-                print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
+                print(f"buildlog sample: machine watch failed: {error}", file=sys.stderr)
             from scripts.build_queue import head_stall
 
             try:
