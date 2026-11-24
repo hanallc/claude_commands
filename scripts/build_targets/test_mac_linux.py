@@ -793,8 +793,14 @@ class MacLinuxRouteTests(unittest.TestCase):
             return wire.FirstAuthorization(request.assignment, request.claim)
 
         _ = self.enterContext(patch.object(admission_client, 'consume_permission', consume))
-        _ = self.enterContext(patch.object(mac_linux, 'send_guest_execution', return_value=wire.DispatchStatus(
-            self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))))
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            self.assertGreater(timeout, 0)
+            state = (placement.ClosedAssignment('completed') if isinstance(request.outcome, placement.AttemptCompleted)
+                     else placement.CurrentAssignment())
+            return wire.DispatchStatus(request.assignment, state, placement.PermissionConsumed(1.0))
+
+        _ = self.enterContext(patch.object(mac_linux, 'send_guest_execution', report))
         _ = self.git('init', '-q', '--initial-branch=main')
         _ = (self.repo / 'history.txt').write_text('old source\n', encoding='utf-8')
         _ = self.git('add', '.')
@@ -885,30 +891,66 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
-    def test_started_guest_reports_once_for_its_placement(self) -> None:
+    def test_guest_reports_start_and_completion_for_its_placement(self) -> None:
         reports: list[wire.ExecutionReport] = []
 
         def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
             self.assertGreater(deadline, time.monotonic())
             self.assertEqual(timeout, 1)
             reports.append(request)
-            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+            state = (placement.ClosedAssignment('completed') if isinstance(request.outcome, placement.AttemptCompleted)
+                     else placement.CurrentAssignment())
+            if isinstance(state, placement.ClosedAssignment):
+                self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+            return wire.DispatchStatus(self.placed, state, placement.PermissionConsumed(1.0))
 
         with patch.object(mac_linux, 'send_guest_execution', report):
             result = self.route()
         self.assertIsInstance(result, GateRun)
-        report_row, = reports
+        report_row, completion = reports
         self.assertEqual((report_row.assignment, report_row.claim), (self.placed, self.consumed[0][0].claim))
         assert isinstance(report_row.evidence, execution_identity.ObservedExecution)
         identity = report_row.evidence.identity
         assert isinstance(identity, execution_identity.CloudExecution)
         self.assertEqual((identity.target, identity.attempt), (mac_linux.TARGET, self.placed.attempt))
+        self.assertEqual((completion.assignment, completion.claim), (report_row.assignment, report_row.claim))
+        self.assertEqual(completion.outcome, placement.AttemptCompleted(0))
+        self.assertEqual(completion.path, placement.DispatchPathSettled())
 
     def test_guest_without_a_start_line_reports_no_execution(self) -> None:
         with patch.object(mac_linux, 'send_guest_execution') as report:
             result = self.route('disconnect-before-copy')
         self.assertIsInstance(result, mac_linux.GuestNotStarted)
         report.assert_not_called()
+
+    def test_completion_report_does_not_wait_for_stalled_configuration(self) -> None:
+        entered = Event()
+        release = Event()
+        finished = Event()
+        read = conf.read
+
+        def read_config(file: str | Path) -> conf.ConfigRead:
+            if file == 'build_admission':
+                entered.set()
+                _ = release.wait(3)
+                finished.set()
+            return read(file)
+
+        with (patch.object(conf, 'read', read_config),
+              patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.2),
+              patch.object(mac_linux, 'send_guest_execution') as send,
+              redirect_stderr(io.StringIO()) as errors):
+            try:
+                mac_linux.report_guest_completion(self.guest_dispatch(), 0)
+                self.assertTrue(entered.is_set())
+                self.assertFalse(finished.is_set(), 'The completion report waited for configuration.')
+            finally:
+                release.set()
+                if entered.is_set():
+                    self.assertTrue(finished.wait(1))
+            send.assert_not_called()
+        self.assertEqual(errors.getvalue(), 'Mac Linux guest completion report failed: '
+                         + 'the queue report configuration read timed out\n')
 
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,
@@ -917,6 +959,29 @@ fi
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)
         self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed: fixture refusal'), 1)
+        self.assertEqual(errors.getvalue().count('Mac Linux guest completion report failed: fixture refusal'), 1)
+
+    def test_closed_stderr_keeps_the_failed_guest_verdict_after_a_report_timeout(self) -> None:
+        completions: list[wire.ExecutionReport] = []
+
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            if isinstance(request.outcome, placement.AttemptCompleted):
+                completions.append(request)
+                raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s')
+            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(errors, 'write', side_effect=BrokenPipeError('fixture stderr pipe closed')) as write,
+              patch.object(mac_linux, 'send_guest_execution', report)):
+            result = self.route('red')
+        assert isinstance(result, GateRun), result
+        self.assertFalse(result.passed)
+        self.assertEqual([job.returncode for job in result.jobs], [1, 1])
+        completion, = completions
+        self.assertEqual(completion.outcome, placement.AttemptCompleted(1))
+        self.assertEqual(completion.path, placement.DispatchPathSettled())
+        write.assert_called_once_with('Mac Linux guest completion report failed: no answer in 1 s')
 
     def test_guest_module_progress_uses_the_placement_sidecar(self) -> None:
         sidecar = self.root / 'placement.cgroup'
