@@ -822,22 +822,30 @@ try {
               }
               if (width === 1440) {
                 const {guest_run:_guestRun, ...pending} = guest;
+                pending.pid = {kind:'PidNotRecorded'};
+                pending.vcpus = {kind:'UnknownCpuCount'};
                 const guestStates = [
                   {...pending, guest_unconfirmed:'starting'},
                   {...pending, guest_unconfirmed:'not confirmed'},
                   guest,
                 ];
-                const guestMachineCells = await evaluate(`(() => {
+                const guestCells = await evaluate(`(() => {
                   const data = latest;
                   const cells = ${JSON.stringify(guestStates)}.map(state => {
                     renderWalk({...data, walk:data.walk.map(row => row.key === state.key ? state : row)});
-                    const cell = document.querySelector('tr[data-tip="row:shot-guest"] td.machine');
-                    return [cell.querySelector('.machine-icon.run')?.dataset.machine, cell.textContent.trim()];
+                    const row = document.querySelector('tr[data-tip="row:shot-guest"]');
+                    const machine = row.querySelector('td.machine');
+                    return [machine.querySelector('.machine-icon.run')?.dataset.machine, machine.textContent.trim(),
+                      row.querySelector('td.pid').textContent, row.querySelector('td.vcpus').textContent];
                   });
                   renderWalk(data);
                   return cells;
                 })()`);
-                assert.deepEqual(guestMachineCells, [['mac-linux','starting'], ['mac-linux','not confirmed'], ['mac-linux','']]);
+                assert.deepEqual(guestCells, [
+                  ['mac-linux','starting','—','—'],
+                  ['mac-linux','not confirmed','—','—'],
+                  ['mac-linux','',String(guest.pid),String(guest.vcpus)],
+                ]);
               }
             }
             if (queueRowsProof) {
