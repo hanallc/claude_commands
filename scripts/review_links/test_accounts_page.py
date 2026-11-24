@@ -25,7 +25,8 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.review_links import accounts_page, console_theme, page_frame, serve
+from scripts.production import staff
+from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
 from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
@@ -1794,6 +1795,42 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with (patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired((), 30)),
               self.assertRaisesRegex(OSError, "took longer than 30 s")):
             _ = accounts_page.render()
+
+    def test_new_item_opens_above_the_color_picker_and_its_screenshot_shows_the_picker(self) -> None:
+        from scripts.review_links.test_page_frame import PAGE_OWNER, WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest("Chrome or Firefox is required for the window rule.")
+        reading = accounts.StatusReading((status_row("claude1"), status_row("claude2")), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,))
+        markup = page_frame.with_owner(rendered, "accounts", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)),
+                                       new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const popup=document.querySelector('[data-color-picker]');
+  document.querySelector('[data-color-key="account.claude1"]').click();
+  await until(()=>popup.open,'the color picker');
+  await painted();
+  check(pressNewItem('over the color picker')!==null,'The press reaches New item.');
+  const capture=await newItemOver(popup,'the color picker');
+  const address=location.pathname+location.search+location.hash;
+  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent('color:account.claude1'),
+   'The screenshot address names the open color picker: '+capture.place);
+  await closeNewItem(popup,'the color picker');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-color-picker]')?.open===true,'the color picker');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = markup.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({"/console/accounts.html": page}, "/console/accounts.html", browser),
+                                 [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:

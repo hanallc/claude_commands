@@ -1785,7 +1785,7 @@ class ImagePairTests(ImagesFixture):
   frameElement.style.height='800px';
   document.querySelector('[data-image-layout]').style.minHeight='300vh';
   const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const heading=document.querySelector('.page-heading'), groups=document.querySelector('[data-image-groups]');
+  const actions=document.querySelector('[data-page-actions]'), groups=document.querySelector('[data-image-groups]');
   for(const top of [0,64,800]){
    scrollTo({top,behavior:'instant'});
    await painted();
@@ -1795,12 +1795,13 @@ class ImagePairTests(ImagesFixture):
     failures.push('The Images pair must fit side by side at 1024 px and scroll position '+top+'.');
    }
   }
-  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
-  if(!heading.hasAttribute('data-page-heading-stuck') || Math.abs(heading.getBoundingClientRect().top-space)>=1){
-   failures.push('At scroll position 800 the heading row must stick at the top.');
+  const space=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-actions-space'));
+  const controls=Math.max(...[...actions.children].map(control=>control.getBoundingClientRect().bottom));
+  if(Math.abs(actions.getBoundingClientRect().top-space)>=1 || document.querySelector('.page-heading').getBoundingClientRect().bottom>0){
+   failures.push('At scroll position 800 the action area must stick at the top and the title must scroll away.');
   }
-  if(groups.getBoundingClientRect().top<heading.getBoundingClientRect().bottom+16){
-   failures.push('The image group index must stick below the heading row.');
+  if(groups.getBoundingClientRect().top<controls+16){
+   failures.push('The image group index must stick below the action area.');
   }
   frameElement.style.width='1382px';
   groups.querySelector('a span').textContent='admin-console-reviewer';
