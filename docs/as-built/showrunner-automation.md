@@ -532,7 +532,16 @@ Each local Promote checkout must exist before the command pushes.
   `--promote` sends the green merge to `~/.claude` main and the Mac.
   See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
 
-The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst` (one feature-log proposal per change-review row; `docs/as-built/feature-log.md`), then `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into. A change for the user to check is never an open question: it goes on the change review list, and `<CloseChangeReview/>` takes the user's verdict for every production, with feature-log calls only where the project closes out by change review (Hana and `~/.claude`).
+Before the call, the showrunner checks the overlap notice, new public items without a consumer, and the design check.
+After the call, it runs `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst`.
+It records one feature log proposal per change review row. See `docs/as-built/feature-log.md`.
+It then runs `<ClearGate/>` and `<CrossUnitChange/>`.
+It runs `<CIPoint/>` only when `ci_points.py due` reports that CI is due.
+It sends the script's `send <unit>:` line and includes each `into:` line in the user update.
+It adds an `into:` line for each unit worktree that receives the merge branch.
+It puts changes that need a user check on the change review list.
+`<CloseChangeReview/>` records the user's verdict for every production.
+It calls the feature log only for projects that close work by change review (Hana and `~/.claude`).
 
 ### Smoke launch
 
@@ -912,9 +921,13 @@ Pane labels do not identify a consultation.
   Stored instants keep their offsets.
   Tests select a private zone when their assertions need one.
 
-### CI points and review watch: `ci_points.py`
+### CI points in `ci_points.py`
 
-`ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
+`ci_points.py due | ci start [--cancel-prior] | ci collect | notice clear <gate> | notice lift <gate> --log <path>`
+
+Each command requires `--production`. The `due` and `ci` commands require `--state-dir` and accept `--no-ci`.
+
+The 2026-11-24 change removed the review watch and its push.
 
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
 - `ci start`: validates the merge-branch tip with `validate_and_push.sh`, publishes it with `push_direct.sh --publish-only`, follows the CI run with `push_direct.sh --follow-published`, and writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`. The run's repository and head commit must match the push remote and the published commit.
@@ -927,12 +940,11 @@ Pane labels do not identify a consultation.
   - A failed run still runs the `--cancel-prior` step before `ci start` exits with the failure.
   - An `ssh.github.com` (SSH over 443) remote uses `github.com` for GitHub API calls and run links.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
-- `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
 - `notice clear <gate>` requires the code merge.
   It drafts `send <waiting unit>: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
   `notice lift <gate> --log <path>` drafts `send <waiting unit>: <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.`
   Each gate row has the form `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
-- Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `CI_POINTS_REVIEW_REGIME`.
+- Tests can use `CI_POINTS_VALIDATE_SCRIPT` to select the validation script.
 
 ### Unit configuration formatting
 
@@ -1273,7 +1285,7 @@ Copied pane marks do not select rows.
   Publication never uses force.
 
 
-- One state directory: `eta_seen.json` and `review_watch.json` live in `WAITING_STATE_DIR` for every caller; a second directory forks the once-per-phase and first-alert records. The command document names this shared path.
+- All callers share `eta_seen.json` in `WAITING_STATE_DIR` to record each phase once.
 
 - `then` reaches the renderer unchanged; the renderer refuses, it never rewrites.
 
@@ -1313,9 +1325,7 @@ Copied pane marks do not select rows.
 
 - `merge_checkpoint.py` accepts a Merge tests command only with status zero.
 
-- CI point: due at 5 code merges; `ci collect` requires job `Test Suite` by name. The review table is `report --since 2026-09-28`.
-
-- `review_watch.json` is written after the LOG line: a crash between them repeats the log entry once (at least once).
+- A CI point is due at five code merges. `ci collect` requires the job named `Test Suite`.
 
 
 - The renderer exposes no list of required fields, which is why the builder names five itself.
