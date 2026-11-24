@@ -624,6 +624,11 @@ def _fingerprint(payload: list[object]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _legacy_draft_fingerprint(draft_id: str, kind: SubmissionKind, words: str,
+                              images: tuple[tuple[str, str], ...]) -> str:
+    return _fingerprint([draft_id, kind, words, images])
+
+
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
     payload: list[object] = [request.kind, words, new_item_dialog.evidence_fields(request.evidence), _image_fingerprints(uploads)]
     if request.page:
@@ -1651,8 +1656,7 @@ def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> FiledDr
     return NoListRecordForClaim()
 
 
-def _draft_filing(folder: Path, members: staff.StaffSnapshot | None = None, *,
-                  repair_index: bool = True) -> DraftFiling:
+def _draft_filing(folder: Path, *, repair_index: bool = True) -> DraftFiling:
     """Read this draft's index and repair missing entries from its files."""
     for location in (_draft_index(folder), folder):
         receipt = _read_location_hint(location, receipt_only=True)
@@ -1681,15 +1685,25 @@ def _draft_filing(folder: Path, members: staff.StaffSnapshot | None = None, *,
               and _is_earlier_native_draft(folder, receipt)):
             atomic_file.sync_folder(location)
         return filing
-    if not repair_index:
-        return UnclaimedDraft()
+    return UnclaimedDraft()
+
+
+@contextmanager
+def _locked_legacy_list_target(folder: Path, members: staff.StaffSnapshot | None
+                               ) -> Generator[LocatedSubmission | NoNativeSubmission]:
+    """Read the native record named by a base-format draft marker."""
     try:
         key = (folder / "list-receipt-key").read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        return UnclaimedDraft()
-    with scoped_submission(read_submission_key(key), members=members) as item:
-        _claim_recovered_native_draft(folder, item.destination)
-        return _publish_recovered_native_draft(folder, item.destination)
+        hint = _read_request_file(folder / "list-capture-target.json", folder.name)
+        if isinstance(hint, NativeSubmissionDestination):
+            with _locked_request(hint.address, members, recovered=hint) as lookup:
+                yield _saved_draft(lookup) or NoNativeSubmission()
+        else:
+            yield NoNativeSubmission()
+    else:
+        with scoped_submission(read_submission_key(key), members=members) as item:
+            yield item
 
 
 def _is_earlier_native_draft(folder: Path, destination: NativeSubmissionDestination) -> bool:
@@ -1718,8 +1732,15 @@ def file_list_draft(request_id: str, payload_hash: str, *,
                     deliver: Callable[[ListAssignmentNotice, str, str], bool]) -> ListItemDestination:
     """Recover the first Send or file a List item under its draft lock."""
     with _locked_filing_draft(request_id) as folder:
-        _sync_draft_parents(folder)
         filing = _draft_filing(folder)
+        if isinstance(filing, UnclaimedDraft):
+            with _locked_legacy_list_target(folder, None) as target:
+                if isinstance(target, LocatedSubmission):
+                    raise DraftAlreadyFiled(target.destination.id)
+            match = _find_legacy_list_draft(request_id)
+            if isinstance(match, NativeSubmissionDestination):
+                raise DraftAlreadyFiled(match.id)
+        _sync_draft_parents(folder)
         if isinstance(filing, PendingFiling):
             raise DraftPending()
         if isinstance(filing, NativeDraftAwaitingReceipt):
@@ -1819,7 +1840,12 @@ def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on
                         ) -> Generator[SubmissionLookup | NoNativeSubmission]:
     token = _browser_draft_token.get()
     recovery = isinstance(token, BrowserDraftRecoveryToken)
-    filing = _draft_filing(folder, members, repair_index=not recovery)
+    filing = _draft_filing(folder, repair_index=not recovery)
+    if isinstance(filing, UnclaimedDraft) and not recovery:
+        with _locked_legacy_list_target(folder, members) as item:
+            if isinstance(item, LocatedSubmission):
+                _claim_recovered_native_draft(folder, item.destination)
+                filing = _publish_recovered_native_draft(folder, item.destination)
     if not isinstance(filing, (ClaimedDraft, NativeDraftAwaitingReceipt, FiledDraft)):
         yield NoNativeSubmission()
         return
@@ -1923,7 +1949,7 @@ def _list_draft_replay(send: ListDraftSend, intent: new_item_dialog.SubmissionCa
             digest = _browser_payload_hash(request, words, evidence, uploads, filing.screenshot)
         else:
             earlier_id = "r2-" + send.request_id[3:]
-            digest = _fingerprint([earlier_id, request.kind, words, _image_fingerprints(uploads)])
+            digest = _legacy_draft_fingerprint(earlier_id, request.kind, words, _image_fingerprints(uploads))
         if isinstance(filing.screenshot, new_item_dialog.PageScreenshot):
             uploads = (*uploads, _ImageUpload(PAGE_SCREENSHOT, "png", filing.screenshot.png))
         original = item.details.capture_intent
@@ -1969,13 +1995,72 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
 
 
+def _saved_legacy_image_fingerprints(details: ReviewSubmission) -> tuple[tuple[str, str], ...]:
+    digests = dict(details.image_digests)
+    fingerprints: list[tuple[str, str]] = []
+    for reference in details.images:
+        if reference == PAGE_SCREENSHOT:
+            continue
+        digest = digests.get(reference.id)
+        if digest is None:
+            path = image_folder(details) / reference.id / reference.file
+            with path.open("rb") as stream:
+                data = stream.read(MAX_IMAGE_BYTES + 1)
+            if not 0 < len(data) <= MAX_IMAGE_BYTES:
+                raise OSError(f"Cannot read the legacy Review image at {path}.")
+            digest = hashlib.sha256(data).hexdigest()
+        fingerprints.append((Path(reference.file).suffix.removeprefix("."), digest))
+    return tuple(fingerprints)
+
+
+def _find_legacy_list_draft(draft_id: str) -> NativeSubmissionDestination | NoNativeSubmission:
+    """Match the draft ID against the saved words and images in base-format List records."""
+    legacy_id = "r2-" + draft_id[3:]
+    errors: list[OSError] = []
+    for folder in sorted(_request_folder(draft_id).parent.iterdir()):
+        if not re.fullmatch(r"r4-[0-9a-f]{64}", folder.name):
+            continue
+        try:
+            markers = [path for path in sorted(folder.iterdir())
+                       if path.name == "page-list" or path.name.startswith("page-list-")]
+            if not markers:
+                continue
+            fingerprint = folder.name[3:]
+            with exclusive(folder / ".lock"):
+                for marker in markers:
+                    try:
+                        identity = marker.read_text(encoding="utf-8").rstrip("\n")
+                    except FileNotFoundError:
+                        continue
+                    try:
+                        kind = read_kind(identity.split("-", 3)[2])
+                    except (IndexError, SubmissionError) as error:
+                        raise OSError(f"Cannot read the Review request at {marker}.") from error
+                    address = _draft_binding(identity, kind, fingerprint, marker)
+                    with _locked_request(address) as lookup:
+                        item = _saved_draft(lookup)
+                        if item is None:
+                            continue
+                        intent = item.details.capture_intent
+                        if isinstance(intent, new_item_dialog.DeferredCaptureIntent) and intent.submitted_draft_id == legacy_id:
+                            return item.destination
+                        images = _saved_legacy_image_fingerprints(item.details)
+                        if _legacy_draft_fingerprint(legacy_id, kind, item.saved().words, images) == fingerprint:
+                            return item.destination
+        except (OSError, UnicodeError) as error:
+            errors.append(OSError(f"Cannot check the legacy Review draft at {folder}: {error}"))
+    if errors:
+        raise errors[0]
+    return NoNativeSubmission()
+
+
 def _recover_pre_upgrade_native_draft(draft_folder: Path, address: SubmissionAddress, words: str,
                                       uploads: tuple[_ImageUpload, ...], members: staff.StaffSnapshot | None, *,
                                       capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
                                       ) -> SavedSubmission | None:
     """Recover a native record from the base draft format."""
     legacy_id = "r2-" + address.request_id[3:]
-    fingerprint = _fingerprint([legacy_id, address.kind, words, _image_fingerprints(uploads)])
+    fingerprint = _legacy_draft_fingerprint(legacy_id, address.kind, words, _image_fingerprints(uploads))
     folder = _request_folder(f"r4-{fingerprint}")
     if not folder.is_dir():
         return None
@@ -2094,7 +2179,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     if browser_draft:
         payload_hash = _browser_payload_hash(request, words, evidence, uploads, screenshot)
     elif legacy_draft:
-        payload_hash = _fingerprint([request_id, kind, words, _image_fingerprints(uploads)])
+        payload_hash = _legacy_draft_fingerprint(request_id, kind, words, _image_fingerprints(uploads))
     else:
         payload_hash = _submission_fingerprint(replace(request, kind=kind, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):

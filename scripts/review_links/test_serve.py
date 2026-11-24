@@ -3372,14 +3372,21 @@ class ReviewLinksServerTests(unittest.TestCase):
                 ("base draft content", "native directory sync"),
                 ("base draft content", "index receipt publication"),
                 ("base draft content", "index claim write"),
+                ("base draft content", "local claim write"),
+                ("base draft content", "index claim write and local claim loss"),
                 ("base draft content", "index parent sync"),
                 ("base draft key", "native directory sync"),
+                ("base draft key", "local claim write"),
             ):
                 with self.subTest(native_recovery=recovery, failure=failure):
                     suffix = uuid4().hex
-                    images = ((new_item_dialog.PastedImage("image/png", PNG),) if failure == "attachment write" else ())
+                    images = ((new_item_dialog.PastedImage("image/png", PNG),)
+                              if failure in ("attachment write", "local claim write") else ())
                     earlier = replace(bug, page="list", request_id="r2-" + suffix, images=images)
                     saved = cache.create_submission(earlier).saved
+                    if failure == "local claim write":
+                        assert isinstance(saved.record, investigation.Investigation)
+                        investigation.write_review_submission(saved.path, saved.record, replace(saved.details, image_digests=()))
                     draft = "r6-" + suffix
                     updated = replace(earlier, request_id=draft)
                     native_body = self.new_item_body(updated)
@@ -3390,6 +3397,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     if recovery == "base draft key":
                         folder.mkdir()
                         _ = (folder / "list-receipt-key").write_text(saved.key + "\n")
+                        if failure == "local claim write":
+                            pasted, = review_submissions.image_folder(saved).glob("*/image.png")
+                            pasted.unlink()
                     with ExitStack() as faults:
                         if failure == "attachment write":
                             attachment, = review_submissions.image_folder(saved).glob("*/image.png")
@@ -3411,19 +3421,23 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 sync(path)
 
                             _ = faults.enter_context(patch.object(atomic_file, "sync_folder", fail_recovery_sync))
-                        elif failure in ("index receipt publication", "index claim write"):
-                            index_file = index_folder(folder) / ("receipt.json" if failure == "index receipt publication"
-                                                                else "pending.json")
+                        elif failure in ("index receipt publication", "index claim write", "local claim write",
+                                         "index claim write and local claim loss"):
+                            claim_folder = folder if failure == "local claim write" else index_folder(folder)
+                            target = claim_folder / ("receipt.json" if failure == "index receipt publication"
+                                                     else "pending.json")
 
-                            def fail_index_write(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
-                                if path == index_file:
+                            def fail_claim_write(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+                                if path == target and json.loads(words)["destination"] == "native":
                                     raise OSError(f"Recovery stopped during {failure}.")
                                 write_text(path, words, new_file_mode=new_file_mode)
 
-                            _ = faults.enter_context(patch.object(atomic_file, "write_text_atomic", fail_index_write))
+                            _ = faults.enter_context(patch.object(atomic_file, "write_text_atomic", fail_claim_write))
                         if failure:
                             interrupted = self.new_item_http(native_body, finished=True)
                             self.assertEqual(interrupted.status, 503, interrupted.body)
+                            if failure == "index claim write and local claim loss":
+                                (folder / "pending.json").unlink()
                             conflict = self.new_item_http(scheduled_body, finished=True)
                             result = cast(dict[str, object], json.loads(conflict.body))
                             self.assertEqual((conflict.status, result.get("id")), (409, saved.id))
@@ -3433,7 +3447,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     else:
                         recovered = self.new_item_http(native_body, finished=True)
                         self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
-                    if failure == "attachment write":
+                    if failure == "attachment write" or recovery == "base draft key" and failure == "local claim write":
                         restored, = review_submissions.image_folder(saved).glob("*/image.png")
                         self.assertEqual(restored.read_bytes(), base64.b64decode(PNG))
                     shutil.rmtree(folder)
