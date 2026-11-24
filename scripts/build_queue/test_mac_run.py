@@ -1,7 +1,7 @@
 """Check mac-linux claims against the native Mac claim path."""
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import errno
 import fcntl
@@ -10,12 +10,13 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 from threading import Event
 import time
-from typing import cast, final, override
+from typing import BinaryIO, cast, final, override
 import unittest
 from unittest import mock
 
@@ -149,6 +150,19 @@ class MacRunTests(unittest.TestCase):
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getppid(), start.start))
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start + "-other"))
         self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
+
+    def test_release_uses_its_own_checkout(self) -> None:
+        foreign_scripts = self.checkout / "scripts"
+        (foreign_scripts / "lib").mkdir(parents=True)
+        _ = (foreign_scripts / "lib/py").touch()
+        (foreign_scripts / "build_queue").mkdir()
+        _ = (foreign_scripts / "build_queue/mac_run.py").write_text("raise SystemExit(0)\n")
+
+        with chdir(self.checkout):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED) as identity:
+                claim, = claim_state.read_claims(self.paths)
+                self.assertEqual(claim_state.claim_identity(claim.record), identity)
+            self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_claim_kind_reads_the_mac_linux_claim_id_prefix(self) -> None:
         with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
@@ -765,7 +779,7 @@ sys.exit(71)
                                                                           fresh_identity.attempt)
                     self.assertEqual(mac_test.command_release(waiting, self.paths), 0)
 
-    def test_guest_waits_for_the_replacement_and_cannot_take_its_slot(self) -> None:
+    def test_guest_cannot_take_the_slot_during_or_after_replacement(self) -> None:
         waiting = self.native_claim(self.checkout)
         self.assertEqual(mac_test.command_claim(waiting, self.paths, watch_claim=False), 0)
         reserved, = claim_state.read_claims(self.paths)
@@ -782,38 +796,34 @@ sys.exit(71)
         runner.retire_wait = "replacement-episode"
         runner.mac_repository = json.dumps(saved.record())
         retiring = Event()
-        guest_waits = Event()
-        lock = claim_state.locked
-
-        @contextmanager
-        def guest_lock(path: Path) -> Generator[None]:
-            with path.open("a+") as lock_file:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                guest_waits.set()
-            with lock(path):
-                yield
+        guest_refused = Event()
 
         def claim_guest() -> None:
             self.assertTrue(retiring.wait(3))
-            with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with replacement"):
+            with self.paths.lock.open("a+") as lock_file:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(mac_run.MacRunRefused, "claim state is busy"):
                 with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
                     self.fail("The guest took the shared slot")
+            guest_refused.set()
 
         def retire(path: Path, missing_ok: bool = False) -> None:
             if path == legacy:
                 retiring.set()
-                self.assertTrue(guest_waits.wait(3))
+                self.assertTrue(guest_refused.wait(3))
             unlink(path, missing_ok=missing_ok)
 
         unlink = Path.unlink
         with ThreadPoolExecutor(max_workers=1) as guests, \
-                mock.patch.object(claim_state, "locked", new=guest_lock), \
                 mock.patch.object(Path, "unlink", autospec=True, side_effect=retire):
             guest = guests.submit(claim_guest)
             status = mac_test.command_claim(runner, self.paths, watch_claim=False)
             guest.result(timeout=3)
         self.assertEqual(status, 0)
+        with self.assertRaisesRegex(mac_run.MacRunRefused, "busy with replacement"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("The guest took the shared slot")
         fresh, = claim_state.read_claims(self.paths)
         self.assertEqual(fresh.path, reserved.path)
         self.assertEqual(fresh.record["what"], "replacement")
@@ -2072,19 +2082,90 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_release_errors_reach_the_caller_after_the_guest_run(self) -> None:
-        refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
-        with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
-            with self.assertRaisesRegex(RuntimeError, refused.reason):
-                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
-                    self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+        reason = "the exact claim changed during cleanup"
+        with self.assertRaisesRegex(RuntimeError, reason):
+            with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+                self.refuse_release(reason)
 
     def test_release_error_preserves_the_guest_error(self) -> None:
-        refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
-        with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
-            with self.assertRaisesRegex(ValueError, "guest failed") as failed:
-                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
-                    raise ValueError("guest failed")
-        self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {refused.reason}"])
+        reason = "the exact claim changed during cleanup"
+        with self.assertRaisesRegex(ValueError, "guest failed") as failed:
+            with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                self.refuse_release(reason)
+                raise ValueError("guest failed")
+        self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {reason}"])
+
+    def refuse_release(self, reason: str) -> None:
+        def child(_command: Sequence[str], *, stderr: BinaryIO, **_options: object) -> mock.Mock:
+            _ = stderr.write(f"cannot release: {reason}\n".encode())
+            return mock.Mock(returncode=12, wait=mock.Mock(return_value=12))
+
+        _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=child))
+
+    def test_busy_claim_lock_refuses_before_start(self) -> None:
+        with claim_state.locked(self.paths.lock), self.assertRaisesRegex(mac_run.MacRunRefused, "claim state is busy"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("A guest started while the state lock was held")
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_release_deadline_keeps_the_claim_when_the_lock_stays_held(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("# range: 5e-324..\nprogram_stop_seconds=0.5\n")
+        with ExitStack() as lock:
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "claim release deadline expired"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    lock.enter_context(claim_state.locked(self.paths.lock))
+            self.assertLess(time.monotonic() - started, 2.0)
+            claim, = claim_state.read_claims(self.paths)
+        self.assertEqual(claim.record["pid"], os.getpid())
+
+    def test_release_deadline_bounds_the_wait_after_kill(self) -> None:
+        now = 10.0
+        waits: list[float] = []
+
+        def wait(*, timeout: float) -> int:
+            nonlocal now
+            waits.append(timeout)
+            now += timeout
+            raise subprocess.TimeoutExpired("release", timeout)
+
+        kill, exit_context = mock.Mock(), mock.MagicMock()
+        child = mock.MagicMock(spec=subprocess.Popen, returncode=None, wait=wait, kill=kill, __exit__=exit_context)
+        _ = (self.root / "build_admission.conf").write_text("# range: 5e-324..\nprogram_stop_seconds=1\n")
+        with self.assertRaisesRegex(RuntimeError, "claim release deadline expired"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                _ = self.enterContext(mock.patch.object(subprocess, "Popen", return_value=child))
+                _ = self.enterContext(mock.patch.object(time, "monotonic", lambda: now))
+        kill.assert_called_once_with()
+        self.assertEqual(len(waits), 2)
+        self.assertGreater(waits[1], 0)
+        self.assertAlmostEqual(now, 11.0)
+        exit_context.assert_not_called()
+
+    def test_release_deadline_includes_the_initial_claim_read(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("# range: 5e-324..\nprogram_stop_seconds=1\n")
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "claim release deadline expired"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                os.mkfifo(self.paths.run)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.paths.run.unlink()
+        claim, = claim_state.read_claims(self.paths)
+        self.assertEqual(claim.record["pid"], os.getpid())
+
+    def test_interrupt_after_claim_publication_releases_the_exact_claim(self) -> None:
+        def interrupt_after_write(_args: mac_test.CliArguments, _record: claim_state.RunRecord,
+                                  path: Path) -> mac_test.ClaimFinished:
+            self.assertTrue(path.is_file())
+            os.kill(os.getpid(), signal.SIGINT)
+            self.fail("SIGINT did not interrupt claim publication")
+
+        with mock.patch.object(mac_test, "finished_claim", side_effect=interrupt_after_write):
+            with self.assertRaises(KeyboardInterrupt):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("An interrupted claim started a guest")
+        self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_mac_host_migration_holds_the_repository_claim_around_the_ssh_run(self) -> None:
         with (self.root / "mac_test.conf").open("a") as settings:

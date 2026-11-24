@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.helper_tree_test_support import FIXTURE_OWNER
-from scripts.lib import cancellation, test_phase
+from scripts.lib import test_phase
 
 from scripts.build_queue.queue_fixture import write_memory_config
 
@@ -523,7 +523,7 @@ class AdmissionFixture(ExitStack):
         worker = threading.Thread(target=serve, name="private-admission-loop")
         self.serving_active.set()
         try:
-            cancellation.start_masked_thread(worker)
+            worker.start()
             yield self
         finally:
             stopped.set()

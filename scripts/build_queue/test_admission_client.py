@@ -9,18 +9,21 @@ import fcntl
 from functools import partial
 import io
 import json
+import math
 import os
 import re
 import resource
 import select
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE, SelectorKey
 import shlex
+import signal
 import socket
 import subprocess
 import time
 import threading
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -32,7 +35,7 @@ from scripts.message.session_send import session_send_argv
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from typing import cast, override
@@ -1442,9 +1445,9 @@ class ClientTests(unittest.TestCase):
             released: list[str] = []
             release = client.release
             def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
-                                ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
+                                ending: wire.ReleaseEnding = "result", *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
                 released.append(reservation)
-                return release(reservation, status, configuration, ending)
+                return release(reservation, status, configuration, ending, deadline=deadline)
             with mock.patch.object(client, "step_request", return_value=original), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \
@@ -1910,6 +1913,59 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(errors.getvalue().count("admission service not answering since"), 1)
                 self.assertNotIn("check failed", errors.getvalue())
                 self.doCleanups()
+
+    def test_release_stops_at_its_deadline_or_on_term(self) -> None:
+        program = """
+from scripts.build_queue import admission_client as client, admission_records as records
+configuration = records.read_memory_config()
+deadline = client.CLOCK.monotonic() + configuration.program_stop_seconds
+try:
+    client.release("fixture", 0, configuration, deadline=deadline)
+except client.ReleaseDeadlineExceeded as error:
+    print(error)
+else:
+    raise AssertionError("release succeeded without a reply")
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, config_environment(Path(directory))):
+            shell = ("from scripts.build_queue import queue_place; "
+                     + "raise SystemExit(queue_place.main(['release', 'fixture', '0']))")
+            for source, code in ((program, 0), (shell, 2)):
+                with self.subTest(shell=source == shell), short_socket_directory() as socket_directory, \
+                        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    self.assert_release_stops(source, checkout, Path(socket_directory) / "s", listener,
+                                              terminate=False, deadline_status=code)
+            with short_socket_directory() as socket_directory, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                self.assert_release_stops(program, checkout, Path(socket_directory) / "s", listener, terminate=True)
+
+    def assert_release_stops(self, program: str, checkout: Path, path: Path, listener: socket.socket,
+                             *, terminate: bool, deadline_status: int = 0) -> None:
+        directory = os.environ["CONF_DIR"]
+        root = Path(directory)
+        write_memory_config(root / "build_admission.conf", program_stop_seconds="60" if terminate else "1")
+        listener.bind(str(path))
+        listener.listen()
+        listener.settimeout(TEST_HANG_GUARD_SECS)
+        environment = {**os.environ, "ADMISSION_SOCKET": str(path), "HOME": directory, "TMPDIR": directory}
+        with subprocess.Popen([sys.executable, "-c", program], cwd=checkout, env=environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+            try:
+                connection = listener.accept()[0]
+                with connection:
+                    connection.settimeout(TEST_HANG_GUARD_SECS)
+                    with connection.makefile("rb") as request_stream:
+                        request = wire.parse_request(request_stream.readline())
+                    self.assertIsInstance(request, wire.ReleaseRequest)
+                    if terminate:
+                        child.terminate()
+                    output, errors = child.communicate(timeout=5)
+                    self.assertEqual(child.returncode, -signal.SIGTERM if terminate else deadline_status, output + errors)
+                    if not terminate:
+                        self.assertIn("did not confirm release of reservation fixture", output + errors)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_standalone_release_succeeds_after_configuration_is_corrupted(self) -> None:
         with AdmissionFixture() as fixture:

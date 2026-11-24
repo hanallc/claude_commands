@@ -6,8 +6,8 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Sequence
-from contextlib import ExitStack
+from collections.abc import Callable, Generator, Sequence
+from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import dataclass
 from functools import partial
@@ -30,7 +30,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation, process_stat
+from scripts.lib import process_stat
 from scripts.lib.descendants import adopt_descendants
 
 
@@ -106,7 +106,7 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
-def remove_abandoned_folders(shared_folder: Path) -> None:
+def remove_abandoned_folders(shared_folder: Path, kept_sidecars: set[Path]) -> None:
     """Remove this user's shared admission folders when their owners are not live."""
     uid = os.getuid()
     prefix = f"build-admission-ci-{uid}-"
@@ -121,9 +121,29 @@ def remove_abandoned_folders(shared_folder: Path) -> None:
                 if (len(owner) == 3 and owner[0].isdecimal() and owner[1].isdecimal()
                         and records.process_start_time(int(owner[0])) == owner[1]):
                     continue
+                if Path(entry.path) / "cargo.cgroup" in kept_sidecars:
+                    continue
                 shutil.rmtree(entry.path)
             except FileNotFoundError:
                 pass
+
+
+@contextmanager
+def cargo_folder(prefix: str, parent: Path | None, keep: Callable[[], bool]) -> Generator[str]:
+    folder = tempfile.mkdtemp(prefix=prefix, dir=parent)
+    try:
+        yield folder
+    finally:
+        if not keep():
+            queue_place.remove_program_folder(Path(folder))
+
+
+def stop_progress_reader(reader: threading.Thread, timeout: float) -> None:
+    if reader.ident is None:
+        return
+    reader.join(timeout=timeout)
+    if reader.is_alive():
+        raise queue_place.CleanupUnresolved("the Cargo progress reader did not stop")
 
 
 def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_folder: Path | JobTemporaryFolder) -> int:
@@ -140,10 +160,10 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
     prefix = f"build-admission-ci-{os.getuid()}-"
     if isinstance(shared_folder, Path):
-        remove_abandoned_folders(shared_folder)
         prefix += f"{pid}-{start}-"
-    with tempfile.TemporaryDirectory(prefix=prefix,
-                                     dir=shared_folder if isinstance(shared_folder, Path) else None) as folder:
+    held: queue_place.HeldReservation | None = None
+    with cargo_folder(prefix, shared_folder if isinstance(shared_folder, Path) else None,
+                      keep=lambda: held is not None and not held.released) as folder:
         directory = Path(folder)
         directory.chmod(0o755)
         sidecar = directory / "cargo.cgroup"
@@ -165,11 +185,14 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
             if not isinstance(grant, wire.RunnerAdmitted):
                 print("the service estimate grant has no runner timing", file=sys.stderr)
                 return 1
+            if isinstance(shared_folder, Path):
+                remove_abandoned_folders(shared_folder, queue_place.cleanup_program_starts(grant.execution))
             place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
                 purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
             environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
             status = 1
             cleanup = ExitStack()
+            held.keep = True
             try:
                 _ = adopt_descendants()
                 # The main thread forks because the death signal follows the thread that forks.
@@ -179,28 +202,28 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 if stream is None:
                     raise RuntimeError("cargo progress pipe is unavailable")
                 reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
-                reader.start()
                 _ = cleanup.callback(stream.close)
-                _ = cleanup.callback(reader.join)
+                _ = cleanup.callback(stop_progress_reader, reader, grant.execution.program_stop_seconds)
+                reader.start()
                 status = process.wait()
             except SystemExit as error:
                 status = error.code if isinstance(error.code, int) else 1
                 raise
             finally:
-                with cancellation.defer_cleanup_signals():
+                try:
+                    place.finish(failed=status != 0)
+                finally:
                     try:
-                        place.finish(failed=status != 0)
+                        cleanup.close()
                     finally:
                         try:
-                            cleanup.close()
-                        finally:
-                            try:
-                                while os.waitpid(-1, os.WNOHANG)[0]:
-                                    pass
-                            except ChildProcessError:
+                            while os.waitpid(-1, os.WNOHANG)[0]:
                                 pass
-                            finally:
-                                held.status = status
+                        except ChildProcessError:
+                            pass
+                        finally:
+                            held.status = status
+                held.keep = False
         return status if status >= 0 else 128 - status
 
 

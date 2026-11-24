@@ -13,6 +13,7 @@ import sys
 import time
 from typing import Final, Literal, NotRequired, TypedDict, cast, get_args
 
+from scripts.buildlog import store
 from scripts.lib import conf
 
 
@@ -385,11 +386,11 @@ def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence
                 report_not_written(error)
 
 
-def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
-    """Append one gate record without failing the caller."""
+def write_gate_run(run: GateRun, executions: Sequence[Execution], *, append_deadline: float | None = None) -> None:
+    """Append a gate record. Raise AppendLockTimeout to a caller that sets a deadline."""
     try:
         # This import keeps gate_record free of an import cycle with index.py.
-        from scripts.buildlog import record, store
+        from scripts.buildlog import record
 
         epoch = time.time()
         host = store.host_name()
@@ -397,8 +398,10 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
                                 "id": record.new_id(host, epoch), "host": host, **run,
                                 "tests_run": sum(module["tests_run"] for module in run["modules"])}
         keep_failure_logs(entry["id"], host, epoch, run["modules"], executions)
-        store.append_line(store.host_file(host, epoch), entry)
+        store.append_line(store.host_file(host, epoch), entry, deadline=append_deadline)
     except Exception as error:
+        if append_deadline is not None and isinstance(error, store.AppendLockTimeout):
+            raise
         report_not_written(error)
 
 

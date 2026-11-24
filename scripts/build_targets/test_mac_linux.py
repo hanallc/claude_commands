@@ -26,7 +26,7 @@ import time
 from types import CodeType
 from typing import ClassVar, cast, override
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, mac_run, placement, progress_profile
@@ -387,6 +387,35 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
 
 class GuestEntryTests(unittest.TestCase):
+    def test_ssh_wait_after_kill_ends_at_its_deadline(self) -> None:
+        now = 10.0
+        waits: list[float] = []
+
+        def wait(*, timeout: float) -> int:
+            nonlocal now
+            waits.append(timeout)
+            now += timeout
+            raise subprocess.TimeoutExpired('ssh', timeout)
+
+        failure = subprocess.TimeoutExpired('ssh', 1.0)
+        closed_output, closed_errors, exit_context = MagicMock(), MagicMock(), MagicMock()
+        child = MagicMock(spec=subprocess.Popen, pid=1234, wait=wait, stdin=None,
+                          communicate=MagicMock(side_effect=failure), __exit__=exit_context,
+                          stdout=MagicMock(close=closed_output), stderr=MagicMock(close=closed_errors))
+        with (patch.object(subprocess, 'Popen', return_value=child),
+              patch.object(mac_linux, 'monotonic', lambda: now),
+              patch.object(process_group, 'send_process_group') as send,
+              redirect_stderr(io.StringIO()) as errors,
+              self.assertRaises(subprocess.TimeoutExpired) as caught):
+            _ = mac_linux.run_guest_ssh(('ssh', 'fixture'), 1.0)
+        self.assertIs(caught.exception, failure)
+        send.assert_called_once_with(1234, signal.SIGKILL)
+        self.assertEqual(waits, [mac_linux.GUEST_KILL_GRACE_SECONDS])
+        self.assertIn('UNRESOLVED: SSH process 1234 did not exit after SIGKILL.', errors.getvalue())
+        exit_context.assert_not_called()
+        closed_output.assert_called_once_with()
+        closed_errors.assert_called_once_with()
+
     def test_gate_entry_gives_the_runner_the_request_and_the_run_copy_word(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         runner = root / mac_linux.RUNNER_PATH
@@ -770,7 +799,8 @@ class MacLinuxRouteTests(unittest.TestCase):
             encoding='utf-8')
         _ = write_config_fixture(config / 'mac_test.conf', 'unreachable_backoff_s=30\n')
         _ = (config / 'build_admission.conf').write_text(
-            '# range: 0.01..\nquery_timeout_seconds=1\n', encoding='utf-8')
+            '# range: 0.01..\nquery_timeout_seconds=1\n'
+            + '# range: 5e-324..\nprogram_stop_seconds=5\n', encoding='utf-8')
         _ = (config / 'machines.conf').write_text(
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
@@ -864,15 +894,20 @@ fi
               module_time_limit_s: float | None = 3) -> GateRun | mac_linux.GuestNotStarted | str:
         mode = SuiteMode.GATE if isinstance(selected, AllModules) else SuiteMode.TARGETED
         temporary_directory = tempfile.TemporaryDirectory
+        runner_bootstrap = mac_linux.runner_bootstrap
 
         def snapshot_index(*, prefix: str) -> tempfile.TemporaryDirectory[str]:
             self.assertEqual(prefix, 'cloud-gate-index-')
             return temporary_directory(prefix=prefix)
 
+        def in_memory_bootstrap(request: mac_linux.GuestRequest | mac_linux.GuestCommandRequest) -> bytes:
+            with patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.')):
+                return runner_bootstrap(request)
+
         with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': scenario,
                                      'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}),
               patch.object(tempfile, 'TemporaryDirectory', snapshot_index),
-              patch.object(tempfile, 'TemporaryFile', side_effect=AssertionError('Keep the bootstrap in memory.'))):
+              patch.object(mac_linux, 'runner_bootstrap', in_memory_bootstrap)):
             result = mac_linux.route(self.repo, mode=mode, full=mode is SuiteMode.GATE, selected=selected,
                                      module_time_limit_s=module_time_limit_s, gate_job=gate_job, assignment=self.placed,
                                      type_dirs=type_dirs)
@@ -1423,7 +1458,7 @@ fi
               patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 1),
               patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6),
               self.assertRaisesRegex(GateResultUnknown, 'SSH or guest run exceeded 6 seconds') as result):
-            _ = self.route('hang')
+            self.fail(f'The route returned {self.route("hang")!r}.')
         group = (self.root / 'run.group').read_text()
         self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assertEqual(self.run_lock().read_text().split()[0], group)
@@ -1777,7 +1812,7 @@ fi
         settings = mac_linux.read_settings(conf.read(self.registry))
         armed = mac_linux.arm_guest(settings, 'changed-account-fixture')
         changed = replace(settings, guest_user='replacement-account')
-        with patch.object(subprocess, 'run') as ssh:
+        with patch.object(subprocess, 'Popen') as ssh:
             proof = mac_linux.prove_guest_end(changed, armed)
         assert isinstance(proof, mac_linux.GuestEndPending), proof
         self.assertIn(f'changed from {settings.guest_user} to replacement-account', proof.detail)
@@ -1946,11 +1981,12 @@ fi
         armed = mac_linux.arm_guest(settings, 'reachable-fixture')
         for status, output in ((1, ''), (0, 'unexpected')):
             with (self.subTest(status=status),
-                  patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], status, output, ''))):
+                  patch.object(mac_linux, 'run_guest_ssh',
+                               return_value=subprocess.CompletedProcess([], status, output, ''))):
                 proof = mac_linux.prove_guest_end(settings, armed)
                 self.assertIsInstance(proof, mac_linux.GuestEndPending)
 
-        with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
+        with patch.object(mac_linux, 'run_guest_ssh', side_effect=subprocess.TimeoutExpired('ssh', 1)):
             self.assertIsInstance(mac_linux.prove_guest_end(settings, armed), mac_linux.GuestEndPending)
 
     def test_each_guest_ssh_hop_waits_the_unreachable_wait_for_a_keepalive_answer(self) -> None:
@@ -1990,15 +2026,16 @@ fi
             (76, '', 'The guest run lock is still held.\n',
              mac_linux.GuestEndPending('The guest run lock is still held.')),
         ):
+            communicate = MagicMock(return_value=(stdout.encode(), stderr.encode()))
+            child = MagicMock(communicate=communicate, returncode=status, stdin=None, stdout=None, stderr=None)
             with (self.subTest(status=status),
                   patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': '/fixture/reservation.cgroup'}),
-                  patch.object(subprocess, 'run',
-                               return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh):
+                  patch.object(subprocess, 'Popen', return_value=child) as ssh):
                 environment = {key: value for key, value in os.environ.items() if key != 'BUILDLOG_PLACEMENT_SIDECAR'}
                 self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
-                ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                            errors='replace', timeout=settings.unreachable_wait_seconds,
-                                            check=False, env=environment)
+                ssh.assert_called_once_with(command, cwd=None, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, start_new_session=True, pass_fds=(), env=environment)
+                communicate.assert_called_once_with(timeout=settings.unreachable_wait_seconds)
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
         def interrupt_source(process: subprocess.Popen[bytes], bootstrap: bytes, _timeout: int,

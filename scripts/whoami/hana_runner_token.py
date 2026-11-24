@@ -1,20 +1,15 @@
 """Seal the Hana Linux runner token and publish the new credential.
 
-Ctrl+C can cancel reseal before publication starts.
-Publication completes or fails once it starts.
+An atomic replacement publishes the complete credential.
 """
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
-
-from scripts.lib import cancellation
-
 
 CREDENTIAL_PATH = Path("/etc/nixos/modules/linux/hana-runner-token.cred")
 ITEM = "op://hana/natedev - hana self-hosted ci runner token/credential"
@@ -45,25 +40,13 @@ def _seal() -> bytes:
 
 
 def _publish(path: Path, sealed: bytes) -> None:
-    with cancellation.defer_cleanup_signals():
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                    dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as output:
-                temporary = Path(output.name)
-                _ = output.write(sealed)
-                output.flush()
-                os.fsync(output.fileno())
-                os.fchmod(output.fileno(), 0o600)
-            os.replace(temporary, path)
-        except BaseException:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-            raise
-        finally:
-            # Discard pending signals before the CLI reports the result.
-            _ = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            _ = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete_on_close=False) as output:
+        os.fchmod(output.fileno(), 0o600)
+        _ = output.write(sealed)
+        output.flush()
+        os.fsync(output.fileno())
+        os.replace(output.name, path)
 
 
 def main(argv: Sequence[str], *, path: Path = CREDENTIAL_PATH) -> int:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,26 @@ from typing import Literal
 PROC_LOCKS = "/proc/locks"
 # Read again because the kernel can omit a line when another lock ends.
 PROC_LOCKS_READS = 3
+
+
+class LockDeadlineExceeded(TimeoutError):
+    """The lock wait reached its deadline."""
+
+
+def flock(descriptor: int, operation: int, *, wait: bool = True, deadline: float | None = None) -> None:
+    """Acquire a file lock, with an optional monotonic deadline."""
+    if not wait or deadline is not None:
+        operation |= fcntl.LOCK_NB
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise LockDeadlineExceeded("the file lock is still held")
+        try:
+            fcntl.flock(descriptor, operation)
+            return
+        except BlockingIOError:
+            if deadline is None:
+                raise
+            time.sleep(max(0, min(0.05, deadline - time.monotonic())))
 
 
 class LockResult(Enum):

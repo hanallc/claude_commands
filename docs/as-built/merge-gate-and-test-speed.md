@@ -521,7 +521,11 @@ A refusal prints `REFUSED: <reason>` to stderr and exits 1.
 **Run, then check before push.** `run_suites` runs. Then `settings.json` at HEAD must match the approved blob prefix (`--settings-blob`, an 8–40 hex hash), and `origin/main` must be an ancestor of HEAD. Only then does the gate push the merge branch and print `Pushed <branch>: <short hash>`.
 A checkpoint rerun accepts its own recorded merge only for the same checkpoint, exact merge commit and original parents, with the remote branch still an ancestor of its base; it reruns the gate checks and pushes that commit, using a separate push recovery record rather than the test pass ledger.
 
-**Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
+**Red, errors and signals.** After a red suite or an exception, the gate uses `rollback_merge(repo, baseline)`. SIGINT raises `KeyboardInterrupt` with Python's default handler.
+The rollback aborts an active merge and runs `git reset --keep <merge HEAD before the merge>`.
+If tracked edits prevent the reset, the gate restores those files to the merge tree and tries once more.
+If the second reset fails, the gate reports `merge NOT undone; merge commit <hash>; blocking files: ...`.
+TERM and HUP can end the gate before it rolls back. The next start uses the recovery record to check the merge baseline and finish rollback.
 
 **Build holds.** SharedMachine waits before jobs, merging, and promotion while another session's natedev hold applies.
 The gate uses `build_targets.caller_holds_only_own`, so the sole holder runs at once.
@@ -726,27 +730,35 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   A wait keeps its gate identity and queue place.
   An admission error refuses the gate with its last reason line.
   Each new sampled peak updates the reservation's `.max` and `.wave` files through atomic writes.
-  The gate releases the reservation on every exit while its private empty-scope sidecar still exists.
+  The gate releases the reservation with a deadline while the queue can still read its sidecar.
   Release writes the run's `gate` or `test-affected` history row for reports.
   Admission does not use that history to size the gate.
 - **Shared CPU slots.** Each module and the `types` job takes one byte from `/dev/steve` before launch.
-  The gate returns the byte after the process group ends, including after failure, kill, or interruption.
-  The pool accepts a FIFO or a character device, including steve's CUSE device.
-  A gate with running jobs uses the existing non-blocking read.
-  It continues to sample memory, collect results, and check holds.
-  An idle gate with a pending job waits in a blocking read, in line with cargo.
-  The gate keeps a separate blocking descriptor open for the pool lifetime.
-  It prints `waits for a CPU slot` once, then prints the elapsed wait when the wait ends.
-  Stop signals interrupt the wait without a masked blocking read.
-  Cleanup returns all registered slots.
-  Steve recovers a byte at process exit if a signal interrupts its registration after the read.
-  `SharedMachine` checks holds again after the blocking read.
-  If a hold prevents admission, the gate returns the slot before it waits for the hold.
-  An absent pool keeps the existing behavior. `BUILDLOG_JOBSERVER_FIFO` selects a private FIFO in tests.
-  Launch and cleanup registration defer cancellation together. The child restores its signal mask before exec.
-  The per-gate job limit still applies. Admission and token waits retain the checkout's shared busy lock.
-  Memory waits print when the need or hold reason changes, with a reminder at most once a minute otherwise.
-- **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
+  The pool accepts a FIFO or a character device.
+  A gate with running jobs uses a nonblocking read and continues to sample memory, collect results, and check holds.
+  An idle gate waits in `select` slices of up to `program_sample_seconds` on a separate blocking descriptor.
+  The wait ends on a token, TERM, or the gate deadline. With no gate deadline, the wait has no total time limit.
+  The gate prints `waits for a CPU slot` once. It prints the elapsed time when the wait ends.
+  The gate checks holds again after it takes a slot. If a hold prevents admission, the gate returns the slot before it waits.
+  Cleanup checks that the process group and its scope are empty before it removes the job files.
+  The gate returns its CPU slots and reservation even if it must keep files for recovery.
+  The gate uses the existing cleanup configuration and `time.monotonic()` for cleanup deadlines.
+  The gate leaves TERM, INT, and HUP unmasked during cleanup.
+  If the gate cannot confirm cleanup, it reports `UNRESOLVED` and keeps its recovery record.
+  The gate uses one strict typed parser to read a gate recovery record. An invalid record stays available for repair.
+  `/dev/steve` reclaims its tokens when the owner exits. The Mac has no pool.
+  Tests use `BUILDLOG_JOBSERVER_FIFO` to select a private FIFO. Recovery replays a dead owner's held bytes only to the same FIFO device and inode.
+  TERM between the read and the record save can lose one FIFO token. An uncertain FIFO operation stays in the recovery record.
+  The per-gate job limit applies. Admission and token waits retain the checkout's shared busy lock.
+  Memory waits print when the need or hold reason changes. Otherwise, they print a reminder at most once a minute.
+- **CPU scope.** The gate gives the scope probe 10 seconds.
+  It skips the probe when `BUILDLOG_SCOPE=0` or when it already runs in `builds.slice` outside a detached run.
+  A detached gate probes in its detached slice.
+  After a successful probe, the gate records a child slice before it starts any job.
+  Each module and each type check receives a separate scope in that slice.
+  The gate refuses a failed probe when the caller requires a scope or the user manager answers.
+  Each job waits for authorization until the gate records its process group.
+  The gate passes only the descriptors that the job can use.
 - Each attempt has its own `TMPDIR` in a numbered folder such as `m0001`.
   The parent holds the gate lease and uses a `g-*` name for a gate or a `t-*` name for affected tests.
   Both modes use the configured gate root for top-level runs.
