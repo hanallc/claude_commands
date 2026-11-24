@@ -556,7 +556,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         work = progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0)
         saved_slot = progress_history.launch_slot(run, slot, launcher)
         passed = pass_recorder.pass_slots(state).get(saved_slot, {})
-        saved_path = text(passed.get("prompt_file"))
+        saved_path = Path(text(passed.get("prompt_file")))
         saved_command = passed.get("launcher_command")
         same_launcher = isinstance(saved_command, list) and (
             saved_command == launcher or (passed.get("status") in ("active", "refused")
@@ -565,8 +565,13 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         proposed = content
         candidate = directory / f"{slot}_prompt{suffix}.txt"
         style_directory = progress_history.dispatch_delivery(passed).actions.style_directory
-        if same_launcher and saved_path and Path(saved_path).is_file() and bool(style_directory) == bool(args.style_since):
-            candidate = Path(saved_path)
+        generated_prompt = (
+            saved_path == Path(style_directory) / "prompt.md" if style_directory
+            else saved_path.parent == directory / "prompts" or saved_path == directory / f"{saved_slot}_prompt{suffix}.txt"
+        )
+        if (same_launcher and generated_prompt and saved_path.is_file()
+                and bool(style_directory) == bool(args.style_since)):
+            candidate = saved_path
             if style_directory:
                 addition = (Path(style_directory) / "assignment.md").read_text()
                 if addition:

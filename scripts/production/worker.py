@@ -1354,21 +1354,24 @@ def admit_dispatch(parent: StaffId, name: WorkerName | progress_history.Dispatch
                    lock: worker_panes.WorkerLockAtUse | worker_panes.WorkerLockHold = worker_panes.WorkerLockAtUse.ACQUIRE,
                    ) -> pass_recorder.DispatchSelection | ExitCode:
     """Check the proposed dispatch without changing files or sending a prompt."""
-    row = worker_admission.find_worker(record, parent, name.value) if isinstance(name, WorkerName) else None
-    observed = (worker_panes.observe_worker(parent, row, record) if row is not None
-                else worker_panes.WorkerNotObserved.CURRENT)
-    pane = observed if isinstance(observed, worker_panes.OpenWorker) and not observed.status.idle else None
     selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
         prompt=prompt, launcher_command=launcher_command, work=work, target=name, prompt_source=prompt_source)
     if isinstance(selection, pass_recorder.ActiveDispatchPromptConflict):
         return _prompt_conflict(selection)
+    # Under the lock, recovery precedes startup. Dispatch uses the startup observation.
+    if isinstance(lock, worker_panes.WorkerLockHold) or isinstance(name, progress_history.DispatchTargetAtUse):
+        return selection
     if _compaction_retry_pending(session_dir, selection):
         return selection
+    row = worker_admission.find_worker(record, parent, name.value)
+    if row is None:
+        return selection
+    observed = worker_panes.observe_worker(parent, row, record)
+    pane = observed if isinstance(observed, worker_panes.OpenWorker) and not observed.status.idle else None
     if pane is not None:
-        if isinstance(lock, worker_panes.WorkerLockAtUse):
-            checked = worker_panes.check_worker_lock(pane.row, include_name=True)
-            if isinstance(checked, worker_panes.Kept):
-                return _busy_dispatch(checked.blocker)
+        checked = worker_panes.check_worker_lock(pane.row, include_name=True)
+        if isinstance(checked, worker_panes.Kept):
+            return _busy_dispatch(checked.blocker)
         matched = selection.action
         read_receipt: Callable[[staff.StaffRow], DispatchReceipt] | Literal["pane only"] = "pane only"
         if isinstance(matched, pass_recorder.MatchedDispatch):
@@ -1383,19 +1386,18 @@ def admit_dispatch(parent: StaffId, name: WorkerName | progress_history.Dispatch
             ready = _dispatch_ready(parent, pane, _client(), read_receipt=read_receipt)
             if isinstance(ready, ExitCode):
                 return ready
-    if row is not None:
-        recorded = progress_history.recorded_dispatch_run(row.id)
-        if isinstance(recorded, progress_history.RecordedDispatchRun):
-            previous = worker_panes.worker_pass(row, recorded.directory, record=record)
-            try:
-                pending = _pending_dispatch_completion(row, recorded.directory, previous,
-                    same_pass=_same_dispatch_pass(selection.action, previous))
-            except (OSError, ValueError, staff.StaffUnreadable) as error:
-                print(f"anomaly: {row.name}: completion recovery for pass {previous.get('instance_id')}: {error}", file=sys.stderr)
-                return ExitCode.UNCERTAIN
-            admission = _admit_completion(row, pending)
-            if admission is not ExitCode.OK:
-                return admission
+    recorded = progress_history.recorded_dispatch_run(row.id)
+    if isinstance(recorded, progress_history.RecordedDispatchRun):
+        previous = worker_panes.worker_pass(row, recorded.directory, record=record)
+        try:
+            pending = _pending_dispatch_completion(row, recorded.directory, previous,
+                same_pass=_same_dispatch_pass(selection.action, previous))
+        except (OSError, ValueError, staff.StaffUnreadable) as error:
+            print(f"anomaly: {row.name}: completion recovery for pass {previous.get('instance_id')}: {error}", file=sys.stderr)
+            return ExitCode.UNCERTAIN
+        admission = _admit_completion(row, pending)
+        if admission is not ExitCode.OK:
+            return admission
     return selection
 
 
