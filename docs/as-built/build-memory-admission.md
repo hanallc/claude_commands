@@ -1108,8 +1108,9 @@ These callers always give an owner, also under systemd or with no session:
 Their requests take the owner from the caller variables, the process family, or the worktree owner record.
 `default_owner(reference)` sets `CLAUDE_SESSION_NAME` to the staff name of the reference, or else to the reference.
 When the reference is a staff unit or a worker of a unit, it also sets `BUILDLOG_UNIT` to that unit if `BUILDLOG_UNIT` is empty.
-It never sets `BUILDLOG_OWNER_STAFF_ID`. `hold_enforcer.restart_entry` reads that variable for a run with no session.
-A hold that stops the run sends a restart notice to that staff member when the hold ends.
+It never sets `BUILDLOG_OWNER_STAFF_ID`. `hold_enforcer.restart_entry` reads that variable from the stopped command.
+The command's session takes precedence over the exported staff ID.
+Release sends the notice to the recorded session after it verifies the confirmed stop.
 The default owner did not start the run, so it must not get that notice.
 It does nothing when an owner variable is already set, and it puts back the earlier values at the end.
 `snapshot_codec.wait_line_name` names a waiting step for the client wait line, the service head label, and the Builds page "behind" text.
@@ -1735,6 +1736,16 @@ A stopped send stays pending and can repeat the notice on retry.
 It also names a recipient whose staff row remains after its session is gone.
 `cycle_status_lines` prints delivery outcomes.
 Release waits for no answer, build or memory allocation.
+
+The hold records the command's boot ID, PID, start time, and run record before it stops the command.
+It saves the command's session marker separately from the owner staff ID.
+If the command has an owner staff ID, its session must match that staff member's current session.
+Release checks the stop confirmation and the saved evidence before it sends a restart notice.
+Release sends the restart notice only to the saved session.
+An unreadable stop confirmation or run record keeps the restart notice pending.
+A confirmed stop can receive a notice after the command exits.
+Release drops invalid restart notices and keeps waits with an independent or unknown origin.
+Release notices show a hold's start date if it differs from today's date in the user's time zone.
 
 `release --resume` supports a file left by an old release. It refuses while any hold is in force. With no cycle, the holder broadcasts the release. `open_cycle`, `save_cycle` and `write_hold` write a complete temporary file before `os.replace`; holder temporary files stay outside the holder directory.
 
