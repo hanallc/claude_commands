@@ -431,9 +431,10 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   `ReportedMacStatus` holds the verdict and the cleanup state.
 - A cleanup timeout preserves the verdict. This applies to the cleanup stream after a fetch too.
   After a Mac command reports its exit status, the runner can still prove departure if the cleanup stream times out.
-  It checks the saved mirror without stopping work and confirms the start fence.
-  When both checks pass, the runner releases its claim before it exits.
-  The runner keeps the claim if work remains or either check fails.
+  The runner verifies the boot ID and home recorded at dispatch.
+  It checks the recorded mirror path without stopping work and confirms the start fence.
+  The runner releases the claim before it exits if all checks pass.
+  The runner keeps the claim if work remains or a check fails.
   If a stream ends without a usable cleanup marker, `claimed_run` checks for leftovers.
   In that case, it releases the claim only after `LeftoversEnded`.
 - When launch authorization has no confirmed reply, one deadline covers the exact release.
@@ -626,7 +627,12 @@ Both values use the existing configuration reader.
 - A printed `mac_exit=<n>` followed by nothing but `mac_cleanup=` markers is the result of a finished test even if ssh failed afterward. With no such line, a run is lost; reach and control checks require their own `rc=<n>` answer.
 - Tests run nothing on the Mac: stand-in `ssh`, `rsync`, `gh` on `PATH`, state under `MAC_TEST_STATE_DIR`, config under `MAC_TEST_CONFIG`. Tests set these variables for a checkout's scripts; installed scripts refuse to run with either set. A test reaching the footer sets `MAC_TEST_STATE_DIR` too.
 - On the Mac the feature writes and removes only under `~/.local/state/mac-test/`. The cleanup removes nothing but the mirror's `target` folder, and only below `free_floor_gib`; `/tmp` and the user's clones are never touched. Only step records are written there; call records are written on natedev only.
-- The claim files live on natedev. A process-bound claim ends when its owner ends. A kept Mac claim with a saved mirror ends when the watcher confirms departure for that mirror. A claim without a saved mirror can end after the whole-Mac idle interval. The owner can also release a kept claim after confirming departure.
+- The claim files live on natedev. A process-bound claim ends when its owner ends.
+  The watcher uses the mirror path recorded at dispatch for the lease and the process check.
+  The watcher releases a kept claim when it confirms departure for that mirror.
+  A different boot ID or home keeps the claim.
+  A claim without a dispatch identity can end after the whole-Mac idle interval.
+  The owner can also release a kept claim after confirming departure.
 - One native claim uses one repository mirror. A whole-Mac claim in `run.json` excludes every other claim. A block refuses claims from other sessions. The watcher checks that the claim is unchanged before release. A failed check keeps the claim.
 - A copy never replaces a copy, and a Mac-only (non-copy) run never gives way; only a live copy claim gives way, and only to a non-copy claim.
 - A copy win stops natedev only through a live group leader whose start time matches; a step that already ended keeps its result.
