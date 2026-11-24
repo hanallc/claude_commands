@@ -12,6 +12,7 @@ except FileNotFoundError:
 
 from collections.abc import Callable, Sequence
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass
 import inspect
 import math
@@ -19,20 +20,31 @@ import json
 import os
 from pathlib import Path
 import platform
+import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING, TypedDict, cast, override
 import unittest
 
 
 from scripts.lib import build_folders
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, gate_parent
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
 )
-from scripts.lib import conf
+from scripts.lib import cancellation, conf
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.buildlog import treekey
 from scripts.production.gate_modules import discover_test_modules
-from scripts.test_times.module_run import TimedResult, TimedRunner, timed_outcomes
+from scripts.production.gate import (
+    SUITE_BOOTSTRAP, RunningGateJob, kill_job_group, stop_gate_jobs, test_module_environment,
+    unwind_tests_only_on_sigterm,
+)
+from scripts.test_times.measurement_gate import MeasurementBlocked, measurement_child, measurement_place
+from scripts.test_times.module_run import (
+    GateModuleLease, StandaloneModuleRun, TimedResult, TimedRunner,
+    run_with_descendant_cleanup, runner_folder_owner, timed_outcomes,
+)
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus
@@ -307,6 +319,12 @@ def print_candidates(rows: Sequence[CoverageRow]) -> None:
 
 
 def main(argv: list[str]) -> int:
+    worker = argv[:1] == ["--measurement-child"]
+    if worker:
+        if isinstance(gate_parent(), UnverifiedGateParent):
+            print("coverage overlap: BLOCKED: the child has no verified gate parent", file=sys.stderr)
+            return 2
+        argv = argv[1:]
     if len(argv) < 2:
         print("usage: coverage_overlap.py scripts/<folder> <file> [<file> ...]", file=sys.stderr)
         return 2
@@ -316,6 +334,48 @@ def main(argv: list[str]) -> int:
     if any(path.resolve() not in modules for path in paths):
         print("coverage overlap: select test modules under scripts/", file=sys.stderr)
         return 2
+    if worker:
+        def run(_owner: GateModuleLease | StandaloneModuleRun, _root: Path) -> None:
+            raise SystemExit(run_coverage(paths))
+
+        with ExitStack() as cleanup:
+            run_with_descendant_cleanup(runner_folder_owner(), cleanup, run)
+        return 0
+    try:
+        with (unwind_tests_only_on_sigterm(),
+              build_folders.tool_folder("natest-coverage") as root,
+              measurement_place(REPOSITORY, root) as place):
+            environment = test_module_environment(root, dict(os.environ))
+            child, fds = measurement_child(place, environment, (build_folders.build_folder_lock_fd(root),))
+            program = Path(__file__).resolve()
+            command = [sys.executable, "-c", SUITE_BOOTSTRAP, sys.executable, str(program), "--measurement-child", *argv]
+            job: RunningGateJob | None = None
+            try:
+                with cancellation.defer_cleanup_signals():
+                    process = subprocess.Popen(command, env=child, pass_fds=fds, start_new_session=True, text=True)
+                    job = RunningGateJob("coverage", program, process, time.monotonic(), time.time(),
+                                         sys.stdout, Path(os.devnull), program.stem)
+                status = process.wait()
+            except BaseException:
+                if job is not None:
+                    with cancellation.defer_cleanup_signals():
+                        if place is None:
+                            kill_job_group(job)
+                        else:
+                            stop_gate_jobs([job])
+                raise
+            if place is not None:
+                place.status = status
+            return status if status >= 0 else 128 - status
+    except MeasurementBlocked as error:
+        print(f"coverage overlap: BLOCKED: {error}", file=sys.stderr)
+        return 2
+    except (OSError, conf.Unusable) as error:
+        print(f"coverage overlap: {error}", file=sys.stderr)
+        return 2
+
+
+def run_coverage(paths: Sequence[Path]) -> int:
     output = os.environ.pop("COVERAGE_OUT", "")
     _ = os.environ.pop("TEST_TIMES_OUT", None)
     tree = ""

@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Measure module CPU, process starts, successful execs and wall time."""
+"""Measure module CPU, process starts, successful execs and wall time on Linux."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -28,11 +28,13 @@ import time
 import traceback
 from typing import Literal, TextIO, TypedDict, cast
 
+from scripts.build_queue.queue_place import QueuePlace
 from scripts.lib import build_folders, conf
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.production.gate import test_module_environment
 from scripts.test_times import task_cpu
+from scripts.test_times.measurement_gate import MeasurementBlocked, measurement_child, measurement_place
 
 
 STAGE_START = Struct("d")
@@ -91,7 +93,8 @@ def wait_for_stage(pid: int, deadline: float, timeout_s: float) -> tuple[int, fl
     raise task_cpu.MeasurementTimeout(timeout_s, task_cpu.stop_pending())
 
 
-def measure(tree: Path, module: str, timeout_s: float, stage_updates: int, *, command_rows: bool) -> ModuleCost:
+def measure(tree: Path, module: str, timeout_s: float, stage_updates: int, place: QueuePlace | None, *,
+            command_rows: bool) -> ModuleCost:
     command = runner_command(tree, module)
     with build_folders.tool_folder("module-cost") as temporary:
         root = Path(temporary)
@@ -99,6 +102,7 @@ def measure(tree: Path, module: str, timeout_s: float, stage_updates: int, *, co
         report = root / "times.json"
         environment["TEST_TIMES_OUT"] = str(report)
         lock_fd = build_folders.build_folder_lock_fd(root)
+        environment, descriptors = measurement_child(place, environment, (lock_fd,))
         with (root / "time.log").open("w+") as output:
             started = time.monotonic()
             _ = os.write(stage_updates, STAGE_START.pack(started))
@@ -107,7 +111,7 @@ def measure(tree: Path, module: str, timeout_s: float, stage_updates: int, *, co
             if pid == 0:
                 try:
                     os.close(stage_updates)
-                    task_cpu.exec_stage(command, tree, environment, (lock_fd,), output.fileno())
+                    task_cpu.exec_stage(command, tree, environment, descriptors, output.fileno())
                 except BaseException:
                     traceback.print_exc(file=output)
                     output.flush()
@@ -128,7 +132,7 @@ def measure(tree: Path, module: str, timeout_s: float, stage_updates: int, *, co
             print(f"{module}: starting trace run", file=sys.stderr, flush=True)
             try:
                 trace = task_cpu.measure(command, cwd=tree, environment=environment, timeout_s=timeout_s,
-                                         pass_fds=(lock_fd,), command_rows=command_rows, output_fd=output.fileno())
+                                         pass_fds=descriptors, command_rows=command_rows, output_fd=output.fileno())
             except task_cpu.TraceStartFailure as error:
                 print(f"{module}: {error}", file=sys.stderr, flush=True)
                 trace = task_cpu.TaskCPU([], 0.0, 1, 0, 0)
@@ -326,6 +330,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--commands", type=int, default=0, metavar="N")
     _ = parser.add_argument("modules", nargs="+", metavar="folder/file")
     request = parser.parse_args(argv, namespace=CostArguments())
+    if sys.platform != "linux":
+        print("module_cost: process and exec measurements require Linux", file=sys.stderr, flush=True)
+        return 1
     try:
         timeout_s = task_cpu.measurement_timeout_s()
     except conf.Unusable as error:
@@ -373,18 +380,27 @@ def run_measurements(request: CostArguments, timeout_s: float, stage_updates: in
     """Reap stage orphans for CPU accounting while the worker is alive."""
     _ = adopt_descendants()
     try:
-        return report_costs(request, timeout_s, stage_updates)
+        tree = request.tree.resolve()
+        with measurement_place(tree, tree) as place:
+            try:
+                status = report_costs(request, timeout_s, stage_updates, place)
+                if place is not None:
+                    place.status = status
+                return status
+            finally:
+                if task_cpu.reap_exited():
+                    _ = task_cpu.stop_pending()
+    except MeasurementBlocked as error:
+        print(f"module_cost: BLOCKED: {error}", file=sys.stderr, flush=True)
+        return 1
     except (conf.Unusable, task_cpu.MeasurementTimeout, task_cpu.LeftoverProcesses) as error:
         print(f"module_cost: {error}", file=sys.stderr, flush=True)
         return 1
-    finally:
-        if task_cpu.reap_exited():
-            _ = task_cpu.stop_pending()
 
 
-def report_costs(request: CostArguments, timeout_s: float, stage_updates: int) -> int:
+def report_costs(request: CostArguments, timeout_s: float, stage_updates: int, place: QueuePlace | None) -> int:
     tree = request.tree.resolve()
-    costs = [measure(tree, module, timeout_s, stage_updates, command_rows=bool(request.commands))
+    costs = [measure(tree, module, timeout_s, stage_updates, place, command_rows=bool(request.commands))
              for module in request.modules]
     passed = all(cost.passed for cost in costs)
     total = ["total", seconds(sum(cost.cpu_s for cost in costs)),
