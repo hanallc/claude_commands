@@ -2953,8 +2953,11 @@ def mirror_run(args: CopyArguments) -> int:
         command = command_tail(args.command)
         if not command:
             raise CopyError("remote mirror requires a command")
-        environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, COMMAND_LOCKS.get()))}
-        answer = subprocess.run(command, pass_fds=COMMAND_LOCKS.get(), env=environment)
+        descriptors = COMMAND_LOCKS.get()
+        if args.action == "mirror-use":
+            descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
+        environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
+        answer = subprocess.run(command, pass_fds=descriptors, env=environment)
         return answer.returncode
 
 
