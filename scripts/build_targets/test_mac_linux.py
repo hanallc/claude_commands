@@ -24,7 +24,7 @@ import tempfile
 from threading import Event, Timer
 import time
 from types import CodeType
-from typing import cast, override
+from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import call, patch
 
@@ -41,6 +41,9 @@ from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+
+
+CHECKOUT = Path(__file__).resolve().parents[2]
 
 
 SSH_FIXTURE = '''import os
@@ -710,6 +713,7 @@ FIXTURE_CLAIM = claim_state.ClaimIdentity(mac_test.MAC_LINUX_CLAIM_ID_PREFIX + '
 
 
 class MacLinuxRouteTests(unittest.TestCase):
+    bootstrap_cache: ClassVar[Path]
     root: Path = Path()
     guest_home: Path = Path()
     trace: Path = Path()
@@ -723,6 +727,21 @@ class MacLinuxRouteTests(unittest.TestCase):
         OwningSession('submitting-session'), 0.0)
     # Each consume request, the SSH trace at that moment, and whether the gate held the named Mac claim.
     consumed: tuple[tuple[wire.ConsumePermission, str, bool], ...] = ()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        cls.bootstrap_cache = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix='mac-linux-bytecode-'))).resolve()
+        _ = subprocess.run(
+            [sys.executable, '-I', '-X', f'pycache_prefix={cls.bootstrap_cache}', '-c',
+             'import sys\n'
+             + 'sys.path.insert(0, sys.argv[1])\n'
+             + 'from scripts.aws_target import gate_box, ledger\n'
+             + 'from scripts.build_targets import mac_linux\n'
+             + 'from scripts.copies import copies\n'
+             + 'from scripts.production import gate_modules, gate_routes\n'
+             + 'from scripts.test_times import gate_record\n',
+             str(CHECKOUT)], check=True, timeout=20)
 
     @override
     def setUp(self) -> None:
@@ -798,7 +817,8 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()
-        package_root = shlex.quote(str(Path(__file__).resolve().parents[2]))
+        package_root = shlex.quote(str(CHECKOUT))
+        cache_option = shlex.quote(f'pycache_prefix={self.bootstrap_cache}')
         shim = """#!/usr/bin/env bash
 candidate="$PWD"
 options=()
@@ -809,7 +829,7 @@ fi
 """
         self.executable(self.repo / 'scripts/lib/py', shim
                         + f'cd {package_root}\nexport PYTHONPATH={package_root}\n'
-                        + f'exec {shlex.quote(sys.executable)} -B "${{options[@]}}"'
+                        + f'exec {shlex.quote(sys.executable)} -B "${{options[@]}}" -X {cache_option}'
                         + f' -c {shlex.quote(GUEST_BOOTSTRAP)} "$candidate" "$@"\n')
         _ = shutil.copyfile(Path(mac_linux.__file__), self.repo / mac_linux.RUNNER_PATH)
         _ = self.git('add', '.')
