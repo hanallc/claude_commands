@@ -39,6 +39,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
+from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
@@ -285,6 +286,8 @@ class GuestGateDispatch:
     started: ArmedGuestAttempt | None = None
     settled: bool = False
     arm_requested: bool = False
+    start_folder_payload: bytes = b''
+    folder_start_reports: ExitStack = field(default_factory=ExitStack, repr=False, compare=False)
 
 
 class GuestRunRequest(TypedDict):
@@ -433,6 +436,10 @@ def tree_mismatches(repo: Path, tree: str, files: Mapping[str, bytes]) -> list[s
 
 def run_start_line(attempt: str) -> str:
     return f'{RUN_START} {attempt}'
+
+
+def guest_start_line(attempt: str, folder: Path, home: Path) -> str:
+    return f'{run_start_line(attempt)} {json.dumps({"folder": str(folder), "home": str(home)})}'
 
 
 def run_locked_line(attempt: str) -> str:
@@ -1387,12 +1394,23 @@ def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: 
     return response
 
 
+def guest_start_execution(armed: ArmedGuestAttempt, attempt: str, folder_payload: bytes
+                          ) -> execution_identity.CloudExecution | execution_identity.GuestExecution:
+    if folder_payload:
+        fields = ledger.mapping(cast(object, json.loads(folder_payload)))
+        folder, home = fields.get('folder'), fields.get('home')
+        if not isinstance(folder, str) or not isinstance(home, str):
+            raise ValueError('the guest start report lacks a folder or home')
+        return execution_identity.GuestExecution(TARGET, attempt, folder, home)
+    return execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, attempt)
+
+
 def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
-                       deadline: float, timeout: float) -> None:
-    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+                       deadline: float, timeout: float, folder_payload: bytes = b'') -> None:
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
 
     assignment = dispatch.assignment
-    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
+    execution = guest_start_execution(armed, assignment.attempt, folder_payload)
     request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
                                    execution_identity.ObservedExecution(execution),
                                    code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
@@ -1688,8 +1706,12 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted 
     started = dispatch.started
     if started is None or isinstance(result, placement.NoTerminalReport):
         return
+    dispatch.folder_start_reports.close()
     assignment = dispatch.assignment
-    execution = execution_identity.CloudExecution(TARGET, started.boot_id, started.machine_id, assignment.attempt)
+    try:
+        execution = guest_start_execution(started, assignment.attempt, dispatch.start_folder_payload)
+    except ValueError:
+        execution = execution_identity.CloudExecution(TARGET, started.boot_id, started.machine_id, assignment.attempt)
 
     def send(deadline: float, timeout: float) -> None:
         request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
@@ -1752,15 +1774,18 @@ def warn_guest_report(reason: str) -> None:
 
 
 def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
-                       reports: ExitStack) -> None:
+                       reports: ExitStack, *, folder_payload: bytes = b"") -> None:
     def send(deadline: float, timeout: float) -> None:
-        report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+        report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout, folder_payload=folder_payload)
 
-    _start_guest_queue_report(send, transfer_deadline, reports, warn_guest_report)
+    # A Folder report can run through stream processing and cleanup. Collect it before reporting completion.
+    _start_guest_queue_report(send, transfer_deadline, dispatch.folder_start_reports if folder_payload else reports,
+                              warn_guest_report, collect_in_background=bool(folder_payload))
 
 
 def _start_guest_queue_report(send: Callable[[float, float], None], deadline_limit: float,
-                              reports: ExitStack, warn: Callable[[str], None]) -> None:
+                              reports: ExitStack, warn: Callable[[str], None], *,
+                              collect_in_background: bool = False) -> None:
     """Read the timeout before starting the report worker. Bound both waits."""
     started = monotonic()
     preparation_deadline = min(deadline_limit, started + SSH_CONNECT_TIMEOUT_SECONDS)
@@ -1802,8 +1827,8 @@ def _start_guest_queue_report(send: Callable[[float, float], None], deadline_lim
 
         ready.set_result(collect_report)
 
-    preparation = Thread(target=prepare, daemon=True)
     try:
+        preparation = Thread(target=prepare, daemon=True)
         preparation.start()
     except RuntimeError as error:
         warn(str(error))
@@ -1819,7 +1844,17 @@ def _start_guest_queue_report(send: Callable[[float, float], None], deadline_lim
         except Exception as error:
             warn(str(error) or type(error).__name__)
 
-    _ = reports.callback(collect)
+    if collect_in_background:
+        # Keep the process alive until collection finishes or reaches its deadline.
+        try:
+            collector = Thread(target=collect, daemon=False)
+            collector.start()
+        except RuntimeError as error:
+            warn(str(error))
+        else:
+            _ = reports.callback(collector.join)
+    else:
+        _ = reports.callback(collect)
 
 
 def ssh_connect_timeout(remaining: float) -> int:
@@ -1862,11 +1897,12 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
                 payload = b'\n' + bootstrap
                 if not stream_input.closed:
                     _ = ready.register(input_fd, EVENT_WRITE)
-        if not connected or started or line != start_line:
+        if not connected or started or (line != start_line and not line.startswith(start_line + b' ')):
             return
         started = True
         dispatch.started = armed
-        start_guest_report(armed, dispatch, deadline, reports)
+        dispatch.start_folder_payload = line[len(start_line) + 1:]
+        start_guest_report(armed, dispatch, deadline, reports, folder_payload=dispatch.start_folder_payload)
 
     def read_reply(data: bytes) -> None:
         nonlocal last_counter
@@ -1969,8 +2005,7 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
                 stderr = error.stderr if isinstance(error.stderr, bytes) else b''
-                started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
-                failure = GuestResultUnavailable if started else GuestUnavailable
+                failure = GuestResultUnavailable if dispatch.started == armed else GuestUnavailable
                 raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
@@ -2066,15 +2101,15 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         first_error.add_note(cleanup_detail)
         raise first_error
     assert stream is not None
-    return stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail)
+    return stream_reply(stream, request['attempt'], len(bootstrap), send, cleanup_detail,
+                        tests_started=dispatch.started == end.armed)
 
 
 def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, bootstrap_bytes: int, send: BundleSend,
-                 cleanup_detail: str) -> GuestReply:
+                 cleanup_detail: str, *, tests_started: bool) -> GuestReply:
     """The reply line and the bundle size from the output of a guest stream that ended, or the guest failure."""
     diagnostics = stream.stderr.decode(errors='replace')
     lines = diagnostics.splitlines()
-    tests_started = run_start_line(attempt) in lines
     if (stream.returncode == GUEST_NOT_LOCKED_STATUS and not tests_started
             and f'{GUEST_ACCEPTED} {attempt}' in lines and run_locked_line(attempt) not in lines):
         raise GuestNotLocked(f'{stream_report(stream)}. {cleanup_detail}')
@@ -2801,6 +2836,7 @@ def run_guest(request_path: Path) -> int:
                 return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
+            environment['MAC_LINUX_GUEST_HOME'] = str(Path.home())
             reply = os.dup(1)
             try:
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
@@ -2872,8 +2908,8 @@ def run_copy(request_path: Path, reply: int) -> None:
     selection = request['selection']
     # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
     token = copies.COMMAND_LOCKS.set(descriptors)
-    # natedev reads this line: a failure before it lets natedev take the gate.
-    print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
+    home = Path(os.environ.pop('MAC_LINUX_GUEST_HOME'))
+    print(guest_start_line(request['attempt'], repo, home), file=sys.stderr, flush=True)
     try:
         with (build_folders.inherit_build_lock(RUN_LOCK_FD),
               os.fdopen(reply, 'w', encoding='utf-8') as output):
