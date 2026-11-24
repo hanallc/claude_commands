@@ -22,10 +22,12 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from scripts.agents import remote
 from scripts.copies import copies
 from scripts.direct import progress_history
-from scripts.lib import build_folders
+from scripts.lib import build_folders, scratch
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.production import change_review, gate, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_routes import GateResultUnknown
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.gate_test_support import gate_suites, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -410,7 +412,7 @@ class NightlyPushTests(unittest.TestCase):
               mock.patch.object(gate, "checked_git", return_value="fixture-tree"),
               mock.patch.object(gate, "nightly_owner", return_value="sdlc"),
               mock.patch.object(copies, "standing", return_value=nullcontext(self.root)),
-              mock.patch.object(gate, "run_suites", return_value=run,
+              mock.patch.object(gate, "run_gate_suites", return_value=run,
                                 side_effect=run if isinstance(run, Exception) else None),
               mock.patch.object(showrunners, "tell", return_value="told sdlc"),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
@@ -771,9 +773,28 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertIn("action=None. The next nightly run tries again.", command)
                 self.assertNotIn("--priority", command)
 
+    def test_nightly_without_a_guest_verdict_publishes_the_reason_and_keeps_the_status(self) -> None:
+        for failure, status in (
+                (gate.MacLinuxTookNoRun("fixture guest did not start"), MAC_LINUX_PRELAUNCH_REFUSED_STATUS),
+                (GateResultUnknown("fixture guest gave no verdict"), GATE_RESULT_UNKNOWN_STATUS)):
+            with (self.subTest(status=status), self.execution(failure) as sent,
+                  mock.patch.object(gate, "_sweep_nightly_build_folders"),
+                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                  redirect_stdout(io.StringIO()),
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(["--nightly", "--merge-branch", "main",
+                                            "--unit", "fixture-merge", "--repo", str(self.root)]), status)
+                self.assertEqual(errors.getvalue(), f"{failure}\n")
+                notices = [command for call in sent.call_args_list
+                           if "--text-id" in (command := cast(list[str], call.args[0]))]
+                self.assertEqual(len(notices), 1, sent.call_args_list)
+                command, = notices
+                self.assertEqual(command[command.index("--text-id") + 1], "nightly.not_run")
+                self.assertIn(f"reason={failure}", command)
+
     def test_interrupt_push_preserves_the_exception(self) -> None:
         run = gate.GateRun((), 0, 0)
-        for stage in ("nightly_git", "run_suites"):
+        for stage in ("nightly_git", "run_gate_suites"):
             failure = KeyboardInterrupt()
             with self.subTest(stage=stage), self.execution(run) as sent:
                 with mock.patch.object(gate, stage, side_effect=failure):
