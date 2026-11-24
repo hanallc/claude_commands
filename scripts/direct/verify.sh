@@ -2917,7 +2917,6 @@ initialize_step_record() {
 # Reuse the call's decision. A hold check supplies the only local allow.
 route_compiling_step() {
     local command=$1
-    local pending_placement_wait="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}.pending"
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
     if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
         local token_status=0 reason
@@ -3144,14 +3143,14 @@ placement_failed() {
 }
 
 publish_placement_wait() {
-    if [[ -s "$pending_placement_wait/sample-$PLACEMENT_CALL_NUMBER" ]]; then
-        mv -- "$pending_placement_wait" "${pending_placement_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
-    fi
+    local pending_wait=$1
+    mv -- "$pending_wait" "${pending_wait%.pending}-$PLACEMENT_CALL_NUMBER" || true
 }
 
 placement_once() {
     local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
+    local wait_folder_output=${2:-}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
     local parent_run=${BUILDLOG_RUN:-}
@@ -3226,8 +3225,9 @@ placement_once() {
     fi
     [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
     PLACEMENT_CALL_NUMBER=$((${PLACEMENT_CALL_NUMBER:-0} + 1))
-    local wait_result="$pending_placement_wait/sample-$PLACEMENT_CALL_NUMBER"
-    [[ -d "$pending_placement_wait" ]] || mkdir -- "$pending_placement_wait" || return $?
+    local pending_wait="${VERIFY_WAIT_DIR:-$HOLD_WAIT_DIR}/placement-call-${BASHPID:-$$}.pending"
+    local wait_result="$pending_wait/sample-$PLACEMENT_CALL_NUMBER"
+    [[ -d "$pending_wait" ]] || mkdir -- "$pending_wait" || return $?
     # An empty file means the client did not return a measurement.
     : > "$wait_result" || return $?
     # A builtin wait lets the parent handle signals during a service outage.
@@ -3243,10 +3243,15 @@ placement_once() {
     wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
     reply=$(< "$HOLD_WAIT_DIR/placement-reply") || return $?
-    # A grant, refusal, or confirmed cancellation ends the admission wait.
-    case "$status" in
-        0|2|"$LINT_LEFT_QUEUE_STATUS") publish_placement_wait ;;
-    esac
+    if [[ -s "$wait_result" ]]; then
+        case "$status" in
+            0|2|"$LINT_LEFT_QUEUE_STATUS") publish_placement_wait "$pending_wait" ;;
+            78)
+                if [[ -n "$wait_folder_output" ]]; then
+                    printf -v "$wait_folder_output" '%s' "$pending_wait"
+                fi ;;
+        esac
+    fi
     while IFS= read -r line; do
         case "$line" in
             first|holder\ *|resource\ *|memory-seconds\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
@@ -3391,10 +3396,10 @@ route_test() {
     # A placement wait holds no cargo token, also after an earlier step; a local grant takes it again.
     release_token || return $?
     while :; do
-        local placement_status=0 admission=0
+        local placement_status=0 admission=0 placement_wait_folder=""
         check_routing_hold || admission=$?
         (( admission == 0 || admission == 10 )) || return "$admission"
-        placement_once "$refresh_source" || placement_status=$?
+        placement_once "$refresh_source" placement_wait_folder || placement_status=$?
         refresh_source=0
         if (( placement_status == 78 )); then
             if [[ "${LINT_MEND_WAIT:-0}" == 1 && "$STEP_WRITES_TREE" == 1 \
@@ -3402,7 +3407,9 @@ route_test() {
                     && STEP_WRITES_TREE=0 step_can_retry; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                     --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "judge lint before local repair" >/dev/null || return $?
-                publish_placement_wait
+                if [[ -n "$placement_wait_folder" ]]; then
+                    publish_placement_wait "$placement_wait_folder"
+                fi
                 LINT_MEMORY_WAIT_FILE="$PLACEMENT_ASSIGNMENT_FILE.wait"
                 LINT_MEMORY_JUDGMENT=1
                 BUILDLOG_PLACEMENT_PREPARED=0
