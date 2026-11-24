@@ -13,19 +13,17 @@ from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
-from unittest.mock import Mock, call, patch
+from unittest.mock import call, patch
 
 from scripts.agents import pane_record, restart, restart_support, shutdown, shutdown_record, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.hooks import codex_hooks
 from scripts.lib import atomic_file
 from scripts.message import sessions
 from scripts.production import staff, worker
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.whoami import quota_state
-from scripts.whoami import account as account_reader
 
 
 NATIVE_PROCESS = herdr.native_process
@@ -42,6 +40,7 @@ class PauseWorkersTests(StaffTestCase):
         world.add(child, "w1:p1")
         world.locations["w1:p1"]["agent_status"] = "working"
         processes = world.foreground.copy()
+
         with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
               patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (123,))),
               patch.object(restart, "stop_row", side_effect=world.stop),
@@ -98,99 +97,64 @@ class PauseWorkersTests(StaffTestCase):
         send.assert_called_once()
         self.assertEqual(send.call_args.args[0], selected)
 
-    def test_codex_production_pause_checks_each_directors_home(self) -> None:
+    def test_production_pause_refuses_running_and_stopped_codex_directors(self) -> None:
         owner = fixture_member("showrunner", name="production")
-        ready = fixture_member("unit", name="ready", parent=owner.id)
-        missing = fixture_member("unit", name="missing", parent=owner.id)
-        untrusted = fixture_member("unit", name="untrusted", parent=owner.id)
-        ready_home = self.root / "ready"
-        missing_home = self.root / "missing home"
-        untrusted_home = self.root / "untrusted"
-        pids = {ready.current_session: 123, missing.current_session: 124, untrusted.current_session: 125}
-        homes = {123: ready_home, 124: missing_home, 125: untrusted_home}
-        trusted = {"command": codex_hooks.DIRECTOR_HOLD.command, "eventName": "userPromptSubmit", "matcher": None,
-                   "handlerType": "command", "timeoutSec": 10, "key": "director-hold", "currentHash": "fixture",
-                   "sourcePath": str(ready_home / "hooks.json"), "trustStatus": "trusted", "enabled": True}
-        fixtures = {ready_home: [trusted], missing_home: [], untrusted_home: [
-            {**trusted, "sourcePath": str(untrusted_home / "hooks.json"), "trustStatus": "untrusted"}]}
-
-        def conversation(identity: staff.StaffId) -> herdr.LiveConversation:
-            return herdr.LiveConversation("codex", (pids[identity],))
-
-        def process_home(pid: int) -> account_reader.ProcessCodexHome:
-            return account_reader.ProcessCodexHome(homes[pid])
-
-        checked: list[Path] = []
-
-        def app_server(_binary: str, path: str) -> Mock:
-            home = Path(path)
-            checked.append(home)
-
-            def rpc(method: str, _params: dict[str, object]) -> dict[str, object]:
-                if method == "initialize":
-                    return {}
-                self.assertEqual(method, "hooks/list")
-                return {"data": [{"hooks": fixtures[home]}]}
-
-            return Mock(call=Mock(side_effect=rpc))
-
-        with (patch.object(herdr, "read_conversation", side_effect=conversation),
-              patch.object(account_reader, "process_codex_home", side_effect=process_home),
-              patch.object(codex_hooks, "AppServer", side_effect=app_server),
+        running = fixture_member("unit", name="running", parent=owner.id)
+        stopped = fixture_member("unit", name="stopped", parent=owner.id)
+        claude = fixture_member("unit", name="claude", parent=owner.id)
+        observations = {
+            running.current_session: herdr.LiveConversation("codex", (123,)),
+            stopped.current_session: herdr.StoppedConversation(),
+            claude.current_session: herdr.LiveConversation("claude", (124,)),
+        }
+        with (patch.object(herdr, "read_conversation", side_effect=observations.__getitem__),
+              patch.object(pane_launch, "current_kind", return_value="codex") as saved_kind,
               patch.object(shutdown, "_message", return_value={"kind": "sent"}) as send,
               patch.object(stop_resume, "stop_unit_workers") as stop,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(shutdown.main(["pause", "--production", owner.name,
                                             "--keep-workers", "--why", "maintenance"]), 2)
 
-        paused = staff.by_id(ready.id)
+        paused = staff.by_id(claude.id)
         assert paused is not None and isinstance(paused.paused, staff.Paused)
         self.assertTrue(paused.paused.keep_workers)
-        self.assertEqual(staff.by_id(missing.id), missing)
-        self.assertEqual(staff.by_id(untrusted.id), untrusted)
-        self.assertEqual(output.getvalue(), "ready: paused\n")
-        lines = errors.getvalue().splitlines()
-        self.assertEqual(len(lines), 2)
-        for row, home in ((missing, f"'{missing_home}'"), (untrusted, str(untrusted_home))):
-            line = next(line for line in lines if line.startswith(f"{row.name}: --keep-workers refused."))
-            self.assertIn(f"CODEX_HOME={home}", line)
-            self.assertTrue(line.endswith("codex_hooks.py install"))
-        self.assertCountEqual(checked, fixtures.keys())
+        self.assertEqual(staff.by_id(running.id), running)
+        self.assertEqual(staff.by_id(stopped.id), stopped)
+        self.assertEqual(output.getvalue(), "claude: paused\n")
+        self.assertCountEqual(errors.getvalue().splitlines(), [
+            f"{row.name}: --keep-workers refused. The running Codex hook is unverified. Use the default pause."
+            for row in (running, stopped)])
+        saved_kind.assert_called_once_with(stopped)
         send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], claude)
         stop.assert_not_called()
 
-    def test_named_codex_pause_checks_the_director_on_the_peer(self) -> None:
+    def test_named_codex_pause_refuses_the_director_on_the_peer(self) -> None:
         owner = fixture_member("showrunner", name="production")
         director = fixture_member("unit", name="selected", parent=owner.id,
                                   worktree=staff.PresentWorktree("mac", self.root))
-        home = self.root / "peer-codex"
 
         def peer(arguments: list[str]) -> tuple[int, str]:
             self.assertEqual(arguments, ["_keep-workers-check", str(director.id), str(director.current_session)])
             with (patch.object(shutdown, "local_machine", return_value="mac"),
                   patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", (123,))),
-                  patch.object(account_reader, "process_codex_home", return_value=account_reader.ProcessCodexHome(home)),
                   redirect_stdout(io.StringIO()) as reply):
                 return shutdown.main(arguments), reply.getvalue().strip()
 
         with (patch.object(shutdown, "local_machine", return_value="natedev"),
               patch.object(shutdown, "run_remote", side_effect=peer) as check_peer,
-              patch.object(codex_hooks, "director_hold_ready", side_effect=[False, True]) as check_home,
-              patch.object(shutdown, "_message", return_value={"kind": "sent"}) as send,
+              patch.object(shutdown, "_message") as send,
+              patch.object(stop_resume, "stop_unit_workers") as stop,
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
             arguments = ["pause", director.name, "--keep-workers", "--why", "maintenance"]
             self.assertEqual(shutdown.main(arguments), 2)
-            self.assertEqual(staff.by_id(director.id), director)
-            send.assert_not_called()
-            self.assertEqual(shutdown.main(arguments), 0)
 
-        paused = staff.by_id(director.id)
-        assert paused is not None and isinstance(paused.paused, staff.Paused)
-        self.assertTrue(paused.paused.keep_workers)
-        self.assertEqual(check_peer.call_count, 2)
-        self.assertEqual(check_home.call_args_list, [call(home), call(home)])
-        self.assertIn(f"CODEX_HOME={home}", errors.getvalue())
-        send.assert_called_once()
+        self.assertEqual(staff.by_id(director.id), director)
+        check_peer.assert_called_once()
+        self.assertEqual(errors.getvalue(),
+                         "selected: --keep-workers refused. The running Codex hook is unverified. Use the default pause.\n")
+        send.assert_not_called()
+        stop.assert_not_called()
 
     def test_plain_pause_stops_the_worker_and_leaves_the_director_running(self) -> None:
         owner = fixture_member("showrunner", name="production")
@@ -217,13 +181,18 @@ class PauseWorkersTests(StaffTestCase):
         director = fixture_member("unit", name="selected", parent=owner.id)
         paused = staff.pause(str(director.id), "maintenance", keep_workers=True)
         for delivered in (False, True):
+            def send_continuation(*_args: object, **_kwargs: object) -> restart_support.MessageSendOutcome:
+                self.assertEqual(staff.by_id(director.id), paused)
+                if delivered:
+                    return {"kind": "sent"}
+                return {"kind": "queued", "reason": "fixture"}
+
             with (self.subTest(delivered=delivered),
                   patch.object(herdr, "reboot_lock", side_effect=ExitStack),
                   patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
                   patch.object(stop_resume, "resume",
                                return_value=stop_resume.ClaudeUp(director.current_session, "w1:p0", "claude2")) as start,
-                  patch.object(shutdown, "_message",
-                               return_value={"kind": "sent" if delivered else "queued"}) as send,
+                  patch.object(shutdown, "_message", side_effect=send_continuation) as send,
                   patch.object(shutdown_record, "remove_started") as remove,
                   redirect_stdout(io.StringIO())):
                 self.assertEqual(shutdown.main(["resume", director.name]), 0 if delivered else 1)
@@ -242,6 +211,7 @@ class PauseWorkersTests(StaffTestCase):
         director = fixture_member("unit", name="selected", parent=owner.id)
         paused = staff.pause(str(director.id), "maintenance", keep_workers=True)
         live = stop_resume.ClaudeUp(director.current_session, "w1:p0", "claude2")
+
         with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
               patch.object(stop_resume, "running_on_account", side_effect=[sessions.SessionNotLive(), live]),
               patch.object(stop_resume, "resume", return_value=live) as start,
@@ -258,7 +228,7 @@ class PauseWorkersTests(StaffTestCase):
         remove.assert_called_once_with([str(director.id)])
         assert isinstance(paused.paused, staff.Paused)
         argv = ["send.py", "--to", str(director.id), "--from", "shutdown", "--summary", "agents lifecycle",
-                "--recipient-kind", "unit", "--key", f"agents-resume:{director.id}:{paused.paused.since}"]
+                "--recipient-kind", "unit", "--key", f"agents-resume:{director.id}:{paused.paused.since}", "--once-per-key"]
         self.assertEqual(send.call_args_list, [call(argv, str(director.id), "Continue where you stopped.")] * 2)
         self.assertEqual(staff.by_id(director.id), director)
 

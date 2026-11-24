@@ -121,7 +121,7 @@ def _peer_kept_workers(output: str) -> dict[str, list[str]]:
     return result
 
 
-def _status(selected: Account, here: bool) -> tuple[list[MachineStatusReport], dict[str, list[str]]]:
+def _status(selected: Account, here: bool) -> list[tuple[MachineStatusReport, dict[str, list[str]]]]:
     if here:
         reading: staff.PeerStatusAuthority | staff.ReadStatusAuthority = staff.ReadStatusAuthority()
         stdin = sys.stdin
@@ -131,8 +131,7 @@ def _status(selected: Account, here: bool) -> tuple[list[MachineStatusReport], d
             except (OSError, UnicodeError):
                 pass
         with staff.status_authority(reading):
-            local, kept_workers = _local_inventory(selected.login)
-            return [local], kept_workers
+            return [_local_inventory(selected.login)]
 
     arguments = ["status", selected.login, "--json", "--here"]
     view = staff.peer_status_authority()
@@ -152,7 +151,7 @@ def _status(selected: Account, here: bool) -> tuple[list[MachineStatusReport], d
         # A local failure must let the command exit before the peer replies.
         Thread(target=read_peer, daemon=True).start()
         try:
-            local, kept_workers = _local_inventory(selected.login)
+            local = _local_inventory(selected.login)
         except BaseException:
             cancellation.cancel()
             raise
@@ -160,14 +159,14 @@ def _status(selected: Account, here: bool) -> tuple[list[MachineStatusReport], d
 
         machine = remote.other_machine()
         if status == 255:
-            return [local, {"machine": machine, "unreachable": True}], kept_workers
+            return [local, ({"machine": machine, "unreachable": True}, {})]
         if status != 0:
-            return [local, _unavailable(machine, status, output)], kept_workers
+            return [local, (_unavailable(machine, status, output), {})]
         try:
             peer_report = parse_inventory(output)
         except InvalidInventory as error:
-            return [local, _unavailable(machine, status, str(error))], kept_workers
-        return [local, peer_report], _peer_kept_workers(output) | kept_workers
+            return [local, (_unavailable(machine, status, str(error)), {})]
+        return [local, (peer_report, _peer_kept_workers(output))]
 
 
 def _report_json(report: MachineStatusReport, kept_workers: Mapping[str, list[str]]) -> Mapping[str, object]:
@@ -221,13 +220,13 @@ def main(arguments: list[str], *, usage: Callable[[], str]) -> int:
         options = _parse_status(parser, arguments)
     try:
         selected = _selected_account(options.account)
-        reports, kept_workers = _status(selected, options.here)
+        reports = _status(selected, options.here)
         if options.as_json:
-            output = [_report_json(report, kept_workers) for report in reports]
+            output = [_report_json(report, kept_workers) for report, kept_workers in reports]
             print(json.dumps(output[0] if options.here else output, sort_keys=True))
         else:
             print(f"{selected.label} · {selected.login}")
-            for report in reports:
+            for report, kept_workers in reports:
                 if "sessions" in report:
                     print("\n".join(_inventory_lines(report, kept_workers)))
                 elif "unreachable" in report:

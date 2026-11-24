@@ -44,13 +44,12 @@ if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
 import argparse
 import json
 import os
-import shlex
 import signal
 import subprocess
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
 from functools import partial
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -455,12 +454,20 @@ def _message(row: staff.StaffRow, text: str, *, require_live: bool = False,
         address = prefix + row.current_session
     try:
         result = restart_support.send_message(address, "agents lifecycle", text, key=key,
-                                              recipient_kind=row.kind if require_live else None)
+                                              recipient_kind=row.kind if require_live else None,
+                                              once_per_key=bool(key))
     except (OSError, ValueError, RuntimeError) as error:
         result = restart_support.MessageUnconfirmed(kind="unconfirmed", reason=str(error))
     if not restart_support.message_was_delivered(result):
         print(f"anomaly: {row.name}: continuation delivery: {result}", file=sys.stderr)
     return result
+
+
+def _complete_paused_resume(row: staff.StaffRow) -> None:
+    if isinstance(row.paused, staff.Paused):
+        with suppress(staff.StaffRefused):
+            _ = staff.set_hold(str(row.id), staff.Active(), expected_pause=row.paused)
+    shutdown_record.remove_started([str(row.id)])
 
 
 def _finish_tasks(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
@@ -486,67 +493,26 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
         stop_resume.ClaudeUp))
 
 
-def _director_codex_home(row: staff.StaffRow) -> Path | None:
-    """Use the live account or the saved home of a stopped Codex director."""
-    from scripts.message import codex_daemon
-    from scripts.whoami import account
-
-    observed = herdr.read_conversation(str(row.current_session))
-    if isinstance(observed, herdr.LiveConversation):
-        if observed.kind == "claude":
-            return None
-        homes: set[Path] = set()
-        for pid in observed.pids:
-            setting = account.process_codex_home(pid)
-            if isinstance(setting, account.ProcessEnvironmentUnread):
-                raise ValueError(setting.reason)
-            homes.add(setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex")
-        if not observed.pids:
-            homes = {read.owner.home for read in codex_daemon.read_daemons(os.environ)
-                     if not isinstance(read.sessions, codex_daemon.DaemonUnreadable)
-                     and any(thread.thread_id == row.current_session for thread in read.sessions)}
-        if len(homes) == 1:
-            home = next(iter(homes)).expanduser()
-            if home.is_absolute():
-                return home
-        raise ValueError("cannot prove the live Codex home")
-    try:
-        kind = pane_launch.current_kind(row)
-    except ValueError:
-        if isinstance(observed, herdr.StoppedConversation):
-            return None
-        raise
-    if kind == "claude":
-        return None
-    if not isinstance(row.home, staff.SessionHome):
-        raise ValueError("cannot prove the saved Codex home")
-    return row.home.path
-
-
 def _local_keep_workers_refusal(row: staff.StaffRow) -> str:
-    """Return the reason when the director cannot use the shared prompt hold."""
-    from scripts.hooks import codex_hooks
-
     try:
-        home = _director_codex_home(row)
-    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-        return f"cannot check director-hold ({' '.join(str(error).splitlines())})"
-    if home is None:
-        return ""
-    try:
-        if codex_hooks.director_hold_ready(home):
-            return ""
-    except (codex_hooks.HookError, OSError):
-        pass
-    return ("director-hold is unavailable. Run "
-            f"CODEX_HOME={shlex.quote(str(home))} ~/.claude/scripts/lib/py ~/.claude/scripts/hooks/codex_hooks.py install")
+        observed = herdr.read_conversation(str(row.current_session))
+        kind = observed.kind if isinstance(observed, herdr.LiveConversation) else pane_launch.current_kind(row)
+    except (OSError, ValueError, herdr_types.HerdrFailure):
+        return "The director's backend is unavailable. Use the default pause."
+    if kind == "codex":
+        return "The running Codex hook is unverified. Use the default pause."
+    return ""
 
 
 def _keep_workers_refusal(row: staff.StaffRow) -> str:
     machine = stop_resume.member_machine(row)
     if machine and not unit_machine_is_local(machine):
         status, output = run_remote(["_keep-workers-check", str(row.id), str(row.current_session)])
-        return (" ".join(output.splitlines()) or f"cannot check director-hold on {machine}") if status else ""
+        if status == 0 and output.strip() == "claude":
+            return ""
+        if status == 2 and output.strip():
+            return " ".join(output.splitlines())
+        return f"Cannot check the director on {machine}. Use the default pause."
     return _local_keep_workers_refusal(row)
 
 
@@ -560,10 +526,11 @@ def _remote_keep_workers_check(identity: str, session: str) -> int:
             raise ValueError(f"the director belongs to {machine}")
         reason = _local_keep_workers_refusal(row)
     except (OSError, ValueError, staff.StaffRefused) as error:
-        reason = " ".join(str(error).splitlines())
+        reason = " ".join(str(error).splitlines()) + ". Use the default pause."
     if reason:
         print(reason)
         return 2
+    print("claude")
     return 0
 
 
@@ -615,7 +582,6 @@ def _lifecycle(options: CommandLine) -> int:
                 keep_workers = isinstance(row.paused, staff.Paused) and row.paused.keep_workers
                 key = f"agents-resume:{row.id}:{row.paused.since}" if isinstance(row.paused, staff.Paused) else ""
                 if _paused_resume_needs_message(row):
-                    _ = staff.resume(str(row.id))
                     text = stop_resume.PAUSED_CONTINUATION
                     if keep_workers:
                         delivery = _message(row, text, require_live=True, key=key)
@@ -624,11 +590,9 @@ def _lifecycle(options: CommandLine) -> int:
                                    else "Resume your existing workers. Do not open new workers.")
                         delivery = _message(row, f"{text} {workers}", key=key)
                     if restart_support.message_was_delivered(delivery):
-                        started = True
-                        shutdown_record.remove_started([str(row.id)])
+                        _complete_paused_resume(row)
                         print(f"{row.name}: active")
                     else:
-                        _ = staff.set_hold(str(row.id), row.paused)
                         code = max(code, 1)
                 else:
                     try:
@@ -640,12 +604,12 @@ def _lifecycle(options: CommandLine) -> int:
                             result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
                         if started and keep_workers:
+                            _ = staff.set_hold(str(row.id), row.paused, expected_pause=staff.Active())
                             delivery = _message(row, stop_resume.PAUSED_CONTINUATION, require_live=True, key=key)
-                            started = restart_support.message_was_delivered(delivery)
-                            if not started:
+                            if not restart_support.message_was_delivered(delivery):
                                 code = max(code, 1)
                                 continue
-                            shutdown_record.remove_started([str(row.id)])
+                            _complete_paused_resume(row)
                         if started and row.kind != "producer" and isinstance(row.exited, staff.Exited):
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))

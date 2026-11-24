@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -17,6 +17,7 @@ from typing import cast
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
+from scripts.production import staff
 
 
 URGENT_PREFIX = "URGENT:"
@@ -98,6 +99,52 @@ class OpenReview:
 
 class AlreadyKeptForReview:
     """A held message already owns this key."""
+
+
+def pause_episode(key: str | None) -> tuple[staff.StaffId, str] | None:
+    """Read the stable staff ID and timestamp from a resume key."""
+    if key is None or not key.startswith("agents-resume:"):
+        return None
+    identity, separator, since = key.removeprefix("agents-resume:").partition(":")
+    if not (identity and separator and since):
+        return None
+    try:
+        _ = datetime.fromisoformat(since)
+    except ValueError:
+        return None
+    return staff.StaffId(identity), since
+
+
+@dataclass
+class PauseDelivery:
+    confirmed: bool = False
+
+
+@contextmanager
+def pause_delivery(key: str, session: str) -> Generator[PauseDelivery | None]:
+    """Clear only the pause that owns the continuation before it reaches the director."""
+    episode = pause_episode(key)
+    if episode is None:
+        raise ValueError("invalid resume key")
+    identity, since = episode
+    row = staff.initial_snapshot().by_id(identity)
+    if (row is None or row.current_session != session or not isinstance(row.paused, staff.Paused)
+            or row.paused.since != since):
+        yield None
+        return
+    pause = row.paused
+    try:
+        _ = staff.set_hold(str(identity), staff.Active(), expected_pause=pause)
+    except staff.StaffRefused:
+        yield None
+        return
+    delivery = PauseDelivery()
+    try:
+        yield delivery
+    finally:
+        if not delivery.confirmed:
+            with suppress(staff.StaffRefused):
+                _ = staff.set_hold(str(identity), pause, expected_pause=staff.Active())
 
 
 def _count_file(session: str) -> Path:
@@ -306,7 +353,10 @@ def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only
         finally:
             os.close(descriptor)
     batch.filed = HeldFileAppend(target, size_before, size_after)
-    return held_notice(len(messages), target, header)
+    notice = held_notice(len(messages), target, header)
+    if any(pause_episode(item.key) is not None for item in messages):
+        notice += "\nThe director pause ended. Follow the continuation in the held messages."
+    return notice
 
 
 def file_release(session: str, batch: ReleasedMessages, at: float, *, batch_only: bool) -> str:
@@ -340,10 +390,26 @@ def _reserve(path: Path, state: ReviewState, delivery: ExitStack, *, key: str = 
 @contextmanager
 def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
                     record_keys: RecordReleasedKeys) -> Generator[ReleasedMessages]:
+    obsolete: list[ReviewMessage] = []
     try:
-        yield batch
+        with ExitStack() as delivery:
+            resumes: list[PauseDelivery] = []
+            for item in batch.held:
+                if pause_episode(item.key) is None:
+                    continue
+                resume = delivery.enter_context(pause_delivery(item.key, count.name))
+                if resume is None:
+                    obsolete.append(item)
+                else:
+                    resumes.append(resume)
+            batch.held = tuple(item for item in batch.held if item not in obsolete)
+            batch.to_file = tuple(item for item in batch.to_file if item not in obsolete)
+            yield batch
+            if not isinstance(batch.accepted_at, UnconfirmedRelease):
+                for resume in resumes:
+                    resume.confirmed = True
     finally:
-        if batch.held:
+        if batch.held or obsolete:
             accepted_at = batch.accepted_at
             if not isinstance(accepted_at, UnconfirmedRelease) and any(item.key for item in batch.held):
                 try:
@@ -358,7 +424,7 @@ def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
                     state = _read_state(count, path)
                     messages = state.messages
                     if isinstance(accepted_at, UnconfirmedRelease):
-                        messages = tuple(sorted((*state.reserved, *messages), key=lambda item: item.sent))
+                        messages = tuple(sorted((*batch.held, *messages), key=lambda item: item.sent))
                     if not messages and not _read_count(count):
                         path.unlink(missing_ok=True)
                     else:
@@ -385,8 +451,9 @@ def _emit_saved(count: Path, path: Path, held: tuple[ReviewMessage, ...], at: fl
                 emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
     if held:
         with _settle_release(count, path, ReleasedMessages(held, held), record_keys) as batch:
-            emit(_file_release(count, batch, at, batch_only=True))
-            batch.accepted_at = at
+            if batch.held:
+                emit(_file_release(count, batch, at, batch_only=True))
+                batch.accepted_at = at
 
 
 def set_count(session: str, remaining: int, at: float, emit: Callable[[str], None], *,
@@ -493,8 +560,11 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
             new_message: ReviewMessage | NoNewMessage = NoNewMessage.OUTSIDE_THE_BATCH
             with _locked(path):
                 settings = conf.read("send")
-                if _enabled(settings):
-                    state = _read_state(count, path)
+                enabled = _enabled(settings)
+                resume = pause_episode(message.key) is not None
+                state = _read_state(count, path) if enabled or resume else None
+                if state is not None and (enabled or any(
+                        item.key == message.key for item in (*state.messages, *state.reserved))):
                     if _hold_open(count, state, message.sent, settings):
                         if include_new and not urgent:
                             saved = (*state.reserved, *state.messages)
@@ -505,6 +575,9 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
                             held = _reserve(path, state, delivery, key=message.key)
                     else:
                         held = _reserve(path, _end_review(path, state), delivery)
+                        if not held and resume and any(item.key == message.key for item in state.reserved):
+                            yield AlreadyKeptForReview()
+                            return
                         if held:
                             if not include_new:
                                 to_file = held

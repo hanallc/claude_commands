@@ -400,9 +400,14 @@ else:
               patch.object(remote, "run_remote", return_value=(0, json.dumps(peer))),
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--json"]), 0)
+            with redirect_stdout(io.StringIO()) as human:
+                self.assertEqual(shutdown.main(["status", LOGIN]), 0)
         reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
-        sessions = cast(list[dict[str, object]], reports[0]["sessions"])
-        self.assertEqual(sessions[0]["kept_workers"], ["impl"])
+        self.assertEqual(reports, [
+            {**local, "sessions": [{**session, "kept_workers": ["impl"]}]}, peer,
+        ])
+        lines = [line for line in human.getvalue().splitlines() if "workers kept" in line]
+        self.assertEqual([line.split(" · ")[-1] for line in lines], ["paused (workers kept: impl)", "paused (workers kept)"])
 
     def test_status_starts_the_peer_before_finishing_the_local_report(self) -> None:
         authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))

@@ -31,7 +31,8 @@ All lifecycle scripts use `scripts/agents/`.
 The director finishes its current turn and holds at the prompt.
 By default, pause stops the workers.
 With `--keep-workers`, the workers continue their current work.
-The command checks the trusted `director-hold` hook in each Codex director's home before it saves the pause.
+The command refuses `--keep-workers` for Codex directors and offers the default pause.
+Codex support needs a runtime check that proves the hook through the worker result route.
 It reports each refusal and pauses the other selected directors.
 `agents exit NAME --why TEXT` stops the director and its workers.
 Both commands preserve the staff rows, tabs, and shells.
@@ -45,9 +46,10 @@ JSON status lists the names under `kept_workers`.
 `agents resume --production SHOWRUNNER` resumes its units.
 It reports each held row and its holder when known.
 It resumes the available rows and returns exit 2 if a row lock blocks a resume.
-Resume removes a pause record and sends a running director one continuation message.
-Resume retries use the same message key for the same pause.
-An open message review keeps one copy of the continuation.
+Resume sends a running director one continuation per pause.
+An open message review keeps the continuation and leaves the director paused.
+The review release clears the matching pause before it presents the continuation.
+The send record prevents another copy after confirmed delivery.
 Resume skips worker restoration for a director paused with `--keep-workers`.
 A worker message to a paused director waits in the director's transcript until resume.
 A paused director on the other machine gets the continuation message without a local liveness read.

@@ -23,6 +23,10 @@ class MessageAcknowledged(TypedDict):
     reason: str
 
 
+class MessagePreviouslySent(TypedDict):
+    kind: Literal["previously sent"]
+
+
 class MessageWindowSkipped(TypedDict):
     kind: Literal["window skipped"]
     reason: str
@@ -43,13 +47,13 @@ class MessageUnconfirmed(TypedDict):
     reason: str
 
 MessageDelivery = MessageSent | MessageQueued
-MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessageWindowSkipped
+MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessagePreviouslySent | MessageWindowSkipped
                       | MessageKept | MessageReplaced | MessageUnconfirmed)
 
 
 def message_was_delivered(outcome: Mapping[str, object]) -> bool:
     """Accept only a delivered send or the recipient's acknowledgement."""
-    return outcome["kind"] in {"sent", "acknowledged"}
+    return outcome["kind"] in {"sent", "acknowledged", "previously sent"}
 
 
 def _send_command() -> list[str]:
@@ -82,6 +86,8 @@ def _deliver_message(
             case "sent":
                 return MessageSent(kind="sent")
             case "skipped":
+                if message_send.is_once_confirmed_skip(detail):
+                    return MessagePreviouslySent(kind="previously sent")
                 if message_send.is_acknowledged_skip(detail):
                     return MessageAcknowledged(kind="acknowledged", reason=detail)
                 return MessageWindowSkipped(kind="window skipped", reason=detail)
@@ -112,6 +118,7 @@ def send_message(
     key: str = "",
     repeat_minutes: int = 0,
     recipient_kind: staff.Kind | None = None,
+    once_per_key: bool = False,
 ) -> MessageSendOutcome:
     """Send to a session and return the observed send outcome."""
     if recipient == "user":
@@ -131,6 +138,8 @@ def send_message(
         command.extend(("--key", key))
         if repeat_minutes:
             command.extend(("--repeat-minutes", str(repeat_minutes)))
+    if once_per_key:
+        command.append("--once-per-key")
     if machine:
         command.extend(("--machine", machine))
     return _deliver_message(command, recipient, text)

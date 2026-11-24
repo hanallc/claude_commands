@@ -2233,12 +2233,16 @@ def move(staff_id: StaffId, new_parent: ReportsTo | StaffRoot) -> StaffRow:
     return _transaction(edit)
 
 
-def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
+def set_hold(reference: str, hold: Paused | Exited | Active, *, expected_pause: Paused | Active | None = None) -> StaffRow:
     """Write a lifecycle state through the staff owner."""
     if not is_owner():
         state = "paused" if isinstance(hold, Paused) else "exited" if isinstance(hold, Exited) else "active"
-        return _remote_row(["set-hold", reference, "--state", state,
-                            "--record", json.dumps(hold.to_json() if isinstance(hold, HoldRecord) else {})])
+        arguments = ["set-hold", reference, "--state", state,
+                     "--record", json.dumps(hold.to_json() if isinstance(hold, HoldRecord) else {})]
+        if expected_pause is not None:
+            expected = expected_pause.to_json() if isinstance(expected_pause, Paused) else None
+            arguments.extend(("--expected-pause", json.dumps(expected)))
+        return _remote_row(arguments)
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _lookup(rows, reference)
@@ -2247,6 +2251,8 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
             row = matches[0] if len(matches) == 1 else None
         if row is None:
             raise StaffNotFound(StaffId(reference))
+        if expected_pause is not None and (row.paused != expected_pause or isinstance(row.exited, Exited)):
+            raise StaffRefused(f"{row.name}: the pause changed")
         if isinstance(hold, Paused):
             paused = row.paused
             if isinstance(paused, Paused):
@@ -2618,6 +2624,7 @@ class _Arguments:
     marker: str = ""
     profile: str = ""
     hold_record: str = ""
+    expected_pause: str | None = None
     home: str = ""
     runtime_id: str = ""
     new_id: str = ""
@@ -2672,6 +2679,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = hold.add_argument("target")
     _ = hold.add_argument("--state", choices=("paused", "exited", "active"), required=True)
     _ = hold.add_argument("--record", dest="hold_record", default="{}")
+    _ = hold.add_argument("--expected-pause")
     _ = hold.add_argument("--json", action="store_true")
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
@@ -2788,7 +2796,9 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "set-hold":
         hold = (Paused.from_json(_decode(arguments.hold_record)) if arguments.state == "paused" else
                 Exited.from_json(_decode(arguments.hold_record)) if arguments.state == "exited" else Active())
-        return set_hold(arguments.target, hold)
+        expected = arguments.expected_pause
+        return set_hold(arguments.target, hold, expected_pause=(
+            None if expected is None else Active() if expected == "null" else Paused.from_json(_decode(expected))))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))

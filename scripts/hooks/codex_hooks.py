@@ -31,7 +31,6 @@ import tempfile
 import time
 from collections.abc import Generator
 from enum import Enum
-from pathlib import Path
 from typing import NamedTuple, cast
 
 
@@ -384,7 +383,7 @@ def _initialize(server: AppServer) -> None:
     )
 
 
-def _listed_hook_entries(server: AppServer, path: str, *, report_diagnostics: bool = True) -> list[dict[str, object]]:
+def _listed_hook_entries(server: AppServer, path: str) -> list[dict[str, object]]:
     result = server.call("hooks/list", {"cwds": [_home()]})
     data = result.get("data")
     if not isinstance(data, list):
@@ -392,7 +391,7 @@ def _listed_hook_entries(server: AppServer, path: str, *, report_diagnostics: bo
     entries: list[dict[str, object]] = []
     for workspace in cast(list[object], data):
         fields = _object(workspace, "hooks/list workspace")
-        for kind in ("warnings", "errors") if report_diagnostics else ():
+        for kind in ("warnings", "errors"):
             messages = fields.get(kind)
             if isinstance(messages, list):
                 for message in cast(list[object], messages):
@@ -460,10 +459,9 @@ def _listed_fields(hook: CodexHook) -> dict[str, object]:
             "handlerType": "command", "timeoutSec": hook.timeout}
 
 
-def _select_hooks(entries: list[dict[str, object]], hooks: tuple[CodexHook, ...] = HOOKS
-                  ) -> dict[CodexHook, LocatedHook | MissingHook]:
-    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in hooks}
-    definitions = {hook: _listed_fields(hook) for hook in hooks}
+def _select_hooks(entries: list[dict[str, object]]) -> dict[CodexHook, LocatedHook | MissingHook]:
+    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
+    definitions = {hook: _listed_fields(hook) for hook in HOOKS}
     for entry in entries:
         hook = next((hook for hook, fields in definitions.items()
                      if all(entry.get(field) == value for field, value in fields.items())), None)
@@ -509,21 +507,13 @@ def _ready(entry: LocatedHook | MissingHook) -> bool:
 
 
 @contextlib.contextmanager
-def _read_hooks(binary: str, codex_home: str, *, report_diagnostics: bool = True
-                ) -> Generator[tuple[AppServer, list[dict[str, object]]]]:
+def _read_hooks(binary: str, codex_home: str) -> Generator[tuple[AppServer, list[dict[str, object]]]]:
     server = AppServer(binary, codex_home)
     try:
         _initialize(server)
-        yield server, _listed_hook_entries(server, os.path.join(codex_home, "hooks.json"),
-                                           report_diagnostics=report_diagnostics)
+        yield server, _listed_hook_entries(server, os.path.join(codex_home, "hooks.json"))
     finally:
         server.close()
-
-
-def director_hold_ready(home: Path) -> bool:
-    """Check the director hold in the selected Codex home."""
-    with _read_hooks(_command_binary(), str(home.absolute()), report_diagnostics=False) as (_, listed):
-        return _ready(_select_hooks(listed, (DIRECTOR_HOLD,))[DIRECTOR_HOLD])
 
 
 def _run(action: str) -> int:

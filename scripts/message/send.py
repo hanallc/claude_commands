@@ -5,7 +5,7 @@ Agents holding the SendMessage tool call it directly; scripts call this. The rul
 every message follows are /message (~/.claude/commands/message.md).
 
   send.py --to NAME|uds:<path>|session:<id>|worker:<unit>/<worker>|codex:<thread>
-          [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
+          [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N | --once-per-key]]
           [--here | --machine HOST] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
   send.py --to user --text-id ID --value KEY=VALUE ... [--through-silence] [--user-asked]
@@ -457,6 +457,7 @@ class PendingDelivery(TypedDict):
     clearing: NotRequired[Emergency]
     recipient: NotRequired[QueuedClaudeMailbox | SavedRelayProcess]
     postmaster: NotRequired[PostmasterReservation]
+    once_per_key: NotRequired[bool]
 
 
 class KeyState(TypedDict):
@@ -465,6 +466,7 @@ class KeyState(TypedDict):
     pending: NotRequired[dict[str, str | PendingDelivery]]
     acknowledged: NotRequired[str]
     clearing: NotRequired[Emergency]
+    once_confirmed: NotRequired[bool]
 
 
 KeyStates = dict[str, KeyState]
@@ -669,6 +671,7 @@ class Message:
     sent_header: str = field(default_factory=lambda: sent_line(now()), compare=False, repr=False)
     review_batch: bool = False
     urgent: bool = False
+    once_per_key: bool = False
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -1106,6 +1109,7 @@ class Options(NamedTuple):
     urgent: bool = False
     skip_closed: bool = False
     user_asked: bool = False
+    once_per_key: bool = False
 
     @property
     def to(self) -> str:
@@ -1163,15 +1167,18 @@ def write_key_states(states: KeyStates) -> None:
     write_atomic(STATE / "keys.json", json.dumps(states, indent=2, sort_keys=True) + "\n")
 
 
+def read_key_states() -> KeyStates:
+    try:
+        return cast(KeyStates, json.loads((STATE / "keys.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
+
+
 @contextmanager
 def key_states() -> Generator[KeyStates]:
     """The key states, under the lock, written back on exit when changed."""
-    path = STATE / "keys.json"
     with locked():
-        try:
-            states = cast(KeyStates, json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            states = {}
+        states = read_key_states()
         before = json.dumps(states, sort_keys=True)
         yield states
         if json.dumps(states, sort_keys=True) != before:
@@ -1733,6 +1740,18 @@ def delivery_turn(message: Message) -> Generator[bool]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+ONCE_CONFIRMED = "the earlier copy has confirmed delivery"
+
+
+def is_once_confirmed_skip(detail: str) -> bool:
+    return detail == ONCE_CONFIRMED
+
+
+def once_confirmed(key: str) -> bool:
+    with locked():
+        return read_key_states().get(key, {"last": {}}).get("once_confirmed", False)
+
+
 def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *,
                    live: bool = False, aliases: tuple[str, ...] = ()) -> str | None:
     """Read prior acceptance under a delivery turn; a lock alone never means sent."""
@@ -1777,6 +1796,8 @@ def record_released_acceptances(held: tuple[review_hold.ReviewMessage, ...], fal
             last = state["last"].get(address)
             if last is None or datetime.fromisoformat(last) < accepted_at:
                 state["last"][address] = accepted_at.isoformat()
+            if review_hold.pause_episode(key) is not None:
+                state["once_confirmed"] = True
 
 
 @dataclass(frozen=True)
@@ -1873,6 +1894,8 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str, *,
         reservation = resolve_postmaster_claim(states, key, recipient, reservation, receipt["outcome"])
     if reservation["outcome"] in ("delivered", "queued"):
         state["last"][recipient] = pending["started"]
+        if reservation["outcome"] == "delivered" and pending.get("once_per_key"):
+            state["once_confirmed"] = True
         detail = "delivery" if reservation["outcome"] == "delivered" else "queue acceptance"
         return RepeatAccepted(f"postmaster confirmed {detail} of entry {reservation['entry_id']}")
     release_postmaster_claim(state, recipient, pending)
@@ -1924,6 +1947,8 @@ def _reserve_claude_delivery(message: Message, at: datetime, limit: float, entry
                            ReservedPostmaster(stage="reserved", entry_id=entry_id,
                                               owner_pid=os.getpid(), owner_start=owner.start))
             attempt = PendingDelivery(started=at.isoformat(), limit_seconds=limit, postmaster=reservation)
+            if message.once_per_key:
+                attempt["once_per_key"] = True
             if isinstance(message.claude_attempt, ClaudeDeliveryAttempt):
                 attempt["recipient"] = _attempt_record(message.claude_attempt)
             if previous is not None and "accepted_before" in previous:
@@ -2017,6 +2042,8 @@ def finish_postmaster_claim(message: Message, entry_id: str,
             previous = state["last"].get(recipient.value)
             if previous is None or datetime.fromisoformat(previous) <= datetime.fromisoformat(marker["started"]):
                 state["last"][recipient.value] = marker["started"]
+            if message.once_per_key:
+                state["once_confirmed"] = True
             return True
         if reservation["stage"] == "publishing":
             return False
@@ -2053,6 +2080,8 @@ def complete_postmaster_fallback(message: Message, recipient: StableRecipient, e
         state["last"][message.to] = marker["started"]
         if not newer:
             state["last"][recipient.value] = marker["started"]
+        if result.outcome == "sent" and message.once_per_key:
+            state["once_confirmed"] = True
         _ = state.get("pending", {}).pop(message.to, None)
         return not newer
 
@@ -2808,9 +2837,11 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
     stable_values = set(keys)
     native = to if isinstance(to, str) and to.startswith("session:") else f"session:{own}" if own else ""
-    with locked():
+    with locked(), ExitStack() as deliveries:
         entries: list[QueuedMessage] = []
         rewrites: list[tuple[Path, list[QueueRow]]] = []
+        states: KeyStates | None = None
+        turns: dict[str, bool] = {}
         candidates = list(dict.fromkeys([*paths, *(STATE / "queue").glob("*.jsonl")]))
         for path in candidates:
             selected: list[QueuedMessage] = []
@@ -2842,11 +2873,22 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
                     matches = bool(owner) and owner in stable_values
                 else:
                     matches = path in paths
+                key = entry["key"]
+                episode = review_hold.pause_episode(key) if matches else None
+                if episode is not None and key is not None:
+                    if states is None:
+                        states = read_key_states()
+                    if states.get(key, {"last": {}}).get("once_confirmed"):
+                        continue
+                    if key not in turns:
+                        turns[key] = deliveries.enter_context(delivery_turn(Message(
+                            f"staff:{episode[0]}", "", "", "", key, sent_header="")))
+                    matches = turns[key]
                 if matches:
                     selected.append(entry)
                 else:
                     kept.append(row)
-            if selected:
+            if len(kept) != len(queued):
                 entries.extend(selected)
                 rewrites.append((path, kept))
         if (not isinstance(to, CodexQueueOwner) and not explicit_staff
@@ -2868,6 +2910,19 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
             else:
                 unkeyed_or_legacy.append(entry)
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
+        resumes: dict[str, review_hold.PauseDelivery] = {}
+        ready: list[QueuedMessage] = []
+        for entry in entries:
+            key = entry["key"]
+            if key is not None and key in turns:
+                if key in resumes:
+                    continue
+                resume = deliveries.enter_context(review_hold.pause_delivery(key, own))
+                if resume is None:
+                    continue
+                resumes[key] = resume
+            ready.append(entry)
+        entries = ready
         text = "\n\n".join(stamped_text(
             delivery_preview(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:",
                              urgent=entry.get("urgent", False))
@@ -2880,6 +2935,12 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
             rendered = (json.dumps({"hookSpecificOutput": {"hookEventName": output.event, "additionalContext": text}})
                         if isinstance(output, CodexHookContext) else text)
             print(rendered, flush=True)
+        if resumes:
+            assert states is not None
+            for key, resume in resumes.items():
+                resume.confirmed = True
+                states.setdefault(key, {"last": {}})["once_confirmed"] = True
+            write_key_states(states)
         for path, kept in rewrites:
             _rewrite_queue(path, kept)
         return text
@@ -4620,6 +4681,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--human"]
     if message.key is not None:
         forwarded += ["--key", message.key]
+        if options.once_per_key:
+            forwarded += ["--once-per-key"]
         if isinstance(options.recipient_identity, LogicalRecipientIdentity):
             forwarded += ["--recipient-key", options.recipient_identity.name]
     if message.to == USER:
@@ -4672,6 +4735,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     if parsed.outcome == "absent" and not options.skip_closed:
         return Result("failed", f"ssh {host}: unexpected ABSENT result")
     detail = parsed.detail
+    if options.once_per_key and parsed.outcome == "skipped" and is_once_confirmed_skip(detail):
+        return Result("skipped", detail, failure, receiver)
     if parsed.payload:
         detail += "\n" + parsed.payload
     if parsed.outcome == "held" and repeat_guard_held:
@@ -4921,8 +4986,11 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
     _ = parser.add_argument("--recipient-key", help="stable logical recipient for keyed deduplication across address changes")
-    _ = parser.add_argument("--repeat-minutes", type=float,
-                           help="skip a delivered or kept send with --key inside this window; failed sends do not count")
+    repeat = parser.add_mutually_exclusive_group()
+    _ = repeat.add_argument("--repeat-minutes", type=float,
+                            help="skip a delivered or kept send with --key inside this window; failed sends do not count")
+    _ = repeat.add_argument("--once-per-key", action="store_true",
+                            help="send one continuation for the staff pause in --key")
     location = parser.add_mutually_exclusive_group()
     _ = location.add_argument("--machine", help="deliver from a configured machine alias or host name")
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
@@ -5068,7 +5136,8 @@ def parse(argv: list[str]) -> Options:
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
                       review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True,
-                      skip_closed=get["skip_closed"] is True, user_asked=get["user_asked"] is True)
+                      skip_closed=get["skip_closed"] is True, user_asked=get["user_asked"] is True,
+                      once_per_key=get["once_per_key"] is True)
     if options.skip_closed and (not to.startswith("codex:") or not isinstance(selection, RosterLookup)):
         parser.error("--skip-closed needs a codex: thread address")
     if options.to == USER and options.summary is None:
@@ -5083,6 +5152,8 @@ def parse(argv: list[str]) -> Options:
         parser.error("--review-delivery requires a keyed session send")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
+    if options.once_per_key and (to == USER or review_hold.pause_episode(options.key) is None or options.urgent):
+        parser.error("--once-per-key requires a staff pause key and a continuation without --urgent")
     if get["clears_when"] is not None and not options.clears_when.strip():
         parser.error("--clears-when needs a command")
     if (options.clears_when or options.self_clearing) and (options.to != USER or options.need != "blocked"):
@@ -5224,13 +5295,20 @@ def send(options: Options) -> Result:
                       else staff.StaffSnapshot(()))
     except staff.StaffUnreadable as error:
         usage_error(f"staff lookup for {options.to!r}: {error}")
-    if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
+    episode = review_hold.pause_episode(options.key) if options.once_per_key else None
+    if episode is not None:
+        recipient_key = f"staff:{episode[0]}"
+    elif isinstance(options.recipient_identity, LogicalRecipientIdentity):
+        recipient_key = options.recipient_identity.name
+    else:
         return _send(options, membership=membership)
-    identity = Message(options.recipient_identity.name, options.sender or default_sender(),
+    identity = Message(recipient_key, options.sender or default_sender(),
                        options.summary or "", "", options.key, sent_header="")
     with delivery_turn(identity) as acquired:
         if not acquired:
             return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
+        if episode is not None and options.key is not None and once_confirmed(options.key):
+            return Result("skipped", ONCE_CONFIRMED)
         return _send(options, membership=membership)
 
 
@@ -5661,7 +5739,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             claude_worker_session = worker_session
     message = Message(destination, sender, summary, text, key, display, options.human, stamp,
                       review_delivery=options.review_delivery, sent_header=sent_line(started),
-                      urgent=options.urgent and (claude_route or bool(claude_worker_session)))
+                      urgent=options.urgent and (claude_route or bool(claude_worker_session)),
+                      once_per_key=options.once_per_key)
     if claude_route and fixed:
         assert isinstance(mailbox, StaffClaudeRecipient)
         plan = _claude_delivery_plan(message, mailbox, registry, running)
@@ -5731,7 +5810,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     review_error = ""
     review_message = review_hold.ReviewMessage(display, started.timestamp(), text, sender_native_id(stamp),
                                                key=key or "", key_recipient=stable.value if key is not None else "")
-    if not isinstance(options.sender_origin, ForwardedSender):
+    if not isinstance(options.sender_origin, ForwardedSender) or options.once_per_key:
         if isinstance(route, (ClaudeRecipient, QueuedStaffRecipient)):
             if not isinstance(recipient, (NoRelayReplyMailbox, RelayProcessRecipient)):
                 review_session = conversation_recipient(recipient).conversation
@@ -5746,7 +5825,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 review_error = f"review hold for {destination}: {error}"
 
     guarded = repeat_guard.Decision()
+    releases_resume = (options.once_per_key and isinstance(review_route, review_hold.ReleasedMessages)
+                       and any(item.key == key for item in review_route.held))
     if (not refused and held is None and not review_error and isinstance(claim_result, ClaimGranted)
+            and not releases_resume
             and not isinstance(review_route, review_hold.AlreadyKeptForReview)
             and not isinstance(route, (RecipientLookupFailed, RemoteDelivery))):
         guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
@@ -5759,7 +5841,11 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     elif held is not None:
         new_message_result = Result("held", held)
     elif isinstance(claim_result, RepeatAccepted):
-        new_message_result = Result("skipped", claim_result.reason)
+        if options.once_per_key and key is not None:
+            new_message_result = (Result("skipped", ONCE_CONFIRMED) if once_confirmed(key)
+                                  else Result("pending", claim_result.reason))
+        else:
+            new_message_result = Result("skipped", claim_result.reason)
     elif isinstance(claim_result, RepeatUnconfirmed):
         new_message_result = UnconfirmedPostmasterDelivery("failed", claim_result.reason)
     elif isinstance(claim_result, RepeatPending):
@@ -5785,9 +5871,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         if not batch_only and isinstance(batch.new_message, review_hold.ReviewMessage):
             body += "\n\n" + review_hold.numbered_entries((batch.new_message,))
         return replace(message, summary="Messages from the review", text=body, review_batch=True,
-                       key=None if batch_only else message.key, urgent=message.urgent and not batch_only)
+                       key=None if batch_only else message.key, urgent=message.urgent and not batch_only,
+                       once_per_key=message.once_per_key and not batch_only)
 
-    def deliver(transport_message: Message, *, batch_only: bool = False) -> Result:
+    def deliver_transport(transport_message: Message, *, batch_only: bool, confirm_only: bool) -> Result:
         nonlocal claim_result, log_route
         delivery_identity = replace(postmaster_identity, key=transport_message.key)
         if isinstance(route, RecipientLookupFailed):
@@ -5815,6 +5902,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             result = deliver_codex(message, route, options.timeout, selection=options.selection,
                                    review_recipient=stable.value)
         elif isinstance(route, QueuedStaffRecipient):
+            if confirm_only:
+                return Result("failed", "the review release needs a live recipient")
             result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
                             + " so it is kept for it")
             assert isinstance(plan, SessionIdWithoutLiveRecipient)
@@ -5846,6 +5935,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                         return relayed_result._replace(receiver=owner.recipient.current.address)
                 if relayed_result.outcome != "queued":
                     return relayed_result
+                if confirm_only:
+                    return Result("failed", relayed_result.detail)
                 attempt = delivery_message.claude_attempt
                 assert isinstance(attempt, ClaudeDeliveryAttempt)
                 queue_recipient = attempt.recipient
@@ -5869,6 +5960,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 return relayed
 
             if isinstance(plan, SessionIdWithoutLiveRecipient):
+                if confirm_only:
+                    return Result("failed", "the review release needs a live recipient")
                 result = Result(
                     "queued",
                     f"no live session answers to {plan.address}, so it is kept under that name",
@@ -5937,6 +6030,33 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                     log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
         return result
 
+    def deliver(transport: Message, *, batch_only: bool = False,
+                batch: review_hold.ReleasedMessages | None = None) -> Result:
+        resume_keys: set[str] = set()
+        if batch is not None:
+            resume_keys = {item.key for item in batch.held if review_hold.pause_episode(item.key) is not None}
+        session = (route.thread_id if isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)) else
+                   native_address.removeprefix("session:") if isinstance(plan, RelayAttempt) else "")
+        with ExitStack() as active:
+            resume = None
+            if transport.once_per_key and transport.key is not None and transport.key not in resume_keys:
+                if once_confirmed(transport.key):
+                    return Result("skipped", ONCE_CONFIRMED)
+                if session:
+                    resume = active.enter_context(review_hold.pause_delivery(transport.key, session))
+                    if resume is None:
+                        return (Result("skipped", ONCE_CONFIRMED) if once_confirmed(transport.key)
+                                else Result("failed", "the matching director pause is unavailable"))
+            result = deliver_transport(transport, batch_only=batch_only, confirm_only=bool(resume_keys))
+            if ((resume is not None or isinstance(route, RemoteDelivery)) and (result.outcome == "sent"
+                    or (result.outcome == "skipped" and is_once_confirmed_skip(result.detail))) and transport.once_per_key):
+                if resume is not None:
+                    resume.confirmed = True
+                assert transport.key is not None
+                with key_states() as states:
+                    states.setdefault(transport.key, {"last": {}})["once_confirmed"] = True
+            return result
+
     def confirm_review_delivery(batch: review_hold.ReleasedMessages, result: Result) -> None:
         accepted = (isinstance(result, PaneTextDelivered) if isinstance(route, PaneWorkerRecipient)
                     else result.outcome in ("sent", "queued"))
@@ -5959,7 +6079,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 print(failure, file=sys.stderr)
                 result = new_message_result
         else:
-            result = deliver(transport, batch_only=batch_only)
+            result = deliver(transport, batch_only=batch_only, batch=review_route)
             confirm_review_delivery(review_route, result)
     elif new_message_result is not None:
         result = new_message_result
@@ -6013,7 +6133,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         try:
             with review_hold.pending_release(review_session, record_keys=record_released_acceptances) as pending:
                 if pending.held:
-                    released = deliver(review_transport(pending, batch_only=True), batch_only=True)
+                    released = deliver(review_transport(pending, batch_only=True), batch_only=True, batch=pending)
                     confirm_review_delivery(pending, released)
         except (OSError, ValueError) as error:
             print(f"review hold for {destination}: {error}", file=sys.stderr)
