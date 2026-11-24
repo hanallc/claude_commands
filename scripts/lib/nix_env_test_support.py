@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from scripts.buildlog.store import host_name
 from scripts.lib import conf_reads
-from scripts.lib.build_slots_test_support import write_private_slot_roots
+from scripts.lib.build_slots_test_support import write_private_build_roots
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
@@ -53,7 +53,7 @@ class NixFixture(unittest.TestCase):
         self.bin.mkdir()
         configuration = self.root / "settings"
         _ = copy_config_fixture(ROOT / "config", configuration)
-        write_private_slot_roots(configuration / "build_folders.conf", self.root, host_name())
+        write_private_build_roots(configuration / "build_folders.conf", self.root, host_name())
         _ = write_config_fixture(configuration / "nix_env.conf",
                                  "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")
         self.env = {**conf_reads.shift_child_environment(), "CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),

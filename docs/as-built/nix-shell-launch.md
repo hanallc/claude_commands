@@ -26,9 +26,7 @@ a repository under a trusted root, using file reads alone.
 Style-sync lint uses `copies.standing`, a numbered copy at `<roots.build>/<repository>/<unit>/<N>`.
 Copy trust requires a copy lease whose source checkout is under a trusted root.
 The copy's `.envrc` must match the `.envrc` of the recorded commit byte for byte.
-The `roots.slots` settings in `build_folders.conf` select the slot root for slot trust.
-natedev sets no slot root, so no folder there gets slot trust. The Mac sets one.
-Slot trust requires a registered worktree and an `.envrc` that matches `HEAD`.
+A folder outside a numbered copy gets only the general rules.
 Forged links still require explicit approval.
 
 Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on natedev

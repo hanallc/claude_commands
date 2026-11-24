@@ -828,13 +828,16 @@ def cloud_update_age(seconds: float) -> str:
     return f"{int(seconds)} s"
 
 
+def cloud_location(progress: cloud_progress.CloudProgress) -> str:
+    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
+    return ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
+
+
 def cloud_detail(row: wire.CloudRow) -> str:
     progress = row.progress
     if not isinstance(progress, cloud_progress.CloudProgress):
         return ""
-    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
-    location = ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
-    return " · ".join(filter(None, (progress.stage, location)))
+    return " · ".join(filter(None, (progress.stage, cloud_location(progress))))
 
 
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
@@ -854,11 +857,7 @@ def cloud_failed_modules(work: CloudWork) -> str:
 def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
         return cloud_status(row, work)
-    parts = (work.state if work.state != "running" else "",
-             cloud_detail(row),
-             work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
-             cloud_failed_modules(work))
-    return (Span(" · ".join(filter(None, parts))),)
+    return (Span(cloud_failed_modules(work)),)
 
 
 @dataclass(frozen=True)
@@ -867,17 +866,16 @@ class WaitingBuild:
     step: admission_records.WaitingStep
 
 
-def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
+def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow]:
     """Keep the queue order within each machine."""
-    rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
+    rows: list[WaitingBuild | wire.CloudRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
-    slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
 
-    def time_key(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
-        return cloud_queue_time(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+    def time_key(row: wire.CloudRow) -> tuple[float, int, str]:
+        return cloud_queue_time(row.place, row.since)
 
     cloud_waits = [row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)]
-    for cloud in sorted([*cloud_waits, *slot_rows], key=time_key):
+    for cloud in sorted(cloud_waits, key=time_key):
         order_time = time_key(cloud)[0]
         position = next((index for index, row in enumerate(rows)
                          if (row.step.since if isinstance(row, WaitingBuild) else time_key(row)[0]) > order_time),
@@ -885,11 +883,10 @@ def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wir
         rows.insert(position, cloud)
 
     # Keep the positions of the local waits and the waits with a reserved cloud slot.
-    queued = {row.owner: row for row in cloud_waits if isinstance(row.wait, wire.CloudSlotWait)
-              and isinstance(row.wait.state, WaitingForCloudSlot)}
-    cloud_order = iter(queued.values())
+    cloud_order = (row for row in cloud_waits if isinstance(row.wait, wire.CloudSlotWait)
+                   and isinstance(row.wait.state, WaitingForCloudSlot))
     for index, row in enumerate(rows):
-        if isinstance(row, wire.CloudRow) and row.owner in queued:
+        if isinstance(row, wire.CloudRow) and isinstance(row.wait, wire.CloudSlotWait) and isinstance(row.wait.state, WaitingForCloudSlot):
             rows[index] = next(cloud_order)
     return rows
 

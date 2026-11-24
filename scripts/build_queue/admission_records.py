@@ -10,7 +10,7 @@ import math
 import os
 import re
 from types import MappingProxyType
-from typing import Callable, Literal, NamedTuple, NotRequired, TypedDict, assert_never, cast
+from typing import Callable, Literal, NamedTuple, NotRequired, TypedDict, TypeGuard, assert_never, cast
 from zoneinfo import ZoneInfo
 
 import sys
@@ -24,7 +24,7 @@ from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
 from scripts.build_queue.snapshot_codec import select_queue_name
-from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
+from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun, RunIdentity,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.build_targets import target_config
@@ -222,6 +222,7 @@ class AdmissionPolicy:
     safety_bytes: int = 3 * GIB
     progress_lookahead_percent: float = field(kw_only=True)
     agent_swap_share_percent: int = field(default=100, kw_only=True)
+    build_reserve_share_percent: int = field(default=100, kw_only=True)
     gpu_tests: GpuTestSlots = field(default=NO_GPU_TESTS, kw_only=True)
     repository_runs: RepositoryRunLimits = field(default_factory=RepositoryRunLimits, kw_only=True)
 
@@ -687,6 +688,7 @@ class HostMemory:
     swap_free: int = 0
     build_and_ci_swap: int | ReadingUnavailable = field(default=0, kw_only=True)
     swap_in_window_bytes: int = field(default=0, kw_only=True)
+    swap_in_window_seconds: int = field(default=0, kw_only=True)
 
 Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 
@@ -792,11 +794,84 @@ class PendingPriorityTransition:
     set_by: str = ""
 
 
-class PriorityEntry(TypedDict):
+# A command from a plain shell has no session; nate typed it.
+PLAIN_SHELL_ACTOR = "user"
+PLAIN_SHELL_WORDS = "typed by nate in a plain shell"
+
+
+@dataclass(frozen=True)
+class StaffAsker:
+    """A staff row names the session that asked."""
+    name: str
+
+
+@dataclass(frozen=True)
+class UnstaffedSession:
+    """A session asked, and no staff row names it."""
+    session_id: str
+
+
+@dataclass(frozen=True)
+class PlainShellAsker:
+    """nate asked from a plain shell with no session."""
+
+
+@dataclass(frozen=True)
+class AskerNotRecorded:
+    """The entry was saved before entries named the actor that asked."""
+
+
+Asker = StaffAsker | UnstaffedSession | PlainShellAsker
+
+
+class UnitPriorityEntry(TypedDict):
+    """The entry raises every step of the unit."""
     unit: str
     why: str
     set_at: float
     set_by: str
+    kind: NotRequired[Literal["UnitPriorityEntry"]]
+    asker: NotRequired[Asker]
+
+
+class RunPriorityEntry(TypedDict):
+    """The entry raises only the steps of one run; the unit and step name it on the page."""
+    kind: Literal["RunPriorityEntry"]
+    run: RunIdentity
+    unit: str
+    step: str
+    why: str
+    set_at: float
+    set_by: str
+    asker: Asker
+
+
+# The run entry comes first: a unit entry has no tag in older saved state.
+PriorityEntry = RunPriorityEntry | UnitPriorityEntry
+
+
+def is_run_entry(entry: PriorityEntry) -> TypeGuard[RunPriorityEntry]:
+    return entry.get("kind") == "RunPriorityEntry"
+
+
+def entry_asker(entry: PriorityEntry) -> Asker | AskerNotRecorded:
+    return entry.get("asker", AskerNotRecorded())
+
+
+def entry_covers(entry: PriorityEntry, unit: str, run: LiveBuildRun | NoLiveBuildRun) -> bool:
+    """A run entry covers the steps of its run; a unit entry covers the steps of its unit."""
+    if is_run_entry(entry):
+        return isinstance(run, LiveBuildRun) and RunIdentity(run.pid, run.start_time) == entry["run"]
+    return entry["unit"] == unit
+
+
+def actor_asker(actor: str, members: QueueStaff) -> Asker:
+    """Name the actor by its staff row, as a plain shell, or by its session id."""
+    if actor == PLAIN_SHELL_ACTOR:
+        return PlainShellAsker()
+    if isinstance(members, staff.StaffSnapshot) and (member := members.by_member_reference(actor)):
+        return StaffAsker(member.name)
+    return UnstaffedSession(actor)
 
 
 @dataclass(frozen=True)
@@ -830,7 +905,7 @@ NO_QUEUE_PRIORITY = NoQueuePriority()
 
 def queue_command_actor() -> str:
     """Identify the user command without a session-role check."""
-    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "user"
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or PLAIN_SHELL_ACTOR
 
 
 @dataclass(frozen=True)
@@ -910,6 +985,27 @@ class RunKeepAside:
 
 
 @dataclass(frozen=True)
+class KeepAsideParts:
+    """A run keeps aside its share of room to grow, its memory held between steps, and a need with no use reading."""
+    growth: int
+    growth_kept: int
+    between_steps: int
+    unread: int
+
+    @property
+    def bytes(self) -> int:
+        return self.growth_kept + self.between_steps + self.unread
+
+
+def keep_aside_parts(run: RunMemory, share_percent: int) -> KeepAsideParts:
+    """The share applies only to growth: the next step reuses memory held between steps."""
+    if isinstance(run.use, AnonymousRunUse):
+        growth = max(0, run.need - run.use.bytes)
+        return KeepAsideParts(growth, (growth * share_percent + 99) // 100, run.held, 0)
+    return KeepAsideParts(0, 0, run.held, run.need)
+
+
+@dataclass(frozen=True)
 class CapUnavailable:
     """These runs prevent calculation of the memory cap."""
     runs: tuple[RunMemory, ...]
@@ -928,6 +1024,8 @@ class MemoryRoom:
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
     ci_use: int = field(default=0, kw_only=True)
     agent_swap_demand: int = field(default=0, kw_only=True)
+    # Swap-in within the window, at most the swap outside builds and CI: the share applies to it.
+    returning_swap: int = field(default=0, kw_only=True)
 
     @property
     def cap_use(self) -> int:
@@ -1814,6 +1912,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
                                        progress_lookahead_percent=number("progress_lookahead_percent"),
                                        agent_swap_share_percent=whole("agent_swap_share_percent"),
+                                       build_reserve_share_percent=whole("build_reserve_share_percent"),
                                        gpu_tests=GpuTestSlots(whole("gpu_test_slots"),
                                                               value("gpu_test_repositories", lambda raw: frozenset(raw.split()))),
                                        repository_runs=RepositoryRunLimits(run_limits, exempt_unit)),
