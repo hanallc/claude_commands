@@ -317,7 +317,7 @@ def read_actions(*, remote: bool) -> RenderRead[ActionFields]:
             sources.deadline = deadline
             refresh_due = snapshot.comparison_refresh_due or 0 < deadline <= time.time()
         waiting_rebuilds = rebuild_row.rebuild_names(actions.rebuild_machines)
-        actions_count = str(actions.other_count)
+        actions_count = f"{actions.other_count}+" if actions.partial else str(actions.other_count)
     except Exception:
         sources.complete = False
     if remote or not deadline:

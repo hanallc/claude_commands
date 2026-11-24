@@ -23,7 +23,7 @@ from threading import Thread
 from pathlib import Path
 from collections.abc import Callable, Iterator
 from typing import ClassVar, NotRequired, TextIO, TypedDict, cast, final, override
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, new_account
@@ -615,8 +615,8 @@ class ForYouStatusTests(unittest.TestCase):
                       patch.object(subprocess, "Popen") as refresh,
                       patch.object(os, "execvp") as render):
                     assignment.main()
-                read.assert_called_once()
-                needs.assert_called_once()
+                read.assert_called_once_with(watch=ANY)
+                needs.assert_called_once_with([], watch=ANY)
                 self.assertEqual(refresh.call_count, int(expire))
                 render.assert_called_once()
                 arguments = cast(list[str], render.call_args.args[1])
@@ -648,6 +648,12 @@ class ForYouStatusTests(unittest.TestCase):
                 pending, = folder.glob("*.json")
                 self.assertEqual(first.sources.stamps[record], assignment.file_stamp(record))
                 self.assertEqual(first.sources.stamps[pending], assignment.file_stamp(pending))
+                damaged = folder / "bad.json"
+                _ = damaged.write_text("{", encoding="utf-8")
+                partial = assignment.read_actions(remote=False)
+                self.assertEqual((partial.value.other_count, partial.value.waiting_rebuilds), ("1+", "rebuild mac"))
+                self.assertFalse(partial.sources.complete)
+                damaged.unlink()
                 _ = store.mark_done(action.key, evidence="Login restored.")
                 self.assertNotEqual(first.sources.stamps[record], assignment.file_stamp(record))
                 self.assertEqual(assignment.read_actions(remote=False).value.other_count, "0")
@@ -900,6 +906,8 @@ class ForYouStatusTests(unittest.TestCase):
     def test_rebuild_and_other_action_share_the_for_you_row(self) -> None:
         lines = status_lines({}, for_you="1", rebuild="rebuild natedev")
         self.assertIn("For you: rebuild natedev, \x1b[1m1\x1b[22m action", lines)
+        partial = status_lines({}, for_you="1+", rebuild="rebuild natedev")
+        self.assertIn("For you: rebuild natedev, \x1b[1m1+\x1b[22m actions", partial)
 
     def test_global_actions_do_not_depend_on_the_session(self) -> None:
         for identity in ("", "sid", "another-session"):
@@ -1251,11 +1259,14 @@ class RoleTests(ConfiguredShellTests):
 
     def test_shell_reuses_each_role_without_starting_python(self) -> None:
         render = self.cache_shell()
+        with patch.dict(os.environ, {"HOME": str(self.home)}, clear=True):
+            need.add_need("natedev", "a" * 40, "Fixture need", "Fixture")
         launches = self.home / "python-invocations"
         for index, (session, hint) in enumerate(
                 ((UNIT.id, "cached-branch"), (WORKER.id, "adhoc items"), (OWNER.id, "proposals")), 1):
             expected = render(session, "/bin/sh")
             self.assertIn(hint, ANSI.sub("", expected))
+            self.assertIn("For you: rebuild natedev, rebuild mac", ANSI.sub("", expected))
             for shell in SHELLS:
                 with self.subTest(session=session, shell=shell):
                     self.assertEqual(render(session, shell), expected)
@@ -2758,17 +2769,24 @@ class RebuildRowTests(unittest.TestCase):
                                   + "rebuild.generations=~/.local/state/rebuild/generations.log\n", encoding="utf-8")
             switched = {"natedev": "a" * 40, "mac": "b" * 40}
             # The running natedev system is the earlier switch, so a later switch to another system is not the base.
-            logs = {"natedev": f"/nix/store/x\nt switch system-1-link {'a' * 40}-dirty /nix/store/x\n"
-                               + f"t switch system-2-link {'c' * 40} /nix/store/y",
-                    "mac": f"/nix/store/m\nt switch system-9-link {'b' * 40} /nix/store/m"}
+            def switch(path: str, generation: int, revision: str) -> str:
+                return (f"/nix/store/{path}\nactivated 2026-11-19T13:00:00Z 100\n"
+                        f"generation system-{generation}-link 2026-11-19T12:59:59Z 101\n--- generations ---\n"
+                        f"2026-11-19T13:00:01Z switch system-{generation}-link {revision} /nix/store/{path}")
+
+            logs = {"natedev": switch("x", 1, switched["natedev"] + "-dirty")
+                               + f"\n2026-11-19T13:00:02Z switch system-2-link {'c' * 40} /nix/store/x",
+                    "mac": switch("m", 9, switched["mac"])}
             commands: list[list[str]] = []
             mac_reachable = True
 
             def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
                 if command[0] == "sh":
-                    self.assertEqual(command[2], "realpath /run/current-system && tail -n 200 "
-                                     + "~/.local/state/rebuild/generations.log")
+                    self.assertIn("current=/run/current-system", command[2])
+                    self.assertIn('realpath "$current"', command[2])
+                    self.assertIn('cat "$running/configuration-revision"', command[2])
+                    self.assertIn('tail -n 200 "$HOME"/.local/state/rebuild/generations.log', command[2])
                     return logs["natedev"]
                 if command[0] == "ssh":
                     return logs["mac"] if mac_reachable else ""
@@ -2784,7 +2802,8 @@ class RebuildRowTests(unittest.TestCase):
                         + "https://claude.ai/code/session_01Abc\n"
                         + f"{'e' * 40}\x1f2026-11-15T01:09:21-05:00\x1fby hand\x1f")
 
-            with patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]):
+            with (patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]),
+                  patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(root / "needs")})):
                 rebuild_row.write_changes(config, run)
                 wrote = [rebuild_row.Change("d" * 40, "2026-11-15T08:45:08-05:00", "memory: THP defrag defer", "96b016bf"),
                          rebuild_row.Change("e" * 40, "2026-11-15T01:09:21-05:00", "by hand", "")]
@@ -2795,12 +2814,11 @@ class RebuildRowTests(unittest.TestCase):
                 commands.clear()
                 mac_reachable = False
                 switched["natedev"] = "c" * 40
-                logs["natedev"] = f"/nix/store/y\nt switch system-2-link {'c' * 40} /nix/store/y"
+                logs["natedev"] = switch("y", 2, switched["natedev"])
                 rebuild_row.write_changes(config, run)
                 # The session map is kept, and a Mac that does not answer keeps its last list.
                 self.assertFalse(any(command[0] == "rg" for command in commands))
                 self.assertEqual(rebuild_row.read_changes(config)["mac"], tuple(wrote))
-                self.assertEqual(rebuild_row.switched_commit("", "/nix/store/x"), "")
 
     def test_read_command_prints_both_one_or_no_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3006,7 +3024,13 @@ class RebuildRowTests(unittest.TestCase):
                     with self.assertRaises(RecursionError):
                         _ = ActionStore(actions).list()
                 elif source == "needs":
-                    (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
+                    folder = home / ".local/state/rebuild/needs"
+                    (folder / "unreadable.json").mkdir(parents=True)
+                    with patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(folder)}):
+                        need.add_need("mac", "a" * 40, "Apply settings.", "fixture")
+                    _ = ActionStore(actions).add(title="Check the build", command="check", machine="mac",
+                                                 cwd="/fixture", requested_by="fixture", reason="Read the result.",
+                                                 waits="Build", concerns="fixture", dedupe_key="check")
                 for shell in SHELLS:
                     with self.subTest(shell=shell, source=source):
                         result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
@@ -3014,8 +3038,10 @@ class RebuildRowTests(unittest.TestCase):
                                                                  "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: rebuild natedev" if source == "ready" else "For you: rebuild natedev, Unavailable"
-                        self.assertEqual(result.stdout.splitlines()[-1], expected)
+                        expected = {"ready": "For you: rebuild natedev",
+                                    "actions": "For you: rebuild natedev, Unavailable",
+                                    "needs": "For you: rebuild natedev, rebuild mac, 1+ actions"}
+                        self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], expected[source])
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)
 

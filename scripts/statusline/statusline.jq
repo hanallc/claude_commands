@@ -109,7 +109,7 @@ def usage($config; $label; $window; $fmt):
      ($render | type != "object" or
       any(.assignment, .role, .branch, .counts, .adhoc, .for_you, .rebuild;
           type != "string" or index("\u0000") != null) or
-      (.for_you | test("\\A(unavailable|[0-9]+)\\z") | not))
+      (.for_you | test("\\A(unavailable|[0-9]+\\+?)\\z") | not))
   then error("Invalid session fields") else . end
 | ($ARGS.named.colors // "" | color_config) as $colors
 | (if ($ARGS.named.legacy_home // "") == "1" then
@@ -171,7 +171,7 @@ def usage($config; $label; $window; $fmt):
 | ($render.for_you // "") as $actions
 | ([($render.rebuild // ""),
     (if $actions == "unavailable" then "Unavailable"
-     elif ($actions | test("\\A[1-9][0-9]*\\z")) then
+     elif ($actions | test("\\A([1-9][0-9]*|[0-9]+\\+)\\z")) then
        "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
      else "" end)]
    | map(select(. != ""))
