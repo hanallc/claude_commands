@@ -300,6 +300,11 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         if isinstance(filing, review_submissions.NoNativeSubmission):
             return change_page.NoMessageDelivery()
         _ensure_list_filing(filing.saved())
+        assignment = filing.details.assignment
+    assignee = ""
+    if isinstance(assignment, new_item_dialog.ChosenAssignee):
+        name = review_items.name(assignment.id, staff.snapshot())
+        assignee = f"\n{name} is the assignee."
 
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
@@ -343,7 +348,7 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
                     label = notice.kind.capitalize()
                 if notice.from_command:
                     source = ""
-            message = (f'New {label} {saved.id}{source}.\n\n{words or saved.words}{evidence}\n\n'
+            message = (f'New {label} {saved.id}{source}.{assignee}\n\n{words or saved.words}{evidence}\n\n'
                        + change_page.reply_command(saved.key))
             record: change_page.StoredReviewMessage = {
                 'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
