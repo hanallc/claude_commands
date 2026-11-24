@@ -736,41 +736,23 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 - basedpyright reports zero errors and zero warnings on each changed Python file.
 
 ### Phase 16 — User zone helper start time  · status: done
-**Depends on:** Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** The configured `scripts/lib/user_zone.py` CLI starts as fast as it did before Phase 4, with the same output and behavior.
-
-**Spec:**
-
-1. **Measure first.** Time the configured CLI: no `USER_ZONE`, a `user_zone.conf` fixture in `CONF_DIR`, `python3 -S`. Take the median of 20 runs at the Phase 4 parent `d5c0a1b746` and at the phase base, with `build_slots.py run --commit <hash>` as in Phase 4. Phase 4 measured 34 ms before and 67 ms after. List the loaded modules and their cost with `python3 -X importtime`.
-2. **Lazy imports.** In `scripts/lib/conf.py`, move each module-level import that a plain `conf.read(stem)` does not need into the function that uses it. Example: `subprocess` serves only `_git` (Git recovery). `decimal` and `scripts.lib.models_registry` already load inside `_agent_limit`; keep them there.
-3. **No behavior change.** Values, diagnostics, host overrides and Git recovery stay the same. Showrunner, 11-24: lazy imports in `conf.py` only.
-4. Keep annotation types visible to basedpyright with `if TYPE_CHECKING:` imports.
-5. A module that module-level code needs (a dataclass, an enum, a lock, `socket` for the host name on each read) stays. Name each one with its cost in the reply.
-6. `scripts/lib/test_user_zone.py` `test_cli_import_budget_without_site`: the configured subtest asserts that each module moved by item 2 stays unloaded.
+- `scripts/lib/conf.py` imports `subprocess` only inside `_git`, the one function that runs Git. `CompletedProcess` is a `TYPE_CHECKING` import. A plain `conf.read(stem)` loads no `subprocess`, `decimal` or `scripts.lib.models_registry`.
+- Values, diagnostics, host overrides and Git recovery do not change.
+- The configured CLI median is 88.50 ms (phase base 167.26 ms, Phase 4 parent 65.94 ms, all under load 55-75). `dataclasses` (through `inspect`) is the largest remaining cost, about 10 ms cumulative.
 
 **Files:**
-- `scripts/lib/conf.py`
-- `scripts/lib/test_user_zone.py`, `scripts/lib/test_conf.py`
+- `scripts/lib/conf.py` — lazy `subprocess`
+- `scripts/lib/test_user_zone.py` — the configured subtest of `test_cli_import_budget_without_site` asserts `subprocess`, `decimal` and `scripts.lib.models_registry` unloaded
+- `scripts/lib/test_build_folders.py` — the Git guard patches `subprocess.run`
 
-**Workers:** 1 writer + 1 tester — one module and its import budget test.
-- `impl` — `scripts/lib/conf.py`, `scripts/lib/test_conf.py`
-- `test` — `scripts/lib/test_user_zone.py`: the configured import budget rows, and the timing before and after
+**Gotchas:**
+- A Git guard patches `subprocess.run`, the attribute every caller shares. A patch of `conf._git` misses a Git call on another path.
+- `socket` (host override on each read) loads `math` through `selectors`. `collections.abc` loads before `conf` through `runpy`.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 4 moved `scripts/lib/user_zone.py` to `conf.read("user_zone").value("zone", <check>)`. `test_cli_import_budget_without_site` has a pinned subtest (`USER_ZONE=Europe/Paris`, `pathlib` unloaded) and a configured subtest (`CONF_DIR` fixture, `decimal` and `scripts.lib.models_registry` unloaded).
-- `conf.py` imports at module level: `collections.abc`, `contextlib`, `contextvars`, `dataclasses`, `enum`, `math`, `os`, `pathlib`, `re`, `socket`, `subprocess`, `sys`, `threading.Lock`, `typing` and `scripts.lib.conf_reads`.
-- `scripts/aws_target/test_hana_render.py` checks the imports of the Hana guest files (`UNSHIPPED_IMPORTS` has a `lib/conf.py` row). A change to a file in `scripts/aws_target/hana_image.files` updates `hana_image.sha256`.
-
-**Acceptance gate:**
-- The configured CLI median of 20 runs is within 5 ms of the 34 ms measured before Phase 4, or the reply names each remaining import, the module-level code that needs it, and its cost.
-- `test_user_zone.py` and `test_conf.py` pass. The configured subtest asserts that the moved modules stay unloaded.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:** lazy `math`, `collections.abc` and `sys` imports: measured, and no module leaves the load list.
 
 ### Phase 17 — Build tool limits follow-ups  · status: done
 **Depends on:** Phase 10
