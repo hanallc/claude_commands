@@ -648,24 +648,58 @@ try {
           break browserProof;
         }
         if (guestMemoryProof || !focusedProof) {
-          const local = {...readings.verify_calls.walk.find(row => row.queued && row.verify), machine:'natedev'};
-          const guest = readings.guest_gate.walk.find(row => row.guest_run);
-          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
-          const awsWait = readings.cloud.waiters.find(row => row.kind === 'cloud');
-          servedReading = {...base, walk:[local, guest, mac], waiters:[awsWait], held_places:[]};
+          const local = {...readings.verify_calls.walk.find(row => row.queued && row.verify),
+            machine:'natedev', unit:'natest', showrunner:'builds', title:{unit:'natest',step:'nextest'}};
+          const guest = {...readings.guest_gate.walk.find(row => row.guest_run),
+            unit:'queue', showrunner:'builds', title:{unit:'queue',step:'gate'}};
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit === 'trunk' && !row.started_by);
+          const awsWait = {...readings.cloud.waiters.find(row => row.kind === 'cloud'),
+            unit:'admin-console', showrunner:'builds', title:{unit:'admin-console',step:'nextest'}};
+          servedReading = {...base, staff_names:readings.verify_calls.staff_names,
+            walk:[local, guest, mac], waiters:[awsWait], held_places:[]};
           await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
-          const memoryCells = `[0,1,2].map(index => {
-            const row = document.querySelector('.wrow[data-run="' + proofRun(index) + '"]');
-            const machine = document.querySelector('tr[data-tip="' + proofTip('row',index) + '"] .machine-icon');
-            return {machine:machine.dataset.machine, text:row.querySelector('.amounts').textContent,
-              memory:!!row.querySelector('.seg-used, .seg-remote'), progress:!!row.querySelector('.row-progress')};
-          })`;
+          const rowCells = `(kind, index) => {
+            const selector = '[data-tip="' + proofTip(kind,index) + '"]';
+            const row = document.querySelector('.wrow' + selector);
+            const table = document.querySelector('tr' + selector);
+            const machine = table.querySelector('.machine-icon');
+            const name = row.querySelector('.name');
+            const owner = row.querySelector('.owner');
+            return {name:name.textContent, owner:owner.textContent,
+              unitColor:name.querySelector('.staff-name')?.dataset.colorText,
+              ownerColor:owner.querySelector('.staff-name')?.dataset.colorText,
+              machine:machine.dataset.machine,
+              icons:[...machine.querySelectorAll('use')].map(use => use.getAttribute('href')),
+              vcpus:table.querySelector('.vcpus').textContent,
+              text:row.querySelector('.amounts').textContent,
+              memory:row.querySelector('.seg-remote, .seg-used')?.classList[1] || null,
+              progress:!!row.querySelector('.row-progress')};
+          }`;
+          const memoryCells = `[0,1,2].map(index => (${rowCells})('row',index))`;
           const measured = await evaluate(memoryCells);
-          assert.deepEqual(measured.map(row => row.machine), ['natedev','mac-linux','mac']);
-          assert.deepEqual(measured.map(row => row.memory), [true,false,true]);
+          const waiting = await evaluate(`(${rowCells})('wait',0)`);
+          assert.deepEqual([...measured, waiting].map(({name,owner,unitColor,ownerColor}) =>
+            [name,owner,unitColor,ownerColor]), [
+            ['natest','builds','role.unit-director','role.showrunner'],
+            ['queue','builds','role.unit-director','role.showrunner'],
+            ['trunk','hana','role.unit-director','role.showrunner'],
+            ['admin-console','builds','role.unit-director','role.showrunner'],
+          ]);
+          assert.deepEqual(measured.map(({machine,icons}) => [machine,...icons]), [
+            ['natedev','#machine-linux'], ['mac-linux','#machine-linux','#machine-apple'], ['mac','#machine-apple'],
+          ]);
+          assert.deepEqual([...measured, waiting].map(row => row.vcpus), [String(local.vcpus),'8','12','']);
+          assert.deepEqual(measured.map(row => row.memory), ['seg-used','seg-remote','seg-remote']);
           assert.ok(measured[1].progress, 'The guest module counter has no progress bar.');
-          assert.equal(measured[1].text, 'Used unavailable');
+          assert.match(measured[1].text, /1\.5 GiB/);
+          assert.equal(await evaluate(`document.querySelector('#machine-linux path').getAttribute('stroke')`), '#fff');
+          const tooltipMemory = await evaluate(`[1,2].map(index => tooltipRows(proofTip('row',index), latest)
+            .filter(row => ['Uses','Reading age','In queue cap'].includes(row.label))
+            .map(({label,value}) => [label,value]))`);
+          assert.deepEqual(tooltipMemory[0].map(([label]) => label), tooltipMemory[1].map(([label]) => label));
+          assert.deepEqual(tooltipMemory[0][0], ['Uses','1.5 GiB']);
+          assert.deepEqual(tooltipMemory[0][2], ['In queue cap','no']);
           assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr.wait td.machine .machine-icon.dim')]
             .map(icon => [icon.dataset.machine, ...[...icon.querySelectorAll('use')].map(use => use.getAttribute('href'))])`),
           [['aws','#machine-cloud','#machine-linux']]);
@@ -675,16 +709,17 @@ try {
           })()`) : null;
           const shot = clip && await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
           const unavailable = await evaluate(`(() => {
+            latest.walk[1].used = {kind:'RunUseUnavailable'};
             latest.walk[2].used = {kind:'MacMemoryUnavailable'};
             fitLabels();
             return ${memoryCells};
           })()`);
           assert.deepEqual(unavailable.slice(1).map(({text,memory}) => [text,memory]),
-            [['Used unavailable',false],['Used unavailable',false]]);
+            [['Used unavailable',null],['Used unavailable',null]]);
           if (guestMemoryProof) {
             const path = join(folder, 'after-dark.png');
             await writeFile(path, Buffer.from(shot.data,'base64'));
-            console.log(JSON.stringify({pass:true,shot:path,rows:measured}));
+            console.log(JSON.stringify({pass:true,shot:path,rows:[...measured, waiting]}));
             break browserProof;
           }
         }
@@ -849,6 +884,7 @@ try {
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
           const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
+            used:{kind:'RunUseUnavailable'},
             changes:'report/keep-all-long-tooltip-values-inside-the-builds-page-at-desktop-and-narrow-widths',
             machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'82ba556d347749b08184ad3ab38ea22a'},
             targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
@@ -1156,21 +1192,36 @@ try {
               assert.ok(before.right > viewport.width && box.left < before.left,
                 'The tooltip did not move after resize with a stationary pointer.');
               assert.ok(resized.innerWidth > viewport.width, 'The proof needs a classic scrollbar.');
-              assert.ok(box.left >= 8 && box.right <= viewport.width-8, 'The tooltip exceeds the visible width.');
-              assert.ok(box.top >= 8 && box.bottom <= viewport.height-8, 'The tooltip exceeds the visible height.');
-              assert.ok(resized.overflow > 0, 'The tooltip has no content below its visible area.');
+              // The tooltip uses rounded dimensions for its position.
+              assert.ok(box.left >= 7.5 && box.right <= viewport.width-7.5, 'The tooltip exceeds the visible width.');
+              assert.ok(box.top >= 7.5 && box.bottom <= viewport.height-7.5,
+                'The tooltip exceeds the visible height. ' + JSON.stringify(resized));
+              const clipped = await evaluate(`(() => {
+                const walk = latest.walk.map(row => row.key === 'shot-guest'
+                  ? {...row, about:'This text checks the height of the tooltip. '.repeat(12), about_parts:undefined}
+                  : row);
+                tips.refresh(pageTooltipHtml('row:shot-guest', {...latest, walk}));
+                const tip = document.querySelector('#tip.on > .tip');
+                return {bottom:tip.getBoundingClientRect().bottom,overflow:tip.scrollHeight-tip.clientHeight};
+              })()`);
+              assert.ok(clipped.bottom <= viewport.height-7.5, 'The clipped tooltip exceeds the visible height.');
+              assert.ok(clipped.overflow > 0, 'The tooltip has no content below its visible area.');
 
-              const rowPoint = await evaluate(`(() => {
+              const clickTarget = await evaluate(`(() => {
                 const row = document.querySelector('tr[data-tip="row:shot-guest"]');
                 row.scrollIntoView({block:'center', inline:'nearest'});
                 const bounds = row.getBoundingClientRect();
-                const x = Math.max(bounds.left, ${box.left}) + 12;
-                const y = bounds.top + bounds.height/2;
+                const tip = document.querySelector('#tip.on > .tip').getBoundingClientRect();
+                const left = Math.max(bounds.left, tip.left);
+                const right = Math.min(bounds.right, tip.right);
+                const top = Math.max(bounds.top, tip.top);
+                const bottom = Math.min(bounds.bottom, tip.bottom);
+                const point = {x:(left+right)/2, y:(top+bottom)/2};
                 row.addEventListener('click', () => { row.dataset.proofClicked = 'yes'; }, {once:true});
-                return {x, y};
+                return {point, overlap:right>left && bottom>top};
               })()`);
-              assert.ok(rowPoint.x > box.left && rowPoint.x < box.right && rowPoint.y > box.top && rowPoint.y < box.bottom,
-                'The guest row click is outside the tooltip.');
+              assert.ok(clickTarget.overlap, 'The guest row does not overlap the current tooltip.');
+              const rowPoint = clickTarget.point;
               const click = async point => {
                 await call('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'left', clickCount:1});
                 await call('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'left', clickCount:1});

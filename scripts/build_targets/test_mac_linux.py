@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from threading import Event, Timer
+from threading import Event, Lock, Thread, Timer
 import time
 from types import CodeType
 from typing import ClassVar, cast, override
@@ -34,6 +34,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
+from scripts.build_queue.queue_fixture import write_process
 from scripts.lib import atomic_file, conf, process_group, process_start, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
@@ -552,6 +553,89 @@ class GuestCheckoutTests(unittest.TestCase):
 
 
 class GuestEntryTests(unittest.TestCase):
+    def test_guest_memory_samples_only_the_gate_tree(self) -> None:
+        proc = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for pid, parent, rss in ((10, 1, 20), (11, 10, 30), (12, 11, 40), (13, 1, 100)):
+            write_process(proc, pid, parent=parent)
+            _ = (proc / str(pid) / 'statm').write_text(f'1000 {rss} 0\n')
+        read_memory = mac_linux.guest_resident_bytes
+        def fixture_memory(_pid: int) -> int | None:
+            return read_memory(10, proc)
+
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        with (patch.object(mac_linux, 'guest_resident_bytes', fixture_memory),
+              mac_linux.report_guest_memory('fixture-attempt', write_fd, Lock())):
+            self.assertTrue(select.select([read_fd], [], [], 3)[0])
+            line = os.read(read_fd, select.PIPE_BUF).rstrip(b'\n')
+        prefix = mac_linux.GUEST_MEMORY.encode()
+        self.assertTrue(line.startswith(prefix))
+        sample = admission_records.parse_guest_memory_report(line.removeprefix(prefix))
+        self.assertEqual(sample['attempt'], 'fixture-attempt')
+        self.assertEqual(sample['resident_bytes'], 90 * os.sysconf('SC_PAGE_SIZE'))
+        record = cast(dict[str, object], json.loads(line.removeprefix(prefix)))
+        self.assertNotIn('read_at', record)
+        self.assertIsNone(read_memory(99, proc))
+
+    def test_guest_memory_drops_a_sample_when_the_reply_pipe_is_full(self) -> None:
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        pending = b'x' * fcntl.fcntl(write_fd, fcntl.F_GETPIPE_SZ)
+        self.assertEqual(os.write(write_fd, pending), len(pending))
+        dropped = Event()
+        write = os.write
+        observed: list[bool] = []
+
+        def watch_write(descriptor: int, data: bytes) -> int:
+            blocking = os.get_blocking(descriptor)
+            observed.append(blocking)
+            if blocking:
+                dropped.set()
+                raise AssertionError('The sample uses a blocking writer.')
+            try:
+                return write(descriptor, data)
+            except BlockingIOError:
+                dropped.set()
+                raise
+
+        reply_lock = Lock()
+        with (patch.object(mac_linux, 'guest_resident_bytes', return_value=1),
+              patch.object(os, 'write', side_effect=watch_write),
+              mac_linux.report_guest_memory('fixture-attempt', write_fd, reply_lock)):
+            self.assertTrue(dropped.wait(3))
+            self.assertTrue(os.get_blocking(write_fd))
+        self.assertEqual(observed, [False])
+        self.assertEqual(os.read(read_fd, len(pending)), pending)
+
+    def test_gate_continues_when_guest_memory_thread_cannot_start(self) -> None:
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        with (patch.object(Thread, 'start', side_effect=RuntimeError('fixture cannot start')) as start,
+              mac_linux.report_guest_memory('fixture-attempt', write_fd, Lock())):
+            _ = os.write(write_fd, b'verdict\n')
+        start.assert_called_once()
+        self.assertEqual(os.read(read_fd, 100), b'verdict\n')
+
+    def test_sandboxed_gate_forwards_the_reply_pipe_and_keeps_the_exit_status(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        def fixture_command(_jobs: int, _runner: Path, _request: Path, fd: int) -> list[str]:
+            code = (f'import os, stat; assert stat.S_ISFIFO(os.fstat({fd}).st_mode); '
+                    f'os.write({fd}, b"sample\\nverdict\\n"); raise SystemExit(7)')
+            return [sys.executable, '-c', code]
+
+        def no_sandbox(_tmp: Path, command: Sequence[str]) -> Sequence[str]:
+            return command
+
+        with (patch.object(mac_linux, 'gate_entry_command', fixture_command),
+              patch.object(mac_linux, 'session_command', no_sandbox),
+              patch.object(sys, 'stdout', io.TextIOWrapper(io.BytesIO(), encoding='utf-8')) as forwarded):
+            self.assertEqual(mac_linux.run_sandboxed_gate(root, 1, root / 'request.json', root, dict(os.environ)), 7)
+            self.assertEqual(forwarded.buffer.getvalue(), b'sample\nverdict\n')
+
     def test_gate_entry_gives_the_runner_the_request_and_the_run_copy_word(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         runner = root / mac_linux.RUNNER_PATH
@@ -1895,6 +1979,23 @@ fi
         self.assertEqual((result.returncode, result.stdout), (0, b'reply\n'))
         self.assertEqual(len(reports), 1)
         self.assertEqual(progress_profile.read_counter(sidecar), progress_profile.ProgressCounter('modules', 2, 3))
+
+    def test_guest_memory_stream_stamps_only_the_armed_attempt_with_natedev_time(self) -> None:
+        sidecar = self.root / 'placement.cgroup'
+        now = 200_000.0
+        sample = {'attempt': 'stream-attempt', 'resident_bytes': 2 << 30, 'read_at': now + 120}
+        records = (sample, {**sample, 'attempt': 'old'}, {**sample, 'resident_bytes': -1})
+        reply = '\n'.join(mac_linux.GUEST_MEMORY + json.dumps(record) for record in records)
+        start = mac_linux.run_start_line('stream-attempt')
+        program = (f'import sys; print({start!r}, file=sys.stderr); print({reply!r}); '
+                   'print("reply")')
+        response = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+        with (patch.object(mac_linux, 'send_guest_execution', return_value=response),
+              patch.object(mac_linux, 'time', return_value=now)):
+            result = self.run_guest_stream(program, sidecar)
+        self.assertEqual((result.returncode, result.stdout), (0, b'reply\n'))
+        saved = cast(object, json.loads(admission_records.guest_memory_path(sidecar).read_bytes()))
+        self.assertEqual(saved, {**sample, 'attempt': self.placed.attempt, 'read_at': now})
 
     def test_guest_ignores_progress_lines_in_module_stderr(self) -> None:
         sidecar = self.root / 'placement.cgroup'

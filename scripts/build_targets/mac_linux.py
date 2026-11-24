@@ -32,16 +32,18 @@ import stat
 import subprocess
 import sys
 import tarfile
-from threading import Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from scripts.aws_target import gate_box, ledger
+from scripts.build_queue import admission_records
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
+from scripts.lib.process_stat import PROC_ROOT
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import (
@@ -91,6 +93,7 @@ FULL_BUNDLE_RETRY_SUFFIX = '-full'
 # The guest prints this line, with the attempt, before it starts the argv of a command request.
 RUN_START = 'mac-linux run start'
 GUEST_PROGRESS = 'mac-linux progress '
+GUEST_MEMORY = 'mac-linux memory '
 # The guest prints this line, with the attempt, to stderr when it has taken the run lock.
 RUN_LOCKED = 'mac-linux run locked'
 # The guest prints this line, with the attempt, when it refuses a command word; it starts nothing after it.
@@ -1844,6 +1847,7 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
     accepted_line = f'{GUEST_ACCEPTED} {armed.attempt}'.encode()
     start_line = run_start_line(armed.attempt).encode()
     progress_prefix = GUEST_PROGRESS.encode()
+    memory_prefix = GUEST_MEMORY.encode()
     sidecar = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR', '')
     stdout, stderr = bytearray(), bytearray()
     reply_line = bytearray()
@@ -1876,6 +1880,15 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
             if not budget_sent and reply_line == mac_ready_line:
                 if input_fd not in ready.get_map():
                     _ = ready.register(input_fd, EVENT_WRITE)
+            elif reply_line.startswith(memory_prefix):
+                if connected and sidecar:
+                    with suppress(OSError, ValueError, TypeError, RecursionError, OverflowError):
+                        received_at = time()
+                        report = admission_records.parse_guest_memory_report(reply_line[len(memory_prefix):])
+                        if report['attempt'] == armed.attempt and report['resident_bytes'] >= 0:
+                            sample = admission_records.GuestMemorySample(attempt=dispatch.assignment.attempt,
+                                resident_bytes=report['resident_bytes'], read_at=received_at)
+                            atomic_file.atomic_sample(admission_records.guest_memory_path(Path(sidecar)), json.dumps(sample))
             elif not reply_line.startswith(progress_prefix):
                 stdout.extend(reply_line)
                 stdout.append(10)
@@ -2414,6 +2427,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 settings = replace(settings, checkout_identity=identity)
                 launch = _record_guest_launch(assignment, claim, settings)
                 dispatch = GuestGateDispatch(assignment, consume_launch_permission(launch, assignment))
+                if sidecar := os.environ.get('BUILDLOG_PLACEMENT_SIDECAR'):
+                    with suppress(OSError):
+                        admission_records.publish_guest_cpu_count(Path(sidecar), assignment.attempt, request['jobs'])
                 reply = transfer_source(repo, settings, source, request, dispatch)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
@@ -2801,24 +2817,25 @@ def run_guest(request_path: Path) -> int:
                 return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
-            reply = os.dup(1)
+            return run_sandboxed_gate(tmp, request['jobs'], request_path, copy.path, environment)
+
+
+def run_sandboxed_gate(tmp: Path, jobs: int, request_path: Path, copy: Path, environment: dict[str, str]) -> int:
+    """Forward the gate's reply pipe to SSH. Send the gate's standard output to standard error."""
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, 'rb') as incoming, os.fdopen(write_fd, 'wb') as outgoing:
+        command = gate_entry_command(jobs, Path(__file__).resolve(), request_path, write_fd)
+        with subprocess.Popen(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
+                              stdout=sys.stderr.fileno(),
+                              pass_fds=(*build_folders.held_build_folder_descriptors(), write_fd)) as child:
+            outgoing.close()
             try:
-                return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
-                                                                  request_path, reply),
-                                          copy.path, environment, reply)
+                while chunk := incoming.read1():
+                    _ = sys.stdout.buffer.write(chunk)
+                    _ = sys.stdout.buffer.flush()
             finally:
-                os.close(reply)
-
-
-def run_sandboxed_gate(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str],
-                       reply: int) -> int:
-    """Run the gate in the sandbox with its standard output on standard error.
-
-    The gate sends progress and the result through the reply descriptor.
-    """
-    return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
-                          stdout=sys.stderr.fileno(), check=False,
-                          pass_fds=(*build_folders.held_build_folder_descriptors(), reply)).returncode
+                incoming.close()
+            return child.wait()
 
 
 def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
@@ -2836,6 +2853,69 @@ def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) 
 
 def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
     return cast(GuestRequest | GuestCommandRequest, json.loads(path.read_text(encoding='utf-8')))
+
+
+def guest_resident_bytes(pid: int, proc: Path = PROC_ROOT) -> int | None:
+    """Read the RSS of the gate and its descendants in the guest PID namespace."""
+    from scripts.lint.memory_admit import process_table, process_tree
+
+    try:
+        processes = process_table(proc)
+    except OSError:
+        return None
+    if pid not in processes:
+        return None
+    pages = 0
+    for member in process_tree({pid: processes[pid].start}, processes):
+        try:
+            resident = int((proc / str(member) / 'statm').read_bytes().split()[1])
+        except (OSError, ValueError, IndexError):
+            if member == pid:
+                return None
+        else:
+            pages += resident
+    return pages * os.sysconf('SC_PAGE_SIZE')
+
+
+@contextmanager
+def report_guest_memory(attempt: str, reply: int, reply_lock: Lock) -> Generator[None]:
+    """Send samples only when the reply pipe can accept them at once."""
+    try:
+        # Reopen the pipe so the regular reply writer keeps its blocking mode.
+        descriptor = os.open(f'/proc/self/fd/{reply}', os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        yield
+        return
+    stopped = Event()
+
+    def sample() -> None:
+        try:
+            while not stopped.is_set():
+                used = guest_resident_bytes(os.getpid())
+                if used is not None:
+                    record = admission_records.GuestMemoryReport(attempt=attempt, resident_bytes=used)
+                    line = (GUEST_MEMORY + json.dumps(record) + '\n').encode()
+                    if len(line) <= PIPE_BUF and reply_lock.acquire(blocking=False):
+                        try:
+                            if not stopped.is_set():
+                                with suppress(BlockingIOError):
+                                    _ = os.write(descriptor, line)
+                        finally:
+                            reply_lock.release()
+                _ = stopped.wait(admission_records.GUEST_MEMORY_INTERVAL_SECONDS)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    try:
+        Thread(target=sample, name='guest memory', daemon=True).start()
+    except (OSError, RuntimeError):
+        os.close(descriptor)
+    try:
+        yield
+    finally:
+        stopped.set()
 
 
 def run_copy(request_path: Path, reply: int) -> None:
@@ -2877,20 +2957,25 @@ def run_copy(request_path: Path, reply: int) -> None:
     try:
         with (build_folders.inherit_build_lock(RUN_LOCK_FD),
               os.fdopen(reply, 'w', encoding='utf-8') as output):
+            reply_lock = Lock()
+
             def send_progress(line: str) -> None:
-                print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
+                with reply_lock:
+                    print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
 
             # Older gate code can omit the progress callback.
             machine = (gate.WholeMachine(module_progress=send_progress)
                        if hasattr(gate.WholeMachine, 'module_progress') else gate.WholeMachine())
-            run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
-                                  mode=SuiteMode(request['mode']), machine=machine,
-                                  selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
-                                  module_time_limit_s=request['module_time_limit_s'],
-                                  time_limit=GateTimeLimit(request['run_time_limit_seconds']))
-            print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
-                              'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
-                  file=output)
+            with report_guest_memory(request['attempt'], reply, reply_lock):
+                run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
+                                      mode=SuiteMode(request['mode']), machine=machine,
+                                      selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
+                                      module_time_limit_s=request['module_time_limit_s'],
+                                      time_limit=GateTimeLimit(request['run_time_limit_seconds']))
+            with reply_lock:
+                print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
+                                  'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
+                      file=output, flush=True)
     finally:
         copies.COMMAND_LOCKS.reset(token)
 

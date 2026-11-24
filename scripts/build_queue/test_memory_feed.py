@@ -787,18 +787,24 @@ class MemoryFeedTests(unittest.TestCase):
         _tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row["key"]}" tabindex="0"'), 1)
 
-    def guest_gate_page(self, *, unconfirmed_age: float = FIXTURE_GUEST_START_LIMIT) -> memory_feed.MemoryPage:
+    def guest_gate_page(self, *, unconfirmed_age: float = FIXTURE_GUEST_START_LIMIT,
+                        memory_age: float | None = None, memory_attempt: str = "guest-attempt",
+                        vcpus: int | None = None) -> memory_feed.MemoryPage:
         base = captured_reading()
         now = base.explanation.now
+        memory = admission_records.GuestMemoryUnavailable() if memory_age is None else admission_records.ConfirmedGuestMemory(
+            attempt=memory_attempt, resident_bytes=admission_records.GIB * 3 // 2, read_at=now - memory_age)
+        confirmed = admission_records.ConfirmedGuest("guest-attempt", memory)
         guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
             pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
             mac_placement="episode/placement-attempt",
-            job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
-            counter=progress_profile.ProgressCounter("modules", 7, 12),
+            job=StepJob("gate"), confirmed_guest=confirmed,
+            guest_vcpus=vcpus, counter=progress_profile.ProgressCounter("modules", 7, 12),
             placement_candidates=gate_candidates(placement.AllowedHost()))
         # The queue names no Mac placement for an unconfirmed guest attempt.
-        pending = replace(guest, pid=8201, started_at=now - unconfirmed_age, mac_placement="", confirmed_guest_run=None,
+        pending = replace(guest, pid=8201, started_at=now - unconfirmed_age, mac_placement="",
+                          confirmed_guest=None, guest_vcpus=None,
                           execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
         running = (guest, pending)
         explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
@@ -810,8 +816,77 @@ class MemoryFeedTests(unittest.TestCase):
         mac = queue_view.MacBuildReading(now, (native,))
         with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
-              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+              mock.patch.object(memory_feed, "mac_build_units", return_value={}),
+              mock.patch.object(time, "time", return_value=now)):
             return memory_feed.reading()
+
+    def test_guest_memory_uses_the_mac_fields_outside_the_queue_cap(self) -> None:
+        baseline = self.guest_gate_page()
+        for age in (2, admission_records.GUEST_MEMORY_MAX_AGE_SECONDS):
+            with self.subTest(age=age):
+                page = self.guest_gate_page(memory_age=age)
+                self.assertEqual(page["ram"], baseline["ram"])
+                self.assertEqual(page["taken"], baseline["taken"])
+                row, = (row for row in page["walk"] if row.get("guest_run"))
+                pending, = (row for row in page["walk"] if row.get("guest_unconfirmed"))
+                self.assertIsInstance(pending.get("used"), admission_records.RunUseUnavailable)
+                self.assertNotIn("read_at", pending)
+                if age < admission_records.GUEST_MEMORY_MAX_AGE_SECONDS:
+                    self.assertEqual((row.get("used"), row.get("read_at")), (1.5, page["read_at"] - age))
+                else:
+                    self.assertIsInstance(row.get("used"), admission_records.RunUseUnavailable)
+                    self.assertNotIn("read_at", row)
+
+    def test_guest_memory_cannot_attach_to_a_different_attempt(self) -> None:
+        with self.assertRaisesRegex(ValueError, "guest memory does not match the confirmed attempt"):
+            _ = self.guest_gate_page(memory_age=2, memory_attempt="old-attempt")
+
+    def test_replacing_a_running_step_can_clear_guest_confirmation(self) -> None:
+        legacy = cast(dict[str, object], codec.snapshot_value(leftover_step(1)))
+        _ = legacy.pop("confirmed_guest", None)
+        legacy["confirmed_guest_run"] = {"target": "mac-linux", "attempt": "guest-attempt"}
+        step = cast(admission_records.RunningStep, codec.parse_snapshot_value(legacy, admission_records.RunningStep))
+        self.assertEqual(step.confirmed_guest, admission_records.ConfirmedGuest("guest-attempt"))
+        encoded = cast(dict[str, object], codec.snapshot_value(step))
+        self.assertEqual(encoded["confirmed_guest_run"], legacy["confirmed_guest_run"])
+        self.assertIsNone(replace(step, confirmed_guest=None).confirmed_guest)
+
+    def test_guest_vcpu_uses_the_count_recorded_for_its_attempt(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, consume_guest_permission, guest_gate, mac_linux_and_natedev_request,
+            publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            sidecar = fixture.root / "guest.cgroup"
+            request = replace(request, local=replace(request.local, sidecar=str(sidecar)))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+            assert isinstance(granted, wire.FirstAuthorization)
+            for confirmed, attempt, jobs, shown in ((False, assignment.attempt, 9, "—"), (True, None, 0, "9"),
+                                                    (True, "old-attempt", 9, "—"), (True, assignment.attempt, 0, "—"),
+                                                    (True, assignment.attempt, 9, "9")):
+                with self.subTest(confirmed=confirmed, attempt=attempt, jobs=jobs):
+                    if confirmed and attempt is None:
+                        execution = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                            "mac-linux", "fixture-boot", "fixture-machine", assignment.attempt))
+                        _ = fixture.server.handle_request(wire.ExecutionReport(
+                            "guest-started", assignment, granted.claim, execution))
+                    if attempt is not None:
+                        admission_records.publish_guest_cpu_count(sidecar, attempt, jobs)
+                    _ = fixture.run_pass()
+                    reading = queue_snapshot.read_view_snapshot(fixture.state_dir)
+                    with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=reading):
+                        page = memory_feed.reading()
+                    guest, = (row for row in page["walk"] if row.get("machine") == "mac-linux")
+                    self.assertEqual(bool(guest.get("guest_run")), confirmed)
+                    self.assertEqual(guest.get("vcpus"), 9 if shown == "9" else queue_view.UnknownCpuCount())
+                    payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                    _tips, table = self.render_assignment_table(payload)
+                    self.assertIn(f'<td class="vcpus">{shown}</td>', table)
 
     def test_guest_gate_is_starting_just_before_the_start_report_limit(self) -> None:
         page = self.guest_gate_page(unconfirmed_age=FIXTURE_GUEST_START_LIMIT - 0.001)
@@ -5397,10 +5472,12 @@ def write_browser_fixture(folder: Path) -> None:
                                  current_session=staff.StaffId("builder"))
         builds = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
+        hana = staff.StaffRow(staff.StaffId("hana"), "showrunner", "hana", staff.StaffRoot(),
+                              current_session=staff.StaffId("hana"))
         units = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.ReportsTo(builds.id),
                                      current_session=staff.StaffId(name))
                       for name in ("queue", "natest", "admin-console"))
-        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, *units))).registry()
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, hana, *units))).registry()
         verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
         builder_unit = memory_feed.StaffUnitName(builder.name)
         verified_waiter["unit"] = builder_unit
@@ -5409,7 +5486,7 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page["walk"].extend(row for row in fixture.mac_verify_call_page()["walk"]
                                    if row.get("kind") == "mac-build" and "verify" in row)
         pages["verify_calls"] = json.loads(memory_feed.page_json(verify_page))
-        pages["guest_gate"] = json.loads(memory_feed.page_json(fixture.guest_gate_page()))
+        pages["guest_gate"] = json.loads(memory_feed.page_json(fixture.guest_gate_page(memory_age=2.25, vcpus=8)))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))

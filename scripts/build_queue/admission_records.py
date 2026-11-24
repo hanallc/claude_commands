@@ -6,6 +6,7 @@ from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import json
 import math
 import os
 import re
@@ -23,7 +24,7 @@ from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE, VERIFY_VERBS as VERIFY_VERBS,
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
-from scripts.build_queue.snapshot_codec import select_queue_name
+from scripts.build_queue.snapshot_codec import parse_snapshot_value, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -31,6 +32,7 @@ from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.lib.atomic_file import atomic_sample
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.process_stat import PROC_ROOT, process_fields
 from scripts.lib.showrunner_state import state_root
@@ -1221,11 +1223,87 @@ class WaitingStep:
     what: str = field(default="", kw_only=True)
 
 
-class ConfirmedGuestRun(TypedDict):
-    """Identify a confirmed Mac Linux attempt in a queue reading."""
+GUEST_MEMORY_INTERVAL_SECONDS = 5
+GUEST_MEMORY_MAX_AGE_SECONDS = 3 * GUEST_MEMORY_INTERVAL_SECONDS
 
-    target: Literal["mac-linux"]
+
+class GuestMemoryReport(TypedDict):
     attempt: str
+    resident_bytes: int
+
+
+class GuestMemorySample(GuestMemoryReport):
+    read_at: float
+
+
+@dataclass(frozen=True)
+class ConfirmedGuestMemory:
+    """Bind the reading to its confirmed guest attempt."""
+
+    attempt: str
+    resident_bytes: int
+    read_at: float
+
+
+@dataclass(frozen=True)
+class GuestMemoryUnavailable:
+    """There is no fresh memory reading for the confirmed guest attempt."""
+
+
+@dataclass(frozen=True)
+class ConfirmedGuest:
+    """Keep the confirmed attempt with its memory reading."""
+
+    attempt: str
+    memory: ConfirmedGuestMemory | GuestMemoryUnavailable = GuestMemoryUnavailable()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.memory, ConfirmedGuestMemory) and self.memory.attempt != self.attempt:
+            raise ValueError("guest memory does not match the confirmed attempt")
+
+
+def parse_guest_memory_report(data: bytes | bytearray) -> GuestMemoryReport:
+    return cast(GuestMemoryReport, parse_snapshot_value(cast(object, json.loads(data)), GuestMemoryReport))
+
+
+def guest_memory_path(sidecar: Path) -> Path:
+    return progress.progress_path(sidecar, "guest-memory.json")
+
+
+def guest_memory_fresh(read_at: float, now: float) -> bool:
+    return 0 <= now - read_at < GUEST_MEMORY_MAX_AGE_SECONDS
+
+
+def read_guest_memory(sidecar: Path, attempt: str, now: float
+                      ) -> ConfirmedGuestMemory | GuestMemoryUnavailable:
+    try:
+        raw = cast(object, json.loads(guest_memory_path(sidecar).read_bytes()))
+        sample = cast(GuestMemorySample, parse_snapshot_value(raw, GuestMemorySample))
+    except (OSError, ValueError, TypeError, RecursionError, OverflowError):
+        return GuestMemoryUnavailable()
+    if (sample["attempt"] == attempt and sample["resident_bytes"] >= 0
+            and guest_memory_fresh(sample["read_at"], now)):
+        return ConfirmedGuestMemory(**sample)
+    return GuestMemoryUnavailable()
+
+
+class GuestCpuCount(TypedDict):
+    attempt: str
+    jobs: int
+
+
+def publish_guest_cpu_count(sidecar: Path, attempt: str, jobs: int) -> None:
+    record = GuestCpuCount(attempt=attempt, jobs=jobs)
+    atomic_sample(progress.progress_path(sidecar, "guest-cpus.json"), json.dumps(record))
+
+
+def read_guest_cpu_count(sidecar: Path, attempt: str) -> int | None:
+    try:
+        raw = cast(object, json.loads(progress.progress_path(sidecar, "guest-cpus.json").read_bytes()))
+        record = cast(GuestCpuCount, parse_snapshot_value(raw, GuestCpuCount))
+    except (OSError, ValueError, TypeError, RecursionError, OverflowError):
+        return None
+    return record["jobs"] if record["attempt"] == attempt and record["jobs"] > 0 else None
 
 
 @dataclass(frozen=True)
@@ -1246,7 +1324,8 @@ class RunningStep:
     assignment_host: str = ""
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
-    confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
+    confirmed_guest: ConfirmedGuest | None = field(default=None, kw_only=True)
+    guest_vcpus: int | None = field(default=None, kw_only=True)
     counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)

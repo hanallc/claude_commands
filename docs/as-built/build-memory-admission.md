@@ -297,7 +297,7 @@ An older caller sends `--token required` (`TokenUnavailable`) and gets no local 
 Remote rows carry execution evidence and the assigned host.
 Physical grouping includes the host, generation, PID, and start time.
 Unavailable remote identity remains uncertain.
-Remote memory remains unavailable and contributes zero to local admission accounting.
+Remote memory contributes zero to local admission accounting.
 A Mac host run shows on the Builds page as its Mac build row; the page hides its queue row, so the run shows once.
 A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launch permission.
 The service sets the remote `started_at` when the gate consumes its launch permission.
@@ -312,9 +312,20 @@ The cell shows the unconfirmed state next to the icon. A confirmed row shows the
 The tooltip shows `Runs on` and `Named targets`.
 The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
 The tooltip clips content that exceeds the available height and lets clicks reach the rows beneath it.
-The memory column shows `Used unavailable` for a guest with no memory reading.
+The guest reads the gate process tree's RSS every five seconds.
+The guest sends a sample on the reply pipe when the pipe can accept it immediately.
+The gate continues if the sampler cannot start.
+The caller stamps the sample with the natedev time and saves it with the placement progress files.
+The service publishes confirmed guest memory only for the current attempt and only while the sample is less than 15 seconds old.
+The feed also checks the sample age on natedev before it writes a new or retained reading.
+The page displays the memory reading from the feed.
+The Builds page shows the guest's measured memory in the same bar as a Mac run.
+The guest tooltip shows Uses, Reading age, and In queue cap.
+The memory column shows `Used unavailable` when the guest has no fresh sample.
 The guest uses the same progress bar as other runs when it has a counter.
-The vCPU column shows `—`.
+The gate caller saves the CPU count from the guest request with the placement attempt.
+The vCPU column shows the count after the service confirms the attempt.
+The column shows `—` before confirmation or when the count is unavailable.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
 The Builds page uses the AWS counter format for Stage, Done, and the module count in the tooltip.
@@ -2423,6 +2434,8 @@ On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): 
 - `hana-gpu` uses the cloud with a ⚡ badge.
 
 A hidden `<svg>` defines the Tux, Apple, and cloud symbols.
+The Tux and the Apple show in their own colors, not the machine color. The Tux has a white outline on every machine. The cloud uses the machine color.
+On 2026-11-24, bob ruled one Tux form for natedev, mac-linux and the AWS badge, because two Tux colors read as two things.
 Each SVG icon and SVG badge references its symbol with `<use href>`.
 CSS uses the icon's `data-badge` value for emoji badges.
 Each icon records its machine in `data-machine` and uses that name in `aria-label`.

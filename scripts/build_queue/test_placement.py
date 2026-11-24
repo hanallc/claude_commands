@@ -1505,7 +1505,7 @@ class PlacementTests(unittest.TestCase):
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
                 pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
-                self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
+                self.assertEqual((pending.confirmed_guest, pending.mac_placement), (None, ""))
 
                 accepted_at = fixture.clock.now()
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
@@ -1517,7 +1517,7 @@ class PlacementTests(unittest.TestCase):
                 running, = (row for row in decoded.reading.view.running if row.assignment_target == "mac-linux")
                 self.assertEqual((running.pid, running.execution, running.placement_candidates),
                                  (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
-                self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+                self.assertEqual(running.confirmed_guest, records.ConfirmedGuest(assignment.attempt))
                 self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
 
                 fixture.restart()
@@ -1577,7 +1577,7 @@ class PlacementTests(unittest.TestCase):
             view, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(view, wire.ViewReply)
             running, = (step for step in view.reading.view.running if step.assignment_target == "mac-linux")
-            self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+            self.assertEqual(running.confirmed_guest, records.ConfirmedGuest(assignment.attempt))
 
             fixture.clock.advance(1)
             _ = fixture.server.handle_request(replace(report, request_id="guest-start-repeated"))
@@ -1703,7 +1703,7 @@ class PlacementTests(unittest.TestCase):
                 placement.CandidateEligibility(native.destination, ALLOWED_HOST),
                 placement.CandidateEligibility(local.destination,
                     placement.FixedExclusion("the target does not support this command"))))
-            self.assertIsNone(running.confirmed_guest_run)
+            self.assertIsNone(running.confirmed_guest)
             self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
 
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:

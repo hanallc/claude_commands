@@ -656,18 +656,6 @@ def step_target_notes(step: admission_records.WaitingStep | admission_records.Ru
     return gate_placement_notes(step) or target_notes(step.route, routes, step.step, step.folder, step.package)
 
 
-def confirmed_guest_run(step: admission_records.RunningStep) -> ConfirmedGuestRun | None:
-    """Read the guest's confirmed attempt from the queue record."""
-    recorded: object = getattr(step, "confirmed_guest_run", None)
-    if not isinstance(recorded, dict):
-        return None
-    fields = cast(dict[str, object], recorded)
-    attempt = fields.get("attempt")
-    if fields.get("target") == MAC_LINUX_TARGET and isinstance(attempt, str) and attempt:
-        return {"target": MAC_LINUX_TARGET, "attempt": attempt}
-    return None
-
-
 def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
     """A Mac-only step, or a step pinned to the Mac target."""
     return isinstance(route, target_config.MacOnly) or (isinstance(route, target_config.PinnedTarget)
@@ -814,6 +802,7 @@ def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames) -
 
 
 class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+    read_at: NotRequired[float]
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
@@ -3077,6 +3066,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     remote_groups: set[str] = set()
     guest_placements: set[str] = set()
     guest_start_limit_seconds: float | None = None
+    memory_now = time.time()
     for entry in explanation.running:
         step = entry.step
         memory = step.measured
@@ -3090,10 +3080,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         name, detail = "", identity.unit
         state = ""
         if isinstance(memory, admission_records.RemoteMemoryUnavailable):
-            guest = confirmed_guest_run(step)
+            guest = step.confirmed_guest
             unconfirmed = guest is None and step.assignment_target == MAC_LINUX_TARGET and step.started_at > 0
             guest_gate = guest is not None or unconfirmed
-            key = f"{MAC_LINUX_TARGET}:{guest['attempt']}" if guest else admission_records.execution_group(step, entry.owner)
+            key = f"{MAC_LINUX_TARGET}:{guest.attempt}" if guest else admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
             job = NotGateStep() if guest_gate and not isinstance(step.job, StepJob) else local_job(step)
@@ -3115,7 +3105,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                              else row_progress((step,), progress.TOKEN_WAIT_REASON)),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": MAC_LINUX_TARGET if guest_gate else admission_records.execution_host(step, machine),
-                "vcpus": queue_view.UnknownCpuCount(),
+                "vcpus": step.guest_vcpus if guest and step.guest_vcpus is not None else queue_view.UnknownCpuCount(),
                 **call_notes(step.verify, step.step),
                 **job_notes(job, names, step=step.step, verify=step.verify,
                             ci=step.unit in ci_runners),
@@ -3128,7 +3118,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if step.mac_placement:
                 remote_row = {**remote_row, **move_fields(moves.get(step.mac_placement.partition("/")[0]), members, zone)}
             if guest:
-                remote_row["guest_run"] = guest
+                remote_row["guest_run"] = {"target": MAC_LINUX_TARGET, "attempt": guest.attempt}
+                sample = guest.memory
+                if (isinstance(sample, admission_records.ConfirmedGuestMemory)
+                        and admission_records.guest_memory_fresh(sample.read_at, memory_now)):
+                    remote_row["used"] = gib(sample.resident_bytes)
+                    remote_row["read_at"] = sample.read_at
                 if step.mac_placement:
                     guest_placements.add(step.mac_placement)
             elif unconfirmed:
@@ -3581,6 +3576,13 @@ def main(argv: Sequence[str]) -> int:
             else:
                 payload = {**last_good, "read_error": str(error), "error_at": time.time()}
                 _ = payload.pop("build_limits", None)
+                payload["walk"] = last_good["walk"].copy()
+                for index, row in enumerate(payload["walk"]):
+                    if ("counted" in row and row.get("guest_run") and "read_at" in row
+                            and not admission_records.guest_memory_fresh(row["read_at"], payload["error_at"])):
+                        expired: RunRow = {**row, "used": admission_records.RunUseUnavailable("remote memory is unavailable")}
+                        _ = expired.pop("read_at")
+                        payload["walk"][index] = expired
         write_text_atomic(target, page_json(payload), new_file_mode=0o644)
         if args.once:
             return 0

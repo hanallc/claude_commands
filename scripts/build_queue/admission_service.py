@@ -237,18 +237,17 @@ PLACEMENT_REASON_TEXT = {
 }
 
 
-def confirmed_guest_run(assignment: placement.PlacementAssignment,
-                        evidence: execution_identity.ExecutionEvidence) -> records.ConfirmedGuestRun | None:
+def confirms_guest_run(assignment: placement.PlacementAssignment,
+                       evidence: execution_identity.ExecutionEvidence) -> bool:
     """Use execution evidence that matches the assigned guest and attempt."""
     destination = assignment.destination
     if (destination.target != "mac-linux" or destination.provider != "ssh"
             or not assignment.attempt or not isinstance(evidence, execution_identity.ObservedExecution)):
-        return None
+        return False
     identity = evidence.identity
-    matches = (identity.host == destination.host and identity.pid > 0 and bool(identity.start_time)
-               if isinstance(identity, execution_identity.ProcessExecution)
-               else (identity.target, identity.attempt) == (destination.target, assignment.attempt))
-    return {"target": destination.target, "attempt": assignment.attempt} if matches else None
+    return (identity.host == destination.host and identity.pid > 0 and bool(identity.start_time)
+            if isinstance(identity, execution_identity.ProcessExecution)
+            else (identity.target, identity.attempt) == (destination.target, assignment.attempt))
 
 
 @dataclass(frozen=True)
@@ -3718,6 +3717,7 @@ class AdmissionServer:
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         reading = self._local_placement_reading(self._placement_wait_reading(reading))
         remote: list[records.RunningStep] = []
+        now = self.clock.now()
         for key, saved in self.assignments.items():
             assignment = saved.assignment
             if assignment.destination.provider == "local":
@@ -3743,14 +3743,19 @@ class AdmissionServer:
             guest = assignment.destination.target == "mac-linux"
             consumed = (current and self.current_assignments.get(assignment.episode) == key
                         and isinstance(saved.permission, placement.PermissionConsumed))
-            confirmed = confirmed_guest_run(assignment, evidence) if consumed else None
-            if (consumed and assignment.destination.target == "mac-linux"
-                    and isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)):
-                confirmed = records.ConfirmedGuestRun(target=assignment.destination.target, attempt=assignment.attempt)
             local = request.local
-            counter = (progress.read_counter(Path(local.sidecar))
-                       if guest and consumed and isinstance(local, wire.LocalAdmissionContext) and local.sidecar
-                       else progress.NoCounter())
+            sidecar = Path(local.sidecar) if isinstance(local, wire.LocalAdmissionContext) and local.sidecar else None
+            counter = progress.read_counter(sidecar) if guest and consumed and sidecar is not None else progress.NoCounter()
+            confirmed = None
+            vcpus = None
+            if consumed and guest and (isinstance(saved.confirmed_guest_start, records.ConfirmedGuestStart)
+                                       or confirms_guest_run(assignment, evidence)):
+                attempt = assignment.attempt
+                memory = (records.read_guest_memory(sidecar, attempt, now) if sidecar is not None
+                          else records.GuestMemoryUnavailable())
+                confirmed = records.ConfirmedGuest(attempt, memory)
+                if sidecar is not None:
+                    vcpus = records.read_guest_cpu_count(sidecar, attempt)
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
             if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
@@ -3761,7 +3766,7 @@ class AdmissionServer:
                 assignment_host=assignment.destination.host, verify=identity.verify,
                 assignment_target=assignment.destination.target if guest else "",
                 placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
-                confirmed_guest_run=confirmed, counter=counter,
+                confirmed_guest=confirmed, guest_vcpus=vcpus, counter=counter,
                 route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
                     if (assignment.destination.provider == "mac" or confirmed is not None
@@ -6199,7 +6204,7 @@ done
                     and current
                     and isinstance(saved.state, placement.CurrentAssignment)
                     and isinstance(saved.permission, placement.PermissionConsumed)
-                    and confirmed_guest_run(assignment, request.evidence) is not None):
+                    and confirms_guest_run(assignment, request.evidence)):
                 saved = replace(saved, confirmed_guest_start=records.ConfirmedGuestStart(self.clock.now()))
                 self.assignments[key] = saved
             outcome = request.outcome

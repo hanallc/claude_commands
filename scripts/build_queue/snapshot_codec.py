@@ -111,6 +111,18 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             record = recover_slot_callers(record)
         elif not writing and schema.__name__ == "BetweenStepsSlot":
             record = {**record, "identity": ended_step_facts(record.get("identity", {"kind": "HoldPredatesStepFacts"}))}
+        elif schema.__name__ == "RunningStep":
+            if writing and isinstance(guest := record.get("confirmed_guest"), dict):
+                # Keep the confirmation field for older snapshot readers.
+                record["confirmed_guest_run"] = {"target": "mac-linux", "attempt": cast(dict[str, object], guest)["attempt"]}
+            elif not writing and "confirmed_guest" not in record and (legacy := record.get("confirmed_guest_run")) is not None:
+                if not isinstance(legacy, dict):
+                    raise ValueError("invalid confirmed guest attempt")
+                fields = cast(dict[str, object], legacy)
+                attempt = fields.get("attempt")
+                if fields.get("target") != "mac-linux" or not isinstance(attempt, str) or not attempt:
+                    raise ValueError("invalid confirmed guest attempt")
+                record = {**record, "confirmed_guest": {"kind": "ConfirmedGuest", "attempt": attempt}}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
         if writing:
             running = record["running"]

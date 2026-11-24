@@ -2574,7 +2574,47 @@ class ReplyPublicationTests(unittest.TestCase):
             after = queue_snapshot.read_view_snapshot(fixture.state_dir)
             guest, = (row for row in after.reading.view.running if row.assignment_target == "mac-linux")
             self.assertEqual(guest.started_at, consumed_at)
-            self.assertIsNone(guest.confirmed_guest_run)
+            self.assertIsNone(guest.confirmed_guest)
+
+    def test_guest_memory_requires_a_confirmed_attempt_and_a_fresh_sample(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, consume_guest_permission, guest_gate,
+            mac_linux_and_natedev_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            request = mac_linux_and_natedev_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            sidecar = fixture.root / "placement.cgroup"
+            request = replace(request, local=replace(request.local, sidecar=str(sidecar)))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            holder = guest_gate(fixture, assignment)
+            granted, = consume_guest_permission(fixture, assignment, holder)
+            assert isinstance(granted, wire.FirstAuthorization)
+            path = records.guest_memory_path(sidecar)
+            now = fixture.clock.now()
+            sample = records.GuestMemorySample(attempt=assignment.attempt, resident_bytes=2 * GIB, read_at=now)
+
+            def published_memory(raw: object) -> records.ConfirmedGuestMemory | records.GuestMemoryUnavailable:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(json.dumps(raw))
+                _ = fixture.run_pass()
+                snapshot = queue_snapshot.read_view_snapshot(fixture.state_dir)
+                guest, = (row for row in snapshot.reading.view.running if row.assignment_target == "mac-linux")
+                self.assertIsInstance(guest.measured, records.RemoteMemoryUnavailable)
+                return guest.confirmed_guest.memory if guest.confirmed_guest else records.GuestMemoryUnavailable()
+
+            self.assertEqual(published_memory(sample), records.GuestMemoryUnavailable())
+            execution = execution_identity.ObservedExecution(execution_identity.CloudExecution(
+                "mac-linux", "fixture-boot", "fixture-machine", assignment.attempt))
+            _ = fixture.server.handle_request(wire.ExecutionReport("guest-started", assignment, granted.claim, execution))
+            self.assertEqual(published_memory(sample), records.ConfirmedGuestMemory(**sample))
+            for invalid in ({**sample, "attempt": "old"}, {**sample, "resident_bytes": True},
+                            {**sample, "read_at": now + 60},
+                            {**sample, "read_at": now - records.GUEST_MEMORY_MAX_AGE_SECONDS}):
+                with self.subTest(sample=invalid):
+                    self.assertEqual(published_memory(invalid), records.GuestMemoryUnavailable())
 
     def test_view_request_does_not_run_a_pending_or_stale_pass(self) -> None:
         for reason in ("pending configuration", "stale pass"):
