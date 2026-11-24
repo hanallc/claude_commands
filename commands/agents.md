@@ -21,6 +21,9 @@ Use the `agents` program.
 - Run `agents reboot [--dry-run]` from a terminal outside Herdr. See Reboot below.
 - `agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]`: restore saved rows or restart local live rows with `--all`.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
+  SESSION can be a staff path, such as `assembly/fix2` or `hana/assembly/fix2`. A unit path stops the unit and its workers.
+  A path that matches no staff row goes to the native session stop, which can match a saved session name such as `review/x`.
+  A path that matches more than one staff row stops nothing.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
@@ -33,7 +36,7 @@ It creates the README if needed and prints the staff id, account and tab.
 Repeat the command with the same options after an interruption.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
-It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
+It also checks live agents in matching tabs and panes in `producer_workspace`.
 Adoption writes the staff row with that native session. It launches nothing.
 Two live sessions cause refusal. An unproved live session also causes refusal.
 The refusal names each conflicting session and pane. It writes no staff row.

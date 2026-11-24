@@ -165,6 +165,20 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
                 if run is not None else "the caller has no staff row and names no unit or production")
 
 
+def cleanup_parent(record: staff.StaffSnapshot, run: Path,
+                   prepared: unit_runs.PreparedRunEnded | unit_runs.CleanupOwnerFromState,
+                   ) -> staff.StaffRow:
+    if not isinstance(prepared, unit_runs.PreparedRunEnded) or run.resolve() != prepared.run:
+        return parent(record, run=run)
+    if ((run / unit_runs.STATE_FILE).exists(follow_symlinks=False)
+            or any(unit_runs.points_to_run(row, run) for row in record.rows)):
+        raise RunOwnerUnavailable(f"{run}: the prepared run changed before cleanup")
+    owner = record.by_id(prepared.owner)
+    if owner is None or owner.kind not in ("unit", "showrunner"):
+        raise RunOwnerUnavailable(f"{run}: the verified cleanup owner is unavailable")
+    return owner
+
+
 def find_worker(record: staff.StaffSnapshot, owner: staff.StaffId, name: str) -> staff.StaffRow | None:
     """Find the named worker under its staff parent."""
     return next((row for row in record.find(kind="worker", parent=owner) if name in (row.name, row.id)), None)
@@ -224,6 +238,8 @@ def reply_ends_dispatch(reply: str, dispatch_id: str) -> bool:
 
 
 def transcript_entry(fields: dict[str, object], changed: set[str]) -> str:
+    if fields.get("isMeta") is True:
+        return ""
     if isinstance(fields.get("message"), dict) and fields.get("type") not in ("user", "assistant"):
         return ""
     raw = fields.get("message", fields.get("payload", {}))

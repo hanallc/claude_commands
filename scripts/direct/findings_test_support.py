@@ -44,10 +44,10 @@ def standard_configuration() -> str:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "direct.conf"
         _ = write_config_fixture(path,
-            "MIN_REPAIR_BUDGET=3\nREPAIR_ROUNDS_PER_FINDING=0.5\nRUNAWAY_ROUNDS=5\n"
-            + "MAX_FIX_ATTEMPTS=2\nMAX_REOPENS=2\nSTALLED_ROUNDS=2\n"
-            + "MAX_CONSECUTIVE_SAME_KIND_PASSES=3\nMAX_REVIEW_CANCELLATIONS=1\n"
-            + "ROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n")
+            "min_repair_budget=3\nrepair_rounds_per_finding=0.5\nrunaway_rounds=5\n"
+            + "max_fix_attempts=2\nmax_reopens=2\nstalled_rounds=2\n"
+            + "max_consecutive_same_kind_passes=3\nmax_review_cancellations=1\n"
+            + "routing_from_round=4\nastra_after_failed_fixes=2\n")
         return path.read_text(encoding="utf-8")
 
 

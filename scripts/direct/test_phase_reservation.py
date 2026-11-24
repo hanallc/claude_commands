@@ -291,7 +291,7 @@ class WorktreeAttributionTests(unittest.TestCase):
         outside.mkdir()
         foreign = make_fixture_worktree(self.first, "other-unit", "p3")
         for requested, reason in ((outside, "--repo does not name a Git checkout"),
-                                  (self.main, "is not in the subpath of"),
+                                  (self.main, "the checkout is not at"),
                                   (foreign, "the checkout is for unit 'other-unit'")):
             with self.subTest(requested=requested):
                 code, errors = self.claim("1", requested)

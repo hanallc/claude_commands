@@ -71,7 +71,8 @@ Without an errors list, the reader reports problems to stderr.
 
 ## Status line
 
-`scripts/statusline/rebuild_row.py` combines cached system comparisons with `read_needs()` on each status read.
+On a Linux status line cache miss, `scripts/statusline/rebuild_row.py` combines cached system comparisons with the open needs from `read_needs()`.
+A fresh render uses the saved fields and skips the scan.
 Its `read()` answer keeps the compared machines in `compared` and the needs in `needs`.
 The console Rebuilds page renders that answer, so the page and the row name the same machines.
 The refresh also writes each machine's change list to `<rebuild.cache>-changes.json`.
@@ -90,9 +91,8 @@ Completed needs leave the row unless the cached system comparison still requires
 The For you card lists the open reasons and uses the oldest open request for its age.
 The Rebuild details page shows completed requests once per machine and commit, newest completion first.
 The page names each damaged archive and shows the valid records.
-A failed need read leaves the cached answer visible.
-A damaged open file leaves the valid rebuild names visible.
-The status line adds `+` to the other action count when only the needs scan is incomplete.
+A failed need read leaves the cached system comparison visible.
+For the partial count rule, see [For you](for-you.md).
 The refresh compares running systems with `rebuild.ref` in `rebuild.repo`.
 It reuses an evaluation only when both machine paths are valid for the same commit and source.
 A timeout, error, or empty path leaves no reusable evaluation.

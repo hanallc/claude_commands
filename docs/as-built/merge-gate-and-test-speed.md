@@ -26,7 +26,7 @@ log='natedev/logs/YYYY-MM/<record-id>.log.gz'
 zcat "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/$log"
 ```
 
-`GATE_FAILURE_LOG_KIB` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
+`gate_failure_log_kib` in `config/test_times.conf` limits the saved tail to 64 KiB by default.
 The writer reads this setting for each record that has failed attempts.
 The first line states how many bytes the writer cut from the start.
 That line is outside the limit.
@@ -56,7 +56,7 @@ buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modu
 
 `show.py top` ranks live gate modules by median CPU time.
 It keeps passed, unrestarted attempts from the selected host, checkout and time window.
-Each module uses one attempt per run, up to `TOP_RUNS`.
+Each module uses one attempt per run, up to `top_runs`.
 The commit time of the merge base with `origin/main` orders the runs.
 The newest start time breaks ties.
 Runs with unknown commit times fill any remaining places.
@@ -136,7 +136,8 @@ In merge mode, it undoes the merge and reports the rollback.
 Status 79 identifies a refusal before tests started.
 Status 80 identifies a run with no verdict or a launch that still needs settlement.
 A direct gate or `copies.py gate-step` uses one placement.
-`copies.py gate-step` preserves status 79 or 80 if cancellation fails and reports the cleanup error on standard error.
+`copies.py run` and `copies.py gate-step` preserve status 79 or 80 if cleanup fails.
+They report the cleanup error on standard error.
 Checkpoint and bump treat these statuses as blocked.
 A nightly gate reports the refusal to its production owner and records no red test result.
 When `copies.py run` owns placement, it reports the claim failure to the queue on status 79.
@@ -150,7 +151,12 @@ An eligible named machine can take the run while the guest is in backoff.
 A fresh reading that still excludes the guest keeps it out of placement.
 If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
-Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
+The command uses `{tree}` for its checkout or repository argument.
+A base check uses the prepared base commit.
+A copy setup failure blocks the checkpoint and reports the test log path.
+The checkpoint skips the rerun and the base check after a copy setup failure.
+Bump gates use `copies.py gate-step` when they have placement targets.
 A claude gate uses the configured targets that its placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate reports status 80 and gives the reason.
@@ -1218,7 +1224,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
 | `UNIT_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `CLAUDE_WORKER_POLL_SECS=15` (s), from `config/direct.conf` | `0.01` |
+| `UNIT_WORKER_POLL_SECS` | `scripts/direct/claude_worker.py` (worker polls) | `claude_worker_poll_secs=15` (s), from `config/direct.conf` | `0.01` |
 | `UNIT_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |

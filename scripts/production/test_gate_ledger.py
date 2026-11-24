@@ -19,7 +19,7 @@ from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import gate, land_runs
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
@@ -61,9 +61,9 @@ print("0 errors, 0 warnings, 0 notes")
 
 LEDGER_SETTINGS = {
     "buildlog": """# whole: 1..
-INDEX_SPILL_PAGES=65536
+index_spill_pages=65536
 # range: 0..
-INDEX_TOUCH_MINUTES=60
+index_touch_minutes=60
 """,
     "codex_daemon": "# range: 0.001..\ntimeout_seconds=5\n",
     "gate": GATE_TEST_SETTINGS + """# one of: on, off
@@ -102,18 +102,18 @@ remote_transport_seconds=30
 waits_review_seconds=30
 """,
     "staff": """# range: 0.001..
-OPERATION_LOCK_SECONDS=30
+operation_lock_seconds=30
 # range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/rust/hanadocs
+remote_seconds=20
+producer_workspace=producers
+producer_folder_root=~/rust/hanadocs
 """,
     "test_times": """# whole: 1..
-GATE_FAILURE_LOG_KIB=64
+gate_failure_log_kib=64
 # range: 0..
-SLOW_TEST_S=0.5
+slow_test_s=0.5
 # whole: 1..
-TOP_RUNS=5
+top_runs=5
 """,
     "build_steps": """names.gate=gate
 names.integrate=integrate
@@ -177,7 +177,7 @@ request_slow_seconds=0.25
 roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
 roots.build={root / 'build'}
-roots.build.{host_name()}={root / 'build'}
+roots.build.{conf.local_host_key_name()}={root / 'build'}
 roots.slots={root / 'slots'}
 roots.slot_cargo={root / 'cargo'}
 roots.workspace={root / 'workspaces'}
@@ -187,9 +187,9 @@ roots.scratch={root / 'scratch'}
 # whole: 1..
 folders.unused_days=2
 # whole: 1..
-slots.{host_name()}.default_max=2
+slots.{conf.local_host_key_name()}.default_max=2
 # whole: 1..
-slots.{host_name()}.origin.max=2
+slots.{conf.local_host_key_name()}.origin.max=2
 # whole: 1..
 slots.unused_days=7
 # range: 5e-324..
