@@ -37,9 +37,9 @@ scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
 The holds record lists their paths, so task end can find them.
 Each folder holds copy_record.RECORD with its task, maker and
-times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
-open, and removes it when its until: time passes, or after 7 idle days whatever its task, since an
-ender can fail. A row's folder waits for its verdict. A git
+times. The hourly sweep (scripts/lint/tmp_sweep.py) checks each folder in ROOT.
+After its until: deadline or 7 idle days, the sweep lists it for vetted manual removal if the other checks pass.
+A row's folder waits for its verdict. A git
 worktree goes through `git worktree remove`, so its source repo keeps no stale entry.
 Removal writes versioned deletion intent to `.scratch-removing-<folder>.json` beside the source.
 The intent preserves the task and source evidence across interruptions.
