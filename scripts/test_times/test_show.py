@@ -228,7 +228,7 @@ class TestTimesTests(unittest.TestCase):
 
     def write_run(self, modules: list[ModuleRun], *, epoch: float = EPOCH,
                   host: str = HOST, aborted: bool = False, status: int = 0,
-                  checkout: str = "") -> None:
+                  checkout: str = "", sha: str | None = None) -> None:
         self.next_id += 1
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": sum(row["wall_s"] for row in modules if row["suite"] == suite),
@@ -242,6 +242,8 @@ class TestTimesTests(unittest.TestCase):
             "checkout": checkout or str(self.repo),
             "slow_test_s": gate_record.slow_test_s(),
         }
+        if sha is not None:
+            run["sha"] = sha
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
             gate_record.write_gate_run(run, fixture_executions(run))
@@ -807,6 +809,159 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertEqual(self.cell(output, alpha, "median s"), "6.000", output)
         self.assertEqual(self.cell(output, alpha, "runs counted"), "2", output)
         self.assertIn("no modules recorded yet", self.report("top", "--repo", str(self.repo)))
+
+    def test_top_uses_merge_base_time_then_start_before_the_run_limit(self) -> None:
+        old, shared, main, newer, older, missing = (digit * 40 for digit in "123456")
+        graph = (
+            f"900 {older} {old}\n"
+            + f"600 {newer} {shared}\n"
+            + f"400 {main} {old} {shared}\n"
+            + f"300 {shared} {old}\n"
+            + f"100 {old}\n"
+        )
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} missing\n" if sha == missing else f"{sha} commit 123\n"
+                                   for sha in (input_text or "").splitlines())
+                case ("rev-list", "--topo-order", "--timestamp", "--parents", "--stdin"):
+                    self.assertEqual(set((input_text or "").splitlines()), {main, newer, shared, older})
+                    return graph
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=2")
+        self.write_run([module_run("test_alpha.py", 40.0)], sha=shared)
+        self.write_run([module_run("test_alpha.py", 6.0)], epoch=EPOCH + 60, sha=newer)
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH + 120, sha=shared)
+        self.write_run([module_run("test_alpha.py", 50.0), module_run("test_beta.py", 8.0)],
+                       epoch=EPOCH + 180, sha=older)
+        self.write_run([module_run("test_alpha.py", 100.0), module_run("test_beta.py", 100.0),
+                        module_run("test_missing.py", 30.0)], epoch=EPOCH + 240, sha=missing)
+
+        with mock.patch.object(show, "ranking_git", side_effect=git) as commands, \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            output = self.report("top")
+            for name, median, count in (("test_alpha.py", "7.000", "2"), ("test_beta.py", "54.000", "2"),
+                                        ("test_missing.py", "30.000", "1")):
+                row = self.line(output, f"tools/{name}")
+                self.assertEqual(self.cell(output, row, "median s"), median)
+                self.assertEqual(self.cell(output, row, "runs counted"), count)
+
+            commands.reset_mock()
+            self.assertEqual(self.report("top"), output)
+            self.assertEqual([call.args[1] for call in commands.call_args_list], ["rev-parse", "cat-file"])
+
+    def test_top_shows_the_latest_counted_run_code_date_in_the_user_zone(self) -> None:
+        older, newer, missing = (digit * 40 for digit in "123")
+        older_base = int(datetime(2026, 11, 2, 1, tzinfo=UTC).timestamp())
+        newer_base = int(datetime(2026, 11, 3, 1, tzinfo=UTC).timestamp())
+        self.write_run([module_run("test_alpha.py", 6.0), module_run("test_beta.py", 3.0)], sha=newer)
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH + 60, sha=older)
+        self.write_run([module_run("test_beta.py", 4.0)], epoch=EPOCH + 120, sha=missing)
+
+        with mock.patch.object(show, "run_code_ages", return_value={older: older_base, newer: newer_base}):
+            output = self.report("top")
+
+        self.assertTrue(output.splitlines()[0].endswith("runs counted  code date"))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "last s"), "8.000")
+        self.assertEqual(self.cell(output, alpha, "code date"), "11-01")
+        beta = self.line(output, "tools/test_beta.py")
+        self.assertEqual(self.cell(output, beta, "runs counted"), "2")
+        self.assertEqual(self.cell(output, beta, "code date"), "unknown")
+
+    def test_top_code_age_cache_resolves_new_objects_and_tracks_main(self) -> None:
+        old, landed = "a" * 40, "b" * 40
+        main = old
+        available = False
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", *_):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} missing\n" if sha == landed and not available
+                                   else f"{sha} commit 123\n" for sha in (input_text or "").splitlines())
+                case ("rev-list", *_):
+                    if landed in (input_text or "").splitlines():
+                        return f"200 {landed} {old}\n100 {old}\n"
+                    return f"100 {old}\n"
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        with mock.patch.object(show, "ranking_git", side_effect=git), \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            revisions = {old, landed}
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100})
+            available = True
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100, landed: 100})
+            main = landed
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100, landed: 200})
+
+    def test_top_code_age_cache_recomputes_when_the_shallow_boundary_changes(self) -> None:
+        main, run_commit, boundary, deeper_boundary = (digit * 40 for digit in "1234")
+        shallow = self.repo / ".git" / "shallow"
+        _ = shallow.write_text(boundary + "\n", encoding="ascii")
+
+        with mock.patch.object(show, "ranking_git", return_value=main + "\n"), \
+                mock.patch.object(show, "resolve_run_commits", return_value={run_commit: run_commit}), \
+                mock.patch.object(show, "merge_base_times", side_effect=[{run_commit: 200}, {run_commit: 100}]) as times, \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 200})
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 200})
+            times.assert_called_once_with(self.repo, main, {run_commit})
+
+            _ = shallow.write_text(deeper_boundary + "\n", encoding="ascii")
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 100})
+            self.assertEqual(times.call_count, 2)
+
+    def test_top_retries_an_unknown_merge_base_after_git_gains_history(self) -> None:
+        main, run_commit, base = (digit * 40 for digit in "123")
+        base_time = int(EPOCH)
+        history_available = False
+        cache = self.root / "cache"
+        self.write_run([module_run("test_alpha.py", 8.0)], sha=run_commit)
+        self.write_run([module_run("test_beta.py", 5.0)], sha=main)
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", *_):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} commit 123\n" for sha in (input_text or "").splitlines())
+                case ("rev-list", *_):
+                    self.assertEqual(set((input_text or "").splitlines()), {main, run_commit})
+                    if history_available:
+                        return (f"{base_time + 60} {main} {base}\n"
+                                + f"{base_time + 30} {run_commit} {base}\n{base_time} {base}\n")
+                    return f"{base_time + 60} {main}\n{base_time + 30} {run_commit}\n"
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        with mock.patch.object(show, "ranking_git", side_effect=git), \
+                mock.patch.object(show, "top_cache_root", return_value=cache):
+            before = self.report("top")
+            self.assertEqual(self.cell(before, self.line(before, "tools/test_alpha.py"), "code date"), "unknown")
+            saved = cache / "gate-top-code-age.json"
+            self.assertEqual(json.loads(saved.read_text()), {"main": main, "shallow": "", "times": {main: base_time + 60}})
+
+            # An older version could save a null time for the run commit.
+            _ = saved.write_text(json.dumps({"main": main, "shallow": "", "times": {main: base_time + 60, run_commit: None}}))
+            history_available = True
+            after = self.report("top")
+            self.assertEqual(self.cell(after, self.line(after, "tools/test_alpha.py"), "code date"), "11-03")
+            self.assertEqual(json.loads(saved.read_text()),
+                             {"main": main, "shallow": "", "times": {main: base_time + 60, run_commit: base_time}})
 
     def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))

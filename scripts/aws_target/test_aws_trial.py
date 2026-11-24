@@ -459,11 +459,11 @@ class Sample(unittest.TestCase):
         confirmed = ledger.GateTerminated(now - 2, 'i-race')
         costs: list[Decimal] = []
         def racing_resolve(attempt: str, outcome: ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated,
-                           *, instance_type: str = '') -> None:
+                           *, expected_owner: ledger.GateWorkerOwner | ledger.GateOwnerUnknown) -> None:
             self.assertIsInstance(outcome, ledger.GateAbsent)
             resolve(attempt, confirmed)
             costs.append(trial.trial_cost(book, {attempt}, self.settings, now)[0])
-            resolve(attempt, outcome, instance_type=instance_type)
+            resolve(attempt, outcome, expected_owner=expected_owner)
         with (mock.patch.object(book, 'resolve_gate', side_effect=racing_resolve),
               mock.patch.object(worker.api, 'call', side_effect=AssertionError('unexpected AWS call'))):
             trial.sweep_trial_resources(current, worker)
