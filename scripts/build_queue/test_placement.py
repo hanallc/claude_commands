@@ -867,8 +867,9 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(assignment_row(closed).get("confirmed_guest_start"), expected)
 
     def test_guest_route_closes_passed_and_failed_attempts_as_completed(self) -> None:
-        for status in (0, 17):
-            with self.subTest(status=status), PlacementFixture() as fixture:
+        for status, checkout_change, expected_status in ((0, "", 0), (17, "", 17),
+                                                         (0, "head", 1), (17, "tree", 17)):
+            with self.subTest(status=status, checkout_change=checkout_change), PlacementFixture() as fixture:
                 request = mac_linux_and_natedev_request(fixture)
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
@@ -881,6 +882,8 @@ class PlacementTests(unittest.TestCase):
                 job = GateJobResult("fixture", "test_first.py", status, 1, "")
                 result = mac_linux.MacLinuxGateRun((job,), 1, 0, bundle_bytes=1, module_skips={},
                     bundle_form=mac_linux.BundleForm.FIRST, bundle_reason=mac_linux.BundleReason.FIRST_RUN)
+                head = "other-head" if checkout_change == "head" else source.head
+                tree = "other-tree" if checkout_change == "tree" else source.tree
 
                 def send(report: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
                     self.assertGreater(deadline, time.monotonic())
@@ -896,15 +899,22 @@ class PlacementTests(unittest.TestCase):
                       mock.patch.object(mac_linux, "consume_launch_permission", return_value=granted.claim),
                       mock.patch.object(mac_linux, "transfer_source"),
                       mock.patch.object(mac_linux, "completed_run", return_value=result),
-                      mock.patch.object(production_gate, "checked_git", return_value=source.head),
-                      mock.patch.object(cloud_gate, "working_tree", return_value=(source.tree, set[str]())),
+                      mock.patch.object(production_gate, "checked_git", return_value=head),
+                      mock.patch.object(cloud_gate, "working_tree", return_value=(tree, set[str]())),
                       mock.patch.object(mac_linux, "send_guest_execution", side_effect=send) as sent):
-                    self.assertIs(mac_linux.route(fixture.root, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
-                        selected=ALL_MODULES, gate_job=StepJob("gate", "fixture"), assignment=assignment), result)
+                    verdict = mac_linux.route(fixture.root, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
+                        selected=ALL_MODULES, gate_job=StepJob("gate", "fixture"), assignment=assignment)
+                if checkout_change:
+                    self.assertEqual(verdict, "mac-linux: the checkout changed during the guest run")
+                else:
+                    self.assertIs(verdict, result)
+                fixture.end_owner(holder)
+                fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+                _ = fixture.run_pass()
                 closed = service.read_state(fixture.state_dir).assignments[key]
                 self.assertEqual(closed.state, placement.ClosedAssignment("completed"))
                 self.assertEqual(closed.terminal_report, placement.TerminalAttemptReport(
-                    placement.AttemptCompleted(status), placement.DispatchPathSettled(), fixture.clock.now()))
+                    placement.AttemptCompleted(expected_status), placement.DispatchPathSettled(), fixture.clock.now()))
                 sent.assert_called_once()
 
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:

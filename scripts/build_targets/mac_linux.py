@@ -1217,14 +1217,13 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
-def report_guest_completion(dispatch: GuestGateDispatch, run: GateRun) -> None:
+def report_guest_completion(dispatch: GuestGateDispatch, status: int) -> None:
     """Report the result after the guest proves that the run ended."""
     ended_at = time()
 
     def send(deadline: float, timeout: float) -> None:
         from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
-        status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
         assignment = dispatch.assignment
         request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
             execution_identity.ExecutionEvidenceUnavailable('the guest run ended', ended_at),
@@ -1865,9 +1864,12 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 reply = run_remote(repo, settings, source, request, prefix,
                                    FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
                 run = completed_run(reply, request, source)
-        if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
+        status = 0 if run.passed else next((job.returncode for job in run.jobs if job.returncode), 1)
+        checkout_changed = (gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head
+                            or cloud_gate.working_tree(repo)[0] != source.tree)
+        report_guest_completion(dispatch, (status or 1) if checkout_changed else status)
+        if checkout_changed:
             raise GuestUnavailable('the checkout changed during the guest run')
-        report_guest_completion(dispatch, run)
         return run
     except mac_run.MacRunRefused as error:
         return GuestNotStarted(str(error))

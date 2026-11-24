@@ -932,7 +932,7 @@ fi
               patch.object(mac_linux, 'send_guest_execution') as send,
               redirect_stderr(io.StringIO()) as errors):
             try:
-                mac_linux.report_guest_completion(self.guest_dispatch(), GateRun((), 1, 0, selection_certified=True))
+                mac_linux.report_guest_completion(self.guest_dispatch(), 0)
                 self.assertTrue(entered.is_set())
                 self.assertFalse(finished.is_set(), 'The completion report waited for configuration.')
             finally:
