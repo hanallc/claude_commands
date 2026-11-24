@@ -3214,6 +3214,8 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         grant = admitted.grant
         if not isinstance(grant, first_step.GatePlacement):
             raise GateAssignmentRefused("The queue returned no gate placement")
+        if args.modules and not first_step.assignment_matches_source(grant.grant.assignment, source):
+            raise GateAssignmentRefused("The requested source does not match the gate placement source")
         admitted.handoff(source)
         yield placement_target(grant.grant)
 
@@ -3224,7 +3226,7 @@ def checked_gate_target(args: GateArguments) -> GateTarget:
     A mode that cannot route takes only a natedev assignment.
     Keep the local grant through the handoff and the suite run.
     """
-    source = Path(args.repo).expanduser().resolve() if (args.affected or args.tests_only) and not args.modules else None
+    source = Path(args.repo).expanduser().resolve() if args.affected or args.tests_only else None
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job, source=source)
     target = placement_target(placed)
     flag = natedev_only_flag(args)
@@ -3730,7 +3732,7 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
         result = admitted.run_gate(run)
         if result.stderr:
             _ = sys.stderr.write(result.stderr)
-        if result.returncode in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):
+        if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
             return 1
         return result.returncode
 

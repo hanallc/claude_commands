@@ -152,8 +152,15 @@ def gate_booking(values: conf.ConfigRead, attempt: str, now: int, expires: int) 
         money(str(values.number('attempt_allowance_usd'))), instance_type=values.words('instance_types')[0])
 
 
+def cooling_zones(rows: Sequence[dict[str, object]], now: float, cooldown: int) -> set[tuple[str, str, str]]:
+    """Return the region, type, and zone of each refusal in the cooldown window."""
+    return {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
+            for row in rows if row.get('result') == 'refused' and row.get('error_code') in run_cost.ZONE_REFUSALS
+            and now - cooldown <= float(str(row['time'])) <= now}
+
+
 def availability() -> Available | Unavailable:
-    """Check local deployment, spending and quota evidence without reserving resources."""
+    """Check local deployment, capacity and spending evidence without reserving resources."""
     try:
         values = settings()
         switch = aws_switch(values)
@@ -175,18 +182,25 @@ def availability() -> Available | Unavailable:
             return Unavailable('image or stack is absent for configured gate types')
         book = ledger.CostLedger(directory)
         snapshot = book.read_snapshot()
-        now = int(time.time())
+        checked_at = time.time()
+        now = int(checked_at)
+        cooldown = values.whole('capacity_cooldown_seconds')
         quotas = gate_quota_capacity(directory, snapshot, now, max_age=policy.whole('price_max_age_seconds'),
-                                     cooldown=values.whole('capacity_cooldown_seconds'))
-        if not any(fit.known and not fit.full and not fit.recently_refused for fit in map(quotas.fit, variants)):
+                                     cooldown=cooldown)
+        ready = [variant for variant in variants if (fit := quotas.fit(variant)).known
+                 and not fit.full and not fit.recently_refused]
+        if not ready:
             return Unavailable('No gate variant has current Spot quota room')
+        zones = cooling_zones(run_cost.gate_launch_history(directory, checked_at, cooldown), checked_at, cooldown)
+        if all((variant.region, variant.instance_type, variant.zone) in zones for variant in ready):
+            return Unavailable('All gate variants with Spot quota room are in a zone refusal cooldown')
         proposed = gate_booking(values, 'placement-preview', now, now + values.whole('lifetime_minutes') * 60)
         try:
             reason = book.gate_booking_refusal(snapshot, policy_path, proposed)
         except (OSError, ValueError, ArithmeticError) as error:
             return Unavailable(str(error) or 'The gate booking cost is unavailable')
         return Unavailable(reason) if reason else Available()
-    except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError, RecursionError):
         return Unavailable('The local AWS gate evidence is unavailable')
 
 
@@ -762,10 +776,7 @@ class GateWorker:
         max_age = policy.whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
         history = run_cost.read_placement_run_history(self.book.directory, now, values, policy, self.api.region)
-        refused = [row for row in history.launch_rows
-                   if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
-        zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
-                 for row in refused if row.get('error_code') in run_cost.ZONE_REFUSALS}
+        zones = cooling_zones(history.launch_rows, now, cooldown)
         cap = values.whole('max_gate_minutes')
         eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, history.evidence, mode,
             now=now, max_age=max_age, max_gate_minutes=cap, live_prices=live_prices)
@@ -1477,17 +1488,18 @@ def reconcile_command(directory: Path, *, start_only: bool = False) -> list[str]
 
 
 def _start_reconcile_if_due(directory: Path, rows: Sequence[ledger.GateReservation],
-                            service: Callable[[Sequence[str]], int | None], *, start_only: bool = False) -> None:
+                            service: Callable[[Sequence[str]], int]) -> None:
     now = int(time.time())
-    if any((not start_only or row.expires <= now) and cleanup_due(row, now) for row in rows):
-        _ = service(reconcile_command(directory, start_only=start_only))
+    if any(cleanup_due(row, now) for row in rows):
+        _ = service(reconcile_command(directory))
 
 
-def _start_reconcile_service(command: Sequence[str]) -> None:
+def start_reconcile_service(command: Sequence[str], timeout: float) -> None:
+    """Submit a service without waiting for its work to finish."""
     # The admission service can run without a user session environment.
     runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
     result = subprocess.run(command, env={**os.environ, 'XDG_RUNTIME_DIR': runtime}, check=False,
-                            capture_output=True, text=True, timeout=settings().number('api_timeout_s'))
+                            capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         raise OSError(result.stderr.strip() or f'systemd-run exited with status {result.returncode}')
 
@@ -1503,7 +1515,15 @@ def reconcile_expired(episode: str, attempt: int) -> None:
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return
     try:
-        _start_reconcile_if_due(directory, rows, _start_reconcile_service, start_only=True)
+        now = int(time.time())
+        if not any(row.expires <= now and cleanup_due(row, now) for row in rows):
+            return
+        command = reconcile_command(directory, start_only=True)
+        timeout = settings().number('api_timeout_s')
+        _, current = _claim_bookings(episode, attempt)
+        if not any(row.expires <= now and ledger.gate_is_open(row) for row in current):
+            return
+        start_reconcile_service(command, timeout)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
         key = (episode, attempt)
         with _reconcile_start_warnings_lock:

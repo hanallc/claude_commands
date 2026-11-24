@@ -913,8 +913,9 @@ It continues cleanup for the other bookings.
 The queue reads settlement for the exact claim through `settlement()`.
 The queue calls `reconcile_expired()` when it checks pending settlement.
 A direct gate that receives status 80 asks the queue for settlement before it takes a replacement in the same episode.
-If settlement or replacement fails, the direct gate reports the refusal and exits with status 1.
-This call requests the reconcile service when a booking for that claim has expired and is due for cleanup.
+If the settlement request or replacement fails after status 80, the direct gate preserves status 80.
+`reconcile_expired()` requests the service when a booking for that claim has expired and cleanup is due.
+It reads the exact claim again before submitting the service.
 The call returns before reconciliation completes.
 If the service cannot start, the call prints one warning per attempt in the queue process.
 The reconciler records the confirmed end in the local ledger.
@@ -1390,8 +1391,11 @@ Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
-`capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
+`capacity_cooldown_seconds=1800` moves recently refused capacity to the end of the launch order.
 `InsufficientInstanceCapacity`, `InsufficientSpotCapacity`, and `SpotMaxPriceTooLow` affect one region, type, and zone.
+Placement reports AWS unavailable while every deployed variant with current Spot quota room has a zone refusal in its cooldown window.
+The window includes the recorded refusal time through that time plus `capacity_cooldown_seconds`.
+Placement reads this evidence from `cloud-gate-launches.jsonl`.
 `MaxSpotInstanceCountExceeded` and `VcpuLimitExceeded` affect every variant of the region.
 Ranking reads the end of `cloud-gate-launches.jsonl` in 64 KiB blocks.
 It stops at the first row before the longer of the price-age and cooldown windows.

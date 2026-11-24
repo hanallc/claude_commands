@@ -102,7 +102,8 @@ The guest run holds a separate lock. Before it can prove the run ended, the gues
 If the wait expires, the route prints `guest unreachable` with the guest alias from `ssh.hops`.
 The gate returns status 80 to the placement retry loop for that episode.
 The route saves the end result in the Mac Linux proof journal before any settlement report.
-The route sends no more cleanup requests.
+The route stops its own cleanup requests.
+The queue can request another proof check for the saved guest attempt while the slot stays held.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
@@ -115,8 +116,9 @@ The new assignment goes into the same file, and the gate runs again on the assig
 A direct `--tests-only` or `--affected` gate without `--module` keeps its admission open during retries.
 It reads the current grant and checks the checkout before each attempt.
 The same retry loop handles status 79 and waits for settlement on status 80.
-It keeps the same queue episode and returns status 1 if settlement or replacement fails.
+It keeps the same queue episode and preserves status 80 if the settlement request or replacement fails.
 A gate with an inherited placement returns the retry status to its wrapper.
+The gate verifies an inherited assignment against the resolved checkout before it runs named modules.
 The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
 If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
 A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.

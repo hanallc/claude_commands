@@ -40,7 +40,7 @@ from scripts.aws_target.ledger_test_support import (
 )
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue import admission_wire, execution_identity, placement
-from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -609,6 +609,29 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         self.assertEqual(start.call_args.kwargs['env']['XDG_RUNTIME_DIR'], '/fixture/user')
         self.assertTrue(all(ledger.gate_is_open(row) for row in self.book.read_snapshot().gate_reservations))
 
+    def test_reconcile_expired_rechecks_a_booking_that_settles_before_service_start(self) -> None:
+        episode, attempt = 'settling', 12
+        claim = execution_identity.assigned_claim_id(episode, f'{attempt:032x}')
+        now = int(self.now)
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                claim, now - 120, now - 1, Decimal('.8'), Decimal(0), placement_claim=claim))
+        reconcile_command = cloud_gate.reconcile_command
+
+        def after_settlement(directory: Path, *, start_only: bool = False) -> list[str]:
+            self.book.resolve_gate(claim, ledger.GateAbsent(now))
+            return reconcile_command(directory, start_only=start_only)
+
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(cloud_gate, 'reconcile_command', side_effect=after_settlement) as command,
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(subprocess, 'run',
+                                side_effect=AssertionError('A settled booking must not start a service')) as start):
+            cloud_gate.reconcile_expired(episode, attempt)
+        command.assert_called_once_with(self.state, start_only=True)
+        start.assert_not_called()
+
     def test_settlement_uses_only_the_exact_claim_and_its_retries(self) -> None:
         episode = 'episode'
         attempt = '0000000000000000000000000000000a'
@@ -690,6 +713,34 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         result = cloud_gate.availability()
         assert isinstance(result, cloud_gate.Unavailable)
         return result.reason
+
+    def test_availability_waits_for_zone_refusal_cooldowns(self) -> None:
+        directory = self.state
+        region = 'us-east-2'
+        self.advance(0.25)
+        config = self.root / 'cloud_gate.conf'
+        override_fixture_settings(config, 'instance_types=m7a.4xlarge')
+        numeric_settings(config, {'capacity_cooldown_seconds': '30'})
+        regional = {**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'fixture-image'}
+        cloud_gate.save(directory / 'gate-deployment.json', {**self.deployment, 'regions': [regional]})
+        cloud_gate.save(directory / 'spot-prices.json', {'regions': [
+            {'region': region, 'read_at': int(self.now), 'standard_vcpus': '16', 'gpu_vcpus': '0'}]})
+        with self.book.transaction() as state:
+            state.observations.clear()
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', side_effect=lambda: self.now),
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Availability uses local files'))):
+            for zone in ('a', 'b'):
+                self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
+                cloud_gate.append_launch(directory, {'time': self.now, 'result': 'refused', 'region': region,
+                    'instance_type': 'm7a.4xlarge', 'availability_zone': zone, 'error_code': 'InsufficientInstanceCapacity'},
+                    gate_job=GATE_JOB_NOT_RECORDED)
+            self.assertIn('zone refusal cooldown', self.unavailable_reason())
+            self.advance(30)
+            self.assertIn('zone refusal cooldown', self.unavailable_reason())
+            self.advance(1)
+            self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
 
     @override
     def setUp(self) -> None:

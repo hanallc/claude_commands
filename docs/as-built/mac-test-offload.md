@@ -99,7 +99,7 @@ The guest run lock still refuses another guest run until the first run ends.
 When the proof wait expires, the gate returns status 80 to its placement retry loop.
 The route appends one record to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
 It records `proven` when cleanup confirms the end, even when the stream gives no start marker.
-It records `unproven` when the proof wait expires.
+It records `unproven` and saves the armed guest identity when the proof wait expires.
 The route sends the end report only if the stream gave the start marker.
 Each record contains the queue attempt key, the Mac claim ID, the result, the detail, and the wall time.
 The writer locks the file during the append and syncs the record to disk.
@@ -107,6 +107,11 @@ A failed report send leaves the proof available on disk.
 `mac_linux.settlement()` reads the file without a lock and skips damaged rows.
 The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
 Only a proven row for that key settles the attempt.
+The queue can call `reconcile_unproven()` while it holds the slot.
+The call submits a service and returns before the service checks the guest.
+The service uses the saved guest identity and appends a new proof only when cleanup confirms the end.
+An older unproven row without an armed guest identity stays pending.
+The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
 
 natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.

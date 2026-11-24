@@ -1,7 +1,7 @@
 """Test the Mac Linux route with a local SSH fixture."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
 from dataclasses import replace
 from datetime import timedelta
@@ -914,6 +914,43 @@ fi
         self.assertIn('Guest cleanup: ended', reason)
         report.assert_not_called()
         self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+
+    def test_reconcile_unproven_guest_after_the_route_returns(self) -> None:
+        attempt = 23
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+        episode = self.placed.episode
+        armed = mac_linux.ArmedGuestAttempt('guest-run', 'f' * 32, 'boot-id', 10, 'user', '/fixture')
+        with (patch.object(mac_linux, 'transfer_source',
+                           side_effect=mac_linux.GuestEndUnproven('guest unavailable', armed)),
+              patch.object(mac_linux, 'send_guest_execution') as report):
+            with self.assertRaises(mac_linux.GuestEndUnproven):
+                _ = self.route()
+        report.assert_not_called()
+
+        def submit(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('--no-block', command)
+            self.assertNotIn('--wait', command)
+            self.assertEqual(command[-3:], ['--reconcile-end', episode, str(attempt)])
+            return subprocess.CompletedProcess(list(command), 0, '', '')
+
+        with (patch.object(subprocess, 'run', side_effect=submit) as start,
+              patch.object(mac_linux, 'prove_kept_guest_end', side_effect=[
+                  mac_linux.GuestEndPending('guest unavailable'),
+                  mac_linux.GuestEndPending('guest unavailable'),
+                  mac_linux.GuestEndProven()]) as prove,
+              redirect_stderr(io.StringIO()) as errors):
+            mac_linux.reconcile_unproven(episode, attempt + 1)
+            start.assert_not_called()
+            for _index in range(3):
+                self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+                mac_linux.reconcile_unproven(episode, attempt)
+                self.assertEqual(prove.call_count, _index)
+                mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
+            mac_linux.reconcile_unproven(episode, attempt)
+            self.assertEqual(start.call_count, 3)
+        self.assertEqual(prove.call_args_list, [call(armed)] * 3)
+        self.assertEqual(errors.getvalue().splitlines(), ['Mac Linux guest reconcile failed: guest unavailable'])
 
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,

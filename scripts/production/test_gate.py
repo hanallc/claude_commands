@@ -6,6 +6,7 @@ from scripts.build_queue import admission_client, admission_records, admission_w
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
+from scripts.build_hold import build_hold
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
@@ -27,6 +28,7 @@ from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.build_targets import mac_linux
 from scripts.buildlog import treekey
+from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import conf, scratch
@@ -140,7 +142,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                           mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
                           mock.patch.object(gate, "run_tests_only", side_effect=run),
                           redirect_stderr(io.StringIO()) as errors):
-                        self.assertEqual(gate.main(arguments), int(blocked), errors.getvalue())
+                        expected = GATE_UNSETTLED_LAUNCH_STATUS if blocked else 0
+                        self.assertEqual(gate.main(arguments), expected, errors.getvalue())
                     self.assertEqual(events, ["admit", "aws", "settle", *([] if blocked else ["natedev"]), "close"])
                     if blocked:
                         self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
@@ -164,10 +167,38 @@ class DirectGatePlacementTests(unittest.TestCase):
                   mock.patch.object(admission_client, "request_settlement",
                                     side_effect=admission_wire.AdmissionUnavailable("fixture settlement failure")) as settle,
                   redirect_stderr(io.StringIO()) as errors):
-                self.assertEqual(gate.main(arguments), 1)
+                self.assertEqual(gate.main(arguments), GATE_UNSETTLED_LAUNCH_STATUS)
             settle.assert_called_once_with(admission_wire.SettlementRequest(assignment))
             self.assertIn(str(failure), errors.getvalue())
             self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
+
+    def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            path = source / ".git" / "assignment.json"
+            key = treekey.tree_key(str(source))
+            assert key is not None
+            owner = placement.SubmittingOwner(host_name(), os.getpid(), "fixture-start")
+            assignment = replace(placed("natedev").assignment, owner=owner,
+                                 source_key=execution_identity.SourceKeyKnown(key))
+            identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+            admission_client.write_assignment(path, admission_wire.Assignment(assignment))
+            _ = (source / "edit.txt").write_text("Changed since placement.\n")
+            response = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+                assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+            for flag in ("--tests-only", "--affected"):
+                with self.subTest(flag=flag):
+                    arguments = (flag, "--module", "lib/test_fixture.py", "--repo", str(source / ".." / source.name))
+                    with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"], "BUILDLOG_PLACEMENT_FILE": str(path),
+                                                       "BUILDLOG_PLACEMENT_EPISODE": assignment.episode}, clear=True),
+                          mock.patch.object(build_hold, "caller_processes", return_value=frozenset({identity})),
+                          mock.patch.object(admission_client, "placement_status", return_value=response),
+                          mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
+                          mock.patch.object(gate, "run_tests_only", return_value=0) as run,
+                          redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(gate.main(arguments), 1)
+                    self.assertIn("source does not match", errors.getvalue())
+                    run.assert_not_called()
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
