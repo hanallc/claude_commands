@@ -29,7 +29,7 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, sync_folder, write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
-from scripts.production import delivery_state, record_store, session_pane, staff
+from scripts.production import delivery_state, goal, record_store, session_pane, staff
 from scripts.review_links import change_page, page_question, question_path, question_record
 
 
@@ -1224,7 +1224,12 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
             raise RetiredListProducer(f"{producer.name}: retired producer. Choose an active producer.")
 
 
-def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
+def _goal_status(item: ListItem) -> goal.ItemStatus:
+    eta = "none recorded" if item.eta is EtaStatus.NOT_ASKED else eta_text(item.eta)
+    return goal.ItemStatus(item.title, item.state.value, eta)
+
+
+def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_producer: staff.StaffId | None = None) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
               "owner": item.owner, "producer": item.producer, "unit": item.unit, "state": item.state.value,
@@ -1250,7 +1255,8 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
                                           ("done_when", item.done_when, "Log", log)):
         fields[key + "_length"] = str(len(text))
         body += record_store.section(heading) + following
-    store.write(item.id, fields, body)
+    with goal.list_item_change(store.owner, item.id, item.producer, _goal_status(item), previous_producer):
+        store.write(item.id, fields, body)
 
 
 def records(keeper: staff.StaffId, *, include_closed: bool = False,
@@ -1540,7 +1546,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(request, PageRequest):
             changed = _save_page_request(store, keeper, changed, request)
         else:
-            _save(store, changed)
+            _save(store, changed, previous_producer=item.producer)
         return SavedEdit(item, changed)
 
 
@@ -2539,17 +2545,101 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     return status
 
 
+class _GoalArguments(argparse.Namespace):
+    action: str = ""
+    item: str = ""
+    blocked: str = ""
+    faster: str = ""
+    keeper: staff.StaffId | None = None
+
+
+def _set_goal(producer: staff.StaffId, identity: str, *, keeper: staff.StaffId) -> str:
+    with _store(keeper).locked(), goal.locked(producer):
+        saved = goal.load(producer)
+        item = load(keeper, identity)
+        if item.producer != producer:
+            raise ListError(f"{item.id} is assigned to another producer.")
+        if saved is goal.NoGoal.UNSET or (saved["keeper"], saved["item"]) != (keeper, item.id):
+            saved = goal.GoalRecord(keeper=keeper, item=item.id, blocked="", faster="", noted_at="")
+        goal.write_goal(producer, saved)
+        return goal.save(producer, saved, _goal_status(item))
+
+
+def _refresh_goal(producer: staff.StaffId, *, note: tuple[str, str] | None = None) -> str:
+    with goal.locked(producer):
+        saved = goal.load(producer)
+        if saved is goal.NoGoal.UNSET:
+            if note is not None:
+                raise ListError(saved.value)
+            goal.clear_card(producer)
+            return saved.value
+        item = load(saved["keeper"], saved["item"])
+        if item.producer != producer:
+            if note is not None:
+                raise ListError(f"{item.id} is assigned to another producer.")
+            return goal.save(producer, saved, goal.ItemAvailability.UNAVAILABLE)
+        if note is not None:
+            blocked, faster = note
+            _line(blocked, "Blocked by")
+            _line(faster, "Faster if")
+            saved["blocked"] = blocked.strip()
+            saved["faster"] = faster.strip()
+            saved["noted_at"] = now().isoformat(timespec="seconds")
+            goal.write_goal(producer, saved)
+        return goal.save(producer, saved, _goal_status(item))
+
+
+def goal_main(argv: list[str] | None = None) -> int:
+    """Run the producer's main goal command."""
+    parser = argparse.ArgumentParser(description=goal.__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    mark = actions.add_parser("set", help="mark one List item as your main goal")
+    _ = mark.add_argument("item", help="the List item ID, such as L1")
+    _ = mark.add_argument("--keeper", type=staff.StaffId, help=_KEEPER_HELP + _CALLER_FIRST_HELP)
+    _ = actions.add_parser("card", help="refresh and print your main goal card")
+    note = actions.add_parser("note", help="write the blocker and what can make work faster")
+    _ = note.add_argument("--blocked", required=True, help="what blocks the main goal")
+    _ = note.add_argument("--faster", required=True, help="what can make work faster")
+    args = parser.parse_args(argv, namespace=_GoalArguments())
+    try:
+        members = staff.snapshot()
+        producer = members.by_current_session(staff.caller_identity())
+        if producer is None or producer not in staff.active(members, "producer"):
+            raise ListError("Run this command in a producer session.")
+        if args.action == "set":
+            keeper = _record_keeper(_active_morty(members), producer.id, args.item, args.keeper,
+                                    policy=_KeeperRouting.CALLER_FIRST)
+            card = _set_goal(producer.id, args.item, keeper=keeper)
+        elif args.action == "note":
+            card = _refresh_goal(producer.id, note=(args.blocked, args.faster))
+        else:
+            card = _refresh_goal(producer.id)
+        print(card)
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        print(f"goal: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 _KEEPER_HELP = "the staff ID of the record keeper"
+_CALLER_FIRST_HELP = " (defaults to your folder if it holds the item, else morty's)"
 
 
 class _KeeperRouting(StrEnum):
-    ANSWER = "answer"
+    CALLER_FIRST = "caller-first"
     UPDATE = "update"
+
+
+def _active_morty(members: staff.StaffSnapshot) -> staff.StaffId | _NoActiveMorty:
+    try:
+        return producer_id(members, "morty")
+    except ListError:
+        return _NoActiveMorty.UNAVAILABLE
 
 
 def _record_keeper(morty: staff.StaffId | _NoActiveMorty, caller: staff.StaffId, identity: str,
                    chosen: staff.StaffId | None, *, policy: _KeeperRouting) -> staff.StaffId:
-    """Select the folder for an answer or an update.
+    """Select the List folder for the command.
 
     The locked write checks the caller against the saved record.
     """
@@ -2557,7 +2647,7 @@ def _record_keeper(morty: staff.StaffId | _NoActiveMorty, caller: staff.StaffId,
         if not _store(chosen).folder().is_dir():
             raise ListError(f"no List folder for keeper {chosen}")
         return chosen
-    if policy is _KeeperRouting.ANSWER:
+    if policy is _KeeperRouting.CALLER_FIRST:
         own = _store(caller)
         if own.valid_id(identity) and os.path.lexists(own.path(identity)):
             return caller
@@ -2573,8 +2663,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
-    _ = answer.add_argument("--keeper", type=staff.StaffId,
-                            help=_KEEPER_HELP + " (defaults to your folder if it holds the item, else morty's)")
+    _ = answer.add_argument("--keeper", type=staff.StaffId, help=_KEEPER_HELP + _CALLER_FIRST_HELP)
     ask = commands.add_parser("ask", help="ask nate for a Go or an approval on the List page")
     _ = ask.add_argument("id", help="the List item ID, such as L1")
     _ = ask.add_argument("--kind", required=True, choices=[kind.value for kind in AskKind])
@@ -2633,12 +2722,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ListError("the current session must be a producer")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
-            try:
-                answer_morty = producer_id(record, "morty")
-            except ListError:
-                answer_morty = _NoActiveMorty.UNAVAILABLE
+            answer_morty = _active_morty(record)
             keeper = _record_keeper(answer_morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
-                                    policy=_KeeperRouting.ANSWER)
+                                    policy=_KeeperRouting.CALLER_FIRST)
             answerer = _QuestionAnswerer(caller, answer_morty)
             result = page_question.answer(_ListQuestionStore(keeper, answerer=answerer), identity, question,
                                           cast(str, args.text))

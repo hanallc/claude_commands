@@ -38,6 +38,14 @@ LIST_TEXT_LIMITS = {
 }
 
 
+def copy_list_item(identity: str, *, source_keeper: staff.StaffId, destination_keeper: staff.StaffId) -> None:
+    """Copy a List fixture into another keeper's folder."""
+    filename = f"{identity}.md"
+    destination = the_list.folder(destination_keeper)
+    destination.mkdir(parents=True, exist_ok=True)
+    _ = shutil.copyfile(the_list.folder(source_keeper) / filename, destination / filename)
+
+
 class ProducerScopedUpdate(Protocol):
     def __call__(self, keeper: staff.StaffId, identity: str, changes: the_list.ItemChanges, *,
                  source: str, assigned_to: staff.StaffRow) -> the_list.ListEdit: ...
@@ -1568,9 +1576,7 @@ class TheListTests(unittest.TestCase):
     def test_morty_can_select_the_keeper_when_list_ids_match(self) -> None:
         first = self.add(number=1)
         # Only morty's folder allocates numbers, so a legacy keeper's L1 is a copy of morty's record.
-        legacy = the_list.folder(OTHER.id)
-        legacy.mkdir(parents=True)
-        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{first.id}.md", legacy / f"{first.id}.md")
+        copy_list_item(first.id, source_keeper=MORTY.id, destination_keeper=OTHER.id)
         second = the_list.load(OTHER.id, first.id)
         status = change_page.DeliveryStatus(self.root / "reviews")
         for keeper, item in ((MORTY.id, first), (OTHER.id, second)):
@@ -2075,9 +2081,7 @@ class TheListTests(unittest.TestCase):
         """Add an item to morty's folder and copy it into bob's legacy folder."""
         # Only morty's folder allocates numbers, so morty keeps an item with the same number.
         item = self.add(changes={"state": state, "producer": producer.id})
-        legacy = the_list.folder(BOB.id)
-        legacy.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(the_list.folder(MORTY.id) / f"{item.id}.md", legacy / f"{item.id}.md")
+        copy_list_item(item.id, source_keeper=MORTY.id, destination_keeper=BOB.id)
         return the_list.load(BOB.id, item.id)
 
     def test_page_mark_read_notice_command_names_a_legacy_keeper(self) -> None:
