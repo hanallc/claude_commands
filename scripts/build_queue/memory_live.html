@@ -1669,9 +1669,9 @@ function unitName(text) {
   return globalThis.staffNames?.unit(text) ?? esc(text);
 }
 // A row starts with its unit, or else with its owner in its staff color (plain ink when the owner has no staff entry).
-function rowLabel({name, unit = "", owner = "", nameSuffix = ""}, note = "") {
+function rowLabel({name, unit = "", owner = "", failureNote = "", nameSuffix = ""}, note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(name)}${esc(nameSuffix)}</span></span>` +
-    `<span class="owner">${owner ? staffName(owner) : ""}</span>` +
+    `<span class="owner">${owner ? staffName(owner) : esc(failureNote)}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, note = "") {
@@ -2683,7 +2683,7 @@ function renderWalk(d) {
       const deadline = w.kept_until.split(" ", 1)[0];
       cells(String(w.position), {step:"", verify:""}, `until ${deadline}`, null, target, null, tip, rowClass);
       const labels = {unit, name: "", nameSuffix: ": kept place",
-        repository: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
+        failureNote: w.failed_step ? `last run failed in ${w.failed_step}` : ""};
       rows.push(`<div class="wrow ${rowClass}" data-tip="${esc(tip)}">${rowLabel(labels)}</div>`);
       return;
     }

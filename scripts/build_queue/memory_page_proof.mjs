@@ -2793,7 +2793,7 @@ try {
                 const dualTargets = structuredClone(base);
                 dualTargets.walk = [
                   structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify)),
-                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by)),
+                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build')),
                 ];
                 dualTargets.walk[0].machine = 'natedev';
                 dualTargets.walk[1].machine = 'mac';
