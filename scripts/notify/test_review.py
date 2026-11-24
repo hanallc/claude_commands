@@ -1248,9 +1248,9 @@ class LocalReviewTests(unittest.TestCase):
                     _ = review.main(arguments)
                 self.assertEqual(error.exception.code, 2)
             texts.assert_not_called()
-            self.assertEqual(review.main(["texts", "--id", "shutdown.manual_restart", "--approve",
+            self.assertEqual(review.main(["texts", "--id", "shutdown.restart_failed", "--approve",
                                           "--user-spec", "User words"]), 0)
-        texts.assert_called_once_with(["shutdown.manual_restart"], True, authority=review.UserSpecifiedText("User words"))
+        texts.assert_called_once_with(["shutdown.restart_failed"], True, authority=review.UserSpecifiedText("User words"))
 
     def test_list_and_show_cli_print_the_catalog(self) -> None:
         listing = push_texts.listing(push_texts.catalog())
