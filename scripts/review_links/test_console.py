@@ -259,17 +259,19 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
 
     def test_repository_config_names_staff_for_every_console_page(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        path = conf.test_config_path("console")
         settings = conf.read(path).values()
         pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
         self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
+        owners = {f"page.{page}.owner" for page in page_frame.OWNER_PAGES} | {"owner.default"}
+        self.assertLessEqual(owners, set(settings))
         for page in page_frame.OWNER_PAGES:
             with self.subTest(page=page):
                 self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
         self.assertEqual(settings["owner.default"], settings["page.review.owner"])
 
     def test_repository_config_puts_the_placement_disk_tab_last_with_the_torus_icon(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        path = conf.test_config_path("console")
         settings = conf.read(path).values()
         pages = [key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")]
         self.assertEqual(pages[-1], "placement_disk")
@@ -430,11 +432,11 @@ class ForYouNotifierTests(unittest.TestCase):
 
 def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
-    settings = Path(__file__).resolve().parents[2] / "config"
     pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
              console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
              console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))
-    with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
+    with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
+            "CONF_DIR": str(conf.copy_for_test(Path(__file__).resolve().parents[2] / "config", Path(folder) / "config"))}):
         source = console.render(pages, console.UnavailablePage()).decode()
     setup = r'''<script>
 const nativeFetch=window.fetch.bind(window),timers=new Map();

@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 _ = copy_helpers(Path(sys.argv[1]), *VERIFY_HELPERS, "scripts/accounts", "scripts/maintenance",
-                 "scripts/astra", "scripts/usage")
+                 "scripts/astra", "scripts/usage", "config")
 PYTHON
 unset CODEX_HOME
 export CLAUDE_BIN="$TEST_DIR/bin/claude"

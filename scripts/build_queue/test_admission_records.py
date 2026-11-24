@@ -1,4 +1,4 @@
-"""Test process identity reads for admission clients."""
+"""Test process identity and memory configuration reads for admission clients."""
 from __future__ import annotations
 
 import os
@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from scripts.build_queue import admission_records as records
+from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.lib import conf
 from scripts.production import staff
 
 
@@ -22,6 +24,18 @@ class ProcessStartTimeTests(unittest.TestCase):
 
             with patch.object(records, "Path", return_value=proc):
                 self.assertEqual(records.process_start_time(123), "4200")
+
+
+class MemoryConfigTests(unittest.TestCase):
+    def test_missing_key_names_the_key_without_a_recovery_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "build_admission.conf"
+            write_memory_config(config, safety_gib=None)
+
+            with patch.dict(os.environ, {"CONF_DIR": temporary}), self.assertRaises(conf.Unusable) as refused:
+                _ = records.read_memory_config(report=False)
+
+        self.assertEqual(str(refused.exception), f"{config}: safety_gib is missing; add it to {config}")
 
 
 class QueueCallerTests(unittest.TestCase):

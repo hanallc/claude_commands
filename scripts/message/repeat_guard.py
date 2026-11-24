@@ -32,10 +32,9 @@ from dataclasses import asdict, dataclass, field
 from subprocess import Popen
 from typing import Literal, cast
 
-from scripts.lib import conf_reads
+from scripts.lib import conf, conf_reads
 from scripts.lib.atomic_file import write_text_atomic
 
-CONFIG = _WORKER_PATH.parents[2] / "config/send_repeat_guard.conf"
 NOTICE_SENDER = "send-repeat-guard"
 
 
@@ -68,7 +67,7 @@ def warn(reason: str) -> None:
 
 def configuration() -> Limits | GuardUnavailable:
     """Read at use. A bad config fails open, without invented code defaults."""
-    path = Path(os.environ.get("SEND_REPEAT_CONFIG", str(CONFIG)))
+    path = Path(os.environ["SEND_REPEAT_CONFIG"]) if "SEND_REPEAT_CONFIG" in os.environ else conf.path("send_repeat_guard")
     try:
         values: dict[str, int] = {}
         contents = conf_reads.read_text(path)

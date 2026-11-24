@@ -1288,7 +1288,7 @@ class BuildsPageTests(unittest.TestCase):
             fixture.release(granted.grant)
 
     def test_the_builds_page_marks_the_row_hand_made(self) -> None:
-        names = build_steps.StepNames(conf.read(REPOSITORY / "config/build_steps.conf").values())
+        names = build_steps.StepNames(conf.read(conf.test_config_path("build_steps")).values())
         self.assertEqual(names.shown(build_steps.HAND_MADE.step), "hand made")
         self.assertEqual(names.queue_name(build_steps.HAND_MADE.step), "hand made")
         self.assertTrue(build_steps.is_recorded_step("hand-made"))
@@ -1299,7 +1299,7 @@ class BuildsPageTests(unittest.TestCase):
     def test_a_hand_made_run_counts_in_the_run_limit_of_its_repository(self) -> None:
         limits = admission_records.RepositoryRunLimits({"natedev.hana": 2})
         self.assertEqual(limits.for_step("natedev", "hana", "hand-made"), admission_records.RepositoryRunLimit(2))
-        settings = conf.read(REPOSITORY / "config/build_admission.conf")
+        settings = conf.read(conf.test_config_path("build_admission"))
         self.assertEqual(settings.number("program_first_peak_gib.hand-made"), 12)
 
 

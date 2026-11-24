@@ -798,16 +798,25 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                     self.config_path.unlink()
                 else:
                     self.write_config(ci_repo=None)
-                errors = io.StringIO()
-                with mock.patch.dict(os.environ, self.environment), redirect_stderr(errors):
+                with mock.patch.dict(os.environ, self.environment), redirect_stderr(io.StringIO()) as errors:
                     config = mac_test.read_config()
                 self.assertEqual(config.ci_repo, "hanallc/hana")
                 self.assertIn("warning:", errors.getvalue())
                 self.assertIn(str(self.config_path), errors.getvalue())
         empty = self.root / "no-history"
         empty.mkdir()
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(empty)}), redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
-            _ = mac_test.read_config()
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(empty)}), redirect_stderr(io.StringIO()):
+            with self.assertRaises(conf.Unusable) as caught:
+                _ = mac_test.read_config()
+            source = empty / self.config_path.name
+            self.assertIn(str(source), str(caught.exception))
+            self.assertIn("the file does not exist; add it with its keys", str(caught.exception))
+            self.write_config(ci_repo=None)
+            _ = source.write_bytes(self.config_path.read_bytes())
+            with self.assertRaises(conf.Unusable) as caught:
+                _ = mac_test.read_config()
+            self.assertIn(str(source), str(caught.exception))
+            self.assertIn("ci_repo is missing", str(caught.exception))
 
     def test_claim_release_and_process_name_behavior_remain_local(self) -> None:
         first = self.start_child(b"mac \xff test")

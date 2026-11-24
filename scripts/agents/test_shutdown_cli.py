@@ -539,7 +539,7 @@ SETUP_PANES = PaneWorld.setup
 @contextmanager
 def pinned_fixture_settings(*stems: str) -> Generator[None]:
     """Give a shared fixture pinned text before it opens any config source."""
-    sources = {CHECKOUT / "config" / f"{stem}.conf": SHUTDOWN_FIXTURE_SETTINGS[stem] for stem in stems}
+    sources = {conf.test_config_path(stem): SHUTDOWN_FIXTURE_SETTINGS[stem] for stem in stems}
     read_text = Path.read_text
 
     def read(path: Path, encoding: str | None = None, errors: str | None = None,

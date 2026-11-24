@@ -10,7 +10,8 @@ from unittest import mock
 
 from scripts.lib import conf
 from scripts.lint.memory_test_support import (
-    ConfigFixtureRefused, commit_config_fixture, config_environment, shifted_number, write_config_fixture,
+    ConfigFixtureRefused, commit_config_fixture, config_environment, copy_config_file_fixture,
+    shifted_number, write_config_fixture,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -44,6 +45,17 @@ class ConfigFixtureTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertIn("# whole: 1..\nMAX_FIX_ATTEMPTS=17\n", text)
         self.assertIn("# test config shift: 4 3\n# whole: 1..4\ncount=3\n", text)
+
+    def test_partial_config_keeps_all_test_owned_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            defaults = copy_config_file_fixture(conf.test_config_path("direct"), root / "defaults.conf")
+            path = root / "direct.conf"
+            _ = path.write_text("MAX_FIX_ATTEMPTS=17\nfixture_only=kept\n")
+            _ = write_config_fixture(path, "MAX_REOPENS=19\n")
+            expected = conf.read(defaults).values()
+            expected.update(MAX_FIX_ATTEMPTS="17", MAX_REOPENS="19", fixture_only="kept")
+            self.assertEqual(conf.read(path).values(), expected)
 
     def test_config_environment_shifts_unpinned_values_and_uses_short_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

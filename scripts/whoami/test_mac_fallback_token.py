@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import termios
@@ -150,6 +151,9 @@ class MacFallbackTokenTests(unittest.TestCase):
         token_file.touch()
         made = datetime(2026, 10, 1, 19, 23, tzinfo=timezone.utc)
         os.utime(token_file, (made.timestamp(), made.timestamp()))
+        config = home / ".claude/config"
+        config.mkdir(parents=True)
+        _ = shutil.copyfile(conf.test_config_path("send"), config / "send.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes),
             "CLAUDE_PYTHON": sys.executable, "PYTHONDONTWRITEBYTECODE": "1",
             "PATH": str(binaries) + os.pathsep + os.environ["PATH"], **(env or {})}, clear=True)))

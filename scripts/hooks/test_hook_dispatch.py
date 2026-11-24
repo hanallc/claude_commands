@@ -13,6 +13,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from scripts.lint.memory_test_support import copy_config_file_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from typing import NamedTuple, cast, override
@@ -164,6 +166,13 @@ class IsolatedHookTests(unittest.TestCase):
 
 
 class RealHookEquivalenceTests(IsolatedHookTests):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.home / ".claude/config"
+        _ = write_config_fixture(config / "build_folders.conf")
+        self.environment["CONF_DIR"] = str(config)
+
     def test_context_deferral_block_reaches_the_caller(self) -> None:
         config = self.root / "config"
         config.mkdir()
@@ -242,7 +251,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
                              current_session=staff.StaffId(session_id), run=staff.OpenRun(run))
         _ = Path(self.environment["STAFF_FILE"]).write_text(json.dumps({"schema": 2, "rows": [row.to_json()]}))
         settings = self.home / ".claude/settings.json"
-        settings.parent.mkdir(parents=True)
+        settings.parent.mkdir(parents=True, exist_ok=True)
         _ = settings.write_text(json.dumps({"autoCompactWindow": 200_000}), encoding="utf-8")
         transcript = self.root / "active-transcript.jsonl"
         _ = transcript.write_text(json.dumps({
@@ -951,7 +960,7 @@ class CopyGuardDispatchTests(IsolatedHookTests):
             + f"dispatch.EVENTS['pre_tool_use'] = (dispatch.CopyPolicyHook(), dispatch.HookSpec({str(later)!r}, None))\n"
             + "sys.argv = ['hook_dispatch.py', 'pre_tool_use']\ndispatch.main()\n"
         )
-        for config in (ROOT / "config/copies.conf", self.root / "missing-copies.conf"):
+        for config in (conf.test_config_path("copies"), self.root / "missing-copies.conf"):
             with self.subTest(config=config.name):
                 marker.unlink(missing_ok=True)
                 self.environment["COPIES_CONFIG"] = str(config)

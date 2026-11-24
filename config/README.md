@@ -14,12 +14,28 @@ The first key wins. A `key.<short-host>` value takes precedence over `key`.
 A comment directly above a key sets its limits: `# whole: A..B`,
 `# range: A..B` or `# one of: a, b, c`.
 
-The reader resolves a missing or invalid key when the caller uses it.
-An absent default file or key can use the repository value when `CONF_DIR` is unset.
-Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
+The Python reader checks a key when the caller uses it.
+A code default supplies a missing key in an existing file.
+For a missing file, a missing key without a code default, or an invalid value, the reader checks the settings file's Git history.
+The reader warns when it uses a committed value.
+The value must pass the limits in its revision.
 Recovery prefers a value that also passes the current setting's limit.
-With no usable value, it raises `conf.Unusable`.
-`ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
+A reader call with `recover_invalid=False` requires a live value or a code default.
+Without a usable value, the reader raises `conf.Unusable`.
+A missing key reports `<path>: <key> is missing; add it to <path>`.
+A missing file adds `; the file does not exist` to that message.
+A whole-file read uses the newest decodable revision.
+Without a usable revision, it reports `<path>: the file does not exist; add it with its keys` for a missing file.
+`ConfigRead.origin(key, convert)` distinguishes a live, recovered, or unavailable value without a warning.
+
+A production `conf.read(stem)` or `conf.sh` read uses `~/.claude/config`, also from a unit worktree.
+Some readers use the `config/` folder of their own checkout instead:
+`copies.config_settings()`, `record.sync_config()`, and the default files of `stall_watch`, `nextest_log`,
+`rust_release`, `rebuild_row`, `design_roles` and `review`.
+A key that a unit branch adds to a `conf.read` file becomes live after the merge and the live config change.
+Until then, recovery can use only the history of the live file.
+To point one hand run at another folder, set `CONF_DIR=<folder>`.
+`conf.py`, `conf.sh`, `user_zone` and `statusline.sh` follow it.
 
 Only the user approves a value change. A session asks the user and runs `/tune`
 on approval, with the user's words. `/tune` makes the value live on both

@@ -13,6 +13,7 @@ import subprocess
 import sys
 from typing import override
 import unittest
+from scripts.lint.memory_test_support import write_config_fixture
 from unittest import mock
 
 from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
@@ -293,6 +294,8 @@ class PairedTreeKeyTests(TreeWatchFixture):
         session = self.root / "session"
         session.mkdir(exist_ok=True)
         _ = (session / "lint.conf").write_text("# key input\n")
+        _ = write_config_fixture(session / "config/direct.conf")
+        _ = write_config_fixture(session / "config/build_folders.conf")
         harness = session / "keys.sh"
         _ = harness.write_text('set -euo pipefail\nCMD=$1; shift; ARGS=("$@")\n'
                                + 'GATE_METADATA=$TEST_METADATA\n'
@@ -307,6 +310,7 @@ printf '%s\\n' "$VERDICT_KEY" "$VERDICT_TREE_KEY"
             "TREE_WATCH_SCRIPT": str(VERIFY.with_name("tree_watch.py")),
             "CACHE_DIR": str(session / "cache"), "LINT_CONFIG_FILE": str(session / "lint.conf"),
             "HOME": str(self.root), "BUILD_HELPER_ROOT": str(self.root / ".claude/scripts"),
+            "CONF_DIR": str(session / "config"),
             "FILTER_RUN": "0", "HOLD_WAIT_DIR": str(session),
         })
 

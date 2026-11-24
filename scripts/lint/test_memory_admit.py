@@ -313,10 +313,15 @@ class BuildBudgetTests(unittest.TestCase):
             ("source_check_seconds", lambda: admission_records.read_memory_config().source_check_seconds, 1),
             ("source_settle_seconds", lambda: admission_records.read_memory_config().source_settle_seconds, 2),
         )
+        private_folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for key, reader, fallback in readers:
             with self.subTest(key=key):
                 write_memory_config(self.config, **{key: None})
                 self.assertEqual(reader(), fallback)
+                write_memory_config(private_folder / self.config.name, **{key: None})
+                with patch.dict(os.environ, {"CONF_DIR": str(private_folder)}):
+                    with self.assertRaisesRegex(conf.Unusable, f"{key} is missing"):
+                        _ = reader()
                 for raw in ("abc", "-5", "nan", "inf", "0"):
                     write_memory_config(self.config, **{key: raw})
                     self.assertEqual(reader(), fallback)
@@ -6745,6 +6750,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         baseline = admission_records.read_memory_config()
         keys = ("slot_gap_seconds", "estimate_refresh_seconds", "recovery_start_seconds",
                 "full_pressure_limit", "some_pressure_limit")
+        private_folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for key in keys:
             for raw in (None, "abc", "-5", "nan", "inf", "0"):
                 with self.subTest(key=key, raw=raw):
@@ -6754,6 +6760,11 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                     self.assertEqual(config, baseline)
                     self.assertIn(key, errors.getvalue())
                     self.assertIn("warning:", errors.getvalue())
+                    if raw is None:
+                        write_memory_config(private_folder / self.config.name, **{key: raw})
+                        with patch.dict(os.environ, {"CONF_DIR": str(private_folder)}):
+                            with self.assertRaisesRegex(conf.Unusable, f"{key} is missing"):
+                                _ = admission_records.read_memory_config()
         for key in keys[:3]:
             self.write_config(**{key: "1.5"})
             with contextlib.redirect_stderr(io.StringIO()) as errors:

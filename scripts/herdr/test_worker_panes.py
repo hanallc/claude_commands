@@ -3101,7 +3101,8 @@ class WorkerPaneTests(StaffTestCase):
                            "commit", "-qm", "private configuration")):
             _ = subprocess.run(["git", "-C", str(self.root), *arguments], check=True, capture_output=True,
                                text=True, timeout=TEST_HANG_GUARD_SECS)
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=invalid\n")
+        path = self.root / "conf/direct.conf"
+        write_text_atomic(path, path.read_text().replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=invalid"))
         with redirect_stderr(io.StringIO()) as errors:
             result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)

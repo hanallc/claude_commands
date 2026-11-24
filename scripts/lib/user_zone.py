@@ -20,8 +20,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from scripts.lib import conf_reads
 
 DEFAULT_ZONE = "America/New_York"
-CONF = os.environ.get("USER_ZONE_CONF") or os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "config", "user_zone.conf")
+
+
+def settings_path() -> str:
+    """The zone file at each call: `USER_ZONE_CONF`, else `user_zone.conf` in the config folder that `CONF_DIR` moves."""
+    if override := os.environ.get("USER_ZONE_CONF"):
+        return override
+    from scripts.lib import conf
+
+    return str(conf.path("user_zone"))
 
 
 def stored_zone(path: str) -> str:
@@ -36,12 +43,12 @@ def stored_zone(path: str) -> str:
 def user_zone_name() -> str:
     """The user's zone as an IANA name. Raises ValueError naming where an unknown one came from."""
     pinned = os.environ.get("USER_ZONE", "")
-    name = pinned or stored_zone(CONF) or DEFAULT_ZONE
+    path = "USER_ZONE" if pinned else settings_path()
+    name = pinned or stored_zone(path) or DEFAULT_ZONE
     try:
         _ = ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as error:
-        source = "USER_ZONE" if pinned else str(CONF)
-        raise ValueError(f"{source}: {name!r} is not a zone name; use one like {DEFAULT_ZONE}") from error
+        raise ValueError(f"{path}: {name!r} is not a zone name; use one like {DEFAULT_ZONE}") from error
     return name
 
 

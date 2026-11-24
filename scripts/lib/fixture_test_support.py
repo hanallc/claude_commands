@@ -5,6 +5,10 @@ from typing import cast
 import unittest
 
 
+# Name the owner of queue requests that a test starts.
+FIXTURE_OWNER = "test fixture"
+
+
 # Match the callback entries stored by unittest.
 type CleanupCallback = tuple[Callable[..., object], tuple[object, ...], dict[str, object]]
 

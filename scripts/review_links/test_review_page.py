@@ -23,7 +23,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
-from scripts.lib import user_zone as user_zone_config
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -5648,7 +5647,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         with self.subTest(count='six legacy Efficiency rows'):
             zone_path = self.fixture.temporary / 'user_zone.conf'
             _ = zone_path.write_text('zone=America/New_York\n')
-            with (patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)),
+            with (patch.dict(os.environ, {'USER_ZONE_CONF': str(zone_path)}),
                   patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads):
                 _ = os.environ.pop('USER_ZONE', None)
                 self.assertEqual(review_items.efficiency(document, record=snapshot.members), 3)
@@ -5677,7 +5676,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             _ = path.write_text(''.join(earlier_log + '\n' if line.startswith('review_log: ') else line for line in lines))
         zone_path = self.fixture.temporary / 'user_zone.conf'
         _ = zone_path.write_text('zone=America/New_York\n')
-        with patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)):
+        with patch.dict(os.environ, {'USER_ZONE_CONF': str(zone_path)}):
             _ = os.environ.pop('USER_ZONE', None)
             answered = review_page.build_snapshot(self.root)
             with patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads:
@@ -6229,6 +6228,19 @@ window.fetch=async(url,options={})=>{
     def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:
         page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, matches_filters=True)
         self.assertEqual(firefox_probe_results(page), [[]])
+
+    def test_question_counts_records_the_current_zone_file(self) -> None:
+        _ = self.question()
+        identities = update_registration.QuestionStaff.for_record(staff.snapshot())
+        owner = next(row for row in identities.record.rows if row.name == 'page-owner')
+        zone_path = self.fixture.temporary / 'question-zone.conf'
+        _ = zone_path.write_text('zone=UTC\n')
+        sources: list[Path] = []
+        with patch.dict(os.environ, {'USER_ZONE_CONF': str(zone_path)}):
+            _ = os.environ.pop('USER_ZONE', None)
+            counts = review_items.question_counts(owner, ZoneInfo('UTC'), identities, sources)
+        self.assertEqual(counts, (1, ''))
+        self.assertIn(zone_path, sources)
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()

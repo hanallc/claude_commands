@@ -9,7 +9,9 @@ import shutil
 from time import perf_counter
 from typing import NamedTuple
 
+from scripts.lib import conf
 from scripts.lib.checkout_test_support import runtime_files
+from scripts.lib.fixture_test_support import FIXTURE_OWNER as FIXTURE_OWNER
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -24,8 +26,6 @@ VERIFY_TEST_ENVIRONMENT = frozenset({
     # Keep the test runner's Python process settings in fixture subprocesses.
     "PYTHON_CPU_COUNT", "PYTHONDONTWRITEBYTECODE",
 })
-# Every fixture says who started its queue requests, so the queue never refuses a test run.
-FIXTURE_OWNER = "test fixture"
 
 
 def verify_test_environment() -> dict[str, str]:
@@ -47,10 +47,14 @@ COPY_TIMES: list[CopyTime] = []
 
 @cache
 def helper_files(folders: tuple[str, ...]) -> tuple[Path, ...]:
-    """Use the shared runtime catalog for the selected folders."""
-    selected = tuple(Path(name) for name in ("scripts/lib", *folders))
+    """Use the shared runtime catalog for the selected folders.
+
+    The config folder comes from `conf.copy_for_test`, with the test-owned files beside it.
+    """
+    owned = ("test_config",) if "config" in folders else ()
+    selected = tuple(Path(name) for name in ("scripts/lib", *folders, *owned))
     return tuple(relative for relative in runtime_files()
-                 if any(relative.is_relative_to(folder) for folder in selected))
+                 if relative.parts[0] != "config" and any(relative.is_relative_to(folder) for folder in selected))
 
 
 def copy_helpers(home: Path, *folders: str) -> Path:
@@ -91,6 +95,8 @@ def copy_helpers(home: Path, *folders: str) -> Path:
                 _ = shutil.copy2(source, destination)
             count += 1
             size += destination.lstat().st_size
+    if "config" in folders:
+        _ = conf.copy_for_test(SOURCE / "config", installed / "config")
     COPY_TIMES.append(CopyTime(perf_counter() - began, count, size))
     return installed / "scripts"
 

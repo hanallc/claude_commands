@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from scripts.lint.memory_test_support import write_config_fixture
 from pathlib import Path
 from typing import Protocol, cast, final, override
 from unittest.mock import patch
@@ -147,8 +148,10 @@ class ContextMessageSwitchTests(unittest.TestCase):
         own.parent.mkdir(parents=True)
         _ = own.write_bytes(self.transcript.read_bytes())
         self.hook.DEBUG_LOG = self.root / "debug.jsonl"
+        models = self.root / "models.conf"
+        _ = write_config_fixture(models)
         self.enterContext(patch.dict(os.environ, {
-            "CONF_DIR": str(self.root), "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
+            "CONF_DIR": str(self.root), "MODELS_CONFIG_FILE": str(models), "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k",
             "CLAUDE_CONTEXT_HOOK_MODE": "dynamic", "CLAUDE_CONTEXT_HOOK_DEBUG": "1",
         }))
 

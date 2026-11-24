@@ -19,10 +19,12 @@ from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import quote
 
-from scripts.lib import atomic_file, conf_reads
+from scripts.lib import atomic_file, conf, conf_reads
 from scripts.rebuild import need
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+# A test run sets CONF_DIR before import, so its defaults come from the test-owned twin.
+DEFAULT_CONFIG = (conf.test_config_path("statusline") if "CONF_DIR" in os.environ
+                  else Path(__file__).resolve().parents[2] / "config/statusline.conf")
 MACHINES = ("natedev", "mac")
 
 

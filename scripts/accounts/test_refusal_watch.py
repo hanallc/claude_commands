@@ -19,6 +19,7 @@ import itertools
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -81,7 +82,7 @@ def observe_whole_reads() -> Generator[Mock]:
     whole = conf.ConfigRead.whole
 
     def record(configuration: conf.ConfigRead, key: str) -> int:
-        observed(configuration.file, key)
+        observed(configuration.source, key)
         return whole(configuration, key)
 
     with patch.object(conf.ConfigRead, "whole", new=record):
@@ -4221,12 +4222,14 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_whole_read_observer_keeps_the_actual_configuration_file(self) -> None:
         configured = conf.read("accounts")
-        other = conf.read(conf.path("accounts"))
+        other_path = self.home / "other-accounts.conf"
+        _ = shutil.copyfile(conf.path("accounts"), other_path)
+        other = conf.read(other_path)
         with observe_whole_reads() as read:
             self.assertEqual(configured.whole("usage_stale_minutes"), other.whole("usage_stale_minutes"))
-        self.assertEqual(read.call_args_list, [call("accounts", "usage_stale_minutes"),
-                                             call(other.file, "usage_stale_minutes")])
-        self.assertNotEqual(configured.file, other.file)
+        self.assertEqual(read.call_args_list, [call(conf.path("accounts"), "usage_stale_minutes"),
+                                             call(other_path, "usage_stale_minutes")])
+        self.assertNotEqual(configured.source, other.source)
 
     def test_login_renewal_uses_one_accounts_read_for_the_interval_and_probe(self) -> None:
         self.expired_login()
@@ -4263,8 +4266,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 80, five=0, five_reset=NOW + timedelta(minutes=5))
         with observe_whole_reads() as read:
             _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(read.call_args_list.count(call("accounts", "transcript_chunk_bytes")), 1)
-        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+        self.assertEqual(read.call_args_list.count(call(conf.path("accounts"), "transcript_chunk_bytes")), 1)
+        self.assertEqual(read.call_args_list.count(call(conf.path("accounts"), "usage_stale_minutes")), 1)
 
     def test_refused_units_read_usage_age_once_through_placement(self) -> None:
         _ = self.groups()
@@ -4277,7 +4280,7 @@ class RefusalWatchTests(unittest.TestCase):
             _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(placement.call_count, 1)
         self.assertEqual(pick.call_count, 1)
-        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+        self.assertEqual(read.call_args_list.count(call(conf.path("accounts"), "usage_stale_minutes")), 1)
 
     def test_refused_terminal_sessions_read_usage_age_once_through_pick(self) -> None:
         for identity, label in (("first", "claude1"), ("second", "claude3")):
@@ -4287,7 +4290,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(accounts, "pick", wraps=accounts.pick) as pick):
             _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
         self.assertGreaterEqual(pick.call_count, 2)
-        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+        self.assertEqual(read.call_args_list.count(call(conf.path("accounts"), "usage_stale_minutes")), 1)
 
     def test_transcript_lookup_ignores_deeper_folders_and_reads_each_live_owner_once_per_tick(self) -> None:
         _ = self.owner("refused")

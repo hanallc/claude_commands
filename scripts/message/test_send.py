@@ -6930,10 +6930,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         for fault in (missing_key, mac_test_conf.unlink):
             fault()
             with self.subTest(fault=fault.__name__):
-                code, output, sent = self.mac_locked_main()
-                self.assertEqual(code, 0)
-                self.assertIn("SKIPPED: the Mac is off on purpose (offload=off)", output)
-                sent.assert_not_called()
+                self.assert_mac_locked_sent()
+        _ = write_config_fixture(mac_test_conf, "offload=off\n")
+        code, output, sent = self.mac_locked_main()
+        self.assertEqual(code, 0)
+        self.assertIn("SKIPPED: the Mac is off on purpose (offload=off)", output)
+        sent.assert_not_called()
 
     def test_mac_locked_block_holder_still_pushes_and_another_sender_does_not(self) -> None:
         state, _, _ = self.mac_in_use()

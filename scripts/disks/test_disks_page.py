@@ -24,7 +24,7 @@ from scripts.review_links.browser_test_support import assert_status_states
 from scripts.disks import disks_page, slots
 from scripts.production import staff
 from scripts.review_links import staff_names
-from scripts.lib import file_lock, test_hang_guard
+from scripts.lib import conf, file_lock, test_hang_guard
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -76,7 +76,7 @@ class DisksPageTests(unittest.TestCase):
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
         # The page reads staff names, and staff reads the machine list.
-        _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
+        _ = shutil.copy(conf.test_config_path("machines"), configuration)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from functools import wraps
 from inspect import currentframe, getsource, signature
 from pathlib import Path
+import pwd
 import resource
 import select
 import shutil
@@ -208,9 +209,13 @@ class RepositoryReadAudit:
             return
 
 
-def install_live_config_guard(folder: str, violation_log: str, startup_hook: str) -> None:
-    """Reject Python writes to the live config and record the first attempt."""
+def install_live_config_guard(folder: str, violation_log: str, startup_hook: str, guard_reads: bool) -> None:
+    """Reject Python writes, and reads when guard_reads is true, of the live config. Record the first attempt."""
+    from stat import S_ISLNK
+
     canonical = os.path.realpath
+    lstat = os.lstat
+    stat = os.stat
 
     def entry_path(path: str) -> str:
         parent, name = os.path.split(path.rstrip(os.sep) or os.sep)
@@ -220,6 +225,12 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     prefixes = tuple(root.rstrip(os.sep) + os.sep for root in roots)
     reported = False
     write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    folders: set[tuple[int, int]]
+    try:
+        folders = {(status.st_dev, status.st_ino) for status in (os.stat(path) for path, _, _ in os.walk(folder))}
+    except OSError:
+        folders = set()
+    devices = {device for device, _ in folders}
 
     def descriptor_path(descriptor: int) -> str:
         if sys.platform == "darwin":
@@ -228,8 +239,45 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
             return os.fsdecode(raw)
         return os.readlink(f"/proc/self/fd/{descriptor}")
 
-    def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
+    def refuse(path: str) -> None:
         nonlocal reported
+        if not os.path.isfile(startup_hook):
+            return
+        if not reported:
+            try:
+                with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
+                    _ = log.write(f"{path}\n")
+            except FileNotFoundError:
+                if not os.path.isfile(startup_hook):
+                    return
+                raise
+            reported = True
+        raise AssertionError(f"Test attempted to read or write live configuration at {path}; "
+                             + "set CONF_DIR to a fixture folder")
+
+    def live_path(path: str) -> str | None:
+        """Return the absolute path when an open of path reaches the live folder."""
+        # This runs on every open, so the spelled path is tested first,
+        # then one lstat and one parent stat replace a full realpath.
+        relative = not path.startswith(os.sep)
+        try:
+            absolute = os.path.join(os.getcwd(), path) if relative else path
+            if absolute.startswith(prefixes):
+                normal = os.path.normpath(absolute)
+                if normal.startswith(prefixes):
+                    # The event omits dir_fd, so a relative name counts only when the working directory holds it.
+                    return absolute if not relative or os.path.lexists(normal) else None
+            status = lstat(absolute)
+            if S_ISLNK(status.st_mode):
+                return absolute if canonical(absolute).startswith(prefixes) else None
+            if status.st_dev not in devices:
+                return None
+            parent = stat(os.path.dirname(absolute))
+        except (OSError, ValueError):
+            return None
+        return absolute if (parent.st_dev, parent.st_ino) in folders else None
+
+    def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
         try:
             if isinstance(value, int):
                 path = descriptor_path(value)
@@ -244,18 +292,7 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
         except (OSError, ValueError):
             return
         if resolved in roots or resolved.startswith(prefixes):
-            if not os.path.isfile(startup_hook):
-                return
-            if not reported:
-                try:
-                    with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
-                        _ = log.write(f"{absolute}\n")
-                except FileNotFoundError:
-                    if not os.path.isfile(startup_hook):
-                        return
-                    raise
-                reported = True
-            raise AssertionError(f"Test attempted to write live configuration at {absolute}")
+            refuse(absolute)
 
     def check_entry(value: object, directory_fd: object = -1) -> None:
         check(value, directory_fd, follow_entry=False)
@@ -263,10 +300,18 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     def audit(event: str, arguments: tuple[object, ...]) -> None:
         if event == "open":
             path, _, flags = arguments
-            # The event omits dir_fd. The working directory may be wrong.
-            if isinstance(flags, int) and flags & write_flags and isinstance(path, (str, bytes)) and os.path.isabs(path):
+            if not isinstance(path, (str, bytes)):
+                return
+            flags = flags if isinstance(flags, int) else 0
+            writes = flags & write_flags
+            if writes and os.path.isabs(path):
                 exclusive = flags & os.O_CREAT and flags & os.O_EXCL
                 check(path, follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
+            elif writes or guard_reads:
+                # A relative write takes the read test: the event omits dir_fd, so only an existing entry counts.
+                absolute = live_path(path if isinstance(path, str) else os.fsdecode(path))
+                if absolute is not None:
+                    refuse(absolute)
         elif event in {"os.rename", "os.link"}:
             check_entry(arguments[0], arguments[2])
             check_entry(arguments[1], arguments[3])
@@ -282,10 +327,24 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     sys.addaudithook(audit)
 
 
+CHECKOUT = Path(__file__).absolute().parents[2]
+"""The checkout under test. Both owners run this file from the tested checkout."""
+
+
+def live_config_folder() -> Path:
+    """Return the real user's live config folder. A test that sets HOME does not move it."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "config")
+
+
 @contextmanager
-def guard_live_config(folder: Path, startup_folder: Path, violation_log: Path) -> Generator[None]:
-    """Use the same guard in the runner and its Python child processes."""
+def guard_live_config(folder: Path, startup_folder: Path, violation_log: Path, *,
+                      checkout_config: Path = CHECKOUT / "config") -> Generator[None]:
+    """Use the same guard in the runner and its Python child processes.
+
+    When the live folder is the checkout's own config/, as on the AWS guest or in ~/.claude, only writes are refused.
+    """
     folder = folder.absolute()
+    guard_reads = os.path.realpath(folder) != os.path.realpath(checkout_config)
     violation_log = violation_log.absolute()
     hook = startup_folder.absolute() / "sitecustomize.py"
     _ = hook.write_text(
@@ -297,7 +356,7 @@ from importlib.machinery import PathFinder
 from importlib.util import module_from_spec
 
 """ + getsource(install_live_config_guard)
-        + f"\ninstall_live_config_guard({str(folder)!r}, {str(violation_log)!r}, __file__)\n"
+        + f"\ninstall_live_config_guard({str(folder)!r}, {str(violation_log)!r}, __file__, {guard_reads!r})\n"
         + """
 # Keep the primary hook registered while the next hook runs.
 directory = os.path.realpath(os.path.dirname(__file__))
@@ -315,7 +374,7 @@ if spec is not None and spec.loader is not None:
     previous = os.environ.get("PYTHONPATH")
     os.environ["PYTHONPATH"] = (str(hook.parent) if previous is None
                                 else os.pathsep.join((str(hook.parent), previous)))
-    install_live_config_guard(str(folder), str(violation_log), str(hook))
+    install_live_config_guard(str(folder), str(violation_log), str(hook), guard_reads)
     try:
         yield
     finally:
@@ -326,7 +385,8 @@ if spec is not None and spec.loader is not None:
         hook.unlink(missing_ok=True)
         if violation_log.exists():
             with violation_log.open(encoding="utf-8") as log:
-                raise AssertionError(f"Test attempted to write live configuration at {log.readline().rstrip()}")
+                raise AssertionError(f"Test attempted to read or write live configuration at {log.readline().rstrip()}; "
+                                     + "set CONF_DIR to a fixture folder")
 
 
 @dataclass(frozen=True)
@@ -839,11 +899,11 @@ def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log
                         candidates.append(parts)
             names.append(".".join(max(candidates, key=len, default=(path.stem,))))
         # The guard reads this file, so the read audit starts after it.
-        with guard_live_config(Path.home() / ".claude" / "config", run_root, violation_log):
+        with guard_live_config(live_config_folder(), run_root, violation_log):
             if isinstance(TimedRunner.destination, TimesOutput):
                 TimedRunner.scanned_folders = set()
                 TimedRunner.read_contents = set()
-                sys.addaudithook(RepositoryReadAudit(Path(__file__).absolute().parents[2], TimedRunner.scanned_folders,
+                sys.addaudithook(RepositoryReadAudit(CHECKOUT, TimedRunner.scanned_folders,
                                                     TimedRunner.read_contents))
             suite = unittest.defaultTestLoader.loadTestsFromNames(names)
             result = TimedRunner(warnings=None if cast(list[str], sys.warnoptions) else "default").run(suite)
@@ -860,20 +920,27 @@ def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log
 
 @contextmanager
 def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
-    """Keep imported run roots and child processes under one private folder."""
-    names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR")
+    """Keep the test config, run roots and child processes under one private folder."""
+    from scripts.lib.conf import copy_for_test
+
+    names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "CONF_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
+
+    def restore() -> None:
+        for name in names:
+            _ = os.environ.pop(name, None)
+        os.environ.update(previous)
+
     with ExitStack() as cleanup:
+        # The restore runs after the folders close, so no removal step reads the live config.
+        _ = cleanup.callback(restore)
         root = cleanup.enter_context(runner_folder(owner, "test-run-roots"))
         if isinstance(owner, GateModuleLease):
             _ = cleanup.enter_context(runner_folder(owner, "config-reads"))
-        try:
-            os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"))
-            yield root
-        finally:
-            for name in names:
-                _ = os.environ.pop(name, None)
-            os.environ.update(previous)
+        config = copy_for_test(CHECKOUT / "config", root / "config")
+        os.environ.update(SCRATCH_ROOT=str(root / "scratch"), ASTRA_REVIEW_DIR=str(root / "astra"),
+                          CONF_DIR=str(config))
+        yield root
 
 
 def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) -> None:

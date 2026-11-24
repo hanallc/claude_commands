@@ -112,7 +112,7 @@ class TestIdentityTests(unittest.TestCase):
 
     def read_settings(self, settings: Path) -> conf.ConfigRead:
         self.assertEqual(settings, SETTINGS)
-        return conf.ConfigRead(SETTINGS, SETTINGS, conf.settings('region=us-west-2\n'), False)
+        return conf.ConfigRead(SETTINGS, conf.settings('region=us-west-2\n'))
 
     def save_plan_key(self, key: str = PLAN_KEY) -> None:
         path = plan_identity.credential_path()

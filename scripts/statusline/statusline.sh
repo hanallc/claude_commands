@@ -25,13 +25,15 @@ staff="${STAFF_FILE:-$HOME/.local/state/staff/staff.json}"
 labels="$HOME/.local/state/agent-notes/by-label.json"
 [ -r "$labels" ] || labels=/dev/null
 
-colors="$statusline/../../config/statusline.conf"
+# The config folder follows the conf.sh rule, as user_zone.py does.
+conf_folder=${CONF_DIR:-$HOME/.claude/config}
+colors="$conf_folder/statusline.conf"
 [ -r "$colors" ] || colors=/dev/null
 [ -z "${CONF_READ_LOG:-}" ] || [ "$colors" = /dev/null ] || conf_record statusline
 
 zone=${USER_ZONE:-}
 if [ -z "$zone" ]; then
-  zone_conf=${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}
+  zone_conf=${USER_ZONE_CONF:-$conf_folder/user_zone.conf}
   zone_stem=${zone_conf##*/}
   [ -z "${CONF_READ_LOG:-}" ] || conf_record "${zone_stem%.conf}"
   {

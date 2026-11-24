@@ -13,6 +13,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Literal, cast, final, override
 from unittest import mock
@@ -32,7 +33,7 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import commit_config_fixture, write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
 from scripts.production import mac_gate_process, gate, targeted_test
 from scripts.copies import copies
@@ -643,15 +644,13 @@ class MacGateSuitesTests(GateSuitesFixture):
         local.assert_not_called()
 
     def test_mac_linux_assignment_requires_an_enable_key_in_the_live_registry(self) -> None:
-        configuration = Path(self.environment["CONF_DIR"])
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         registry = configuration / "build_targets.conf"
-        fallback = configuration / "repository" / registry.name
-        _ = write_config_fixture(fallback, "enabled.mac-linux=on\n")
         _ = write_config_fixture(registry, "enabled.mac-linux=on\n")
+        commit_config_fixture(registry)
         _ = registry.write_text(registry.read_text().replace("enabled.mac-linux=on\n", ""))
         target = gate.MacLinuxAssignment(self.gate_assignment("mac-linux"))
         with (mock.patch.dict(os.environ), mock.patch.object(conf, "directory", return_value=configuration),
-              mock.patch.object(conf, "_repository_path", return_value=fallback),
               mock.patch.object(mac_linux, "route", return_value="unexpected guest route") as guest):
             _ = os.environ.pop("CONF_DIR", None)
             with self.assertRaisesRegex(gate.MacLinuxGateRefused, "enabled.mac-linux=off"):

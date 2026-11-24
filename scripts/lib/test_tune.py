@@ -11,13 +11,14 @@ import socket
 import subprocess
 import sys
 import time
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 from scripts.lib import conf, live_settings, main_publish, models_registry, tune, waiting_rows
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase, pending_rows
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("tune.py")
@@ -38,6 +39,11 @@ class TuneTests(PublicationTestCase):
     @override
     def setUp(self) -> None:
         (self.repository.home / ".claude").symlink_to(self.repository.checkout, target_is_directory=True)
+        machines = self.repository.config.with_name("machines.conf")
+        _ = write_config_fixture(machines)
+        _ = self.repository.git(self.repository.checkout, "add", str(machines))
+        _ = self.repository.git(self.repository.checkout, "commit", "-m", "Add fixture machines")
+        _ = self.repository.git(self.repository.checkout, "push", "origin", "HEAD:main")
         for name in ("basedpyright", "pytest", "cargo"):
             program = self.repository.programs / name
             _ = program.write_text('#!/bin/sh\nprintf test >> "$HOME/unexpected-check"\nexit 99\n')
@@ -181,6 +187,9 @@ class TuneTests(PublicationTestCase):
         _ = repo.git(repo.checkout, "commit", "-qm", "color fixture")
         _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
         key = "model.gpt-6.2-sol"
+        models = repo.root / "models.conf"
+        _ = models.write_text("[codex.agents]\ngpt-6.2-sol=high\n")
+        repo.env["MODELS_CONFIG_FILE"] = str(models)
         value = "#304050"
         approval = ("--why", "Chosen model color", "--user-words", "Save the model color")
         baseline = self.snapshot()
@@ -290,8 +299,13 @@ class TuneTests(PublicationTestCase):
         _ = repo.git(repo.root, "clone", "-q", "--branch", "main", str(repo.origin), str(mac))
         key, value = "model.gpt-6.2-sol", "#304050"
         pending_key, pending_value = "model.gpt-6.2-astra", "#506070"
+        catalog = "[codex.agents]\ngpt-6.2-sol=high\ngpt-6.2-astra=high\n"
+        natedev_catalog = repo.root / "natedev-models.conf"
+        _ = natedev_catalog.write_text(catalog)
+        _ = cast(object, self.enterContext(mock.patch.dict(repo.env, {"MODELS_CONFIG_FILE": str(natedev_catalog)})))
         mac_catalog = mac / "config/models.conf"
-        _ = mac_catalog.write_text("[codex.agents]\ngpt-6.2-sol=high\ngpt-6.2-astra=high\n")
+        _ = write_config_fixture(mac_catalog.with_name("machines.conf"))
+        _ = mac_catalog.write_text(catalog)
         mac_env = {**repo.env, "CONF_DIR": str(mac_catalog.parent), "MODELS_CONFIG_FILE": str(mac_catalog),
                    "XDG_STATE_HOME": str(mac / "state")}
         with mock.patch.dict(os.environ, mac_env, clear=True):

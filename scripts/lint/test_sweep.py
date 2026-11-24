@@ -7969,14 +7969,27 @@ class BudgetTests(unittest.TestCase):
             (1024 * GIB, f"{sweep.BUDGET_ENV} in the environment"),
         )
 
-    def test_workspace_recovers_doc_budget_separately_from_a_private_budget_file(self) -> None:
+    def test_workspace_reads_both_budgets_from_the_private_file(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        budget_path = root / "lint.conf"
+        _ = write_config_fixture(budget_path, "sweep_budget_gib=17\nsweep_doc_index_mib=29\n")
+        target = root / "target"
+        target.mkdir()
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root), sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""}),
+              mock.patch.object(sweep, "process_uses", return_value={}),
+              mock.patch.object(sweep, "_build_trees", return_value=[]),
+              mock.patch.object(sweep, "prune_doc_index", return_value=0) as prune,
+              mock.patch.object(sweep, "sweep", return_value=0) as workspace):
+            self.assertEqual(sweep.sweep_workspace(str(target), conf.read(budget_path), True, 60), 0)
+        self.assertEqual(prune.call_args.args[1], 29 * MIB)
+        self.assertEqual(workspace.call_args.args[2], 17 * GIB)
+
+    def test_workspace_refuses_a_live_lint_file_without_the_doc_budget(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         budget_path = root / "lint.conf"
         _ = budget_path.write_text("# range: 0..\nsweep_budget_gib=17\n")
         target = root / "target"
         target.mkdir()
-        repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
-        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),
@@ -7984,26 +7997,37 @@ class BudgetTests(unittest.TestCase):
               mock.patch.object(sweep, "process_uses", return_value={}),
               mock.patch.object(sweep, "_build_trees", return_value=[]),
               mock.patch.object(sweep, "prune_doc_index", return_value=0) as prune,
-              mock.patch.object(sweep, "sweep", return_value=0) as workspace):
-            self.assertEqual(sweep.sweep_workspace(str(target), conf.read(budget_path), True, 60), 0)
-        self.assertEqual(prune.call_args.args[1], doc_budget)
-        self.assertEqual(workspace.call_args.args[2], 17 * GIB)
+              mock.patch.object(sweep, "sweep", return_value=0) as removal,
+              redirect_stderr(io.StringIO()) as errors):
+            status = sweep.sweep_workspace(str(target), conf.read(budget_path), True, 60)
+        self.assertEqual(status, 1)
+        prune.assert_not_called()
+        removal.assert_not_called()
+        self.assertIn(f"{budget_path}: sweep_doc_index_mib is missing; add it to {budget_path}", errors.getvalue())
 
-    def test_sweep_recovers_missing_live_recent_minutes_from_the_repository(self) -> None:
+    def test_sweep_uses_recent_minutes_from_the_private_file(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        live = root / "live"
-        live.mkdir()
-        _ = (live / "lint.conf").write_text("# range: 0..\nsweep_budget_gib=1\n")
-        repository = root / "repository.conf"
-        _ = repository.write_text("# range: 0..\nrecent_minutes=60\n")
-        environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
-        with (mock.patch.dict(os.environ, environment, clear=True),
-              mock.patch.object(conf, "directory", return_value=live),
-              mock.patch.object(conf, "_repository_path", return_value=repository),
+        _ = write_config_fixture(root / "lint.conf", "recent_minutes=60")
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(root)}),
               mock.patch.object(sweep, "sweep_workspace", return_value=0) as workspace,
               redirect_stderr(io.StringIO())):
             self.assertEqual(sweep.main([]), 0)
         self.assertEqual(workspace.call_args.args[3], 60.0)
+
+    def test_sweep_refuses_a_live_lint_file_without_recent_minutes(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        live = root / "live"
+        live.mkdir()
+        source = live / "lint.conf"
+        _ = source.write_text("# range: 0..\nsweep_budget_gib=1\n")
+        environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(conf, "directory", return_value=live),
+              mock.patch.object(sweep, "sweep_workspace", return_value=0) as workspace,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(sweep.main([]), 2)
+        workspace.assert_not_called()
+        self.assertIn(f"{source}: recent_minutes is missing; add it to {source}", errors.getvalue())
 
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:
@@ -8077,8 +8101,10 @@ class RunnerTargetDirTests(SweepCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # A runner home has no ~/.claude: conf recovers lint.conf from the repository copy.
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = home / ".claude/config"
+        config.mkdir(parents=True)
+        _ = write_config_fixture(config / "lint.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "1024", "HOME": str(home)})))
         _ = os.environ.pop("CONF_DIR", None)
 

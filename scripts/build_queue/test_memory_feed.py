@@ -2494,6 +2494,7 @@ const refresh = createPageRefresh(tick);
                 installed = self.root / "installed" / module
                 source = Path(memory_feed.__file__).resolve().parents[1]
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                _ = shutil.copytree(conf.test_config_path("console").parent, installed / "test_config")
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
                 _ = write_config_fixture(installed / 'config/console.conf')
@@ -3469,7 +3470,7 @@ const refresh = createPageRefresh(tick);
                       job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
                       owner: unit_labels.UnitLabels | None = None) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
-        config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
+        config = conf.test_config_path("build_steps")
         _ = shutil.copyfile(config, self.root / "build_steps.conf")
         base = with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110))
         running = replace(base.view.running[0], step=step, pid=running_pid, job=job)

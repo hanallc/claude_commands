@@ -17,7 +17,7 @@ from unittest.mock import patch
 from scripts.lib.helper_tree_test_support import copy_helpers
 
 from scripts.direct import worker_state
-from scripts.lib import models_registry
+from scripts.lib import conf, models_registry
 from scripts.direct import claude_worker
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -146,7 +146,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         _, unit, _ = self.tree()
         identity = fixture_runtime_id("background-Claude-native")
         home = Path.home()
-        _ = copy_helpers(home)
+        _ = copy_helpers(home, "config")
         self.write_json(home / ".claude.json", {"oauthAccount": {"emailAddress": "fixture@example.invalid"}})
         work = self.root / "project"
         work.mkdir()
@@ -165,9 +165,13 @@ class NativeClaudeWorkerTests(StaffTestCase):
                   "sessionId": identity, "name": "fresh-impl", "entrypoint": "cli",
                   "messagingSocketPath": "", "updatedAt": 1, "formerNames": [], "tmux": ""}
         models = write_registry(self.root / "models.conf")
-        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
+        sync = self.root / "catalog-sync"
+        sync.touch()
+        self.enterContext(patch.dict(os.environ, {
+            "MODELS_CONFIG_FILE": str(models), "CODEX_CATALOG_SYNC_STATE_FILE": str(sync),
+        }))
         environment = {**os.environ, "CODEX_THREAD_ID": unit.id, "UNIT_RUN_DIR": str(run_dir),
-            "CONF_DIR": str(CHECKOUT / "config"), "UNIT_WORKER_POLL_SECS": "0",
+            "CONF_DIR": str(conf.copy_for_test(CHECKOUT / "config", self.root / "config")), "UNIT_WORKER_POLL_SECS": "0",
             "CLAUDE_BIN": str(backend), "CLAUDE_WORKER_SEND_SCRIPT": str(sender),
             "FIXTURE_CHECKOUT": str(CHECKOUT), "FIXTURE_NATIVE_ID": identity,
             "FIXTURE_BACKEND_LOG": str(backend_log), "FIXTURE_SENT": str(sent),

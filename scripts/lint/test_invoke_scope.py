@@ -210,6 +210,15 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
                 # This folder is still under the fixture repo; the file itself has no history.
                 self.assertNotEqual(refused.returncode, 0)
                 self.assertIn("Unusable", refused.stderr)
+                if damage in ("missing file", "missing key"):
+                    if damage == "missing file":
+                        empty.unlink()
+                    else:
+                        _ = empty.write_text("other=1\n")
+                    refused = self.read_config(empty, self.python_reader)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertEqual(refused.stdout, "")
+                    self.assertIn("build_oom_score_adj is missing", refused.stderr)
 
     def test_present_invalid_value_warns_once_and_uses_default(self) -> None:
         for value in ("", " # comment", "abc", "2000", "-1001"):

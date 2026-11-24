@@ -117,7 +117,8 @@ def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunn
         target = folder.parent / source.name
         if source.name != "statusline" and not target.exists():
             target.symlink_to(source, target_is_directory=source.is_dir())
-    return f'statusline="{folder}"; . "$statusline/statusline.sh"'
+    # A shell variable, not an export: only statusline.sh reads the fixture folder when CONF_DIR is unset.
+    return f'statusline="{folder}"; : "${{CONF_DIR:={root / "config"}}}"; . "$statusline/statusline.sh"'
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
@@ -1313,8 +1314,8 @@ class CountsRowTests(ConfiguredShellTests):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)
-        _ = (self.configuration / "statusline.conf").write_text(
-            "# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
+        with fixture_colors(self.configuration / "statusline.conf").open("a", encoding="utf-8") as settings:
+            _ = settings.write("# whole: 1..\ncounts.retry_seconds=7\n")
         environment = {"CONF_DIR": str(self.configuration), "USER_ZONE": USER_ZONE.key}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf")

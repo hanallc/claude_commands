@@ -329,7 +329,11 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
-        write_machine_config(Path(os.environ["CONF_DIR"]))
+        configuration = Path(os.environ["CONF_DIR"])
+        write_machine_config(configuration)
+        models = configuration / "models.conf"
+        _ = write_config_fixture(models)
+        self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.root / "astra-runs"))
         counts_cache = session_counts_cache()
         counts_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -10266,6 +10270,12 @@ class SessionModelReaderTests(unittest.TestCase):
         _ = self.claude.write_bytes(self.claude_turn("claude-opus-5-5") + self.output(256 * 1024))
         self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
                          accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+    def test_unreadable_live_registry_gives_no_rows_and_reads_no_other_file(self) -> None:
+        with (patch.object(models_registry, "registry_text", side_effect=OSError("unreadable")),
+              patch.object(conf, "test_config_path", side_effect=AssertionError("no fallback file")),
+              patch.object(Path, "read_text", side_effect=AssertionError("no fallback file"))):
+            self.assertEqual(accounts.SessionModelReader().registry, {})
 
     def test_model_reader_stops_at_the_configured_scan_limit(self) -> None:
         _ = write_config_fixture(self.settings, "session_model_scan_kib=256\n")

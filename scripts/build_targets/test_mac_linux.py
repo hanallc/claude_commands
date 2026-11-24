@@ -36,7 +36,7 @@ from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store
 from scripts.lib import conf, process_group, process_start
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import commit_config_fixture, write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
@@ -820,6 +820,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         for folder in ('config', 'scripts/lib', 'scripts/production', 'scripts/fixture', 'scripts/build_targets'):
             (self.repo / folder).mkdir(parents=True)
         _ = shutil.copyfile(config / 'build_folders.conf', self.repo / 'config/build_folders.conf')
+        _ = write_config_fixture(self.repo / 'config/copies.conf')
         _ = (self.repo / 'scripts/production/gate.py').write_text(GATE_FIXTURE, encoding='utf-8')
         for module in ('test_first.py', 'test_second.py'):
             (self.repo / 'scripts/fixture' / module).touch()
@@ -1299,13 +1300,13 @@ fi
         paths = mac_test.state_paths(mac_linux.TARGET)
         configuration = self.registry.with_name('mac_linux.conf')
         _ = write_config_fixture(configuration, 'slots=1\n')
-        fallback = self.registry.parent / 'repository' / self.registry.name
-        _ = write_config_fixture(fallback, 'enabled.mac-linux=on\n')
+        _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
+        commit_config_fixture(self.registry)
         _ = self.registry.write_text(self.registry.read_text().replace('enabled.mac-linux=on\n', ''))
-        with (patch.dict(os.environ), patch.object(conf, 'directory', return_value=self.registry.parent),
-              patch.object(conf, '_repository_path', return_value=fallback)):
-            _ = os.environ.pop('CONF_DIR', None)
-            self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
+        with self.assertRaisesRegex(conf.Unusable, r'enabled\.mac-linux is missing'):
+            _ = mac_test.free_now(paths, configuration, self.repo)
+        _ = write_config_fixture(self.registry, 'enabled.mac-linux=on\n')
+        self.assertEqual(mac_test.free_now(paths, configuration, self.repo), 'free')
 
     def test_free_now_reads_the_probe_backoff_for_a_registered_guest(self) -> None:
         _ = write_config_fixture(self.registry, 'pinned_targets=hana-gpu,mac-linux\n')
@@ -1355,10 +1356,10 @@ fi
         result = self.route()
         self.assertIsInstance(result, str)
         self.assertIn(key, str(result))
-        self.assertIn('key is missing', str(result))
+        self.assertIn(f'{key} is missing; add it to {self.registry}', str(result))
         self.assert_guest_clean()
 
-    def test_unreachable_wait_uses_the_committed_value_when_the_key_is_missing(self) -> None:
+    def test_unreachable_wait_refuses_a_missing_key_even_with_a_committed_value(self) -> None:
         registry = self.repo / 'config/build_targets.conf'
         original = self.registry.read_text().replace(
             'settings.mac-linux=mac_linux.conf', f"settings.mac-linux={self.registry.with_name('mac_linux.conf')}")
@@ -1367,8 +1368,8 @@ fi
         _ = self.git('commit', '-qm', 'Add the target registry')
         key = target_config.UNREACHABLE_WAIT_KEY
         _ = registry.write_text(original.replace(f'{key}=20\n', ''))
-        settings = mac_linux.read_settings(conf.read(registry))
-        self.assertEqual(settings.unreachable_wait_seconds, 20)
+        with self.assertRaisesRegex(conf.Unusable, f'{key} is missing; add it to '):
+            _ = mac_linux.read_settings(conf.read(registry))
 
     def test_unreachable_wait_requires_whole_seconds_in_range(self) -> None:
         key = target_config.UNREACHABLE_WAIT_KEY

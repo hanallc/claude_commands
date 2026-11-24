@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.for_you.action import ActionStore, ActionStoreError, REVIEW_PATH
-from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
+from scripts.lib.user_zone import settings_path as user_zone_path, user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
 from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
@@ -465,7 +465,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     sources = ReviewSourceStamps()
     sources.extend((folder/change_browser.MANIFEST, staff.record_path(), state_root(),
                     change_review.lists_directory(), urgency.state_dir(), conf.path('review_links'), conf.path('production'), conf.path('statusline'),
-                    Path(USER_ZONE_CONF)))
+                    Path(user_zone_path())))
     zone = user_zone()
     token,initial = change_browser.browser_manifest(folder)
     members = staff.snapshot()

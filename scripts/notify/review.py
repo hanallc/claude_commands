@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cas
 from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
-from scripts.lib import conf_reads, models_registry, nix_env
+from scripts.lib import conf, conf_reads, models_registry, nix_env
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -49,7 +49,8 @@ STATE_DIR = Path.home() / ".local/state/notify"
 GUIDE = Path.home() / "rust/nate_style/message"
 LOADER = Path.home() / ".claude/scripts/ux_style/load-ux-style.sh"
 PROMPT_FILE = Path(__file__).with_name("reviewer_prompt.md")
-NOTIFY_CONFIG = ROOT / "config/notify.conf"
+# A test run sets CONF_DIR before import, so its defaults come from the test-owned twin.
+NOTIFY_CONFIG = conf.test_config_path("notify") if "CONF_DIR" in os.environ else ROOT / "config/notify.conf"
 HOLD_SECONDS = 300
 # Minimum age; the configured review and post budgets may require more time.
 CLAIM_STALE_SECONDS = 120

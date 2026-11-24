@@ -131,6 +131,13 @@ class ProgressHistoryTests(unittest.TestCase):
         self.team_slot = ""
         self.models_config_file = self.root / ".claude" / "config" / "models.conf"
         _ = write_registry(self.models_config_file)
+        accounts = self.models_config_file.with_name("accounts.json")
+        _ = accounts.write_text('{"workers": ""}\n', encoding="utf-8")
+        self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root),
+            "CONF_DIR": str(self.config_file.parent),
+            "MODELS_CONFIG_FILE": str(self.models_config_file),
+        }))
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -352,8 +359,8 @@ from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-          pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+          pass_recorder.DEFAULT_MODELS_CONFIG_PATH, user_zone.settings_path(),
+          {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
 plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
@@ -368,7 +375,7 @@ for number in (1, 2):
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
                    'UNIT_NOW_EPOCH': '1000'}
-    for key in ('CONF_DIR', 'MODELS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
+    for key in ('CONF_DIR', 'MODELS_CONFIG_FILE', 'UNIT_HISTORY_DIR', 'USER_ZONE_CONF',
                 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         environment.pop(key, None)
     session = home / 'session'
@@ -391,8 +398,8 @@ for number in (1, 2):
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-                pass_recorder.DEFAULT_MODELS_CONFIG_PATH,
-                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+                pass_recorder.DEFAULT_MODELS_CONFIG_PATH, user_zone.settings_path(),
+                {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
 '''

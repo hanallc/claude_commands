@@ -3286,7 +3286,7 @@ class ChangePageTests(unittest.TestCase):
         settings = self.temporary / "config/review_links.conf"
         _ = settings.write_text("\n".join(line for line in settings.read_text().splitlines()
                                          if line.partition("=")[0].strip() != "feedback_rows") + "\n")
-        with self.assertRaisesRegex(conf.Unusable, "feedback_rows.*key is missing"):
+        with self.assertRaisesRegex(conf.Unusable, "feedback_rows is missing; add it to "):
             _ = change_page.render(self.page, change_page.DeliveryStatus(self.root))
 
     def test_multiline_browser_answers_preserve_messages_and_repeat_without_changes(self) -> None:

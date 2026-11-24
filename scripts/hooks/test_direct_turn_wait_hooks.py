@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.agents import remote
 
 import json
@@ -86,6 +87,9 @@ class DirectorWaitFixture:
 def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct") -> Generator[DirectorWaitFixture]:
     with short_socket_directory("turn-wait-") as temporary, ExitStack() as resources:
         root = Path(temporary)
+        config = root / ".claude/config"
+        config.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(config / "idle_update.conf")
         _ = resources.enter_context(mock.patch.object(unit_runs, "RUN_ROOT", root / "unit"))
         run = root / "unit" / "run"
         run.mkdir(parents=True)

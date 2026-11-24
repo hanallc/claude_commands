@@ -92,6 +92,7 @@ class ProducerRoleColorTests(unittest.TestCase):
         use_fixture_history(self, configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "statusline.conf", "role.producer=pink\n")
+        _ = write_config_fixture(configuration / "machines.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         reading = accounts.StatusReading((replace(status_row("plain-account"), roles=("producers",)),), (), (),
                                          timezone.utc, AT)
@@ -506,6 +507,7 @@ window.fetch=(url,options)=>options?.method==='POST'
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
         _ = write_config_fixture(config / "accounts.conf", ACCOUNT_SETTINGS)
         _ = (config / 'statusline.conf').write_text('account.claude1=brown\nrole.unit-director=yellow\nrole.worker=#c0c0c0\n')
+        _ = write_config_fixture(config / "machines.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {'CONF_DIR': str(config)})))
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
                                          upcoming_moves=("Upcoming moves:", "units → claude1"))
@@ -1458,6 +1460,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
             _ = write_config_fixture(config.parent / "accounts.conf", ACCOUNT_SETTINGS)
+            _ = write_config_fixture(config.parent / "machines.conf")
             for value, expected in (("brown", "#af875f"), ("magenta", "#800080"),
                                     ("#A0522D", "#A0522D"), ("#af875f", "#af875f"), ("", ""),
                                     ('red;position:fixed', ""), ('\"><script>alert(1)</script>', "")):
@@ -1482,6 +1485,10 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 
     def test_color_save_validates_the_request_and_uses_this_checkouts_tune(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"CONF_DIR": temporary}):
+            _ = write_config_fixture(Path(temporary) / "machines.conf")
+            models = Path(temporary) / "models.conf"
+            _ = models.write_text("[codex.agents]\ngpt-6.2-sol=high\n")
+            self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}))
             _ = (Path(temporary) / "statusline.conf").write_text(
                 "account.claude1=brown\nrole.units=teal\nrole.worker=white\nlevel.ok=green\nmodel.claude-opus-5-5=#e08a5c\n")
             for key, value in (("account.unknown", "#af875f"), ("claude1", "#af875f"), ("role.units", "#af875f"),

@@ -131,7 +131,10 @@ class UserZoneTests(unittest.TestCase):
                          + "user_zone() to astimezone(), or add the script to USES_THE_MACHINE_ZONE with the reason")
 
     def test_the_shipped_setting_is_a_real_zone(self) -> None:
-        env = {key: value for key, value in os.environ.items() if key not in ("USER_ZONE", "USER_ZONE_CONF")}
+        env = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
+        from scripts.lib import conf
+
+        env["USER_ZONE_CONF"] = str(conf.test_config_path("user_zone"))
         result = subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.strip())

@@ -860,7 +860,7 @@ class LiveConfigTripwireTests(unittest.TestCase):
             result = gate.finish_gate_job(job, 0)
         self.assertTrue(result.tripwire_tripped)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("a test attempted to write live configuration at /fixture/config/console.conf", result.output)
+        self.assertIn("a test attempted to read or write live configuration at /fixture/config/console.conf", result.output)
         self.assertFalse(job_root.exists())
 
 

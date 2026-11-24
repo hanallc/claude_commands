@@ -25,7 +25,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.checkout_test_support import copy_runtime
-from scripts.lib import user_zone
+from scripts.lib import conf, user_zone
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
@@ -181,13 +181,11 @@ class NotifierTests(unittest.TestCase):
             "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
         })
         if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
-            config = environment.get("USER_ZONE_CONF") or str(
-                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
+            config = environment.get("USER_ZONE_CONF") or str(conf.test_config_path("user_zone"))
             if not Path(config).is_absolute():
                 config = str(Path.cwd() / config)
             try:
-                with mock.patch.object(user_zone, "CONF", config):
-                    zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
+                zone = invoke_cli(user_zone, user_zone.main, [], {**environment, "USER_ZONE_CONF": config}, self.root)
             except Exception:
                 # The shell ignores helper failures and uses the machine zone.
                 environment["SHOWN_ZONE"] = ""

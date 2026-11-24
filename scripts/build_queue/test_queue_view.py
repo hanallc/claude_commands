@@ -75,7 +75,8 @@ class RecordedOwnerQueueTests(unittest.TestCase):
         from scripts.production import staff
         from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
-        with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+        with (QueueFixture() as fixture, mock.patch.dict(os.environ, {"HOME": str(fixture.root)}),
+              isolated_staff_file(fixture.root / "staff.json", {})):
             runner = fixture_member("showrunner", name="hana")
             unit = fixture_member("unit", name="demo", parent=runner.id)
             worker = fixture_member("worker", name="impl", parent=unit.id)

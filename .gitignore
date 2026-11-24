@@ -23,6 +23,8 @@
 /config/accounts.json
 /config/accounts.lock
 /config/models.conf.*
+!test_config/
+!test_config/**
 !docs/
 !docs/**
 docs/plans/*-log.md

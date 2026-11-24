@@ -61,11 +61,7 @@ class RecordBusy(TimeoutError):
 
 
 def record_lock_seconds() -> float:
-    key = "RESTART_RECORD_LOCK_SECONDS"
-    config = conf.read_or_repository("shutdown")
-    if isinstance(config.settings, dict) and config.effective_key(key) not in config.settings:
-        config = conf.read(Path(__file__).resolve().parents[2] / "config" / "shutdown.conf")
-    return config.number(key)
+    return conf.read_or_repository("shutdown").number("RESTART_RECORD_LOCK_SECONDS")
 
 
 @contextmanager

@@ -1,6 +1,7 @@
 """Prove group membership, sender identity, and one concurrent delivery per address."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -85,6 +86,9 @@ class BroadcastTests(unittest.TestCase):
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
+        config = self.root / ".claude/config"
+        config.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(config / "machines.conf")
         _ = (self.root / "ps").write_text("", encoding="utf-8")
         binaries = self.root / "bin"
         binaries.mkdir()

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import process_table
 from scripts.herdr import herdr_types
 from scripts.message import codex_daemon
@@ -312,6 +313,10 @@ class TopLevelRunningRecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="tl-", dir="/tmp")))
+        config = self.folder / ".claude/config"
+        config.mkdir(parents=True, exist_ok=True)
+        _ = write_config_fixture(config / "machines.conf")
+        _ = write_config_fixture(config / "codex_daemon.conf")
         self.directory = self.folder / "sessions"
         self.directory.mkdir()
         binaries = self.folder / "bin"

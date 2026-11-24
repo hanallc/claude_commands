@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -16,6 +17,7 @@ from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, VERIFY, write_fixture_cargo_mend
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class VerifyLintToolVersionTests(VerifyLintCacheFixture):
@@ -196,6 +198,13 @@ if sys.argv[1:] == ["mend", "--build-info"]:
 
 
 class LintVersionKeyTests(TreeWatchFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        configuration = self.root / "config"
+        _ = write_config_fixture(configuration / "direct.conf")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
+
     def test_unknown_versions_preserve_the_input_watch(self) -> None:
         metadata = json.dumps(self.metadata)
         expected = tree_watch.TreeInputs(["--", "lint"], metadata)

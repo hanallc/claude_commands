@@ -33,7 +33,7 @@ from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib import process_group
+from scripts.lib import conf, process_group
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
@@ -921,7 +921,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_OWNER_SOURCE": str(self.root / "natedev-sources"),
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
+            "STAFF_CONFIG": str(shutil.copyfile(conf.test_config_path("staff"), self.root / "staff.conf")),
         })))
         _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))

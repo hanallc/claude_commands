@@ -66,7 +66,9 @@ PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / 
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or session_send.SEND_SCRIPT)
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
-WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+# A test run sets CONF_DIR before import, so its defaults come from the test-owned twin.
+WATCH_DEFAULTS = (tunables.test_config_path("stall_watch") if "CONF_DIR" in os.environ
+                  else Path(__file__).resolve().parents[2] / "config/stall_watch.conf")
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"

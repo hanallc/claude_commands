@@ -413,7 +413,7 @@ settings_local_keys_notices deliver
 ''', check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("postmaster.conf", result.stderr)
-        self.assertIn("no usable committed value", result.stderr)
+        self.assertIn("is missing", result.stderr)
         self.assertEqual(self.sends(), [])
         self.assertIn('"pending"', self.history.read_text())
 

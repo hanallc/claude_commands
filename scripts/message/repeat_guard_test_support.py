@@ -73,8 +73,9 @@ def install_notice_test_config(home: Path) -> Path:
     """Give notice fixtures real settings without repository recovery."""
     config = home / ".claude/config"
     config.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).resolve().parents[2] / "config/send.conf"
-    _ = copy_config_file_fixture(source, config / "send.conf")
+    source = Path(__file__).resolve().parents[2] / "config"
+    for name in ("send", "send_repeat_guard"):
+        _ = copy_config_file_fixture(source / f"{name}.conf", config / f"{name}.conf")
     return config
 
 

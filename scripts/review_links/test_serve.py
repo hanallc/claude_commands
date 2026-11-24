@@ -102,6 +102,7 @@ def setUpModule() -> None:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
+    _ = write_config_fixture(configuration / "machines.conf")
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
         "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
@@ -4691,7 +4692,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             (question, 'answer'), (investigation_key, 'read'), (question, 'later')))
 
         _, efficiency = case.decisions()
-        config = Path(__file__).resolve().parents[2]/'config/nightly_review.conf'
+        config = conf.test_config_path("nightly_review")
         _ = shutil.copyfile(config, case.fixture.temporary/'config/nightly_review.conf')
         self.assert_stale_review_actions(case, ((efficiency, 'approve'), (efficiency, 'decline')))
 

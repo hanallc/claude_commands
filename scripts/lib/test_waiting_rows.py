@@ -21,6 +21,7 @@ from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_ro
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import pending_rows
+from scripts.lint.memory_test_support import write_config_fixture
 
 SETTINGS = "# whole: 1..\namount=2\n# whole: 1..\nlimit=5\n"
 REGISTRY = "[assignments]\ndirect=codex\nreview=gpt-a:high\n"
@@ -50,6 +51,7 @@ class WaitingRowsTests(unittest.TestCase):
         _ = (self.checkout / "config/example.conf").write_text(SETTINGS)
         _ = (self.checkout / "config/models.conf").write_text(REGISTRY)
         _ = (self.checkout / "config/statusline.conf").write_text(STATUSLINE)
+        _ = write_config_fixture(self.checkout / "config/machines.conf")
         self.run_git(self.checkout, "add", ".")
         self.run_git(self.checkout, "commit", "-qm", "start")
         self.run_git(self.checkout, "push", "-q", "origin", "HEAD:main")
@@ -215,6 +217,15 @@ class WaitingRowsTests(unittest.TestCase):
         waiting_rows.move_to(self.checkout, target)
         with pending_rows() as changes:
             self.assertEqual(changes, [])
+
+    def test_a_missing_live_models_file_refuses_a_new_model_color(self) -> None:
+        models = self.checkout / "config/models.conf"
+        _ = models.write_text("[codex.agents]\ngpt-6.2-sol=high\n")
+        _ = os.environ.pop("MODELS_CONFIG_FILE", None)
+        self.assertTrue(waiting_rows.model_color_key("statusline", "model.gpt-6.2-sol"))
+        models.unlink()
+        with mock.patch.object(conf, "test_config_path", side_effect=AssertionError("no fallback file")):
+            self.assertFalse(waiting_rows.model_color_key("statusline", "model.gpt-6.2-sol"))
 
     def test_new_model_colors_stay_live_through_a_main_change_to_statusline(self) -> None:
         catalog = self.root / ".claude/cache/model-catalog/fixture-cc.json"
