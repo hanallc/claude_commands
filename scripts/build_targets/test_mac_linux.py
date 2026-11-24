@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import timedelta
 import errno
@@ -272,7 +272,8 @@ signal.pause()
 '''
 
 
-GATE_FIXTURE = '''import fcntl
+GATE_FIXTURE = '''from dataclasses import replace
+import fcntl
 import os
 from pathlib import Path
 import signal
@@ -292,9 +293,11 @@ def checked_git(repo, *args):
 
 class WholeMachine:
     module_progress = None
+    rerun_failed_modules = False
 
-    def __init__(self, module_progress=None):
+    def __init__(self, module_progress=None, *, rerun_failed_modules=False):
         self.module_progress = module_progress
+        self.rerun_failed_modules = rerun_failed_modules
 
 
 def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
@@ -362,7 +365,12 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
                                 capture_output=True, text=True)
         jobs += (GateJobResult(*TYPE_CHECK_JOB, result.returncode, 0, result.stdout + result.stderr,
                                kind=GateJobKind.TYPE_CHECK),)
-    return GateRun(jobs, 2.0, 30, selection_certified=isinstance(selected, SelectedModules), executions=jobs)
+    executions = jobs
+    if scenario == 'rerun-alone':
+        assert machine.rerun_failed_modules, 'The guest gate did not enable failure reruns.'
+        first = replace(jobs[0], returncode=1, output='fixture first failure')
+        executions = (first, *jobs[1:], jobs[0])
+    return GateRun(jobs, 2.0, 30, selection_certified=isinstance(selected, SelectedModules), executions=executions)
 '''
 
 
@@ -3780,6 +3788,22 @@ fi
         self.assertIs(types.kind, GateJobKind.TYPE_CHECK)
         self.assertEqual(types.output, 'Type check: scripts/fixture, scripts/lib\n')
         self.assertEqual(result.module_skips, {'scripts/fixture/test_second.py': 1})
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_enables_failure_reruns_and_reports_the_pass_on_natedev(self) -> None:
+        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'rerun-alone',
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}),
+              redirect_stdout(io.StringIO()) as output):
+            result = gate.run_gate_suites(self.repo, full=True, module_time_limit_s=3,
+                                          target=gate.MacLinuxAssignment(self.placed))
+        self.assertTrue(result.passed)
+        attempts = [job for job in result.executions if job.module == 'test_first.py']
+        self.assertEqual([job.returncode for job in attempts], [1, 0])
+        self.assertEqual(attempts[0].output, 'fixture first failure')
+        label = '--- fixture/test_first.py passed on rerun alone; first run exit=1 ---'
+        self.assertEqual(output.getvalue().count(label), 1)
+        self.assertIn('fixture first failure', output.getvalue())
+        self.assertIn('Mac Linux guest gate passed: 2 modules', output.getvalue())
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:

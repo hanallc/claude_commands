@@ -11,6 +11,7 @@ import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -32,7 +33,7 @@ from typing import BinaryIO, Literal, NamedTuple, TextIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
 
-from scripts.herdr import herdr
+from scripts.herdr import herdr, message_proof
 from scripts.herdr import pane_launch
 from scripts.herdr import fake_herdr
 from scripts.message import codex_daemon
@@ -196,6 +197,87 @@ class NativePaneSessionTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HERDR_BIN": str(Path(herdr.__file__).with_name("fake_herdr.py")),
         })))
+
+    def test_message_recipient_lookup_skips_a_candidate_with_an_unreadable_environment(self) -> None:
+        denied_pid, recipient_pid = 998070, 998071
+        identity = fixture_runtime_id("readable-recipient")
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        proc = self.root / "proc"
+        denied_path = proc / str(denied_pid) / "environ"
+        readable_path = proc / str(recipient_pid) / "environ"
+        readable_path.parent.mkdir(parents=True)
+        readable_path.touch()
+        foreground = [{"pid": pid, "argv": ["claude"]} for pid in (denied_pid, recipient_pid)]
+        info: dict[str, object] = {"foreground_processes": foreground}
+        read_bytes = Path.read_bytes
+        denied_environments = {denied_path}
+
+        def read_process_file(path: Path) -> bytes:
+            if path in denied_environments:
+                raise PermissionError(13, "Permission denied", str(path))
+            return read_bytes(path)
+
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="fixture-start"),
+              patch.object(staff, "runtime_id", return_value=identity) as runtime_id,
+              patch.object(Path, "read_bytes", read_process_file)):
+            proof = message_proof.ProvedMessageOwner(conversation=identity, pid=recipient_pid, start="fixture-start")
+            with message_proof.message_lookup(proof), herdr.process_action():
+                with message_proof.message_lookup(message_proof.StrictOwnerProof.REQUIRED):
+                    self.assertIsInstance(herdr.pane_foreground(place, info), herdr.UnknownPaneOwner)
+                owner = herdr.pane_foreground(place, info)
+                self.assertIsInstance(owner, herdr.ProvedClaudeForeground)
+                assert isinstance(owner, herdr.ProvedClaudeForeground)
+                self.assertEqual(owner.pid, recipient_pid)
+                self.assertEqual(herdr.read_foreground_pane_owner(owner, {}).current_identity, identity)
+                runtime_id.assert_called_once_with(recipient_pid)
+                denied_environments.add(readable_path)
+                unknown = herdr.pane_foreground(place, info)
+                self.assertIsInstance(unknown, herdr.UnknownPaneOwner)
+                assert isinstance(unknown, herdr.UnknownPaneOwner)
+                self.assertIn("Permission denied", unknown.reason)
+                self.assertIn(str(readable_path), unknown.reason)
+
+            denied_environments.remove(readable_path)
+            for other in (replace(proof, conversation=fixture_runtime_id("other-recipient")),
+                          replace(proof, pid=denied_pid), replace(proof, start="old-start")):
+                with self.subTest(message_owner=other), message_proof.message_lookup(other):
+                    self.assertIsInstance(herdr.pane_foreground(place, info), herdr.UnknownPaneOwner)
+            self.assertIsInstance(herdr.pane_foreground(place, info), herdr.UnknownPaneOwner)
+            self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.UnprovedForegroundOwner)
+
+    def test_close_pane_refuses_when_either_claude_environment_is_unreadable(self) -> None:
+        first, second = 998070, 998071
+        identity = fixture_runtime_id("closure-target")
+        client = herdr.Herdr("agents")
+        pane = "w1:p1"
+        row = {"pane_id": pane, "terminal_id": "terminal-one"}
+        info = {"shell_pid": 998069, "foreground_process_group_id": first,
+                "foreground_processes": [{"pid": pid, "argv": ["claude"]} for pid in (first, second)]}
+        for denied_pid in (first, second):
+            with self.subTest(denied_pid=denied_pid):
+                readable_pid = second if denied_pid == first else first
+                proof = message_proof.ProvedMessageOwner(conversation=identity, pid=readable_pid, start="fixture-start")
+
+                def read_environment(process: Path) -> dict[str, str]:
+                    if process.name == str(denied_pid):
+                        raise PermissionError(13, "Permission denied", str(process / "environ"))
+                    return {}
+
+                errors = io.StringIO()
+                with (patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")}),
+                      patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(herdr, "_process_environment", side_effect=read_environment),
+                      patch.object(sessions, "process_start", return_value="fixture-start"),
+                      patch.object(staff, "runtime_id", return_value=identity),
+                      patch.object(client, "pane_row", return_value=row),
+                      patch.object(client, "result", return_value={"process_info": info}),
+                      patch.object(client, "run") as run,
+                      message_proof.message_lookup(proof), redirect_stderr(errors)):
+                    self.assertFalse(client.close_pane(pane, target=identity))
+                self.assertIn("Permission denied", errors.getvalue())
+                run.assert_not_called()
 
     def test_pane_agent_process_reads_only_the_foreground_agent_without_native_identity(self) -> None:
         from scripts.herdr.test_worker_panes import PaneWorld
@@ -5092,6 +5174,7 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("herdr_types.py"), isolated / "herdr_types.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("message_proof.py"), isolated / "message_proof.py")
         message = isolated.parent / "message"
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
