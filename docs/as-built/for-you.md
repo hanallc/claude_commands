@@ -41,21 +41,25 @@ The CLI provides no completion command.
 
 `scripts/review_links/for_you.py` returns a `ForYouSnapshot` with typed `ForYouRow` values.
 It groups rebuild needs into one row per machine.
-It also reads completed needs and the current rebuild comparison.
-Each `RebuildRequest` retains its reason, requester, concerns, and switch evidence.
+Each rebuild card lists its open requests under Why.
+Each request shows its reason, requester and time.
+An old time without a UTC offset uses UTC.
+An old request with no reason shows `No reason given`.
+The card uses the oldest open request for its age.
+When only the comparison calls for a rebuild, the card has no request age.
+The card reports an unknown running revision when neither embedded metadata nor an active switch confirms it.
+The requests stay open until the background refresh or the clear command confirms completion.
+Completed requests appear on Rebuild details in order of completion, newest first.
 Staff names replace known staff IDs for display.
 `rebuild.cwd.natedev` and `rebuild.cwd.mac` supply each target machine's rebuild working directory.
 The reader preserves `~/` for expansion on the target machine.
 `rebuild.repo` remains the evaluation repository.
-Waiting work shows the affected staff member's name and open phase from the staff member's recorded run.
-A worker uses its unit's recorded run.
-A missing staff row or open phase shows the name or staff ID with `Not recorded`.
 The reader creates no second rebuild store.
 
 A stale comparison or failed machine probe cannot prove completion.
 The comparison cache records running-system probe availability for each machine.
 A legacy cache without that field leaves the comparison unavailable.
-Historical rows use `unknown` when the reader cannot confirm their current state.
+The card says `The running revision is unknown.` when it cannot identify the running revision.
 `UnavailableSource` identifies each failed source.
 `KnownOpenCount` counts each open machine row and each open agent action once.
 `UnavailableOpenCount` retains the known open count without claiming a complete count.
@@ -100,7 +104,9 @@ On a miss, `assignment.py` reads the current sources.
 It saves the session fields only after a complete read with unchanged sources and a valid deadline.
 The Mac requests the rebuild machines and counts from the console host without command text.
 The Mac resolves the peer in `console.conf` setting `for_you.host` with `tailscale ip -4`.
-The status line omits a known zero count and shows `Unavailable` for an incomplete read.
+The status line omits a known zero count.
+When only the needs scan is incomplete, the status line keeps the valid rebuild names and shows a count such as `1+ actions`.
+For other incomplete reads, it shows `Unavailable`.
 It keeps the known rebuild names when the count is unavailable.
 Legacy review cache labels remain readable during the transition.
 The status line no longer inserts rebuild text into review counts.
