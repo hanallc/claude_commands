@@ -132,6 +132,40 @@ As built (checkpoint 6e39bb203c, stacked on phase 7 on `natedev-postmaster-relay
 - Tests: `scripts/notify/test_push_texts.py`, `test_pushover.py`, `test_review.py`. As-built: `docs/as-built/message-clarity.md`.
 - Gate: the showrunner asked for direct tests instead of the queue (11-22 17:44 PST). 718 tests in `scripts.message.test_send` and all `scripts/notify` test modules passed. The merge gate is the full proof.
 
+### Phase 9 — An announcement goes to live sessions only  · status: todo
+
+List item 268 (nate 11-23 14:08 PST, showrunner task 14:07 PST). `broadcast.py --all` printed 887 lines: 59 sent and 824 closed workers.
+
+#### Work Order
+
+**Goal:** An announcement selects live sessions only. It makes no send attempt to a closed worker and prints no line for it. One line for each live session stays, with the count line.
+
+1. `_broadcast` in `scripts/production/broadcast.py` leaves closed worker rows out of the recipients of every group. A typed check in `scripts/message/roster.py` names the closed state; the roster row stays as it is.
+2. Stopped, unknown and incomplete workers, blind reviewers and Claude sessions with no messaging socket keep their line.
+3. Tests: rows in `scripts/production/test_broadcast.py`. As-built: the broadcast recipient doc.
+
+**Acceptance gate:** `targeted_test.py --affected --repo <worktree>` passes; basedpyright clean on each changed file; live `/announce` to all shows no closed worker line.
+
+### Phase 10 — Approved push texts go into the catalog  · status: done
+
+As built (checkpoint 0b8bbb4980, branch `postmaster-textcat`, stacked with phase 11):
+
+- `scripts/notify/push_catalog.py` carries the texts nate approved on the Images page: quota.claude_expiry, mac_idle.unreachable, nightly.result, nixos.gpu_stopped, nixos.ups_no_contact, nixos.ups_power_back, nixos.ups_replace_battery, nixos.ups_shutdown, silence.auto_off, silence.auto_on. `push_texts_reviewed.json` records each approval with nate's words, place and time.
+- `hide_sender_values` raises when a hidden sender value is missing; `silence_auto_off_values` raises on an unknown held sentence; `mac_idle_unreachable_values` keeps `minutes` for the sender.
+- `scripts/notify/push_texts.py` renders no trailing newline for an empty body.
+- nixos.ups_battery and quota.codex_workers_moved stay as on main: their approved titles exceed the 44-character phone title. Shorter titles went back to nate.
+- Tests: `scripts/notify/test_push_texts.py`, `test_pushover.py`, `scripts/whoami/test_quota_alert_expiry.py`.
+- Gate: `--affected`, Mac Linux guest gate passed, 697 modules (11-24).
+
+### Phase 11 — A production announcement survives a passing unreadable record  · status: done
+
+As built (commit 3d4a6fc921 on `postmaster-retry`, stacked as checkpoint 0b8bbb4980):
+
+- The `--production` path in `scripts/production/broadcast.py` reads the roster a second time when each roster problem is an unreadable session record, on either machine. The wait before the second read comes from `config/session_retries.toml`. A record still unreadable stops the send, as the staff-copies phase 52 rule requires. Any other problem stops it at once.
+- `scripts/message/roster.py` names the unreadable-record problem as a typed value.
+- Tests: `scripts/production/test_broadcast.py` (recovers on the second read with a recipient seen only then, stays blocked, other problem stops at once; the sleep uses the configured wait), `scripts/message/test_roster.py`.
+- Gate: stacked with phase 10, 697 modules passed (11-24).
+
 ## Acceptance gate
 
 - basedpyright reports zero errors, zero warnings and zero notes on each changed Python file.
