@@ -780,43 +780,24 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 **Ruled out:** a cap in code on the edited-crate maximum: the limit line `whole: 1..48` holds the bound.
 
 ### Phase 18 — Message limit follow-ups  · status: done
-**Depends on:** Phase 11
 
-#### Work Order
+#### As-built
 
-**Goal:** An unusable `notify` sender limit no longer stops an emergency push cancel or a push sent with no `--source`, and an unusable `waste_watch` wait-share limit no longer stops the context alerts.
-
-**Spec:**
-
-1. **Audit source.** `scripts/notify/pushover.py` `parent_source()` (line 176) cuts the parent command to `pushover.max_source_chars`. Since Phase 11 it raises `conf.Unusable` when that limit has no usable value. Two callers then fail before any log row: `cancel` (line 699) when no `--source` is given, and the post path in `main` (line 408).
-   - `parent_source()` never raises `conf.Unusable`. When the limit is unusable, it returns `parent pid <ppid>` and prints the conf diagnostic on stderr. Add no number (P807 rule 7).
-   - `cancel KEY` with an unusable limit and no `--source` still sends the cancel request and logs its outcome with source `parent pid <ppid>`.
-   - A post with no `--source` and an unusable limit reaches `post_message`, which refuses and logs it (Phase 11).
-2. **Context alerts.** `scripts/usage/waste_watch.py` `watch()` (line 384) reads `alert.max_wait_share` before the context alert check, which does not use that value. When the read raises `conf.Unusable`, the pass prints the diagnostic on stderr, sends no wait alert, and still sends each context alert. The command then exits 1, so the collector journal shows the fault.
-3. **Tests.** Each new test fails before the repair.
-   - `scripts/notify/test_pushover.py`: `cancel` with no `--source` and an unusable limit sends the cancel and logs it with source `parent pid <ppid>`. The post command with no `--source` and an unusable limit returns 2 and logs the refusal.
-   - `scripts/usage/test_waste_watch.py`: with an unusable `alert.max_wait_share`, a pass with a context-flagged thread sends the context alert, sends no wait alert, prints the diagnostic and exits 1.
-4. **Docs.** `docs/as-built/usage-ledger.md` (line 400) says when the watch reads `alert.max_wait_share`. Add the rule of item 2 in one STE sentence.
+- `pushover.parent_source()` never raises `conf.Unusable`. With an unusable `pushover.max_source_chars` it prints the diagnostic on stderr and returns `parent pid <ppid>`. Conf warnings of a usable read print once, through `conf.diagnostics(report=False)`.
+- `cancel KEY` with no `--source` and an unusable limit sends the cancel request and logs its outcome with source `parent pid <ppid>`.
+- `send` takes `arguments["source"] if arguments["source"] is not None else parent_source()`. The parsed source is never `None` there, because `parse` falls back to the template sender, so `parent_source()` runs only in `cancel`. An empty template sender is refused with `no sender` and nothing posts.
+- `waste_watch.watch()` holds the wait share as `float | conf.Unusable`. With an unusable `alert.max_wait_share` the pass sends no wait alert, still sends each context alert, and raises the error after the pass, so `main` exits 1 with the diagnostic on stderr. When the state write fails in that pass, the config diagnostic prints before the write error.
+- `docs/as-built/usage-ledger.md` states the waste watch rule.
 
 **Files:**
-- `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py`
-- `scripts/usage/waste_watch.py`, `scripts/usage/test_waste_watch.py`
-- `docs/as-built/usage-ledger.md`
+- `scripts/notify/pushover.py` — the `parent_source` fallback
+- `scripts/notify/test_pushover.py` — the unusable-limit cancel row of `test_cancel_posts_cancel_by_tag_with_the_token_and_logs`; the send-path row of `test_an_empty_sender_is_refused_and_nothing_is_posted`
+- `scripts/usage/waste_watch.py` — the wait-share fault path
+- `scripts/usage/test_waste_watch.py` — `test_the_command_sends_context_alerts_when_the_wait_share_is_unusable`, with and without a failed state write
+- `docs/as-built/usage-ledger.md` — the rule
 
-**Workers:** 2 writers — split by module.
-- `impl` — `scripts/notify/pushover.py`, `scripts/notify/test_pushover.py`
-- `test` opens as impl — `scripts/usage/waste_watch.py`, `scripts/usage/test_waste_watch.py`, `docs/as-built/usage-ledger.md`
+**Gotchas:**
+- `send` always has a source from the template sender. A change that treats an empty source as absent sends the parent command as sender in place of the `no sender` refusal.
 
-**State:** none
-
-**Constraints from prior phases:**
-- Phase 11: `conf.Unusable` is a `ValueError`. It is raised only when the live value and the committed value both fail.
-- Phase 11: `post_message` refuses an unusable sender limit. It logs `REFUSED_BEFORE_SENDING: <diagnostic>` with the detail suffix, prints one stderr line and returns 2. `conf.diagnostics(report=False)` collects conf warnings for one print.
-- Phase 11: `watch()` reads `alert.max_wait_share` once per pass and passes it to `UnitUsage.wait_alert(max_wait_share)`; `alert_text(..., *, wait_alert)` takes the result. `main` reports `conf.Unusable` on stderr with exit 1.
-- Phase 11: tests write `notify.conf` and `waste_watch.conf` fixtures with `write_config_fixture` under `CONF_DIR`.
-
-**Acceptance gate:**
-- The new tests fail before the repair and pass after it.
-- `scripts/notify/test_pushover.py`, `scripts/notify/test_silence.py` and `scripts/usage/test_waste_watch.py` pass.
-- The queued `gate.py --affected` run passes, except a red that also fails on the base commit.
-- basedpyright reports zero errors and zero warnings on each changed Python file.
+**Ruled out:**
+- A sender limit check before silence keeps a push: the release refuses and logs a kept push with an unusable limit.
