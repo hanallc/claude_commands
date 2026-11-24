@@ -91,6 +91,12 @@ class ReviewIndexEntry(TypedDict):
     unreadAnswer: NotRequired[bool]
 
 
+class LinkedImageAnswer(TypedDict):
+    """A completed Images answer that an item link opens in the table."""
+    entry: ReviewIndexEntry
+    body: str
+
+
 def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
     """Identify the complete retained record and its displayed assets."""
     source = item.source
@@ -247,13 +253,17 @@ class ReviewSnapshot:
 
     def linked_card(self, root: Path, key: str, *, view: ReviewBodyView = ReviewBodyView.CARD) -> bytes:
         """Serve an active or completed card."""
-        if key in self.records:
-            return self.body(key, view=view)
-        item = next((item for item in review_items.read(
-            root, members=self.members, kinds=TYPES, show=ReviewState.DONE)
-            if item.key == key), None)
-        if item is None:
-            raise LookupError('This item is not in the current snapshot.')
+        item = self.records.get(key)
+        if item is not None:
+            origin = review_items.submission_origin(item)
+            if not isinstance(origin, new_item_dialog.ReviewSubmission) or not origin.image_card_labels():
+                return self.body(key, view=view)
+            try:
+                item = review_items.read_current(root, item, self.members)
+            except review_items.ReviewRecordMissing:
+                item = self.completed_item(root, key)
+        else:
+            item = self.completed_item(root, key)
         item = review_items.normalize_times(item, self.zone)
         assets: dict[str, str] = {}
         retain_asset(item, assets)
@@ -262,6 +272,22 @@ class ReviewSnapshot:
             return body
         entry = card_entry(item, self.members, self.names, self.zone)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
+
+    def completed_item(self, root: Path, key: str) -> ReviewItem:
+        kinds = review_items.QUESTION_TYPES if key.startswith('question/') else TYPES
+        for item in review_items.read(root, members=self.members, kinds=kinds, show=ReviewState.DONE):
+            if item.key == key:
+                return item
+        raise LookupError('This item is not in the current snapshot.')
+
+    def linked_image_answer(self, key: str) -> LinkedImageAnswer:
+        """Read one completed Images Question for a link into the table."""
+        item = review_items.completed_image_question(key, self.members, self.zone)
+        item = review_items.normalize_times(item, self.zone)
+        assets: dict[str, str] = {}
+        retain_asset(item, assets)
+        return LinkedImageAnswer(entry=card_entry(item, self.members, self.names, self.zone),
+                                 body=self.render_body(item, assets).decode())
 
     def render_body(self, item: ReviewItem, assets: Mapping[str, str]) -> bytes:
         body = CARD_ERROR
@@ -359,16 +385,22 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
         body += '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
     if images:
         links: list[str] = []
+        labels = origin.image_card_labels()
+        image_pair = len(labels) == len(images) == 2
         for at, image in enumerate(images, 1):
-            url = attachment_url(key, image)
-            links.append(f'<a href="{url}" target="_blank" rel="noopener"><img loading="lazy" '
-                         + f'src="{url}" alt="Attachment {at}"></a>')
+            url = attachment_url(key, image, retained=bool(labels))
+            label = labels[at - 1] if image_pair else f'Attachment {at}'
+            link = f'<a href="{url}" target="_blank" rel="noopener"><img loading="lazy" src="{url}" alt="{label}"></a>'
+            links.append(f'<figure><figcaption>{label}</figcaption>{link}</figure>' if image_pair else link)
         body += '<section class="review-attachments"><h3>Attachments</h3>'+''.join(links)+'</section>'
     return body
 
 
-def attachment_url(key: str, image: new_item_dialog.ImageReference) -> str:
-    return html.escape(ATTACHMENT_PATH+'?'+urlencode({'key': key, 'id': image.id}), quote=True)
+def attachment_url(key: str, image: new_item_dialog.ImageReference, *, retained: bool = False) -> str:
+    fields = {'key': key, 'id': image.id}
+    if retained:
+        fields['saved'] = '1'
+    return html.escape(ATTACHMENT_PATH+'?'+urlencode(fields), quote=True)
 
 
 def bug_page_state_box(key: str, state: new_item_dialog.BugPageState, title: str, captured: bool) -> str:
@@ -1462,6 +1494,7 @@ main:has(>[data-review]){max-width:1124px}
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
+.review-attachments figure{display:inline-block;margin:0;vertical-align:top}
 [data-review] .record-filter-row{margin-bottom:12px}
 [data-review] .list-filters:has(>[data-clear-linked-reviews][hidden]){display:none}
 .record-filter-row>.review-types{gap:8px}
@@ -1953,6 +1986,9 @@ function requestReviewCard(key,version,saved=false){
  return fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
   .then(async response=>({response,text:response.ok ? await response.text() : ''}));
 }
+function isSubmittedQuestionKey(key){
+ return typeof key==='string' && key.startsWith('question/') && /-review-[0-9a-f]{64}(?:-\d+)?\.md$/.test(key);
+}
 const firstReviewCard=(()=>{
  const frame=window.frameElement;
  if(frame?.reviewPlace){
@@ -1966,7 +2002,7 @@ const firstReviewCard=(()=>{
  const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
  if(!index.has(key)) return null;
  const version=document.querySelector('[data-review]').dataset.version;
- const result=requestReviewCard(key,version);
+ const result=requestReviewCard(key,version,isSubmittedQuestionKey(key));
  void result.catch(()=>{});
  return {key,version,result};
 })();
@@ -1989,6 +2025,7 @@ const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null,newItemRefresh;
+let linkedAnswer=null,requestedAnswer=null;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function rowOwners(entry){
@@ -2025,7 +2062,7 @@ function awaitsHandoff(key){
 function isListed(entry,filters){
  const {owner,show,type,sourceOwner}=filters;
  const key=entry.key,departure=saved.get(key);
- if(pendingSaves.get(key)?.departing || awaitsHandoff(key)) return false;
+ if(entry.linkedAnswer || pendingSaves.get(key)?.departing || awaitsHandoff(key)) return false;
  return (!departure || entry.type==='for-you' || departure.readAnswer && entry.state!=='Done' ||
   departure.handed && entry.state!=='Open') &&
   availableForFilters(entry,filters) && (!owner || rowOwners(entry).includes(owner)) &&
@@ -2211,7 +2248,44 @@ function applyReviewDetail(key,row,detail,text){
  bindForm(row);
  view.showDraftCopy(reviewDrafts.get(key)?.draft.feedback,Boolean(detail.querySelector('[name="feedback"]')));
 }
+function keepLinkedAnswer(){
+ const key=linkedAnswer?.entry.key;
+ if(key===view.linkedItem && !index.has(key)){
+  index.set(key,linkedAnswer.entry);
+  bodies.set(key,linkedAnswer.body);
+ }
+}
+function loadLinkedAnswer(){
+ const key=view.linkedItem;
+ if(requestedAnswer?.key!==key) requestedAnswer=null;
+ if(linkedAnswer && linkedAnswer.entry.key!==key){
+  const previous=linkedAnswer.entry.key;
+  if(index.get(previous)===linkedAnswer.entry) index.delete(previous);
+  bodies.delete(previous);
+  linkedAnswer=null;
+ }
+ if(!isSubmittedQuestionKey(key) || index.has(key) || requestedAnswer) return;
+ const request={key};
+ requestedAnswer=request;
+ const query=new URLSearchParams({'image-answer':key});
+ void fetch(location.pathname+'?'+query,{cache:'no-store',signal:reviewRequestSignal()})
+  .then(async response=>{
+   if(response.status===404) return;
+   if(!response.ok) throw new Error('HTTP '+response.status);
+   const {entry,body}=await response.json();
+   if(requestedAnswer!==request || view.linkedItem!==key || entry.key!==key || index.has(key)) return;
+   linkedAnswer={entry:{...entry,linkedAnswer:true,order:index.size},body};
+   keepLinkedAnswer();
+   if(!view.retryItemLink()) view.followItemLink({inheritFilters:true});
+  }).catch(error=>{
+   if(requestedAnswer===request && view.linkedItem===key){
+    requestedAnswer=null;
+    view.itemError('The item could not refresh: '+error.message);
+   }
+  });
+}
 function loadBodies(){
+ loadLinkedAnswer();
  view.opened.forEach(key=>{
   const row=view.openItem;
   if(row?.dataset.key!==key || !index.has(key) || !needsBody(row)) return;
@@ -2233,7 +2307,8 @@ function loadBodies(){
   drawSaveControls(recordDetails(row).querySelector('[data-review-form]'));
   const version=content.dataset.version;
   const prefetched=firstRequest?.key===key && firstRequest.version===version;
-  const result=prefetched ? firstRequest.result : requestReviewCard(key,version);
+  const result=prefetched ? firstRequest.result : requestReviewCard(key,version,
+    view.linkedItem===key && isSubmittedQuestionKey(key));
   if(prefetched) firstRequest=null;
   const request=result
    .then(({response,text})=>{
@@ -2557,6 +2632,7 @@ function applyReviewIndex(payload){
  }
  storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
+ keepLinkedAnswer();
  bind();
  const openedLink=view.retryItemLink();
  if(!openedLink) view.apply(false);

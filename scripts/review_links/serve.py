@@ -1006,7 +1006,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 fields = parse_qs(route.query)
                 delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
                 snapshot = server.review_cache.get()
-                if 'body' in fields:
+                if 'image-answer' in fields:
+                    key, = fields['image-answer']
+                    if not key.startswith('question/'):
+                        self.send_error(404)
+                        return None
+                    try:
+                        with server.staff_read_scope():
+                            answer = snapshot.linked_image_answer(key)
+                    except LookupError:
+                        self.send_error(404)
+                    else:
+                        self.json_response(200, answer)
+                    return None
+                elif 'body' in fields:
                     view = (review_page.ReviewBodyView.CARD if fields.get('view') == ['card']
                             else review_page.ReviewBodyView.TABLE)
                     try:
@@ -1877,13 +1890,25 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.send_error(403)
             return None
         fields = parse_qs(query, keep_blank_values=True)
-        if set(fields) != {"key", "id"} or any(len(values) != 1 for values in fields.values()):
+        saved = fields.pop("saved", [])
+        if (saved not in ([], ["1"]) or set(fields) != {"key", "id"}
+                or any(len(values) != 1 for values in fields.values())):
             self.send_error(404)
             return None
+        retained = saved == ["1"]
         try:
-            item = server.review_cache.get().records[fields["key"][0]]
+            snapshot = server.review_cache.get()
+            key = fields["key"][0]
+            item = snapshot.records.get(key)
+            if item is None and retained and key.startswith("question/"):
+                item = snapshot.completed_item(server.root, key)
+            if item is None:
+                raise FileNotFoundError()
             origin = review_items.submission_origin(item)
             if not isinstance(origin, new_item_dialog.ReviewSubmission):
+                raise FileNotFoundError()
+            registered_image = bool(origin.image_card_labels())
+            if retained and not registered_image:
                 raise FileNotFoundError()
             image = next((image for image in origin.images if image.id == fields["id"][0]), None)
             if image is None:
@@ -1891,26 +1916,32 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             folder = review_submissions.image_folder(origin)
             path = folder / image.id / image.file
             media = ATTACHMENT_MEDIA[image.file]
-            if path.resolve() != path:
+            if path.resolve() != path or not path.is_file():
                 raise FileNotFoundError()
-            with path.open("rb") as stream:
-                content = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
-            if not 0 < len(content) <= new_item_dialog.MAX_IMAGE_BYTES:
-                raise FileNotFoundError()
-        except (KeyError, OSError, ValueError):
+            with ExitStack() as opened:
+                stream = opened.enter_context(path.open("rb"))
+                size = os.fstat(stream.fileno()).st_size
+                if size <= 0 or (size > new_item_dialog.MAX_IMAGE_BYTES and not registered_image):
+                    raise FileNotFoundError()
+                self.attachment_headers(size, media)
+                _ = opened.pop_all()
+                return stream
+        except (LookupError, OSError, ValueError):
             self.send_error(404)
             return None
-        return self.attachment_response(content, media)
 
     def attachment_response(self, content: bytes, media: str) -> BinaryIO:
+        self.attachment_headers(len(content), media)
+        return BytesIO(content)
+
+    def attachment_headers(self, size: int, media: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", media)
-        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Length", str(size))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
-        return BytesIO(content)
 
     def review_post(self) -> None:
         """Save the review answer before its shared message delivery."""
@@ -2242,15 +2273,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.json_response(200, {"state": "read"})
 
     def image_post(self) -> None:
-        """Answer the browser before the shared sender delivers an image question."""
+        """File image questions in Review and apply other actions on Images."""
         server = cast(ReviewLinksServer, self.server)
-        root = server.root
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 raise ValueError("empty image request")
-            delivery = images.submit(root, self.rfile.read(length).decode("utf-8"), server.delivery_status)
-        except question_record.AnswerRefused as error:
+            action = images.submit(server.root, self.rfile.read(length).decode("utf-8"))
+            if isinstance(action, images.ImageQuestionRequest):
+                self.file_image_question(server, action)
+                return
+        except new_item_dialog.SubmissionConflict as error:
+            self.browser_failure(409, str(error), error)
+            return
+        except (question_record.AnswerRefused, new_item_dialog.SubmissionError) as error:
             self.browser_failure(400, str(error), error)
             return
         except images.AnswerNotSent as error:
@@ -2262,10 +2298,42 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The image could not be changed. Try again.", error)
             return
+        self.json_response(200, {"state": "done"})
+
+    def file_image_question(self, server: ReviewLinksServer, question: images.ImageQuestionRequest) -> None:
+        """Publish the Review question before responding to the image form."""
+        site = f"http://{server.bound_address}:{server.server_port}"
+        store = image_store.ImageQuestionStore(images.images_root(server.root))
+        with server.staff_read_scope(), exclusive(store.root / image_store.LOCK):
+            folder = store.folder(question.identity)
+            record = image_store.read_record(folder)
+            members = staff.snapshot()
+            request_id = question.request_id(record)
+            for saved in images.review_questions(record, members):
+                if saved.request_id == request_id or saved.awaiting_reply and saved.words == question.words:
+                    break
+            else:
+                request = images.review_question(folder, record, question)
+                requests = record.get("review_requests", [])
+                if request_id not in requests:
+                    # Save the link before filing so a new form can find the Question after a lost response.
+                    record["review_requests"] = [*requests, request_id]
+                    image_store.write_record(folder, record)
+                saved = server.review_cache.create_submission(
+                    request, initial_delivery=review_submissions.InitialDelivery(site)).saved
+        recipient = review_items.name(saved.owner, members)
         try:
-            self.json_response(200, {"state": "done"})
+            delivery = review_actions.prepare_submission_delivery(
+                saved, saved.words, server.delivery_status, evidence_page=site + review_page.PAGE_PATH)
+        except review_actions.SubmissionDeliveryPending:
+            delivery = change_page.NoMessageDelivery()
+        try:
+            self.json_response(200, {
+                "state": "review-question", "recipient": recipient, "waiting": saved.awaiting_reply,
+                "review": images.review_question_url(images.review_question_key(saved)),
+            }, headers=(("X-Image-Question", "review"),))
         finally:
-            change_page.deliver(delivery, server.delivery_status)
+            _ = self.deliver_review(server, delivery)
 
     def news_post(self) -> None:
         """Record the page the console shows, and name the other pages that hold new items."""
@@ -2334,13 +2402,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def json_response(self, status: int, fields: Mapping[str, object]) -> None:
+    def json_response(self, status: int, fields: Mapping[str, object], *,
+                      headers: tuple[tuple[str, str], ...] = ()) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
         _ = self.wfile.write(content)
         self.wfile.flush()

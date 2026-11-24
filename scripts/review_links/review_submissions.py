@@ -259,6 +259,28 @@ class _ImageUpload:
     data: bytes
 
 
+@dataclass(frozen=True)
+class _RegisteredImageUpload:
+    reference: ImageReference
+    extension: str
+    source: Path
+
+
+type _ReviewImageUpload = _ImageUpload | _RegisteredImageUpload
+
+
+def _registered_images(paths: tuple[Path, ...]) -> tuple[_RegisteredImageUpload, ...]:
+    uploads: list[_RegisteredImageUpload] = []
+    for position, path in enumerate(paths, 1):
+        extension = path.suffix.removeprefix(".")
+        extension = "jpeg" if extension == "jpg" else extension
+        if extension not in IMAGE_FORMATS.values() or path.is_symlink() or not path.is_file():
+            raise SubmissionError("An image file is not available.")
+        reference = ImageReference(f"{position:012x}", f"image.{extension}")
+        uploads.append(_RegisteredImageUpload(reference, extension, path))
+    return tuple(uploads)
+
+
 def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
     if len(images) > MAX_IMAGES:
         raise SubmissionError(f"Paste up to {MAX_IMAGES} images.")
@@ -324,14 +346,21 @@ def image_folder(item: SavedSubmission | ReviewSubmission) -> Path:
     return _request_folder(item.request_id) / "images"
 
 
-def _save_images(folder: Path, request: NewItemRequest, uploads: tuple[_ImageUpload, ...]) -> None:
+def _file_digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _save_images(folder: Path, request: NewItemRequest, uploads: tuple[_ReviewImageUpload, ...]) -> None:
     references = tuple(upload.reference for upload in uploads)
     if not references:
         return
+    if request.page_recipient is new_item_dialog.PageRecipient.IMAGE_OWNER and _discard_image_stages(folder):
+        atomic_file.sync_folder(folder)
     images = folder / "images"
     if images.exists():
-        for reference, upload in zip(references, uploads, strict=True):
-            if (images / reference.id / reference.file).read_bytes() != upload.data:
+        for reference, (_, digest) in zip(references, _image_fingerprints(uploads), strict=True):
+            if _file_digest(images / reference.id / reference.file) != digest:
                 raise OSError("A saved Review image does not match the request.")
         return
 
@@ -340,10 +369,13 @@ def _save_images(folder: Path, request: NewItemRequest, uploads: tuple[_ImageUpl
         workspace = Path(temporary)
         stage = workspace / "images"
         for reference, upload in zip(references, uploads, strict=True):
-            if reference != PAGE_SCREENSHOT:
-                _validate_image(upload)
-            source = workspace / reference.file
-            atomic_file.write_bytes_atomic(source, upload.data, mode=0o600)
+            source = workspace / f"{reference.id}.{upload.extension}"
+            if isinstance(upload, _RegisteredImageUpload):
+                source.symlink_to(upload.source)
+            else:
+                if reference != PAGE_SCREENSHOT:
+                    _validate_image(upload)
+                atomic_file.write_bytes_atomic(source, upload.data, mode=0o600)
             _ = image_store.register_file(source, stage, owner=request.recipient_id,
                                           subject="Review request " + request.request_id, identity=reference.id, private=True)
         atomic_file.sync_folder(stage)
@@ -440,15 +472,16 @@ def _check_same_request(saved: NativeSubmissionDestination | PendingFiling, requ
         raise SubmissionConflict("This request ID already has different item data.")
 
 
-def _image_fingerprints(uploads: tuple[_ImageUpload, ...]) -> tuple[tuple[str, str], ...]:
-    return tuple((upload.extension, hashlib.sha256(upload.data).hexdigest()) for upload in uploads)
+def _image_fingerprints(uploads: tuple[_ReviewImageUpload, ...]) -> tuple[tuple[str, str], ...]:
+    return tuple((upload.extension, _file_digest(upload.source) if isinstance(upload, _RegisteredImageUpload)
+                  else hashlib.sha256(upload.data).hexdigest()) for upload in uploads)
 
 
 def _fingerprint(payload: list[object]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
+def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ReviewImageUpload, ...]) -> str:
     payload: list[object] = [request.kind, words, new_item_dialog.evidence_fields(request.evidence), _image_fingerprints(uploads)]
     if request.page:
         payload.append(request.page)
@@ -1069,10 +1102,10 @@ def _has_remote_document(row: staff.StaffRow) -> bool:
 
 
 def sent_question_scope(owner: staff.StaffId, members: staff.StaffSnapshot) -> update_registration.QuestionScope:
-    """Use the staff row for a sent Question whose production document is remote."""
+    """Use the staff row for a question in the member's own store."""
     row = members.by_id(owner)
-    if row is not None and _has_remote_document(row):
-        return update_registration.ProducerQuestions(row)
+    if row is not None and (row.kind in ("unit", "worker") or _has_remote_document(row)):
+        return update_registration.StaffQuestions(row)
     return update_registration.question_scope(owner, members)
 
 
@@ -1214,6 +1247,12 @@ def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> st
 def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,
                     choice: new_item_dialog.PageRecipient) -> staff.StaffRow:
     identity = address.recipient_id
+    if choice is new_item_dialog.PageRecipient.IMAGE_OWNER:
+        row = members.rows_by_id.get(identity)
+        if row is None or not _page_owner_is_active(row, members) or (
+                row.kind in ("showrunner", "producer") and not _submission_owner_is_active(row, members)):
+            raise SubmissionConflict("The image owner is unavailable.")
+        return row
     if choice == new_item_dialog.PageRecipient.LIST_OWNER:
         configured = _configured_list_producer(conf.read_or_repository("console"), members)
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
@@ -1310,9 +1349,9 @@ def recipient_options(members: staff.StaffSnapshot, *,
     return options
 
 
-def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
-                                    outgoing: update_registration.QuestionFromReview
-                                    ) -> update_registration.QuestionRecord:
+def _file_question_in_staff_store(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
+                                  outgoing: update_registration.QuestionFromReview
+                                  ) -> update_registration.QuestionRecord:
     owner = recipient.id
     folder = update_registration.QuestionFolder(record_store.default_question_folder(owner), owner)
     limit = conf.read_or_repository("production").whole("question_title_max_chars")
@@ -1337,8 +1376,9 @@ def _file(kind: SubmissionKind, recipient: staff.StaffRow, title: str, words: st
     match kind:
         case SubmissionKind.QUESTION:
             outgoing = update_registration.QuestionFromReview(words, why, details, before_write)
-            if recipient.kind == "showrunner" and _has_remote_document(recipient):
-                return _file_question_for_remote_owner(recipient, title, members, outgoing)
+            if recipient.kind in ("unit", "worker") or (
+                    recipient.kind == "showrunner" and _has_remote_document(recipient)):
+                return _file_question_in_staff_store(recipient, title, members, outgoing)
             identities = update_registration.QuestionStaff.for_record(members)
             scope = update_registration.question_scope(recipient, members)
             parts = update_registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
@@ -1435,7 +1475,21 @@ def _recover_unverified_draft(request_id: str, members: staff.StaffSnapshot | No
     raise error
 
 
+def _discard_image_stages(folder: Path) -> bool:
+    removed = False
+    for path in folder.glob(".stage-*"):
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            continue
+        removed = True
+    return removed
+
+
 def _discard_unfiled_send(folder: Path) -> None:
+    _ = _discard_image_stages(folder)
     images = folder / "images"
     if images.is_dir():
         shutil.rmtree(images)
@@ -1604,6 +1658,14 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     kind = SubmissionKind.INVESTIGATION if request.kind == "enhancement" else read_kind(request.kind)
     if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
+    if request.page_recipient is new_item_dialog.PageRecipient.IMAGE_OWNER and (
+            request.page != "images" or kind is not SubmissionKind.QUESTION):
+        raise SubmissionError("Use the question box on an image.")
+    if request.registered_images and (not request_id.startswith("r1-")
+                                      or request.page_recipient is not new_item_dialog.PageRecipient.IMAGE_OWNER
+                                      or request.images or len(request.registered_images) > 2
+                                      or not isinstance(screenshot, new_item_dialog.NoPageScreenshot)):
+        raise SubmissionError("Use the question box on an image.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         raise SubmissionError("Select a recipient from the New item dialog.")
     if request.page and kind == SubmissionKind.PROPOSAL:
@@ -1619,6 +1681,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     words = read_words(request.words, "Your words", kind=request.kind)
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
+    registered_images = _registered_images(request.registered_images)
     if list_draft:
         previous = _legacy_list_draft(address, words, uploads, members, request_kind=request.kind)
         if previous is not None:
@@ -1641,7 +1704,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     elif legacy_draft:
         payload_hash = _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)])
     else:
-        payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
+        payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words,
+                                               (*uploads, *registered_images))
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
         total = len(screenshot.png) + sum(len(upload.data) for upload in uploads)
         if len(uploads) >= MAX_IMAGES or total > MAX_TOTAL_IMAGE_BYTES:
@@ -1655,6 +1719,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                                 or not (legacy_draft or list_draft)):
         state = replace(state, viewport=None, include_screenshot=False)
     request = replace(request, kind=kind, evidence=evidence, page_state=state)
+    attachments = (*uploads, *registered_images)
     try:
         if list_draft:
             locked = _locked_browser_recipient(address, request.page, request.page_recipient)
@@ -1735,7 +1800,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             if kind == SubmissionKind.PROPOSAL and isinstance(destination, NoNativeFolder):
                 raise SubmissionError("Select a recipient with a native proposal folder.")
             pending_file = folder / "pending.json"
-            images = tuple(upload.reference for upload in uploads)
+            images = tuple(upload.reference for upload in attachments)
             proof = reply_tokens.mint()
             details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
@@ -1754,7 +1819,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                     if legacy_list_draft and (folder / "images").is_dir():
                         # The draft fingerprint excludes the page screenshot.
                         shutil.rmtree(folder / "images")
-                    _save_images(folder, request, uploads)
+                    _save_images(folder, request, attachments)
                     lookup.bind_draft()
                     atomic_file.sync_folder(folder.parent)
                     atomic_file.sync_folder(folder.parent.parent)
@@ -1775,7 +1840,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             try:
                 record = _file(kind, recipient, title, words, details, current, destination, before_write)
             except Exception:
-                if not browser_draft or not staging_started:
+                image_question = request.page_recipient is new_item_dialog.PageRecipient.IMAGE_OWNER
+                if not staging_started or not (browser_draft or image_question):
                     raise
                 if destinations:
                     saved = destinations[0]
@@ -1869,6 +1935,40 @@ def current_reply_proof(key: str) -> reply_tokens.ReplyTokenProof:
     if not isinstance(located, LocatedSubmission) or located.destination.id != scoped.item_id:
         raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
     return located.details.reply_proof
+
+
+def read_image_question(request_id: str, recipient: staff.StaffId,
+                        members: staff.StaffSnapshot) -> SavedSubmission | NoNativeSubmission:
+    """Read the native Question named by an Images card."""
+    address = _request_address(SubmissionKind.QUESTION, recipient, request_id)
+    hint = _request_hint(address)
+    if isinstance(hint, UnreadableRequestFile):
+        raise hint.error
+    if isinstance(hint, NativeSubmissionDestination):
+        located = locate_native_submission(address, hint, members=members)
+        if isinstance(located, LocatedSubmission) and located.details.page == "images":
+            return located.saved()
+    return NoNativeSubmission()
+
+
+def clean_image_question_staging(request_id: str, recipient: staff.StaffId) -> None:
+    """Remove partial copies and keep attachments for a filed Images Question."""
+    address = _request_address(SubmissionKind.QUESTION, recipient, request_id)
+    folder = _request_folder(request_id)
+    if not folder.is_dir():
+        return
+    with investigation.recipient_locks(recipient):
+        if (folder / "receipt.json").is_file():
+            if _discard_image_stages(folder):
+                atomic_file.sync_folder(folder)
+            return
+    with _locked_request(address) as lookup:
+        if isinstance(lookup.hint, UnreadableRequestFile):
+            raise lookup.hint.error
+        if isinstance(lookup.native, NoNativeSubmission) and not (folder / "receipt.json").is_file():
+            _discard_unfiled_send(folder)
+        elif _discard_image_stages(folder):
+            atomic_file.sync_folder(folder)
 
 
 def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:

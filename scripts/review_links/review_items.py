@@ -704,6 +704,35 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, do
     return found
 
 
+def question_key(owner: staff.StaffId, path: Path) -> str:
+    return 'question/'+owner+'/'+path.name
+
+
+def completed_image_question(key: str, members: staff.StaffSnapshot, zone: ZoneInfo) -> ReviewItem:
+    """Read the completed Question named by an Images link."""
+    match = re.fullmatch(r'question/([A-Za-z0-9][A-Za-z0-9_.-]{0,127})/'
+                         + r'(question-[A-Za-z0-9_.-]+-review-[a-f0-9]{64}(?:-\d+)?\.md)', key)
+    if match:
+        owner = staff.StaffId(match[1])
+        filename = match[2]
+        document = record_store.local_document(members.by_id(owner))
+        folders = record_store.known_folders(record_store.RecordKind.QUESTION, owner, document=document,
+                                             require_document=False)
+        paths = [folder / filename for folder in folders]
+        for archive in record_store.archive_folders(folders):
+            paths.extend(archive.rglob(filename))
+        for path in dict.fromkeys(paths):
+            if path.is_symlink() or not path.is_file():
+                continue
+            record = update_registration.read_review_question(path, owner)
+            origin = review_submissions.native_origin(record)
+            if (record.owner == owner and record.status == 'closed'
+                    and isinstance(origin, new_item_dialog.ReviewSubmission) and origin.image_card_labels()
+                    and review_submissions.question_response(record, ()) is not None):
+                return question_item(record, members, zone=zone)
+    raise LookupError('No completed Images Question matches this link.')
+
+
 def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
                   unowned: bool = False, zone: ZoneInfo | None = None) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
@@ -777,7 +806,7 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     status_time = question_path.answer_time(
         moment(saved_answer_time, zone) if saved_answer_time is not None else question_path.NO_ANSWER_TIME, saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
-    key = 'question/'+owner+'/'+path.name
+    key = question_key(owner, path)
     review_id = fields.get('review_id', path.stem)
     identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
@@ -833,8 +862,12 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             return
         seen.add(record.path)
         if question_state(record) not in states or not selection.includes(
-                record.path, 'question/'+record.owner+'/'+record.path.name):
+                record.path, question_key(record.owner, record.path)):
             return
+        if unowned and (member := members.by_id(record.owner)) is not None and member.kind in ('unit', 'worker'):
+            origin = review_submissions.native_origin(record)
+            if isinstance(origin, new_item_dialog.ReviewSubmission) and origin.page == 'images':
+                unowned = False
         item = question_item(record, members, unowned=unowned, zone=zone)
         if item.type in kinds:
             found.append(item)

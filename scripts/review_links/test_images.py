@@ -30,12 +30,29 @@ from scripts.message import send_result
 from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
+from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, page_question, serve
 from scripts.review_links import question_record
 from scripts.review_links.server_test_support import started_review_server
 
 SEND_MESSAGE = change_page.send_message
 PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
+
+
+def legacy_question(root: Path, identity: str, words: str, status: change_page.DeliveryStatus
+                    ) -> change_page.MessageDelivery:
+    """Create an image question with the legacy protocol."""
+    store = image_store.ImageQuestionStore(images.images_root(root))
+    folder = store.folder(identity)
+    target = change_page.image_question_target(folder / image_store.RECORD, image_store.read_record(folder))
+    return page_question.ask(store, target, words, status)
+
+
+def submit_legacy_fixture(root: Path, body: str, status: change_page.DeliveryStatus
+                          ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    action = images.submit(root, body)
+    if isinstance(action, images.ImageQuestionRequest):
+        return legacy_question(root, action.identity, action.words, status)
+    return action
 
 
 class ImagesFixture(unittest.TestCase):
@@ -71,7 +88,7 @@ class ImagesFixture(unittest.TestCase):
         _ = self.enterContext(patch.object(change_page, "send_question", side_effect=self.capture_question))
 
     def submit(self, body: str) -> None:
-        delivery = images.submit(self.root, body, self.status)
+        delivery = submit_legacy_fixture(self.root, body, self.status)
         change_page.deliver(delivery, self.status)
 
     def capture(self, recipient: str, sender: str, message: str, **_delivery: str) -> None:
@@ -801,7 +818,7 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_startup_resumes_an_image_question_after_the_sender_stops(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record["id"], "Which check passed?", self.status)
+        delivery = legacy_question(self.root, record["id"], "Which check passed?", self.status)
         path = self.status.path(delivery.page, delivery.row)
         with (patch.object(change_page, "send_question", side_effect=SystemExit),
               self.assertRaises(SystemExit)):
@@ -919,7 +936,7 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(saved.state, delivery_state.QuestionSendState.FAILED)
         self.assertEqual(saved.error, 'owner offline')
         self.status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
-        pending = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        pending = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         content = images.render(self.status).decode()
         self.assertNotIn(f'data-image="{record["id"]}"', content)
         self.assertIn(f'data-waiting-images="{record["id"]}"', content)
@@ -934,7 +951,7 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_startup_waits_for_the_sender_lock_before_recovery(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         publish = change_page.publish_question_attempt
 
         def interrupt_after_send(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
@@ -965,7 +982,7 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_recovery_refusals_keep_the_first_send_result_unknown(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         publish = change_page.publish_question_attempt
 
         def fail_confirmation(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
@@ -1049,7 +1066,7 @@ class ImageQuestionTests(ImagesFixture):
     def test_malformed_question_delivery_metadata_renders_as_unknown(self) -> None:
         record = self.register()
         other = self.register('An image without a question')
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         change_page.deliver(delivery, self.status)
         path = self.status.path(delivery.page, delivery.row)
 
@@ -1067,7 +1084,7 @@ class ImageQuestionTests(ImagesFixture):
     def test_an_unreadable_sender_with_a_held_lock_prevents_a_second_send(self) -> None:
         record = self.register()
         words = 'Which check passed?'
-        delivery = images.ask_question(self.root, record['id'], words, self.status)
+        delivery = legacy_question(self.root, record['id'], words, self.status)
         assert isinstance(delivery, change_page.PageQuestionSend)
         assert isinstance(delivery.job, change_page.QuestionJob)
         with patch.object(process_start, "process_start", return_value=process_start.Unreadable("Cannot read the sender.")):
@@ -1084,7 +1101,7 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_a_failed_send_mark_records_failure_before_transport_runs(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         with (patch.object(atomic_file, 'sync_folder', side_effect=OSError('Cannot sync the send mark.')),
               redirect_stderr(StringIO()) as output):
             change_page.deliver(delivery, self.status)
@@ -1097,7 +1114,7 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_startup_recovers_after_a_failed_failure_receipt(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         publish = change_page.publish_question_attempt
 
         def fail_result(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
@@ -1508,12 +1525,13 @@ async (find, whenPageShows, check, controlRefresh) => {
                         return
                 else:
                     requests.append(parse_qs(payload))
-                    delivery = images.submit(root, payload, delivery_status)
+                    delivery = submit_legacy_fixture(root, payload, delivery_status)
                     if isinstance(delivery, change_page.MessageDelivery):
                         body = response_body
                         is_first_delivery = len(requests) == 1
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 try:
                     _ = self.wfile.write(body)
@@ -1861,7 +1879,7 @@ class ImagesServerTests(ImagesFixture):
 
     def test_a_saved_question_stays_off_the_page_before_and_after_startup_recovery(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = legacy_question(self.root, record['id'], 'Which check passed?', self.status)
         assert isinstance(delivery, change_page.PageQuestionSend)
         assert isinstance(delivery.job, change_page.QuestionJob)
         _ = delivery.job.release()

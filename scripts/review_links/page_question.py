@@ -104,18 +104,24 @@ def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answ
     return Answered(question_record.Question(question.question_id, question.asked_at, question.words, response))
 
 
+def question_text_html(question_id: str, words: str, *, heading_suffix: str = "", asked_time_html: str = "") -> str:
+    return f'<h3>Question {html.escape(question_id + heading_suffix)}</h3>{asked_time_html}<p>{html.escape(words)}</p>'
+
+
+def answer_text_html(words: str, *, answer_time_html: str = "", answer_mark_html: str = "") -> str:
+    return f'<h3>Answer{answer_mark_html}</h3>{answer_time_html}<p>{html.escape(words)}</p>'
+
+
 def open_question_html(question: question_record.Question, *, asked_time_html: str = "", failed: bool = False) -> str:
     waiting = "" if failed else " — waiting for an answer"
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'
-            + f'<h3>Question {html.escape(question.question_id)}{waiting}</h3>'
-            + asked_time_html + f'<p>{html.escape(question.words)}</p>'
+            + question_text_html(question.question_id, question.words, heading_suffix=waiting, asked_time_html=asked_time_html)
             + change_page.question_failure_html(failed) + '</section>')
 
 
 def answered_question_html(question: question_record.Question, answer: question_record.Answer, *,
                            asked_time_html: str = "", answer_time_html: str = "", answer_mark_html: str = "") -> str:
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'
-            + f'<h3>Question {html.escape(question.question_id)}</h3>'
-            + asked_time_html + f'<p>{html.escape(question.words)}</p>'
-            + '<h3>Answer' + answer_mark_html + '</h3>'
-            + answer_time_html + f'<p>{html.escape(answer.text)}</p></section>')
+            + question_text_html(question.question_id, question.words, asked_time_html=asked_time_html)
+            + answer_text_html(answer.text, answer_time_html=answer_time_html, answer_mark_html=answer_mark_html)
+            + '</section>')

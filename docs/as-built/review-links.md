@@ -1500,7 +1500,7 @@ The store keeps the unread update if the read write fails or a newer update exis
 Feedback applies the current filters. A read item leaves the view when Unread only is on.
 Feedback with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
-List and Images share the code that saves and sends the question.
+List and legacy Images questions share the code that saves and sends the question.
 After the server replies to the browser, it sends the record keeper the item number, title, question, and answer command.
 The List uses the keeper as the recipient even when another producer owns the work.
 Equal words select the open question. Different words create a new question.
@@ -1513,7 +1513,7 @@ The console updates its unread indicator on its own news refresh.
 The page shows “Question not delivered.” after a confirmed failure.
 List, Images, and Review use the same text.
 All attempts for one question use the same sender lock.
-List, Images, and Review question sends use the same retry loop.
+List, legacy Images, and Review question sends use the same retry loop.
 An unconfirmed send keeps its saved message ID for the next attempt.
 The server retries unresolved attempts during recovery.
 If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
@@ -1572,7 +1572,7 @@ The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
 The command refuses an unknown ID, a second answer, and empty text.
 
-List and Images questions share one delivery record for each question and recipient.
+List and legacy Images questions use one delivery record for each question and recipient.
 The record stores the source, stable message ID, revision, attempt ID, job owner, transport receipt, and error.
 The delivery lock protects every atomic update.
 A job holds the question's sender lock from claim through result publication.
@@ -1756,7 +1756,7 @@ Each card shows, in this order:
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
 3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved** and **Send Feedback**.
+5. The action buttons **Approved**, **Send Feedback**, and **Ask question**.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
@@ -1805,10 +1805,29 @@ Feedback always means that the image is not approved, so the page has no separat
 A card loaded before that change can still post `not approved`; the server refuses it with **Not Approved was removed. Use Send Feedback.**
 Otherwise the card leaves the page at once, and the request runs in the background.
 The page skips its refresh while a send runs.
-An image leaves the page while each open question has a live sender or confirmed acceptance.
-The page also hides an image while the server recovers its verified delivery on startup.
+**Ask question** files a Question in Review for the image owner.
+Review shows **Waiting for answer · <recipient>** and retains the image as an attachment.
+For an image pair, Review retains the **Before** and **After** attachments after the Images card is deleted.
+If the Question write fails, the server removes the attachments and any partial copy for that unfiled request.
+Deleting an Images card also removes partial copies for its unfiled Questions.
+The Images card reads the saved Question each time it loads or refreshes.
+The card shows the Question ID and words above the recipient and the **Filed in Review** link.
+The browser starts the refresh timer when the server confirms a waiting Question.
+An incomplete send response keeps the draft and its request ID for retry.
+After the answer arrives, the card shows the Question and answer with a link to Review.
+The link opens the Question in the Review table.
+After **Mark read**, the link loads the completed Question on demand.
+Use the Review reply command to send the answer to **Needs me**.
+The image remains available for **Approved** and **Send Feedback**.
+Repeating the same question on an image reuses its Review Question while it waits for an answer.
+A Question from the page owner control also files only in Review.
+
+Images retains questions sent with the earlier Images reply command.
+The page hides an image while those questions have a live sender or confirmed acceptance.
+The page also hides the image during recovery of those sends.
 A failed or uncertain delivery returns the card with a delivery notice.
-When the owner answers the last open question, the card returns and the console shows a new update.
+The last legacy answer returns the card and sets a new update in the console.
+
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
@@ -2204,7 +2223,7 @@ If only the destination changed, startup recovery keeps that copy.
 If both copies changed or a digest is missing, recovery reports the refusal and keeps both copies and the journal.
 The completed move retains the original delivery path if the filing receipt is missing.
 Recovery preserves attempts that a live request owns.
-It resumes a List or Images question if the saved sender released its lock during delivery.
+It resumes a List or legacy Images question if the saved sender released its lock during delivery.
 It reuses the question's message ID.
 Recovery scans each review list once and finds each record through `change_routing.delivery_path`.
 It ignores the `page` field in legacy records.

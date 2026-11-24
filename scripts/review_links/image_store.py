@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import secrets
 import shutil
@@ -40,6 +41,7 @@ class ImageRecord(TypedDict):
     # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
     feedback_at: NotRequired[str]
     questions: NotRequired[list[question_record.StoredQuestion]]
+    review_requests: NotRequired[list[str]]
 
 
 def read_record(folder: Path) -> ImageRecord:
@@ -71,6 +73,11 @@ def read_record(folder: Path) -> ImageRecord:
         if len({question.question_id for question in checked}) != len(checked):
             raise ValueError(f"{folder.name}: duplicate question id")
         record["questions"] = [question_record.stored(question) for question in checked]
+    if "review_requests" in fields:
+        requests = fields["review_requests"]
+        if not isinstance(requests, list) or any(not isinstance(item, str) for item in cast(list[object], requests)):
+            raise ValueError(f"{folder.name}: invalid Review requests")
+        record["review_requests"] = cast(list[str], requests)
     return record
 
 
@@ -147,7 +154,11 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
         for stem, source in sources:
             target = draft / files[stem]
             if private:
-                atomic_file.write_bytes_atomic(target, source.read_bytes(), mode=0o600)
+                with source.open("rb") as original, target.open("xb") as copy:
+                    os.fchmod(copy.fileno(), 0o600)
+                    shutil.copyfileobj(original, copy)
+                    copy.flush()
+                    os.fsync(copy.fileno())
             else:
                 _ = shutil.copyfile(source, target)
         write_record(draft, record)

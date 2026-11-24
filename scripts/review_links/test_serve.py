@@ -8,6 +8,7 @@ from scripts.lib.checkout_test_support import python_tool_source
 import fcntl
 import base64
 import hashlib
+import html
 import importlib.util
 import json
 import gzip
@@ -37,7 +38,7 @@ from unittest.mock import ANY, Mock, call, patch
 
 
 from typing import TextIO, cast, override
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -57,7 +58,7 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
+from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_path, question_record, reply_tokens, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
@@ -153,6 +154,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         super().__init__(methodName)
         self.review_posts: HandlerCalls = HandlerCalls()
         self.new_item_posts: HandlerCalls = HandlerCalls()
+        self.image_posts: HandlerCalls = HandlerCalls()
 
     @property
     def server(self) -> serve.ReviewLinksServer:
@@ -187,6 +189,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self._server = server
         review_posts = self.review_posts
         new_item_posts = self.new_item_posts
+        image_posts = self.image_posts
 
         class ReviewFixtureHandler(serve.ReviewLinksHandler):
             @override
@@ -198,6 +201,11 @@ class ReviewLinksServerTests(unittest.TestCase):
             def new_item_post(self) -> None:
                 with new_item_posts.running():
                     super().new_item_post()
+
+            @override
+            def image_post(self) -> None:
+                with image_posts.running():
+                    super().image_post()
 
         server.RequestHandlerClass = ReviewFixtureHandler
         self.port = server.server_port
@@ -847,6 +855,37 @@ class ReviewLinksServerTests(unittest.TestCase):
         filed, = investigation.records(other.id)
         self.assertEqual(filed.question, request.words)
         self.assertEqual(investigation.records(owner.id), [])
+
+    def test_page_owner_questions_file_only_in_review(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        keeper = fixture_member("producer", name="morty")
+        pages = sorted(page_frame.OWNER_PAGES - {"list"})
+        _ = write_config_fixture(conf.path("console"),
+            "".join(f"page.{page}.owner={owner.id}\n" for page in pages) + f"page.list.owner={keeper.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            for page in pages:
+                with self.subTest(page=page):
+                    request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                                      page=page, request_id="r6-" + uuid4().hex, words=f"Which {page} check passed?")
+                    response = self.new_item_http(self.new_item_body(request), finished=True)
+                    self.assertEqual(response.status, 200, response.body)
+                    saved = cast(dict[str, str], json.loads(response.body))
+                    item = cache.get().records[saved["key"]]
+                    self.assertEqual((item.owner, item.type, item.state),
+                                     (owner.id, review_items.ReviewType.QUESTION, review_items.ReviewState.WAITING))
+                    origin = review_items.submission_origin(item)
+                    assert isinstance(origin, new_item_dialog.ReviewSubmission)
+                    self.assertEqual(origin.page, page)
+                    self.assertNotIn("list_key", saved)
+                    self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
+                    self.assertEqual(the_list.records(owner.id, include_closed=True), [])
+                    send.assert_called_once_with(f"session:{owner.current_session}", change_page.SENDER, ANY)
+                    send.reset_mock()
 
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
@@ -4908,6 +4947,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             content = response.read()
             if review_post and wait_for_delivery:
                 self.assertTrue(self.review_posts.wait_until_none_run())
+            if path == images.PAGE_PATH and wait_for_delivery:
+                self.assertTrue(self.image_posts.wait_until_none_run())
             return response.status, content
         finally:
             connection.close()
@@ -5508,34 +5549,511 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.body, image)
 
     def test_an_image_question_answers_the_browser_before_delivery_finishes(self) -> None:
-        _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
-        page = change_page.ReviewPage(self.root / 'fixture-image', self.root, ('Images fixture/Q1',), '')
-        delivery = change_page.MessageDelivery(page, page.rows[0], (), 'Fixture question', 'fixture-attempt')
-        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        from scripts.review_links.test_review_submissions import PNG
 
-        def send(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                 status: change_page.DeliveryStatus) -> None:
-            self.assertIs(message, delivery)
-            self.assertEqual(status.root, self.root)
+        case = self.review_fixture()
+        page_owner = case.ready_submission_recipient()
+        owner = case.fixture.unit
+        keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.images.owner={page_owner.id}\npage.list.owner={keeper.id}\n")
+        source = case.fixture.temporary / "image.png"
+        _ = source.write_bytes(base64.b64decode(PNG))
+        image = images.register(source, "The completed build", owner.id, "Phase Images")
+        identity = image["id"]
+        words = "Which check passed?"
+        form = urlencode({"image": identity, "token": images.request_token(images.console_token(case.root), identity),
+                          "action": "question", "feedback": words, "question_nonce": "b" * 32})
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        sent: list[tuple[staff.StaffId, str]] = []
+
+        def send(identity: staff.StaffId, _sender: str, message: str, **_options: str) -> None:
+            sent.append((identity, message))
             started.set()
             try:
                 self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
             finally:
                 finished.set()
 
-        with patch.object(images, 'submit', return_value=delivery) as submit, patch.object(
-                change_page, 'deliver', side_effect=send):
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_to_staff", side_effect=send)):
             try:
-                code, body = self.post(images.PAGE_PATH, 'fixture-question')
-                self.assertEqual((code, json.loads(body)), (200, {'state': 'done'}))
+                code, body = self.post(images.PAGE_PATH, form, wait_for_delivery=False)
+                self.assertEqual(code, 200, body)
+                reply = cast(dict[str, str], json.loads(body))
+                self.assertEqual((reply["state"], reply["recipient"]), ("review-question", owner.name))
+                place = parse_qs(urlsplit(reply["review"]).query)["at.review"][0]
+                key = parse_qs(urlsplit(place).fragment)["item"][0]
+                waiting = cache.get().records[key]
+                self.assertEqual(waiting.queue_at(datetime.now(timezone.utc)), question_path.Queue.WAITING_FOR_ANSWER)
+                self.assertEqual(waiting.owner, owner.id)
+                self.assertIsInstance(waiting.source, review_items.QuestionSource)
+                self.assertEqual(images.records(case.root), [dict(image, review_requests=[
+                    cast(new_item_dialog.ReviewSubmission, review_items.submission_origin(waiting)).request_id])])
+                self.assertEqual(the_list.records(keeper.id, include_closed=True), [])
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
-                submit.assert_called_once()
-                self.assertEqual(submit.call_args.args[:2], (self.root, 'fixture-question'))
+                replay_code, replay_body = self.post(images.PAGE_PATH, form, wait_for_delivery=False)
+                self.assertEqual((replay_code, replay_body), (code, body))
+                fresh_form = form.replace("question_nonce=" + "b" * 32, "question_nonce=" + "c" * 32)
+                fresh_code, fresh_body = self.post(images.PAGE_PATH, fresh_form, wait_for_delivery=False)
+                self.assertEqual((fresh_code, fresh_body), (code, body))
+                self.assertEqual(len(cache.get().records), 1)
             finally:
                 release.set()
                 if started.is_set():
                     self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+                    self.assertTrue(self.image_posts.wait_until_none_run())
+
+        recipient, message = sent[0]
+        self.assertEqual((len(sent), recipient), (1, owner.id))
+        self.assertIn(words, message)
+        self.assertIn("Evidence in Review", message)
+        origin = review_items.submission_origin(waiting)
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        self.assertEqual(origin.page, "images")
+        native = waiting.source
+        assert isinstance(native, review_items.QuestionSource)
+        question_id = native.record.item.get("review_id")
+        assert question_id is not None
+        reply_key = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, owner.id,
+                                                 question_id, origin.request_id)
+        self.assertIn(reply_key, message)
+        self.assertTrue(change_page.answer_item(reply_key, "The layout check passed.", origin.reply_token, case.status))
+        reopened = review_page.build_snapshot(case.root).records[key]
+        self.assertEqual(reopened.type, review_items.ReviewType.RESPONSE)
+        self.assertEqual(reopened.queue_at(datetime.now(timezone.utc)), question_path.Queue.NEEDS_ME)
+        self.assertTrue(reopened.unread_answer)
+        self.assertEqual(images.records(case.root), [dict(image, review_requests=[origin.request_id])])
+        self.assertIn("<h3>Answer</h3><p>The layout check passed.</p>", images.render(case.status).decode())
+        saved, _ = cache.publish_record(cache.get(), key)
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1")):
+            card = self.request(review_page.PAGE_PATH + "?" + urlencode({"body": key}))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b"The layout check passed.", card.body)
+            code, body = self.post(review_page.PAGE_PATH, case.card_body(saved, key, "read"))
+            self.assertEqual(code, 200, body)
+        self.assertEqual(cast(dict[str, str], json.loads(body))["state"], review_items.ReviewState.DONE)
+        self.assertNotIn(key, cache.get().records)
+        self.assertEqual(update_registration.read_review_question(native.record.path, owner.id).status, "closed")
+
+    def test_images_reload_reads_the_current_review_question_state(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        source = case.fixture.temporary / "image.png"
+        _ = source.write_bytes(base64.b64decode(PNG))
+        image = images.register(source, "The completed build", owner.id, "Phase Images")
+        words = "Which <layout> passed?\nCheck the spacing & colors."
+        answer = "The <wide> layout passed."
+        form = {"image": image["id"], "token": images.request_token(images.console_token(case.root), image["id"]),
+                "action": "question", "feedback": words, "question_nonce": "b" * 32}
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message") as send):
+            code, body = self.post(images.PAGE_PATH, urlencode(form))
+            self.assertEqual(code, 200, body)
+            reply = cast(dict[str, str], json.loads(body))
+            waiting = self.request(images.PAGE_PATH)
+            link = b'href="' + html.escape(reply["review"], quote=True).encode() + b'"'
+            self.assertEqual(waiting.status, 200)
+            self.assertIn(b'data-image-review-question', waiting.body)
+            self.assertIn(("Waiting for answer · " + owner.name).encode(), waiting.body)
+            self.assertIn(link + b' target="_top">Filed in Review</a>', waiting.body)
+            self.assertRegex(waiting.body, rb'data-refresh-seconds="[0-9.]*[1-9][0-9.]*"')
+
+            item, = cache.get().records.values()
+            origin = review_items.submission_origin(item)
+            source_record = item.source
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            assert isinstance(source_record, review_items.QuestionSource)
+            identity = source_record.record.item.get("review_id")
+            assert identity
+            question_html = f"<h3>Question {identity}</h3><p>{html.escape(words)}</p>".encode()
+            self.assertIn(question_html + b'<p role="status" data-image-review-question>', waiting.body)
+            key = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, owner.id,
+                                                 identity, origin.request_id)
+            self.assertTrue(change_page.answer_item(key, answer, origin.reply_token, case.status))
+            answered = self.request(images.PAGE_PATH)
+            answer_url = images.review_question_url(item.key)
+            answer_link = b'href="' + html.escape(answer_url, quote=True).encode() + b'"'
+            self.assertEqual(answered.status, 200)
+            self.assertIn(question_html + f"<h3>Answer</h3><p>{html.escape(answer)}</p>".encode(), answered.body)
+            self.assertIn(b'data-image-review-question>Answered', answered.body)
+            self.assertIn(answer_link + b' target="_top">Read the answer in Review</a>', answered.body)
+            self.assertNotIn(("Waiting for answer · " + owner.name).encode(), answered.body)
+            self.assertIn(b'data-refresh-seconds="0"', answered.body)
+            card = self.request(review_page.card_url(item.key))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(html.escape(answer).encode(), card.body)
+            saved, _ = cache.publish_record(cache.get(), item.key)
+            self.assertIn(html.escape(answer).encode(), saved.body(item.key))
+            code, body = self.post(review_page.PAGE_PATH, case.card_body(saved, item.key, "read"))
+            self.assertEqual(code, 200, body)
+            self.assertIn(answer_link + b' target="_top">Read the answer in Review</a>', self.request(images.PAGE_PATH).body)
+            card = self.request(review_page.card_url(item.key))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(html.escape(answer).encode(), card.body)
+            replay_code, replay_body = self.post(images.PAGE_PATH, urlencode(form))
+            self.assertEqual(replay_code, 200, replay_body)
+            self.assertEqual(cast(dict[str, str], json.loads(replay_body))["review"], reply["review"])
+            send.assert_called_once()
+            code, body = self.post(images.PAGE_PATH, urlencode(dict(form, question_nonce="c" * 32)))
+            self.assertEqual(code, 200, body)
+            self.assertNotEqual(cast(dict[str, str], json.loads(body))["review"], reply["review"])
+            self.assertEqual(send.call_count, 2)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the Images link")
+    def test_image_answer_link_preserves_the_review_table_and_sidebar_return(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        source = case.fixture.temporary / "image.png"
+        _ = source.write_bytes(base64.b64decode(PNG))
+        image = images.register(source, "The completed build", owner.id, "Phase Images")
+        _ = write_config_fixture(conf.path("console"),
+            "page.images.url=python:scripts.review_links.images:page_url\n"
+            + "page.images.title=Images\npage.review.title=Review\n"
+            + "page.review.url=python:scripts.review_links.review_page:page_url\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        form = {"image": image["id"], "token": images.request_token(images.console_token(case.root), image["id"]),
+                "action": "question", "feedback": "Which check passed?"}
+        answer = "The layout check passed."
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message")):
+            code, body = self.post(images.PAGE_PATH, urlencode(form))
+            self.assertEqual(code, 200, body)
+            item, = cache.get().records.values()
+            origin = review_items.submission_origin(item)
+            source_record = item.source
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            assert isinstance(source_record, review_items.QuestionSource)
+            identity = source_record.record.item.get("review_id")
+            assert identity is not None
+            key = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, owner.id,
+                                                 identity, origin.request_id)
+            self.assertTrue(change_page.answer_item(key, answer, origin.reply_token, case.status))
+            saved, _ = cache.publish_record(cache.get(), item.key)
+            code, body = self.post(review_page.PAGE_PATH, case.card_body(saved, item.key, "read"))
+            self.assertEqual(code, 200, body)
+            self.assertNotIn(item.key, cache.get().records)
+
+            path = source_record.record.path
+            archive = path.parent / "archive" / "closed"
+            archive.mkdir(parents=True)
+            _ = path.rename(archive / path.name)
+            blank = case.fixture.temporary / "blank.html"
+            blank.touch()
+            with case.firefox_commands(blank) as command:
+                for existing in (False, True):
+                    with self.subTest(existing_review=existing):
+                        first = 'review' if existing else 'images'
+                        _ = command('WebDriver:Navigate', url=f'http://127.0.0.1:{self.port}/console/?page={first}')
+                        result = cast(dict[str, str], command('WebDriver:ExecuteAsyncScript', script=r"""
+const [existing,key,answer,done]=arguments;
+async function wait(read,label){
+ const until=performance.now()+2500;
+ do {
+  const value=read();
+  if(value) return value;
+  await new Promise(resolve=>requestAnimationFrame(resolve));
+ } while(performance.now()<until);
+ throw new Error(label);
+}
+const frame=name=>document.querySelector('iframe[data-console-page="'+name+'"]');
+const loaded=name=>{
+ const doc=frame(name)?.contentDocument;
+ return doc?.readyState==='complete' && doc;
+};
+void (async()=>{
+ let review=null;
+ if(existing){
+  review=await wait(()=>frame('review')?.contentWindow.consoleNavigate && loaded('review'),
+                    'Review table did not load.');
+  document.querySelector('a[data-page="images"]').click();
+ }
+ const link=await wait(()=>loaded('images')?.querySelector?.('[data-image-review-question] a'),
+                       'The answer link did not load.');
+ if(link.textContent!=='Read the answer in Review') return done('The link does not name the answer.');
+ link.click();
+ const opened=await wait(()=>{
+  const current=frame('review');
+  if(!current || current.hidden) return;
+  const card=current.contentDocument.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  if(card?.innerText.includes(answer)) return current.contentDocument;
+ },'The answer card did not open.');
+ if(review && review!==opened) return done('The console replaced the Review document.');
+ const table=opened.querySelector('[data-review] table');
+ if(!table) return done('The answer did not open in the table.');
+ document.querySelector('a[data-page="images"]').click();
+ if(!frame('review').hidden) return done('The console did not switch to Images.');
+ document.querySelector('a[data-page="review"]').click();
+ const returned=frame('review');
+ if(returned.hidden || returned.contentDocument!==opened || !table.isConnected)
+  return done('The sidebar did not return to the Review table.');
+ done('');
+})().catch(error=>done(error.message));
+""", args=[existing, item.key, answer]))
+                        self.assertEqual(result['value'], '')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the Images retry")
+    def test_image_review_question_retries_after_the_first_refresh_fails(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        source = case.fixture.temporary / "image.png"
+        _ = source.write_bytes(base64.b64decode(PNG))
+        _ = images.register(source, "The completed build", owner.id, "Phase Images")
+        settings = conf.path("review_links")
+        _ = settings.write_text(settings.read_text().replace("page_refresh_seconds=15", "page_refresh_seconds=5"))
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        blank = case.fixture.temporary / "blank.html"
+        blank.touch()
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message") as send,
+              case.firefox_commands(blank) as command):
+            _ = command('WebDriver:Navigate', url=f'http://127.0.0.1:{self.port}{images.PAGE_PATH}')
+            result = cast(dict[str, str], command('WebDriver:ExecuteAsyncScript', script=r"""
+const [recipient,done]=arguments;
+const list=()=>document.querySelector('[data-images]');
+const status=()=>document.querySelector('[data-page-status]').dataset.state;
+const form=list().querySelector('[data-image-form]');
+const read=window.fetch.bind(window);
+let failedRead=false,lostPost=false,saved=null;
+window.fetch=async (url,options)=>{
+ if(url===location.pathname && options?.cache==='no-store' && lostPost && !saved){
+  return new Response('',{status:503});
+ }
+ if(url===location.pathname && options?.method==='POST' && !lostPost){
+  const response=await read(url,options);
+  lostPost=true;
+  if(response.headers.get('X-Image-Question')!=='review') throw new Error('The Review response has no protocol header.');
+  return new Response('{"state":',{status:response.status,headers:response.headers});
+ }
+ if(url===location.pathname && options?.cache==='no-store' && saved && !failedRead){
+  failedRead=true;
+  return new Response('',{status:503});
+ }
+ const response=await read(url,options);
+ if(url===location.pathname && options?.method==='POST') saved=await response.clone().json();
+ return response;
+};
+async function wait(check){
+ const until=performance.now()+6500;
+ while(!check() && performance.now()<until)
+  await new Promise(resolve=>requestAnimationFrame(resolve));
+ return check();
+}
+void (async()=>{
+ if(list().dataset.refreshSeconds!=='0') return done('Images already had a refresh timer.');
+ form.elements.feedback.value='Which check passed?';
+ form.requestSubmit(form.querySelector('[value="question"]'));
+ const retry=()=>list().querySelector('[data-image-form]');
+ if(!await wait(()=>retry()?.querySelector('[data-image-status]').textContent.startsWith('Not sent:')))
+  return done('The incomplete response hid the draft.');
+ if(retry().elements.feedback.value!=='Which check passed?' || !retry().dataset.questionNonce)
+  return done('The incomplete response lost the draft or its nonce.');
+ retry().requestSubmit(retry().querySelector('[value="question"]'));
+ if(!await wait(()=>status()==='Failed')) return done('The first refresh did not fail.');
+ if(saved?.state!=='review-question' || !saved.waiting || saved.recipient!==recipient)
+  return done('The server did not return the waiting Review response.');
+ if(Number(list().dataset.refreshSeconds)<=0) return done('Images did not start the refresh timer.');
+ if(!await wait(()=>status()==='Live' &&
+   list().querySelector('[data-image-review-question]')?.textContent.includes('Waiting for answer · '+recipient)))
+  return done('The timer did not display the saved Question.');
+ const question=list().querySelector('[data-image-review-question]').closest('.page-question');
+ if(!question || !/^Question Q[1-9][0-9]*$/.test(question.querySelector('h3').innerText) ||
+   question.querySelector('h3 + p').innerText!=='Which check passed?')
+  return done('The waiting card did not show the Question ID and words.');
+ done('');
+})().catch(error=>done(error.message));
+""", args=[owner.name]))
+            self.assertEqual(result['value'], '')
+            self.assertTrue(self.image_posts.wait_until_none_run())
+            send.assert_called_once()
+
+    def test_failed_image_question_removes_the_pair_and_delete_cleans_old_staging(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        before = case.fixture.temporary / "before.png"
+        after = case.fixture.temporary / "after.png"
+        for source in (before, after):
+            _ = source.write_bytes(base64.b64decode(PNG))
+        image = images.register(after, "The completed build", owner.id, "Phase Images", before=before)
+        identity = image["id"]
+        form = {"image": identity, "token": images.request_token(images.console_token(case.root), identity)}
+        words = "Which check passed?"
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message") as send):
+            for nonce, simulate_old_staging in (("b" * 32, False), ("c" * 32, True)):
+                request_id = images.ImageQuestionRequest(identity, words, nonce).request_id(image)
+                origin = new_item_dialog.ReviewSubmission(request_id, "", new_item_dialog.NoEvidence(), (), "")
+                pair = review_submissions.image_folder(origin)
+
+                def fail_write(_path: Path, _text: str) -> None:
+                    self.assertEqual(len(list(pair.glob("*/image.png"))), 2)
+                    raise OSError("The fixture cannot write the Question.")
+
+                with ExitStack() as stack:
+                    _ = stack.enter_context(patch.object(record_store, "create_record_text", side_effect=fail_write))
+                    if simulate_old_staging:
+                        _ = stack.enter_context(patch.object(review_submissions, "_discard_unfiled_send"))
+                    code, body = self.post(images.PAGE_PATH, urlencode(dict(
+                        form, action="question", feedback=words, question_nonce=nonce)))
+                    self.assertEqual(code, 503, body)
+                self.assertEqual(pair.exists(), simulate_old_staging)
+            self.assertEqual(self.post(images.PAGE_PATH, urlencode(dict(form, action="delete")))[0], 200)
+            self.assertEqual(images.records(case.root), [])
+            self.assertFalse(pair.exists())
+            self.assertFalse((pair.parent / "pending.json").exists())
+            self.assertFalse((pair.parent / "first-message.json").exists())
+            self.assertEqual(cache.get().records, {})
+            send.assert_not_called()
+
+    def test_interrupted_image_copy_cleans_partial_staging_on_failure_or_delete(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        before = case.fixture.temporary / "before.png"
+        after = case.fixture.temporary / "after.png"
+        for source in (before, after):
+            _ = source.write_bytes(base64.b64decode(PNG))
+        image = images.register(after, "The completed build", owner.id, "Phase Images", before=before)
+        identity = image["id"]
+        form = {"image": identity, "token": images.request_token(images.console_token(case.root), identity)}
+        words = "Which check passed?"
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        register = image_store.register_file
+
+        def interrupt(source: Path, root: Path, caption: str = "", owner: str = "", subject: str = "",
+                      *, before: Path | None = None, identity: str = "", private: bool = False
+                      ) -> image_store.ImageRecord:
+            if identity == "000000000002":
+                workspace = root.parent
+                self.assertTrue((root / "000000000001" / "image.png").is_file())
+                # Preserve the partial copy as a process stop would.
+                _ = workspace.rename(workspace.with_name(".stage-interrupted"))
+                raise OSError("The second copy stopped before publication.")
+            return register(source, root, caption, owner, subject, before=before, identity=identity, private=private)
+
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message") as send):
+            for nonce, stop_before_cleanup in (("b" * 32, False), ("c" * 32, True), ("d" * 32, True)):
+                request_id = images.ImageQuestionRequest(identity, words, nonce).request_id(image)
+                origin = new_item_dialog.ReviewSubmission(request_id, "", new_item_dialog.NoEvidence(), (), "")
+                pair = review_submissions.image_folder(origin)
+                interrupted = pair.parent / ".stage-interrupted"
+                with ExitStack() as stack:
+                    _ = stack.enter_context(patch.object(image_store, "register_file", side_effect=interrupt))
+                    if stop_before_cleanup:
+                        _ = stack.enter_context(patch.object(review_submissions, "_discard_unfiled_send"))
+                    code, body = self.post(images.PAGE_PATH, urlencode(dict(
+                        form, action="question", feedback=words, question_nonce=nonce)))
+                    self.assertEqual(code, 503, body)
+                self.assertFalse(pair.exists())
+                self.assertEqual(interrupted.exists(), stop_before_cleanup)
+            retry = urlencode(dict(form, action="question", feedback=words, question_nonce="d" * 32))
+            self.assertEqual(self.post(images.PAGE_PATH, retry)[0], 200)
+            self.assertFalse(interrupted.exists())
+            self.assertEqual(len(list(pair.glob("*/image.png"))), 2)
+            interrupted.mkdir()
+            self.assertEqual(self.post(images.PAGE_PATH, urlencode(dict(form, action="delete")))[0], 200)
+            self.assertEqual(images.records(case.root), [])
+            self.assertFalse(interrupted.exists())
+            other = images.ImageQuestionRequest(identity, words, "c" * 32).request_id(image)
+            self.assertFalse((pair.parent.with_name(other) / ".stage-interrupted").exists())
+            self.assertEqual(len(list(pair.glob("*/image.png"))), 2)
+            self.assertEqual(len(cache.get().records), 1)
+            send.assert_called_once()
+
+    def test_image_pair_question_keeps_both_attachments_after_deletion(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        before = case.fixture.temporary / "before.gif"
+        after = case.fixture.temporary / "after.png"
+        gif = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+        # The original is larger than the limit for pasted images.
+        comments = (b'\xff' + b'x' * 255) * (new_item_dialog.MAX_IMAGE_BYTES // 256 + 1)
+        before_bytes = gif[:-1] + b'\x21\xfe' + comments + b'\x00' + gif[-1:]
+        after_bytes = base64.b64decode(PNG)
+        _ = before.write_bytes(before_bytes)
+        _ = after.write_bytes(after_bytes)
+        image = images.register(after, "The completed build", owner.id, "Phase Images", before=before)
+        form = {"image": image["id"], "token": images.request_token(images.console_token(case.root), image["id"])}
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message")):
+            code, body = self.post(images.PAGE_PATH, urlencode(dict(form, action="question", feedback="What changed?")))
+            self.assertEqual(code, 200, body)
+            self.assertEqual(self.post(images.PAGE_PATH, urlencode(dict(form, action="delete")))[0], 200)
+            self.assertEqual(images.records(case.root), [])
+
+            item, = cache.get().records.values()
+            origin = review_items.submission_origin(item)
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            first, second = origin.images
+            source_record = item.source
+            assert isinstance(source_record, review_items.QuestionSource)
+            identity = source_record.record.item.get("review_id")
+            assert identity
+            key = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, owner.id,
+                                                 identity, origin.request_id)
+            self.assertTrue(change_page.answer_item(key, "Both checks passed.", origin.reply_token, case.status))
+            saved, _ = cache.publish_record(cache.get(), item.key)
+            code, body = self.post(review_page.PAGE_PATH, case.card_body(saved, item.key, "read"))
+            self.assertEqual(code, 200, body)
+            self.assertNotIn(item.key, cache.get().records)
+            card = self.request(review_page.card_url(item.key))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertLess(card.body.index(b'alt="Before"'), card.body.index(b'alt="After"'))
+            for reference, media, data in ((first, "image/gif", before_bytes), (second, "image/png", after_bytes)):
+                url = review_page.attachment_url(item.key, reference, retained=True)
+                self.assertIn(url.encode(), card.body)
+                attachment = self.request(html.unescape(url))
+                self.assertEqual((attachment.status, attachment.content_type, len(attachment.body)),
+                                 (200, media, len(data)))
+                self.assertEqual(hashlib.sha256(attachment.body).digest(), hashlib.sha256(data).digest())
 
     def test_list_ask_saves_before_delivery_and_retries_the_same_question(self) -> None:
         morty, item = self.list_keeper_item("The question item")
@@ -5927,23 +6445,35 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn("answer L1 --question Q1", messages[0])
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
-        _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
-        page = change_page.ReviewPage(self.root / 'fixture-image', self.root, ('Images fixture/Q1',), '')
-        delivery = change_page.MessageDelivery(page, page.rows[0], (), 'Fixture question', 'fixture-attempt')
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        source = case.fixture.temporary / "image.png"
+        _ = source.write_bytes(base64.b64decode(PNG))
+        image = images.register(source, "The completed build", owner.id, "Phase Images")
+        body = urlencode({"image": image["id"], "token": images.request_token(images.console_token(case.root), image["id"]),
+                          "action": "question", "feedback": "Which check passed?"})
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
         completed = threading.Event()
 
-        def send(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
-                 status: change_page.DeliveryStatus) -> None:
-            self.assertIs(message, delivery)
-            self.assertEqual(status.root, self.root)
+        def capture(_recipient: str, _sender: str, _message: str, **_options: str) -> None:
             completed.set()
 
-        with patch.object(images, 'submit', return_value=delivery), patch.object(
-                change_page, 'deliver', side_effect=send), patch.object(
-                serve.ReviewLinksHandler, 'json_response', side_effect=BrokenPipeError('fixture disconnect')):
+        with (patch.object(self.server, "root", case.root),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "send_message", side_effect=capture) as send,
+              patch.object(serve.ReviewLinksHandler, "json_response", side_effect=BrokenPipeError("fixture disconnect"))):
             with self.assertRaises(OSError):
-                _ = self.post(images.PAGE_PATH, 'fixture-question')
+                _ = self.post(images.PAGE_PATH, body)
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(self.image_posts.wait_until_none_run())
+            send.assert_called_once()
+        item, = cache.get().records.values()
+        self.assertEqual((item.owner, item.state), (owner.id, review_items.ReviewState.WAITING))
 
     def test_quota_clear_changes_the_nav_until_an_escalation_or_reset(self) -> None:
         from scripts.accounts import accounts

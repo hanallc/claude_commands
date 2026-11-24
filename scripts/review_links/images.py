@@ -10,21 +10,21 @@ import secrets
 import shutil
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production.delivery_state import QuestionSendState
-from scripts.production import staff
+from scripts.production import staff, update_registration
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
-from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, review_link
+from scripts.review_links import change_browser, change_page, console, image_store, new_item_dialog, page_frame, page_question, review_items, review_link, review_page, review_submissions
 
 PAGE_NAME = "images.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -146,9 +146,13 @@ def delete(root: Path, identity: str) -> None:
     if not image_store.IDENTITY.fullmatch(identity):
         raise ValueError(f"{identity}: not an image id")
     folder = images_root(root) / identity
-    if folder.is_symlink() or not folder.is_dir():
-        raise ValueError(f"no image {identity}")
-    shutil.rmtree(folder)
+    with file_lock.exclusive(folder.parent / LOCK):
+        if folder.is_symlink() or not folder.is_dir():
+            raise ValueError(f"no image {identity}")
+        record = image_store.read_record(folder)
+        for request_id in record.get("review_requests", []):
+            review_submissions.clean_image_question_staging(request_id, staff.StaffId(record["owner"]))
+        shutil.rmtree(folder)
 
 
 def console_token(root: Path) -> str:
@@ -185,9 +189,46 @@ def question_html(question: question_record.Question, open_questions: Mapping[st
     return page_question.open_question_html(question, failed=open_questions.get(question.question_id) is QuestionSendState.FAILED)
 
 
+def review_questions(record: image_store.ImageRecord, members: staff.StaffSnapshot
+                     ) -> Iterator[review_submissions.SavedSubmission]:
+    for request_id in record.get("review_requests", []):
+        saved = review_submissions.read_image_question(request_id, staff.StaffId(record["owner"]), members)
+        if isinstance(saved, review_submissions.SavedSubmission):
+            yield saved
+
+
+def review_question_url(key: str) -> str:
+    place = review_page.PAGE_PATH + "#" + urlencode({"item": key, "show": "all"})
+    return "/console/" + console.place_query("review", place)
+
+
+def review_question_key(saved: review_submissions.SavedSubmission) -> str:
+    return review_items.question_key(saved.owner, saved.path)
+
+
+def review_question_html(saved: review_submissions.SavedSubmission, members: staff.StaffSnapshot) -> str:
+    record = saved.record
+    if not isinstance(record, update_registration.QuestionRecord):
+        return ''
+    path = html.escape(review_question_url(review_question_key(saved)), quote=True)
+    if saved.awaiting_reply:
+        recipient = html.escape(review_items.name(saved.owner, members))
+        body = page_question.question_text_html(saved.id, saved.words)
+        status = f'Waiting for answer · {recipient} · <a href="{path}" target="_top">Filed in Review</a>'
+    else:
+        response = review_submissions.question_response(record, ())
+        if response is None:
+            return ''
+        body = (page_question.question_text_html(saved.id, response.question)
+                + page_question.answer_text_html(response.answer))
+        status = f'Answered · <a href="{path}" target="_top">Read the answer in Review</a>'
+    return f'<section class="page-question">{body}<p role="status" data-image-review-question>{status}</p></section>'
+
+
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
-         open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS) -> str:
+         open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS,
+         filed_questions: tuple[review_submissions.SavedSubmission, ...] = ()) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -212,6 +253,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'{shown_time(added)}</time></dd></dl>'
             + (f'<div class="image-pair" data-image-zoom-group>{pictures}</div>' if pair else pictures)
             + ''.join(question_html(question, open_questions) for question in questions)
+            + ''.join(review_question_html(saved, members) for saved in filed_questions)
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
@@ -237,7 +279,14 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     for record in records(root):
         review = image_review(status, record)
         if review.visible():
-            cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
+            try:
+                filed = tuple(review_questions(record, members))
+            except (OSError, ValueError) as error:
+                print(f"review-links images: {record['id']}: {error}", file=sys.stderr)
+                filed = ()
+            cards.append(card(record, token, members, rows, names, open_questions=review.open_questions,
+                              filed_questions=filed))
+            refresh_needed |= any(saved.awaiting_reply for saved in filed)
         elif review.open_questions:
             waiting.append(record['id'])
         refresh_needed |= review.refresh()
@@ -256,12 +305,23 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     return page_frame.rendered(change_page.document(content, "Images"), started, read_at)
 
 
-def submit(root: Path, body: str, status: change_page.DeliveryStatus
-           ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Save a question for deferred delivery; keep feedback and delete actions as before."""
+@dataclass(frozen=True)
+class ImageQuestionRequest:
+    identity: str
+    words: str
+    nonce: str
+
+    def request_id(self, record: image_store.ImageRecord) -> str:
+        digest = hashlib.sha256(json.dumps(
+            [self.identity, record["registered_at"], self.nonce, self.words]).encode()).hexdigest()[:32]
+        return f"r1-{digest}-question-{record['owner']}"
+
+
+def submit(root: Path, body: str) -> ImageQuestionRequest | change_page.NoMessageDelivery:
+    """Read a Review question request or apply the image action."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
-    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round"} or any(
+    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round", "question_nonce"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -277,26 +337,41 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
-        return ask_question(root, identity, fields.get('feedback', [''])[0], status)
+        words = fields.get('feedback', [''])[0].strip()
+        nonce = fields.get('question_nonce', [''])[0]
+        if not words:
+            raise question_record.AnswerRefused("Enter a question first.")
+        if nonce and (len(nonce) != 32 or any(digit not in '0123456789abcdef' for digit in nonce)):
+            raise question_record.AnswerRefused("Use the question box on this image.")
+        return ImageQuestionRequest(identity, new_item_dialog.read_words(words, "Your words"), nonce)
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
         send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
         return change_page.NoMessageDelivery()
-    with file_lock.exclusive(images_root(root) / LOCK):
-        try:
-            delete(root, identity)
-        except ValueError as error:
-            raise question_record.AnswerRefused(str(error)) from error
+    try:
+        delete(root, identity)
+    except ValueError as error:
+        raise question_record.AnswerRefused(str(error)) from error
     return change_page.NoMessageDelivery()
 
 
-def ask_question(root: Path, identity: str, words: str, status: change_page.DeliveryStatus
-                 ) -> change_page.MessageDelivery:
-    store = image_store.ImageQuestionStore(images_root(root))
-    folder = store.folder(identity)
-    record = image_store.read_record(folder)
-    target = change_page.image_question_target(folder / image_store.RECORD, record)
-    return page_question.ask(store, target, words, status)
+def review_question(folder: Path, record: image_store.ImageRecord,
+                    request: ImageQuestionRequest) -> new_item_dialog.NewItemRequest:
+    attachments: list[Path] = []
+    for _, file in shown_files(record):
+        path = folder / file
+        if path.name != file or path.suffix not in image_store.SUFFIXES or path.is_symlink() or not path.is_file():
+            raise question_record.AnswerRefused("An image file is not available.")
+        attachments.append(path)
+    evidence = new_item_dialog.PageDataEvidence("Images", (
+        ("Caption", record['caption'][:240]),
+        ("For", record['subject'][:240]),
+        ("Attachments", *(label or "Image" for label, _ in shown_files(record))),
+    ))
+    return new_item_dialog.NewItemRequest(
+        request.request_id(record), new_item_dialog.SubmissionKind.QUESTION, staff.StaffId(record["owner"]),
+        request.words, evidence, page="images", page_recipient=new_item_dialog.PageRecipient.IMAGE_OWNER,
+        registered_images=tuple(attachments))
 
 
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
@@ -480,6 +555,11 @@ function bind(root) {
     // Remove the card after the fade. Restore the card if the request fails.
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
     const body = new URLSearchParams(new FormData(form, event.submitter));
+    if (question) {
+      form.dataset.questionNonce ||= Array.from(crypto.getRandomValues(new Uint8Array(16)),
+        byte => byte.toString(16).padStart(2, '0')).join('');
+      body.set('question_nonce', form.dataset.questionNonce);
+    }
     status.textContent = '';
     let postFailed = false;
     setCardSubmitting(form, true);
@@ -492,11 +572,25 @@ function bind(root) {
         throw new Error(reason || 'HTTP ' + response.status);
       }
       if (question) {
-        card.remove();
-        list.dataset.waitingImages += ' ' + card.dataset.image;
-        list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
-        apply();
-        pageRefresh.restart();
+        const reviewResponse = response.headers.get('X-Image-Question') === 'review';
+        const result = await response.json().catch(() => null);
+        if (result?.state === 'review-question' && typeof result.waiting === 'boolean') {
+          form.elements.feedback.value = '';
+          delete form.dataset.questionNonce;
+          if (result.waiting && refreshSeconds() !== list.dataset.answerRefreshSeconds) {
+            list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
+            pageRefresh.restart();
+          }
+        } else if (!reviewResponse && (!result || result.state === 'done')) {
+          // Keep the refresh path for replies from the earlier server.
+          card.remove();
+          list.dataset.waitingImages += ' ' + card.dataset.image;
+          list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
+          apply();
+          pageRefresh.restart();
+        } else {
+          throw new Error('The server response is incomplete.');
+        }
       }
     } catch (error) {
       postFailed = true;
@@ -506,7 +600,9 @@ function bind(root) {
     } finally {
       sending--;
       setCardSubmitting(form, false);
-      if (question && !postFailed) void pageRefresh.refresh(true);
+      if (question && !postFailed) {
+        void pageRefresh.refresh(true);
+      }
       else void refresh().catch(error => {
         if (postFailed) return;
         status.dataset.refreshFailed = 'true';
@@ -539,8 +635,10 @@ async function refresh(_supersede=false,current=()=>true) {
       const previous = forms.get(form.elements.image.value);
       if (!previous) return;
       form.elements.feedback.value = previous.elements.feedback.value;
+      if (previous.dataset.questionNonce) form.dataset.questionNonce = previous.dataset.questionNonce;
       const oldStatus = previous.querySelector('[data-image-status]');
-      if (!oldStatus.dataset.refreshFailed) form.querySelector('[data-image-status]').textContent = oldStatus.textContent;
+      if (!oldStatus.dataset.refreshFailed)
+        form.querySelector('[data-image-status]').textContent = oldStatus.textContent;
     });
     const top = scrollY;
     const wasWaiting = !waiting.hidden;

@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum, StrEnum
+from pathlib import Path
 from typing import Literal, cast
 
 from scripts.production import staff
@@ -283,6 +284,7 @@ class PageRecipient(StrEnum):
     PAGE_OWNER = "page-owner"
     LIST_OWNER = "list-owner"
     SELECTED = "selected"
+    IMAGE_OWNER = "image-owner"
 
 
 @dataclass(frozen=True)
@@ -296,6 +298,7 @@ class NewItemRequest:
     page: str = ""
     page_state: BugPageState | None = None
     page_recipient: PageRecipient = PageRecipient.PAGE_OWNER
+    registered_images: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -341,6 +344,13 @@ class ReviewSubmission:
         if self.page_state_data is not None:
             return self.page_state_data
         return self.evidence if isinstance(self.evidence, PageDataEvidence) else None
+
+    def image_card_labels(self) -> tuple[str, ...]:
+        if self.page == "images" and isinstance(self.evidence, PageDataEvidence):
+            for row in self.evidence.rows:
+                if row in (("Attachments", "Before", "After"), ("Attachments", "Image")):
+                    return row[1:]
+        return ()
 
 
 type SubmissionOrigin = ReviewSubmission | NoReviewSubmission
@@ -612,7 +622,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         page_recipient = PageRecipient(data.get("page_recipient", PageRecipient.PAGE_OWNER))
     except ValueError as error:
         raise SubmissionError("Select a recipient from the New item dialog.") from error
-    if not page and page_recipient != PageRecipient.PAGE_OWNER:
+    if page_recipient is PageRecipient.IMAGE_OWNER or (not page and page_recipient != PageRecipient.PAGE_OWNER):
         raise SubmissionError("Select a recipient from the New item dialog.")
     try:
         evidence = read_evidence(data.get("evidence"))

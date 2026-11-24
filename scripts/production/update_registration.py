@@ -478,8 +478,8 @@ class StaffAsker:
 
 
 @dataclass(frozen=True)
-class ProducerQuestions:
-    """A producer owns questions without a production document."""
+class StaffQuestions:
+    """A staff member owns questions in their own store."""
 
     owner: staff.StaffRow
 
@@ -492,7 +492,8 @@ class ProducerQuestions:
         return user_zone()
 
 
-QuestionScope = Production | ProducerQuestions
+ProducerQuestions = StaffQuestions
+QuestionScope = Production | StaffQuestions
 
 
 def question_owner(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
@@ -504,12 +505,12 @@ def question_owner(reference: str, record: staff.StaffSnapshot) -> staff.StaffRo
 def question_scope(reference: str | staff.StaffRow, record: staff.StaffSnapshot) -> QuestionScope:
     """Read the question owner without requiring a producer to have a production."""
     owner = reference if isinstance(reference, staff.StaffRow) else question_owner(reference, record)
-    return ProducerQuestions(owner) if owner is not None and owner.kind == "producer" else read_production(reference, record)
+    return StaffQuestions(owner) if owner is not None and owner.kind == "producer" else read_production(reference, record)
 
 
 def question_source(scope: QuestionScope) -> Path | staff.StaffRow:
-    """Select a production document or a producer's fixed staff row."""
-    return scope.owner if isinstance(scope, ProducerQuestions) else scope.doc
+    """Select the production document or the fixed staff row."""
+    return scope.owner if isinstance(scope, StaffQuestions) else scope.doc
 
 
 @dataclass(frozen=True)
