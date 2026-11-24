@@ -4,7 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import os
 from pathlib import Path
-from subprocess import DEVNULL, CompletedProcess
+from subprocess import DEVNULL, PIPE, CompletedProcess
 import sys
 from tempfile import TemporaryDirectory
 from typing import cast, final
@@ -38,7 +38,7 @@ class ReviewFixture:
         _ = self.after.write_text(AFTER, encoding="utf-8")
         _ = self.words.write_text(FEEDBACK, encoding="utf-8")
         _ = test.enterContext(patch.object(simplify_report, "uuid4", return_value=UUID(REPORT_ID)))
-        self.sender = Mock(return_value=CompletedProcess([], 0))
+        self.sender = Mock(return_value=CompletedProcess([], 0, "SENT: fixture delivery\n"))
         _ = test.enterContext(patch.object(simplify_report, "run", new=self.sender))
         self.stdout = test.enterContext(redirect_stdout(StringIO()))
         self.stderr = test.enterContext(redirect_stderr(StringIO()))
@@ -64,27 +64,49 @@ class SimplifyReportTests(unittest.TestCase):
             input=(f"Ad hoc review simplify report {REPORT_ID}\n\n"
                    f"Why the first item failed\n{FAILURE}\n\n"
                    f"Before\n{BEFORE}\n\nAfter\n{AFTER}"),
-            encoding="utf-8", stdout=DEVNULL, stderr=DEVNULL, check=False,
+            encoding="utf-8", stdout=PIPE, stderr=DEVNULL, check=False,
         )
         self.assertEqual(fixture.stdout.getvalue(), REPORT_ID + "\n")
         self.assertEqual(fixture.stderr.getvalue(), "")
 
     def test_feedback_sends_exact_words_with_the_same_item_and_report_id(self) -> None:
         fixture = ReviewFixture(self)
-        fixture.sender.return_value = CompletedProcess([], 1)
-        self.assertEqual(fixture.report(), 1)
+        self.assertEqual(fixture.report(), 0)
         report_id = fixture.stdout.getvalue().strip()
         fixture.sender.reset_mock()
-        fixture.sender.return_value = CompletedProcess([], 0)
         self.assertEqual(fixture.feedback(report_id), 0)
         fixture.sender.assert_called_once_with(
             [sys.executable, str(simplify_report.SEND_SCRIPT), f"--to={RECIPIENT}", f"--from={SENDER}"],
             input=(f"Ad hoc review simplify feedback for report {REPORT_ID}\n\n"
                    f"Simplified item\n{AFTER}\n\nUser feedback\n{FEEDBACK}"),
-            encoding="utf-8", stdout=DEVNULL, stderr=DEVNULL, check=False,
+            encoding="utf-8", stdout=PIPE, stderr=DEVNULL, check=False,
         )
         self.assertEqual(fixture.stdout.getvalue(), REPORT_ID + "\n")
         self.assertEqual(fixture.stderr.getvalue(), "")
+
+    def test_report_prints_id_for_confirmed_queued_or_kept_send(self) -> None:
+        fixture = ReviewFixture(self)
+        for status, output in ((1, "QUEUED: fixture offline\n"), (0, "KEPT: fixture hold\n")):
+            with self.subTest(output=output):
+                fixture.sender.return_value = CompletedProcess([], status, output)
+                self.assertEqual(fixture.report(), 0)
+        self.assertEqual(fixture.stdout.getvalue(), (REPORT_ID + "\n") * 2)
+        self.assertEqual(fixture.stderr.getvalue(), "")
+
+    def test_report_refuses_an_unconfirmed_exit_one_or_a_skipped_send(self) -> None:
+        fixture = ReviewFixture(self)
+        for status, output in ((1, "child process error\n"), (0, "SKIPPED: fixture skipped\n")):
+            with self.subTest(output=output):
+                fixture.sender.return_value = CompletedProcess([], status, output)
+                self.assertNotEqual(fixture.report(), 0)
+        self.assertEqual(fixture.stdout.getvalue(), "")
+        self.assertEqual(
+            fixture.stderr.getvalue().splitlines(),
+            [
+                "simplify_report.py: send.py did not confirm delivery or storage (exit 1)",
+                "simplify_report.py: send.py returned SKIPPED",
+            ],
+        )
 
     def test_reports_read_the_recipient_from_the_current_fixture_config(self) -> None:
         fixture = ReviewFixture(self)

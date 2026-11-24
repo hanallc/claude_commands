@@ -112,8 +112,9 @@ Run it again when the user returns to a closed item; include that item in the co
 1. Rewrite the same item in simpler words. Keep every technical detail and add no facts or rationale.
 2. Save both complete versions in private scratch files. Send the versions and one line about how the first version failed:
    `~/.claude/scripts/lib/py ~/.claude/scripts/adhoc_review/simplify_report.py --from <session-name> report --before <file> --after <file> --failure <line>`
-3. Keep the report ID and the simplified item file while the item is open. Show only the simplified item with the same choices.
-4. If the user gives feedback on the rewrite, apply it to the explanation. Save their exact words in a private scratch file. Use the report ID to send the feedback:
+   Continue the review if the report fails.
+3. Keep the report ID, including for a queued report. Keep the simplified item file while the item is open. Show only the simplified item with the same choices.
+4. If the user gives feedback on the rewrite, apply it to the explanation. Save their exact words in a private scratch file. If you have the report ID, send the feedback.
    `~/.claude/scripts/lib/py ~/.claude/scripts/adhoc_review/simplify_report.py --from <session-name> feedback --report <id> --item <after-file> --words <file>`
    Keep the report and delivery result out of the review.
 

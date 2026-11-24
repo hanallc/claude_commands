@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import re
-from subprocess import DEVNULL, run
+from subprocess import DEVNULL, PIPE, run
 import sys
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
 from scripts.lib import conf
+from scripts.message import send_result
 
 
 RECIPIENT_KEY = "simplify_report_recipient"
@@ -64,13 +65,17 @@ def read_text(path: Path) -> str:
     return text
 
 
-def send_message(recipient: str, sender: str, message: str) -> int:
+def send_message(recipient: str, sender: str, message: str) -> None:
     result = run([sys.executable, str(SEND_SCRIPT), f"--to={recipient}", f"--from={sender}"],
-                 input=message, encoding="utf-8", stdout=DEVNULL, stderr=DEVNULL, check=False)
-    return result.returncode
+                 input=message, encoding="utf-8", stdout=PIPE, stderr=DEVNULL, check=False)
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.UnconfirmedSendOutcome):
+        raise ValueError(f"send.py did not confirm delivery or storage (exit {result.returncode})")
+    if outcome.header.outcome not in ("sent", "kept", "queued"):
+        raise ValueError(f"send.py returned {outcome.header.outcome.upper()}")
 
 
-def send_report(arguments: ReportArguments, recipient: str) -> int:
+def send_report(arguments: ReportArguments, recipient: str) -> None:
     failure = arguments["failure"].strip()
     if not failure or len(failure.splitlines()) != 1:
         raise ValueError("--failure requires one line")
@@ -80,13 +85,11 @@ def send_report(arguments: ReportArguments, recipient: str) -> int:
     message = (f"Ad hoc review simplify report {report_id}\n\n"
                f"Why the first item failed\n{failure}\n\n"
                f"Before\n{before}\n\nAfter\n{item}")
-    status = send_message(recipient, arguments["sender"], message)
-    if status in (0, 1):  # send.py delivered or queued the report.
-        print(report_id)
-    return status
+    send_message(recipient, arguments["sender"], message)
+    print(report_id)
 
 
-def send_feedback(arguments: FeedbackArguments, recipient: str) -> int:
+def send_feedback(arguments: FeedbackArguments, recipient: str) -> None:
     report_id = arguments["report"]
     if not re.fullmatch(r"[0-9a-fA-F]{32}", report_id):
         raise ValueError("--report requires 32 hexadecimal characters")
@@ -94,7 +97,7 @@ def send_feedback(arguments: FeedbackArguments, recipient: str) -> int:
     words = read_text(arguments["words"])
     message = (f"Ad hoc review simplify feedback for report {report_id}\n\n"
                f"Simplified item\n{item}\n\nUser feedback\n{words}")
-    return send_message(recipient, arguments["sender"], message)
+    send_message(recipient, arguments["sender"], message)
 
 
 def main(argv: list[str]) -> int:
@@ -102,11 +105,13 @@ def main(argv: list[str]) -> int:
     try:
         recipient = configured_recipient()
         if arguments["mode"] == "report":
-            return send_report(arguments, recipient)
-        return send_feedback(arguments, recipient)
+            send_report(arguments, recipient)
+        else:
+            send_feedback(arguments, recipient)
     except (ValueError, OSError) as error:
         print(f"simplify_report.py: {error}", file=sys.stderr)
         return 2
+    return 0
 
 
 if __name__ == "__main__":
