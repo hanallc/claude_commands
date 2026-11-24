@@ -14,7 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, cast, final, override
+from typing import Literal, Protocol, cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -709,13 +709,15 @@ class TheListTests(unittest.TestCase):
         item = self.add(changes={"producer": OTHER.id})
         until = START + timedelta(days=1)
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
-            for name, *args in (("park", "--until", until.isoformat()), ("close", "--words", "Done")):
+            for name, *args in (("park", "--until", until.isoformat()), ("unpark",), ("close", "--words", "Done")):
                 with self.subTest(command=name), self.assertRaises(SystemExit) as refused:
                     _ = self.command(name, "--id", item.id, *args)
                 self.assertEqual(refused.exception.code, 2)
             self.assertEqual(self.command("park", "--id", item.id, "--until", until.isoformat(),
                                           "--source", "nate: park it till tomorrow"), (0, "", ""))
             self.assertEqual(the_list.load(MORTY.id, item.id).parked_until, until)
+            self.assertEqual(self.command("unpark", "--id", item.id, "--source", "nate: unpark it"), (0, "", ""))
+            self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
             self.assertEqual(self.command("close", "--id", item.id, "--words", "Done",
                                           "--source", "nate: close it"), (0, "", ""))
             closed = the_list.load(MORTY.id, item.id)
@@ -724,13 +726,15 @@ class TheListTests(unittest.TestCase):
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.state, the_list.ItemState.NEW)
         self.assertEqual([entry.source for entry in saved.log[1:]],
-                         ["nate: park it till tomorrow", "nate: close it", "nate: reopen it"])
+                         ["nate: park it till tomorrow", "nate: unpark it", "nate: close it", "nate: reopen it"])
 
     def test_producer_cannot_park_close_or_reopen_another_producers_item(self) -> None:
         item = self.add(changes={"producer": BOB.id})
+        item = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
         closed = the_list.close(MORTY.id, self.add(changes={"producer": BOB.id}).id, "Done", source="nate")
         commands = (
             ("park", "--id", item.id, "--until", START.isoformat()),
+            ("unpark", "--id", item.id),
             ("close", "--id", item.id, "--words", "Done"),
             ("reopen", "--id", closed.id),
         )
@@ -806,11 +810,13 @@ class TheListTests(unittest.TestCase):
 
     def test_close_reopen_and_repeats_keep_the_record_and_number(self) -> None:
         item = self.add(number=70)
+        _ = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
         path = the_list.folder(MORTY.id) / "L70.md"
         self.assertEqual(self.command("close", "--id", item.id, "--words", "Stop tracking this item", "--source", "nate"), (0, "", ""))
         closed = the_list.load(MORTY.id, item.id)
         self.assertEqual((closed.state, closed.closed, closed.closing_words),
                          (the_list.ItemState.CLOSED, START, "Stop tracking this item"))
+        self.assertIs(closed.parked_until, the_list.NoTimestamp.UNSET)
         self.assertEqual(the_list.records(MORTY.id), [])
         self.assertEqual(the_list.records(MORTY.id, include_closed=True), [closed])
         self.assertNotIn("| 70 |", self.command("list")[1])
@@ -1697,9 +1703,16 @@ class TheListTests(unittest.TestCase):
                     self.assertEqual(receipt, the_list.PageRequest("read", "read", ""))
 
     def test_page_item_actions_save_the_notice_in_the_same_write(self) -> None:
-        for action in ("remove", "park"):
-            with self.subTest(action=action):
+        cases: tuple[tuple[Literal["remove", "park"], the_list.Parking], ...] = (
+            ("remove", the_list.NoTimestamp.UNSET),
+            ("remove", the_list.ParkUntilDelivered.DELIVERED),
+            ("park", the_list.NoTimestamp.UNSET),
+        )
+        for action, parking in cases:
+            with self.subTest(action=action, parking=parking):
                 item = self.add("One write for " + action)
+                if parking is not the_list.NoTimestamp.UNSET:
+                    _ = the_list.park(MORTY.id, item.id, parking, source="nate")
                 notice = the_list.PageItemNotice("request-" + action, "The item action is complete.", action)
                 with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
                     if action == "remove":
@@ -1707,6 +1720,8 @@ class TheListTests(unittest.TestCase):
                     else:
                         saved = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source=the_list.PAGE_SOURCE, notice=notice)
                 save.assert_called_once()
+                if action == "remove":
+                    self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
                 feedback = the_list.feedback_requests(saved)[notice.request]
                 self.assertEqual((feedback.action, feedback.words, feedback.state), (action, notice.words, "pending"))
                 self.assertEqual(saved.log[-1].time, saved.log[-2].time)
@@ -1722,7 +1737,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(repeated, reopened)
 
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
-        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        item = self.add(changes={"state": the_list.ItemState.WORKING, "producer": BOB.id})
         self.assertEqual(self.command("park", "--id", item.id, "--until", "2026-11-17", "--source", "nate"), (0, "", ""))
         item = the_list.load(MORTY.id, item.id)
         self.assertEqual(item.parked_until, datetime(2026, 11, 17, 5, tzinfo=UTC))
@@ -1734,6 +1749,9 @@ class TheListTests(unittest.TestCase):
             self.assertIn("| 1 |", self.command("list")[1])
         self.assertEqual(self.command("park", "--id", item.id, "--until", "", "--source", "nate"), (0, "", ""))
         self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+        _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="morty")
+        self.assertEqual(self.command("unpark", "--id", item.id, "--source", "morty"), (0, "", ""))
+        self.assertIn(item.title, self.command("list")[1])
 
     def test_park_until_delivered_through_the_cli(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})

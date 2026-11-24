@@ -70,7 +70,7 @@ An invalid live value counts as `off`, and a missing key or a missing live file 
 `hana_guest.read_settings()` also reads the Hana key, but only the image build (`hana_render.py`) uses that value, and it refuses an invalid live value.
 So no image holds a switch value that the user did not set, and the image files do not import `config.py`.
 
-With `enabled=off` in `hana_aws.conf`, the controller still observes and stops the box when the lifecycle record shows that the box can run: a state other than `idle-stopped` or `unprovisioned`, a claim, a replacement stop duty, open Hana compute in the cost ledger, or an operation other than `observe`.
+With `enabled=off` in `hana_aws.conf`, the controller still observes and stops the box, unless `key_refused.json` holds the calls (see Hana lifecycle controller), when the lifecycle record shows that the box can run: a state other than `idle-stopped` or `unprovisioned`, a claim, a replacement stop duty, open Hana compute in the cost ledger, or an operation other than `observe`.
 With `enabled=off` in `cloud_gate.conf`, the gate route launches no new box, also for a retry after a Spot interruption or a box failure.
 When a gate reservation is due for cleanup, the route starts only the reconcile step, which ends that box and launches no box.
 A reservation is due for cleanup when its worker is dead, or when it has no known worker and its time is up; `cleanup_due()` in `cloud_gate.py` holds this rule.
@@ -351,7 +351,7 @@ Open compute exposure remains reserved after permit expiry until a lifecycle obs
 Storage remains reserved after stop and termination until volume deletion is confirmed.
 Storage estimates use a 30-day month.
 The ledger reserves the remaining storage cost for every day that a permit reaches.
-With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped, and a start from outside the controller is not seen.
+With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped unless `key_refused.json` holds the calls, and a start from outside the controller is not seen.
 For an automatic restart, `reconcile()` reserves the boot guard interval and retains exposure until a confirmed stop.
 Unknown lifecycle state releases no exposure.
 Each lifecycle observation names the generation that the observer read before its request.
@@ -396,6 +396,16 @@ The new rate therefore belongs to the Hana configuration.
 `aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
 Each child attempts Hana lifecycle recovery before account charge refresh.
 Either operation can fail without suppressing the other operation.
+A refused key is the one exception.
+When AWS refuses the key itself (`KEY_REFUSED_CODES` in `aws_cli.py`, such as `AuthFailure`), the child writes `key_refused.json` in the account directory and stops.
+While that record exists, each child makes no AWS call: no lifecycle step, no charge refresh, and no stop for a running box.
+The hourly job also makes no AWS call while the record exists.
+The cloud gate route then sends each gate to natedev with no AWS call, with the reason `key_refusal.REFUSED_REASON`.
+The record clears only after one child sees every AWS machine off and a later child sees one on.
+So a person sets `enabled=off` in both `cloud_gate.conf` and `hana_aws.conf`, keeps them off for at least one tick (about 10 s), then sets one to `on`.
+An unusable `enabled` value does not count as off for this rule.
+An unreadable record holds the calls, as a refusal does.
+`scripts/aws_target/key_refusal.py` owns the record.
 The supervisor continues after a failed or timed-out child.
 It releases all child-owned locks when the child exits.
 
@@ -478,7 +488,7 @@ Renewal retains the execution identity and advances the permit generation.
 A failed install leaves the active permit unchanged.
 An exact replay can acknowledge the installed permit while it is fresh.
 The controller reserves exposure until stop confirmation through the Phase C ledger.
-With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped, and a start from outside the controller is not seen.
+With Hana off, a record at rest gets no AWS call, a record that is not at rest (starting, stopping, interrupted, a claim, a stop duty or open compute) is still observed and stopped unless `key_refused.json` holds the calls, and a start from outside the controller is not seen.
 An automatic restart cannot reuse an interrupted execution's boot challenge.
 
 `HanaProvider.step()` defines the typed provider boundary.

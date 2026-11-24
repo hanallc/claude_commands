@@ -67,10 +67,24 @@ def wrapper_words(name: str) -> frozenset[str]:
     return frozenset(found.group(1).split())
 
 
+def in_named_step_scope(environment: Mapping[str, str]) -> bool:
+    """The cgroup folder of this process equals BUILDLOG_STEP_SCOPE, the scope that a queued step or a reserved
+    program names. The wrapper starts cargo there at once, with no folder step. A value from another scope is
+    stale and changes nothing."""
+    step_scope = environment.get("BUILDLOG_STEP_SCOPE")
+    if not step_scope:
+        return False
+    try:
+        lines = Path(environment.get("CARGO_WRAPPER_CGROUP_FILE") or "/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return False
+    return any(line.startswith("0::") and "/sys/fs/cgroup" + line[3:] == step_scope for line in lines)
+
+
 def folder_step_due(argv: Sequence[str], environment: Mapping[str, str]) -> bool:
     """The wrapper does its folder steps for the cargo words argv in the environment: a build subcommand other
-    than install, no help or version word after it, and no outer step that did the steps."""
-    if environment.get("CARGO_FOLDER_CHECKED") == "1" or environment.get("BUILDLOG_STEP_SCOPE"):
+    than install, no help or version word after it, no outer step that did the steps, and no named step scope."""
+    if environment.get("CARGO_FOLDER_CHECKED") == "1" or in_named_step_scope(environment):
         return False
     value_options, skip = wrapper_words("value_options"), False
     for index, word in enumerate(argv):

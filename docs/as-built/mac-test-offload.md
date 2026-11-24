@@ -49,11 +49,31 @@ The count excludes type checks.
 Older guest gate code can return its result without sending progress records.
 If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
 The queue can then give the gate to the next named target.
+For a placed gate, `copies.py run` keeps the copy lease and uses its original placement request again.
+The gate must exit with status 79 and write a claim failure that matches the current assignment.
+After the queue settles that attempt, the gate starts with the replacement assignment.
+If the claim failure is missing or invalid, `copies.py run` reports `Gate placement blocked` and returns status 79.
 If the guest run fails after that line, the gate fails and reports the guest and the reason.
 A stream failure reports its status and up to 1200 characters from standard error.
 A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
+
+The probe, arm, gate stream, and cleanup retry an inner SSH connect reset or refusal.
+The Mac gives the inner SSH client a private log and deletes it when the shell exits.
+When SSH exits 255 and the log contains only the connect error, the shell reports the error with a reserved status.
+The route checks the reserved status, the Mac marker, and empty standard output before it retries.
+The probe, arm, and gate stream allow three attempts within the unreachable wait, with one second between attempts.
+The arm covers the gate stream's connect window and allows time for the arm reply and guest lock setup.
+The gate stream sends the remaining connect time to the Mac after the outer SSH hop starts the Mac shell.
+The Mac applies that time to the inner SSH hop. The sender declines the inner hop when less than one second remains.
+The local stream enforces the deadline until the guest accepts the command.
+The guest acceptance line starts the transfer timeout and the bundle upload.
+If the deadline expires before acceptance, the queue can try another target after the guest confirms cleanup.
+Cleanup continues until it gets end proof or the proof deadline expires.
+It waits one second between the first three connect attempts, then uses the normal proof interval before a new group.
+An interrupt preserves the proof deadline and the count of attempts in the current group.
+The hand-made command stream combines output and diagnostics and uses one stream attempt.
 
 ## Mac queue runs
 
@@ -251,7 +271,7 @@ The `[mac_idle]` section of `config/mac_test.conf` supplies these defaults:
 | Key | Default | Purpose |
 |---|---:|---|
 | `alert_seconds` | 180 | Delay before the view alert and showrunner message |
-| `push_seconds` | 600 | Delay before the phone push |
+| `push_seconds` | 600 | Not read. The machine watch uses `excluded_notice_seconds.mac` in `build_targets.conf` |
 | `stale_seconds` | 300 | Maximum age of a saved reading |
 | `repeat_minutes` | 1440 | Minimum repeat window for an outage |
 | `send_timeout_s` | 180 | Timeout for a phone send |
@@ -287,14 +307,21 @@ The views place the same `MAC IDLE` alert first.
 The unreachable state sends the message after `alert_seconds` while eligible steps wait.
 The unreadable state sends no message or phone push.
 
-A free Mac, idle claim, block, or disk exclusion sends no phone push.
+The machine watch, `scripts/buildlog/machine_watch.py`, sends the phone push. See [build-targets.md](build-targets.md).
+It reads the saved alert of the same pass.
+The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `excluded_notice_seconds.mac` (600 s) while eligible steps wait.
+A free Mac, an idle claim or a disk exclusion with waiting steps sends no phone push.
+`mac_idle` counts a waiting step only after `alert_seconds`.
+The machine watch sends one message to bob and the builds showrunner 600 s after it first sees the waiting steps.
+A block sends no phone push.
 These states keep the message to builds.
-The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `push_seconds` while eligible steps wait.
 A Mac that the user turned off sends no phone push: a Mac block, `offload=off` or `enabled.mac=off`.
-`mac_test.machine_off_on_purpose` holds this one rule for every outage push and takes any target name.
-Each target reads `enabled.<machine>` in `build_targets.conf`; only the Mac also reads its block and `offload`.
+`mac_test.machine_off_on_purpose` holds this one rule for every outage notice and takes any target name.
+Each target reads `enabled.<machine>` in `build_targets.conf`.
+The local target also reads the `/build:hold` holds in force. An unreadable hold state counts as in use.
+An SSH target also reads its block and one switch in its settings file: `offload` for a macOS target, `enabled` for another target.
 Only an explicit `off` counts. A missing `enabled.<machine>` key, an unusable value or an unreadable record counts as in use.
-A missing live `mac_test.conf` or a missing `offload` key reads the committed file, as the router does, so the committed `offload` value counts.
+A missing live settings file or a missing switch key reads the committed file, as the router does, so the committed `offload` value counts.
 A block is a lease that a showrunner gives to one session. It does not count when its holder asks.
 `mac.locked` in `send.py` asks with its `sender=` value, so the block holder still reaches the user.
 For a Mac that is off on purpose, `send.py` prints `SKIPPED: the Mac is off on purpose (<reason>)` and exits 0.
@@ -307,9 +334,10 @@ The saved alert, the `MAC UNREACHABLE` line and the builds message stay.
 When the Mac is in use again and still unreachable, the push goes on the next pass.
 `mac_idle.push_retired` is the clear-check rule: the Mac is off on purpose, the saved state is not unreachable, or no step waits.
 `mac_idle.py cleared` exits 0 on this rule, and the push stops its repeats.
-The watch saves `pushed` as false only for a Mac that is off on purpose, before its early return.
-Otherwise one outage sends one phone push, also across a pass with no waiting steps or a short free-Mac reading.
-The watch reads the off-on-purpose state once per pass.
+The machine watch removes its saved `sent` mark only for a Mac that is off on purpose, an outage that ended, or a change of notice kind.
+Otherwise one outage sends one phone push, also across a pass with no waiting steps.
+A free-Mac reading with waiting steps is a message outage, so a later unreachable reading starts a new push outage.
+The machine watch reads the off-on-purpose state once per pass.
 The clear check retires the key, so the same `mac-idle-<since>` key pushes again when the Mac is in use again.
 The title is "Mac tests stopped".
 The action is "Wake the Mac or check its network."
@@ -336,7 +364,7 @@ Delivery takes precedence over loss in that gap.
 This policy covers process stops, including SIGTERM, SIGKILL, and session stops.
 It does not cover power loss or promise filesystem synchronization.
 
-The watch saves `messaged` and `pushed` only after accepted delivery.
+The Mac idle watch saves `messaged`, and the machine watch saves `sent`, only after accepted delivery.
 The unreachable push uses `mac_idle.py cleared --since <since>`.
 That check reads only the saved result.
 It clears when the saved state is no longer unreachable, the outage changes, or no steps wait.

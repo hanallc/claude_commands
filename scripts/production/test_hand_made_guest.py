@@ -92,8 +92,7 @@ class InjectedGuest:
         self.events.append("arm")
         return mac_linux.ArmedGuestAttempt(attempt, "0" * 32, "boot", 1, "fixture", "/fixture/checkout")
 
-    def stream(self, _settings: mac_linux.GuestSettings, _source: mac_linux.CheckoutSource, _bootstrap_bytes: int,
-               _armed: mac_linux.ArmedGuestAttempt, _prefix: str, _send: mac_linux.BundleSend, *,
+    def stream(self, _settings: mac_linux.GuestSettings, _shell: str, _prefix: str, _send: mac_linux.BundleSend, *,
                count: bool, link: int) -> list[str]:
         del link
         self.events.append(f"run count={count}")

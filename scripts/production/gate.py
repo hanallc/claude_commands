@@ -2495,10 +2495,13 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
                 recovery.rollback = ""
                 recovery.save()
         except Exception as cleanup_error:
-            if not isinstance(error, (AwsGateTookNoRun, GateSettlementPending)):
+            if not isinstance(error, GATE_PLACEMENT_ERRORS):
                 raise
             if isinstance(recovery, GateRecovery):
                 recovery.rollback = baseline
+            if isinstance(error, MacLinuxTookNoRun):
+                detail = str(cleanup_error) or type(cleanup_error).__name__
+                raise MacLinuxTookNoRun(f"{error}; merge cleanup failed: {detail}") from cleanup_error
             raise_gate_cleanup_failure(error, cleanup_error, "Merge cleanup")
         if isinstance(error, (AwsGateTookNoRun, GateSettlementPending)):
             print("Merge undone. The merge was not pushed.", file=sys.stderr, flush=True)
@@ -3488,6 +3491,12 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 if job.returncode:
                     print(f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{job.output}",
                           file=sys.stderr, flush=True)
+        else:
+            modules = sum(job.kind is GateJobKind.TEST_MODULE for job in outcome.jobs)
+            minutes, seconds = divmod(round(outcome.seconds), 60)
+            head = checked_git(repo, "rev-parse", "HEAD")[:10]
+            print(f"Mac Linux guest gate passed: {modules} modules in {minutes} min {seconds} s (checkout HEAD {head})",
+                  flush=True)
         return finish_remote(outcome) if local_types else outcome
 
     def run_routed(select: Callable[[RoutedGateTree, set[str]], GateRun]) -> GateRun:
