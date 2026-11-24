@@ -119,9 +119,19 @@ move automatically (recommended — you can keep editing) / leave hidden / let t
 
 ### Reader test
 
+The session that shows the items runs this test on each item before the user sees it.
+
+For one live item, the writer runs it alone:
+
 1. Read only the title and **The point** as a reader who knows none of the work.
 2. State why the item exists.
 3. If you need more context to answer, rewrite the item and repeat the test.
+
+For a prepared batch, run it cold:
+
+1. Give a helper only the titles and **The point** blocks.
+2. The helper states why each item exists.
+3. Rewrite each item where the helper cannot, and repeat the test for it.
 
 ## The comprehension gate
 

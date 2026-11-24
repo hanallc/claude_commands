@@ -92,8 +92,8 @@ For each item, in order:
 1. Mark the task `in_progress`.
 2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
 3. Build the causal explanation with the shared file's build order. Then use its **Ad hoc review items** template.
-4. Give each subagent that prepares an item the shared guide. Require it to pass the reader test before it returns the draft.
-5. Pass the shared **reader test** and **comprehension gate** before each presentation. Then show the item.
+4. When a subagent or worker prepares items, give it the shared guide, the user's own words for the request, and the text the user sees on screen.
+5. Run the shared **reader test** and **comprehension gate** on each item before the user sees it, prepared items included. Then show the item.
 6. **Wait for the user's response.**
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
