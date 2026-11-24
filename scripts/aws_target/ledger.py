@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
@@ -21,8 +21,10 @@ from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib import conf
+from scripts.lib.file_lock import LockResult, exclusive
+from scripts.build_queue import placement, snapshot_codec
 from scripts.aws_target import hana_result, remote
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -173,6 +175,92 @@ class GateReservation:
 def gate_is_open(reservation: GateReservation) -> bool:
     """Keep pending and running reservations open until AWS confirms closure."""
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
+
+
+GateDispatchSettlement = Literal["no launch", "launch ended"]
+
+
+@dataclass(frozen=True)
+class GateDispatchRecord:
+    """Bind the service folders to the exact queue claim and caller."""
+    claim: placement.ProviderClaimReference
+    holder: placement.ClaimHolderIdentity
+    state: Literal["prelaunch"] | GateDispatchSettlement = "prelaunch"
+    folders: tuple[Path, ...] = ()
+
+
+def _gate_dispatch_text(record: GateDispatchRecord) -> str:
+    return json.dumps(snapshot_codec.snapshot_value(record), sort_keys=True) + '\n'
+
+
+@dataclass(frozen=True)
+class GateDispatchJournal:
+    """Use the path the queue assigned to this gate."""
+    path: Path
+
+    def read(self) -> GateDispatchRecord:
+        return cast(GateDispatchRecord, snapshot_codec.parse_snapshot_value(
+            cast(object, json.loads(self.path.read_text())), GateDispatchRecord))
+
+    def begin(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity) -> None:
+        """Persist the caller before it requests launch permission."""
+        if not create_text_atomic(self.path, _gate_dispatch_text(GateDispatchRecord(claim, holder))):
+            self.require_open(claim, holder)
+
+    def require_open(self, claim: placement.ProviderClaimReference,
+                     holder: placement.ClaimHolderIdentity) -> GateDispatchRecord:
+        record = self.read()
+        if (record.claim, record.holder) != (claim, holder):
+            raise LedgerUnavailable('The AWS journal names a different claim or caller')
+        if record.state != "prelaunch":
+            raise LedgerUnavailable('The AWS dispatch is closed')
+        return record
+
+    def lock(self, *, wait: bool = True) -> AbstractContextManager[LockResult]:
+        return exclusive(self.path.with_suffix('.lock'), wait=wait)
+
+    def register(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity,
+                 folder: Path) -> None:
+        """Persist a service folder before the service can start."""
+        with self.lock():
+            record = self.require_open(claim, holder)
+            if folder not in record.folders:
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, folders=(*record.folders, folder))))
+
+    def settle(self, claim: placement.ProviderClaimReference, holder: placement.ClaimHolderIdentity,
+               book: CostLedger) -> GateDispatchSettlement | placement.DispatchPathPending:
+        """Use only local evidence to close a dispatch and fence its workers."""
+        try:
+            with self.lock(wait=False) as access:
+                if access is LockResult.BUSY:
+                    return placement.DispatchPathPending('The AWS worker holds the dispatch lock')
+                record = self.read()
+                if (record.claim, record.holder) != (claim, holder):
+                    raise LedgerUnavailable('The AWS journal names a different claim or caller')
+                if record.state != "prelaunch":
+                    return record.state
+                state: GateDispatchSettlement = "no launch"
+                if record.folders:
+                    reservations = ({row.attempt: row for row in book.read_snapshot().gate_reservations}
+                                    if book.path.exists() else {})
+                    for folder in record.folders:
+                        reservation = reservations.get(folder.name)
+                        if reservation is not None and gate_is_open(reservation):
+                            return placement.DispatchPathPending(f'AWS launch {folder.name} remains open')
+                        try:
+                            launch = mapping(cast(object, json.loads((folder / 'launch.json').read_text())))
+                        except FileNotFoundError:
+                            launch = {}
+                        if reservation is not None and isinstance(reservation.state, GateTerminated):
+                            state = "launch ended"
+                        if 'instance' in launch:
+                            state = "launch ended"
+                        if reservation is None and ('arguments' in launch or 'instance' in launch):
+                            return placement.DispatchPathPending(f'AWS launch {folder.name} has no confirmed end')
+                write_text_atomic(self.path, _gate_dispatch_text(replace(record, state=state)))
+                return state
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return placement.DispatchPathPending(f'Local AWS dispatch evidence is unavailable. {error}')
 
 
 @dataclass(frozen=True)

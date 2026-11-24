@@ -22,7 +22,7 @@ import signal
 from pathlib import Path
 import subprocess
 import sys
-from tempfile import TemporaryFile
+from tempfile import TemporaryDirectory, TemporaryFile
 import threading
 import time
 from types import SimpleNamespace
@@ -38,7 +38,7 @@ from scripts.aws_target.ledger_test_support import (
     CostFixture, account_reply, install_aws_fixture_settings, instant, numeric_settings,
     override_fixture_settings, text_setting,
 )
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
@@ -49,6 +49,7 @@ from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
+from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.lib.git_test_support import commit_repository
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -2945,6 +2946,34 @@ wait_for_watchdog()
             self.assertIn('cloud gate fixture watchdog expired', output)
             self.assertIn('in wait_for_watchdog', output)
         stop.assert_called_once_with(process.pid, signal.SIGKILL)
+
+
+class GateDispatchJournalTests(unittest.TestCase):
+    def test_a_late_worker_cannot_start_after_local_closure(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            book = ledger.CostLedger(root / 'aws')
+            journal = ledger.GateDispatchJournal(root / 'queue' / 'claim.json')
+            claim = placement.ProviderClaimReference('scaler', 'aws', WHOLE_MAC, 'claim', 'episode', 'attempt')
+            holder = placement.ClaimHolderIdentity('host', 1, '1')
+            journal.begin(claim, holder)
+            folder = root / 'worker'
+            journal.register(claim, holder, folder)
+            self.assertEqual(journal.read().state, 'prelaunch')
+            self.assertEqual(journal.settle(claim, holder, book), 'no launch')
+            self.assertEqual(journal.read().state, 'no launch')
+
+            command = ['cloud_gate.py', '--worker', str(folder), '--directory', str(book.directory),
+                       '--sidecar', str(folder / 'progress'), '--placement-journal', str(journal.path)]
+            with (mock.patch.object(sys, 'argv', command),
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('AWS client started')) as api,
+                  mock.patch.object(ledger.CostLedger, 'reserve_gate',
+                                    side_effect=AssertionError('Spend was reserved')) as reserve):
+                self.assertEqual(cloud_gate.main(), 0)
+            api.assert_not_called()
+            reserve.assert_not_called()
+            self.assertFalse(book.path.exists())
+            self.assertFalse((folder / 'launch.json').exists())
 
 
 class CloudRouteTests(CloudGateHangGuard, CostFixture):

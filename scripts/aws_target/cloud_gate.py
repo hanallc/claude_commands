@@ -9,7 +9,7 @@ import argparse
 import ast
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -33,7 +33,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, 
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
     gate_regions, money, read_settings)
 from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, placement, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib import cancellation, git_index
 from scripts.build_targets import target_config
@@ -55,6 +55,19 @@ class LocalFallback:
     reason: str
 
 
+@dataclass(frozen=True)
+class UnassignedCloudGate:
+    """The cloud gate obtains a slot through legacy admission."""
+
+
+@dataclass(frozen=True)
+class AssignedCloudGate:
+    """The queue has granted this gate a cloud slot."""
+    journal: ledger.GateDispatchJournal
+    claim: placement.ProviderClaimReference
+    holder: placement.ClaimHolderIdentity
+
+
 @dataclass
 class CloudAttempt:
     directory: Path
@@ -62,6 +75,7 @@ class CloudAttempt:
     identifier: str = ''
     interruptions: int = 0
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    dispatch: AssignedCloudGate | UnassignedCloudGate = UnassignedCloudGate()
 
 
 @dataclass(frozen=True)
@@ -1338,10 +1352,13 @@ def read_saved_request(repo: Path, path: Path, tree: str,
 
 
 def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Path,
-                         directory: Path, sidecar: Path) -> list[str]:
-    return service_command('scripts.aws_target.cloud_gate',
-        [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
-         '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
+                         directory: Path, sidecar: Path, *,
+                         dispatch: AssignedCloudGate | UnassignedCloudGate = UnassignedCloudGate()) -> list[str]:
+    arguments = [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
+                 '--settings', str(account_settings_path())]
+    if isinstance(dispatch, AssignedCloudGate):
+        arguments.extend(('--placement-journal', str(dispatch.journal.path)))
+    return service_command('scripts.aws_target.cloud_gate', arguments, 'cloud-gate-' + folder.name)
 
 
 def reconcile_command(directory: Path) -> list[str]:
@@ -1445,6 +1462,13 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
     return outcome
 
 
+def cloud_attempt_slot(repo: Path, sidecar: Path, attempt: CloudAttempt,
+                       gate_job: StepJob | GateJobNotRecorded) -> AbstractContextManager[CloudReservation]:
+    if isinstance(attempt.dispatch, AssignedCloudGate):
+        return nullcontext(CloudReservation(sidecar))
+    return cloud_reservation(repo, sidecar, attempt.mode, gate_job=gate_job)
+
+
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
@@ -1461,7 +1485,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
-        current = root / 'current.json'
+        dispatch = attempt.dispatch
+        current = (root / f'{dispatch.claim.claim_id}.json' if isinstance(dispatch, AssignedCloudGate)
+                   else root / 'current.json')
         if not current.exists() and not deployment_path.exists():
             return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
@@ -1511,7 +1537,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             else:
                 attempt.identifier = folder.name
                 attempt.gate_job = _saved_gate_job(previous)
-                with cloud_reservation(repo, folder / 'reservation.cgroup', mode, gate_job=command_job) as reservation:
+                with cloud_attempt_slot(repo, folder / 'reservation.cgroup', attempt, command_job) as reservation:
                     outcome = _complete_outcome(repo, folder, request, row)
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
                     return outcome
@@ -1545,7 +1571,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if retrying:
             retry_limit = min(retry_limit, int(str(previous.get('spot_retry_limit', retry_limit))))
             box_retry_limit = min(box_retry_limit, int(str(previous.get('box_retry_limit', box_retry_limit))))
-        with cloud_reservation(repo, sidecar, mode, gate_job=command_job) as reservation:
+        with cloud_attempt_slot(repo, sidecar, attempt, command_job) as reservation:
             while True:
                 state: dict[str, object] = {'attempt': folder.name, **identity,
                     'gate_job': snapshot_codec.snapshot_value(attempt.gate_job),
@@ -1572,7 +1598,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         if not isinstance(switch, AwsOn):
                             reservation.status = 0
                             return LocalFallback(cloud_gate_off_reason(switch))
-                    command = gate_attempt_command('--worker', folder, directory, sidecar)
+                    command = gate_attempt_command('--worker', folder, directory, sidecar, dispatch=dispatch)
                     request = saved_request or prepare(repo, folder, mode, module_time_limit_s,
                                                        selected=selected, gate_job=attempt.gate_job)
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
@@ -1588,6 +1614,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         request['retry_launch'] = retry_launch
                     save(folder / 'request.json', request)
                     save(folder / 'deployment.json', deployment)
+                    if isinstance(dispatch, AssignedCloudGate):
+                        dispatch.journal.register(dispatch.claim, dispatch.holder, folder)
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
                     failure = retryable_cloud_failure(result)
@@ -1694,6 +1722,7 @@ def main() -> int:
     _ = parser.add_argument('--directory', required=True, type=Path)
     _ = parser.add_argument('--sidecar', type=Path, help='required with --worker and --cleanup')
     _ = parser.add_argument('--settings', type=Path, default=account_settings_path())
+    _ = parser.add_argument('--placement-journal', type=Path)
     args = parser.parse_args()
     directory = cast(Path, args.directory)
     settings_path = cast(Path, args.settings)
@@ -1714,14 +1743,25 @@ def main() -> int:
     cleanup = cast(Path | None, args.cleanup)
     folder = cleanup if cleanup is not None else cast(Path, args.worker)
     with control_lock(folder):
-        worker = gate_worker()
         if cleanup is not None:
             with cancellation.defer_cleanup_signals():
-                return int(not cleanup_folder(folder, worker))
-        if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
-            return 0
-        outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
-        save(folder / 'outcome.json', outcome)
+                return int(not cleanup_folder(folder, gate_worker()))
+        journal_path = cast(Path | None, args.placement_journal)
+        if journal_path is None:
+            return execute_gate_worker(folder, gate_worker)
+        journal = ledger.GateDispatchJournal(journal_path)
+        with journal.lock():
+            dispatch = journal.read()
+            if dispatch.state != "prelaunch" or folder not in dispatch.folders:
+                return 0
+            return execute_gate_worker(folder, gate_worker)
+
+
+def execute_gate_worker(folder: Path, worker: Callable[[], GateWorker]) -> int:
+    if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
+        return 0
+    outcome = worker().execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+    save(folder / 'outcome.json', outcome)
     return 0
 
 
