@@ -31,7 +31,7 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
-from scripts.mac_test.test_mac_queue_run import queue_fixture, queue_with_ready_event
+from scripts.mac_test.test_mac_queue_run import end_queue_fixture, queue_fixture, queue_with_ready_event
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.test_times import gate_record
@@ -863,9 +863,9 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             caller = [sys.executable, '-c', CALL_ROUTE, str(self.repo), str(callback),
                       str(reader) if explicit else '']
             result = root / 'route.log'
-            with result.open('w+') as output, subprocess.Popen(
-                caller, env=environment, stdout=output, stderr=output, pass_fds=(reader,) if explicit else (),
-            ) as process:
+            with os.fdopen(writer, 'wb') as caller_end, result.open('w+') as output:
+                process = subprocess.Popen(caller, env=environment, stdout=output, stderr=output,
+                                           pass_fds=(reader,) if explicit else ())
                 try:
                     marker = root / ('bundle_pid' if prepare_bundle else 'module_pid')
                     wait_until(lambda: marker.exists() or process.poll() is not None, root, processes=(process,))
@@ -874,7 +874,7 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                     if prepare_bundle:
                         self.assertTrue(gate.checked_git(self.repo, 'for-each-ref', 'refs/cloud-gates/'))
                     if explicit:
-                        self.assertEqual(os.write(writer, b'x'), 1)
+                        self.assertEqual(os.write(caller_end.fileno(), b'x'), 1)
                     else:
                         process.send_signal(signal.SIGTERM)
                     self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0 if explicit else -signal.SIGTERM,
@@ -896,11 +896,13 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                     self.assertEqual(record['groups'], {})
                     self.assertEqual(record['folders'], [])
                 finally:
-                    if process.poll() is None:
+                    if wait_for_ready:
+                        end_queue_fixture(process, caller_end)
+                    elif process.poll() is None:
                         process.kill()
+                        _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         finally:
             os.close(reader)
-            os.close(writer)
 
     def sleeping_process(self) -> subprocess.Popen[bytes]:
         process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],

@@ -1,7 +1,7 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from datetime import UTC, datetime, timedelta
 import io
 import json
@@ -15,7 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import TextIO, cast
+from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
 
@@ -143,17 +143,46 @@ def queue_with_ready_event(root: Path) -> Path:
     source = Path(__file__).resolve().parents[2]
     script = root / "queue-entry.py"
     _ = script.write_text(f"import sys\nsys.path.insert(0, {str(source)!r})\n" + r"""
+import os
+import select
+
 from scripts.mac_test import mac_queue_run
 
 def wait_for_ready(output, _timeout):
     expected = b"ready\n"
-    with open(output, "rb", closefd=False) as stream:
-        return stream.readline(len(expected)) == expected
+    received = b""
+    while received != expected:
+        readable, _, _ = select.select([caller, output], [], [])
+        if caller in readable:
+            return False
+        chunk = os.read(output, len(expected) - len(received))
+        received += chunk
+        if not chunk or not expected.startswith(received):
+            return False
+    return True
 
-mac_queue_run.watcher_ready = wait_for_ready
-raise SystemExit(mac_queue_run.main())
+with os.fdopen(os.dup(int(sys.argv[sys.argv.index("--caller-fd") + 1])), "rb") as pipe:
+    caller = pipe.fileno()
+    mac_queue_run.watcher_ready = wait_for_ready
+    raise SystemExit(mac_queue_run.main())
 """)
     return script
+
+
+def end_queue_fixture(process: subprocess.Popen[str] | subprocess.Popen[bytes], caller: BinaryIO,
+                      *, queue_group: bool = False) -> None:
+    """Close the caller pipe so the queue can stop and reap its watcher."""
+    caller.close()
+    try:
+        _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+    except subprocess.TimeoutExpired:
+        if queue_group:
+            with suppress(ProcessLookupError):
+                send_process_group(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+        _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+        raise
 
 
 class QueueRunTests(unittest.TestCase):
@@ -632,35 +661,35 @@ raise SystemExit(mac_queue_run.main(sys.argv[2:]))
             environment = {**queue_fixture(root), "FAKE_SSH_HOLD": "1"}
             reader, writer = os.pipe()
             try:
-                command = [sys.executable, str(queue_with_ready_event(root)), "--caller-fd", str(reader),
-                           *self.command(root)[3:]]
-                with subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
+                with os.fdopen(writer, "wb") as caller:
+                    command = [sys.executable, str(queue_with_ready_event(root)), "--caller-fd", str(reader),
+                               *self.command(root)[3:]]
+                    queue = subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    assert queue.stdout is not None and queue.stderr is not None
+                    queue_output = cast(TextIO, queue.stdout)
                     try:
-                        assert queue.stdout is not None
-                        queue_output = cast(TextIO, queue.stdout)
-                        self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
-                        self.assertEqual(queue_output.readline().strip(), "Mac command started")
-                        processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True)
-                        watchers: list[int] = []
-                        for line in processes.splitlines():
-                            fields = line.split(maxsplit=2)
-                            if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
-                                watchers.append(int(fields[0]))
-                        self.assertEqual(len(watchers), 1)
-                        os.kill(watchers[0], signal.SIGKILL)
-                        output, errors = queue.communicate(timeout=10)
+                        with queue_output, queue.stderr:
+                            self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(queue_output.readline().strip(), "Mac command started")
+                            processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True,
+                                                                timeout=TEST_HANG_GUARD_SECS)
+                            watchers: list[int] = []
+                            for line in processes.splitlines():
+                                fields = line.split(maxsplit=2)
+                                if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
+                                    watchers.append(int(fields[0]))
+                            self.assertEqual(len(watchers), 1)
+                            os.kill(watchers[0], signal.SIGKILL)
+                            output, errors = queue.communicate(timeout=10)
                     finally:
-                        if queue.poll() is None:
-                            send_process_group(queue.pid, signal.SIGKILL)
-                            _ = queue.communicate()
+                        end_queue_fixture(queue, caller, queue_group=True)
                 self.assertEqual(queue.returncode, -signal.SIGTERM, output + errors)
                 self.assertIn("caller watch ended unexpectedly", errors)
                 self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
                 self.assertIn("signal_group TERM", (root / "stop").read_text())
             finally:
                 os.close(reader)
-                os.close(writer)
 
     def test_caller_watch_accepts_ready_after_the_termination_grace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
