@@ -127,8 +127,18 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
 fi
 
 if [[ $remote == *' smoke-status '* ]]; then
+    # Return the fixture's status over the fake SSH connection.
     outer=("${(@Q)${(z)remote}}")
-    exec "${outer[@]}"
+    status_command=${outer[-1]}
+    status_words=("${(@Q)${(z)status_command}}")
+    (( ${#status_words} == 5 )) && [[ ${status_words[4]} == smoke-status ]] || exit 99
+    episode=${status_words[-1]}
+    [[ ${#episode} == 32 && $episode != *[^0-9a-f]* ]] || exit 99
+    folder=$SCRATCH_ROOT/mac-smoke-$episode
+    [[ -f $folder/status ]] || exit 1
+    printf 'mac_smoke_status='
+    cat -- "$folder/status" && rm -- "$folder/status" && rmdir -- "$folder"
+    exit $?
 fi
 
 if (( placed_run )); then
@@ -253,26 +263,11 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 if sys.argv[0].endswith("/mac_queue_run.py"):
     with (Path(os.environ["MAC_RUN_STUB_STATE"]) / "runner-events").open("a") as stream:
         stream.write(json.dumps(sys.argv[1:]) + "\n")
-
-if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
-    original_monotonic = time.monotonic
-    offset = 0.0
-
-    def advancing_monotonic() -> float:
-        return original_monotonic() + offset
-
-    def advancing_sleep(seconds: float) -> None:
-        global offset
-        offset += seconds
-
-    time.monotonic = advancing_monotonic
-    time.sleep = advancing_sleep
 '''
 
 
@@ -324,7 +319,7 @@ class MacRunTests(unittest.TestCase):
         self.config_path = self.root / "config/mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n"
+        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\nprobe_timeout_s=15\n"
                                  + "block_hours=4\nblock_max_hours=48\nclaim_poll_seconds=60\n")
         self.write_production_config()
         queue = self.root / "fake-queue.py"
@@ -539,7 +534,7 @@ class MacRunTests(unittest.TestCase):
         self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
         self.clear_events()
 
-        result = self.mac_run(extra={"MAC_TEST_ADVANCE_WAIT": "1"})
+        result = self.mac_run()
 
         self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
         self.assertRegex(result.stdout, r"busy: unit tests since \d\d:\d\d")
@@ -598,8 +593,8 @@ class MacRunTests(unittest.TestCase):
         self.assert_claim_released()
 
     def test_pending_host_evidence_retries_placement_and_starts_the_build(self) -> None:
-        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "pending-evidence",
-                                     "MAC_TEST_ADVANCE_WAIT": "1"}, timeout=TEST_HANG_GUARD_SECS)
+        result = self.mac_run(extra={"MAC_RUN_QUEUE_WAIT_REPLY": "pending-evidence"},
+                              timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         queue_events = [cast(list[str], json.loads(line))
