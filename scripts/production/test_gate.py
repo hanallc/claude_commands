@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement, queue_place
 from scripts.build_queue.admission_jobs import StepJob
+from scripts.build_targets.gate_targets import caller_gate_targets
 
 from scripts.agents import remote
 from scripts.build_hold import build_hold
@@ -118,9 +119,9 @@ class DirectGatePlacementTests(unittest.TestCase):
 
                     @contextmanager
                     def admit(_command: Sequence[str], checkout: Path, *,
-                              targets: tuple[str, ...]) -> Generator[first_step.FirstStepAdmission]:
+                              targets: placement.GateTargets) -> Generator[first_step.FirstStepAdmission]:
                         self.assertEqual(checkout, source)
-                        self.assertEqual(targets, ("mac-linux",))
+                        self.assertEqual(targets.names, ("mac-linux",))
                         events.append("admit")
                         try:
                             yield admitted
@@ -149,7 +150,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                                 raise OSError("fixture test folder cleanup failed")
 
                     with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                          mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                          mock.patch.object(first_step, "gate_targets",
+                              return_value=caller_gate_targets(("mac-linux",))),
                           mock.patch.object(first_step, "admitted_run", side_effect=admit),
                           mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                           mock.patch.object(admission_client, "request_settlement", side_effect=settle),
@@ -175,7 +177,8 @@ class DirectGatePlacementTests(unittest.TestCase):
             armed = mac_linux.ArmedGuestAttempt("fixture-arm", "f" * 32, "boot-id", 10, "user", "/fixture")
             failure = mac_linux.GuestEndUnproven("fixture guest end remains unproven", armed)
             with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                  mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                  mock.patch.object(first_step, "gate_targets",
+                      return_value=caller_gate_targets(("mac-linux",))),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
                   mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                   mock.patch.object(conf, "read", return_value=mock.Mock(value=mock.Mock(return_value=True))),
@@ -257,7 +260,8 @@ class DirectGatePlacementTests(unittest.TestCase):
                     outcome = (gate.MacLinuxTookNoRun("fixture guest took no run") if status == GATE_PRELAUNCH_REFUSED_STATUS
                                else gate.GateSettlementPending("fixture guest end remains unproven"))
                     with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                          mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                          mock.patch.object(first_step, "gate_targets",
+                              return_value=caller_gate_targets(("mac-linux",))),
                           mock.patch.object(first_step, "admitted_run", return_value=admit()),
                           mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                           mock.patch.object(gate, "test_run_folder", side_effect=run_folder),
@@ -305,14 +309,16 @@ class DirectGatePlacementTests(unittest.TestCase):
             admitted = self.admission(source, ("gate.py", *arguments))
             _ = (source / "edit.txt").write_text("Changed since placement.\n")
             with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
-                  mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                  mock.patch.object(first_step, "gate_targets",
+                      return_value=caller_gate_targets(("mac-linux",))),
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as open_admission,
                   mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
                   mock.patch.object(treekey, "tree_key", wraps=treekey.tree_key) as key,
                   mock.patch.object(gate, "run_tests_only", return_value=0) as run,
                   redirect_stderr(io.StringIO()) as errors):
                 self.assertEqual(gate.main(arguments), 1)
-            open_admission.assert_called_once_with(("gate.py", *arguments), source, targets=("mac-linux",))
+            open_admission.assert_called_once_with(("gate.py", *arguments), source,
+                                                   targets=caller_gate_targets(("mac-linux",)))
             key.assert_called_once_with(str(source))
             self.assertIn("source does not match", errors.getvalue())
             run.assert_not_called()
@@ -386,17 +392,18 @@ class MergeGateCheckpointTests(MergeGateFixture):
             return gate.GateRun((), 0, 0, tests_reused=True)
 
         @contextmanager
-        def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[object]:
+        def admit(command: Sequence[str], source: Path, *, targets: placement.GateTargets) -> Generator[object]:
             self.assertEqual(command[0], 'gate.py')
             self.assertEqual(source, self.checkout)
-            self.assertEqual(targets, ("natedev",))
+            self.assertEqual(targets.names, ("natedev",))
             self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
             self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
             yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.InheritedGatePlacement(assignment))
 
         assignment = placed('natedev')
         with (mock.patch.object(gate, "run_suites", side_effect=suites),
-              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+              mock.patch.object(first_step, "gate_targets",
+                  return_value=caller_gate_targets(("natedev",))),
               mock.patch.object(first_step, 'admitted_run', side_effect=admit) as admitted,
               mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment])):
             result = self.run_gate()
@@ -546,7 +553,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 raise OSError("fixture admission cleanup failed")
 
         with (mock.patch.object(gate, "current_gate_placement", side_effect=[gate.NO_GATE_ASSIGNMENT, grant]),
-              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "gate_targets",
+                  return_value=caller_gate_targets(("mac-linux",))),
               mock.patch.object(first_step, "admitted_run", return_value=admit()),
               mock.patch.object(admission_client, "request_settlement"),
               mock.patch.object(gate, "run_gate_suites", side_effect=pending) as run):

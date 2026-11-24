@@ -11,6 +11,25 @@ from scripts.mac_test.claim_state import ClaimScope
 
 SubmittingSession = OwningSession | NoOwningSession
 
+GATE_MACHINES = ("natedev", "mac-linux", "aws")
+GATE_CALLER_EXCLUSION = "the run asks for it"
+TARGET_READING_UNAVAILABLE = "the target reading is unavailable"
+
+
+@dataclass(frozen=True)
+class GateTargets:
+    """Keep the ordered target names and the reasons for excluded machines."""
+
+    names: tuple[str, ...]
+    exclusions: tuple[tuple[str, str], ...]
+    caller_supplied: bool = False
+
+    def restrict(self, names: tuple[str, ...], reason: str) -> GateTargets:
+        """Keep prior reasons and record the reason for each new exclusion."""
+        previous = dict(self.exclusions)
+        return GateTargets(names, tuple((machine, previous.get(machine, reason))
+            for machine in GATE_MACHINES if machine not in names), self.caller_supplied)
+
 
 @dataclass(frozen=True)
 class SubmittingOwner:
@@ -544,6 +563,23 @@ def assigned_claim_reference(assignment: PlacementAssignment) -> ProviderClaimRe
     return ProviderClaimReference(destination.provider, destination.target, destination.scope,
         execution_identity.assigned_claim_id(assignment.episode, assignment.attempt), assignment.episode, assignment.attempt)
 
+
+PLACEMENT_REASON_TEXT = {
+    "mac_linux_off": "the guest is off",
+    "mac_linux_unregistered": "the guest has no queue registration",
+    "mac_linux_settings_unreadable": "the guest settings are unreadable or invalid",
+    "mac_linux_backoff_unreadable": "the guest backoff record is unreadable or invalid",
+    "mac_linux_backoff": "the guest is in retry backoff",
+    "mac_linux_reading_required": "the queue needs a newer guest reading",
+    MAC_LINUX_NO_ANSWER: "the Mac does not answer",
+    "busy": "the target is busy",
+    "off": "the target is off",
+    "disk": "the target needs more disk space",
+    "command": "the target does not support this command",
+    "repo": "the target does not support this repository",
+    "linux_only": "this step runs only on Linux",
+    "offload_exclude": "the target excludes this step",
+}
 
 def retry_decision(destination: PlacementDestination, reason: str | execution_identity.HanaCommandAdmissionRefused, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""

@@ -45,7 +45,7 @@ from scripts.lib.copy_record import (
 from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
-from scripts.build_queue import first_step
+from scripts.build_queue import first_step, placement
 from scripts.lib.build_steps import (
     GATE_SCRIPTS, StepJob, VerifyCommand, build_call_arguments, command_job,
     command_program, read_step_names, verify_command,
@@ -1465,18 +1465,19 @@ class DirectCommandCopy:
 @contextmanager
 def _command_copy(
     owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-    merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (), place_unnamed_gate: bool = True,
+    merge: MergePolicy, step: str = "", gate_targets: placement.GateTargets | None = None, place_unnamed_gate: bool = True,
 ) -> Generator[AdmittedCommandCopy | DirectCommandCopy]:
     """Hold the copy and any first-step admission through the caller scope."""
     from scripts.build_targets.gate_targets import uses_parent_reservation
 
     job = command_job(command)
     label = step or (job.step if isinstance(job, StepJob) else "")
+    named = gate_targets is not None and bool(gate_targets.names)
     try:
         with ExitStack() as scope:
-            if isinstance(job, StepJob) and (gate_targets or not uses_parent_reservation(tuple(command))):
+            if isinstance(job, StepJob) and (named or not uses_parent_reservation(tuple(command))):
                 source = Path(repo).expanduser().resolve()
-                if (gate_targets or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
+                if (named or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
                         or isinstance(verify_command(command), VerifyCommand)):
                     source = scope.enter_context(requested_source(source, policy, merge))
                     policy = CommittedSource(commit_at(source, "HEAD"))
@@ -1498,7 +1499,7 @@ def _command_copy(
 
 @contextmanager
 def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
+                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: placement.GateTargets | None = None) -> Generator[Path]:
     """Admit a queue command before preparing its slot and hold the slot through the caller scope."""
     with _command_copy(owner, repo, policy, command, merge=merge, step=step, gate_targets=gate_targets,
                        place_unnamed_gate=False) as prepared:
@@ -2724,7 +2725,7 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
     def run() -> subprocess.CompletedProcess[str]:
         return subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
 
-    if not targets and uses_parent_reservation(tuple(command)):
+    if not targets.names and uses_parent_reservation(tuple(command)):
         result = run()
     else:
         with first_step.admitted_run(command, source, targets=targets) as admitted:

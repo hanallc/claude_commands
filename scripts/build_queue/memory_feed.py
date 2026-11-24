@@ -568,7 +568,7 @@ def local_runs_on(mac: target_availability.TargetFit | target_availability.NoMac
 
 
 # A run that asks for natedev: the plain words of the local caller route.
-RUN_ASKS_TEXT = "the run asks for it"
+RUN_ASKS_TEXT = placement.GATE_CALLER_EXCLUSION
 
 
 def step_runs_on(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
@@ -630,25 +630,69 @@ def ci_target_notes(machine: str) -> TargetNotes:
     return {"runs_on": named.text(), "targets": list(named.targets), "mac_text": ""}
 
 
+DAILY_SPENDING_LIMIT = "the daily spending limit is reached"
+MONTHLY_SPENDING_LIMIT = "the monthly spending limit is reached"
+GATE_REASON_NOT_RECORDED = "the queue did not record a reason"
+GATE_SPENDING_REASONS = {"daily_limit": DAILY_SPENDING_LIMIT, "monthly_limit": MONTHLY_SPENDING_LIMIT}
+CLAUDE_GATE_REPOSITORIES = frozenset({"claude", ".claude", "claude_commands"})
+
+
+def old_claude_gate(step: str, folder: str, project: str = "") -> bool:
+    return step in GATE_STEPS and (project in CLAUDE_GATE_REPOSITORIES
+                                  or Path(folder).name in CLAUDE_GATE_REPOSITORIES)
+
+
+def gate_machine(destination: placement.PlacementDestination) -> str:
+    return "aws" if destination.provider == "scaler" else destination.target if destination.target != "aws" else ""
+
+
+def gate_target_reasons(selection: placement.GateTargets | None,
+                        candidates: tuple[placement.CandidateEligibility, ...],
+                        named: tuple[str, ...], *, running: str = "",
+                        machines: tuple[str, ...] = placement.GATE_MACHINES) -> str:
+    """Give each excluded machine one reason in machine order."""
+    excluded = dict(selection.exclusions) if selection is not None else {}
+    reasons: list[str] = []
+    for machine in machines:
+        matching = tuple(row for row in candidates if gate_machine(row.destination) == machine)
+        if running == machine or any(row.destination.target == running
+                or row.destination.host == running for row in matching):
+            continue
+        if any(isinstance(row.eligibility, placement.AllowedHost) for row in matching):
+            continue
+        reason = next((row.eligibility.reason for row in matching
+            if not isinstance(row.eligibility, placement.AllowedHost) and row.eligibility.reason), "")
+        reason = reason or excluded.get(machine, "")
+        if not reason and machine in named:
+            continue
+        words = placement.PLACEMENT_REASON_TEXT.get(reason, GATE_SPENDING_REASONS.get(reason, reason))
+        reasons.append(f"{machine}: {route_reason(words) or GATE_REASON_NOT_RECORDED}")
+    return " · ".join(reasons)
+
+
 def gate_placement_notes(step: admission_records.WaitingStep | admission_records.RunningStep) -> TargetNotes | None:
-    """Use the placement candidates for a route that can place the step in the Mac Linux guest."""
-    # Older queue readings have no placement candidates.
-    recorded: object = getattr(step, "placement_candidates", ())
-    if not isinstance(recorded, tuple):
-        return None
-    # The service never places a step on a fixed exclusion, so the page does not name it.
-    candidates = tuple(row for row in cast(tuple[object, ...], recorded)
-                       if isinstance(row, placement.CandidateEligibility)
-                       and not isinstance(row.eligibility, placement.FixedExclusion))
-    guest = tuple(candidate.eligibility for candidate in candidates if candidate.destination.target == MAC_LINUX_TARGET)
-    if not guest:
-        return None
-    reason = ""
-    if not any(isinstance(state, placement.AllowedHost) for state in guest):
-        reason = next((state.reason for state in guest if not isinstance(state, placement.AllowedHost)), "")
-    named = RunsOn(tuple(dict.fromkeys(candidate.destination.target for candidate in candidates)))
-    return {"runs_on": named.text(), "targets": list(named.targets), "mac_text": "",
-            "because": f"{MAC_LINUX_TARGET}: {reason}" if reason else ""}
+    """Use recorded gate targets and placement evidence for the row."""
+    candidates = step.placement_candidates
+    names = tuple(dict.fromkeys(item.destination.target for item in candidates
+                               if not isinstance(item.eligibility, placement.FixedExclusion)))
+    selection = step.gate_targets
+    running = ""
+    if isinstance(step, admission_records.RunningStep):
+        running = step.assignment_target or step.assignment_host or LOCAL_TARGET
+    if selection is None and not old_claude_gate(step.step, step.folder, step.project):
+        if MAC_LINUX_TARGET not in names:
+            return None
+        machines = (MAC_LINUX_TARGET,)
+    else:
+        machines = placement.GATE_MACHINES
+        if isinstance(step, admission_records.WaitingStep) and step.placement_targets:
+            names = step.placement_targets
+        elif not candidates:
+            names = (selection.names if selection is not None and selection.names
+                     else (running or LOCAL_TARGET,))
+    named = RunsOn(names)
+    return {"runs_on": named.text(), "targets": list(names), "mac_text": "",
+            "because": gate_target_reasons(selection, candidates, names, running=running, machines=machines)}
 
 
 def step_target_notes(step: admission_records.WaitingStep | admission_records.RunningStep,
@@ -1735,7 +1779,7 @@ def wait_why(reason: admission_records.WaitingStepReason) -> str:
 
 def route_reason(reason: str) -> str:
     """Use a phrase for the route restriction."""
-    phrases = {"step writes the tree": "edits the tree", "the run asks for it": "requested by the caller",
+    phrases = {"step writes the tree": "edits the tree", RUN_ASKS_TEXT: "requested by the caller",
                "a direct cargo command runs where it starts": "direct cargo command"}
     phrase = phrases.get(reason, reason.removeprefix("it "))
     return phrase.rstrip(".")
@@ -3101,7 +3145,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 guest_labels = replace(identity, unit=step.unit or identity.unit)
                 owner = replace(owner, labels=guest_labels, unit=staff_unit(guest_labels))
                 shown_step = replace(shown_step, step=job_step(job, step.step), unit=guest_labels.unit)
-            named = local_step_name(shown_step, owner, names, labels, "", job if guest_gate else NotGateStep())
+            named = local_step_name(shown_step, owner, names, labels, "",
+                                    job if guest_gate or step.gate_targets is not None else NotGateStep())
             if isinstance(named, NoNamedStep):
                 continue
             remote_groups.add(key)
@@ -3270,8 +3315,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             waiting_position += 1
         if isinstance(named, NoNamedStep):
             continue
-        notes: TargetNotes = {"runs_on": target_text, "targets": list(targets), "mac_text": ""} if targets else (
-            ci_target_notes(machine) if ci_label else step_target_notes(waiter, routes))
+        notes: TargetNotes = (gate_placement_notes(waiter) or {"runs_on": target_text, "targets": list(targets),
+            "mac_text": ""}) if targets else (ci_target_notes(machine) if ci_label else step_target_notes(waiter, routes))
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         **move_fields(move, members, zone),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
@@ -3387,9 +3432,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     and not isinstance(cloud.wait, wire.CloudSlotWait) else "",
                 **job_notes(job, names, step=cloud.identity.step, verify=cloud.identity.verify)}
             limit_cloud_names[cloud.owner] = values["name"]
+            gate_reasons = (gate_target_reasons(cloud.identity.gate_targets, (), ("aws",))
+                if cloud.identity.gate_targets is not None or old_claude_gate(cloud.identity.step, cloud.identity.folder)
+                else "")
+            if gate_reasons:
+                values["because"] = gate_reasons
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
-                    "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
+                    "runs_on": CLOUD_RUNS_ON, "because": gate_reasons or "natedev when AWS cannot start", "targets": ["aws"]}
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})
         work_rows.sort(key=lambda row: row["started_at"])

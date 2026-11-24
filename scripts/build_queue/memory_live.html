@@ -1392,9 +1392,12 @@ function becauseRows(reason, parts) {
   return reason.length <= 30 ? [{...field('Because', reason), valueParts:parts}]
     : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
 }
+function hasGateReasons(row) {
+  return /^(natedev|mac-linux|aws): /.test(row.because || '');
+}
 function routeFields(row) {
   return [machineField('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
-    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
+    ...(row.runs_on === 'natedev or Mac' && !hasGateReasons(row) ? [] : becauseRows(row.because || '', row.because_parts))];
 }
 function progressRows(row) {
   const progress = row.progress;
@@ -1422,7 +1425,10 @@ function stepTooltip(key, data) {
   const guestFields = guest ? [machineField('Runs on', row.machine), ...progressRows(row)] : [];
   const namesGuest = row.targets?.includes('mac-linux');
   const namedTargets = !waiting && (guest || namesGuest)
-    ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || ''), ...becauseRows(row.because || '')] : [];
+    ? [machineField('Named targets', row.runs_on || row.targets?.join(' or ') || '')] : [];
+  const runningReasons = !waiting && (namedTargets.length || hasGateReasons(row))
+    ? becauseRows(row.because || '', row.because_parts) : [];
+  const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
   const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
     : stepTitle(row, unavailable && !guestRow(row) ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
   const rows = [title];
@@ -1433,8 +1439,10 @@ function stepTooltip(key, data) {
   if (macRow(row) && row.gate_label && !row.gate_label.startsWith('placement ')) {
     detailFields.push(field('Mac build', row.gate_label));
   }
-  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...guestFields, ...namedTargets,
-    ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
+  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...guestFields,
+    ...(!waiting && !guest && hasGateReasons(row) ? [machineField('Runs on', machine)] : []),
+    ...namedTargets, ...runningReasons,
+    ...(waiting && (namesGuest || hasGateReasons(row)) ? routeFields(row) : []), ...callFields];
   if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
@@ -1481,8 +1489,7 @@ function stepTooltip(key, data) {
       rows.push(...groupRows(need));
     }
   } else {
-    const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
-    rows.push(...(guest ? guestFields : [machineField('Runs on', machine)]), ...namedTargets);
+    rows.push(...(guest ? guestFields : [machineField('Runs on', machine)]), ...namedTargets, ...runningReasons);
     if (row.kind === 'cloud') {
       if (row.activity) rows.push(field('Status', row.activity));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));

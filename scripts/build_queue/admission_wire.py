@@ -202,6 +202,7 @@ class Identity:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     what: str = field(default="", kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -865,6 +866,8 @@ def _write_wire_record(value: object) -> object:
     if not isinstance(value, dict):
         return value
     record = {key: _write_wire_record(item) for key, item in cast(dict[str, object], value).items()}
+    if "gate_targets" in record and record["gate_targets"] is None:
+        del record["gate_targets"]
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]

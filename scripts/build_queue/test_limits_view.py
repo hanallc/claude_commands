@@ -19,7 +19,7 @@ from unittest import mock
 from xml.etree import ElementTree
 
 from scripts.aws_target import hana_box, hana_placement
-from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, queue_view
+from scripts.build_queue import admission_protocol as wire, admission_records as records, limits_view, placement, queue_view
 from scripts.build_queue import snapshot_codec, test_memory_hover
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -43,6 +43,24 @@ def wait_names(groups: Mapping[str, limits_view.WaitGroup]) -> dict[str, list[st
 
 class BuildLimitsTests(unittest.TestCase):
     hana_origin: str = "https://example.invalid/team/hana"
+
+    def test_a_gate_with_one_remote_target_waits_under_that_machine(self) -> None:
+        base = head_reading()
+        guest = replace(base.view.waiting[0], route=target_config.ANY_ELIGIBLE_TARGET,
+            project="claude_commands", reason=records.MachineChoiceWait(), placement_targets=("mac-linux",))
+        cloud = replace(guest, pid=guest.pid + 1, placement_targets=("claude-aws",),
+            placement_candidates=(placement.CandidateEligibility(placement.PlacementDestination(
+                "scaler", "claude-aws", "aws", claim_state.WHOLE_MAC), placement.TemporaryExclusion("busy")),))
+        waits = (limits_view.VisibleWait(queue_view.WaitingBuild(1, guest), "Guest gate"),
+                 limits_view.VisibleWait(queue_view.WaitingBuild(2, cloud), "AWS gate"))
+        saved = limits_view.Background(frozenset({"https://example.invalid/team/claude_commands"}),
+                                      limits_view.Metric("money", None, None))
+        shown = limits_view.build_limits(base, (), waits, {}, {}, saved, UTC)
+        row = next(item for item in shown.repositories if item.name == "claude_commands")
+        words = limits_view.wait_words(guest.reason).one
+        self.assertEqual(wait_names(shown.unplaced), {words: ["Guest gate"]})
+        self.assertEqual(wait_names(row.aws.waits), {words: ["AWS gate"]})
+        self.assertEqual(wait_names(row.natedev.waits), {})
 
     def configure_hana(self, fixture: AdmissionFixture, *, maximum: int = 2) -> None:
         config = fixture.root / "build_admission.conf"

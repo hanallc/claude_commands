@@ -1478,6 +1478,44 @@ class ImportTests(unittest.TestCase):
 
 
 class StateCheckTests(unittest.TestCase):
+    def test_gate_targets_read_in_both_wire_and_state_versions(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        targets = placement.GateTargets(("natedev",), (("mac-linux", "off"), ("aws", "off")))
+        current_fields = codec.snapshot_fields
+
+        def fields_before_gate_targets(schema: type) -> dict[str, object]:
+            fields = current_fields(schema)
+            if schema is wire.Identity:
+                return {name: kind for name, kind in fields.items() if name != "gate_targets"}
+            return fields
+
+        with AdmissionFixture() as fixture:
+            plain = fixture.request()
+            placement_call = placement_request(fixture)
+            for old in (plain, placement_call):
+                new = replace(old, identity=replace(old.identity, gate_targets=targets))
+                legacy_message = wire.encode_request(old)
+                self.assertNotIn('"gate_targets"', legacy_message)
+                self.assertEqual(wire.parse_request(legacy_message), old)
+                new_message = wire.encode_request(new)
+                self.assertEqual(wire.parse_request(new_message), new)
+                with mock.patch.object(codec, "snapshot_fields", side_effect=fields_before_gate_targets):
+                    self.assertEqual(wire.parse_request(new_message), old)
+
+            old_state = service.ServiceState({}, {}, {}, records.ReadyToStart(),
+                placement_requests={placement_call.episode: placement_call})
+            new_call = replace(placement_call, identity=replace(placement_call.identity, gate_targets=targets))
+            new_state = replace(old_state, placement_requests={placement_call.episode: new_call})
+            path = fixture.state_dir / "state.json"
+            legacy_state = wire.encode_record(old_state).replace(',"gate_targets":null', "")
+            write_text_atomic(path, legacy_state)
+            self.assertEqual(service.read_state(fixture.state_dir), old_state)
+            write_text_atomic(path, wire.encode_record(new_state))
+            self.assertEqual(service.read_state(fixture.state_dir), new_state)
+            with mock.patch.object(codec, "snapshot_fields", side_effect=fields_before_gate_targets):
+                self.assertEqual(service.read_state(fixture.state_dir), old_state)
+
     def test_state_check_reads_current_state_and_refuses_an_old_placement_shape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4449,6 +4487,32 @@ class ReadingAlertTests(unittest.TestCase):
 
 
 class PlacementRestartTests(unittest.TestCase):
+    def test_plain_gate_targets_reach_waiting_and_running_rows_after_restart(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            plain = fixture.request()
+            targets = placement.GateTargets(("natedev",), (("mac-linux", "off"), ("aws", "off")))
+            request = replace(plain, identity=replace(plain.identity, job=StepJob("test-all"), gate_targets=targets))
+            self.assertIsInstance(fixture.connect(request).replies()[0], wire.Wait)
+
+            waiting, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(waiting, wire.ViewReply)
+            row, = waiting.reading.view.waiting
+            self.assertEqual(row.gate_targets, targets)
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            self.assertIsInstance(fixture.server.ledger[request.episode].reply, wire.Admitted)
+            fixture.restart()
+            _ = fixture.run_pass()
+            running, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(running, wire.ViewReply)
+            admitted, = (step for step in running.reading.view.running if step.pid == request.owner.pid)
+            self.assertEqual(admitted.gate_targets, targets)
+
     def test_first_view_after_restart_uses_the_snapshot_while_a_probe_succeeds_slowly(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import PlacementFixture, placement_request
@@ -4520,6 +4584,9 @@ class PlacementRestartTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.Wait)
                 pending = placement_request(fixture, since=fixture.clock.now() - 25)
                 consumed = placement_request(fixture, since=fixture.clock.now() - 10)
+                targets = placement.GateTargets(("mac",), tuple((machine, placement.GATE_CALLER_EXCLUSION)
+                    for machine in placement.GATE_MACHINES), caller_supplied=True)
+                consumed = replace(consumed, identity=replace(consumed.identity, gate_targets=targets))
                 _ = publish_candidate(fixture, pending)
                 pending_assignment = assignment_for(fixture, pending)
                 consumed_assignment = assignment_for(fixture, consumed)
@@ -4531,6 +4598,7 @@ class PlacementRestartTests(unittest.TestCase):
                 waiters = {episode: fixture.server.waiters[episode].request for episode in (local.episode, cloud.episode)}
                 fixture.restart()
                 self.assertEqual(fixture.server.places, positions)
+                self.assertEqual(fixture.server.placement_requests[consumed.episode].identity.gate_targets, targets)
                 for message in legacy_messages:
                     reply, = fixture.connect(message).replies()
                     self.assertIsInstance(reply, wire.Wait)
@@ -4543,6 +4611,10 @@ class PlacementRestartTests(unittest.TestCase):
                 self.assertEqual(saved.assignment, consumed_assignment)
                 self.assertIsInstance(saved.state, placement.CurrentAssignment)
                 self.assertIsInstance(saved.permission, placement.PermissionConsumed)
+                reply, = fixture.connect(wire.ViewRequest()).replies()
+                assert isinstance(reply, wire.ViewReply)
+                projected, = (step for step in reply.reading.view.running if step.assignment_target == "mac")
+                self.assertEqual(projected.gate_targets, targets)
                 status, = fixture.server.handle_request(consume)
                 self.assertIsInstance(status, wire.DispatchStatus)
                 assert isinstance(status, wire.DispatchStatus)
@@ -4565,6 +4637,9 @@ class CloudAdmissionTests(unittest.TestCase):
                     for _ in range(16):
                         _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
                 request = aws_gate_request(fixture, enabled=cause != "off", daily_room=cause != "daily")
+                targets = placement.GateTargets(("claude-aws",), (("natedev", placement.GATE_CALLER_EXCLUSION),
+                    ("mac-linux", placement.GATE_CALLER_EXCLUSION)), caller_supplied=True)
+                request = replace(request, identity=replace(request.identity, gate_targets=targets))
                 if cause == "absent":
                     _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\n")
                 directory = fixture.root / "queue-target-state"
@@ -4579,6 +4654,10 @@ class CloudAdmissionTests(unittest.TestCase):
                         self.assertEqual(reply.assignment.destination.target, "claude-aws")
                         self.assertEqual(fixture.server.current_assignments[request.episode],
                             execution_identity.attempt_key(request.episode, reply.assignment.attempt))
+                        view, = fixture.connect(wire.ViewRequest()).replies()
+                        assert isinstance(view, wire.ViewReply)
+                        running, = (step for step in view.reading.view.running if step.assignment_target == "claude-aws")
+                        self.assertEqual(running.gate_targets, targets)
                     else:
                         self.assertNotIsInstance(reply, wire.Assignment)
                         self.assertNotIn(request.episode, fixture.server.current_assignments)

@@ -54,6 +54,10 @@ Copy wrappers apply this rule before target overrides.
 Promotion without tests uses natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 A gate that does not request placement uses natedev.
+The gate uses `ANY_ELIGIBLE_TARGET` with the candidates in its requested list.
+`GateTargets` records candidate names in registry order and reasons for excluded machines.
+The Builds page shows these reasons in the Because field.
+The AWS gate scaler uses its scaler registry entry.
 
 The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
 The admission service requires a synced [Mac Linux state root](mac-test-offload.md#mac-linux-guest-folders) before guest placement.

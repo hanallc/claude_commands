@@ -207,24 +207,6 @@ class RetryAfterAvailability:
     declined_at: float
 
 
-PLACEMENT_REASON_TEXT = {
-    "mac_linux_off": "the guest is off",
-    "mac_linux_unregistered": "the guest has no queue registration",
-    "mac_linux_settings_unreadable": "the guest settings are unreadable or invalid",
-    "mac_linux_backoff_unreadable": "the guest backoff record is unreadable or invalid",
-    "mac_linux_backoff": "the guest is in retry backoff",
-    "mac_linux_reading_required": "the queue needs a newer guest reading",
-    MAC_LINUX_NO_ANSWER: "the Mac does not answer",
-    "busy": "the target is busy",
-    "off": "the target is off",
-    "disk": "the target needs more disk space",
-    "command": "the target does not support this command",
-    "repo": "the target does not support this repository",
-    "linux_only": "this step runs only on Linux",
-    "offload_exclude": "the target excludes this step",
-}
-
-
 def confirmed_guest_run(assignment: placement.PlacementAssignment,
                         evidence: execution_identity.ExecutionEvidence) -> records.ConfirmedGuestRun | None:
     """Use execution evidence that matches the assigned guest and attempt."""
@@ -2971,6 +2953,8 @@ class AdmissionServer:
             row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
             row["job"] = identity.job
+        if identity.gate_targets is not None:
+            row["gate_targets"] = identity.gate_targets
         if isinstance(request, ServiceEstimatedAdmission):
             row["ci_runner"] = request.runner
             if isinstance(request.job_start, records.JobStart):
@@ -3644,7 +3628,7 @@ class AdmissionServer:
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
                 record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job,
-                verify=waiter.get("verify", records.NotVerifyCall()))
+                verify=waiter.get("verify", records.NotVerifyCall()), gate_targets=waiter.get("gate_targets"))
             sidecar = Path(record.sidecar)
             started_at = step_estimator.epoch(record.admitted_at)
             current = cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress()
@@ -3761,10 +3745,12 @@ class AdmissionServer:
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host, verify=identity.verify,
-                assignment_target=assignment.destination.target if guest else "",
+                assignment_target=assignment.destination.target if guest or identity.gate_targets is not None else "",
                 placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
                 confirmed_guest_run=confirmed, counter=counter,
-                route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
+                route=request.route if guest or identity.gate_targets is not None else records.DIRECT_CARGO,
+                job=identity.job if guest or identity.gate_targets is not None else GATE_JOB_NOT_RECORDED,
+                gate_targets=identity.gate_targets,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
                     if (assignment.destination.provider == "mac" or confirmed is not None
                         or guest and consumed and assignment.episode in self.bumps.moves) else "",
@@ -3828,7 +3814,8 @@ class AdmissionServer:
                     records.MachineChoiceWait(), row.get("unit", ""),
                     project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
                     route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
-                    job=row.get("job", GATE_JOB_NOT_RECORDED), what=row.get("what", "")))
+                    job=row.get("job", GATE_JOB_NOT_RECORDED), what=row.get("what", ""),
+                    gate_targets=row.get("gate_targets")))
                 continue
             request = routed.get(row_id)
             candidates = self.placement_eligibility.get(request.episode, ()) if request is not None else ()
@@ -3844,6 +3831,8 @@ class AdmissionServer:
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
                 ci_job_start=records.waiter_job_start(row),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
+                placement_candidates=candidates if "gate_targets" in row else (),
+                gate_targets=row.get("gate_targets"),
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
                 took_place=took_place, what=row.get("what", "")))
         reading = replace(reading, ordered=ordered, view=replace(reading.view, waiting=tuple(visible)))
@@ -5532,12 +5521,12 @@ done
         candidates = self.placement_eligibility.get(request.episode)
         if candidates is None:
             candidates = tuple(placement.CandidateEligibility(candidate.destination,
-                placement.EvidenceNeeded("the target reading is unavailable")
+                placement.EvidenceNeeded(placement.TARGET_READING_UNAVAILABLE)
                     if isinstance(candidate.eligibility, placement.AllowedHost) else candidate.eligibility)
                 for candidate in request.constraints.candidates)
         return tuple(replace(candidate, eligibility=replace(state, reason=reason))
                      if not isinstance(state := candidate.eligibility, placement.AllowedHost)
-                     and (reason := PLACEMENT_REASON_TEXT.get(state.reason)) is not None else candidate
+                     and (reason := placement.PLACEMENT_REASON_TEXT.get(state.reason)) is not None else candidate
                      for candidate in candidates)
 
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],

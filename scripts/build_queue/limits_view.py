@@ -1033,7 +1033,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             add_wait(destination, WAIT_WORDS["run_limit_full"], visible.name)
             continue
         step = entry.step
-        pinned = step.route.target if isinstance(step.route, target_config.PinnedTarget) else local
+        pinned = step.route.target if isinstance(step.route, target_config.PinnedTarget) else (
+            step.placement_targets[0] if len(step.placement_targets) == 1 else local)
         reason = waiting_cause(step)
         recorded = waiting_origins.get((step.pid, step.since), "")
         checkout = origins.resolve("", step.folder)
@@ -1053,7 +1054,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             mac_name = mac_row_name(scope)
             destination = row(mac_name).mac.waits if mac_name else mac_waits
         elif machine != local:
-            destination = row(name).aws.waits if name and machine in saved.aws_targets else remote_wait(machine)
+            scaler = (machine in saved.aws_targets or any(candidate.destination.provider == "scaler"
+                and candidate.destination.target == machine for candidate in step.placement_candidates))
+            destination = (row(name).aws.waits if name else aws_waits) if scaler else remote_wait(machine)
         elif isinstance(reason, records.GpuSlotWait):
             if name:
                 destination = row(name).natedev.waits

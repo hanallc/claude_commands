@@ -172,6 +172,19 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
     assert.ok(kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
+    if (path === 'memory_live.html') {
+      const gateReasons = [
+        ['wait:gate-proof-caller', 'mac-linux: requested by the caller · aws: requested by the caller'],
+        ['wait:gate-proof-aws-off', 'aws: cloud gates are off (cloud_gate.conf enabled=off)'],
+        ['wait:gate-proof-guest-wait', 'natedev: requested by the caller · mac-linux: the target is busy · aws: requested by the caller'],
+        ['row:gate-proof-running', 'mac-linux: the target is busy · aws: the daily spending limit is reached'],
+      ];
+      for (const [key, reason] of gateReasons) {
+        const row = shown.rows.find(row => row.key === key);
+        assert.ok(row, `Missing ${key} at ${width} px.`);
+        assert.equal(row.hover.split(reason).length - 1, 1, `${key} at ${width} px: ${row.hover}`);
+      }
+    }
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
     assert.ok(shown.rows.some(row => row.smallLines.some(([kind]) => kind === 'wait-note')),
       `The real-shape rows show no waiting note at ${width} px.`);

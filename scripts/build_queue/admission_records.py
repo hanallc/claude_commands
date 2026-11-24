@@ -744,6 +744,7 @@ class Waiter(TypedDict):
     route: NotRequired[StepRoute]
     verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
+    gate_targets: NotRequired[placement.GateTargets]
     # The caller's own text for the work, such as the mac_queue_run --what text.
     what: NotRequired[str]
 
@@ -1215,6 +1216,7 @@ class WaitingStep:
     ci_job_start: CiJobStart = field(default=NO_JOB_START, kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
     # "failed" or "waiting": the run took the place of an older run of its unit (rules 13 and 20).
     took_place: str = field(default="", kw_only=True)
@@ -1246,6 +1248,7 @@ class RunningStep:
     assignment_host: str = ""
     assignment_target: str = field(default="", kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
+    gate_targets: placement.GateTargets | None = field(default=None, kw_only=True)
     confirmed_guest_run: ConfirmedGuestRun | None = field(default=None, kw_only=True)
     counter: progress.ProgressCounter | progress.NoCounter = field(default_factory=progress.NoCounter, kw_only=True)
     mac_placement: str = field(default="", kw_only=True)
