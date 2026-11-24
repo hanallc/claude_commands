@@ -1747,12 +1747,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
                 response = {"id": saved.id, "key": created.key, "version": created.version}
-                if saved.attachment_warning:
+                if isinstance(saved.attachments, review_submissions.UnavailableAttachments):
                     if not valid_token:
                         self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                         return
-                    response["attachment_warning"] = saved.attachment_warning + (
-                        "\nThe item keeps the values from the first Send." if edited else "")
+                    warnings = list(dict.fromkeys(
+                        "The saved screenshot is missing or damaged." if reference == review_submissions.PAGE_SCREENSHOT
+                        else "A saved pasted image is missing or damaged."
+                        for reference in saved.attachments.references))
+                    if edited:
+                        warnings.append("The item keeps the values from the first Send.")
+                    response["attachment_warning"] = "\n".join(warnings)
                 on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
                 if list_draft_id and edited:
                     request = None

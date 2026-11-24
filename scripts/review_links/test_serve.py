@@ -1081,6 +1081,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                             with self.subTest(lookup=lookup):
                                 earlier = review_submissions.native_origin(original)
                                 assert isinstance(earlier, new_item_dialog.ReviewSubmission)
+                                if lookup == "base draft key":
+                                    draft = self.submission_draft_folder(str(fields["request_id"]))
+                                    shutil.rmtree(draft.parent / ".draft-index" / draft.name)
+                                    key = new_item_dialog.submission_key(request.kind, request.recipient_id,
+                                                                         saved["id"], earlier.request_id)
+                                    _ = (draft / "list-receipt-key").write_text(key + "\n")
                                 for pasted in earlier.images[:-1]:
                                     (review_submissions.image_folder(earlier) / pasted.id / pasted.file).unlink()
                                 compatible = self.new_item_http(json.dumps(fields).encode(), finished=True)
@@ -2631,12 +2637,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         png = base64.b64decode(PNG)
         maker = self.server.page_captures
         for damage in ("file", "corrupt image", "directory", "receipt interruption", "unreadable claimed record",
-                       "different retry bytes", "screenshot"):
+                       "different retry bytes", "screenshot", "screenshot and pasted image"):
             with self.subTest(damage=damage):
+                missing_screenshot = damage in ("screenshot", "screenshot and pasted image")
                 images = ((new_item_dialog.PastedImage("image/png", PNG),) if damage != "screenshot" else ())
                 attempt = replace(request, request_id="r6-" + uuid4().hex, images=images)
                 fields: dict[str, object] = {**asdict(attempt), "token": self.server.new_item_token}
-                if damage == "screenshot":
+                if missing_screenshot:
                     key = maker.start(FIXTURE_CAPTURE)
                     _ = maker.complete(key, new_item_dialog.PageScreenshot(
                         png, new_item_dialog.PageViewport(876, 640, True)))
@@ -2647,7 +2654,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                         first = self.new_item_http(json.dumps(fields).encode(), finished=True)
                     self.assertEqual(first.status, 200, first.body)
                     saved = cast(dict[str, str], json.loads(first.body))
-                    attachment, = (self.submission_draft_folder(attempt.request_id) / "images").glob("*/image.png")
+                    attachments = list((self.submission_draft_folder(attempt.request_id) / "images").glob("*/image.png"))
+                    if damage == "screenshot and pasted image":
+                        screenshot, = [path for path in attachments if path.parent.name == review_submissions.PAGE_SCREENSHOT.id]
+                        screenshot.unlink()
+                        attachments.remove(screenshot)
+                    attachment, = attachments
                     if damage in ("directory", "receipt interruption", "different retry bytes"):
                         shutil.rmtree(self.submission_draft_folder(attempt.request_id))
                     elif damage == "corrupt image":
@@ -2666,21 +2678,23 @@ class ReviewLinksServerTests(unittest.TestCase):
                             self.assertEqual(set(latest.parent.glob("I*.md")), before)
                         finally:
                             _ = latest.write_text(original)
-                    if damage == "different retry bytes":
+                    if damage in ("different retry bytes", "screenshot and pasted image"):
                         changed = new_item_dialog.PastedImage("image/png", base64.b64encode(png + b"changed").decode())
                         bad = self.new_item_http(json.dumps({**fields, "images": [asdict(changed)]}).encode(), finished=True)
                         result = cast(dict[str, str], json.loads(bad.body))
                         self.assertEqual((bad.status, result["id"]), (200, saved["id"]))
                         self.assertIn("saved pasted image", result["attachment_warning"])
                         self.assertIn("first Send", result["attachment_warning"])
+                        if missing_screenshot:
+                            self.assertIn("saved screenshot", result["attachment_warning"])
                     retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
                     result = cast(dict[str, str], json.loads(retry.body))
                     self.assertEqual(result["id"], saved["id"])
-                    if damage == "screenshot":
-                        self.assertEqual(retry.status, 200, retry.body)
+                    self.assertEqual(retry.status, 200, retry.body)
+                    if missing_screenshot:
                         self.assertIn("saved screenshot", result["attachment_warning"])
-                    else:
-                        self.assertEqual(retry.status, 200, retry.body)
+                        self.assertNotIn("pasted image", result["attachment_warning"])
+                    if images:
                         reference = attachment.parent.name
                         attachment_reply = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
                             {"key": saved["key"], "id": reference}))
@@ -3344,6 +3358,35 @@ class ReviewLinksServerTests(unittest.TestCase):
                         self.assertEqual((denied.status, json.loads(denied.body)["id"]),
                                          (409, json.loads(first.body)["id"]))
                         self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
+            for recovery in ("base draft content", "base draft key"):
+                with self.subTest(native_recovery=recovery):
+                    suffix = uuid4().hex
+                    earlier = replace(bug, page="list", request_id="r2-" + suffix)
+                    saved = cache.create_submission(earlier).saved
+                    draft = "r6-" + suffix
+                    updated = replace(earlier, request_id=draft)
+                    native_body = self.new_item_body(updated)
+                    scheduled_body = json.dumps({**scheduled, "request_id": draft}).encode()
+                    folder = self.submission_draft_folder(draft)
+                    list_before = {item.id for item in the_list.records(morty.id)}
+                    native_before = [item.id for item in investigation.records(showrunner.id)]
+                    if recovery == "base draft key":
+                        folder.mkdir()
+                        _ = (folder / "list-receipt-key").write_text(saved.key + "\n")
+                        conflict = self.new_item_http(scheduled_body, finished=True)
+                        self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, saved.id))
+                    else:
+                        recovered = self.new_item_http(native_body, finished=True)
+                        self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
+                    shutil.rmtree(folder)
+                    conflict = self.new_item_http(scheduled_body, finished=True)
+                    self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, saved.id))
+                    shutil.rmtree(folder)
+                    recovered = self.new_item_http(native_body, finished=True)
+                    self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
+                    self.assertEqual({item.id for item in the_list.records(morty.id)}, list_before)
+                    self.assertEqual([item.id for item in investigation.records(showrunner.id)], native_before)
+
             index_folder = review_submissions._draft_index  # pyright: ignore[reportPrivateUsage]
             for kind in ("scheduled", "bug"):
                 with self.subTest(repair_missing_index=kind):
