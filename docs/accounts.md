@@ -116,10 +116,10 @@ A token refresh does not extend this server time limit.
 Roles include observed members and selected roles with zero members.
 `selected_roles` identifies the selected account independently.
 Codex roles are `workers` or `spare`.
-Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, idle, paused, exited, total}`.
+Each `role_counts` entry gives the local count for the role at the same index, as `{busy, idle, paused, exited, total}`.
 `sessions` lists each locally observed member once as `{"session": "<native session id>", "state": "busy|idle|paused|exited"}`.
 The list uses the same classified results as the local role counts, without another pane read.
-Peer caches supply aggregate counts only; they supply no session identities.
+Peer caches can supply counts for `spare` accounts.
 Claude sessions use their session-record state for busy and idle counts.
 A unit or showrunner without a live session counts as exited on its selected role account.
 Absent units use the units account; absent showrunners use the showrunners account.
@@ -142,7 +142,7 @@ The Models card below the accounts board counts the same sessions by full model 
 The `unknown` row counts sessions with missing model or effort evidence.
 Select a Models header to sort its rows.
 Use a model swatch to add or change its `model.<id>` color in `config/statusline.conf`.
-Each role has a separate row with its own counts from natedev and the Mac.
+Each role has a separate row with counts from the machine that reads status.
 The first role row includes all account values.
 Later rows show only the role and its counts.
 For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
@@ -164,7 +164,8 @@ Unknown process evidence keeps its pane and reason; incomplete observations keep
 Neither state proves that a worker stopped or disappeared.
 An unreadable staff record produces a problem, not an empty worker list.
 Codex shell counts remain unknown and blank.
-The last row sums known counts across all accounts and roles.
+The last row sums the local counts across all accounts and roles.
+An unreadable local Claude registry makes the Claude counts and the total `unknown`.
 Narrow panes preserve the order and the total row.
 JSON retains `credits_in_use`, `read_at`, and `read_ok` for other consumers.
 The board has no `in use` or `read` column or fact.
@@ -180,20 +181,19 @@ One file lock prevents concurrent fetches.
 The board read never waits for the fetch.
 `status --stored` reads the saved peer counts with the same ten-minute age limit.
 The board uses `peer_session_counts.json` only within the existing ten-minute age limit.
-A failed fetch keeps the last good copy, so one slow read on a busy machine does not hide the peer counts.
+A failed fetch keeps the last good peer copy until its age limit.
 It writes the time and reason of the last failure to `peer_session_counts_failed.json`; each failure replaces that file.
 A missing, damaged, or old copy also makes the peer unavailable.
 Problems then contains one line: `<machine> unavailable: counts are <this machine> only`.
-The count columns then show local counts only.
-A later successful fetch restores the combined counts on the next board tick.
+An unreadable Claude registry in a fresh peer copy adds `<peer> Claude sessions unreadable: Claude counts are <local> only` to Problems.
 
 Each JSON account has `role_counts_by_machine`, keyed by machine and then role.
 Each role value contains `busy`, `idle`, `paused`, `exited`, and `total`, in that order.
-The JSON omits unavailable machines from this field.
-Python combines the available machine counts once in `role_counts`, in role order.
-The board and text table read `role_counts` without combining machine records again.
-Each activity count includes every available machine.
-The JSON has no session identities or account directories.
+Each assigned role appears only under the local machine key.
+The peer machine key appears only when it supplies a count for an existing `spare` row.
+The `role_counts` entry for `spare` stays null, and the display stays blank.
+The board and text table use `role_counts` in role order.
+JSON omits peer session identities and account directories.
 
 The JSON `session_inputs` lists the files and directories that the board watches, including the peer cache.
 Each existing ten-second tick refreshes local liveness.

@@ -16,6 +16,7 @@ from scripts.whoami.account_test_support import store_usage
 from scripts.whoami.note_file import note_name
 
 import ast
+from collections import Counter
 import io
 from importlib import import_module
 import base64
@@ -872,7 +873,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIs(decode_session_counts(published, local).get("claude_registry_unreadable"), True)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_spare_accounts_report_unknown_total_when_registry_is_unreadable(self) -> None:
+    def test_spare_accounts_report_unknown_total_only_for_a_local_registry_fault(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
         self.codex_login("spare@example.invalid", self.home / ".codex1")
         registry_path = self.root / "denied-sessions"
@@ -899,25 +900,30 @@ class AccountsTests(unittest.TestCase):
                     status = accounts.read_status(source=accounts.StoredUsageOnly())
                 table = accounts.render_status_table(status)
                 self.assertIn("spare", table)
-                self.assertIn("Claude session registry unreadable. Claude session counts are unknown.",
-                              table)
+                local = "mac" if peer == "natedev" else "natedev"
+                expected = (f"{local}: Claude session registry unreadable. Claude session counts are unknown."
+                            if denied_machine == "local"
+                            else f"{peer} Claude sessions unreadable: Claude counts are {local} only")
+                self.assertIn(expected, table)
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
                 self.assertEqual([row["roles"] for row in document["accounts"]], [["spare"]])
+                self.assertEqual(document["problems"].count(expected), 1)
                 cells = document["board"]["rows"][-1]["cells"]
                 self.assertEqual(cells["label"][0]["text"], "total")
-                self.assertEqual(cells["total"][0]["text"], "unknown")
+                total = "unknown" if denied_machine == "local" else "0"
+                self.assertEqual(cells["total"][0]["text"], total)
                 for column in ("busy", "idle", "paused", "exited"):
-                    self.assertEqual(cells[column][0]["text"], "")
+                    self.assertEqual(cells[column][0]["text"], "" if denied_machine == "local" else "0")
                 model_totals = accounts.models_board(status, {}).rows[-1]["cells"]
                 self.assertEqual([model_totals[column][0]["text"] for column in accounts.MODEL_COUNT_COLUMNS],
-                                 ["unknown"] * len(accounts.MODEL_COUNT_COLUMNS))
+                                 [total] * len(accounts.MODEL_COUNT_COLUMNS))
 
-    def test_unreadable_peer_registry_keeps_combined_claude_counts_unknown(self) -> None:
+    def test_unreadable_peer_registry_keeps_local_claude_counts_known(self) -> None:
         local = accounts.RoleSessionCounts(1, 2, 0, 0)
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
                       roles=("units",), role_counts=(local,))
         now = datetime.now(timezone.utc)
-        peer = remote.other_machine()
+        peer = "mac"
         publish = cast(Callable[..., accounts.MachineSessionCounts], getattr(accounts, "_session_counts_document"))
         folder = self.home / ".claude1"
         members: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {(folder, "units"): {"unit": "busy"}}
@@ -928,12 +934,13 @@ class AccountsTests(unittest.TestCase):
         document = publish(members, models=models)
         document.update(machine=peer, at=now.isoformat(), claude_registry_unreadable=True)
         atomic_file.write_text_atomic(session_counts_cache(), json.dumps(document))
-        counts = machine_role_counts((row,), now)
+        with patch.object(remote, "other_machine", return_value=peer):
+            counts = machine_role_counts((row,), now)
         rows, problems = counts.rows, counts.problems
-        self.assertEqual(rows[0].role_counts, (accounts.UnknownRoleCounts(),))
-        self.assertEqual(rows[0].role_counts_by_machine[peer], {})
-        self.assertEqual(rows[0].models_by_role, {})
-        self.assertEqual(problems, (f"{peer}: Claude session registry unreadable. Claude session counts are unknown.",))
+        self.assertFalse(counts.claude_registry_unreadable)
+        self.assertEqual(rows[0].role_counts, (local,))
+        self.assertEqual(set(rows[0].role_counts_by_machine), {"natedev"})
+        self.assertEqual(problems, ("mac Claude sessions unreadable: Claude counts are natedev only",))
 
     def test_model_cells_name_counted_sessions_from_the_existing_scan(self) -> None:
         from scripts.herdr import pane_launch
@@ -993,35 +1000,35 @@ class AccountsTests(unittest.TestCase):
         ])
         self.assertEqual(published.get("unknown_model_names"), {"claude1": {"units": [short_id]}})
 
-    def test_peer_model_cells_name_remote_sessions_and_count_names_missing_from_older_documents(self) -> None:
+    def test_peer_models_and_names_do_not_change_local_model_cells(self) -> None:
         now = datetime.now(timezone.utc)
+        local = accounts.ObservedSessionModel("claude-opus-5-5", "high")
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude", roles=("units",),
-                      role_counts=(accounts.RoleSessionCounts(0, 0, 0, 0),))
+                      role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),),
+                      models_by_role={"units": Counter({local: 1})},
+                      model_names_by_role={"units": {local: accounts.ModelSessionNames(["local unit"])}})
         counts = {"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}
         model = {"model": "claude-opus-5-5", "effort": "high", "count": 2}
-        cases: tuple[tuple[dict[str, object], list[tuple[str, ...]]], ...] = (
-            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit"]}]}},
-              "unknown_model_names": {"claude1": {"units": ["other-unit"]}}},
-             [("hana-unit (mac)", "1 more on mac"), ("other-unit (mac)",),
-              ("hana-unit (mac)", "other-unit (mac)", "1 more on mac")]),
-            ({"models": {"claude1": {"units": [model]}}},
-             [("2 more on mac",), ("1 more on mac",), ("3 more on mac",)]),
-            ({}, [("3 more on mac",), ("3 more on mac",)]),
-            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit", "\ud800"]}]}},
-              "unknown_model_names": {"claude1": {"units": ["\udfff"]}}},
-             [("hana-unit (mac)", "1 more on mac"), ("1 more on mac",),
-              ("hana-unit (mac)", "2 more on mac")]),
+        cases: tuple[dict[str, object], ...] = (
+            {"models": {"claude1": {"units": [{**model, "names": ["peer unit"]}]}},
+             "unknown_model_names": {"claude1": {"units": ["other peer unit"]}}},
+            {"models": {"claude1": {"units": [model]}}},
+            {},
+            {"models": {"claude1": {"units": [{**model, "names": ["peer unit", "\ud800"]}]}},
+             "unknown_model_names": {"claude1": {"units": ["\udfff"]}}},
         )
+        expected_board = accounts.models_board(accounts.StatusReading((row,), (), (), timezone.utc, now), {})
         with patch.object(remote, "other_machine", return_value="mac"):
-            for payload, names in cases:
+            for payload in cases:
                 with self.subTest(payload=payload):
                     _ = session_counts_cache().parent.mkdir(parents=True, exist_ok=True)
                     _ = session_counts_cache().write_text(json.dumps({"machine": "mac", "at": now.isoformat(),
                         "accounts": {"claude1": {"units": counts}}, **payload}), encoding="utf-8")
                     combined = machine_role_counts((row,), now)
+                    self.assertEqual(combined.rows[0].models_by_role, row.models_by_role)
+                    self.assertEqual(combined.rows[0].model_names_by_role, row.model_names_by_role)
                     board = accounts.models_board(accounts.StatusReading(combined.rows, (), (), timezone.utc, now), {})
-                    self.assertEqual([line.get("session_names", {}).get("units") for line in board.rows], names)
-                    self.assertEqual([line.get("session_names", {}).get("total") for line in board.rows], names)
+                    self.assertEqual(board, expected_board)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
@@ -1362,7 +1369,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(observed, account.ConfiguredClaudeFolder(Path("/fixture/.claude4")))
         kernel.assert_called_once_with(990001)
 
-    def test_peer_members_add_a_role_to_an_unselected_account(self) -> None:
+    def test_peer_members_do_not_add_a_role_to_an_unselected_account(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="claude4", tool="claude", roles=(), role_counts=())
         peer = remote.other_machine()
@@ -1371,9 +1378,9 @@ class AccountsTests(unittest.TestCase):
         counts = machine_role_counts((row,), now)
         rows, problems = counts.rows, counts.problems
         self.assertEqual(problems, ())
-        self.assertEqual(rows[0].roles, ("units",))
+        self.assertEqual(rows[0].roles, ())
         self.assertEqual(rows[0].selected_roles, ())
-        self.assertIn("units 30 (busy 9, idle 20, paused 0, exited 1)", accounts.render_status_table(
+        self.assertNotIn("units 30", accounts.render_status_table(
             accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_stored_status_starts_a_background_counts_fetch_without_waiting_for_ssh(self) -> None:
@@ -1387,7 +1394,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(set(self.home.rglob("*")), paths)
         self.assertEqual({path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}, before)
 
-    def test_machine_counts_publish_and_merge_on_either_machine_without_waiting_for_ssh(self) -> None:
+    def test_machine_counts_keep_only_local_roles_on_either_machine_without_waiting_for_ssh(self) -> None:
         from scripts.message import sessions
         local = accounts.RoleSessionCounts(1, 2, 0, 1)
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
@@ -1411,11 +1418,11 @@ class AccountsTests(unittest.TestCase):
                     accounts.StatusReading(rows, problems, (), timezone.utc, now))))
                 self.assertEqual(document["problems"], [])
                 machines = document["accounts"][0]["role_counts_by_machine"]
-                self.assertEqual(machines[peer]["units"], count)
-                self.assertEqual(machines[here]["units"], {"busy": 1, "paused": 0, "exited": 1, "idle": 2, "total": 4})
-                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 4, "paused": 0, "exited": 3, "idle": 3, "total": 10}])
-                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 0, 3),))
-                self.assertIn("units 10 (busy 4, idle 3, paused 0, exited 3)", accounts.render_status_table(
+                expected = {"busy": 1, "paused": 0, "exited": 1, "idle": 2, "total": 4}
+                self.assertEqual(machines, {here: {"units": expected}})
+                self.assertEqual(document["accounts"][0]["role_counts"], [expected])
+                self.assertEqual(rows[0].role_counts, (local,))
+                self.assertIn("units 4 (busy 1, idle 2, paused 0, exited 1)", accounts.render_status_table(
                     accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_published_counts_pass_the_older_peer_count_check(self) -> None:
@@ -1436,7 +1443,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(count, expected)
         self.assertEqual(decode_session_counts(json.dumps(published), published["machine"])["accounts"]["codex1"]["workers"], expected)
 
-    def test_older_peer_starting_and_waiting_merge_as_busy_on_both_machines(self) -> None:
+    def test_older_peer_starting_and_waiting_leave_worker_counts_local(self) -> None:
         self.write_note("codex1", "waiting@example.invalid")
         self.codex_login("waiting@example.invalid", self.home / ".codex1")
         now = datetime.now(timezone.utc)
@@ -1454,13 +1461,13 @@ class AccountsTests(unittest.TestCase):
                 counts = machine_role_counts((row,), now)
                 rows, problems = counts.rows, counts.problems
                 reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
-                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(3, 0, 0, 0),))
-                self.assertIn("workers 3 (busy 3, idle 0, paused 0, exited 0)", accounts.render_status_table(reading))
+                self.assertEqual(rows[0].role_counts, row.role_counts)
+                self.assertIn("workers 1 (busy 1, idle 0, paused 0, exited 0)", accounts.render_status_table(reading))
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
                 self.assertEqual(document["accounts"][0]["role_counts"],
-                                 [{"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}])
+                                 [{"busy": 1, "idle": 0, "paused": 0, "exited": 0, "total": 1}])
 
-    def test_combined_role_counts_preserve_role_order_for_codex(self) -> None:
+    def test_local_role_counts_preserve_role_order_for_codex(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
             roles=("workers", "units"), role_counts=(accounts.RoleSessionCounts(1, 2, 0, 0),))
@@ -1474,11 +1481,11 @@ class AccountsTests(unittest.TestCase):
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(document["accounts"][0]["roles"], ["workers", "units"])
         self.assertEqual(document["accounts"][0]["role_counts"], [
-            {"busy": 4, "paused": 0, "exited": 0, "idle": 6, "total": 10},
-            {"busy": 2, "paused": 0, "exited": 0, "idle": 1, "total": 3}])
+            {"busy": 1, "paused": 0, "exited": 0, "idle": 2, "total": 3},
+            {"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
         table = accounts.render_status_table(reading)
-        self.assertIn("workers 10 (busy 4, idle 6, paused 0, exited 0)", table)
-        self.assertIn("units 3 (busy 2, idle 1, paused 0, exited 0)", table)
+        self.assertIn("workers 3 (busy 1, idle 2, paused 0, exited 0)", table)
+        self.assertIn("units 0 (busy 0, idle 0, paused 0, exited 0)", table)
         self.assertNotIn("shell", table)
 
     def test_unreported_roles_have_zero_counts_and_spare_has_no_count(self) -> None:
@@ -1500,6 +1507,28 @@ class AccountsTests(unittest.TestCase):
                         "units 0 (busy 0, idle 0, paused 0, exited 0)")
                     self.assertIn(text, accounts.render_status_table(reading))
 
+    def test_peer_spare_count_is_optional_metadata_for_the_existing_spare_row(self) -> None:
+        now = datetime.now(timezone.utc)
+        spare = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
+                        roles=("spare",), role_counts=(accounts.NoRoleCount(),))
+        count = accounts.RoleSessionCountsDocument(busy=2, idle=0, paused=0, exited=0, total=2)
+        with patch.object(remote, "other_machine", return_value="mac"):
+            for peer_roles in ({"workers": count}, {"workers": count, "spare": count}):
+                with self.subTest(peer_roles=peer_roles):
+                    _ = session_counts_cache().write_text(json.dumps({"machine": "mac", "at": now.isoformat(),
+                        "accounts": {"codex1": peer_roles}}))
+                    counted = machine_role_counts((spare,), now)
+                    self.assertEqual(counted.problems, ())
+                    reading = accounts.StatusReading(counted.rows, (), (), timezone.utc, now)
+                    status = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    row, = status["accounts"]
+                    self.assertEqual(row["roles"], ["spare"])
+                    self.assertEqual(row["role_counts"], [None])
+                    expected: dict[str, dict[str, accounts.RoleSessionCountsDocument]] = {"natedev": {}}
+                    if "spare" in peer_roles:
+                        expected["mac"] = {"spare": count}
+                    self.assertEqual(row["role_counts_by_machine"], expected)
+
     def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
@@ -1517,7 +1546,7 @@ class AccountsTests(unittest.TestCase):
                 counts = machine_role_counts((row,), now)
                 rows, problems = counts.rows, counts.problems
                 self.assertEqual(problems, ())
-                self.assertEqual(set(rows[0].role_counts_by_machine), {here, peer})
+                self.assertEqual(set(rows[0].role_counts_by_machine), {here})
             with (patch.object(remote, "other_machine", return_value=here),
                   patch.object(role_map, "ssh_role_map", return_value=json.dumps(published))):
                 self.assertEqual(fetch_session_counts(), 0)
@@ -1576,17 +1605,24 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(observed.counts[(numbered, "workers")], {row.current_session: "idle"})
 
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
-        row = SharedStatusDocumentTests().row()
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", roles=("units",),
+                      role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),))
         now = datetime.now(timezone.utc)
         peer = remote.other_machine()
         local = "mac" if peer == "natedev" else "natedev"
+        session_counts_cache().unlink()
+        missing = machine_role_counts((row,), now)
+        self.assertEqual(missing.rows[0].role_counts, row.role_counts)
+        self.assertEqual(missing.problems, (f"{peer} unavailable: counts are {local} only",))
+        peer_counts = {"claude1": {"units": {"busy": 7, "idle": 0, "paused": 0, "exited": 0, "total": 7}}}
         for seconds, available in ((600, True), (601, False), (-1, True)):
             with self.subTest(seconds=seconds):
                 atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
-                    "machine": peer, "at": (now - timedelta(seconds=seconds)).isoformat(), "accounts": {}}))
+                    "machine": peer, "at": (now - timedelta(seconds=seconds)).isoformat(), "accounts": peer_counts}))
                 counts = machine_role_counts((row,), now)
                 rows, problems = counts.rows, counts.problems
-                self.assertEqual(peer in rows[0].role_counts_by_machine, available)
+                self.assertEqual(rows[0].role_counts, row.role_counts)
+                self.assertEqual(set(rows[0].role_counts_by_machine), {local})
                 self.assertEqual(problems, () if available else
                     (f"{peer} unavailable: counts are {local} only",))
         for content in ('{"unavailable": true}', '{}', 'broken'):

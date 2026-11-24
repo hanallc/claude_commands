@@ -4610,18 +4610,15 @@ SessionModel = ObservedSessionModel | SessionModelUnknown
 
 @dataclass
 class ModelSessionNames:
-    """Names in one count and the peer sessions that did not supply names."""
+    """Names of the local sessions in a model count."""
 
     names: list[str] = field(default_factory=list)
-    unlisted_by_machine: Counter[str] = field(default_factory=Counter)
 
     def extend(self, other: ModelSessionNames) -> None:
         self.names.extend(other.names)
-        self.unlisted_by_machine.update(other.unlisted_by_machine)
 
     def display_lines(self) -> tuple[str, ...]:
-        return (*sorted(self.names, key=lambda name: (name.casefold(), name)),
-                *(f"{count} more on {machine}" for machine, count in sorted(self.unlisted_by_machine.items())))
+        return tuple(sorted(self.names, key=lambda name: (name.casefold(), name)))
 
 
 class SessionModelCountDocument(TypedDict):
@@ -4682,7 +4679,7 @@ class StatusRow:
     models_by_role: dict[str, Counter[ObservedSessionModel]] = field(default_factory=dict)
     inherited_roles: tuple[ClaudeGroup, ...] = ()
     model_names_by_role: dict[str, dict[SessionModel, ModelSessionNames]] = field(default_factory=dict)
-    # Filled only for local sessions, and only when the read uses include_models=True; a peer sends counts without names.
+    # The read fills this field only for local sessions and only with include_models=True.
     named_sessions_by_role: dict[str, tuple[NamedSession, ...]] = field(default_factory=dict)
 
 
@@ -7177,7 +7174,7 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             continue
         checked[label] = {}
         for role, raw in cast(dict[str, object], roles).items():
-            if role not in ("units", "showrunners", "workers", "producers") or not isinstance(raw, dict):
+            if role not in (*MODEL_ROLES, "spare") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
             starting = count.get("starting", 0)
@@ -7260,7 +7257,7 @@ def _start_session_counts_fetch() -> bool:
 
 @dataclass(frozen=True)
 class MachineRoleCounts:
-    """Role counts and registry availability across both machines."""
+    """Local role counts, optional peer spare counts, and local registry availability."""
 
     rows: tuple[StatusRow, ...]
     problems: tuple[str, ...]
@@ -7273,14 +7270,7 @@ class MachineRoleCounts:
         yield self.problems
 
 
-def _add_peer_model_names(groups: dict[SessionModel, ModelSessionNames], model: SessionModel, peer: str,
-                          count: int, names: Sequence[str]) -> None:
-    roster = ModelSessionNames([f"{name} ({peer})" for name in names])
-    if unlisted := count - len(names):
-        roster.unlisted_by_machine[peer] = unlisted
-    if model in groups:
-        roster.extend(groups[model])
-    groups[model] = roster
+_PEER_SESSIONS_UNREADABLE_NOTE = "{peer} Claude sessions unreadable: Claude counts are {local} only"
 
 
 def _machine_role_counts(
@@ -7292,8 +7282,6 @@ def _machine_role_counts(
     local, peer = _session_counts_machine(), remote.other_machine()
     peer_registry_unreadable = False
     peer_count_notes: tuple[str, ...] = ()
-    peer_models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
-    peer_unknown_names: dict[str, dict[str, list[str]]] = {}
     try:
         with _session_counts_cache().open() as cache:
             document = _decode_session_counts(cache.read(), peer)
@@ -7301,69 +7289,45 @@ def _machine_role_counts(
         stamp = _stored_time(document["at"])
         if stamp is None or _reading_is_old(stamp, now, account_config=account_config):
             raise ValueError("old counts")
+        observed = stamp.astimezone(zone)
+        age_minutes = max(0, (now - stamp) // timedelta(minutes=1))
         peer_accounts = document["accounts"]
         peer_registry_unreadable = document.get("claude_registry_unreadable", False)
-        peer_models = document.get("models", {})
-        peer_unknown_names = document.get("unknown_model_names", {})
-    except (OSError, ValueError):
+    except (OSError, OverflowError, ValueError):
         peer_accounts = {}
-        stamp = None
+        observed = None
+        age_minutes = 0
         published_at_ns = 0
     fetch_started = _start_session_counts_fetch()
-    if peer == "mac" and stamp is not None:
-        age_minutes = max(0, (now - stamp) // timedelta(minutes=1))
+    if peer == "mac" and observed is not None:
         if age_minutes or not fetch_started or _session_counts_failed_after(published_at_ns):
-            observed = stamp.astimezone(zone)
             time_format = "%H:%M %Z" if observed.date() == now.astimezone(zone).date() else "%Y-%m-%d %H:%M %Z"
             peer_count_notes = (f"{peer} counts from {observed:{time_format}}, {age_minutes} min old",)
     counted: list[StatusRow] = []
     for row in rows:
         local_unknown = row.tool == "claude" and claude_registry_unreadable
-        local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
-            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
+        local_counts = {role: count
             for role, count in zip(row.roles, row.role_counts) if isinstance(count, RoleSessionCounts) and not local_unknown}
-        machines = {local: local_counts}
-        if stamp is not None:
-            machines[peer] = peer_accounts.get(row.label, {})
-        roles = tuple(dict.fromkeys((*row.roles, *(role for counts in machines.values() for role in counts))))
-        if any(role != "spare" for role in roles):
-            roles = tuple(role for role in roles if role != "spare")
-        combined: list[RoleSessionCounts | NoRoleCount | UnknownRoleCounts] = []
-        for role in roles:
-            if role != "spare" and row.tool == "claude" and (local_unknown or peer_registry_unreadable):
-                combined.append(UnknownRoleCounts())
-                continue
-            counts = [machine[role] for machine in machines.values() if role in machine]
-            combined.append(NoRoleCount() if role == "spare" else RoleSessionCounts(
-                busy=sum(count["busy"] for count in counts),
-                idle=sum(count["idle"] for count in counts),
-                paused=sum(count["paused"] for count in counts),
-                exited=sum(count["exited"] for count in counts)))
-        models = {role: Counter(counts) for role, counts in row.models_by_role.items() if not local_unknown}
-        model_names = {role: dict(groups) for role, groups in row.model_names_by_role.items() if not local_unknown}
-        for role, peer_count in peer_accounts.get(row.label, {}).items():
-            entries = peer_models.get(row.label, {}).get(role, [])
-            remainder = peer_count["total"]
-            for entry in entries:
-                model = ObservedSessionModel(entry["model"], entry["effort"])
-                models.setdefault(role, Counter())[model] += entry["count"]
-                _add_peer_model_names(model_names.setdefault(role, {}), model, peer, entry["count"], entry.get("names", []))
-                remainder -= entry["count"]
-            if remainder:
-                names = peer_unknown_names.get(row.label, {}).get(role, [])
-                _add_peer_model_names(model_names.setdefault(role, {}), SessionModelUnknown(), peer, remainder, names)
-        counted.append(replace(row, roles=roles, role_counts=tuple(combined),
-                               role_counts_by_machine=machines, models_by_role=models, model_names_by_role=model_names))
-    problems = (() if stamp is not None else (f"{peer} unavailable: counts are {local} only",))
-    unreadable = tuple(f"{machine}: Claude session registry unreadable. Claude session counts are unknown."
-                       for machine, unread in ((local, claude_registry_unreadable), (peer, peer_registry_unreadable))
-                       if unread)
-    return MachineRoleCounts(tuple(counted), (*problems, *unreadable),
-                             claude_registry_unreadable or peer_registry_unreadable, peer_count_notes)
+        machines = {local: {role: RoleSessionCountsDocument(busy=count.busy,
+            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
+            for role, count in local_counts.items()}}
+        if "spare" in row.roles and (peer_spare := peer_accounts.get(row.label, {}).get("spare")) is not None:
+            machines[peer] = {"spare": peer_spare}
+        role_counts = tuple(NoRoleCount() if role == "spare" else UnknownRoleCounts() if local_unknown
+                            else local_counts.get(role, RoleSessionCounts(0, 0, 0, 0)) for role in row.roles)
+        counted.append(replace(row, role_counts=role_counts, role_counts_by_machine=machines,
+                               models_by_role={} if local_unknown else row.models_by_role,
+                               model_names_by_role={} if local_unknown else row.model_names_by_role))
+    problems = (() if observed is not None else (f"{peer} unavailable: counts are {local} only",))
+    if peer_registry_unreadable:
+        problems += (_PEER_SESSIONS_UNREADABLE_NOTE.format(peer=peer, local=local),)
+    if claude_registry_unreadable:
+        problems += (f"{local}: Claude session registry unreadable. Claude session counts are unknown.",)
+    return MachineRoleCounts(tuple(counted), problems, claude_registry_unreadable, peer_count_notes)
 
 
 def _role_count_text(row: StatusRow, role: str) -> str:
-    """Render the same combined counts in the table and detail output."""
+    """Render the same role counts in the table and detail output."""
     selected = " ✓" if role in row.selected_roles else ""
     if role in row.inherited_roles:
         selected += " (from showrunners)"

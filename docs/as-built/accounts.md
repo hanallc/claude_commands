@@ -647,13 +647,11 @@ For a compressed file, the reader streams the records and caches the result in t
 The compressed cache evicts the least recently used result at `session_model_cache_entries`.
 A missing Claude transcript gives `unknown`.
 Live process options apply when the reader can establish that no turn was recorded.
-The peer count document carries model counts and session names by account and role.
+The Models table uses local role counts, model counts, and session names.
 The Models table puts the remainder of each role count in the `unknown` row.
 Hover over a positive count or focus it to see the session names in order.
 The tooltip uses the staff name or the Claude registry name.
 If neither name is available, the tooltip uses the first eight characters of the session ID.
-The tooltip includes the machine for each peer session.
-An older peer count adds a line such as `2 more on mac` for sessions without names.
 `config/statusline.conf` holds each account color under `account.<label>`.
 `ROLE_COLOR_KEYS` maps each role group to its color key:
 
@@ -715,7 +713,6 @@ The count columns are busy, idle and total. Each shows the total for the role ac
 A warning icon after the total names the paused and exited sessions of the role.
 `StatusRow.named_sessions_by_role` gives the staff name and state of each local session of a role.
 It is filled only for local sessions, and only when the read uses `include_models=True`.
-A peer count has no names, so the icon gives the count and `names unknown` for those sessions.
 The count tooltip lists counts by account when any observed sessions run outside the selected account.
 The tooltip also lists accounts outside the selected account when their counts are unknown.
 If the role has no selected account, the tooltip lists the count for each observed account.
@@ -793,7 +790,7 @@ JSON `problems` matches the text board's problem lines, with only the `* ` footn
 Each account row exports `sessions` beside `role_counts`.
 Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
-Peer caches provide aggregate counts only; the session list contains local members.
+The session list and assigned role counts contain local members only.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
 Status attributes a session to its account independently of the current role selection.
 This preserves visible off-target members during a move.
@@ -824,7 +821,11 @@ One claim prevents concurrent fetches.
 The normal status path never waits for that fetch.
 The cache keeps each machine's counts separate and uses the `usage_stale_minutes` age limit from `config/accounts.conf`.
 Canonical `mac` and `natedev` names identify observations independently of a desktop hostname.
-The board sums available machine counts.
+The board uses local counts for each assigned role and for the total.
+Only an unreadable local Claude registry makes the Claude roles and the total unknown.
+An unreadable Claude registry in a fresh peer copy adds one Problems line.
+The JSON field `role_counts_by_machine` uses the local key for each assigned role.
+A peer key can supply a `spare` count for an existing spare row. The spare count cells stay blank.
 It shows the time and age of usable Mac counts after a failed fetch or once the copy is one minute old.
 It reports the peer as unavailable when no usable copy exists.
 

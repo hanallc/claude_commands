@@ -776,7 +776,7 @@ window.fetch=(url,options)=>options?.method==='POST'
                                                       accounts.NamedSession("fix2", "exited"),
                                                       accounts.NamedSession("busy-unit", "busy"))}),
             replace(status_row("claude2"), roles=("showrunners",), selected_roles=("showrunners",)),
-            # The Mac sends counts without names.
+            # The local worker count has no session names.
             replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",),
                     role_counts=(accounts.RoleSessionCounts(0, 0, 2, 0),)),
         )
