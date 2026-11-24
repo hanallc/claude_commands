@@ -47,8 +47,8 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_SCRIPTS, StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names,
-    verify_command,
+    GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS, StepJob, VerifyCommand, build_call_arguments, command_job,
+    command_program, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -2642,7 +2642,14 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             tool = tuple(build_call_arguments(command)[:1])
             if tool in (("cargo",), ("cargo-nextest",)) or isinstance(command_job(command), StepJob):
                 selection = PublicationSelection.AVAILABLE
-        publish_files(tree, args.publish, before, command_exit, selection=selection, captured=captured)
+        def publish() -> None:
+            publish_files(tree, args.publish, before, command_exit, selection=selection, captured=captured)
+
+        if command_exit == GATE_UNSETTLED_LAUNCH_STATUS and command_program(command) in GATE_SCRIPTS:
+            first_step.close_unsettled_gate(publish)
+            first_step.close_unsettled_gate(scope.close)
+        else:
+            publish()
         return command_exit
 
 

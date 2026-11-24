@@ -748,30 +748,14 @@ class AcquisitionRetry:
 _ACQUISITION_RETRY: ContextVar[AcquisitionRetry | None] = ContextVar("acquisition_retry", default=None)
 
 
-_PLACEMENT_RETRY_DEADLINE: ContextVar[float] = ContextVar("placement_retry_deadline", default=float("inf"))
-
-
 def launch_wait_limit_seconds() -> int:
     return _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
 
 
 @contextmanager
-def scaler_retry_window(since: float) -> Generator[None]:
-    """Use the launch wait limit for replacement placement after a scaler decline."""
-    remaining = launch_wait_limit_seconds() - max(0.0, CLOCK.now() - since)
-    if remaining <= 0:
-        raise wire.AdmissionUnavailable(LAUNCH_WAIT_LIMIT_REASON)
-    token = _PLACEMENT_RETRY_DEADLINE.set(CLOCK.monotonic() + remaining)
-    try:
-        yield
-    finally:
-        _PLACEMENT_RETRY_DEADLINE.reset(token)
-
-
-@contextmanager
 def placement_acquisition() -> Generator[None]:
     """Preserve one leave schedule across placement replies and estimate requests."""
-    token = _ACQUISITION_RETRY.set(AcquisitionRetry(_PLACEMENT_RETRY_DEADLINE.get()))
+    token = _ACQUISITION_RETRY.set(AcquisitionRetry(float("inf")))
     try:
         yield
     except _QueueUnreachable as error:
@@ -934,12 +918,11 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     retry = _ACQUISITION_RETRY.get() if acquisition else None
     owns_retry = retry is None
     if retry is None:
-        limit = launch_wait_limit_seconds()
-        launch = isinstance(request, wire.LaunchRequest)
+        limit = launch_wait_limit_seconds() if isinstance(request, wire.LaunchRequest) else None
         deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
                     if isinstance(request, wire.RepositorySlotRequest) else
-                    CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
-        retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
+                    CLOCK.monotonic() + limit if limit is not None and limit > 0 else float("inf"))
+        retry = AcquisitionRetry(deadline, launch_without_wait=limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
         from scripts.build_queue import admission_records as records
@@ -1573,9 +1556,9 @@ def launch(request: wire.LaunchRequest, on_wait: Callable[[wire.Wait], None],
 def _first_request_wait[Request, Reply](launching: bool, refresh: Callable[[], Request],
                                         wait: Callable[[Request], Reply]) -> Reply | wire.Refused | LeftQueue:
     """Build the first request inside the retry schedule that its refreshes use."""
-    limit = launch_wait_limit_seconds()
-    token = _ACQUISITION_RETRY.set(AcquisitionRetry(CLOCK.monotonic() + limit if launching and limit > 0 else float("inf"),
-                                                    launch_without_wait=launching and limit == 0))
+    limit = launch_wait_limit_seconds() if launching else None
+    deadline = CLOCK.monotonic() + limit if limit is not None and limit > 0 else float("inf")
+    token = _ACQUISITION_RETRY.set(AcquisitionRetry(deadline, launch_without_wait=limit == 0))
     try:
         try:
             request = refresh()

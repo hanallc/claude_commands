@@ -81,18 +81,19 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(client, "_line", side_effect=late_reply)):
                 client.request_settlement(wire.SettlementRequest(assignment))
 
-    def test_scaler_replacement_uses_the_existing_launch_wait_limit(self) -> None:
+    def test_scaler_replacement_ignores_the_app_launch_wait_limit(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             cloud = register_scaler(fixture)
 
             def grant(request: wire.PlacementRequest) -> wire.Assignment:
-                return wire.Assignment(placement.PlacementAssignment(request.episode, "attempt",
+                return wire.Assignment(placement.PlacementAssignment(request.episode, str(place.call_count),
                     cloud.destination, request.constraints.source_key, request.owner,
                     request.constraints.session, request.since))
 
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": cloud.destination.target,
                                                "BUILDLOG_MEM_WAIT_LIMIT_S": "0"}),
+                  mock.patch.object(records, "process_start_time", return_value="123"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
                   mock.patch.object(first_step, "_placement_grant", side_effect=grant) as place,
                   mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
@@ -104,14 +105,15 @@ class FirstStepTests(unittest.TestCase):
                     _ = report.write_text(wire.encode_request(refusal))
                     reply = wire.DispatchStatus(assignment, placement.CurrentAssignment(),
                         placement.PermissionAvailable(), retry=placement.RetryAt(0))
-                    run = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, GATE_PRELAUNCH_REFUSED_STATUS))
+                    run = mock.Mock(side_effect=[subprocess.CompletedProcess(GATE_COMMAND, GATE_PRELAUNCH_REFUSED_STATUS),
+                                                 subprocess.CompletedProcess(GATE_COMMAND, 0)])
                     with mock.patch.object(client, "claim_failure", return_value=reply) as claim:
                         result = admitted.run_gate(run)
                     claim.assert_called_once_with(refusal)
-                    place.assert_called_once()
-                    run.assert_called_once()
-                    self.assertEqual(result.returncode, GATE_PRELAUNCH_REFUSED_STATUS)
-                    self.assertEqual(result.stderr, "Gate placement blocked\n")
+                    self.assertEqual(place.call_count, 2)
+                    self.assertEqual(place.call_args_list[0], place.call_args_list[1])
+                    self.assertEqual(run.call_count, 2)
+                    self.assertEqual(result.returncode, 0)
 
     def test_copies_run_hana_gate_keeps_unassigned_route(self) -> None:
         with PlacementFixture() as fixture:
@@ -194,6 +196,7 @@ class FirstStepTests(unittest.TestCase):
                     request.constraints.session, request.since))
 
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+                  mock.patch.object(records, "process_start_time", return_value="123"),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
                   mock.patch.object(first_step, "_placement_grant", side_effect=grant),
                   mock.patch.object(queue_place, "request_place", side_effect=AssertionError("plain memory admission")),
@@ -285,7 +288,7 @@ class FirstStepTests(unittest.TestCase):
                                 run = mock.Mock(return_value=subprocess.CompletedProcess(GATE_COMMAND, exit_code))
                                 with mock.patch.object(client, "request_settlement", side_effect=could_not_settle):
                                     blocked = admitted.run_gate(run)
-                                self.assertEqual(blocked.returncode, GATE_PRELAUNCH_REFUSED_STATUS)
+                                self.assertEqual(blocked.returncode, GATE_UNSETTLED_LAUNCH_STATUS)
                                 self.assertIn("launch settlement", blocked.stderr)
                                 run.assert_called_once()
 
