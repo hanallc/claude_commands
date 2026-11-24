@@ -69,6 +69,7 @@ PROJECT_PATTERN = re.compile(
     r"^[ \t]*-[ \t]+\*\*Project:\*\*[^\n]*$",
     re.MULTILINE,
 )
+COMMIT_HASH_PATTERN = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 # A percentage is an estimate; a stage is a fact. These ceilings keep an
 # optimistic estimate from claiming a gate that has not run — the failure mode
@@ -5284,34 +5285,36 @@ def _finish_wait(args: argparse.Namespace) -> None:
 def _checkpoint(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
-    state = pass_recorder.read_state(pass_recorder.argument_session_dir(args))
+    session_dir = pass_recorder.argument_session_dir(args)
+    state = pass_recorder.read_state(session_dir)
     commit = pass_recorder.arg_string(args, "commit")
-    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None:
+    if COMMIT_HASH_PATTERN.fullmatch(commit) is None:
         raise SystemExit("checkpoint requires a full commit hash")
     phase = _selected_phase(state, args)
     if phase is None:
         raise SystemExit("checkpoint requires the named open phase")
     events = _run_events(state)
-    folders = _phase_working_dirs(state, events, phase)
-    if not any(_is_commit(folder, commit) for folder in folders):
-        raise SystemExit(f"checkpoint refused: {commit} is not a commit in {' or '.join(map(str, folders))}")
+    checked: list[str] = []
+    for folder in _phase_working_dirs(session_dir, state, events, phase):
+        if _is_commit(folder, commit):
+            break
+        checked.append(str(folder))
+    else:
+        raise SystemExit(f"checkpoint refused: {commit} is not a commit in {' or '.join(checked)}")
     for event in events:
         if (event.get("event_type") == "checkpoint" and event.get("checkpoint_commit") == commit
                 and event.get("phase_instance_id") == phase.get("instance_id")):
             print(pass_recorder.string(event.get("event_id")))
             return
     event = pass_recorder.record_event(state, "checkpoint", pass_recorder.now_epoch(), phase_record=phase)
-    event.update(checkpoint_commit=commit, session_dir=str(pass_recorder.argument_session_dir(args)))
+    event.update(checkpoint_commit=commit, session_dir=str(session_dir))
     pass_recorder.append_event(state, event)
     print(event["event_id"])
 
 
-def _phase_working_dirs(state: dict[str, object], events: list[dict[str, object]],
-                        phase: dict[str, object]) -> list[Path]:
-    """The folders that exist among the phase_started record and the run's current folder; else the current directory.
-
-    A transferred unit keeps its old phase_started folder, so the run's current folder is checked too.
-    """
+def _phase_working_dirs(session_dir: Path, state: dict[str, object], events: list[dict[str, object]],
+                        phase: dict[str, object]) -> Generator[Path]:
+    """Yield the run folders before reading the saved checkout."""
     recorded = next((pass_recorder.string(event.get("working_dir")) for event in events
                      if event.get("event_type") == "phase_started"
                      and event.get("phase_instance_id") == phase.get("instance_id")), "")
@@ -5320,12 +5323,42 @@ def _phase_working_dirs(state: dict[str, object], events: list[dict[str, object]
     for folder in (recorded, current):
         if folder and Path(folder).is_dir():
             _ = folders.setdefault(Path(folder).resolve(), Path(folder))
-    return list(folders.values()) or [Path.cwd()]
+    yield from folders.values()
+
+    from scripts.direct import phase_reservation
+
+    phase_dir = phase_reservation.phase_directory(session_dir, pass_recorder.string(phase.get("id")))
+    try:
+        checkout = phase_reservation.phase_worktree_override(phase_dir)
+    except (OSError, UnicodeError):
+        checkout = None
+    if checkout is not None and checkout.is_dir():
+        root = checkout.resolve()
+        if root not in folders and _checkout_has_phase_baseline(root, phase_dir / phase_reservation.BASELINE_FILE):
+            yield checkout
+            return
+    if not folders:
+        yield Path.cwd()
+
+
+def _checkout_has_phase_baseline(checkout: Path, baseline_file: Path) -> bool:
+    from scripts.direct import phase_reservation
+
+    if not baseline_file.is_file():
+        return False
+    try:
+        baseline = phase_reservation.read_baseline_file(baseline_file)
+        _ = git_files.at(checkout)
+    except (OSError, UnicodeError, git_files.GitFilesError):
+        return False
+    return (baseline is not None and COMMIT_HASH_PATTERN.fullmatch(baseline) is not None
+            and _is_commit(checkout, baseline))
 
 
 def _is_commit(working_dir: Path, commit: str) -> bool:
-    """The hash names a commit object itself in the repository of the working dir; a tag hash does not."""
-    found = subprocess.run(["git", "-C", str(working_dir), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+    """Check that the hash names a commit object in the repository."""
+    found = subprocess.run(["git", "-C", str(working_dir), "rev-parse", "--verify", "--quiet", "--end-of-options",
+                            f"{commit}^{{commit}}"],
                            capture_output=True, text=True, check=False)
     return found.returncode == 0 and found.stdout.strip() == commit
 
