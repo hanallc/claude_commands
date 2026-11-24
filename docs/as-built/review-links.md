@@ -1557,8 +1557,7 @@ An open question adds a Producer answering note below the saved state.
 The recipient runs the command in the message to save an answer: `the_list.py answer L<N> --keeper <keeper> --question <id> --text "<answer>"`.
 Morty can answer any List question.
 Without `--keeper`, the command uses the caller's List folder if it holds the item, and morty's folder if not.
-Only morty can name a keeper other than itself or the caller.
-Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
+The saved recipient and the record keeper can answer with the keeper's staff ID in `--keeper`.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
 The entry keeps the question ID, words, time, and saved recipient.
@@ -1626,7 +1625,7 @@ The picker can resend the original request and instant after the parking time pa
 When the saved date has passed, the picker gives focus to an enabled day.
 The page keeps the words for Tell.
 **Unpark** clears parking through `the_list.unpark` and keeps the item state.
-It records one Unparked event and saves one notice for the item's producer.
+It records one Unparked event and saves one notice for the record keeper.
 If the item has no active parking time, the writer saves only a hidden request receipt.
 The receipt records whether the time expired or was absent.
 A replay of that request preserves any newer parking time.
@@ -1694,7 +1693,8 @@ The page can mark an item read, close it, park it, unpark it, or append feedback
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
 The same write saves the pending notice and its recipient for actions that send a notice.
-The recipient is the producer named when the page renders the form.
+For Tell, the recipient is the producer named when the page renders the form.
+For Remove, Park, and Unpark, the recipient is the record keeper.
 For a Mark read notice, the recipient is the item's producer when the notice saves.
 Under the lock, each action checks the request ID against the saved actions.
 A retry changes no item fields and saves no second notice.

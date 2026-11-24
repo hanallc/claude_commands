@@ -891,20 +891,17 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
-        notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words,
-                                        recipient=prefix.recipient)
+        notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
         changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
         parked_until = the_list.read_parking_time(until)
         label = parking_notice_label(parked_until, user_zone())
-        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park", words,
-                                        recipient=prefix.recipient)
+        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park", words)
         changed = the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "unpark":
-        notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words,
-                                        recipient=prefix.recipient)
+        notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
         changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(keeper, identity, the_list.PageFeedback(

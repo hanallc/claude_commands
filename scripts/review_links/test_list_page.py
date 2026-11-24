@@ -7173,6 +7173,74 @@ window.fetch=async(path,options={})=>{
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
 
+    def test_assigned_producer_receives_and_answers_a_legacy_list_question(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        keeper = staff.StaffId("legacy-keeper")
+        for recover in (False, True):
+            with self.subTest(recover=recover):
+                item = self.add("Check the legacy List item")
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                legacy = the_list.folder(keeper)
+                legacy.mkdir(parents=True, exist_ok=True)
+                source = legacy / f"{item.id}.md"
+                _ = (the_list.folder(MORTY.id) / source.name).rename(source)
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper, item), list_page.form_secret(status.root))
+                with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+                    asked = list_page.submit(status.root, urlencode(dict(
+                        keeper=keeper, id=item.id, request=request, token=token, action="question",
+                        words="Which check passed?", until="")), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                claimed = delivery.job.record
+                self.assertEqual(claimed.recipient_id, DWIGHT.id)
+                self.assertEqual(claimed.source.path, str(source.resolve()))
+                path = status.path(delivery.page, delivery.row)
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                    if recover:
+                        with status.locked():
+                            change_page.advance_question_attempt(path, claimed, replace(
+                                claimed, state=delivery_state.QuestionSendState.READY,
+                                owner=delivery_state.NoQuestionSendOwner()))
+                        _ = delivery.job.release()
+                        change_page.recover_review_messages(status)
+                    else:
+                        list_page.deliver(asked)
+                with self.subTest(check="delivery"):
+                    send.assert_called_once_with(DWIGHT.id, claimed.message, claimed.message_id)
+                    self.assertIs(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+                command = claimed.message.split("Answer with this command: ", 1)[1].splitlines()[0]
+                arguments = ["The smoke test passed." if word == "<answer>" else word
+                             for word in shlex.split(command)[2:]]
+                with (patch.object(staff, "caller_identity", return_value=DWIGHT.current_session),
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+                    result = the_list.main(arguments)
+                self.assertEqual(result, 0, errors.getvalue())
+                answered = the_list.load(keeper, item.id)
+                answer = answered.questions[0].answer
+                assert isinstance(answer, question_record.Answer)
+                self.assertEqual(answer.text, "The smoke test passed.")
+                self.assertEqual(answered.log[-1].source, DWIGHT.name)
+                self.assertEqual(answered.unread_since, NOW)
+
+    def test_item_action_notices_go_to_the_keeper_when_the_producer_differs(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check the notice recipient")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        for action, until in (("park", "2026-12-03"), ("unpark", ""), ("remove", "")):
+            with self.subTest(action=action):
+                fields = self.fields(item, action, until=until)
+                with patch.object(change_page, "send_to_staff") as send:
+                    list_page.deliver(list_page.submit(root, urlencode(fields)))
+                item = the_list.load(MORTY.id, item.id)
+                notice = the_list.feedback_requests(item)[fields["request"]]
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[0], MORTY.id)
+                self.assertEqual(notice.recipient_id(MORTY.id), MORTY.id)
+                self.assertEqual(notice.state, "sent")
+
     def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
         root = self.root / "reviews"
         for keeper in (DWIGHT.id, OTHER.id, staff.StaffId("missing-keeper")):

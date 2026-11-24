@@ -574,8 +574,7 @@ The `the_list.py list` command still shows the item.
 The saved recipient uses `the_list.py answer` to save an answer and mark the item unread.
 Morty can answer any List question.
 Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
-Only morty can name a keeper other than itself or the caller.
-Another producer can pass only its own staff ID or morty's staff ID in `--keeper`.
+The saved recipient and the record keeper can answer with the keeper's staff ID in `--keeper`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.

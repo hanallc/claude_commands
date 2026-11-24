@@ -855,6 +855,13 @@ class TheListTests(unittest.TestCase):
 
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
+        legacy = self.add(changes={"producer": OTHER.id})
+        self.write_legacy_question(legacy, question_record.Question("Q1", START.isoformat(), "Which check passed?"))
+        folder = the_list.folder(BOB.id)
+        folder.mkdir(parents=True)
+        path = folder / f"{legacy.id}.md"
+        _ = (the_list.folder(MORTY.id) / path.name).rename(path)
+        before = path.read_bytes()
         commands = (
             ("mark-read", "--id", item.id),
             ("clean-evidence",),
@@ -866,9 +873,10 @@ class TheListTests(unittest.TestCase):
                 with self.subTest(command=name):
                     self.assertEqual(self.command(name, *args, "--source", "dwight"),
                                      (1, "", f"the_list: only morty can run {name}\n"))
-            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer",
+            self.assertEqual(self.command("answer", legacy.id, "--question", "Q1", "--text", "Answer",
                                           "--keeper", BOB.id),
-                             (1, "", "the_list: only the record keeper or morty can answer\n"))
+                             (1, "", "the_list: Only the question recipient or morty can answer.\n"))
+        self.assertEqual(path.read_bytes(), before)
         self.assertEqual(the_list.records(MORTY.id), [item])
         self.assertEqual(self.notices, [])
 

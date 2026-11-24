@@ -2273,11 +2273,9 @@ def main(argv: list[str] | None = None) -> int:
             morty = producer_id(record, "morty")
             target = cast(staff.StaffId | None, args.keeper)
             own = _store(caller.id)
-            # A legacy keeper's own folder comes first, as in change_page's question recovery.
+            # Without --keeper, check the caller's folder first.
             held = own.valid_id(identity) and os.path.lexists(own.path(identity))
             keeper = target if target is not None else caller.id if held else morty
-            if keeper not in (morty, caller.id) and caller.id != morty:
-                raise ListError("only the record keeper or morty can answer")
             answerer = _QuestionAnswerer(caller, morty)
             result = page_question.answer(_ListQuestionStore(keeper, answerer=answerer), identity, question,
                                           cast(str, args.text))

@@ -786,19 +786,14 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
 def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
     source = record.source
     path = Path(source.path)
-    listing = record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
     try:
-        if listing.path(source.item_id).resolve() == path:
+        keeper, collection, _ = path.relative_to(record_store.state_root().resolve()).parts
+        listing = record_store.NumberedRecords(staff.StaffId(keeper), "list", "L", "list item", ValueError)
+        if collection == listing.collection and listing.path(source.item_id).resolve() == path:
             return listing
     except ValueError as error:
         raise StaleQuestionAttempt("The List question source is unavailable.") from error
-    keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
-    if len(keepers) != 1:
-        raise StaleQuestionAttempt("The List keeper is unavailable.")
-    listing = replace(listing, owner=keepers[0])
-    if listing.path(source.item_id).resolve() != path:
-        raise StaleQuestionAttempt("The List question source has moved.")
-    return listing
+    raise StaleQuestionAttempt("The List question source has moved.")
 
 
 def _open_list_question(listing: record_store.NumberedRecords,
