@@ -1174,50 +1174,35 @@ raise SystemExit(1)
         self.assertIn("send beta:", result.stdout)
         self.assert_rolled_back(start)
 
-    def test_resumed_drop_requires_a_confirmed_directory_sync(self) -> None:
+    def test_failed_drop_sync_discards_the_drop_and_rolls_back_the_batch(self) -> None:
         start, alpha, beta, rows = self.prepare_row_drop()
         record = self.batch_record()
         sync_folder = atomic_file.sync_folder
-        allow_sync = False
-        drop_syncs: list[bool] = []
-        runs: list[RowDropRun] = []
+        reset_batch = merge_checkpoint.reset_batch
 
         def sync(folder: Path) -> None:
-            if folder == record.parent and "\ndrop\t" in record.read_text():
-                drop_syncs.append(allow_sync)
-                if not allow_sync:
-                    raise OSError("fixture refused drop directory sync")
+            if folder == record.parent and record.exists() and "\ndrop\t" in record.read_text():
+                raise OSError("fixture refused drop directory sync")
             sync_folder(folder)
 
-        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)),
-              patch.object(atomic_file, "sync_folder", side_effect=sync)):
-            first = self.land_batch(rows)
-            self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-            self.assertIn("new content visible; durability unconfirmed", first.stdout)
-            saved = record.read_text()
-            self.assertIn("\ndrop\t", saved)
-            self.assertNotEqual(self.git("rev-parse", "HEAD"), start)
-            runs.clear()
+        def rollback(checkout: merge_checkpoint.ResetBatchCheckout, warnings: list[str]) -> None:
+            self.assertFalse(record.exists())
+            reset_batch(checkout, warnings)
 
-            held = self.land_batch(rows)
-            self.assertEqual(held.returncode, 1, held.stdout + held.stderr)
-            self.assertIn("could not confirm the saved batch drop", held.stdout)
-            self.assertIn("send alpha:", held.stdout)
-            self.assertIn("send beta:", held.stdout)
-            self.assertEqual(self.git("rev-parse", "HEAD"), start)
-            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
-            self.assertEqual(record.read_text(), saved)
-            self.assertEqual(runs, [])
-            with patch.dict("os.environ", self.env):
-                self.assertNotEqual(land_runs.last_results()[alpha]["state"], "dropped")
-
-            allow_sync = True
+        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])),
+              patch.object(atomic_file, "sync_folder", side_effect=sync),
+              patch.object(merge_checkpoint, "reset_batch", side_effect=rollback) as reset):
             result = self.land_batch(rows)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(drop_syncs[:3], [False, False, True])
-        self.assertEqual(runs, [RowDropRun(False, False, True, False)])
-        _ = self.assert_landed(start, [beta])
-        self.assertFalse(record.exists())
+        reset.assert_called_once()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("new content visible; durability unconfirmed", result.stdout)
+        self.assertIn("send alpha:", result.stdout)
+        self.assertIn("send beta:", result.stdout)
+        self.assertNotIn("batch: dropped", result.stdout)
+        self.assert_rolled_back(start)
+        with patch.dict("os.environ", self.env):
+            results = land_runs.last_results()
+        self.assertEqual([results[commit]["state"] for commit in (alpha, beta)], ["failed", "failed"])
 
     def test_drop_stays_saved_until_the_result_is_written(self) -> None:
         start, alpha, beta, rows = self.prepare_row_drop()

@@ -2475,6 +2475,9 @@ def batch_resume_record(requests: tuple[MergeRequest, ...], upstream: str) -> Ge
             if sum(item.commit == drop.commit for item in checkpoints) != 1 or len(checkpoints) < 2:
                 raise Refusal("the saved drop does not name one row of this batch")
             record.drop = drop
+        if not isinstance(record.merge_state, NoBatchMerge) and isinstance(
+                read_open_merge(merge_head_path(checkout)), NoOpenMerge):
+            record.store_merge_state(NO_BATCH_MERGE)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         record.store_merge_state(NO_BATCH_MERGE)
@@ -2504,28 +2507,12 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
             "batch", "failed", f"fetch failed: {error}", "send this checkpoint again when origin is available")
         return finish_batch_stop(stop, batch_stop_notices(requests, stop), record_results=False)
     with batch_resume_record(requests, upstream) as resume_record:
-        return run_recorded_batch(resume_record, upstream)
+        return run_recorded_batch(resume_record)
 
 
-def run_recorded_batch(resume_record: BatchResumeRecord, upstream: str) -> int:
+def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
     """Run the active rows, with at most one drop before a full survivor gate."""
-    production = resume_record.checkpoints[0].production
-    drop = resume_record.drop
-    if drop is not None:
-        try:
-            atomic_file.sync_folder(resume_record.path.parent)
-        except OSError as error:
-            stop = checkpoint_gate.Stop("batch", "held", f"could not confirm the saved batch drop: {error}",
-                                        "the showrunner will inspect the batch record")
-            pending = tuple(row for row in resume_record.checkpoints if not checkpoint_completed(row, upstream))
-            rollback: ResetBatchCheckout | KeepBatchCheckout = KEEP_BATCH_CHECKOUT
-            if any(row.commit == drop.commit for row in resume_record.unpublished_checkpoints):
-                rollback = ResetBatchCheckout(production, drop.start_tip, drop.tested_tip, drop.published_tip, resume_record)
-            return finish_batch_stop(stop, batch_stop_notices(pending, stop), rollback)
-    if not isinstance(resume_record.merge_state, NoBatchMerge) and isinstance(
-            read_open_merge(merge_head_path(production.checkout)), NoOpenMerge):
-        resume_record.store_merge_state(NO_BATCH_MERGE)
-    if drop is not None:
+    if resume_record.drop is not None:
         if (stopped := apply_batch_drop(resume_record)) is not None:
             return stopped
     try:
@@ -2554,11 +2541,14 @@ def run_recorded_batch(resume_record: BatchResumeRecord, upstream: str) -> int:
                              red.rollback.start_tip, red.rollback.published_tip, str((build_store.root() / kept).resolve()))
             resume_record.store(resume_record.merge_state, drop)
         except (OSError, ValueError) as error:
-            stop = checkpoint_gate.Stop("batch", "held", f"could not save the batch drop: {error}",
-                                        "the showrunner will inspect the batch record")
-            save_failure_rollback = KEEP_BATCH_CHECKOUT if isinstance(error, atomic_file.AtomicDurabilityUnconfirmed) else red.rollback
-            return finish_batch_stop(stop, batch_stop_notices(tuple(row.request for row in red.notices), stop),
-                                     save_failure_rollback)
+            checkpoint_gate.report("batch", "warning", f"could not save the batch drop: {error}")
+            if isinstance(error, atomic_file.AtomicDurabilityUnconfirmed):
+                try:
+                    resume_record.path.unlink(missing_ok=True)
+                    atomic_file.sync_folder(resume_record.path.parent)
+                except OSError as cleanup_error:
+                    checkpoint_gate.report("batch", "warning", f"could not discard the batch drop: {cleanup_error}")
+            return finish_batch_stop(red, red.notices, red.rollback)
         if (stopped := apply_batch_drop(resume_record)) is not None:
             return stopped
         survivors = tuple(row.request for row in red.notices if row.request.commit != owner.commit)
