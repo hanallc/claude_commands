@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 if TYPE_CHECKING:
+    from scripts.build_queue.test_placement import PlacementFixture
     from scripts.mac_test import offload
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
@@ -49,7 +50,7 @@ from scripts.buildlog import record as buildlog_record
 from scripts.build_hold import override_guard
 from scripts.build_hold.owning_session import OwningSession
 
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
@@ -75,6 +76,79 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def replace_waiting_placement(self, fixture: PlacementFixture) -> wire.PlacementRequest:
+        from scripts.build_queue.test_place_take import mac_step, unit_request, wait_in_line
+        from scripts.build_queue.test_placement import local_candidate
+
+        fixture.free(0)
+        fixture.hold_starts()
+        old = mac_step(fixture, fixture.run_owner())
+        old = replace(old, constraints=replace(old.constraints, candidates=(local_candidate(fixture),)))
+        self.assertIsInstance(fixture.server.handle_request(old)[0], wire.PlacementWait)
+        fixture.clock.advance(1)
+        wait_in_line(fixture, unit_request(fixture, fixture.run_owner()))
+        self.assertNotIn(old.episode, fixture.server.placement_requests)
+        return old
+
+    def test_replaced_waiting_placement_refuses_a_prerequisite_and_cancel(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            old = self.replace_waiting_placement(fixture)
+
+            prerequisite = wire.PrerequisiteReport("prerequisite", old.episode, old.owner, placement.TokenHeld())
+            cancel = wire.CancelPlacement("cancel", old.episode, old.owner, "the caller left")
+            refused = [wire.Refused(status_wire.REPLACED_REASON)]
+            with self.subTest(request="prerequisite"):
+                self.assertEqual(fixture.connect(prerequisite).replies(), refused)
+            with self.subTest(request="cancel"):
+                self.assertEqual(fixture.connect(cancel).replies(), refused)
+
+            fixture.restart()
+            with fixture.serving():
+                with self.assertRaises(client.RunReplaced) as rejected_prerequisite:
+                    _ = client.report_prerequisite(prerequisite)
+                with self.assertRaises(client.RunReplaced) as rejected_cancel:
+                    _ = client.cancel_placement(cancel)
+            message = "Replaced: a newer run of this unit took the place of this run."
+            self.assertEqual(rejected_prerequisite.exception.reason, message)
+            self.assertEqual(rejected_cancel.exception.reason, message)
+
+            missing = [wire.Refused(wire.PLACEMENT_REQUEST_MISSING_REASON)]
+            other_owner = replace(old.owner, pid=old.owner.pid + 1)
+            self.assertEqual(fixture.connect(replace(cancel, owner=other_owner)).replies(), missing)
+            fixture.clock.advance(records.read_memory_config().replay_retention_seconds + 1)
+            self.assertEqual(fixture.server.handle_request(prerequisite), missing)
+
+    def test_replaced_placement_replay_does_not_match_an_unrelated_request(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            old = self.replace_waiting_placement(fixture)
+            owner = old.owner
+            request_id = "placement-replaced:" + json.dumps((old.episode, owner.host, owner.pid, owner.start_time))
+            release = wire.ReleaseRequest(request_id, "unrecorded-reservation", 0)
+            self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+            fixture.restart()
+            self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+            cancel = wire.CancelPlacement("cancel", old.episode, owner, "the caller left")
+            self.assertEqual(fixture.server.handle_request(cancel), [wire.Refused(status_wire.REPLACED_REASON)])
+
+    def test_replaced_placement_expires_before_the_next_pass(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture
+
+        with PlacementFixture() as fixture:
+            fixture.configure(replay_retention_seconds=2)
+            fixture.restart()
+            old = self.replace_waiting_placement(fixture)
+            cancel = wire.CancelPlacement("cancel", old.episode, old.owner, "the caller left")
+            fixture.clock.advance(1)
+            self.assertEqual(fixture.server.handle_request(cancel), [wire.Refused(status_wire.REPLACED_REASON)])
+            saved = (fixture.state_dir / "state.json").read_bytes()
+            fixture.clock.advance(1)
+            self.assertEqual(fixture.server.handle_request(cancel), [wire.Refused(wire.PLACEMENT_REQUEST_MISSING_REASON)])
+            self.assertEqual((fixture.state_dir / "state.json").read_bytes(), saved)
+
     def test_kept_place_restores_its_failed_step_and_reads_an_old_record(self) -> None:
         from scripts.build_queue.test_place_take import place_rules, run_steps
 
@@ -455,15 +529,15 @@ class PlacementStatusTests(unittest.TestCase):
 
     def test_placement_poll_sees_an_expired_attempt_retry_after_the_timer_pass(self) -> None:
         from scripts.build_queue.test_placement import (
-            PlacementFixture, assignment_for, mac_linux_and_natedev_request, publish_candidate,
+            PlacementFixture, assignment_for, placement_request, publish_candidate,
         )
 
         with PlacementFixture() as fixture:
             fixture.configure(waiting_pass_seconds=10)
-            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            request = placement_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
-            closed, = fixture.server.handle_request(wire.ClaimFailure("guest-refusal", assignment, placement.MAC_LINUX_NO_ANSWER))
+            closed, = fixture.server.handle_request(wire.ClaimFailure("mac-refusal", assignment, "lost"))
             assert isinstance(closed, wire.DispatchStatus)
             assert isinstance(closed.retry, placement.RetryAt)
             fixture.clock.advance(closed.retry.deadline - fixture.clock.now() - 1)
@@ -5982,7 +6056,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(saved.identity.step, request.profile.step)
 
     def assert_reload_hash_journal(self, journal: str, next_check: float) -> str:
-        schedule, ready, revision = journal.splitlines()
+        provision, schedule, ready, revision = journal.splitlines()
+        self.assertEqual(provision, f"memory admission: Mac Linux state root ready at {Path.home() / '.local/state/build-targets'}")
         self.assertEqual(schedule, f"memory admission: source watch checks 1 paths first at monotonic {next_check:.3f}")
         self.assertRegex(ready, r"^memory admission: reload ready, source hash [a-f0-9]{64}$")
         self.assertEqual(revision, "memory admission: ready with git revision unavailable")
@@ -6295,6 +6370,20 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(fixture.server.handle_request(request), [wire.Refused("owner no longer exists")])
             self.assertFalse(fixture.server.waiters)
             self.assertFalse(fixture.server.reservations)
+
+    def test_admission_fixture_leaves_an_inherited_config_folder_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            inherited = Path(directory)
+            existing = inherited / "build_targets.conf"
+            contents = b"# Caller configuration\n"
+            _ = existing.write_bytes(contents)
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}):
+                with AdmissionFixture() as fixture:
+                    self.assertEqual(Path(os.environ["CONF_DIR"]), fixture.root)
+                    self.assertTrue((fixture.root / existing.name).is_file())
+                self.assertEqual(Path(os.environ["CONF_DIR"]), inherited)
+            self.assertEqual(list(inherited.iterdir()), [existing])
+            self.assertEqual(existing.read_bytes(), contents)
 
     def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
         with tempfile.TemporaryDirectory(prefix="admit-long-", dir="/tmp") as root:
@@ -6708,6 +6797,48 @@ class ServiceTests(unittest.TestCase):
             fixture.server.run_once(0)
             self.assertTrue(fixture.server.stopped)
 
+    def test_start_provisions_the_mac_linux_state_root_before_ready(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            root = fixture.root / "target-state" / "guest-state"
+            server = fixture.new_server(start=False)
+            try:
+                with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
+                      mock.patch.object(atomic_file, "sync_folder", wraps=atomic_file.sync_folder) as sync,
+                      mock.patch.object(service, "_notify") as notify,
+                      redirect_stderr(io.StringIO()) as journal):
+                    def ready(message: str) -> None:
+                        self.assertEqual(message, "READY=1")
+                        self.assertTrue(root.is_dir())
+                        self.assertEqual(sync.call_args_list, [mock.call(root.parent), mock.call(fixture.root)])
+
+                    notify.side_effect = ready
+                    self.assertFalse(root.exists())
+                    server.start()
+                    server.start()
+                    notify.assert_called_once_with("READY=1")
+                self.assertEqual(journal.getvalue().splitlines()[0],
+                                 f"memory admission: Mac Linux state root ready at {root}")
+            finally:
+                server.close()
+
+    def test_start_continues_after_mac_linux_state_setup_fails(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            root = fixture.root / "guest-state"
+            root.mkdir()
+            failure = OSError(errno.EIO, "fixture parent sync failed")
+            with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
+                  mock.patch.object(atomic_file, "sync_folder", side_effect=failure) as sync,
+                  redirect_stderr(io.StringIO()) as journal):
+                fixture.server = fixture.new_server()
+            self.assertTrue(root.is_dir())
+            sync.assert_called_once_with(root.parent)
+            self.assertEqual(journal.getvalue().splitlines()[0],
+                             f"memory admission: Cannot prepare the Mac Linux state root {root}: {failure}. "
+                             + "Run build_targets.py setup-mac-linux on natedev.")
+            self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+
     def test_serve_binds_the_environment_socket_without_listen_fds(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.server.close()
@@ -6745,6 +6876,8 @@ class ServiceTests(unittest.TestCase):
                     ["git", "-C", str(Path(service.__file__).resolve().parent), "rev-parse", "HEAD"],
                     text=True).strip()
                 ready_revision = f"memory admission: ready with git revision {revision}"
+                state_root = fixture.root / ".local/state/build-targets"
+                state_ready = f"memory admission: Mac Linux state root ready at {state_root}"
                 original_watch = ""
                 changed_at = fixture.clock.monotonic()
 
@@ -6779,7 +6912,7 @@ class ServiceTests(unittest.TestCase):
                         _ = service.main()
                     reload_marker = os.environ.get(service.ADMISSION_SOURCE_RELOAD, "")
                 self.assertEqual(journal.getvalue().splitlines(),
-                    [original_watch, ready_revision,
+                    [state_ready, original_watch, ready_revision,
                      f"memory admission: source watch detected changes at monotonic {changed_at:.3f} in {source}",
                      "memory admission: source watch will reload after the changes settled",
                      f"memory admission: reload for changed source {source}"])
@@ -6795,6 +6928,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(len(states), 2)
                 self.assertEqual(states[0], "READY=1")
                 self.assertRegex(states[1], r"^RELOADING=1\nMONOTONIC_USEC=\d+$")
+                state_root.rmdir()
                 with mock.patch.dict(os.environ, {**environment, service.ADMISSION_SOURCE_RELOAD: reload_marker}), \
                      mock.patch.object(service, "LISTEN_FD", os.dup(listener.fileno())), \
                      redirect_stderr(io.StringIO()) as journal:
@@ -6805,7 +6939,8 @@ class ServiceTests(unittest.TestCase):
 
                     def notify_before_journal(message: str) -> None:
                         self.assertEqual(message, "READY=1")
-                        self.assertEqual(journal.getvalue().splitlines(), [replacement_watch])
+                        self.assertTrue(state_root.is_dir())
+                        self.assertEqual(journal.getvalue().splitlines(), [state_ready, replacement_watch])
                         notify(message)
 
                     try:
@@ -6815,7 +6950,8 @@ class ServiceTests(unittest.TestCase):
                         version = admission_code.reload_source_version(replacement.source_root)
                         self.assertRegex(version, r"^[0-9a-f]{64}$")
                         self.assertEqual(journal.getvalue().splitlines(),
-                            [replacement_watch, f"memory admission: reload ready, source hash {version}", ready_revision])
+                            [state_ready, replacement_watch, f"memory admission: reload ready, source hash {version}",
+                             ready_revision])
                         self.assertNotIn(service.ADMISSION_SOURCE_RELOAD, os.environ)
                     finally:
                         replacement.close()

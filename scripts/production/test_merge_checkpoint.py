@@ -82,7 +82,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
-    def test_package_commands_and_retries_use_the_package_folder(self) -> None:
+    def test_package_commands_use_the_workspace_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
                 with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
@@ -100,8 +100,9 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     _ = verify.write_text(
                         f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
                         + "print(f'{sys.argv[1]}={Path.cwd()}')\n"
-                        + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
-                           + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
+                        + ("marker = Path(__file__).with_name('retried')\n"
+                           + "if sys.argv[1] == 'test' and not marker.exists():\n"
+                           + "    marker.touch()\n    sys.exit(1)\n" if retry else ""))
                     verify.chmod(0o755)
                     production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                           checkout / "production.log", ZoneInfo("UTC"))
@@ -112,7 +113,11 @@ class CheckpointTestFolderTests(unittest.TestCase):
                             production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log,
                             merge_head="fixture-merge")
                     output = log.read_text()
-                    self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
+                    initial_folder = checkout.resolve() if workspace else package.resolve()
+                    expected = [f"test={initial_folder}"]
+                    if retry:
+                        expected.append(f"test={package.resolve()}")
+                    self.assertEqual([line for line in output.splitlines() if line.startswith("test=")], expected)
                     self.assertIn("package_proof_crate_EXIT=" + ("1" if retry else "0"), output)
                     if retry:
                         self.assertIn("package_proof_crate_RERUN_EXIT=0", output)
