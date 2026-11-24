@@ -46,7 +46,7 @@ from scripts.review_links import console, list_page, page_frame, serve, staff_na
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -4878,7 +4878,7 @@ observer.observe(original.parentElement,{childList:true});
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, 1366, 768)
 
-        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=load)):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -7388,7 +7388,7 @@ window.fetch=async(_path,options={})=>{
             width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
             return self.firefox_view(arguments[-1], path, int(width), int(height))
 
-        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+        with patch("scripts.review_links.browser_test_support.subprocess", SimpleNamespace(run=screenshot)):
             assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
