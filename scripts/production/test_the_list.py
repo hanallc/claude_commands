@@ -32,9 +32,9 @@ BOB = staff.StaffRow(staff.StaffId("a02a55c8-a2c4-47d9-bf99-fd30ffe75247"), "pro
                      current_session=staff.StaffId("32c954ea-25b3-44e7-9eed-3218ce9df1d6"))
 START = datetime(2026, 11, 16, 18, tzinfo=UTC)
 LIST_TEXT_LIMITS = {
-    "latest_status_max_chars": 80,
-    "next_step_max_chars": 72,
-    "evidence_line_max_chars": 90,
+    "max_chars.latest_status": 80,
+    "max_chars.next_step": 72,
+    "max_chars.evidence_line": 90,
 }
 
 
@@ -211,10 +211,10 @@ class TheListTests(unittest.TestCase):
 
     def test_text_limits_on_add_and_update(self) -> None:
         cases = (
-            ("latest-status", "latest_status", "latest_status_max_chars"),
-            ("next-step", "next_step", "next_step_max_chars"),
-            ("add-evidence", "evidence", "evidence_line_max_chars"),
-            ("evidence", "evidence", "evidence_line_max_chars"),
+            ("latest-status", "latest_status", "max_chars.latest_status"),
+            ("next-step", "next_step", "max_chars.next_step"),
+            ("add-evidence", "evidence", "max_chars.evidence_line"),
+            ("evidence", "evidence", "max_chars.evidence_line"),
         )
         for option, field, key in cases:
             limit = LIST_TEXT_LIMITS[key]
@@ -256,11 +256,11 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.load(MORTY.id, identity).done_when, updated)
 
     def test_old_long_text_remains_readable_and_survives_other_updates(self) -> None:
-        status = "s" * (LIST_TEXT_LIMITS["latest_status_max_chars"] + 1)
-        step = "n" * (LIST_TEXT_LIMITS["next_step_max_chars"] + 1)
+        status = "s" * (LIST_TEXT_LIMITS["max_chars.latest_status"] + 1)
+        step = "n" * (LIST_TEXT_LIMITS["max_chars.next_step"] + 1)
         done = ("The producer can find the release checklist in the List and confirm that the review, "
                 "the browser check, and the final approval are complete before closing the item.")
-        evidence = "e" * (LIST_TEXT_LIMITS["evidence_line_max_chars"] + 1)
+        evidence = "e" * (LIST_TEXT_LIMITS["max_chars.evidence_line"] + 1)
         item = self.add(changes={"latest_status": status, "next_step": step, "done_when": done, "evidence": evidence})
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
         code, output, error = self.command("list", "--latest-status")
@@ -277,14 +277,14 @@ class TheListTests(unittest.TestCase):
     def test_text_limit_uses_the_current_config_and_refuses_bad_settings(self) -> None:
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.list_config.parent)}))
         item = self.add()
-        for setting in ("", "# whole: 1..\nlatest_status_max_chars=0\n"):
+        for setting in ("", "# whole: 1..\nmax_chars.latest_status=0\n"):
             with self.subTest(setting=setting):
                 _ = self.list_config.write_text(setting)
                 self.assertEqual(self.command("update", "--id", item.id, "--source", "nate", "--latest-status", "ok"),
-                                 (1, "", f"the_list: --latest-status needs a valid latest_status_max_chars in "
+                                 (1, "", f"the_list: --latest-status needs a valid max_chars.latest_status in "
                                          + f"{self.list_config}\n"))
                 self.assertEqual(the_list.load(MORTY.id, item.id), item)
-        _ = self.list_config.write_text("# whole: 1..\nlatest_status_max_chars=2\n")
+        _ = self.list_config.write_text("# whole: 1..\nmax_chars.latest_status=2\n")
         self.assertEqual(self.command("update", "--id", item.id, "--source", "nate", "--latest-status", "ok"),
                          (0, "", ""))
         self.assertEqual(the_list.load(MORTY.id, item.id).latest_status, "ok")

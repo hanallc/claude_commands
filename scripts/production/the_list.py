@@ -2081,12 +2081,12 @@ def _check_cli_text_limits(changes: ItemChanges, add_evidence: str | None) -> No
     lengths: list[tuple[str, str, int]] = []
     for field, value in (("latest_status", changes.get("latest_status")), ("next_step", changes.get("next_step"))):
         if value is not None:
-            lengths.append((f"{field}_max_chars", "--" + field.replace("_", "-"), len(value)))
+            lengths.append((f"max_chars.{field}", "--" + field.replace("_", "-"), len(value)))
     if "evidence" in changes:
         longest = max(map(len, changes["evidence"].splitlines()), default=0)
-        lengths.append(("evidence_line_max_chars", "--evidence", longest))
+        lengths.append(("max_chars.evidence_line", "--evidence", longest))
     if add_evidence is not None:
-        lengths.append(("evidence_line_max_chars", "--add-evidence", len(add_evidence)))
+        lengths.append(("max_chars.evidence_line", "--add-evidence", len(add_evidence)))
     if not lengths:
         return
     settings = conf.read("the_list")
@@ -2095,7 +2095,7 @@ def _check_cli_text_limits(changes: ItemChanges, add_evidence: str | None) -> No
         if not isinstance(limit, conf.UsableLiveValue):
             raise ListError(f"{option} needs a valid {key} in {settings.source}")
         if length > limit.value:
-            unit = "characters per line" if key == "evidence_line_max_chars" else "characters"
+            unit = "characters per line" if key == "max_chars.evidence_line" else "characters"
             raise ListError(f"{option} limit is {limit.value} {unit}. write it for nate: two short sentences")
 
 

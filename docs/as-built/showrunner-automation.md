@@ -648,9 +648,9 @@ The CLI reads character limits in `config/the_list.conf` when add or update sets
 
 | Config key | Limit |
 | --- | --- |
-| `latest_status_max_chars` | 200 characters for the latest status |
-| `next_step_max_chars` | 160 characters for the next step |
-| `evidence_line_max_chars` | 300 characters for each replacement or appended evidence line |
+| `max_chars.latest_status` | 200 characters for the latest status |
+| `max_chars.next_step` | 160 characters for the next step |
+| `max_chars.evidence_line` | 300 characters for each replacement or appended evidence line |
 
 The CLI refuses a write if the applicable setting is missing, invalid, or too small for the supplied text.
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
