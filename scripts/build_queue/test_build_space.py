@@ -21,7 +21,8 @@ class BuildSpaceTests(unittest.TestCase):
     def configure_floor(self, fixture: AdmissionFixture, *, estimate_lifetime: str = "3600") -> Path:
         output = fixture.root / "build-output"
         output.mkdir()
-        _ = write_config_fixture(fixture.root / "build_folders.conf", f"roots.build={output}\nroots.build.natedev={output}\n")
+        _ = write_config_fixture(fixture.root / "build_folders.conf",
+                                 f"roots.build={output}\nroots.build.natedev={output}\n")
         write_memory_config(fixture.root / "build_admission.conf",
                             free_floor_gib="150", estimate_refresh_seconds=estimate_lifetime)
         _ = fixture.enter_context(mock.patch.object(fixture.readings, "build_space",

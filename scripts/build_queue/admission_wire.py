@@ -124,7 +124,7 @@ class CloudPlace:
     group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP
 
 
-def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]:
+def cloud_queue_time(place: CloudPlace, since: float) -> tuple[float, int, str]:
     """Use the trial start time for grouped requests."""
     if isinstance(group := place.group, CloudGroup):
         return group.started_at, 0, group.key
@@ -181,11 +181,13 @@ OUTSIDE_UNIT_RULES = OutsideUnitRules()
 
 @dataclass(frozen=True)
 class RunPlace:
-    """The run placement holds its identity, first owner, start time, and unit."""
+    """Keep the first place of a live run."""
     run: RunIdentity
     since: float
     first_owner: Owner
     unit: str = ""
+    move_id: str = ""
+    repository: str = ""
     unit_place: UnitPlace | OutsideUnitRules = field(default=OUTSIDE_UNIT_RULES, kw_only=True)
 
 

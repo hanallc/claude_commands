@@ -49,11 +49,18 @@ DIRECT_GATE_ARGUMENTS = (
 
 
 def placed(target: str) -> wire.Assignment:
-    provider = 'scaler' if target == 'aws' else 'ssh' if target == 'mac-linux' else 'local'
+    provider = 'scaler' if target in ('aws', 'claude-aws') else 'ssh' if target == 'mac-linux' else 'local'
     return wire.Assignment(placement.PlacementAssignment('episode', 'attempt',
         placement.PlacementDestination(provider, target, 'fixture-host', WHOLE_MAC),
         execution_identity.SourceKeyKnown('fixture-source'), placement.SubmittingOwner('fixture-host', 1, '1'),
         NoOwningSession(), 1.0))
+
+
+def scaler_registry(root: Path) -> dict[str, str]:
+    _ = write_config_fixture(root / "build_targets.conf",
+        "targets=natedev,mac-linux,claude-aws\nkind.claude-aws=scaler\n"
+        + "settings.claude-aws=cloud_gate.conf\nenabled.claude-aws=on\n")
+    return {"CONF_DIR": str(root)}
 
 
 def inherited_admission(grant: wire.Assignment) -> first_step.FirstStepAdmission:
@@ -267,12 +274,11 @@ class GateDefaultPlacementTests(unittest.TestCase):
             assignment = placed("aws")
             admitted = inherited_admission(assignment)
 
-            def launch(arguments: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...], env: dict[str, str],
-                       text: bool, check: bool) -> subprocess.CompletedProcess[str]:
-                self.assertEqual((arguments, cwd, text, check), (command, source, True, False))
-                reader, = pass_fds
-                inherited = {**env, copies.PREPARED_GATE_FD: str(os.dup(reader))}
-                with mock.patch.dict(os.environ, inherited, clear=True):
+            def launch(arguments: Sequence[str], *, cwd: Path, descriptors: tuple[int, ...],
+                       environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                self.assertEqual((arguments, cwd, descriptors), (command, source, ()))
+                with (mock.patch.dict(os.environ, environment, clear=True),
+                      mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True)):
                     status = gate.main(command[1:])
                 return subprocess.CompletedProcess(arguments, status)
 
@@ -280,7 +286,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
                   mock.patch.object(gate, "current_gate_placement", return_value=assignment),
                   mock.patch.object(gate, "run_tests_only", return_value=0) as run,
-                  mock.patch.object(subprocess, "run", side_effect=launch)):
+                  mock.patch.object(copies, "run_prepared_gate", side_effect=launch)):
                 args = copies.CopyArguments(repo=folder, targets="aws")
                 self.assertEqual(copies.run_gate_step(args, command), 0)
             self.assertEqual(run.call_args.args[-1], gate.AwsGateAssignment(assignment.assignment))
@@ -414,42 +420,132 @@ class GateDefaultPlacementTests(unittest.TestCase):
         admit.assert_not_called()
         self.assertEqual(run.call_args.args[-1], gate.MacLinuxAssignment(assignment.assignment))
 
+    def run_copy_fixture_gate(self, tree: Path, script: str, program: str, *, targets: str = "claude-aws") -> int:
+        path = tree / script
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(dedent(program))
+        repository = Path(__file__).resolve().parents[2]
+        with (mock.patch.dict(os.environ, {**scaler_registry(tree), "BUILDLOG_GATE_TARGETS": "claude-aws", "PYTHONPATH": str(repository)},
+                              clear=True),
+              mock.patch.object(copies, "caller_owner", return_value="fixture"),
+              mock.patch("scripts.copies.copies._command_copy",
+                         return_value=nullcontext(copies.DirectCommandCopy(tree)))):
+            return copies.main(["run", "--repo", str(tree), "--commit", "HEAD", "--targets", targets, "--",
+                                sys.executable, script, "--tests-only"])
+
     def test_copied_gate_reuses_its_aws_assignment(self) -> None:
-        assignment = placed('aws')
         with TemporaryDirectory() as directory:
-            tree = Path(directory)
-            command = ["./scripts/lib/py", "scripts/production/gate.py", "--tests-only"]
+            status = self.run_copy_fixture_gate(Path(directory), "scripts/production/gate.py", """\
+                from contextlib import nullcontext, redirect_stderr
+                from dataclasses import replace
+                from io import StringIO
+                import os
+                from pathlib import Path
+                from unittest import mock
 
-            def launch(arguments: Sequence[str], *, cwd: Path, pass_fds: tuple[int, ...],
-                       env: dict[str, str], text: bool) -> subprocess.CompletedProcess[str]:
-                self.assertEqual(arguments, command)
-                self.assertEqual(cwd, tree)
-                self.assertTrue(text)
-                reader, = pass_fds
-                self.assertEqual(env[copies.PREPARED_GATE_FD], str(reader))
-                # The parent keeps its descriptor during the child run.
-                inherited = {**env, copies.PREPARED_GATE_FD: str(os.dup(reader))}
-                with mock.patch.dict(os.environ, inherited, clear=True):
-                    gate_arguments = ["--tests-only", "--repo", directory]
-                    status = gate.main(gate_arguments)
-                    self.assertEqual(gate.main(gate_arguments), 1)
-                return subprocess.CompletedProcess(arguments, status)
+                from scripts.aws_target import cloud_gate
+                from scripts.build_queue import admission_client, admission_records, admission_wire as wire, first_step, placement
+                from scripts.buildlog import treekey
+                from scripts.production import gate
+                from scripts.production.test_gate_default_placement import placed
 
-            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "aws"}, clear=True),
-                  mock.patch.object(copies, "caller_owner", return_value="fixture"),
-                  mock.patch("scripts.copies.copies._command_copy",
-                             return_value=nullcontext(copies.DirectCommandCopy(tree))),
-                  mock.patch.object(subprocess, "run", side_effect=launch),
-                  mock.patch.object(gate, 'current_gate_placement', return_value=assignment),
-                  mock.patch.object(first_step, 'admitted_run') as admit,
-                  mock.patch.object(gate, 'run_tests_only', return_value=0) as run,
-                  redirect_stderr(io.StringIO()) as errors):
-                args = copies.CopyArguments(repo=directory)
-                self.assertEqual(copies.run_copy(args, command, copies.CommittedSource("HEAD"), copies.NO_MERGE), 0)
-            self.assertIn("A direct gate cannot take an AWS assignment", errors.getvalue())
-        admit.assert_not_called()
-        run.assert_called_once()
-        self.assertEqual(run.call_args.args[-1], gate.AwsGateAssignment(assignment.assignment))
+                pid = os.getpid()
+                start = admission_records.process_start_time(pid)
+                assert start is not None
+                owner = placement.SubmittingOwner(gate.host_name(), pid, start)
+                saved = replace(placed("claude-aws").assignment, owner=owner)
+                path = Path.cwd() / "assignment.json"
+                wire.write_assignment(path, wire.Assignment(saved))
+                os.environ["BUILDLOG_PLACEMENT_FILE"] = str(path)
+                os.environ["BUILDLOG_PLACEMENT_EPISODE"] = saved.episode
+                status = wire.PlacementStatusReply(wire.KnownPlacementStatus(
+                    saved, placement.CurrentAssignment(), placement.NoProviderClaim()))
+                result = gate.GateRun((), 1, 0, tests_reused=True)
+                with (mock.patch.object(admission_client, "placement_status", return_value=status) as check,
+                      mock.patch.object(treekey, "tree_key", return_value="fixture-source") as source,
+                      mock.patch.object(first_step, "admitted_run") as admit,
+                      mock.patch.object(gate.scratch, "copy_lock", return_value=nullcontext()),
+                      mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
+                      mock.patch.object(gate.copies, "source_owner", return_value=""),
+                      mock.patch.object(gate, "run_suites") as local,
+                      mock.patch.object(cloud_gate, "working_tree", return_value=("tree", set())),
+                      mock.patch.object(cloud_gate, "route", return_value=result) as aws,
+                      redirect_stderr(StringIO()) as errors):
+                    assert gate.main(["--tests-only"]) == 0, errors.getvalue()
+                check.assert_called_once_with(saved.episode, saved.attempt)
+                source.assert_called_once_with(str(Path.cwd()))
+                admit.assert_not_called()
+                local.assert_not_called()
+                aws.assert_called_once()
+                assert aws.call_args.kwargs["assignment"] == saved
+                """)
+        self.assertEqual(status, 0)
+
+    def test_copied_gate_without_an_assignment_runs_locally(self) -> None:
+        with TemporaryDirectory() as directory:
+            status = self.run_copy_fixture_gate(Path(directory), "scripts/production/gate.py", """\
+                from contextlib import nullcontext
+                from unittest import mock
+
+                from scripts.aws_target import cloud_gate
+                from scripts.build_queue import first_step
+                from scripts.production import gate
+
+                result = gate.GateRun((), 1, 0, tests_reused=True)
+                with (mock.patch.object(first_step, "admitted_run") as admit,
+                      mock.patch.object(gate.scratch, "copy_lock", return_value=nullcontext()),
+                      mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
+                      mock.patch.object(gate.copies, "source_owner", return_value=""),
+                      mock.patch.object(gate, "run_suites", return_value=result) as local,
+                      mock.patch.object(cloud_gate, "working_tree", return_value=("tree", set())),
+                      mock.patch.object(cloud_gate, "route") as aws):
+                    assert gate.main(["--tests-only"]) == 0
+                admit.assert_not_called()
+                aws.assert_not_called()
+                local.assert_called_once()
+                """)
+        self.assertEqual(status, 0)
+
+    def test_a_child_of_the_copied_gate_cannot_take_the_handoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            status = self.run_copy_fixture_gate(Path(directory), "scripts/production/gate.py", """\
+                import os
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                from scripts.copies import copies
+
+                fd = int(os.environ[copies.PREPARED_GATE_FD])
+                repository = Path(copies.__file__).resolve().parents[2]
+                check = (
+                    "import sys; sys.path.insert(0, sys.argv[1]); "
+                    "from scripts.copies import copies; assert not copies.take_prepared_gate_handoff()"
+                )
+                subprocess.run([sys.executable, "-c", check, str(repository)], pass_fds=(fd,), check=True)
+                assert not copies.take_prepared_gate_handoff()
+                """)
+        self.assertEqual(status, 0)
+
+    def test_a_gate_script_outside_the_production_path_gets_no_handoff(self) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), TemporaryDirectory() as directory:
+                tree = Path(directory) / "copy"
+                tree.mkdir()
+                script = Path(directory) / "gate.py"
+                if symlink:
+                    canonical = tree / "scripts/production/gate.py"
+                    canonical.parent.mkdir(parents=True)
+                    script = tree / "gate-alias.py"
+                    script.symlink_to(canonical)
+                status = self.run_copy_fixture_gate(tree, str(script), """\
+                    import os
+
+                    from scripts.copies import copies
+
+                    assert copies.PREPARED_GATE_FD not in os.environ
+                    """, targets="natedev,claude-aws")
+                self.assertEqual(status, 0)
 
     def test_a_gate_inside_a_copy_shell_requires_direct_placement(self) -> None:
         with TemporaryDirectory() as directory:

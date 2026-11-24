@@ -38,6 +38,33 @@ def run_child(run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess
 
 
 class CheckpointGateTests(unittest.TestCase):
+    def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary).resolve()
+            production = ProductionDocument(folder / "production.md", "fixture", "merge", folder,
+                                            folder / "production.log", ZoneInfo("UTC"))
+            prefix = ["env", "HERDR_BIN=/nonexistent/herdr"]
+            command = [*prefix, *GATE, "--checkout", "."]
+            step = checkpoint_gate.CheckpointTestStep("merge test 1", command, folder)
+            log = folder / "test.log"
+            script_dir = Path(checkpoint_gate.__file__).resolve().parents[1]
+            expected = [*prefix, str(script_dir / "lib/py"), str(script_dir / "copies/copies.py"), "run",
+                        "--repo", str(folder), "--commit", "merged-tip", "--", *GATE, "--checkout", "{tree}"]
+            retry = [*expected, "--module", "known_flake"]
+
+            with mock.patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess(expected, 1, RED_OUTPUT, ""),
+                    subprocess.CompletedProcess(retry, 0, "", ""),
+            ]) as run:
+                result = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset({"known_flake"}),
+                                                        log, merge_head="merged-tip")
+            options = {"cwd": folder, "capture_output": True, "text": True, "check": False, "pass_fds": ()}
+            self.assertEqual(run.call_args_list, [mock.call(expected, **options), mock.call(retry, **options)])
+            self.assertEqual(result, "merge test 1")
+            self.assertIn("merge_test_1_EXIT=1", log.read_text())
+            self.assertIn("merge_test_1_RERUN_EXIT=0", log.read_text())
+            self.assertIn("known flaky tests known_flake", production.log.read_text())
+
     def test_named_gate_uses_a_supervisor_with_the_gate_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -175,7 +202,8 @@ class CheckpointPackageTests(unittest.TestCase):
         rows = "".join(f"verify.sh: step result: test {name} exit=0\n" for name in ("alpha", "beta", "gamma"))
         with mock.patch.object(subprocess, "run",
                                return_value=subprocess.CompletedProcess(fixture.joined, 0, "", rows)) as run:
-            result = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(), fixture.log)
+            result = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(),
+                                                    fixture.log, merge_head="merged-tip")
         run.assert_called_once_with(fixture.joined, cwd=fixture.production.checkout, capture_output=True, text=True,
                                     check=False, pass_fds=())
         self.assertEqual(result, "package alpha, package beta, package gamma")
@@ -305,7 +333,8 @@ class GatePlacementFixture:
         admission_wire.write_assignment(self.assignment_file, self.local)
 
     def run_step(self, child: mock.Mock, *, retry_failed_steps: bool = False) -> str:
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], folder: Path, *, merge_head: str) -> subprocess.CompletedProcess[str]:
+            self.case.assertEqual(merge_head, "")
             return first_step.run_gate_with_placement(
                 lambda: cast("subprocess.CompletedProcess[str]", child(command, folder)),
                 self.assignment_file, self.request, self.place_again)
@@ -326,30 +355,26 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         production = ProductionDocument(root / "production.md", "fixture", "merge", root,
                                         root / "production.log", ZoneInfo("UTC"))
         log = root / "test.log"
-        step = checkpoint_gate.CheckpointTestStep("merge test 1", COMMAND, root)
-        admitted = mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.HandedOff(), run_gate=run_child)
+        command = ["env", "HERDR_BIN=/nonexistent/herdr", *GATE]
+        step = checkpoint_gate.CheckpointTestStep("merge test 1", command, root)
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
-            args = copies.CopyArguments(repo=str(folder), targets="mac-linux,natedev")
-            result = copies.run_gate_step(args, command)
-            return subprocess.CompletedProcess(command, result, RED_OUTPUT, "")
-
-        with (mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as place,
-              mock.patch.object(subprocess, "run",
-                                return_value=subprocess.CompletedProcess(COMMAND, status)) as child,
-              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run),
+        with (mock.patch.object(subprocess, "run",
+                                return_value=subprocess.CompletedProcess(command, status, RED_OUTPUT, "")) as child,
               self.assertRaises(checkpoint_gate.Stop) as stopped):
             _ = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset({"known_flake"}), log,
-                                               retry_failed_steps=retry_failed_steps)
-        place.assert_called_once_with(COMMAND, root, targets=("mac-linux", "natedev"))
+                                               retry_failed_steps=retry_failed_steps, merge_head="merged-tip")
         child.assert_called_once()
         if status == 1:
             assert isinstance(stopped.exception, checkpoint_gate.RedCheckpointTests)
             self.assertEqual(stopped.exception.red, (checkpoint_gate.RedStep(step, frozenset({"lib/test_infrastructure.py"})),))
         else:
             self.assertEqual(stopped.exception.state, "blocked")
-            self.assertIn(f"gate status {status}", stopped.exception.detail.lower())
-            self.assertNotIn("RERUN", log.read_text())
+            self.assertIn(f"status {status}", stopped.exception.detail)
+            self.assertIn(str(log), stopped.exception.detail)
+            output = log.read_text()
+            self.assertIn(f"merge_test_1_EXIT={status}", output)
+            self.assertNotIn("RERUN", output)
+            self.assertNotIn("BASE", output)
         self.assertFalse(production.log.exists())
 
     def test_silent_guest_requests_placement_again_at_original_queue_time(self) -> None:
@@ -426,7 +451,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
                                                frozenset(), fixture.log)
         self.assertEqual(stopped.exception.state, "blocked")
         self.assertIn("settlement", stopped.exception.detail)
-        run.assert_called_once_with(COMMAND, fixture.step.folder)
+        run.assert_called_once_with(COMMAND, fixture.step.folder, merge_head="")
 
     def test_queue_loss_during_replacement_preserves_exit_79(self) -> None:
         fixture = GatePlacementFixture(self)
@@ -437,7 +462,8 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             finally:
                 raise OSError("fixture folder cleanup failed")
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], folder: Path, *, merge_head: str) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(merge_head, "")
             with redirect_stderr(io.StringIO()) as errors:
                 code = copies.main(["gate-step", "--repo", str(folder), "--", *command])
             self.assertEqual(code, GATE_PRELAUNCH_REFUSED_STATUS, errors.getvalue())
@@ -461,7 +487,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         fixture.report_failure.assert_not_called()
         acquire.assert_called_once_with(fixture.request)
         invoked.assert_called_once()
-        runner.assert_called_once_with(COMMAND, fixture.step.folder)
+        runner.assert_called_once_with(COMMAND, fixture.step.folder, merge_head="")
         output = fixture.log.read_text()
         self.assertIn("Gate cleanup failed. no socket", output)
         self.assertIn("Gate cleanup failed. fixture folder cleanup failed", output)
@@ -478,7 +504,8 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             finally:
                 raise OSError("fixture folder cleanup failed")
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], folder: Path, *, merge_head: str) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(merge_head, "")
             with redirect_stderr(io.StringIO()) as errors:
                 code = copies.main(["gate-step", "--repo", str(folder), "--", *command])
             return subprocess.CompletedProcess(command, code, "", errors.getvalue())
@@ -502,7 +529,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertIn("launch settlement", stopped.exception.detail)
         connect.assert_called_once()
         invoked.assert_called_once()
-        runner.assert_called_once_with(COMMAND, fixture.step.folder)
+        runner.assert_called_once_with(COMMAND, fixture.step.folder, merge_head="")
         output = fixture.log.read_text()
         self.assertIn("guest end unproven", output)
         self.assertIn("Gate cleanup failed. no socket", output)
@@ -533,3 +560,8 @@ class CheckpointGatePlacementTests(unittest.TestCase):
 
     def test_red_gate_remains_a_test_failure(self) -> None:
         self.check_exit_status(1, retry_failed_steps=False)
+
+    def test_copy_setup_errors_block_the_checkpoint_without_a_test_retry(self) -> None:
+        for status in (copies.COPY_ERROR_STATUS, os.EX_TEMPFAIL, 127):
+            with self.subTest(status=status):
+                self.check_exit_status(status, retry_failed_steps=True)

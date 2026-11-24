@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
 
+import errno
 import fcntl
 import io
 import json
@@ -18,8 +19,8 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator
 from datetime import date, datetime
 from dataclasses import replace
 from pathlib import Path
@@ -28,7 +29,7 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import conf, copy_record, file_lock, session_folder
+from scripts.lib import conf, copy_record, file_lock, main_push_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.git_test_support import fixture_git_environment
@@ -3984,6 +3985,138 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertEqual(run_with_image("add", "--production", DOC, "--list", str(outside), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def ready_arguments(self, *, names: tuple[str, ...] = ("First", "Second"), rows_per_merge: int = 1) -> tuple[str, ...]:
+        self.path = self.path.with_name("change-review - commit-scan.md")
+        _ = self.enterContext(isolated_staff_file(self.repo.parent / "staff.json", {}))
+        self.enterContext(mock.patch.dict(os.environ, {"CHANGE_REVIEW_DIR": str(self.path.parent)}))
+        source, _, _ = origin_commits(self.repo.parent)
+        production = self.repo.parent / "production.md"
+        _ = production.write_text(f"# Scan fixture\n- **Showrunner checkout:** `{source}`\n"
+                                  + f"- **Change review:** `{self.path}`\n")
+        _ = fixture_member("showrunner", name="commit-scan", doc=staff.LiveDoc(remote.local_machine(), production))
+        for name in names:
+            titles = [name] if rows_per_merge == 1 else [f"{name} {number}" for number in range(1, rows_per_merge + 1)]
+            trailers = "\n".join(f"Change-Review: {title} | Read | Result" for title in titles)
+            message = pictured_review_lines(f"{name} change\n\n{trailers}")
+            for arguments in (("checkout", "-qb", name), ("commit", "-qm", message, "--allow-empty"),
+                              ("checkout", "-q", "main"), ("merge", "--no-ff", "-qm", f"Merge {name}", name)):
+                _ = subprocess.run(["git", "-C", str(source), *arguments], check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(source), "push", "origin", "main"], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        return ("list-ready", "--repo", str(source), "--production", "commit-scan", "--merge-branch", "main")
+
+    @contextmanager
+    def hold_vault_lock(self) -> Generator[Callable[[], None]]:
+        with ForkChildren() as children:
+            ready, announce = children.pipe()
+            stop, release = children.pipe()
+
+            def hold() -> int:
+                with main_push_lock.main_push_lock(self.repo, "agent-notes"):
+                    _ = os.write(announce, b"1")
+                    return 0 if os.read(stop, 1) == b"1" else 1
+
+            child = children.start(hold, pass_fds=(announce, stop))
+            self.assertEqual(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], [ready])
+            self.assertEqual(os.read(ready, 1), b"1")
+
+            def finish() -> None:
+                _ = os.write(release, b"1")
+                result = child.result()
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            yield finish
+
+    def test_list_ready_reports_uncommitted_writes_once_while_the_vault_lock_is_held(self) -> None:
+        arguments = self.ready_arguments()
+        with self.hold_vault_lock() as release:
+            code, output, error = run(*arguments)
+            self.assertEqual(code, 0)
+            self.assertEqual(output.count("| C"), 2)
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertIn("2 new rows saved. The commit attempt failed", error)
+            self.assertIn(self.path.name, error)
+            self.assertIn(os.strerror(errno.EAGAIN), error)
+            self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+            code, output, error = run(*arguments)
+            self.assertEqual((code, output), (0, ""))
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertIn("0 new rows saved. The commit attempt failed", error)
+            release()
+
+    def test_merge_publication_warns_once_and_the_next_add_commits_all_rows(self) -> None:
+        arguments = self.ready_arguments(rows_per_merge=3)
+        production = production_doc.ProductionDocument(self.repo.parent / "production.md", "commit-scan", "main",
+                                                        Path(arguments[2]), self.repo.parent / "log", ZoneInfo("UTC"))
+        before = self.git("rev-parse", "HEAD")
+        output, warnings = io.StringIO(), io.StringIO()
+        with self.hold_vault_lock() as release:
+            with (mock.patch.object(main_push_lock, "main_push_lock", wraps=main_push_lock.main_push_lock) as lock,
+                  redirect_stdout(output), redirect_stderr(warnings)):
+                merge_checkpoint.record_publication_changes(production)
+            lock.assert_called_once_with(self.repo, "change-review", wait=False)
+            self.assertEqual(self.git("rev-parse", "HEAD"), before)
+            release()
+        self.assertIn(f"6 row(s) added to {self.path}", output.getvalue())
+        self.assertEqual(len(warnings.getvalue().splitlines()), 1, warnings.getvalue())
+        self.assertIn(f"{self.path}: 6 new rows saved.", warnings.getvalue())
+        self.assertIn(os.strerror(errno.EAGAIN), warnings.getvalue())
+        names = {f"{name} {number}" for name in ("First", "Second") for number in range(1, 4)}
+        self.assertEqual({row["Change"] for row in change_review.pending(self.path)}, names)
+        self.assertEqual(run_with_image("add", "--production", "commit-scan", "--list", str(self.path),
+                                        "--change", "Next", "--check", "Read", "--see", "Result"), (0, "C7\n", ""))
+        self.assertEqual(self.git("rev-list", "--count", f"{before}..HEAD"), "1")
+        committed = self.git("show", f"HEAD:{self.path.relative_to(self.repo)}")
+        self.assertEqual(committed, self.path.read_text(encoding="utf-8").strip())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_list_ready_commits_after_agent_notes_releases_the_vault_lock(self) -> None:
+        arguments = self.ready_arguments()
+        with self.hold_vault_lock() as release:
+            code, output, error = run(*arguments)
+            self.assertEqual(code, 0)
+            self.assertEqual(output.count("| C"), 2)
+            self.assertEqual(len(error.splitlines()), 1, error)
+            self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+            release()
+        self.assertEqual(run(*arguments), (0, "", ""))
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Second"])
+
+    def test_list_ready_warns_only_for_the_list_that_stays_uncommitted(self) -> None:
+        arguments = self.ready_arguments(names=("First", "Second", "Third"))
+        other = self.path.with_name("change-review - other.md")
+        with self.hold_vault_lock() as release:
+            lock = (self.repo / ".git" / "main-push.lock").stat()
+            real_flock = fcntl.flock
+
+            def release_after_first_attempt(descriptor: int | TextIO, operation: int) -> None:
+                try:
+                    real_flock(descriptor, operation)
+                except BlockingIOError:
+                    number = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                    if os.path.samestat(os.fstat(number), lock):
+                        release()
+                    raise
+
+            with (mock.patch.object(fcntl, "flock", release_after_first_attempt),
+                  mock.patch.object(change_review, "list_path", side_effect=[self.path, other, self.path])):
+                code, output, error = run(*arguments)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(output.count("| C"), 3)
+        self.assertEqual(len(error.splitlines()), 1, error)
+        self.assertIn("2 new rows saved. The commit attempt failed", error)
+        reason = BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+        self.assertIn(f"({reason})", error)
+        self.assertIn(str(self.path), error)
+        self.assertNotIn(other.name, error)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(self.git("status", "--porcelain", "-z"), f"?? {self.path.relative_to(self.repo)}\0")
+        self.assertEqual([row["Change"] for row in change_review.pending(self.path)], ["First", "Third"])
+        self.assertEqual([row["Change"] for row in change_review.pending(other)], ["Second"])
 
     def test_a_held_index_lock_warns_writes_and_the_next_add_commits_both_rows(self) -> None:
         lock = self.repo / ".git" / "index.lock"

@@ -28,6 +28,11 @@ The `/agents` skill uses the `agents` program.
 The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
+SESSION is a staff id, a session id, a unique name, or a staff path.
+A staff path is the full path, such as `hana/assembly/fix2`, or a path under a showrunner, such as `assembly/fix2`.
+A unit path stops the unit and its workers.
+A path that matches no staff row goes to the native session stop, which can match a saved session name such as `review/x`.
+A path that matches more than one staff row stops nothing and returns status 2 with the matching paths.
 Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.

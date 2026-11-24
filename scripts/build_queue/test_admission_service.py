@@ -4554,6 +4554,80 @@ class PlacementRestartTests(unittest.TestCase):
 
 
 class CloudAdmissionTests(unittest.TestCase):
+    def test_aws_grant_requires_a_registered_enabled_scaler_with_slots_and_daily_room(self) -> None:
+        from scripts.aws_target import ledger
+        from scripts.build_queue.test_placement import PlacementFixture, aws_gate_request, read_aws_gate_evidence
+
+        for cause in ("off", "slots", "daily", "absent", "ready"):
+            with self.subTest(cause=cause), PlacementFixture() as fixture:
+                fixture.configure(cloud_gate_slots=16)
+                if cause == "slots":
+                    for _ in range(16):
+                        _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+                request = aws_gate_request(fixture, enabled=cause != "off", daily_room=cause != "daily")
+                if cause == "absent":
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\n")
+                directory = fixture.root / "queue-target-state"
+                book = ledger.CostLedger(directory / "aws")
+                saved = book.path.read_bytes()
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
+                                                  "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                    _ = read_aws_gate_evidence(fixture, request)
+                    reply, = fixture.server.handle_request(request)
+                    if cause == "ready":
+                        assert isinstance(reply, wire.Assignment)
+                        self.assertEqual(reply.assignment.destination.target, "claude-aws")
+                        self.assertEqual(fixture.server.current_assignments[request.episode],
+                            execution_identity.attempt_key(request.episode, reply.assignment.attempt))
+                    else:
+                        self.assertNotIsInstance(reply, wire.Assignment)
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                        candidate, = fixture.server.placement_eligibility[request.episode]
+                        self.assertNotIsInstance(candidate.eligibility, placement.AllowedHost)
+                self.assertEqual(book.path.read_bytes(), saved)
+
+    def test_aws_grants_count_against_daily_room_until_the_worker_books(self) -> None:
+        from decimal import Decimal
+        from scripts.aws_target import ledger
+        from scripts.aws_target.ledger_test_support import override_fixture_settings
+        from scripts.build_queue.test_placement import PlacementFixture, aws_gate_request, read_aws_gate_evidence
+
+        with PlacementFixture() as fixture:
+            directory = fixture.root / "queue-target-state"
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(directory),
+                                              "AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}):
+                first = aws_gate_request(fixture)
+                second = aws_gate_request(fixture)
+                gate_settings = fixture.root / "cloud_gate.conf"
+                override_fixture_settings(gate_settings, "# range: 0..\nattempt_allowance_usd=20\n")
+                _ = read_aws_gate_evidence(fixture, first)
+                _ = read_aws_gate_evidence(fixture, second)
+                reply, = fixture.server.handle_request(first)
+                self.assertIsInstance(reply, wire.Assignment)
+                assert isinstance(reply, wire.Assignment)
+                self.assertNotIsInstance(fixture.server.handle_request(second)[0], wire.Assignment)
+                blocked, = fixture.server.placement_eligibility[second.episode]
+                self.assertEqual(blocked.eligibility, placement.TemporaryExclusion("daily_limit"))
+
+                assert isinstance(first.local, wire.LocalAdmissionContext)
+                binding = ledger.GateDispatchBinding.read(ledger.gate_dispatch_binding_path(Path(first.local.sidecar)))
+                holder = placement.ClaimHolderIdentity(first.owner.host, first.owner.pid, first.owner.start_time)
+                journal = ledger.GateDispatchJournal(binding.journal)
+                journal.begin(binding, holder)
+                permission, = fixture.server.handle_request(wire.ConsumePermission("consume", reply.assignment, binding.claim, holder))
+                self.assertIsInstance(permission, wire.FirstAuthorization)
+                folder = fixture.root / "worker"
+                journal.register(binding.claim, holder, folder)
+                book = ledger.CostLedger(binding.directory)
+                now = int(fixture.clock.now())
+                with book.transaction() as evidence:
+                    evidence.gate_reservations.append(ledger.GateReservation(folder.name, now, now + 60,
+                                                                             Decimal(0), Decimal(20)))
+                override_fixture_settings(gate_settings, "attempt_allowance_usd=10\n")
+                _ = read_aws_gate_evidence(fixture, second)
+                self.assertIsInstance(fixture.server.handle_request(second)[0], wire.Assignment)
+                self.assertEqual(len(book.read_snapshot().gate_reservations), 1)
+
     def test_cloud_and_memory_settings_share_the_checked_pass_and_failure_path(self) -> None:
         from scripts.build_queue import cloud_progress
 
@@ -4690,6 +4764,172 @@ class CloudAdmissionTests(unittest.TestCase):
 
     def cloud_group(self, fixture: AdmissionFixture, key: str, size: int) -> status_wire.CloudGroup:
         return status_wire.CloudGroup(key, size, fixture.clock.now(), fixture.proc.spawn())
+
+    def ordered_cloud_waits(self, fixture: AdmissionFixture) -> list[wire.Owner]:
+        reading = self.reading(fixture)
+        assert isinstance(reading, wire.CloudQueueRead)
+        return [row.owner for row in reading.cloud if isinstance(row.wait, wire.CloudSlotWait)
+                and isinstance(row.wait.state, status_wire.WaitingForCloudSlot)]
+
+    def test_cloud_grants_a_later_ranked_unit_before_an_earlier_unranked_unit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            blocker = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            older = replace(self.cloud_request(fixture), since=fixture.clock.now() - 30)
+            ranked = self.cloud_request(fixture)
+            labels = {ranked.identity.session_id: UnitLabels("ranked", unit="urgent")}
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                for request in (older, ranked):
+                    _ = fixture.server.handle_request(request)
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    "cloud-priority", "urgent", "user work", "director")), [wire.Ok()])
+                self.assertEqual(self.ordered_cloud_waits(fixture), [ranked.owner, older.owner])
+                fixture.release(blocker)
+                _ = fixture.run_pass()
+                self.assertIn(ranked.episode, fixture.server.reservations)
+                self.assertIn(older.episode, fixture.server.waiters)
+
+    def test_cloud_keeps_time_order_for_two_waits_of_the_same_rank(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            newer = self.cloud_request(fixture)
+            older = replace(self.cloud_request(fixture), since=fixture.clock.now() - 30)
+            for request in (newer, older):
+                _ = fixture.server.handle_request(replace(request, identity=replace(request.identity, unit="urgent")))
+            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                "cloud-priority", "urgent", "user work", "director")), [wire.Ok()])
+            self.assertEqual(self.ordered_cloud_waits(fixture), [older.owner, newer.owner])
+
+    def test_cloud_keeps_time_order_without_saved_priority(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            blocker = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            newer = self.cloud_request(fixture)
+            older = replace(self.cloud_request(fixture), since=fixture.clock.now() - 30)
+            for request in (newer, older):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(self.ordered_cloud_waits(fixture), [older.owner, newer.owner])
+            fixture.release(blocker)
+            _ = fixture.run_pass()
+            self.assertIn(older.episode, fixture.server.reservations)
+
+    def test_cloud_and_natedev_rank_the_same_units_in_the_same_order(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            fixture.free(0)
+            fixture.hold_starts()
+            cloud_units: dict[wire.Owner, str] = {}
+            for age, unit in ((30, "unranked"), (20, "second"), (10, "first")):
+                since = fixture.clock.now() - age
+                local = fixture.request(since=since)
+                cloud = replace(self.cloud_request(fixture), since=since)
+                for request in (local, cloud):
+                    _ = fixture.server.handle_request(replace(request, identity=replace(request.identity, unit=unit)))
+                cloud_units[cloud.owner] = unit
+            for unit in ("first", "second"):
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    f"rank-{unit}", unit, "user work", "director")), [wire.Ok()])
+            local_order = [step.unit for step in self.reading(fixture).view.waiting]
+            self.assertEqual(local_order, ["first", "second", "unranked"])
+            self.assertEqual([cloud_units[owner] for owner in self.ordered_cloud_waits(fixture)], local_order)
+
+    def test_disconnected_cloud_group_keeps_its_unit_rank_after_restart(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=2)
+            group = self.cloud_group(fixture, "trial", 2)
+            first = self.cloud_request(fixture, group=group)
+            first = replace(first, identity=replace(first.identity, unit="urgent"))
+            self.assertIsInstance(fixture.connect(first).replies()[0], wire.Wait)
+            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                "cloud-priority", "urgent", "user work", "director")), [wire.Ok()])
+            fixture.restart()
+            older = replace(self.cloud_request(fixture), since=group.started_at - 30)
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.Wait)
+            self.assertEqual(self.ordered_cloud_waits(fixture), [older.owner])
+            self.assertFalse(fixture.server.reservations)
+
+    def test_cloud_group_keeps_its_roster_unit_after_restart(self) -> None:
+        for label_at_registration in (True, False):
+            with self.subTest(label_at_registration=label_at_registration), AdmissionFixture() as fixture:
+                fixture.configure(cloud_gate_slots=2)
+                group = self.cloud_group(fixture, "trial", 2)
+                first = self.cloud_request(fixture, group=group)
+                roster = {first.identity.session_id: UnitLabels("first", unit="urgent")}
+                labels = roster.copy() if label_at_registration else {}
+                with mock.patch.object(gate, "priority_labels", return_value=labels):
+                    self.assertIsInstance(fixture.connect(first).replies()[0], wire.Wait)
+                    labels.update(roster)
+                    self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                        "cloud-priority", "urgent", "user work", "director")), [wire.Ok()])
+                    labels.clear()
+                    fixture.restart()
+                    older = replace(self.cloud_request(fixture), since=group.started_at - 30)
+                    self.assertIsInstance(fixture.server.handle_request(older)[0], wire.Wait)
+                    pending = service.read_state(fixture.state_dir).pending_cloud_groups[group.key]
+                    self.assertEqual(pending.unit, "urgent")
+                    self.assertIsInstance(fixture.server.handle_request(first)[0], wire.Wait)
+                    second = self.cloud_request(fixture, group=group)
+                    _ = only_admitted(fixture.server.handle_request(second))
+                    self.assertEqual(set(fixture.server.reservations), {first.episode, second.episode})
+                    self.assertEqual(self.ordered_cloud_waits(fixture), [older.owner])
+
+    def test_placement_report_keeps_cloud_waits_in_the_last_pass_order(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, adopt_assignment, assignment_for, consume_permission, placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            remote = placement_request(fixture)
+            _ = publish_candidate(fixture, remote)
+            assignment = assignment_for(fixture, remote)
+            claim = adopt_assignment(fixture, remote, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("place-consume", assignment, claim)),
+                             [wire.FirstAuthorization(assignment, claim)])
+            _ = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            older = replace(self.cloud_request(fixture), since=fixture.clock.now() - 30)
+            newer = self.cloud_request(fixture)
+            labels = {newer.identity.session_id: UnitLabels("ranked", unit="urgent")}
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                for request in (older, newer):
+                    _ = fixture.server.handle_request(request)
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    "cloud-priority", "urgent", "user work", "director")), [wire.Ok()])
+                order = [newer.owner, older.owner]
+                for position, request in enumerate((newer, older), 1):
+                    wait = fixture.server.waiters[request.episode].last_reply
+                    assert isinstance(wait, wire.Wait)
+                    self.assertEqual(wait.position, position)
+                before = self.reading(fixture)
+                self.assertEqual(self.ordered_cloud_waits(fixture), order)
+                labels.clear()
+                labels[older.identity.session_id] = UnitLabels("ranked", unit="urgent")
+                passed = fixture.server.last_result
+                evidence = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                    assignment.destination.host, "host-generation-a", 700001, "start"))
+                _ = fixture.server.handle_request(wire.ExecutionReport("remote-started", assignment, claim, evidence))
+                self.assertIs(fixture.server.last_result, passed)
+                self.assertIsNot(self.reading(fixture), before)
+                self.assertEqual(self.ordered_cloud_waits(fixture), order)
+                _ = fixture.run_pass()
+                self.assertEqual(self.ordered_cloud_waits(fixture), [older.owner, newer.owner])
+
+    def test_cloud_group_precedes_an_earlier_submission_at_the_same_time(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=1)
+            blocker = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            single = self.cloud_request(fixture)
+            self.assertIsInstance(fixture.server.handle_request(single)[0], wire.Wait)
+            group = replace(self.cloud_group(fixture, "trial", 1), started_at=single.since)
+            grouped = replace(self.cloud_request(fixture, group=group), since=single.since)
+            self.assertIsInstance(fixture.server.handle_request(grouped)[0], wire.Wait)
+            self.assertEqual(self.ordered_cloud_waits(fixture), [grouped.owner, single.owner])
+            fixture.release(blocker)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {grouped.episode})
+            self.assertEqual(self.ordered_cloud_waits(fixture), [single.owner])
 
     def test_cloud_group_waits_for_all_members_and_slots_before_it_admits(self) -> None:
         from scripts.build_queue import cloud_progress
@@ -9475,6 +9715,171 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(fixture.queue_pids(), [other.owner.pid, second.owner.pid])
             self.assertFalse(service.read_state(fixture.state_dir).run_places)
 
+    def test_returning_run_sorts_by_its_first_wait_start(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate")
+            _ = fixture.finish_step(first, end_owner=True)
+            fixture.allow_next_start()
+            fixture.restart()
+            saved, = service.read_state(fixture.state_dir).run_places.values()
+            fixture.hold_starts()
+            peers = [fixture.request(step="gate", owner=fixture.fixture_owner(pid, "4000"))
+                     for pid in (700001, 700002)]
+            for peer in peers:
+                self.assertIsInstance(fixture.server.handle_request(peer)[0], wire.Wait)
+            returning = fixture.request(run=run, step="gate")
+            self.assertIsInstance(fixture.server.handle_request(returning)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [returning.owner.pid, *(peer.owner.pid for peer in peers)])
+            row, = (row for _, row in self.reading(fixture).ordered if row["pid"] == returning.owner.pid)
+            self.assertEqual(row["since"], returning.since)
+            self.assertEqual(row.get("order_since"), first.since)
+            self.assertTrue(saved.move_id)
+            self.assertEqual(saved.repository, "fixture")
+            self.assertNotEqual(row.get("move_id"), saved.move_id)
+
+    def test_tied_waiter_keeps_the_first_step_at_the_head(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate", owner=fixture.fixture_owner(700001, "4000"))
+            _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            fixture.restart()
+            fixture.hold_starts()
+            peer = fixture.request(step="gate", since=first.since,
+                                   owner=fixture.fixture_owner(700002, "4000"))
+            self.assertIsInstance(fixture.server.handle_request(peer)[0], wire.Wait)
+            returning = fixture.request(run=run, step="gate", owner=fixture.fixture_owner(700003, "4000"))
+            self.assertIsInstance(fixture.server.handle_request(returning)[0], wire.Wait)
+            self.assertGreater(returning.since, peer.since)
+            rows = [row for _, row in self.reading(fixture).ordered]
+            self.assertEqual([row.get("order_since") for row in rows], [first.since, first.since])
+            self.assertEqual([row["pid"] for row in rows], [returning.owner.pid, peer.owner.pid])
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {returning.episode})
+
+    def test_replacement_gate_saves_its_move_id_with_the_inherited_arrival(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            old = fixture.request(run=fixture.run_owner(), step="gate")
+            old = replace(old, identity=replace(old.identity, unit="queue", job=StepJob("test-affected")))
+            self.assertIsInstance(fixture.server.handle_request(old)[0], wire.Wait)
+            fixture.clock.advance(10)
+            run = fixture.run_owner()
+            new = fixture.request(run=run, step="gate")
+            new = replace(new, identity=replace(new.identity, unit=old.identity.unit, job=old.identity.job))
+            peer = fixture.connect(new)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            row = fixture.server.waiters[new.episode].row
+            move_id = row.get("move_id", "")
+            self.assertTrue(move_id)
+            fixture.free(60 * GIB)
+            fixture.allow_next_start()
+            _ = fixture.server.run_pass()
+            _ = only_admitted(peer.replies())
+            saved = service.read_state(fixture.state_dir).run_places[records.run_owner(run.pid, run.start_time)]
+            self.assertEqual((saved.since, saved.move_id, saved.repository), (old.since, move_id, "fixture"))
+
+    def test_returning_gate_uses_its_current_units_priority(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run, step="gate")
+            first = replace(first, identity=replace(first.identity, unit="former"))
+            _ = fixture.finish_step(first)
+            saved, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertEqual(saved.unit, "former")
+            fixture.hold_starts()
+            priority = ("former", "peer", "current")
+            fixture.server.priority = records.QueuePriority(tuple(
+                {"unit": unit, "why": "fixture", "set_at": fixture.clock.now(), "set_by": "fixture"}
+                for unit in priority))
+            peer = fixture.request(step="gate")
+            peer = replace(peer, identity=replace(peer.identity, unit="peer"))
+            returning = fixture.request(run=run, step="gate", need=first.profile.peak.bytes * 2)
+            returning = replace(returning, identity=replace(returning.identity, unit="current"))
+            for request in (peer, returning):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            self.assertEqual([records.waiter_priority(row) for _, row in gate.ranked_queue_waiters(inputs)],
+                             [records.PriorityUnit("peer", 1), records.PriorityUnit("current", 2)])
+            fixture.allow_next_start()
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {peer.episode})
+
+    def test_younger_run_logs_once_when_it_starts_in_a_gate_gap(self) -> None:
+        with AdmissionFixture() as fixture:
+            first_run, second_run = fixture.run_owner(), fixture.run_owner()
+            first = fixture.request(run=first_run, step="gate")
+            first_grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            second = fixture.request(run=second_run, step="gate")
+            second_grant = only_admitted(fixture.server.handle_request(second))
+            fixture.release(first_grant)
+            fixture.release(second_grant)
+            fixture.allow_next_start()
+            self.assertEqual(len(fixture.server.slots), 2)
+            younger_run = fixture.run_owner()
+            younger = fixture.request(run=younger_run, step="gate")
+            with redirect_stderr(io.StringIO()) as journal:
+                grant = only_admitted(fixture.server.handle_request(younger))
+                self.assertEqual(only_admitted(fixture.server.handle_request(younger)), grant)
+                _ = fixture.run_pass()
+            lines = [line for line in journal.getvalue().splitlines() if "started in the gate gap" in line]
+            expected = (f"memory admission: run {younger_run.pid}:{younger_run.start_time} "
+                        f"started in the gate gap of {first_run.pid}:{first_run.start_time} "
+                        f"for fixture on {fixture.server.host}")
+            self.assertEqual(lines, [expected])
+
+    def test_old_run_place_loads_with_empty_move_id_and_repository(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run), end_owner=True)
+            saved = cast(dict[str, object], json.loads(fixture.state_text()))
+            places = cast(dict[str, dict[str, object]], saved["run_places"])
+            place, = places.values()
+            _ = place.pop("move_id", None)
+            _ = place.pop("repository", None)
+            _ = (fixture.state_dir / "state.json").write_text(json.dumps(saved))
+            restored, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertEqual(restored.move_id, "")
+            self.assertEqual(restored.repository, "")
+
+    def test_main_892cb2d74f_loads_run_place_with_new_fields(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+            place, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertTrue(place.move_id)
+            self.assertEqual(place.repository, "fixture")
+            baseline = fixture.root / "baseline"
+            baseline.mkdir()
+            for name in ("admission_protocol.py", "admission_wire.py", "admission_service.py", "snapshot_codec.py"):
+                source = subprocess.check_output(
+                    ("git", "-C", str(repository), "show", f"892cb2d74f:scripts/build_queue/{name}"),
+                    timeout=5)
+                _ = (baseline / name).write_bytes(source)
+            check = """
+import sys
+from pathlib import Path
+import scripts.build_queue
+scripts.build_queue.__path__ = [sys.argv[1], *scripts.build_queue.__path__]
+from scripts.build_queue import admission_service, admission_protocol
+place, = admission_service.read_state(Path(sys.argv[2])).run_places.values()
+assert type(place) is admission_protocol.RunPlace
+assert place.run.pid == int(sys.argv[3])
+assert not hasattr(place, 'move_id')
+assert not hasattr(place, 'repository')
+"""
+            result = subprocess.run((sys.executable, "-c", check, str(baseline),
+                                     str(fixture.state_dir), str(run.pid)),
+                                    capture_output=True, text=True, check=False, timeout=8)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_run_exit_between_steps_removes_the_idle_watch_and_saved_place(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
@@ -9672,6 +10077,14 @@ class RunPlaceTests(unittest.TestCase):
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_admission_fixture_leaves_an_inherited_config_folder_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inherited = Path(temporary) / "inherited-conf"
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}), AdmissionFixture() as fixture:
+                self.assertEqual(os.environ["CONF_DIR"], str(fixture.root))
+                self.assertTrue((fixture.root / "build_folders.conf").is_file())
+                self.assertFalse(inherited.exists())
+
     def test_invalid_remote_start_hold_is_refused_during_configuration_read(self) -> None:
         for value in (None, "invalid", "86401"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
