@@ -7,17 +7,19 @@ from io import StringIO
 import os
 from pathlib import Path
 import signal
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
 from scripts.aws_target import cloud_gate
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_wire as wire, execution_identity, first_step, placement
+from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, first_step, placement
 from scripts.build_queue.admission_client import OuterReservation
 from scripts.build_targets import mac_linux
 from scripts.copies import copies
-from scripts.lib import conf, scratch
+from scripts.lib import build_folders, conf, scratch
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.production import gate
 from scripts.production.gate_routes import GateResultUnknown, ModuleCoverage
@@ -32,6 +34,24 @@ def placed(target: str) -> wire.Assignment:
 
 
 class GateDefaultPlacementTests(unittest.TestCase):
+    def test_gate_step_preserves_incomplete_child_status_when_cancellation_fails(self) -> None:
+        for status in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            with self.subTest(status=status), TemporaryDirectory() as folder:
+                source = Path(folder)
+                command = ["gate.py", "--tests-only"]
+                request = mock.Mock(spec=wire.PlacementRequest, local=wire.LocalAdmissionUnavailable("fixture"))
+                with (mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(source)),
+                      mock.patch.object(first_step, "_gate_request", return_value=request),
+                      mock.patch.object(first_step, "_placement_grant", return_value=placed("mac-linux")),
+                      mock.patch.object(admission_client, "cancel_placement", side_effect=wire.AdmissionUnavailable(
+                          "fixture queue unavailable")) as cancel,
+                      mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(command, status)),
+                      redirect_stderr(StringIO()) as errors):
+                    result = copies.main(["gate-step", "--repo", folder, "--targets", "mac-linux", "--", *command])
+                self.assertEqual(result, status)
+                self.assertEqual(errors.getvalue(), "Gate cleanup failed. fixture queue unavailable\n")
+                cancel.assert_called_once()
+
     def test_tests_only_sigterm_releases_the_placement_before_termination(self) -> None:
         arguments = ["--tests-only"]
         events: list[str] = []

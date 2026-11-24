@@ -224,13 +224,14 @@ class LocalGateAssignment:
 
     grant: admission_wire.Admitted
     owner: placement.SubmittingOwner
+    sidecar: Path
 
-    def suite_place(self, temporary: Path) -> QueuePlace:
+    def suite_place(self) -> QueuePlace:
         try:
             configuration = admission_records.read_memory_config()
         except conf.Unusable as error:
             raise GateRefused(str(error)) from error
-        return QueuePlace(Path(self.grant.max_path).with_suffix(""), temporary / "reservation.cgroup",
+        return QueuePlace(Path(self.grant.max_path).with_suffix(""), self.sidecar,
                           configuration=configuration, reservation=HeldReservation(self.grant))
 
     def mark_children(self, environment: dict[str, str]) -> None:
@@ -1859,7 +1860,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
-          (nullcontext(local_grant.suite_place(temporary)) if placed else
+          (nullcontext(local_grant.suite_place()) if placed else
            gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if needs_shared_slots
            else nullcontext(None)) as reservation,
           (shared_cpu_pool() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
@@ -3262,7 +3263,10 @@ def placement_target(
     if placed.assignment.destination.target == "mac-linux":
         return MacLinuxAssignment(placed.assignment)
     if isinstance(placed, admission_wire.LocalPlacementGranted) and placed.assignment.destination.target == "natedev":
-        return LocalGateAssignment(placed.grant, placed.assignment.owner)
+        sidecar = os.environ.get("BUILDLOG_PLACEMENT_SIDECAR")
+        if not sidecar:
+            raise GateAssignmentRefused("The local gate placement has no progress sidecar")
+        return LocalGateAssignment(placed.grant, placed.assignment.owner, Path(sidecar))
     return placed.assignment.destination.target
 
 

@@ -47,6 +47,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
+    GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
     StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
@@ -2630,12 +2631,19 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
     targets = first_step.gate_targets(command, source, args.targets)
     if not targets:
         raise CopyError("gate-step requires a gate command and placement targets")
-    with first_step.admitted_run(command, source, targets=targets) as admitted:
-        admitted.handoff(source)
-        result = subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
-        if result.stderr:
-            _ = sys.stderr.write(result.stderr)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    status = 0
+    try:
+        with first_step.admitted_run(command, source, targets=targets) as admitted:
+            admitted.handoff(source)
+            result = subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
+            if result.stderr:
+                _ = sys.stderr.write(result.stderr)
+            status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except Exception as error:
+        if status not in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            raise
+        print(f"Gate cleanup failed. {error}", file=sys.stderr, flush=True)
+    return status
 
 
 def captured_path(root: Path, number: int, path: Path) -> Path:

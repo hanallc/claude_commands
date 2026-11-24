@@ -884,15 +884,11 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-The queue offers AWS after `cloud_gate.availability()` confirms the switch, deployment, spend room and Spot quota room.
-This check reads local files and makes no AWS call.
-It checks the per-attempt booking against the daily and monthly caps and the safety reserve.
-It deducts live gate vCPUs from current Spot quotas and checks recent quota refusals.
-With `enabled=off` in `cloud_gate.conf`, the queue excludes AWS.
-The route checks this switch again before a launch.
-The AWS route consumes the assignment's launch permission once and reports the result to the queue.
-The gate ends with status 79 when AWS takes no run.
-The gate ends with status 80 when AWS could have run tests and gives no verdict.
+Direct gate placement uses natedev and `mac-linux`.
+A merge gate or targeted test in a prepared copy can use the cloud route without a placement assignment.
+The cloud route reserves a queue slot before it requests a box.
+The route checks `enabled` in `cloud_gate.conf` before it reads deployment state and again before a new launch.
+With `enabled=off`, a gate without a placement assignment runs its tests on natedev.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
@@ -901,10 +897,10 @@ The route saves the interruption count and the next choice in `current.json` bef
 Resume restores both values, so a crash cannot reset the retry budget.
 Each retry gets a new attempt ID and passes the existing spend and attempt checks.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
-The final refusal row includes the interruption count when retries or capacity choices end.
+The final fallback row includes the interruption count when retries or capacity choices end.
+A gate without a placement assignment runs the tests on natedev after a final cloud refusal.
 A complete gate failure keeps its failed result and gets no retry.
 An uncertain launch or termination keeps its cost reservation until reconciliation confirms the end.
-The route reports pending settlement to the queue while the launch remains uncertain.
 The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
@@ -951,7 +947,7 @@ The module time limit and process groups stop the gate.
 The bootstrap names no `merge_gate` attribute and copies no host function source.
 A paired trial uses the changed candidate's entry point to supervise both verified trees.
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
-The controller reports the failure to the queue.
+If the cloud route returns a final refusal, a gate without a placement assignment uses the natedev fallback.
 The result fields and transfer links keep their existing format.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
