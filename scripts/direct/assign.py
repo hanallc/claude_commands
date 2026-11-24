@@ -502,15 +502,14 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
     instance = uuid.uuid4()
     message = directory / f"{slot}_prompt{suffix}.{instance}.txt"
-    work_order = prompt.read_bytes().decode("utf-8")
-    content = work_order + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    work_order = prompt.read_bytes()
+    content = work_order.decode("utf-8") + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
     write_text_atomic(message, content)
     try:
-        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message,
-                               len(work_order.encode("utf-8")))
+        return _dispatch_herdr(args, run, phase, role, paths, env, slot, suffix, instance, message, len(work_order))
     finally:
         with suppress(OSError, SystemExit, ValueError, recorder_state.OldRecorderState):
             if message.is_file() and not _prompt_adopted(run, instance):
@@ -522,7 +521,7 @@ def _prompt_adopted(run: Path, instance: uuid.UUID) -> bool:
     state = pass_recorder.read_state(run, resolve_staff=False)
     return (not pass_recorder.string(state.get("history_file"))
             or any(passed.get("instance_id") == str(instance) for passed in pass_recorder.pass_slots(state).values())
-            or isinstance(staff_worker.admitted_pass(state, str(instance)), staff_worker.AdmittedPass))
+            or any(event.get("pass_instance_id") == str(instance) for event in pass_recorder.pass_history(state)))
 
 
 def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: list[str], env: dict[str, str],
@@ -565,7 +564,10 @@ def _dispatch_herdr(args: Arguments, run: Path, phase: str, role: str, paths: li
     with log.open("a") as output, TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
         offset = output.tell()
         path_file = Path(temporary) / "paths.json"
-        write_text_atomic(path_file, json.dumps({"paths": paths, "work_order_size": -1 if args.style_since else work_order_size}))
+        publication: dict[str, object] = {"paths": paths}
+        if not args.style_since:
+            publication["work_order_size"] = work_order_size
+        write_text_atomic(path_file, json.dumps(publication))
         result = subprocess.run([*command, "--assignment-paths-file", str(path_file)], env=worker_env, text=True,
                                 stdout=output, stderr=subprocess.STDOUT)
     with log.open() as output:

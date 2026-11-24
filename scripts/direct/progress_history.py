@@ -1158,7 +1158,7 @@ class DispatchWork:
     kind: str
     lens: str
     fix_pass: int
-    work_order: pass_recorder.AssignmentWorkOrder | pass_recorder.FullPromptDigest = pass_recorder.FullPromptDigest.FULL_PROMPT
+    assignment: pass_recorder.AssignmentManifest | pass_recorder.NoAssignmentManifest = pass_recorder.NoAssignmentManifest.NONE
 
 
 class DispatchWorkAtUse(Enum):
@@ -1207,11 +1207,11 @@ def select_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
         if saved_phase is not None and pass_recorder.string(saved_phase.get("id")) == phase:
             match_phase = saved_phase
     match = (pass_recorder.dispatch_match(previous, match_phase, _dispatch_fields(role, prompt, work),
-                             launcher_command, dispatch_owned=True, work_order=work.work_order
-                             if isinstance(work, DispatchWork) else pass_recorder.FullPromptDigest.FULL_PROMPT)
+                             launcher_command, dispatch_owned=True, assignment=work.assignment
+                             if isinstance(work, DispatchWork) else pass_recorder.NoAssignmentManifest.NONE)
              if match_phase is not None else pass_recorder.NoMatchedDispatch())
     if isinstance(match, pass_recorder.ActiveDispatchPromptConflict):
-        return match
+        return replace(match, slot=slot)
     action: pass_recorder.MatchedDispatch | pass_recorder.NewAssignment = pass_recorder.NewAssignment()
     if isinstance(match, pass_recorder.MatchedDispatch) and (isinstance(target, DispatchTargetAtUse) or match.worker_name == target.value):
         action = match
@@ -1301,23 +1301,23 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "",
                    called: CalledAgent = CALLED_AGENT_NOT_RECORDED,
                    new_pass_instance_id: uuid.UUID | None = None,
-                   work_order: pass_recorder.AssignmentWorkOrder | pass_recorder.FullPromptDigest =
-                   pass_recorder.FullPromptDigest.FULL_PROMPT,
+                   assignment: pass_recorder.AssignmentManifest | pass_recorder.NoAssignmentManifest =
+                   pass_recorder.NoAssignmentManifest.NONE,
                    selection: pass_recorder.DispatchSelection | pass_recorder.SelectDispatchAtRecorder =
                    pass_recorder.SelectDispatchAtRecorder.SELECT) -> str:
     """Record a published worker's dispatch and return its durable pass id."""
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
-    args = argparse.Namespace(
+    request = pass_recorder.WorkerDispatchRequest(
         session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role, launcher_pid=os.getpid(),
-        worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
+        worker_name=worker_name, worker_id=worker_id, launcher_command=launcher_command,
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family=called.family, called_model=called.model, called_effort=called.effort,
-        fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
-        new_pass_instance_id=new_pass_instance_id, work_order=work_order,
+        fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens,
+        new_pass_instance_id=new_pass_instance_id, assignment=assignment,
         assign_status_file=os.environ.get(ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else "",
     )
-    return pass_recorder.record_worker_dispatch(args, selection, lambda: link_dispatch_state(worker_id, session_dir))
+    return pass_recorder.record_worker_dispatch(request, selection, lambda: link_dispatch_state(worker_id, session_dir))
 
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
@@ -2804,8 +2804,12 @@ def _board_stamp(line: str) -> float | None:
         return None
 
 
+class LegacyBoardRegistration(Enum):
+    EXCLUDED = "this pass uses a registration with its ID"
+
+
 def assignment_registered(session_dir: Path, slot: str, role: staff.WorkerRole, instance: str, status: str,
-                          legacy_since: int) -> bool:
+                          legacy_since: int | LegacyBoardRegistration) -> bool:
     """Find a registration by pass ID or by its unique recorded pass window."""
     prefix = f"[{slot}] register: role={role}; "
     try:
@@ -2817,7 +2821,8 @@ def assignment_registered(session_dir: Path, slot: str, role: staff.WorkerRole, 
                 fields = body.removeprefix(prefix)
                 if fields.startswith(f"pass={instance}; ") or fields.endswith(f"; pass {instance}"):
                     return True
-                if fields == f"status in {status}" and (at := _board_stamp(line)) is not None and at >= legacy_since:
+                if (isinstance(legacy_since, int) and fields == f"status in {status}"
+                        and (at := _board_stamp(line)) is not None and at >= legacy_since):
                     return True
     except FileNotFoundError:
         pass

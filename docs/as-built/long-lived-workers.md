@@ -96,8 +96,9 @@ If notice delivery fails, the assign returns uncertain and reports the pending n
 A replacement for a failed pass starts after the hook delivers the pending notice.
 The recorder gives the replacement a new pass id even when the assignment inputs match.
 
-A dispatch retry matches the slot, phase, role, launcher arguments, and the recorder's prompt identity.
-For a generated assignment prompt, the recorder matches the work order digest and retains the admitted delivery bytes.
+A retry matches the admitted pass even when completion recovery changes its status.
+The prompt digest includes the authorized paths. A ticket may add paths when its manifest and ticket path list record the same widen.
+The recorder preserves a ticket's admitted prompt for delivery and reserves its manifest number before it appends history.
 `assign.sh` removes each temporary prompt when the recorder confirms that no pass uses it.
 The worker publishes the manifest and registers the pass on the board before submission.
 A retry preserves a manifest that names the admitted pass.

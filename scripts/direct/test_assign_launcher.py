@@ -1,7 +1,6 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
-import argparse
 import fcntl
 import json
 import os
@@ -22,7 +21,7 @@ from scripts.lib.fixture_test_support import set_up_fixture
 from scripts.agents import codex_test_support as codex_fixture
 from scripts.direct import assign, assign_claude, pass_record, progress_history, recorder_state
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
-from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
+from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, AssignLauncherFixture, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr, turn_end, worker_panes
 from scripts.lib import atomic_file, unit_runs
@@ -723,19 +722,30 @@ class AssignLauncherTests(HookAssignmentFixture):
 
         for pass_status in ("active", "completed"):
             if pass_status == "completed":
-                self.native.agent.complete(pane)
                 self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
-            for damage in ("intact", "missing", "changed"):
+            cases = ("intact", "missing", "changed")
+            for damage in (*cases, "pending completion") if pass_status == "active" else cases:
                 with self.subTest(status=pass_status, damage=damage):
                     if damage == "missing":
                         prompt.unlink()
                     elif damage == "changed":
                         write_text_atomic(prompt, "Changed prompt bytes.\n")
+                    elif damage == "pending completion":
+                        self.native.agent.complete(pane)
+                        reply = pass_record.dispatch_delivery(passed).reply_file
+                        progress_history.save_hook_completion(self.session_dir, str(identity),
+                                                              progress_history.HookCompletion("done", reply))
                     with patch.object(atomic_file, "write_bytes_atomic", side_effect=restore_under_lock):
-                        _ = self.successful()
+                        if damage == "pending completion":
+                            result = AssignLauncherFixture.launch(self)
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                            self.assertEqual((phase / "impl_status").read_text(), "done\n")
+                        else:
+                            _ = self.successful()
                     state = read_object(self.session_dir / "progress_history_state.json")
                     saved = assign.object_map(assign.object_map(state["pass"])["impl"])
-                    self.assertEqual((saved["instance_id"], saved["status"]), (identity, pass_status))
+                    expected = "completed" if damage == "pending completion" else pass_status
+                    self.assertEqual((saved["instance_id"], saved["status"]), (identity, expected))
                     self.assertEqual(prompt.read_bytes(), content)
                     self.assertEqual(self.native.agent.submitted, submitted)
                     self.assertEqual(self.native.agent.waited, [])
@@ -1244,11 +1254,11 @@ class AssignLauncherTests(HookAssignmentFixture):
                 return run_command([*command[:3], str(blocked_board), *command[4:]], capture_output=True, **options)
             return run_command(command, **options)
 
-        def start_with_ticket_lock(args: argparse.Namespace,
+        def start_with_ticket_lock(args: pass_record.WorkerDispatchRequest,
                               selection: pass_record.DispatchSelection | pass_record.SelectDispatchAtRecorder
                               ) -> str:
             instance = start_pass(args, selection)
-            if pass_record.optional_arg(args, "team_slot").startswith("style-ticket-"):
+            if args.team_slot.startswith("style-ticket-"):
                 self.assert_lock_held(manifest.parent / "ticket-paths.lock")
             return instance
 
@@ -1266,8 +1276,15 @@ class AssignLauncherTests(HookAssignmentFixture):
             self.assertEqual(sum(f"[{name}] register:" in line for line in board), 1)
 
         self.native.agent.during_prompt = lambda: None
+        append_event = pass_record.append_event
+
+        def interrupt_history(state: dict[str, object], event: dict[str, object]) -> None:
+            if event.get("event_type") == "pass_started":
+                raise OSError("History publication interrupted.")
+            append_event(state, event)
+
         cases = ("stale manifest", interrupted_ticket, legacy_ticket, unregistered_worker,
-                 widened_ticket, "large paths", "invalid board bytes")
+                 widened_ticket, "interrupted history", "large paths", "invalid board bytes", "changed scope")
         for round_number, case in enumerate(cases, start=2):
             with self.subTest(admission=case):
                 paths = self.paths.read_text().splitlines()
@@ -1283,6 +1300,14 @@ class AssignLauncherTests(HookAssignmentFixture):
                 worker_name = case if case.startswith("style-ticket-") or case == unregistered_worker else f"impl{round_number}"
                 pass_id = ""
                 admitted_prompt: tuple[Path, bytes] | None = None
+                if case == "interrupted history":
+                    _ = self.native.opened(worker_name)
+                    with patch.object(pass_record, "append_event", side_effect=interrupt_history):
+                        failed = self.launch("implement", "--to", worker_name)
+                    self.assertEqual(failed.returncode, worker.ExitCode.UNCERTAIN, failed.stderr)
+                    self.assertIn("History publication interrupted.", failed.stderr)
+                    self.assertEqual(self.turn_starts, round_number - 1)
+                    pass_id = str(pass_record.pass_slots(pass_record.read_state(self.session_dir))[worker_name]["instance_id"])
                 with (patch.object(subprocess, "run", side_effect=check_worker_arguments),
                       patch.object(pass_record, "start_pass", side_effect=start_with_ticket_lock),
                       patch.object(atomic_file, "write_text_atomic", side_effect=write_with_ticket_lock)):
@@ -1311,9 +1336,12 @@ class AssignLauncherTests(HookAssignmentFixture):
                             paths.append(widened)
                         elif case == widened_ticket:
                             ticket_paths = manifest.with_name("ticket-paths.txt")
+                            write_text_atomic(self.paths, "\n".join([*paths, widened]) + "\n")
+                            refused = self.launch("implement", "--to", worker_name)
+                            self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stderr)
+                            self.assertEqual(manifest.read_bytes(), saved_manifest)
                             style_plan.widen_live_dispatch(self.session_dir, "widened", (widened,))
                             paths = ticket_paths.read_text().splitlines()
-                            write_text_atomic(self.paths, ticket_paths.read_text())
                             saved = pass_record.pass_slots(pass_record.read_state(self.session_dir))[worker_name]
                             saved_path = Path(str(saved["prompt_file"]))
                             admitted_prompt = saved_path, saved_path.read_bytes()
@@ -1331,6 +1359,12 @@ class AssignLauncherTests(HookAssignmentFixture):
                     _ = self.successful("implement", "--to", worker_name)
                     self.assertEqual(admitted_prompt[0].read_bytes(), admitted_prompt[1])
                     self.assertEqual(self.turn_starts, round_number)
+                if case == "changed scope":
+                    write_text_atomic(self.paths, "src/worker.py\n")
+                    _ = self.successful("implement", "--to", worker_name)
+                    self.assertEqual(self.turn_starts, round_number + 1)
+                    updated = pass_record.pass_slots(pass_record.read_state(self.session_dir))[worker_name]
+                    self.assertNotEqual(updated["instance_id"], passed["instance_id"])
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
@@ -1488,13 +1522,17 @@ class AssignLauncherTests(HookAssignmentFixture):
         saved_files = {path: path.read_bytes() for path in phase.iterdir() if path.is_file() and path != log}
         run_files = (self.session_dir / "heartbeat.log", self.session_dir / unit_runs.STATE_FILE)
         saved_run_files = {path: path.read_bytes() for path in run_files}
+        original_order = self.prompt.read_text()
         self.write_phase_prompt("7", "Assignment core", "Implement the third change.")
         _ = self.paths.write_text("tests/test_worker.py\n")
         arguments = ["--role", "implement", "--cwd", str(self.project), "--phase", "7", "--prompt", str(self.prompt),
                      "--paths", str(self.paths), "--session-dir", str(self.session_dir),
                      "--reply-file", str(self.project / "report.txt")]
-        for target in ([], ["--to", "impl"], ["--new-worker", "impl"]):
-            with self.subTest(target=target):
+        for target, change in (([], "both"), (["--to", "impl"], "both"),
+                               (["--new-worker", "impl"], "both"), (["--to", "impl"], "paths only")):
+            with self.subTest(target=target, change=change):
+                if change == "paths only":
+                    write_text_atomic(self.prompt, original_order)
                 refused = invoke_assignment(arguments + target, os.environ.copy())
                 self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
                 self.assertIn("has different prompt content", refused.stderr)
@@ -1636,6 +1674,8 @@ class AssignLauncherTests(HookAssignmentFixture):
         status = Path(str(passed.pop("assign_status_file")))
         self.assertEqual(status, self.session_dir / "phases/7/impl2_status")
         passed["status"] = pass_status
+        if pass_status == "active":
+            _ = passed.pop("dispatch_number")
         write_text_atomic(state_path, json.dumps(state))
         write_text_atomic(status, "running\n")
         board = self.session_dir / "board.log"
