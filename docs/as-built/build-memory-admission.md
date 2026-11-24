@@ -298,7 +298,8 @@ The Machine cell shows one bright icon for `mac-linux` and the guest state.
 The icon uses the Mac color in light and dark modes.
 The cell shows `not confirmed` until confirmation, then `running`.
 The tooltip lists the named targets. It shows the attempt ID after confirmation.
-The shared tooltip wraps long fields within its box. The tooltip adjusts its position to fit the viewport when it opens or its content changes.
+The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
+Scroll within the tooltip to read content that exceeds the available height.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
