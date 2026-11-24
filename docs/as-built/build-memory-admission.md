@@ -305,8 +305,9 @@ A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
 The Machine cell shows one bright Apple icon with a 🐧 badge.
 The Apple icon has a white fill and a black outline in light and dark modes.
-The cell adds `not confirmed` until the queue confirms the run.
-The tooltip shows `Runs on` and `Named targets`.
+The cell shows `not confirmed` until confirmation, then `running`.
+The tooltip shows `Runs on` and `Named targets`. It shows the attempt ID after confirmation.
+The shared tooltip wraps long fields within its box. The tooltip adjusts its position to fit the viewport when it opens or its content changes.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
