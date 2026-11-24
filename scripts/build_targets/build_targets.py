@@ -142,6 +142,7 @@ def parser() -> argparse.ArgumentParser:
     _ = backoff.add_argument("--no-probe", action="store_true")
     status = commands.add_parser("status")
     _ = status.add_argument("--probe", action="store_true")
+    _ = commands.add_parser("setup-mac-linux", help="Repair the state root for the Mac Linux gate on natedev")
     eligible = commands.add_parser("eligible", aliases=["constraints"])
     _ = eligible.add_argument("--repo-root", required=True)
     _ = eligible.add_argument("--package", default="")
@@ -1807,6 +1808,14 @@ def main() -> int:
         from scripts.build_targets import target_config
 
         args = parser().parse_args(namespace=CliArguments())
+        if args.command == "setup-mac-linux":
+            root = target_config.build_targets_state_root()
+            try:
+                target_config.provision_mac_linux_state_root(root)
+            except OSError as error:
+                print(f"setup-mac-linux: Cannot prepare {root}: {error}", file=sys.stderr)
+                return 1
+            return 0
         if args.command == "recover-probe":
             return command_recover_probe(args)
         if args.command == "probe-backoff":

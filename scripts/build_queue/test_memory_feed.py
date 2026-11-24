@@ -4685,7 +4685,6 @@ const refresh = createPageRefresh(tick);
             self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
 
     def test_ci_scan_deducts_a_process_that_enters_a_reserved_scope_between_samples(self) -> None:
-
         gib = admission_records.GIB
         with AdmissionFixture() as fixture:
             ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
