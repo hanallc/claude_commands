@@ -50,6 +50,11 @@ Resume sends a running director one continuation per pause.
 Resume saves the pending message and clears the pause in one staff write before calling the sender.
 A retry recovers the pending continuation even when the director is active.
 A durable send, queue entry, or review entry completes the pending resume.
+A remote send saves its destination before delivery.
+A retry checks the remote receipt before it looks for a live director.
+A lost reply keeps the resume pending until the sender can confirm acceptance.
+A retry can reclaim a relay if its owner died before the socket write.
+An unconfirmed socket write keeps the resume pending.
 Review release publishes the continuation once and can retry the notice.
 Resume skips worker restoration for a director paused with `--keep-workers`.
 A worker message to a paused director waits in the director's transcript until resume.

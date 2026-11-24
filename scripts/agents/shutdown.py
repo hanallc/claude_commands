@@ -466,7 +466,7 @@ def _message(row: staff.StaffRow, text: str, *, require_live: bool = False,
 
 def _deliver_pending_resume(row: staff.StaffRow) -> tuple[staff.StaffRow, int]:
     pending = row.resume_pending
-    assert pending is not None
+    assert isinstance(pending, staff.ResumePending)
     text = stop_resume.PAUSED_CONTINUATION
     keep_workers = pending.original_pause.keep_workers
     if not keep_workers:
@@ -594,7 +594,7 @@ def _lifecycle(options: CommandLine) -> int:
                     print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                     code = 2
                     continue
-                if row.resume_pending is not None:
+                if isinstance(row.resume_pending, staff.ResumePending):
                     row, status = _deliver_pending_resume(row)
                     code = max(code, status)
                     if status or (isinstance(row.paused, staff.Active) and isinstance(row.exited, staff.Active)):

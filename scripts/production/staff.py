@@ -376,6 +376,11 @@ class Paused(HoldRecord):
 
 
 @dataclass(frozen=True)
+class NoPendingResume:
+    """The director has no continuation to recover."""
+
+
+@dataclass(frozen=True)
 class ResumePending:
     key: str
     original_pause: Paused
@@ -434,7 +439,7 @@ class StaffRow:
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
-    resume_pending: ResumePending | None = field(default=None, kw_only=True)
+    resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -466,7 +471,7 @@ class StaffRow:
             value["paused"] = self.paused.to_json()
         if isinstance(self.exited, Exited):
             value["exited"] = self.exited.to_json()
-        if self.resume_pending is not None:
+        if isinstance(self.resume_pending, ResumePending):
             value["resume_pending"] = self.resume_pending.to_json()
         if isinstance(self.retirement, RetiredProducer):
             value["retired_producer"] = self.retirement.profile
@@ -529,7 +534,8 @@ class StaffRow:
                    run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
-                   resume_pending=ResumePending.from_json(fields["resume_pending"]) if "resume_pending" in fields else None,
+                   resume_pending=ResumePending.from_json(fields["resume_pending"])
+                   if "resume_pending" in fields else NoPendingResume(),
                    unknown_fields=_unknown_fields(fields, known_fields))
 
 
@@ -2321,7 +2327,7 @@ def begin_resume(identity: StaffId, pause: Paused) -> StaffRow:
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
-        if row.resume_pending is not None:
+        if isinstance(row.resume_pending, ResumePending):
             return row
         if row.paused != pause or isinstance(row.exited, Exited):
             raise StaffRefused(f"{row.name}: the pause changed")
@@ -2342,12 +2348,12 @@ def finish_resume(identity: StaffId, key: str, *, restore_pause: bool = False) -
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
         pending = row.resume_pending
-        if pending is None or pending.key != key:
+        if isinstance(pending, NoPendingResume) or pending.key != key:
             return row
         pause = row.paused
         if restore_pause and isinstance(pause, Active) and isinstance(row.exited, Active):
             pause = pending.original_pause
-        changed = replace(row, paused=pause, resume_pending=None)
+        changed = replace(row, paused=pause, resume_pending=NoPendingResume())
         rows[rows.index(row)] = changed
         return changed
 

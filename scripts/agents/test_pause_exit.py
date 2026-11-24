@@ -149,7 +149,7 @@ class PauseExitTests(StaffTestCase):
         lost_reply: restart_support.MessageQueued | restart_support.MessageUnconfirmed | RuntimeError,
     ) -> None:
         paused = staff.pause(str(self.unit.id), "maintenance")
-        self.assertIsNone(paused.resume_pending)
+        self.assertEqual(paused.resume_pending, staff.NoPendingResume())
         assert isinstance(paused.paused, staff.Paused)
         key = f"agents-resume:{paused.id}:{paused.paused.since}"
         pending = replace(paused, paused=staff.Active(), resume_pending=staff.ResumePending(key, paused.paused))

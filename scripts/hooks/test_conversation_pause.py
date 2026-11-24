@@ -80,7 +80,7 @@ class ConversationPauseTests(ConversationPauseFixture):
         pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True)
         _ = staff.set_hold(director.id, pause)
         row = staff.begin_resume(director.id, pause)
-        assert row.resume_pending is not None
+        assert isinstance(row.resume_pending, staff.ResumePending)
         session = str(director.current_session)
         key = row.resume_pending.key
         self.write_review_config("on")

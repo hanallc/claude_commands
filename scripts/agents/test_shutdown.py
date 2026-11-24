@@ -7,11 +7,15 @@ import io
 import json
 import math
 import os
+import shlex
 import signal
+import subprocess
+import sys
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import call, patch
 
@@ -20,7 +24,7 @@ from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import atomic_file
-from scripts.message import sessions
+from scripts.message import roster, send as message_send, sessions
 from scripts.production import staff, worker
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.whoami import quota_state
@@ -240,13 +244,91 @@ class PauseWorkersTests(StaffTestCase):
         self.assertEqual(staff.by_id(director.id), director)
 
 
+    def test_resume_keeps_pending_after_a_lost_peer_reply_and_recovers_the_receipt(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        paused = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        pending = pending_resume_row(paused)
+        assert isinstance(pending.resume_pending, staff.ResumePending)
+        key = pending.resume_pending.key
+        origin_state = self.root / "origin-messages"
+        peer_state = self.root / "peer-messages"
+        attempts = 0
+        peer_live = True
+        receipt_visible = False
+
+        def invoke_sender(args: list[str], text: str) -> subprocess.CompletedProcess[str]:
+            output, errors = io.StringIO(), io.StringIO()
+            with (patch.object(sys, "stdin", io.StringIO(text)),
+                  redirect_stdout(output), redirect_stderr(errors)):
+                code = message_send.main(args)
+            return subprocess.CompletedProcess(args, code, output.getvalue(), errors.getvalue())
+
+        def run_sender(command: list[str], *, input: str, **_options: object) -> subprocess.CompletedProcess[str]:
+            return invoke_sender(command[1:], input)
+
+        def route(*_args: object, **_kwargs: object) -> message_send.RemoteDelivery:
+            if not peer_live:
+                message_send.usage_error(f"no live session answers to staff ID {director.id}")
+            return message_send.RemoteDelivery("mac", director.id)
+
+        def ssh(command: list[str], text: str, _timeout: float) -> tuple[int, str, str]:
+            nonlocal attempts
+            self.assertEqual(command[3], "mac")
+            args = shlex.split(command[-1])[2:]
+            if args == ["once-receipt", key]:
+                if not receipt_visible:
+                    return 255, "", "fixture receipt unavailable"
+                with patch.object(message_send, "STATE", peer_state):
+                    result = invoke_sender(args, "")
+                return result.returncode, result.stdout, result.stderr
+            attempts += 1
+            self.assertEqual(message_send.read_key_states()[key].get("once_remote"),
+                             {"host": "mac", "recipient": director.id})
+            if attempts == 1:
+                self.assertEqual(text, "Continue where you stopped.")
+                with patch.object(message_send, "STATE", peer_state):
+                    message_send.record_once(key)
+                return 255, "", "fixture lost reply"
+            return 3, f"FAILED: {message_send.BEFORE_ACCEPTANCE}no live staff recipient\n", ""
+
+        live = stop_resume.ClaudeUp(director.current_session, "w1:p0", "claude2")
+        arguments = ["resume", director.name]
+        with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+              patch.object(stop_resume, "running_on_account", return_value=live),
+              patch.object(restart_support, "_send_command", return_value=["send.py"]),
+              patch.object(restart_support, "subprocess", SimpleNamespace(run=run_sender)),
+              patch.object(shutdown_record, "remove_started"),
+              patch.object(message_send, "STATE", origin_state),
+              patch.object(message_send, "resolve_recipient", side_effect=route) as resolve,
+              patch.object(roster, "roster", return_value=roster.Roster([], [])),
+              patch.object(message_send, "run", side_effect=ssh),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(arguments), 1)
+            self.assertEqual(staff.by_id(director.id), pending)
+            self.assertEqual(shutdown.main(arguments), 1)
+            self.assertEqual(staff.by_id(director.id), pending)
+            peer_live = False
+            self.assertEqual(shutdown.main(arguments), 1)
+            self.assertEqual(staff.by_id(director.id), pending)
+            self.assertNotIn(": active", output.getvalue())
+
+            receipt_visible = True
+            resolve.reset_mock()
+            self.assertEqual(shutdown.main(arguments), 0)
+            resolve.assert_not_called()
+        self.assertEqual(staff.by_id(director.id), director)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(output.getvalue(), "selected: active\n")
+
+
 class ProductionResumeTests(StaffTestCase):
     def test_resume_recovers_a_saved_continuation_before_the_active_path(self) -> None:
         director = fixture_member("unit", name="selected", parent=fixture_member("showrunner", name="production").id)
         pause = staff.Paused("2026-11-24T08:31:00-08:00", "director", "review")
         _ = staff.set_hold(str(director.id), pause)
         pending = staff.begin_resume(director.id, pause)
-        assert pending.resume_pending is not None
+        assert isinstance(pending.resume_pending, staff.ResumePending)
 
         with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
               patch.object(stop_resume, "resume") as start,

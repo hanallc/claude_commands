@@ -83,6 +83,9 @@ from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, fixture_session
 
 
+RELAY = send.relay
+
+
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
@@ -2294,6 +2297,63 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.outcome = send.Result("sent", "fixture delivery confirmed")
         self.assertEqual(send.send(options).outcome, "sent")
         self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+    def test_once_send_reclaims_a_dead_owner_before_the_relay(self) -> None:
+        self.session("recipient", "Recipient")
+        key = "interrupted-before-relay"
+        options = local_options(["--to", "recipient", "--recipient-kind", "unit", "--key", key,
+                                 "--once-per-key", "--text", "Continue where you stopped."])
+        stop_in_child(lambda: send.send(options), send, "relay", when="before")
+
+        session_record = self.root / "sessions/recipient.json"
+        recorded = session_record.read_text(encoding="utf-8")
+        session_record.unlink()
+        self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(self.relayed, [])
+
+        _ = session_record.write_text(recorded, encoding="utf-8")
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual([message.key for message in self.relayed], [key])
+
+    def test_once_send_recovers_a_relay_receipt_after_the_sender_dies(self) -> None:
+        self.session("recipient", "Recipient")
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                key = f"interrupted-after-relay-{confirmed}"
+                delivered = self.root / key
+                options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                         "--text", "Continue where you stopped."])
+
+                def forward(message: send.Message, *_args: object) -> send.RelayTransportResponse:
+                    claim = message.direct_relay_claim
+                    assert isinstance(claim, send.DirectRelayClaim)
+                    send.mark_direct_relay_write(claim)
+                    with delivered.open("a", encoding="utf-8") as log:
+                        _ = log.write(message.text + "\n")
+                    return send.RelayTransportResponse(0, "", "", message.to,
+                        send.RelayRequestForwarded("fixture-tool", send.agent_text(message, via_relay=True)))
+
+                with (mock.patch.object(send, "relay", RELAY),
+                      mock.patch.object(send, "claude_binary", return_value="fixture-claude"),
+                      mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+                      mock.patch.object(models_registry, "claude_model", return_value="fixture"),
+                      mock.patch("scripts.whoami.mac_fallback_token.prepare_child", return_value=False),
+                      mock.patch.object(send, "_bound_relay", side_effect=forward),
+                      mock.patch.object(send, "read_relay", return_value=send.CheckedRelayAcceptance("fixture-tool", "fixture"))):
+                    stop_in_child(lambda: send.send(options), send, "relay" if confirmed else "read_relay",
+                                  when="after" if confirmed else "before")
+                    result = send.send(options)
+                self.assertEqual(result.outcome, "skipped" if confirmed else "pending")
+                self.assertEqual(delivered.read_text(encoding="utf-8").splitlines(), ["Continue where you stopped."])
+
+    def test_once_send_allows_matching_message_and_recipient_keys(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--key", "once", "--recipient-key", "once",
+                                 "--once-per-key", "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual(len(self.relayed), 1)
 
     def test_urgent_send_goes_through_an_open_review(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")

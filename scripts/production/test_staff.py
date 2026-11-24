@@ -796,6 +796,12 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_staff_row_without_pending_resume_uses_the_named_state(self) -> None:
+        _, unit, _ = self.tree()
+        encoded = unit.to_json()
+        self.assertNotIn("resume_pending", encoded)
+        self.assertEqual(staff.StaffRow.from_json(encoded).resume_pending, staff.NoPendingResume())
+
     def test_resume_transaction_saves_the_pause_and_checks_the_key_on_completion(self) -> None:
         _, unit, _ = self.tree()
         pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True,

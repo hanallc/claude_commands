@@ -427,6 +427,12 @@ class DirectRelayInProgress(PostmasterOwner):
     stage: Literal["direct-relay"]
 
 
+class DirectRelayReady(PostmasterOwner):
+    """The relay has not started the recipient write."""
+
+    stage: Literal["direct-relay-ready"]
+
+
 class RelayRetryBlocked(PostmasterOwner):
     """The postmaster allowed fallback. Older direct relays also used this stage."""
 
@@ -445,7 +451,7 @@ class ResolvedPostmaster(PostmasterOwner):
 
 
 PostmasterReservation = (
-    ReservedPostmaster | PublishingPostmaster | DirectRelayInProgress | RelayRetryBlocked
+    ReservedPostmaster | PublishingPostmaster | DirectRelayInProgress | DirectRelayReady | RelayRetryBlocked
     | RelayAcceptanceUnconfirmed | ResolvedPostmaster
 )
 
@@ -462,6 +468,11 @@ class PendingDelivery(TypedDict):
     once_per_key: NotRequired[bool]
 
 
+class OnceRemoteDestination(TypedDict):
+    host: str
+    recipient: str
+
+
 class KeyState(TypedDict):
     # Map each recipient to its claim time. A failed send releases its claim.
     last: dict[str, str]
@@ -470,6 +481,8 @@ class KeyState(TypedDict):
     clearing: NotRequired[Emergency]
     once_confirmed: NotRequired[bool]
     once_accepted: NotRequired[bool]
+    once_remote: NotRequired[OnceRemoteDestination]
+    once_delivery_interrupted: NotRequired[bool]
 
 
 KeyStates = dict[str, KeyState]
@@ -658,6 +671,18 @@ def _attempt_record(attempt: ClaudeDeliveryAttempt) -> QueuedClaudeMailbox | Sav
 
 
 @dataclass(frozen=True)
+class DirectRelayClaim:
+    key: str
+    recipient: str
+    entry_id: str
+
+
+@dataclass(frozen=True)
+class NoDirectRelayClaim:
+    """This message does not own a keyed direct relay."""
+
+
+@dataclass(frozen=True)
 class Message:
     """Routing identity and body with sending-machine display text, or the raw sender for legacy callers."""
     to: str
@@ -675,6 +700,8 @@ class Message:
     review_batch: bool = False
     urgent: bool = False
     once_per_key: bool = False
+    direct_relay_claim: DirectRelayClaim | NoDirectRelayClaim = field(
+        default_factory=NoDirectRelayClaim, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -1727,14 +1754,14 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 
 
 @contextmanager
-def delivery_turn(message: Message) -> Generator[bool]:
-    """Exclude only this key and recipient; never hold the global state lock during transport."""
+def delivery_turn(message: Message, *, once: bool = False) -> Generator[bool]:
+    """Lock the key alone for a once-per-key send, or the key and recipient for other sends."""
     if message.key is None:
         yield True
         return
     directory = STATE / "delivery-locks"
     directory.mkdir(parents=True, exist_ok=True)
-    identity = json.dumps([message.key, message.to])
+    identity = json.dumps([message.key] if once else [message.key, message.to])
     path = directory / (hashlib.sha256(identity.encode()).hexdigest() + ".lock")
     with path.open("a") as lock:
         try:
@@ -1751,6 +1778,7 @@ def delivery_turn(message: Message) -> Generator[bool]:
 ONCE_ACCEPTED = "the earlier copy has durable acceptance"
 DURABLE_ACCEPTANCE = "durable acceptance. "
 BEFORE_ACCEPTANCE = "delivery did not start. "
+ONCE_REMOTE_UNCONFIRMED = "the earlier remote delivery is unconfirmed"
 
 
 def is_once_accepted_skip(detail: str) -> bool:
@@ -1767,6 +1795,12 @@ def record_once_locked(keys: Iterable[str]) -> None:
         state = states.setdefault(key, {"last": {}})
         if not state.get("once_accepted"):
             state["once_accepted"] = True
+            changed = True
+        if "once_remote" in state:
+            del state["once_remote"]
+            changed = True
+        if "once_delivery_interrupted" in state:
+            del state["once_delivery_interrupted"]
             changed = True
     if changed:
         write_key_states(states)
@@ -1804,6 +1838,19 @@ def recover_once(key: str) -> bool:
                 record_once_locked((key,))
                 return True
     return once_accepted(key)
+
+
+def remote_once_receipt(destination: OnceRemoteDestination, key: str) -> bool:
+    """Read the peer receipt without resolving the recipient."""
+    command = ["ssh", "-o", "BatchMode=yes", destination["host"],
+               f"{REMOTE} {shlex.join(['once-receipt', key])}"]
+    try:
+        code, out, _ = run(command, "", conf.read("send").number("remote_transport_seconds"))
+    except OSError:
+        return False
+    result = send_outcome(code, out)
+    return (not isinstance(result, UnconfirmedSendOutcome) and result.header.outcome == "skipped"
+            and result.header.detail == ONCE_ACCEPTED)
 
 
 def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *,
@@ -1914,10 +1961,13 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str, *,
     if "postmaster" not in pending:
         return ClaimGranted()
     reservation = pending["postmaster"]
-    if reservation["stage"] == "reserved" or reservation["stage"] == "direct-relay":
+    if (reservation["stage"] == "reserved" or reservation["stage"] == "direct-relay"
+            or reservation["stage"] == "direct-relay-ready"):
         if _owner_released(reservation):
             if reservation["stage"] == "direct-relay" and pending.get("once_per_key"):
                 return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)
+            if pending.get("once_per_key"):
+                state["once_delivery_interrupted"] = True
             release_postmaster_claim(state, recipient, pending)
             return ClaimGranted()
         return RepeatPending(POSTMASTER_UNCONFIRMED)
@@ -1955,6 +2005,8 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str, *,
             state["once_accepted"] = True
         detail = "delivery" if reservation["outcome"] == "delivered" else "queue acceptance"
         return RepeatAccepted(f"postmaster confirmed {detail} of entry {reservation['entry_id']}")
+    if reservation["outcome"] == "expired" and pending.get("once_per_key"):
+        state["once_delivery_interrupted"] = True
     release_postmaster_claim(state, recipient, pending)
     return ClaimGranted()
 
@@ -1998,11 +2050,14 @@ def _reserve_claude_delivery(message: Message, at: datetime, limit: float, entry
                 state["last"][message.to] = at.isoformat()
             else:
                 _ = state["last"].setdefault(message.to, at.isoformat())
-            reservation = (DirectRelayInProgress(stage="direct-relay", entry_id=entry_id,
-                                                 owner_pid=os.getpid(), owner_start=owner.start)
-                           if direct_relay else
-                           ReservedPostmaster(stage="reserved", entry_id=entry_id,
-                                              owner_pid=os.getpid(), owner_start=owner.start))
+            owner_record = PostmasterOwner(entry_id=entry_id, owner_pid=os.getpid(), owner_start=owner.start)
+            reservation: PostmasterReservation
+            if direct_relay and message.once_per_key:
+                reservation = DirectRelayReady(stage="direct-relay-ready", **owner_record)
+            elif direct_relay:
+                reservation = DirectRelayInProgress(stage="direct-relay", **owner_record)
+            else:
+                reservation = ReservedPostmaster(stage="reserved", **owner_record)
             attempt = PendingDelivery(started=at.isoformat(), limit_seconds=limit, postmaster=reservation)
             if message.once_per_key:
                 attempt["once_per_key"] = True
@@ -2055,9 +2110,24 @@ def cancel_unpublished_postmaster_claim(message: Message, entry_id: str) -> None
         marker = pending_deliveries(state).get(message.to)
         if marker is not None and "postmaster" in marker:
             reservation = marker["postmaster"]
-            if (reservation["entry_id"] == entry_id and reservation["stage"] in ("reserved", "direct-relay")
+            if (reservation["entry_id"] == entry_id and reservation["stage"] in (
+                    "reserved", "direct-relay", "direct-relay-ready")
                     and _owns_attempt(reservation)):
                 release_postmaster_claim(state, message.to, marker)
+
+
+def mark_direct_relay_write(claim: DirectRelayClaim) -> None:
+    """Save the uncertain state before the socket write."""
+    with key_states() as states:
+        marker = pending_deliveries(states.get(claim.key, {"last": {}})).get(claim.recipient)
+        if marker is None or "postmaster" not in marker:
+            raise ValueError("the relay no longer owns the key")
+        reservation = marker["postmaster"]
+        if (reservation["stage"] != "direct-relay-ready" or reservation["entry_id"] != claim.entry_id
+                or not _owns_attempt(reservation)):
+            raise ValueError("the relay no longer owns the key")
+        marker["postmaster"] = RelayAcceptanceUnconfirmed(stage="relay-unconfirmed", entry_id=claim.entry_id,
+            owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
 
 
 def record_postmaster_result(message: Message, entry_id: str,
@@ -2120,7 +2190,8 @@ def complete_postmaster_fallback(message: Message, recipient: StableRecipient, e
         if marker is None or "postmaster" not in marker:
             return False
         reservation = marker["postmaster"]
-        if (reservation["stage"] not in ("direct-relay", "relaying") or reservation["entry_id"] != entry_id
+        stages = ("direct-relay-ready", "relay-unconfirmed", "relaying") if message.once_per_key else ("direct-relay", "relaying")
+        if (reservation["stage"] not in stages or reservation["entry_id"] != entry_id
                 or not _owns_attempt(reservation)):
             return False
         if isinstance(result, UncertainRelayDelivery):
@@ -2320,7 +2391,8 @@ def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
             _ = state["pending"].pop(to, None)
             if not state["pending"]:
                 del state["pending"]
-        if not state["last"] and "acknowledged" not in state:
+        if not state["last"] and not any(field in state for field in (
+                "acknowledged", "once_accepted", "once_confirmed", "once_remote", "once_delivery_interrupted")):
             del states[key]
 
 
@@ -4140,7 +4212,8 @@ def _matched_relay_payload(wire: bytearray, expected: str) -> str | RefusedRelay
 
 def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: socket.socket,
                           attempt: ClaudeDeliveryAttempt, approved: Path,
-                          expected: str, write: RelayRecipientWrite) -> RelayForward | unit_lookup.SocketUnavailable:
+                          expected: str, write: RelayRecipientWrite,
+                          claim: DirectRelayClaim | NoDirectRelayClaim) -> RelayForward | unit_lookup.SocketUnavailable:
     """Forward the approved request on the connection that passed the owner check."""
     request_bytes = bytearray()
     with selectors.DefaultSelector() as reader:
@@ -4194,6 +4267,8 @@ def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: so
                         owner = _validate_attempt_recipient(attempt)
                         if isinstance(owner, unit_lookup.SocketUnavailable):
                             return owner
+                        if isinstance(claim, DirectRelayClaim):
+                            mark_direct_relay_write(claim)
                         write.state = RelayRequestInterrupted("the proxy did not complete the request")
                         peer.sendall(request_bytes)
                         write.state = RelayRequestForwarded(tool_id, payload)
@@ -4288,7 +4363,7 @@ def _bound_relay(message: Message, timeout: float, command: list[str], env: dict
                 with cancel, stop, ThreadPoolExecutor(max_workers=1) as executor:
                     try:
                         forwarding = executor.submit(_forward_relay_socket, listener, peer, stop, attempt,
-                                                     approved, payload, write)
+                                                     approved, payload, write, message.direct_relay_claim)
                     except RuntimeError as error:
                         return _unaccepted_relay(write.state, f"cannot start the relay proxy thread: {error}")
                     try:
@@ -4368,6 +4443,10 @@ def relay(message: Message, timeout: float) -> Result:
     if isinstance(observed, Result):
         return observed
     code, out, err = observed.code, observed.stdout, observed.stderr
+    result = read_relay(observed, agent_text(message, via_relay=True), summary=quote_sender_lines(message.summary),
+                        review_delivery=message.review_delivery)
+    if isinstance(result, CheckedRelayAcceptance) and isinstance(message.direct_relay_claim, DirectRelayClaim):
+        record_once(message.direct_relay_claim.key)
     if isinstance(token_made, datetime):
         login = _relay_token_login(observed)
         try:
@@ -4381,8 +4460,6 @@ def relay(message: Message, timeout: float) -> Result:
             write_atomic(raw, out + err)
         except OSError as error:
             print(f"message relay log: {error}", file=sys.stderr)
-    result = read_relay(observed, agent_text(message, via_relay=True), summary=quote_sender_lines(message.summary),
-                        review_delivery=message.review_delivery)
     if isinstance(result, CheckedRelayAcceptance):
         if isinstance(token_made, datetime):
             return Result("sent", "the relay confirmed delivery")
@@ -4747,6 +4824,17 @@ def remote(message: Message, host: str, options: Options) -> Result:
         # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
         forwarded += ["--repeat-minutes", "0"]
     command = ["ssh", "-o", "BatchMode=yes", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
+    once_key = message.key if options.once_per_key else None
+    first_attempt = False
+    if once_key is not None:
+        destination = OnceRemoteDestination(host=host, recipient=target)
+        with key_states() as states:
+            state = states.setdefault(once_key, {"last": {}})
+            previous = state.get("once_remote")
+            if previous is not None and previous != destination:
+                return Result("pending", ONCE_REMOTE_UNCONFIRMED)
+            first_attempt = previous is None
+            state["once_remote"] = destination
     code, out, err = run(command, message.text, send_budget.remote_seconds(options.timeout))
     receiver, err = recipient_report(err)
     error_lines = err.splitlines()
@@ -4769,13 +4857,19 @@ def remote(message: Message, host: str, options: Options) -> Result:
     if parsed.outcome == "absent" and not options.skip_closed:
         return Result("failed", f"ssh {host}: unexpected ABSENT result")
     detail = parsed.detail
-    if options.once_per_key:
+    if once_key is not None:
         if parsed.outcome == "skipped" and is_once_accepted_skip(detail):
             return Result("skipped", ONCE_ACCEPTED, failure, receiver)
         if parsed.outcome in ("kept", "queued") and not detail.startswith(DURABLE_ACCEPTANCE):
             return UncertainRelayDelivery("failed", f"on {host}: no durable acceptance receipt", failure, receiver)
-        if parsed.outcome == "failed" and not detail.startswith(BEFORE_ACCEPTANCE):
-            return UncertainRelayDelivery("failed", f"on {host}: {detail}", failure, receiver)
+        if parsed.outcome in ("failed", "refused", "held", "closed", "absent"):
+            if not detail.startswith(BEFORE_ACCEPTANCE):
+                return UncertainRelayDelivery("failed", f"on {host}: {detail}", failure, receiver)
+            if first_attempt:
+                with key_states() as states:
+                    state = states.get(once_key)
+                    if state is not None:
+                        _ = state.pop("once_remote", None)
     if parsed.payload:
         detail += "\n" + parsed.payload
     if parsed.outcome == "held" and repeat_guard_held:
@@ -5332,31 +5426,45 @@ def send(options: Options) -> Result:
     once = options.key if options.once_per_key else None
     if once is not None:
         identity = Message("once", "", "", "", once, sent_header="")
-        with delivery_turn(identity) as acquired:
+        with delivery_turn(identity, once=True) as acquired:
             if not acquired:
                 return Result("retry", f"key {once!r} has a delivery in progress")
             return send_once(options, once)
     return send_with_membership(options)
 
 
-def send_once(options: Options, key: str) -> Result:
-    if recover_once(key):
-        return Result("skipped", ONCE_ACCEPTED)
+def once_relay_status(key: str) -> ClaimGranted | RepeatAccepted | RepeatPending:
+    status: ClaimGranted | RepeatPending = ClaimGranted()
     with key_states() as states:
         for address, attempt in pending_deliveries(states.get(key, {"last": {}})).items():
             if not attempt.get("once_per_key"):
                 continue
             prior = postmaster_claim(states, key, address)
             if isinstance(prior, RepeatAccepted):
-                return Result("skipped", ONCE_ACCEPTED)
+                return prior
             if isinstance(prior, RepeatPending):
-                return Result("pending", prior.reason)
+                status = prior
+    return status
+
+
+def send_once(options: Options, key: str) -> Result:
+    if recover_once(key):
+        return Result("skipped", ONCE_ACCEPTED)
+    destination = read_key_states().get(key, {"last": {}}).get("once_remote")
+    if destination is not None and remote_once_receipt(destination, key):
+        record_once(key)
+        return Result("skipped", ONCE_ACCEPTED)
+    prior = once_relay_status(key)
+    if isinstance(prior, RepeatAccepted):
+        return Result("skipped", ONCE_ACCEPTED)
+    if isinstance(prior, RepeatPending):
+        return Result("pending", prior.reason)
     try:
         result = send_with_membership(options)
     except SystemExit as error:
         if error.code != 2:
             raise
-        return Result("failed", BEFORE_ACCEPTANCE + "the recipient could not be resolved")
+        result = Result("failed", "the recipient could not be resolved")
     if result.outcome in ("sent", "kept", "queued") or (
             result.outcome == "skipped" and is_once_accepted_skip(result.detail)):
         record_once(key)
@@ -5364,6 +5472,11 @@ def send_once(options: Options, key: str) -> Result:
             return result._replace(detail=DURABLE_ACCEPTANCE + result.detail)
     elif result.outcome in ("failed", "refused", "held", "closed", "absent") and not isinstance(
             result, (UncertainRelayDelivery, WorkerMessageUnconfirmed)):
+        state = read_key_states().get(key, {"last": {}})
+        if "once_remote" in state:
+            return Result("pending", ONCE_REMOTE_UNCONFIRMED)
+        if state.get("once_delivery_interrupted"):
+            return Result("pending", "the earlier delivery was interrupted")
         return result._replace(detail=BEFORE_ACCEPTANCE + result.detail)
     return result
 
@@ -5786,6 +5899,9 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             raise
     if isinstance(route, (RecipientClosed, RecipientAbsent)):
         return route.as_result()
+    if (options.once_per_key and options.key is not None and not isinstance(route, RemoteDelivery)
+            and "once_remote" in read_key_states().get(options.key, {"last": {}})):
+        return Result("pending", ONCE_REMOTE_UNCONFIRMED)
     destination = route.address if isinstance(route, SessionRecipient | QueuedStaffRecipient | RemoteDelivery) else options.to
     if isinstance(route, RemoteDelivery) and route.selected_conversation:
         mailbox = ConversationRecipient(route.host, route.address[8:])
@@ -6094,6 +6210,9 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                             claim_result = RepeatPending(reason)
                             result = Result("failed", reason)
                 else:
+                    if delivery_identity.once_per_key and delivery_identity.key is not None:
+                        relay_message = replace(relay_message, direct_relay_claim=DirectRelayClaim(
+                            delivery_identity.key, delivery_identity.to, entry_id))
                     result = relay_with_claim(relay_message, options.timeout, entry_id)
                     log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
         return result
@@ -6288,6 +6407,12 @@ def main(argv: list[str]) -> int:
             print(acknowledge(key))
         case ["reopen", key]:
             print(reopen(key))
+        case ["once-receipt", key]:
+            if recover_once(key) or isinstance(once_relay_status(key), RepeatAccepted):
+                print(f"SKIPPED: {ONCE_ACCEPTED}")
+                return EXIT["skipped"]
+            print("PENDING: no durable acceptance receipt")
+            return EXIT["pending"]
         case ["pending", *named] if len(named) <= 1:
             try:
                 _ = pending(named[0] if named else None, emit=True)
