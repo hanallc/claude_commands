@@ -26,8 +26,11 @@ count into Step 2 without listing the items.
 
 ## Step 2: Set up where decisions get recorded
 
-
-Create a transient document at the repository root by default. Give it today's date and the source of the items. Exclude it from Git with `bash ~/.claude/scripts/exclude/exclude.sh <path>`. Record each decision and its pending actions. If you act on a decision during the review, record the action as done. Before the first item's choice line, add `N items. Decisions go in <path>. The file is temporary.`
+Create a transient document at the repository root by default.
+Give it today's date and the source of the items.
+Exclude it from Git with `bash ~/.claude/scripts/exclude/exclude.sh <path>`.
+Record each decision and its pending actions. If you act on a decision during the review, record the action as done.
+Before the first item's choice line, add `N items. Decisions go in <path>. I'll delete this file when the review ends.`
 
 Ask first only when an obvious doc is in scope that the user did not name, a file they have been editing or named this session that the decisions belong in:
   > `N items. Record decisions in <relative/path/to/doc.md> (recommended)? (yes / transient doc)`
@@ -88,15 +91,15 @@ For each item, in order:
 
 1. Mark the task `in_progress`.
 2. Check that the item contains **one decision**. If it contains independent questions, split them into ordered subitems, preserve the original ID as their prefix, update the task list, and present only the first.
-3. Draft the item with the shared file's **Ad hoc review items** template.
-4. If a subagent prepares the item, give it the template. Require it to pass the shared reader test before it returns the draft.
+3. Build the causal explanation with the shared file's build order. Then use its **Ad hoc review items** template.
+4. Give each subagent that prepares an item the shared guide. Require it to pass the reader test before it returns the draft.
 5. Pass the shared **reader test** and **comprehension gate** before each presentation. Then show the item.
 6. **Wait for the user's response.**
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
-7. Accept a terminal choice when the user's response is clear. Record the decision and any pending actions. Mark the task `completed` and continue to the next item.
+7. Accept a terse reply such as `okay` or `continue` when it clearly selects a terminal choice. Record the decision and any pending actions. Mark the task `completed` and continue to the next item.
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
@@ -109,10 +112,11 @@ Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_item
 The command output names the held messages file. Read the file at your own pace.
 Each release in the file lists its messages oldest first.
 
+For a transient document, summarize each completed decision inline as `1. <label> → <decision>`.
+List all pending actions, or say `none pending`. Then delete the document.
+
 When every item is done:
 
-
-- Transient doc: summarize inline, one line per item — `1. <label> → <decision>` — then every action still pending (or `none pending`), then delete the doc.
 - A doc the user chose: one-line summary — `Wrote decisions for N completed items to <path>`. It stays.
 - Ensure every task has a terminal status.
 

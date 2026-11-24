@@ -381,7 +381,7 @@ deliverable do?" is the same under both options, it is not the user's decision.
 </FilterFindingsForUserReview>
 
 <DecisionPresentationTemplate>
-Use this structure for inline decisions and pending decisions in Work Orders.
+Use this structure for inline decisions and pending decisions in Work Orders. Apply `<RequiredSubSections/>` in the body.
 
 ```markdown
 **Decision N: <concrete thing to decide>**
@@ -396,7 +396,7 @@ What should change:
 - <recommended plan/code direction>
 
 Recommendation:
-<direct recommendation, with the exact phase/doc placement>
+<direct recommendation>
 
 Approve this direction, or modify it?
 ```
@@ -405,7 +405,8 @@ Do not present a finding as "the architect flagged X". The user should not have 
 </DecisionPresentationTemplate>
 
 <RequiredSubSections>
-When a decision needs source detail, include it inside `<DecisionPresentationTemplate/>` using these facts:
+For a proposed plan change, name the exact phase and location in the document.
+When the decision needs source details, include these facts in its body:
 
 1. **What the plan currently says** — quote the exact line(s) being changed.
 2. **What just shipped** — concrete files / types / line numbers; the gap that triggered the finding.
@@ -446,6 +447,7 @@ same wording softened. Afterwards, restate the pending question and wait.
 
 <DispatchAdhocReview>
 Prepare the filtered decisions with the shared ad hoc review template and reader test in `<UserFacingText/>`.
+Apply `<RequiredSubSections/>` in the body of each item.
 Invoke `/adhoc_review` with those items. Apply each decision to the plan when the user makes it.
 </DispatchAdhocReview>
 

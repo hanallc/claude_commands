@@ -91,12 +91,13 @@ State the one decision. Omit team names for the work.
 
 1. **The point**
 2. **How the choices behave.** Describe the current behavior and what each choice changes.
+   Explain any relevant triggering event or task. Explain what can go wrong if the system chooses incorrectly.
 3. **Concrete scenario.** Include one when timing, lifecycle, ownership, state changes, or multiple actors matter.
 4. **Question.** Ask the user to decide in terms of behavior.
 5. **Recommendation.** Name the recommended outcome and the goal or failure it addresses. Include meaningful costs or restrictions.
 6. **Implementation mapping.** Add the proposed name or a short code example if it makes the decision more precise.
 7. **Still pending.** Name nearby decisions that could appear settled. Say where you will handle them if known.
-8. **Choices.** Follow the shared Choices rules below.
+8. **Choices.** Follow the shared Choices rules below. Always include the exact choice `elaborate`.
 
 Labels after **The point** are optional.
 
@@ -108,10 +109,10 @@ Labels after **The point** are optional.
 **The point**
 
 The editor can disappear when you unplug its monitor.
-Should it move to another monitor until you reconnect the first one?
+Should the editor move to another monitor or stay hidden, or should the application open a replacement?
 
-The editor can stay hidden, wait for the application to replace it, or move automatically.
-I recommend moving it automatically so you can keep editing.
+If the editor stays hidden, you cannot use it. A replacement depends on when the application opens it.
+I recommend moving the current editor automatically so you can keep editing.
 
 move automatically (recommended — you can keep editing) / leave hidden / let the application replace it / elaborate
 ```
