@@ -1,7 +1,9 @@
 """CI cargo jobs share the admission queue and release their grants."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from dataclasses import replace
+import io
 import json
 import os
 from pathlib import Path
@@ -10,10 +12,14 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 from typing import TextIO, cast
 import unittest
+from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_client, admission_protocol as wire
+from scripts.build_queue import queue_place
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
@@ -154,7 +160,7 @@ class CargoLifetimeTests(unittest.TestCase):
                     + ", 'a') as output:\n    output.write('\\n'.join(os.environ[name] for name in"
                     + " ('PATH', 'TMPDIR', 'PYTHONPATH')) + '\\n')\ndescendant = 0"))
                 cargo.chmod(0o755)
-                environment = {**os.environ, "BUILD_QUEUE_LOCAL_REASON": reason,
+                environment = {**os.environ, "BUILD_QUEUE_LOCAL_REASON": reason, "GITHUB_ACTIONS": "",
                     "PYTHONPATH": "job-module-path", "TMPDIR": str(job_temporary),
                     "PATH": os.pathsep.join((str(front_dir), str(devshell_dir), str(shim_dir),
                                               str(cargo_dir), os.environ["PATH"]))}
@@ -213,7 +219,7 @@ class CargoLifetimeTests(unittest.TestCase):
         environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
             "HOME": str(fixture.root / "runner-home"), "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(fixture.root),
-            "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile"}
+            "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile", "GITHUB_ACTIONS": ""}
         child = subprocess.Popen([sys.executable, "-c", DENIED_HOME_FRONT,
             "--cargo", str(cargo), "--", *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=environment, cwd=fixture.root)
@@ -350,6 +356,78 @@ class CargoLifetimeTests(unittest.TestCase):
                         os.kill(descendant, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+
+class JobStartTests(unittest.TestCase):
+    def test_job_start_is_the_start_of_the_runner_worker_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 50, parent=1, start="40", name="Runner.Listener")
+            write_process(proc, 100, parent=50, start="12345", name="Runner.Worker")
+            write_process(proc, 200, parent=100, start="12400", name="bash")
+            write_process(proc, 300, parent=200, start="12500", name="a) (b c")
+            self.assertEqual(ci_cargo_front.job_start(300, proc), 12345 / os.sysconf("SC_CLK_TCK"))
+
+    def test_a_missing_parent_stat_means_no_job_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 300, parent=200, start="12500", name="python3")
+            self.assertIsNone(ci_cargo_front.job_start(300, proc))
+
+    def test_a_parent_cycle_without_a_runner_worker_means_no_job_start(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder)
+            write_process(proc, 200, parent=300, start="12400", name="bash")
+            write_process(proc, 300, parent=200, start="12500", name="python3")
+            self.assertIsNone(ci_cargo_front.job_start(300, proc))
+
+    def test_no_runner_worker_ancestor_warns_only_in_a_github_job(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder) / "proc"
+            write_process(proc, os.getpid(), parent=200, name="python3")
+            write_process(proc, 200, parent=1, name="bash")
+            write_process(proc, 1, parent=0, name="systemd")
+            self.assertIsNone(ci_cargo_front.job_start(os.getpid(), proc))
+            for actions, warning in (("", ""), ("true", "::warning::build queue: no readable Runner.Worker ancestor")):
+                held = mock.Mock(side_effect=queue_place.QueuePlaceRefused("stopped by the test"))
+                errors = io.StringIO()
+                with self.subTest(actions=actions), mock.patch.object(ci_cargo_front, "PROC_ROOT", proc), \
+                     mock.patch.object(queue_place, "held_reservation", held), \
+                     mock.patch.dict(os.environ, {"GITHUB_ACTIONS": actions}), redirect_stderr(errors):
+                    status = ci_cargo_front.run_cargo("cargo", ["build"], "", Path(folder))
+                self.assertEqual(status, 1)
+                held.assert_called_once()
+                self.assertEqual(errors.getvalue().count("::warning::"), 1 if warning else 0, errors.getvalue())
+                if warning:
+                    self.assertTrue(errors.getvalue().startswith(warning), errors.getvalue())
+
+    def test_queue_job_start_converts_boot_time_to_the_queue_clock(self) -> None:
+        self.assertEqual(ci_cargo_front.queue_job_start(100.0, now=1_000_000.0, boot_now=400.0),
+                         records.JobStart(999_700.0))
+        self.assertEqual(ci_cargo_front.queue_job_start(None, now=1_000_000.0, boot_now=400.0), records.NO_JOB_START)
+
+    def test_a_ci_step_reads_its_job_start_once_and_sends_it_on_the_queue_clock(self) -> None:
+        class FixedClock:
+            def now(self) -> float:
+                return 1_000_000.0
+
+        sent: list[wire.ServiceEstimateRequest] = []
+
+        def refuse(request: wire.ServiceEstimateRequest) -> None:
+            sent.append(request)
+            raise queue_place.QueuePlaceRefused("stopped by the test")
+
+        read = mock.Mock(return_value=100.0)
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(ci_cargo_front, "job_start", read), \
+             mock.patch.object(admission_client, "CLOCK", FixedClock()), \
+             mock.patch.object(time, "clock_gettime", return_value=400.0), \
+             mock.patch.object(queue_place, "held_reservation", side_effect=refuse), \
+             mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stderr(io.StringIO()):
+            self.assertEqual(ci_cargo_front.run_cargo("cargo", ["build"], "", Path(folder)), 1)
+        read.assert_called_once()
+        request, = sent
+        self.assertEqual(request.since, 1_000_000.0)
+        self.assertEqual(request.job_start, records.JobStart(999_700.0))
 
 
 class RunnerHomeTests(unittest.TestCase):

@@ -5292,9 +5292,9 @@ def _checkpoint(args: argparse.Namespace) -> None:
     if phase is None:
         raise SystemExit("checkpoint requires the named open phase")
     events = _run_events(state)
-    working_dir = _phase_working_dir(state, events, phase)
-    if not _is_commit(working_dir, commit):
-        raise SystemExit(f"checkpoint refused: {commit} is not a commit in {working_dir}")
+    folders = _phase_working_dirs(state, events, phase)
+    if not any(_is_commit(folder, commit) for folder in folders):
+        raise SystemExit(f"checkpoint refused: {commit} is not a commit in {' or '.join(map(str, folders))}")
     for event in events:
         if (event.get("event_type") == "checkpoint" and event.get("checkpoint_commit") == commit
                 and event.get("phase_instance_id") == phase.get("instance_id")):
@@ -5306,13 +5306,21 @@ def _checkpoint(args: argparse.Namespace) -> None:
     print(event["event_id"])
 
 
-def _phase_working_dir(state: dict[str, object], events: list[dict[str, object]], phase: dict[str, object]) -> Path:
-    """The first folder that exists: the phase_started record, the run's current folder, the current directory."""
+def _phase_working_dirs(state: dict[str, object], events: list[dict[str, object]],
+                        phase: dict[str, object]) -> list[Path]:
+    """The folders that exist among the phase_started record and the run's current folder; else the current directory.
+
+    A transferred unit keeps its old phase_started folder, so the run's current folder is checked too.
+    """
     recorded = next((pass_recorder.string(event.get("working_dir")) for event in events
                      if event.get("event_type") == "phase_started"
                      and event.get("phase_instance_id") == phase.get("instance_id")), "")
     current = pass_recorder.string(state.get("working_dir"))
-    return next((Path(folder) for folder in (recorded, current) if folder and Path(folder).is_dir()), Path.cwd())
+    folders: dict[Path, Path] = {}
+    for folder in (recorded, current):
+        if folder and Path(folder).is_dir():
+            _ = folders.setdefault(Path(folder).resolve(), Path(folder))
+    return list(folders.values()) or [Path.cwd()]
 
 
 def _is_commit(working_dir: Path, commit: str) -> bool:

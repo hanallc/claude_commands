@@ -18,8 +18,7 @@ from scripts.lib import conf
 LINUX_PRIVATE_PATHS = tuple(Path(name) for name in ("/home", "/tmp", "/build", "/session", "/dev/shm", "/var/tmp"))
 LINUX_CHECKOUT = Path("/home/removal-source")
 MAC_BACKEND = Path("/usr/bin/sandbox-exec")
-CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_state_dir",
-                              "visible_root", "holds_file"))
+CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_state_dir", "holds_file"))
 ROOT_CONFIGS = ("build_folders.conf", "lint.conf", "mac_test.conf", "scratch.conf")
 
 

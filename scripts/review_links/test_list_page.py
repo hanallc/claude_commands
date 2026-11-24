@@ -1527,7 +1527,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         shell = shell.replace('</body>', probe + '</body>')
         proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
         _ = (self.root / "config/scratch.conf").write_text(
-            f"visible_root={self.root / 'scratch'}\nholds_file={self.root / 'holds.json'}\n"
+            f"holds_file={self.root / 'holds.json'}\n"
             + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
             + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
             + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")

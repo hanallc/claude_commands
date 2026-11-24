@@ -343,13 +343,15 @@ class MemoryFeedTests(unittest.TestCase):
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(staff_names.parts_text(rows[0].get("name_parts", [])), rows[0]["name"])
-                self.assertEqual(rows[0].get("slot"), expected)
+                # The feed sends no slot number; the slot folder ends with it.
+                self.assertNotIn("slot", rows[0])
+                self.assertEqual(rows[0].get("slot_folder", "—").rsplit("/", 1)[-1], str(expected))
                 # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
                 self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
                                  ("/".join(folder.parts[-3:]), mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
-                self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
+                self.assertTrue(all("slot" not in row for row in shown_rows))
                 self.assertTrue(all("slot" not in row for row in page["waiters"]))
                 for waiting in page["waiters"]:
                     self.assertEqual(staff_names.parts_text(waiting.get("name_parts", [])), waiting["name"])
@@ -391,7 +393,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=merge gate\n"
+            + "names.gate=gate\n"
             + "owned.default={unit} {step}\n"
             + "owned.test-affected={unit} {step}\n"
             + "owned.ci-default=CI {step}\n"
@@ -504,12 +506,32 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(reading.explanation.room, baseline.explanation.room)
 
     def gate_wait_page(self, guest: placement.HostEligibility) -> memory_feed.MemoryPage:
+        return self.placement_wait_page("/fixture/claude_commands", gate_candidates(guest))
+
+    def placement_wait_page(self, folder: str,
+                            candidates: tuple[placement.CandidateEligibility, ...]) -> memory_feed.MemoryPage:
         base = captured_reading()
-        waiter = GatePlacementWaiter(8100, "gate-session", "fixture gate", "gate", "/fixture/claude_commands",
+        waiter = GatePlacementWaiter(8100, "gate-session", "fixture gate", "gate", folder,
             base.explanation.now - 30, admission_records.GIB, admission_records.NeedsMemory(),
-            job=StepJob("gate"), placement_candidates=gate_candidates(guest))
+            job=StepJob("gate"), placement_candidates=candidates)
         with mock.patch.object(admission_client, "view", return_value=replace(base, view=replace(base.view, waiting=(waiter,)))):
             return memory_feed.reading()
+
+    def test_a_fixed_guest_exclusion_is_not_a_target_and_the_route_fit_names_the_targets(self) -> None:
+        row, = self.placement_wait_page("/fixture/hana", gate_candidates(placement.FixedExclusion("repo")))["waiters"]
+        route_fit, = self.placement_wait_page("/fixture/hana", ())["waiters"]
+        self.assertNotIn("mac-linux", row.get("targets", []))
+        self.assertNotIn("mac-linux", row.get("runs_on", ""))
+        self.assertEqual((row.get("runs_on"), row.get("targets"), row.get("because")),
+                         (route_fit.get("runs_on"), route_fit.get("targets"), route_fit.get("because")))
+
+    def test_an_allowed_guest_is_a_target_and_a_fixed_exclusion_is_not(self) -> None:
+        candidates = tuple(replace(candidate, eligibility=placement.FixedExclusion("offload_exclude"))
+                           if candidate.destination.target == "hana-aws" else candidate
+                           for candidate in gate_candidates(placement.AllowedHost()))
+        row, = self.placement_wait_page("/fixture/claude_commands", candidates)["waiters"]
+        self.assertEqual(row.get("targets"), ["natedev", "mac-linux"])
+        self.assertEqual(row.get("runs_on"), "natedev or mac-linux")
 
     def test_gate_wait_row_lists_every_named_machine_once(self) -> None:
         page = self.gate_wait_page(placement.AllowedHost())
@@ -520,12 +542,11 @@ class MemoryFeedTests(unittest.TestCase):
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         _tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="wait:{row.get("key")}" tabindex="0"'), 1)
-        self.assertIn('data-machine="natedev or mac-linux or hana-aws"', table)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="wait:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("dim", "natedev"), ("dim", "mac-linux"), ("dim", "hana-aws")])
 
     def test_gate_wait_row_shows_the_recorded_mac_linux_exclusion(self) -> None:
-        for guest in (placement.FixedExclusion("not enabled"),
-                      placement.TemporaryExclusion("backoff until 15:30 EST"),
-                      placement.FixedExclusion("unknown target"),
+        for guest in (placement.TemporaryExclusion("backoff until 15:30 EST"),
                       placement.EvidenceNeeded("unreadable record"),
                       placement.TemporaryExclusion("the Mac does not answer")):
             with self.subTest(guest=guest):
@@ -550,9 +571,9 @@ class MemoryFeedTests(unittest.TestCase):
         step = GatePlacementStep("gate-session", "fixture gate", "gate", "/Mac/claude_commands", 0,
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
             pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
-            job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.FixedExclusion("not enabled"))))
+            job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.TemporaryExclusion("not answering"))))
         reading = replace(base, view=replace(base.view, running=(step,)))
-        build = queue_view.MacBuild(8202, step.folder, step.started_at, "merge gate", "claude_commands",
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
         other = replace(build, pid=8203, gate_placement="episode/other-attempt")
         mac = queue_view.MacBuildReading(now, (build, other))
@@ -562,31 +583,35 @@ class MemoryFeedTests(unittest.TestCase):
             page = memory_feed.reading()
         row = next(row for row in page["walk"] if row["pid"] == build.pid)
         self.assertEqual(row.get("targets"), ["mac", "natedev", "mac-linux", "hana-aws"])
-        self.assertEqual(row.get("because"), "mac-linux: not enabled")
+        self.assertEqual(row.get("because"), "mac-linux: not answering")
         unrelated = next(row for row in page["walk"] if row["pid"] == other.pid)
         self.assertNotIn("targets", unrelated)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
-        self.assertIn("mac-linux: not enabled", "\n".join(tips["walk"][page["walk"].index(row)]))
-        self.assertIn('<td class="machine" data-machine="mac or natedev or mac-linux or hana-aws">'
-            + '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
+        text = "\n".join(tips["walk"][page["walk"].index(row)])
+        self.assertIn("mac-linux: not answering", text)
+        self.assertIn("Named targets  Mac or natedev or mac-linux or hana-aws", text)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("run", "mac")])
 
     def guest_gate_page(self) -> memory_feed.MemoryPage:
         base = captured_reading()
         now = base.explanation.now
         guest = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
             admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
-            pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", mac_placement="episode/placement-attempt",
+            pid=8200, started_at=now - 30, assignment_host="guest-ssh-name", assignment_target="mac-linux",
+            mac_placement="episode/placement-attempt",
             job=StepJob("gate"), confirmed_guest_run={"target": "mac-linux", "attempt": "guest-attempt"},
             placement_candidates=gate_candidates(placement.AllowedHost()))
-        pending = replace(guest, pid=8201, mac_placement="pending/placement-attempt", confirmed_guest_run=None,
+        # The queue names no Mac placement for an unconfirmed guest attempt.
+        pending = replace(guest, pid=8201, started_at=now - 20, mac_placement="", confirmed_guest_run=None,
                           execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now))
         running = (guest, pending)
         explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
             0, 0, 0, owner=str(step.pid)) for step in running)
         reading = replace(base, view=replace(base.view, running=running),
                           explanation=replace(base.explanation, running=explained))
-        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "merge gate", "claude_commands",
+        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=guest.mac_placement)
         mac = queue_view.MacBuildReading(now, (native,))
         with (mock.patch.object(admission_client, "view", return_value=reading),
@@ -594,7 +619,7 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
             return memory_feed.reading()
 
-    def test_guest_gate_row_shows_only_the_confirmed_attempt(self) -> None:
+    def test_guest_gate_rows_show_on_mac_linux_with_the_confirmed_attempt_or_not_confirmed(self) -> None:
         page = self.guest_gate_page()
         row = next(row for row in page["walk"] if row["pid"] == 8200)
         self.assertEqual(row.get("guest_run"), {"target": "mac-linux", "attempt": "guest-attempt"})
@@ -602,7 +627,8 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertFalse(any(other["pid"] == 8202 for other in page["walk"]))
         unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
-        self.assertEqual(unconfirmed.get("state"), "uncertain")
+        self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
+                         ("mac-linux", True, "uncertain"))
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
@@ -611,14 +637,70 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("Guest attempt  guest-attempt", text)
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
 
-    def test_running_gate_table_lists_named_targets_and_marks_the_selected_target(self) -> None:
+    def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
+        # The user, 11-23: a running row shows one icon where it runs; the named targets go in the tooltip.
         page = self.guest_gate_page()
+        row = next(row for row in page["walk"] if row["pid"] == 8200)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
-        _tips, table = self.render_assignment_table(payload)
-        self.assertIn('<td class="machine" data-machine="natedev or mac-linux or hana-aws">'
-            + '<span class="machine" data-machine="natedev">natedev</span> or '
-            + '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
-            + '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
+        tips, table = self.render_assignment_table(payload)
+        cells = dict(cast(list[tuple[str, str]],
+            re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(cells[str(row.get("key"))]), [("run", "mac-linux")])
+        self.assertIn("Named targets  natedev or mac-linux or hana-aws", "\n".join(tips["walk"][page["walk"].index(row)]))
+
+    def test_consumed_unconfirmed_guest_gate_shows_one_mac_linux_row(self) -> None:
+        base = captured_reading()
+        now = base.explanation.now
+        consumed = GatePlacementStep("gate-session", "fixture gate", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, assignment_host="linux-guest",
+            assignment_target="mac-linux", job=StepJob("gate"),
+            execution=execution_identity.ExecutionEvidenceUnavailable("guest has no start record", now),
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        # Before the consume, the queue has no start time and the gate starts nothing on the guest.
+        available = replace(consumed, session_id="available-session", started_at=0.0)
+        native = GatePlacementStep("mac-session", "fixture mac gate", "gate", "/Mac/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=8300, started_at=now - 20, assignment_host="mac", mac_placement="episode/native-attempt",
+            job=StepJob("gate"))
+        running = (consumed, available, native)
+        explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
+            0, 0, 0, owner=str(index)) for index, step in enumerate(running))
+        reading = replace(base, view=replace(base.view, running=running),
+                          explanation=replace(base.explanation, running=explained))
+        build = queue_view.MacBuild(8302, native.folder, native.started_at, "gate", "claude_commands",
+            gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=native.mac_placement)
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (build,))),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+            page = memory_feed.reading()
+        remote = [row for row in page["walk"] if row.get("keep_text") == "remote memory is unavailable"]
+        guest = next(row for row in remote if row["started_at"] == consumed.started_at)
+        self.assertEqual((guest.get("machine"), guest.get("guest_unconfirmed")), ("mac-linux", True))
+        self.assertNotIn("guest_run", guest)
+        waiting = next(row for row in remote if row["started_at"] == 0)
+        self.assertEqual(waiting.get("machine"), "linux-guest")
+        self.assertNotIn("guest_unconfirmed", waiting)
+        host_row = next(row for row in remote if row["pid"] == native.pid)
+        mac_row = next(row for row in page["walk"] if row["pid"] == build.pid)
+        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+        tips, table = self.render_assignment_table(payload)
+        counts = {name: table.count(f'data-tip="row:{row.get("key")}" tabindex="0"')
+                  for name, row in (("guest", guest), ("waiting", waiting), ("host", host_row), ("mac", mac_row))}
+        # The Mac host run shows once, as its Mac build row; the guest run shows once, as its queue row.
+        self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
+        # The guest row shows the bright mac-linux icon; its hover says the attempt is not confirmed.
+        self.assertIn('class="machine machine-icon run" data-machine="mac-linux"', table)
+        text = "\n".join(tips["walk"][page["walk"].index(guest)])
+        self.assertIn("Runs on  mac-linux", text)
+        self.assertIn("Guest attempt  not confirmed", text)
+        self.assertNotIn("unavailable", text.splitlines()[0])
+        # The confirmation adds a pid and an attempt; the row keeps its key, so an open hover stays.
+        confirmed = cast(memory_feed.RunRow, guest.copy())
+        confirmed["pid"] = 8400
+        confirmed["guest_run"] = memory_feed.ConfirmedGuestRun(target="mac-linux", attempt="guest-attempt")
+        del confirmed["guest_unconfirmed"]
+        self.assertEqual(memory_feed.step_key(confirmed), guest.get("key"))
 
     def render_assignment_table(self, payload: dict[str, object]) -> tuple[dict[str, list[list[str]]], str]:
         html = self.expected_page()
@@ -689,22 +771,23 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
                     if kind == "wait":
-                        # A queued row names the machines that can take it, in a span that wraps in the column.
+                        # A queued row shows a dim icon for each machine that can take it.
                         self.assertEqual(machine, "")
-                        targets = " or ".join(cast(list[str], row["targets"]))
+                        targets = cast(list[str], row["targets"])
                         self.assertTrue(targets)
-                        shown = " or ".join(f'<span class="machine" data-machine="{target}">{target}</span>'
-                                            for target in cast(list[str], row["targets"]))
-                        self.assertIn(f'<td class="machine" data-machine="{targets}"><span class="wait-target">{shown}</span></td>',
-                                      cell)
+                        self.assertEqual(machine_icons(cell), [("dim", target) for target in targets])
                     else:
                         self.assertTrue(machine)
-                        self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
+                        self.assertEqual([name for _, name in machine_icons(cell)], [machine])
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
-                    unit = str(row["unit"])
-                    self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
+                    title = cast(memory_feed.QueueRowTitle, row["title"])
+                    # A row with no unit shows the step after ": " in its name.
+                    name = str(row["name"])
+                    step = (title["step"] if row["unit"] not in ("", "—") else
+                            name.partition(": ")[2])
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     self.assertIn(str(row["name"]), text)
                     if row.get("kind") == "cloud":
                         self.assertNotIn("Uses  ", text)
@@ -997,6 +1080,22 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("ci_label"), "hana CI")
                 self.assertEqual(row["title"], {"unit": "", "step": "hana CI"})
 
+    def test_a_waiting_ci_step_shows_its_job_start_and_age(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("ci_label=Fixture CI · {runner} · {job}\n")
+        base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        started = base.explanation.now - 70 * 60
+        waiting = replace(base.view.waiting[0], ci_runner="hana-linux-2", session_name="unregistered session",
+                          ci_job_start=admission_records.JobStart(started))
+        reading = replace(base, view=replace(base.view, waiting=(waiting,)))
+        reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
+        assert isinstance(reply, wire.ViewReply)
+        with mock.patch.object(admission_client, "view", return_value=reply.reading), \
+             mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            page = memory_feed.reading()
+        wait, = page["waiters"]
+        clock = datetime.fromtimestamp(started, UTC).strftime("%H:%M")
+        self.assertEqual(wait.get("job_start"), f"{clock} UTC · 1 h 10 min ago")
+
     def test_ci_feed_rejects_incomplete_label_templates(self) -> None:
         for template, valid in (("CI {runner} {job}", "CI hana-linux-2 compile"),
                                 ("CI {runner} ({job})", "CI hana-linux-2 (compile)")):
@@ -1073,7 +1172,13 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(ci.get("ci_label"))
                 for row in (run, page["waiters"][0], ci):
                     self.assertFalse(row.get("mac_text"))
+                for row in (run, ci):
                     self.assertFalse(row.get("runs_on"))
+                # bob, 2026-11-23: a waiting CI step can run only on the host, where the running CI row shows it.
+                host = FIXTURE_MACHINE
+                self.assertEqual(ci.get("machine"), host)
+                self.assertEqual(page["waiters"][0].get("targets"), [host])
+                self.assertEqual(page["waiters"][0].get("runs_on"), f"{host} only")
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
         self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
 
@@ -2491,7 +2596,7 @@ process.stdout.write(JSON.stringify({
         """Build three rows from their recorded placement routes."""
         from scripts.build_targets import targets
         from scripts.build_targets.target_config import SshTarget
-        from scripts.mac_test import eligibility
+        from scripts.mac_test import claim_state, eligibility, mac_test
 
         reading = queued_reading(captured_reading(host=admission_records.HostMemory(
             0, 60 * admission_records.GIB)), ("build", "mend", "direct"))
@@ -2502,10 +2607,16 @@ process.stdout.write(JSON.stringify({
                      for index, (row, step, route) in enumerate(zip(
                          reading.view.waiting[:3], ("build", "mend", "build"), routes, strict=True)))
         reading = replace(reading, view=replace(reading.view, waiting=rows))
-        job = targets.RunningJob("nextest hana_catalyst", datetime.now(UTC), targets.NotSeenIdle())
+        # The Mac fit note reads the claim folder, so the running job has its claim there too.
+        record: claim_state.ProcessBoundClaim = {
+            "claim_id": "fixture", "episode": "fixture", "attempt": "fixture", "submitting_session": "", "pid": 4242,
+            "proc_start": "1", "what": "nextest hana_catalyst", "worktree": "/fixture/hana_catalyst",
+            "since": datetime.now(UTC).isoformat()}
+        claim = claim_state.HeldClaim(RepositoryScope("hana_catalyst"), self.root / "claim.json", record)
         snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"),
-                     (targets.Running((job,)),), (), eligibility.NO_BACKOFF),)
+                     (targets.Running((targets.running_job(claim),)),), (claim,), eligibility.NO_BACKOFF),)
         with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(mac_test, "run_is_live", return_value=True),
               mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
               mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r"))):
             return memory_feed.reading()
@@ -3284,6 +3395,39 @@ process.stdout.write(JSON.stringify({
                                               slot_roots={}, slot_machine="private-mac-host")
                 self.assertEqual(row["name"], "hana CI: nextest")
                 self.assertEqual(row.get("ci_label"), label)
+
+    def test_a_mac_build_with_no_unit_starts_with_its_launcher(self) -> None:
+        # bob, 2026-11-23: a Mac build with no owner names who started it; a row with a unit does not change.
+        worker = staff.StaffRow(staff.StaffId("impl2"), "worker", "impl2", staff.StaffRoot(),
+                                current_session=staff.StaffId("session-a"))
+        members = memory_feed.FeedStaff(staff.StaffSnapshot((worker,)))
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo build -p hana", "hana")
+        owned = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                        unit_labels.UnderDirector("research", "research", ""))
+        for case, launched, identity, expected in (
+            ("known session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-a"),
+             unit_labels.UnitLabels(""), "impl2"),
+            ("unknown session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-x"),
+             unit_labels.UnitLabels(""), "Claude session"),
+            ("CI", replace(build, launcher=queue_view.MacLauncher.CI, origin=queue_view.MacBuildOrigin.CI),
+             unit_labels.UnitLabels(""), "hana CI"),
+            ("rust-analyzer", replace(build, launcher=queue_view.MacLauncher.RUST_ANALYZER),
+             unit_labels.UnitLabels(""), "rust-analyzer"),
+            ("terminal", replace(build, launcher=queue_view.MacLauncher.TERMINAL), unit_labels.UnitLabels(""), "terminal"),
+            ("old reading", build, unit_labels.UnitLabels(""), ""),
+            ("unit", replace(build, launcher=queue_view.MacLauncher.TERMINAL), owned, ""),
+        ):
+            with self.subTest(case=case):
+                row = memory_feed.mac_work_row(launched, queue_view.MacBuildReading(1, (launched,)), identity,
+                    names=read_step_names(), slot_roots={}, slot_machine="private-mac-host",
+                    launcher=memory_feed.mac_launcher_name(launched, members))
+                if expected:
+                    self.assertEqual(row.get("started_by"), {"name": expected, "step": "build"})
+                    self.assertEqual(row["name"], f"{expected}: build")
+                    self.assertEqual(row["repository"], "hana")
+                else:
+                    self.assertNotIn("started_by", row)
+                    self.assertEqual(row["name"], "research: build" if case == "unit" else "hana: build")
 
     def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
@@ -4412,6 +4556,17 @@ process.stdout.write(JSON.stringify({
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
 
 
+class PageTextTests(unittest.TestCase):
+    def test_the_page_and_its_fixtures_use_only_configured_job_names(self) -> None:
+        # bob, 2026-11-23 12:59: job names come from config/build_steps.conf (names.gate=gate), so no file shows the retired name.
+        retired = " ".join(("merge", "gate"))
+        folder = Path(__file__).resolve().parent
+        for name in ("memory_live.html", "builds_page_real_rows.json", "memory_page_proof.mjs",
+                     "test_memory_feed.py", "test_memory_hover.py", "test_queue_view.py"):
+            with self.subTest(file=name):
+                self.assertNotIn(retired, (folder / name).read_text(encoding="utf-8").lower())
+
+
 class BuildsPageProofTests(unittest.TestCase):
     def test_only_a_nightly_lease_selects_all_page_proof_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4444,6 +4599,20 @@ class BuildsPageProofTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).glob("*.png")), [])
             for report in ("proof.json", "steady-refresh.json"):
                 self.assertFalse((Path(directory) / report).exists())
+
+
+def machine_icons(row: str) -> list[tuple[str, str]]:
+    """Return the state and name of each machine in the Machine cell of one rendered table row.
+
+    An icon has the state "run" or "dim" and its name as its accessible name. An unknown machine is text, with no state.
+    """
+    cell = re.search(r'<td class="machine">(.*?)</td>', row, flags=re.S)
+    assert cell is not None
+    machines = cast(list[tuple[str, str, str]], re.findall(
+        r'<span class="machine(?: machine-icon (run|dim))?" data-machine="([^"]+)"(?:[^>]* role="img" aria-label="([^"]+)")?>',
+        cell.group(1)))
+    assert all(label == (name if state else "") for state, name, label in machines), machines
+    return [(state, name) for state, name, _ in machines]
 
 
 def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:
@@ -4572,7 +4741,12 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page = fixture.verify_call_page()
         builder = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
                                  current_session=staff.StaffId("builder"))
-        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder,))).registry()
+        builds = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        units = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.ReportsTo(builds.id),
+                                     current_session=staff.StaffId(name))
+                      for name in ("queue", "natest", "admin-console"))
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, *units))).registry()
         verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
         builder_unit = memory_feed.StaffUnitName(builder.name)
         verified_waiter["unit"] = builder_unit
@@ -4612,13 +4786,18 @@ def write_browser_fixture(folder: Path) -> None:
                   mock.patch.object(admission_client, "view", return_value=base)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
                 reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        # The first build has no unit: a terminal started it. The last one is from a reading with no launcher.
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
-            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
-            for index, (pid, path, command, repository, used, done, unit) in enumerate((
-                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk"),
-                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify"),
-                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler"))))
+            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit,
+            launcher=launcher)
+            for index, (pid, path, command, repository, used, done, unit, launcher) in enumerate((
+                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk",
+                 queue_view.MacLauncher.TERMINAL),
+                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify",
+                 queue_view.MacLauncher.CLAUDE),
+                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler",
+                 queue_view.MacLauncher.UNKNOWN))))
         mac_reading = queue_view.MacBuildReading(base.explanation.now - 5, mac_builds)
         from scripts.mac_test import claim_state
         from scripts.copies import copies
