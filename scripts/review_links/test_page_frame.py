@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import page_frame, review_submissions, serve
@@ -581,11 +582,11 @@ def firefox_screenshot(page: bytes, width: int, height: int) -> bytes:
         (root / "profile").mkdir()
         document = root / "page.html"
         _ = document.write_bytes(page)
-        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
-                              "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
-                              document.as_uri()],
-                             capture_output=True, text=True, timeout=45,
-                             env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
+        run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(root / "profile"),
+                                 "--window-size", f"{width},{height}", "--screenshot", str(root / "page.png"),
+                                 document.as_uri()],
+                                timeout=45,
+                                env={**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)})
         if run.returncode:
             raise AssertionError(run.stderr)
         return (root / "page.png").read_bytes()
@@ -884,22 +885,17 @@ class PageWindowTests(unittest.TestCase):
   check(copy!==null && dialog.contains(copy),'The New item button over New item belongs to its window.');
   await painted();
   check(dialog.open && dialog.matches(':modal') && onTop(dialog),'A second press keeps New item open on top.');
-  const words=dialog.querySelector('textarea[name="words"]'),done=dialog.querySelector('[data-done]');
+  const words=dialog.querySelector('textarea[name="words"]');
   check(document.activeElement===words,'A second press moves the focus to the words box.');
   words.value='A saved item.';
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const send=dialog.querySelector('[type="submit"]');
   await until(()=>!send.disabled,'Send');
+  let saved;
+  dialog.addEventListener('review-item-created',event=>{saved=event.detail.id;},{once:true});
   send.click();
-  await until(()=>dialog.querySelector('#new-item-saved').textContent==='Saved Q7.' && !words.checkVisibility(),
-   'the Saved state');
-  check(pressNewItem('over the saved item')!==null,'The press reaches New item in the Saved state.');
-  await painted();
-  check(dialog.open && document.activeElement===done,'In the Saved state a press moves the focus to Done.');
-  check(dialog.getBoundingClientRect().top>=actionsBottom(),'New item starts below the action area.');
-  dialog.querySelector('[data-cancel]').click();
-  await painted();
-  check(!dialog.open && !document.querySelector('[data-page-window-actions]'),'Closing New item removes the copy.');
+  await until(()=>saved==='Q7','the saved item ID');
+  check(!dialog.open && !document.querySelector('[data-page-window-actions]'),'Send closes New item and removes the copy.');
   check(document.activeElement===document.querySelector('[data-page-actions] [data-owner-new]'),
    'Focus returns to the New item button on the page.');
   // On a phone, New item is taller than the view. It stays centered, and its height clears the copy.
@@ -915,6 +911,7 @@ class PageWindowTests(unittest.TestCase):
    'At 390 px New item stays centered below the action area.');
   // A picture load or a resize measures New item again. The measure keeps the scroll of its body.
   const body=dialog.querySelector('.new-item-body');
+  words.style.minHeight='1000px';
   body.scrollTop=1e4;
   await painted();
   const end=body.scrollTop;
