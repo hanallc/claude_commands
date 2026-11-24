@@ -6113,8 +6113,6 @@ done
                     return []
             self.queue_changes.append(OrderedQueueChange(request, connections))
             return []
-        if isinstance(request, wire.PrioritySetRequest) and isinstance(request.target, wire.OneRun):
-            return self._mutation_reply(request.request_id, wire.Refused("priority applies to a unit"))
         why = asked_words(request.why, request.actor)
         if isinstance(why, wire.Refused):
             return self._mutation_reply(request.request_id, why)

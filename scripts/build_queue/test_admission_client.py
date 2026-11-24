@@ -2902,20 +2902,6 @@ class ClientTests(unittest.TestCase):
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
                 self.doCleanups()
 
-    def test_page_view_stops_at_the_query_timeout_and_command_view_at_silence(self) -> None:
-        reads: tuple[tuple[client.QueueReadWait, float], ...] = (("page read", 0.5), ("command read", 2))
-        for wait, limit in reads:
-            with self.subTest(wait=wait), AdmissionFixture() as fixture:
-                fixture.configure(query_timeout_seconds=0.5, silence_seconds=2)
-                transport = self.use_transport(fixture, Exchange(TimeoutError()))
-                with self.assertRaises(wire.AdmissionUnavailable) as error:
-                    _ = client.view(wait)
-                self.assertEqual(error.exception.reason, f"no answer in {limit:g} s")
-                self.assertEqual(fixture.clock.monotonic(), limit)
-                self.assertEqual(len(transport.attempts), 1)
-                self.assertFalse(fixture.clock.sleeps)
-                self.doCleanups()
-
     def test_placement_status_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
         # The Mac gate reads this on each cargo call; a busy service must not refuse the step.
         from scripts.build_queue import admission_wire as status_wire

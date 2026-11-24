@@ -365,21 +365,6 @@ class MineRequest(CallerCode):
 
 
 @dataclass(frozen=True)
-class WholeUnit:
-    """The priority raises every step of the unit."""
-
-
-WHOLE_UNIT = WholeUnit()
-
-
-@dataclass(frozen=True)
-class OneRun:
-    """The priority raises only the steps of this run; the step names it on the page."""
-    run: RunIdentity
-    step: str
-
-
-@dataclass(frozen=True)
 class WordsNotGiven:
     """The caller gave no --words; the service refuses unless a plain shell asked."""
 
@@ -389,12 +374,11 @@ WORDS_NOT_GIVEN = WordsNotGiven()
 
 @dataclass(frozen=True)
 class PrioritySetRequest(CallerCode):
-    """The request sets queue priority for a unit or one run, with the user's words and the actor."""
+    """Set queue priority for a unit and record the actor and the user's words."""
     request_id: str
     unit: str
     why: str | WordsNotGiven
     actor: str
-    target: WholeUnit | OneRun = WHOLE_UNIT
 
 
 @dataclass(frozen=True)
@@ -807,8 +791,7 @@ Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | V
          | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
-# An older service must refuse a one-run bump before it can raise the whole unit.
-_ONE_RUN_PRIORITY = "priority_run_set"
+_UNIT_PRIORITY_ONLY = "priority applies to a unit"
 _REQUESTS: dict[str, type] = {
     "repository_slot": RepositorySlotRequest,
     "verify_run_slot": VerifyRunSlotRequest,
@@ -820,7 +803,7 @@ _REQUESTS: dict[str, type] = {
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
-    _GROUPED_CLOUD_ADMIT: AdmitRequest, _ONE_RUN_PRIORITY: PrioritySetRequest,
+    _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
@@ -883,8 +866,6 @@ def _write_wire_record(value: object) -> object:
         del record["session"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
-    if record.get("kind") == "PrioritySetRequest" and record.get("target") == {"kind": "WholeUnit"}:
-        del record["target"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
         del record["state"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
@@ -902,6 +883,10 @@ def parse_record(text: str, schema: type[T]) -> T:
 
 
 def _parse_value(value: object, schema: type[T]) -> T:
+    if schema is PrioritySetRequest and isinstance(value, dict):
+        value = cast(dict[str, object], value)
+        if "target" in value:
+            raise ValueError(_UNIT_PRIORITY_ONLY)
     if schema in (QueueMoveRequest, QueueUndoRequest):
         if not isinstance(value, dict):
             raise ValueError("Invalid queue move request.")
@@ -932,12 +917,16 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if type(version) is not int or not 1 <= version <= VERSION:
             raise UnsupportedVersion(version)
         name = envelope.get("type")
-        if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
+        if not isinstance(name, str) or set(envelope) != {"v", "type", "data"}:
             raise ValueError("invalid admission envelope")
-        data = envelope["data"]
-        if version < 3 and variants[name] in _PLACEMENT_TYPES:
+        if variants is _REQUESTS and name == "priority_run_set":
+            raise ValueError(_UNIT_PRIORITY_ONLY)
+        schema = variants.get(name)
+        if schema is None:
+            raise ValueError("invalid admission envelope")
+        if version < 3 and schema in _PLACEMENT_TYPES:
             raise ValueError("placement requires version 3")
-        return version, cast(object, _parse_value(data, variants[name]))
+        return version, cast(object, _parse_value(envelope["data"], schema))
     except (ArithmeticError, KeyError, RecursionError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
@@ -958,8 +947,6 @@ def encode_request(request: Request) -> str:
             and isinstance(request.place.group, CloudGroup)):
         # An older service must refuse the request before it can grant one slot.
         return encode_envelope(request, {_GROUPED_CLOUD_ADMIT: AdmitRequest})
-    if isinstance(request, PrioritySetRequest) and isinstance(request.target, OneRun):
-        return encode_envelope(request, {_ONE_RUN_PRIORITY: PrioritySetRequest})
     return encode_envelope(request, _REQUESTS)
 
 

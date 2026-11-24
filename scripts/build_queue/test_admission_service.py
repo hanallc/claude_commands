@@ -7930,26 +7930,43 @@ class CutoverServiceTests(unittest.TestCase):
                 request = fixture.request()
                 fixture.free(60 * GIB if running else 0)
                 _ = fixture.server.handle_request(request)
-                stranger = fixture.run_owner()
-                # Each row: a set the service refuses, and its refusal.
-                refusals = ((wire.PrioritySetRequest("absent", "missing", "urgent", "director"),
-                             "unknown unit missing; the queue priority did not change"),
-                            (wire.PrioritySetRequest("absent-run", "present", "urgent", "director",
-                                                     wire.OneRun(stranger, "nextest")),
-                             f"no waiting step has run {stranger.pid}; the queue priority did not change"))
+                absent = wire.PrioritySetRequest("absent", "missing", "urgent", "director")
+                refusal = wire.Refused("unknown unit missing; the queue priority did not change")
                 with mock.patch.object(gate, "priority_labels", return_value={
                         "unrelated": UnitLabels("other", unit="roster-unit"),
                         request.identity.session_id: UnitLabels("worker", unit="present")}):
-                    for absent, reason in refusals:
-                        self.assertEqual(fixture.completed_queue_change(absent), [wire.Refused(reason)])
-                        self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
+                    self.assertEqual(fixture.completed_queue_change(absent), [refusal])
+                    self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
                     self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
                         "present", "present", "urgent", "director")), [wire.Ok()])
-                    for absent, reason in refusals:
-                        self.assertEqual(fixture.completed_queue_change(absent), [wire.Refused(reason)])
+                    self.assertEqual(fixture.completed_queue_change(absent), [refusal])
                     priority = fixture.server.priority
                     assert not isinstance(priority, records.NoQueuePriority)
                     self.assertEqual(priority.entries[0]["unit"], "present")
+
+    def test_retired_priority_requests_leave_priority_unchanged(self) -> None:
+        with AdmissionFixture() as fixture:
+            with mock.patch.object(gate, "priority_labels", return_value={
+                    "session": UnitLabels("worker", unit="present")}):
+                self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                    "initial", "present", "urgent", "director")), [wire.Ok()])
+            priority = fixture.server.priority
+            self.assertIsInstance(priority, records.QueuePriority)
+            self.assertEqual(service.read_state(fixture.state_dir).priority, priority)
+            request = wire.PrioritySetRequest("retired", "present", "other words", "director")
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+            data = cast(dict[str, object], envelope["data"])
+            data["target"] = {"kind": "OneRun", "run": codec.snapshot_value(wire.RunIdentity(41, "900")),
+                              "step": "nextest"}
+            for name in ("priority_set", "priority_run_set"):
+                with self.subTest(name=name):
+                    envelope["type"] = name
+                    peer = fixture.connect(json.dumps(envelope) + "\n")
+                    self.assertEqual(peer.replies(), [wire.Refused("priority applies to a unit")])
+                    reply, = fixture.connect(wire.ViewRequest()).replies()
+                    assert isinstance(reply, wire.ViewReply)
+                    self.assertEqual(reply.reading.explanation.priority, priority)
+                    self.assertEqual(service.read_state(fixture.state_dir).priority, priority)
 
     def test_waiter_keeps_source_basis_scope_and_typed_width_in_state_and_views(self) -> None:
         for source, runs in (("measured", 7), ("buildlog", 12), ("pooled", 31), ("fallback", 0)):

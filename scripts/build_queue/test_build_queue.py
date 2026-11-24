@@ -28,11 +28,12 @@ class QueueTests(unittest.TestCase):
         self.fixture.free(0)
         self.fixture.hold_starts()
 
-    def waiter(self, pid: int, unit: str) -> wire.AdmitRequest:
+    def waiter(self, pid: int, unit: str, *, session_id: str | None = None) -> wire.AdmitRequest:
         owner = self.fixture.fixture_owner(pid, str(pid))
         request = self.fixture.request(owner=owner)
         request = replace(request, identity=replace(request.identity, name="recorded-" + unit,
-            unit=unit, folder=f"/fixture/tree-{pid}"))
+            unit=unit, folder=f"/fixture/tree-{pid}",
+            session_id=request.identity.session_id if session_id is None else session_id))
         _ = self.fixture.server.handle_request(request)
         return request
 
@@ -284,10 +285,28 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([(bump.action, bump.unit) for bump in self.bumps()],
                          [(person_actions.SetBump(selected, 2), "tail")] * 5)
 
+    def test_bump_uses_the_session_label_when_the_waiter_has_no_unit(self) -> None:
+        waiter = self.waiter(100, "")
+        session = waiter.identity.session_id
+        selected = self.fixture.server.waiters[waiter.episode].row.get("move_id", "")
+        with mock.patch.object(memory_admit, "priority_labels",
+                               return_value={session: unit_labels.UnitLabels("worker", unit="roster-unit")}) as read:
+            self.assertEqual(self.bump_output("1")[0], 0)
+        read.assert_called_once_with([session])
+        bump, = self.bumps()
+        self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(selected, 1), "roster-unit"))
+
     def test_unitless_bump_refuses_without_writing_priority(self) -> None:
         _ = self.waiter(100, "")
         with mock.patch.object(memory_admit, "priority_labels", return_value={}):
             self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step 1 has no unit\n", ""))
+        self.assertEqual(self.bumps(), [])
+
+    def test_waiter_with_no_session_or_unit_cannot_be_bumped(self) -> None:
+        _ = self.waiter(100, "", session_id="")
+        with mock.patch.object(memory_admit, "priority_labels") as read:
+            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step 1 has no unit\n", ""))
+        read.assert_not_called()
         self.assertEqual(self.bumps(), [])
 
     def test_clear_from_any_session_records_the_actor(self) -> None:
