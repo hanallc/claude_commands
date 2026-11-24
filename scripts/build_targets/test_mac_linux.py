@@ -136,11 +136,12 @@ guest_input, link = os.pipe()
 forward = ['head', '-c', str(bootstrap_bytes + 16)] if scenario == 'disconnect' else ['tee', str(payload)]
 _ = subprocess.Popen(forward, stdout=link)
 before_copy = scenario in ('disconnect-before-copy', 'interrupted-before-copy')
+lost_reply = scenario == 'lost-run-reply'
 # A guest whose SSH server has not seen the end of the link keeps its input open.
 held = before_copy or 'FIXTURE_HELD_LINK' in os.environ
 guest = subprocess.Popen(['bash', '-c', shell], stdin=guest_input,
-                         stdout=subprocess.DEVNULL if before_copy else None,
-                         stderr=subprocess.PIPE if before_copy else None,
+                         stdout=subprocess.DEVNULL if before_copy or lost_reply else None,
+                         stderr=subprocess.PIPE if before_copy else subprocess.DEVNULL if lost_reply else None,
                          env=environment, start_new_session=True, pass_fds=(link,) if held else ())
 os.close(guest_input)
 os.close(link)
@@ -159,6 +160,9 @@ if before_copy:
     os._exit(255)
 status = guest.wait()
 record_bundle()
+if lost_reply:
+    assert status == 0, status
+    sys.exit(255)
 sys.exit(status)
 '''
 
@@ -278,6 +282,8 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
         signal.pause()
     if scenario == 'runner-failure':
         raise RuntimeError('fixture guest runner failed')
+    if scenario == 'lost-run-reply':
+        Path(os.environ['FIXTURE_RUN_GROUP']).write_text(str(os.getpgrp()))
     if scenario == 'time-limit':
         sleep(time_limit.seconds)
         report = f'time limit: limit {time_limit.seconds:g} s'
@@ -944,18 +950,20 @@ fi
         with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
             self.assertEqual(mac_linux.settlement(self.placed.episode, 16), placement.Settled())
 
-    def test_guest_without_a_start_line_saves_end_proof_and_reports_no_execution(self) -> None:
+    def test_guest_that_ran_without_a_received_start_line_reports_an_unknown_result(self) -> None:
         attempt = 16
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
         pending = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
         with patch.object(mac_linux, 'send_guest_execution', return_value=pending) as report:
-            reason = self.not_started(self.route('disconnect-before-copy'))
-        self.assertIn('Guest cleanup: ended', reason)
-        report.assert_called_once()
-        request = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertIsInstance(request.evidence, execution_identity.ExecutionNotStarted)
-        self.assertEqual(request.outcome, placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER))
-        self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+            outcome = self.route('lost-run-reply')
+        self.assertTrue((self.root / 'run.group').is_file())
+        self.assertIsInstance(outcome, str)
+        self.assertIn('Guest cleanup: ended', str(outcome))
+        self.assertIn('did not confirm whether the run started', str(outcome))
+        report.assert_not_called()
+        self.assertIsInstance(mac_linux.settlement(self.placed.episode, attempt), placement.Pending)
+        with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
 
     def lose_guest_permission_reply(self, attempt: int) -> wire.ConsumePermission:
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
@@ -995,6 +1003,31 @@ fi
         self.assertEqual(record['attempt'], execution_identity.attempt_key(episode, self.placed.attempt))
         self.assertEqual(record['claim'], request.claim.claim_id)
         self.assertEqual(record['result'], 'not started')
+
+    def test_lost_launch_replies_request_settlement_after_releasing_the_holder(self) -> None:
+        for attempt, scenario in ((48, 'missing-arm-ack'), (49, 'lost-consume-reply'), (51, 'already-consumed')):
+            with self.subTest(scenario=scenario):
+                self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+                if scenario == 'already-consumed':
+                    reply = wire.DispatchStatus(self.placed, placement.CurrentAssignment(),
+                        placement.PermissionConsumed(1.0), 'launch permission was already consumed')
+                    consume = patch.object(admission_client, 'consume_permission', return_value=reply)
+                elif scenario == 'lost-consume-reply':
+                    consume = patch.object(admission_client, 'consume_permission',
+                                           side_effect=wire.AdmissionUnavailable('fixture lost consume reply'))
+                else:
+                    consume = nullcontext()
+                with consume, patch.object(mac_linux, 'send_guest_execution') as report:
+                    outcome = self.route(scenario)
+                assert isinstance(outcome, mac_linux.GuestNotStarted), outcome
+                self.assertTrue(outcome.settlement_required)
+                report.assert_not_called()
+                with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+                    mac_linux.reconcile_unproven(self.placed.episode, attempt)
+                submit.assert_called_once()
+                mac_linux.reconcile_guest_end(self.placed.episode, attempt)
+                self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+        self.assert_guest_clean('probe', 'arm', 'fence', 'fence', 'fence')
 
     def test_guest_fence_refuses_a_gate_that_arms_after_reconciliation(self) -> None:
         request = self.lose_guest_permission_reply(29)
@@ -1116,6 +1149,29 @@ fi
         self.assertEqual(mac_linux.settlement(self.placed.episode, 38), placement.Settled())
         self.assert_guest_clean('probe')
         self.assertFalse(self.run_lock().exists())
+
+    def test_failed_launch_release_exits_with_a_settlement_error(self) -> None:
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        armed = mac_linux.ArmedGuestAttempt('fixture-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture')
+        for attempt, reason in ((52, 'the guest end is unproven'), (50, 'the guest main probe failed')):
+            with self.subTest(reason=reason):
+                self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+                transfer = (patch.object(mac_linux, 'transfer_source', side_effect=mac_linux.GuestEndUnproven(reason, armed))
+                            if attempt == 52 else nullcontext())
+                with (transfer, patch.object(mac_linux, '_end_proofs_path', side_effect=[path, path.parent, path.parent]),
+                      patch.object(mac_linux, 'send_guest_execution') as report, redirect_stderr(io.StringIO())):
+                    outcome = self.route('main-probe-failure')
+                assert isinstance(outcome, str), outcome
+                self.assertIn('Cannot release the Mac Linux launch holder', outcome)
+                self.assertIn(reason, outcome)
+                report.assert_not_called()
+                self.assertIsInstance(mac_linux.settlement(self.placed.episode, attempt), placement.Pending)
+                with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+                    mac_linux.reconcile_unproven(self.placed.episode, attempt)
+                    submit.assert_not_called()
+                    with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+                        mac_linux.reconcile_unproven(self.placed.episode, attempt)
+                    submit.assert_called_once()
 
     def test_direct_affected_retries_after_a_consumed_guest_takes_no_run(self) -> None:
         key = treekey.tree_key(str(self.repo))
@@ -1935,7 +1991,8 @@ fi
         self.assert_guest_clean('probe', 'arm', 'fence')
 
     def test_disconnect_before_take_copy_kills_the_run_and_proves_end(self) -> None:
-        reason = self.not_started(self.route('disconnect-before-copy'))
+        reason = self.route('disconnect-before-copy')
+        assert isinstance(reason, str), reason
         self.assertIn('SSH or source stream exited 255', reason)
         self.assertIn('Guest cleanup: ended', reason)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
@@ -2523,7 +2580,7 @@ fi
         self.assertIn('Guest cleanup: ended', str(result))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def test_runner_failure_before_a_test_lets_natedev_take_the_gate(self) -> None:
+    def test_runner_failure_before_a_test_reports_an_unconfirmed_start(self) -> None:
         # Without Chromium on the guest PATH, the runner stops before a test starts.
         (self.root / 'bin/chromium').unlink()
         # A host can have Chromium, as the guest has: a PATH folder that holds it changes to a fixture folder of links
@@ -2539,8 +2596,10 @@ fi
                 folders[index] = str(links)
         os.environ['PATH'] = os.pathsep.join(folders)
         self.assertIsNone(shutil.which('chromium'))
-        reason = self.not_started(self.route())
-        self.assertRegex(reason, r'^SSH or source stream exited 1: .*Chromium is absent from the guest PATH')
+        reason = self.route()
+        assert isinstance(reason, str), reason
+        self.assertRegex(reason, r'^mac-linux: SSH or source stream exited 1: .*Chromium is absent from the guest PATH')
+        self.assertIn('did not confirm whether the run started', reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_unusable_reply_names_the_exit_status_and_the_stderr_tail(self) -> None:
@@ -2588,8 +2647,9 @@ fi
         main = self.guest_home / '.claude'
         self.assertIsInstance(self.route(), GateRun)
         _ = (self.repo / 'scripts/fixture/test_added.py').touch()
-        reason = self.not_started(self.route('disconnect'))
-        self.assertTrue(reason.startswith('SSH or source stream exited 1:'), reason)
+        reason = self.route('disconnect')
+        assert isinstance(reason, str), reason
+        self.assertTrue(reason.startswith('mac-linux: SSH or source stream exited 1:'), reason)
         self.assertEqual((main / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
         self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
@@ -2683,7 +2743,10 @@ fi
 
         with (patch.dict(os.environ, {'FIXTURE_PROBED_MAIN': self.git('rev-parse', 'origin/main')}),
               patch.object(mac_linux, 'arm_guest', lose_retry_reply)):
-            self.assertIn('did not acknowledge the armed deadline', self.not_started(self.route()))
+            outcome = self.route()
+        assert isinstance(outcome, mac_linux.GuestNotStarted), outcome
+        self.assertTrue(outcome.settlement_required)
+        self.assertIn('did not acknowledge the armed deadline', outcome.reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'arm')
         self.assertFalse((self.guest_home / 'build').exists())
         self.assertIsInstance(mac_linux.settlement(episode, 45), placement.Pending)
@@ -2736,8 +2799,9 @@ fi
     def test_guest_refuses_when_the_type_check_tool_is_missing(self) -> None:
         missing = self.root / 'missing-basedpyright'
         with patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(missing)}):
-            reason = self.not_started(self.route(type_dirs=('scripts',)))
-        self.assertTrue(reason.startswith('SSH or source stream exited 1:'), reason)
+            reason = self.route(type_dirs=('scripts',))
+        assert isinstance(reason, str), reason
+        self.assertTrue(reason.startswith('mac-linux: SSH or source stream exited 1:'), reason)
         self.assertIn(f'The guest cannot find the type-check tool {missing}', reason)
         self.assertIn('Guest cleanup: ended', reason)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
