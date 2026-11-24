@@ -426,39 +426,6 @@ ENTRIES = (
             "count": "1", "noun": "command"})),
         purpose="Auto mode refused a session's commands. The commands wait for you.",
         session=SessionTemplate("{session}"), expand_values=auto_mode_refused_values),
-    # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
-    # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
-    # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop from the case.
-    # It removes a final period from cause and fix. Only the started push has the alert's waits_line.
-    # No owner, file, command or commit (user, 2026-10-23 19:20). Examples: the demo and handler cases of 2026-10-23.
-    PushText("permission.rca_started", "{sender}", "note", "{sender}: finding why {session} hit a check",
-        NoActionNeeded(),
-        "At {time} in the {session} session, {stop}.{waits_line} "
-        + "A session now finds the cause and fixes it, so this does not happen again. "
-        + "A second push comes when the fix is in.",
-        (PushExample("typical", {"sender": "hana", "session": "demo", "time": "14:23 AST",
-            "stop": "auto mode refused a file change", "waits_line": " The demo build waits for it."}),
-         PushExample("prompt", {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-            "stop": "the session asked you to allow a shell command", "waits_line": ""})),
-        purpose="Someone starts to find the cause of a session's permission check."),
-    PushText("permission.rca_fixed", "{sender}", "note", "{sender}: fixed why {session} hit a check",
-        NoActionNeeded(),
-        "At {time} in the {session} session, {stop}.\nWhy: {cause}.\nNow: {fix}.",
-        (PushExample("typical", {"sender": "hana", "session": "demo", "time": "14:23 AST",
-            "stop": "auto mode refused a file change",
-            "cause": "the steps told the session to write a progress file by hand, which auto mode does not allow",
-            "fix": "a script writes that file, so the session never has to"}),
-         PushExample("prompt", {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-            "stop": "the session asked you to allow a shell command",
-            "cause": "a helper ran a build command that needs your permission",
-            "fix": "helpers use the build command that is always allowed"})),
-        purpose="The fix merged: that check no longer stops or refuses the session."),
-    # rca.py fixed sends this when the push review refused the fixed text twice: the reviewer's own rewrite.
-    PushText("permission.rca_fixed_rewritten", "{sender}", "note", "{title}", NoActionNeeded(), "{body}",
-        (PushExample("typical", {"sender": "hana", "title": "hana: fixed why demo hit a check",
-            "body": "At 14:23 AST in the demo session, auto mode refused a file change.\n"
-            + "Why: its steps told it to write a progress file by hand.\nNow: a script writes that file."}),),
-        purpose="The fix merged; the push review wrote this text after two refusals."),
     # Paid credits (user approved 2026-10-21): sent with send.py --text-id quota.paid_credits. send.py fills
     # sender from the session's own name; a script with no session record names itself with --from.
     # Examples: the codex2 values the user approved, and codex1 sent from the natedev session.

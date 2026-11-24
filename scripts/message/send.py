@@ -242,19 +242,10 @@ SESSION_TEMPLATES = {
     PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
                                + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
-    rca.STARTED_TEXT: ("a unit starts to fix the cause of a permission stop or refusal. Sent by rca.py start;"
-                       + " sessions run rca.py, not this: " + rca.CALL + " start <id> --owner <unit>"),
-    rca.FIXED_TEXT: ("the fix merged; that permission does not stop or refuse the session again. Sent by rca.py fixed;"
-                     + " sessions run rca.py, not this: " + rca.CALL
-                     + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
-    rca.REWRITTEN_TEXT: ("the push review's rewrite of a fixed text it refused twice. Sent by rca.py fixed;"
-                         + " sessions run rca.py, not this."),
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
-# The rca.py pushes describe permission stops or refusals. A cause can name an auto-mode refusal.
-RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
@@ -4840,7 +4831,7 @@ def wrong_template(options: Options, shown: str) -> str | None:
     if options.to != USER or options.user_asked:
         return None
     registered_text = bool(options.text_id) and not push_texts.agent_written(options.text_id)
-    if options.text_id != AUTO_MODE_TEXT and options.text_id not in RCA_TEXTS and reports_auto_mode_refusal(shown):
+    if options.text_id != AUTO_MODE_TEXT and reports_auto_mode_refusal(shown):
         return AUTO_MODE_HELD
     if not registered_text and PAID_CREDITS_REPORT.search(shown) is not None:
         return PAID_CREDITS_HELD
