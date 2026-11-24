@@ -1291,8 +1291,10 @@ class AssignLauncherTests(HookAssignmentFixture):
                                      ("held lock with receipt", "implement", worker.ExitCode.BUSY),
                                      ("held name lock with receipt", "implement", worker.ExitCode.BUSY),
                                      ("done with an active pass", "implement", worker.ExitCode.BUSY),
+                                     ("completion waits for a detached run", "test", worker.ExitCode.BUSY),
                                      ("blocked", "test", worker.ExitCode.BLOCKED)):
             with self.subTest(state=case), ExitStack() as cleanup:
+                locations[pane]["agent_status"] = "working"
                 world.first_turn_timeout = case in ("working", "missing receipt")
                 _ = cleanup.callback(setattr, world, "first_turn_timeout", False)
                 task = "Implement" if role == "implement" else "Test"
@@ -1309,6 +1311,18 @@ class AssignLauncherTests(HookAssignmentFixture):
                     locations[pane]["agent_status"] = "done"
                     self.write_phase_prompt("7", "Assignment core", "Change the active prompt.")
                     self.assertEqual(worker_panes.worker_pass(row, self.session_dir).get("status"), "active")
+                if case == "completion waits for a detached run":
+                    passed = worker_panes.worker_pass(row, self.session_dir)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    self.native.agent.append(pane, "assistant", f"Changes complete.\nDONE {delivery.completion_id}")
+                    _ = cleanup.callback(write_text_atomic, source, transcript)
+                    path, detached = self.native.detached_record(row, "verification")
+                    supervisor = cleanup.enter_context(subprocess.Popen(
+                        [sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                        stdin=subprocess.PIPE))
+                    detached.update(status="running", pid=supervisor.pid, pane_dispatch_id=str(passed["instance_id"]))
+                    write_text_atomic(path, json.dumps(detached))
+                    _ = cleanup.callback(path.unlink)
                 if case == "held lock with receipt":
                     hold = cleanup.enter_context(worker_panes.worker_lock(self.native.fixture.parent.id,
                                                                           staff.WorkerName.parse("impl")))
@@ -1328,6 +1342,9 @@ class AssignLauncherTests(HookAssignmentFixture):
                     self.assertIn("dispatch lock is held", refused.stderr)
                 if case == "done with an active pass":
                     self.assertIn("has different prompt content", refused.stderr)
+                if case == "completion waits for a detached run":
+                    self.assertEqual(locations[pane]["agent_status"], "done")
+                    self.assertIn(worker.CompletionRecovery.WAITING_ON_RUNS.value, refused.stderr)
                 if case == "blocked":
                     self.assertIn(question, refused.stderr)
                 self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, files)
