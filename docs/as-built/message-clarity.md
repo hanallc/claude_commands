@@ -48,6 +48,9 @@ The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
 `send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
+The hold ends when the review ends (count 0), or after `review_hold_idle_minutes` with no user prompt.
+Each user prompt restarts that time.
+The next user prompt after an idle end delivers the held messages and starts the hold again while the review has open items.
 A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
 Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
 Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
@@ -69,6 +72,7 @@ The hook works only after its `PreToolUse` entry is in `settings.json`.
 
 When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
 The block tells Claude Code to omit the original prompt text.
+A release batch passes an open hold: a line that starts with this session's held messages notice marks it.
 The session-start hook preserves the state and pending messages while the review hold is open.
 It delivers pending messages after the hold ends.
 

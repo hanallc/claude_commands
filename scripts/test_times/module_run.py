@@ -35,9 +35,10 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
-from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, gate_parent
+from scripts.lib.python_startup.sitecustomize import UnverifiedGateParent, checkout_root, gate_parent
 
 if TYPE_CHECKING:
+    from scripts.lib.testing_folders import PreparedTestRunsParent
     from scripts.test_times.gate_record import TestStatus, TestTime
 
 
@@ -212,6 +213,8 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     from stat import S_ISLNK
 
     canonical = os.path.realpath
+    lstat = os.lstat
+    stat = os.stat
 
     def entry_path(path: str) -> str:
         parent, name = os.path.split(path.rstrip(os.sep) or os.sep)
@@ -263,12 +266,12 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
                 if normal.startswith(prefixes):
                     # The event omits dir_fd, so a relative name counts only when the working directory holds it.
                     return absolute if not relative or os.path.lexists(normal) else None
-            status = os.lstat(absolute)
+            status = lstat(absolute)
             if S_ISLNK(status.st_mode):
                 return absolute if canonical(absolute).startswith(prefixes) else None
             if status.st_dev not in devices:
                 return None
-            parent = os.stat(os.path.dirname(absolute))
+            parent = stat(os.path.dirname(absolute))
         except (OSError, ValueError):
             return None
         return absolute if (parent.st_dev, parent.st_ino) in folders else None
@@ -701,18 +704,41 @@ class GateModuleLease:
 
 
 @dataclass(frozen=True)
-class StandaloneModuleRun:
-    """The runner owns its folder leases."""
+class UnleasedGateJob:
+    """A gate job without a module lease. The runner keeps its folder leases in the gate's TMPDIR."""
 
 
-def runner_folder_owner() -> GateModuleLease | StandaloneModuleRun:
+@dataclass(frozen=True)
+class DirectModuleRun:
+    """A direct run. The runner keeps its folder leases in the test-runs folder of the start_dir checkout.
+
+    A checkout without a modeled output uses `$TMPDIR/test-runs` instead.
+    """
+    parent: PreparedTestRunsParent
+
+
+RunnerFolderOwner = GateModuleLease | UnleasedGateJob | DirectModuleRun
+
+
+def runner_folder_owner(start_dir: Path) -> RunnerFolderOwner:
     if root := os.environ.pop("MERGE_GATE_MODULE_DIR", ""):
         return GateModuleLease(Path(root))
-    return StandaloneModuleRun()
+    if not isinstance(gate_parent(), UnverifiedGateParent):
+        return UnleasedGateJob()
+    from scripts.lib import git_files
+    from scripts.lib.testing_folders import prepare_test_runs_parent, use_test_runs_parent
+
+    try:
+        checkout = git_files.locate(start_dir).toplevel
+    except git_files.GitFilesError:
+        checkout = Path(checkout_root(str(start_dir)) or start_dir)
+    parent = prepare_test_runs_parent(checkout)
+    use_test_runs_parent(parent)
+    return DirectModuleRun(parent)
 
 
 @contextmanager
-def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Generator[Path]:
+def runner_folder(owner: RunnerFolderOwner, name: str) -> Generator[Path]:
     if isinstance(owner, GateModuleLease):
         folder = owner.root / name
         creator = os.getpid()
@@ -730,6 +756,12 @@ def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Ge
                     from scripts.lib import build_folders
 
                     build_folders.remove_folder(folder)
+    elif isinstance(owner, DirectModuleRun):
+        from scripts.lib import build_folders
+
+        request = build_folders.UniqueBuildFolder(f"{name}-", build_folders.ExplicitBuildParent(owner.parent))
+        with build_folders.temporary_build_folder(request) as folder:
+            yield folder
     else:
         from scripts.lib import build_folders
 
@@ -737,7 +769,7 @@ def runner_folder(owner: GateModuleLease | StandaloneModuleRun, name: str) -> Ge
             yield folder
 
 
-def main(owner: GateModuleLease | StandaloneModuleRun, run_root: Path) -> None:
+def main(owner: RunnerFolderOwner, run_root: Path) -> None:
     violation_log = (owner.root if isinstance(owner, GateModuleLease) else run_root) / "live-config-writes"
     try:
         from scripts.lib import conf_reads
@@ -759,9 +791,6 @@ def main(owner: GateModuleLease | StandaloneModuleRun, run_root: Path) -> None:
 
 
 def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log: Path) -> None:
-    if len(sys.argv) != 3:
-        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
-        sys.exit(2)
     start_dir, pattern = sys.argv[1:]
     output = os.environ.pop("TEST_TIMES_OUT", None)
     TimedRunner.destination = NoTimesOutput() if output is None else TimesOutput(Path(output), config_log)
@@ -797,8 +826,8 @@ def run_module(config_log: Path | NoConfigReadLog, run_root: Path, violation_log
 
 
 @contextmanager
-def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator[Path]:
-    """Keep imported run roots, the config copy and child processes under one private folder."""
+def private_run_roots(owner: RunnerFolderOwner) -> Generator[Path]:
+    """Keep the test config, run roots and child processes under one private folder."""
     names = ("SCRATCH_ROOT", "ASTRA_REVIEW_DIR", "CONF_DIR")
     previous = {name: os.environ[name] for name in names if name in os.environ}
 
@@ -821,7 +850,7 @@ def private_run_roots(owner: GateModuleLease | StandaloneModuleRun) -> Generator
         yield root
 
 
-def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cleanup: ExitStack) -> None:
+def run_with_descendant_cleanup(owner: RunnerFolderOwner, cleanup: ExitStack) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
     from scripts.lib.descendants import adopt_descendants
@@ -917,6 +946,9 @@ def run_with_descendant_cleanup(owner: GateModuleLease | StandaloneModuleRun, cl
 
 
 if __name__ == "__main__":
-    folder_owner = runner_folder_owner()
+    if len(sys.argv) != 3:
+        print("usage: module_run.py <start_dir> <pattern>", file=sys.stderr)
+        sys.exit(2)
+    folder_owner = runner_folder_owner(Path(sys.argv[1]).resolve())
     with ExitStack() as runner_cleanup:
         run_with_descendant_cleanup(folder_owner, runner_cleanup)

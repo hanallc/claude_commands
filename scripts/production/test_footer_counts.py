@@ -142,12 +142,12 @@ class FooterCountsTests(unittest.TestCase):
         _ = listing.write_text(LIST, encoding="utf-8")
         doc = self.doc(f"- **Change review:** `{listing}`")
         record = staff.snapshot()
-        with (mock.patch.object(change_review, "routed_review_entries", wraps=change_review.routed_review_entries) as routed,
+        with (mock.patch.object(change_review, "review_snapshot", wraps=change_review.review_snapshot) as snapshot,
               mock.patch.object(staff, "snapshot", side_effect=AssertionError("use the supplied snapshot"))):
             counts = footer_counts.read_counts(doc, record=record)
         self.assertEqual(counts.changes, 2)
         self.assertEqual(counts.unrouted, 0)
-        routed.assert_called_once_with(listing, doc, record=record)
+        snapshot.assert_called_once_with(listing, include_reviewed=False, collect_owners=False)
 
     def test_footer_counts_and_watches_questions_without_a_proposals_line(self) -> None:
         doc = self.root / "example-production.md"

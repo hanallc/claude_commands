@@ -28,7 +28,7 @@ from scripts.review_links import (
     change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
     review_submissions,
 )
-from scripts.review_links.test_accounts_page import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 class ConsoleMarkup(HTMLParser):

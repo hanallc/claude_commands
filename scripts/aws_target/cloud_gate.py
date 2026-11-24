@@ -27,7 +27,7 @@ import time
 from typing import BinaryIO, Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
+from scripts.aws_target import admin_secrets, gate_box, key_refusal, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import (AwsOn, account_settings_path, aws_switch, cloud_gate_off_reason, gate_deployment,
@@ -183,19 +183,37 @@ def launch_error_code(reason: str) -> str:
     return code[1] if code and code.lastindex else code[0] if code else ''
 
 
-def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
-    """Read module completion lines from the current box log."""
-    total = 0
-    finished: set[str] = set()
-    for line in text.splitlines():
-        start = re.fullmatch(r'Runner: (\d+) modules, whole machine, \d+ CPUs', line)
+@final
+class ModuleProgress:
+    """Keep the module total and the names of completed test modules."""
+    _header = re.compile(r'Runner: ([0-9]{1,9}) modules, whole machine, [0-9]{1,9} CPUs')
+    _result = re.compile(r'(.+) exit=-?[0-9]{1,9} seconds=[0-9]{1,12}\.[0-9]{1,9}(?: stopped)?')
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.finished: set[str] = set()
+
+    def observe(self, line: str) -> None:
+        start = self._header.fullmatch(line)
         if start:
-            total = int(start[1])
-        result = re.fullmatch(r'(\S+) exit=-?\d+ seconds=\d+\.\d+(?: stopped)?', line)
-        if result:
-            finished.add(result[1])
-    return (progress_profile.ProgressCounter('modules', min(len(finished), total), total)
-            if total else progress_profile.NoCounter('The box has no module counter yet'))
+            self.total = int(start[1])
+        else:
+            result = self._result.fullmatch(line)
+            if result and result[1] != '/'.join(gate_record.TYPE_CHECK_JOB):
+                self.finished.add(result[1])
+
+    def counter(self) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+        if not self.total:
+            return progress_profile.NoCounter('The box has no module counter yet')
+        return progress_profile.ProgressCounter('modules', min(len(self.finished), self.total), self.total)
+
+
+def log_progress(text: str) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
+    """Read module progress from the current box log."""
+    progress = ModuleProgress()
+    for line in text.splitlines():
+        progress.observe(line)
+    return progress.counter()
 
 
 def log_cloud_progress(text: str, size_vcpus: int, updated_at: float) -> cloud_progress.CloudProgress:
@@ -1435,6 +1453,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         reason = cloud_gate_off_reason(switch)
         end_open_gates(attempt.directory, service)
         return LocalFallback(reason)
+    if isinstance(key_refusal.read(attempt.directory), key_refusal.KeyRefused):
+        # AWS refuses every call with this key, so the gate makes none.
+        return LocalFallback(key_refusal.REFUSED_REASON)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'

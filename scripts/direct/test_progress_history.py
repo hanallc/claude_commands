@@ -2786,6 +2786,24 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual([(event["checkpoint_commit"], event["event_id"])
                           for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
 
+    def test_checkpoint_of_a_transferred_unit_checks_its_current_folder_when_the_old_folder_remains(self) -> None:
+        session = self.start_run("transferred-checkpoint", 1000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 1010)
+        row = unit_runs.run_owner(self.read_state(session), staff.snapshot())
+        assert isinstance(row, staff.StaffRow)
+        current = self.root / "transferred-worktree"
+        _ = subprocess.run(["git", "init", "-q", str(current)], check=True, capture_output=True)
+        commit = commit_repository(current, "transferred checkpoint", allow_empty=True)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), current), expected=row.worktree)
+        recorded = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1020)
+        self.assertEqual([(event["checkpoint_commit"], event["event_id"])
+                          for event in self.phase_events(session.name, "checkpoint")], [(commit, recorded)])
+        missing = "4d38667805cd7cdb0f8a0b8e2e6e1c4d3dc3e4f0"
+        refused = self.run_failing_command("checkpoint", "--session-dir", str(session), "--phase", "6",
+                                           "--commit", missing, at=1025)
+        folders = f"{self.working_dir.resolve()} or {current}"
+        self.assertEqual(refused.stderr.splitlines(), [f"checkpoint refused: {missing} is not a commit in {folders}"])
+
     def test_checkpoint_without_a_phase_started_event_checks_the_current_directory(self) -> None:
         session = self.covered_wait_phase("checkpoint-current-directory")
         history = self.history_dir / "runs" / f"{session.name}.jsonl"

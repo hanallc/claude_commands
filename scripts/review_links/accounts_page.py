@@ -358,9 +358,10 @@ def _swatch(spans: list[accounts.BoardSpan]) -> str:
     color = accounts.account_color(spans[0].get("color", ""))
     css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
     background = f' style="background:{css}"' if css else ""
-    return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
+    key = html.escape(spans[0]["color_key"], quote=True)
+    return (f'<button type="button" class="color-swatch" data-color-key="{key}" '
             + f'data-color-name="{name}" data-saved-color="{css}"{background} '
-            + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
+            + f'aria-label="Change {name} color" aria-haspopup="dialog" data-window-place="color:{key}"></button>')
 
 
 def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...],

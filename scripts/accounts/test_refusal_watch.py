@@ -18,6 +18,7 @@ import fcntl
 import itertools
 import json
 import os
+import shlex
 import socket
 import shutil
 import subprocess
@@ -36,7 +37,6 @@ from unittest.mock import ANY, Mock, call, patch
 from scripts.lib import conf, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
@@ -89,6 +89,8 @@ def observe_whole_reads() -> Generator[Mock]:
 
 
 REAL_SESSION_MOVES = stop_resume.move_sessions
+# A row lock that this test process holds names this holder.
+HOLDER = f"pid {os.getpid()}: {shlex.join(sys.argv)}"
 
 
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
@@ -140,7 +142,7 @@ class RefusalWatchTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
         write_machine_config(Path(os.environ["CONF_DIR"]))
-        for name in ("send", "postmaster", "codex_daemon"):
+        for name in ("send", "postmaster", "codex_daemon", "shutdown"):
             _ = shutil.copy2(conf.test_config_path(name),
                              Path(os.environ["CONF_DIR"]) / f"{name}.conf")
         (self.home / "notes").mkdir()
@@ -1379,6 +1381,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(stop_resume, "_retire_prompt"),
               patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
               patch.object(stop_resume, "_stop", side_effect=stop_resume.NotRunning),
+              patch.object(stop_resume, "_hung_holder_seconds", return_value=0),
               patch.object(stop_resume, "_resume_move", side_effect=resume)):
             older = accounts.move_group("showrunners", "claude3")
             assert isinstance(older, accounts.GroupMoveStarted), older
@@ -1639,7 +1642,6 @@ class RefusalWatchTests(unittest.TestCase):
         with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
               patch.object(staff, "initial_snapshot", side_effect=self.membership),
               patch.object(pane_launch, "current_kind", return_value="claude"),
-              patch.object(stop_resume, "_build_holders", return_value={}),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
               patch.object(stop_resume, "_record_launches"),
               patch.object(stop_resume, "_retire_prompt"),
@@ -1653,64 +1655,58 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertCountEqual(stopped, ["direct", "late"])
         self.assertCountEqual(resumed, ["direct", "late"])
 
-    def test_direct_group_moves_report_a_busy_member_while_the_watcher_holds_its_row(self) -> None:
-        _ = self.groups(units="claude3")
+    def test_a_group_move_by_hand_takes_a_member_from_the_watcher_move(self) -> None:
         _ = self.owner("watcher", host="unit")
-        held, free_done = Event(), Event()
-        stopped: list[str] = []
-        resumed: list[str] = []
+        for target in ("claude1", "claude3"):
+            with self.subTest(target=target):
+                self.moves.calls.clear()
+                _ = self.groups(units="claude3")
+                held, released = Event(), Event()
+                stopped: list[str] = []
+                resumed: list[tuple[str, str]] = []
 
-        def stop(identity: str) -> stop_resume.NotRunning:
-            stopped.append(identity)
-            if identity == "watcher":
-                self.assertEqual(staff.row_activity(identity), staff.RowMoving("claude3"))
-                held.set()
-                self.assertTrue(free_done.wait(5))
-            return stop_resume.NotRunning(identity)
+                def stop(identity: str) -> stop_resume.NotRunning:
+                    stopped.append(identity)
+                    if len(stopped) == 1:
+                        self.assertEqual(staff.row_activity(identity), staff.RowMoving("claude3"))
+                        held.set()
+                        self.assertTrue(released.wait(5))
+                    return stop_resume.NotRunning(identity)
 
-        def resume(identity: str, target: str, why: str, *_args: object) -> stop_resume.ClaudeUp:
-            resumed.append(identity)
-            self.moved(MoveCall(identity, target, why))
-            if identity == "free":
-                self.assertEqual(staff.row_activity("watcher"), staff.RowMoving("claude3"))
-                free_done.set()
-            return stop_resume.ClaudeUp(identity, "w1:p1", target)
+                def resume(identity: str, account: str, why: str, *_args: object) -> stop_resume.ClaudeUp:
+                    resumed.append((identity, account))
+                    self.moved(MoveCall(identity, account, why))
+                    return stop_resume.ClaudeUp(identity, "w1:p1", account)
 
-        with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
-              patch.object(staff, "initial_snapshot", side_effect=self.membership),
-              patch.object(pane_launch, "current_kind", return_value="claude"),
-              patch.object(stop_resume, "_build_holders", return_value={}),
-              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
-              patch.object(stop_resume, "_record_launches"),
-              patch.object(stop_resume, "_retire_prompt"),
-              patch.object(stop_resume, "_send_move_push") as send,
-              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
-              patch.object(stop_resume, "_stop", side_effect=stop),
-              patch.object(stop_resume, "_resume_move", side_effect=resume),
-              patch("scripts.agents.stop_resume.time.sleep", side_effect=AssertionError("busy row was retried")),
-              ThreadPoolExecutor(max_workers=1) as pool):
-            watcher = pool.submit(refusal_watch.run, NOW, recover_units=False)
-            try:
-                self.assertTrue(held.wait(5))
-                self.reading(SOURCE_LOGIN, 80)
-                conflicting = accounts.move_group("units", "claude1")
-                self.assertIsInstance(conflicting, accounts.GroupMoveStartFailed)
-                assert isinstance(conflicting, accounts.GroupMoveStartFailed)
-                self.assertIsInstance(conflicting.outcomes[0], moves.MoveWaitingForRow)
-                self.assertIn("owner watcher: move pending", conflicting.stderr)
-                _ = self.owner("free", host="unit")
-                direct = accounts.move_group("units", "claude3")
-                self.assertIsInstance(direct, accounts.GroupMoveStarted)
-                assert isinstance(direct, accounts.GroupMoveStarted)
-                watcher_result = next(result for result in direct.outcomes if result.session_id == "watcher")
-                self.assertEqual(watcher_result, moves.MoveInProgress("watcher", "claude3"))
-            finally:
-                free_done.set()
-            self.assertTrue(any("watcher: Claude is up on claude3" in line for line in watcher.result(timeout=5)))
-        self.assertEqual(stopped, ["watcher", "free"])
-        self.assertEqual(resumed, ["free", "watcher"])
-        send.assert_not_called()
-        self.assertEqual(moves.pending_move_requests(), ())
+                def row_wait(_seconds: float) -> None:
+                    released.set()
+                    _ = Event().wait(0.01)
+
+                with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+                      patch.object(staff, "initial_snapshot", side_effect=self.membership),
+                      patch.object(pane_launch, "current_kind", return_value="claude"),
+                      patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+                      patch.object(stop_resume, "_record_launches"),
+                      patch.object(stop_resume, "_retire_prompt"),
+                      patch.object(stop_resume, "_send_move_push") as send,
+                      patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+                      patch.object(stop_resume, "_stop", side_effect=stop),
+                      patch.object(stop_resume, "_resume_move", side_effect=resume),
+                      patch("scripts.agents.stop_resume.time.sleep", side_effect=row_wait),
+                      ThreadPoolExecutor(max_workers=1) as pool):
+                    watcher = pool.submit(refusal_watch.run, NOW, recover_units=False)
+                    try:
+                        self.assertTrue(held.wait(5))
+                        self.reading(SOURCE_LOGIN, 80)
+                        direct = accounts.move_group("units", target)
+                    finally:
+                        released.set()
+                    self.assertTrue(any("watcher: Claude is up on claude3" in line for line in watcher.result(timeout=5)))
+                assert isinstance(direct, accounts.GroupMoveStarted), direct
+                self.assertEqual(direct.outcomes, (stop_resume.ClaudeUp("watcher", "w1:p1", target),))
+                self.assertEqual(stopped, ["watcher", "watcher"])
+                self.assertEqual(resumed, [("watcher", "claude3"), ("watcher", target)])
+                send.assert_not_called()
 
     def test_group_move_reports_a_held_mac_row_with_no_live_process(self) -> None:
         _ = self.groups()
@@ -1727,6 +1723,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(inventory, "listing", return_value=[]),
               patch.object(stop_resume, "move_sessions", new=move_live_sessions),
               patch.object(stop_resume, "_stop") as stop,
+              patch.object(stop_resume, "_hung_holder_seconds", return_value=0),
               patch.object(stop_resume, "_send_move_push") as send):
             preview = accounts.move_group("units", "claude3", dry_run=True)
             assert isinstance(preview, accounts.GroupMoveDryRun)
@@ -1741,11 +1738,11 @@ class RefusalWatchTests(unittest.TestCase):
                 self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude3."])
                 self.assertEqual(next_moves.read_next_moves(), ())
         assert isinstance(result, accounts.GroupMoveStartFailed)
-        self.assertEqual(result.outcomes, (moves.MoveWaitingForRow("held", "another operation holds this row"),))
+        self.assertEqual(result.outcomes, (moves.MoveWaitingForRow("held", f"another operation holds this row ({HOLDER})"),))
         self.assertIn("owner held: move pending", result.stderr)
         stop.assert_not_called()
         send.assert_not_called()
-        self.assertIn(moves.batch_move_command("held", moves.FollowGroupAccount("units")), result.stderr)
+        self.assertIn(moves.batch_move_command("held", moves.FollowGroupAccount("units"), user_command=True), result.stderr)
         self.assertFalse(moves.latest_request_path("held").exists())
 
     def test_group_move_uses_the_staff_id_when_a_row_becomes_busy_after_observation(self) -> None:
@@ -1771,15 +1768,16 @@ class RefusalWatchTests(unittest.TestCase):
                   patch.object(inventory, "listing", side_effect=listing),
                   patch.object(stop_resume, "move_sessions", new=move_live_sessions),
                   patch.object(stop_resume, "_prepare_move", side_effect=AssertionError("busy row entered a move")),
+                  patch.object(stop_resume, "_hung_holder_seconds", return_value=0),
                   patch.object(stop_resume, "_send_move_push") as send):
                 result = accounts.move_group("units", "claude3")
 
         assert isinstance(result, accounts.GroupMoveStartFailed)
         self.assertEqual(result.session_ids, (row.current_session,))
-        self.assertEqual(result.outcomes, (moves.MoveWaitingForRow(row.id, "another operation holds this row"),))
+        self.assertEqual(result.outcomes, (moves.MoveWaitingForRow(row.id, f"another operation holds this row ({HOLDER})"),))
         self.assertIn(f"{row.name}: move pending", result.stderr)
         send.assert_not_called()
-        self.assertIn(moves.batch_move_command("new-conversation", moves.FollowGroupAccount("units")), result.stderr)
+        self.assertIn(moves.batch_move_command("new-conversation", moves.FollowGroupAccount("units"), user_command=True), result.stderr)
         self.assertFalse(moves.latest_request_path(row.current_session).exists())
 
     def test_changed_registered_process_identity_confirms_completion_fresh(self) -> None:
@@ -2989,36 +2987,56 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
 
-    def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+    def test_group_completion_moves_a_unit_with_a_live_step_at_once(self) -> None:
+        from scripts.build_queue import admission_client
+
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())
         before = accounts.groups_file().read_bytes()
-        held = {"unit": ("verify.sh build in /w",)}
 
         def move_now(selected: list[str], target: str, *, why: str, **_options: object) -> list[stop_resume.MoveResult]:
             return self.moves(selected, target, why=why)
 
-        token = stop_resume._batch_process.set(True)  # pyright: ignore[reportPrivateUsage]
-        self.addCleanup(stop_resume._batch_process.reset, token)  # pyright: ignore[reportPrivateUsage]
         with patch.object(stop_resume, "move_sessions", new=REAL_SESSION_MOVES), \
                 patch.object(staff, "initial_snapshot", side_effect=self.membership), \
                 patch.object(pane_launch, "current_kind", return_value="claude"), \
                 patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound), \
                 patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()), \
-                patch.object(stop_resume, "_build_holders", side_effect=[held, held, {}]), \
-                patch.object(stop_resume, "monotonic", side_effect=[0.0, 1800.0]), \
-                patch("time.sleep"), \
+                patch.object(admission_client, "view", side_effect=AssertionError("queue read")), \
+                patch("time.sleep", side_effect=AssertionError("the move waited")), \
                 patch.object(stop_resume, "_move_now", side_effect=move_now) as moved:
             _ = self.cli()
-            self.assertEqual(moved.call_count, 0)
-            self.assertEqual(accounts.groups_file().read_bytes(), before)
-            self.assertEqual(self.moves.calls, [])
-            _ = self.cli()
+        moved.assert_called_once()
         self.assertEqual(len(self.moves.calls), 1)
         self.assertEqual(self.moves.calls[0].target, "claude3")
         self.assertEqual(accounts.groups_file().read_bytes(), before)
+
+    def test_group_completion_of_a_hand_selection_does_not_wait_or_claim(self) -> None:
+        _ = self.groups()
+        _ = self.owner("unit", host="unit")
+        _ = accounts.set_group_account("units", "claude3", why="units moved by hand", now=NOW)
+        row = self.membership().by_current_session("unit")
+        assert row is not None
+        calls: list[tuple[object, object]] = []
+        real_moves = cast(Callable[..., list[stop_resume.MoveResult]], REAL_SESSION_MOVES)
+
+        def busy_moves(*arguments: object, **options: object) -> list[stop_resume.MoveResult]:
+            calls.append((options.get("cause"), options.get("user_command", False)))
+            # Another operation takes the row after the watcher selects the member.
+            with staff.slot_operation(row.id, row.name):
+                return real_moves(*arguments, **options)
+
+        with patch.object(stop_resume, "move_sessions", new=busy_moves), \
+                patch.object(staff, "initial_snapshot", side_effect=self.membership), \
+                patch.object(pane_launch, "current_kind", return_value="claude"), \
+                patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound), \
+                patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()), \
+                patch("time.sleep", side_effect=AssertionError("the move waited")), \
+                patch.object(stop_resume, "_move_now", side_effect=AssertionError("the busy row moved")):
+            _ = self.cli()
+        self.assertEqual(calls, [("by hand", False)])
+        self.assertFalse(moves.latest_request_path(str(row.current_session)).exists())
 
     def test_hand_group_selection_without_live_members_is_reused_for_a_later_member(self) -> None:
         _ = self.groups()
@@ -4447,7 +4465,8 @@ class RefusalWatchTests(unittest.TestCase):
         assert isinstance(transition, accounts.GroupTransition)
         move.assert_called_once_with((first.id, second.id), "claude3",
                                      why="weekly refusal", account_config=ANY,
-                                     intent=moves.FollowGroupAccount("showrunners"), staff_members=(first, second))
+                                     intent=moves.FollowGroupAccount("showrunners"), staff_members=(first, second),
+                                     user_command=True)
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")

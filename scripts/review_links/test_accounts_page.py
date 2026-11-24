@@ -5,7 +5,6 @@ from scripts.lint.memory_test_support import copy_config_fixture, write_config_f
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
 import json
 import os
@@ -14,20 +13,20 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
 from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.accounts import accounts, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.review_links import accounts_page, console_theme, page_frame, serve
+from scripts.production import staff
+from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
 from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
@@ -194,51 +193,6 @@ MENU_PROBE = '''<script>
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-
-
-def firefox_probe_results(page: bytes) -> list[list[str]]:
-    """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
-    results: list[list[str]] = []
-    complete = threading.Event()
-
-    class BrowserProbe(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            if self.path == "/complete":
-                _ = complete.wait(TEST_HANG_GUARD_SECS)
-            elif self.path == "/":
-                _ = self.wfile.write(b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
-            else:
-                _ = self.wfile.write(page)
-
-        def do_POST(self) -> None:
-            payload = self.rfile.read(int(self.headers["Content-Length"]))
-            results.append(cast(list[str], json.loads(payload)))
-            complete.set()
-            self.send_response(204)
-            self.end_headers()
-
-        @override
-        def log_message(self, format: str, *args: object) -> None:
-            pass
-
-    with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
-        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-        thread.start()
-        try:
-            profile = Path(temporary) / "profile"
-            profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                  "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
-            if run.returncode:
-                raise AssertionError(run.stderr)
-        finally:
-            server.shutdown()
-            thread.join(TEST_HANG_GUARD_SECS)
-    return results
 
 
 class AccountsPageTests(unittest.TestCase):
@@ -1844,6 +1798,42 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         with (patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired((), 30)),
               self.assertRaisesRegex(OSError, "took longer than 30 s")):
             _ = accounts_page.render()
+
+    def test_new_item_opens_above_the_color_picker_and_its_screenshot_shows_the_picker(self) -> None:
+        from scripts.review_links.test_page_frame import PAGE_OWNER, WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results
+
+        if not WINDOW_BROWSERS:
+            self.skipTest("Chrome or Firefox is required for the window rule.")
+        reading = accounts.StatusReading((status_row("claude1"), status_row("claude2")), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,))
+        markup = page_frame.with_owner(rendered, "accounts", PAGE_OWNER, staff.StaffSnapshot((PAGE_OWNER,)),
+                                       new_item_dialog.render)
+        probe = r'''
+(async()=>{
+ if(nested) return;
+ try{
+  await painted();
+  const popup=document.querySelector('[data-color-picker]');
+  document.querySelector('[data-color-key="account.claude1"]').click();
+  await until(()=>popup.open,'the color picker');
+  await painted();
+  check(pressNewItem('over the color picker')!==null,'The press reaches New item.');
+  const capture=await newItemOver(popup,'the color picker');
+  const address=location.pathname+location.search+location.hash;
+  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent('color:account.claude1'),
+   'The screenshot address names the open color picker: '+capture.place);
+  await closeNewItem(popup,'the color picker');
+  await opensAgain(capture.place,doc=>doc.querySelector('[data-color-picker]')?.open===true,'the color picker');
+ }catch(error){failures.push(String(error));}
+ await report();
+})();'''
+        page = markup.replace(b"</body>", b"<script>" + (WINDOW_PROBE + probe).encode() + b"</script></body>", 1)
+        for browser in WINDOW_BROWSERS:
+            with self.subTest(browser=browser):
+                self.assertEqual(window_probe_results({"/console/accounts.html": page}, "/console/accounts.html", browser),
+                                 [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:

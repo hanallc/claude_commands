@@ -37,7 +37,7 @@ from scripts.lint.memory_test_support import admission_policy_fixture, config_en
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
-from scripts.build_queue import placement
+from scripts.build_queue import placement, queue_snapshot
 from scripts.mac_test import claim_state, mac_test
 from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -77,6 +77,27 @@ class FakeClock:
         self.sleeps.append(seconds)
         self.advance(seconds)
         self.on_sleep(seconds)
+
+
+class FixedSystemReader:
+    """Publish fixture evidence through the system reader interface."""
+
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 class InjectedCrash(RuntimeError):
@@ -134,11 +155,13 @@ class ObservedAdmissionServer(service.AdmissionServer):
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
                  check_access: Callable[[str], None], before_admission: Callable[[], None],
-                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         self.check_access: Callable[[str], None] = check_access
         self.before_admission: Callable[[], None] = before_admission
         self.wake_lock: threading.Lock = threading.Lock()
-        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path, host_probe=host_probe)
+        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path, host_probe=host_probe,
+                         job_start_reader=job_start_reader)
 
     @override
     def close(self) -> None:
@@ -245,8 +268,9 @@ class ObservedAdmissionServer(service.AdmissionServer):
 
 class TestProcesses:
     """Real pidfds with private resident-memory files."""
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, private: bool = False) -> None:
         self.path: Path = path
+        self.private: bool = private
         path.mkdir(parents=True, exist_ok=True)
         self.children: list[subprocess.Popen[bytes]] = []
         self.starts: dict[int, str] = {}
@@ -255,7 +279,7 @@ class TestProcesses:
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
-        start = records.process_start_time(child.pid)
+        start = str(child.pid) if self.private else records.process_start_time(child.pid)
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
@@ -272,11 +296,14 @@ class TestProcesses:
         return gate.process_table(self.path)
 
     def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
-        start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
+        if self.private:
+            start = self.starts.get(pid)
+        else:
+            start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
     def owner_process(self, pid: int) -> service.OwnerProcessReading:
-        return service.linux_owner_process(pid, Path("/proc"))
+        return service.linux_owner_process(pid, self.path if self.private else Path("/proc"))
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(os.getpid() if pid in self.fixture_owners else pid)
@@ -288,6 +315,9 @@ class TestProcesses:
         child = next(child for child in self.children if child.pid == owner.pid)
         child.kill()
         _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+        if self.private:
+            del self.starts[owner.pid]
+            (self.path / str(owner.pid) / "stat").unlink()
 
     def close(self) -> None:
         for child in self.children:
@@ -301,6 +331,7 @@ class PrivateReadings:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.host_path: Path = root / "meminfo"
+        self.pressure_path: Path = root / "pressure"
         self.counts: Counter[str] = Counter()
 
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
@@ -312,7 +343,7 @@ class PrivateReadings:
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host, policy=policy)
+        return gate.read_pressure(host, policy=policy, pressure_path=self.pressure_path)
 
     def build_space(self, floor: int) -> records.NoBuildSpaceHold:
         self.counts[f"build_space:{floor}"] += 1
@@ -388,11 +419,11 @@ class GaplessRefill:
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
-                 state_dir: Path | None = None, skip_idle_spacing: bool = False) -> None:
+                 state_dir: Path | None = None, skip_idle_spacing: bool = False, private: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        if configuration := os.environ.get("CONF_DIR"):
+        if not private and (configuration := os.environ.get("CONF_DIR")):
             _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         try:
@@ -409,7 +440,7 @@ class AdmissionFixture(ExitStack):
             self.skip_idle_spacing: bool = skip_idle_spacing
             self.clock: FakeClock = FakeClock()
             self.fault: Faults = Faults()
-            self.proc: TestProcesses = TestProcesses(self.root / "proc")
+            self.proc: TestProcesses = TestProcesses(self.root / "proc", private=private)
             _ = self.callback(self.proc.close)
             pressure = self.root / "pressure"
             if not pressure.exists():
@@ -440,6 +471,8 @@ class AdmissionFixture(ExitStack):
             self.loop_access: threading.RLock = threading.RLock()
             self.serving_active: threading.Event = threading.Event()
             self.loop_permission: threading.local = threading.local()
+            # The job start of each CI front pid; a fixture never reads a real runner process.
+            self.job_starts: dict[int, records.CiJobStart] = {}
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
             self.close()
@@ -449,10 +482,14 @@ class AdmissionFixture(ExitStack):
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
                                          fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn,
-                                         before_admission=self.advance_idle_spacing, host_probe=self.read_provider)
+                                         before_admission=self.advance_idle_spacing, host_probe=self.read_provider,
+                                         job_start_reader=self.read_job_start)
         if start:
             server.start()
         return server
+
+    def read_job_start(self, owner: wire.Owner) -> records.CiJobStart:
+        return self.job_starts.get(owner.pid, records.NO_JOB_START)
 
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         return placement.HostEvidenceUnavailable(key, self.clock.now(), "the fixture has no provider transport")
@@ -705,7 +742,7 @@ class AdmissionFixture(ExitStack):
 
     def hold_starts(self, *, unreadable: bool = False) -> None:
         """Hold new starts without creating a running reservation."""
-        path = self.root / "pressure"
+        path = self.readings.pressure_path
         if unreadable:
             path.unlink()
         else:
@@ -1017,6 +1054,13 @@ class ScriptedTransport:
 
 def reply_bytes(reply: wire.Reply) -> bytes:
     return wire.encode_reply(reply).encode()
+
+
+def publish_fixture_view(directory: Path, reading: records.QueueRead, written_at: float,
+                         pass_interval: float = 30) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    queue_snapshot.write_view_snapshot(directory, written_at, written_at + pass_interval,
+                                       reply_bytes(wire.ViewReply(reading)))
 
 
 def queue_decision(available: int, total: int | records.UnknownHostTotal, need: int,

@@ -19,6 +19,8 @@ from scripts.mac_test import cargo_manifest, claim_state
 
 
 MAC_LINUX_TARGET = "mac-linux"
+# The guest route holds a repository claim on this Mac target while its run lasts.
+MAC_LINUX_CLAIM_TARGET = "mac"
 
 
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"]

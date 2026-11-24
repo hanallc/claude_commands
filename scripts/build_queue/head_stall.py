@@ -102,7 +102,7 @@ def configured_limits() -> tuple[float, float]:
 def last_admission(times: Path) -> float:
     """The newest admitted time of a step with memory need in the tail of queue_times.jsonl; 0 when none.
 
-    A merge gate or targeted test is admitted with zero need every few minutes; it frees nothing for the head.
+    The service admits gate jobs with zero need. These admissions free no memory for the head.
     """
     try:
         with times.open("rb") as stream:
