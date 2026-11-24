@@ -43,7 +43,9 @@ from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import (
+    AllModules, GateJobKind, GateResultUnknown, GateRun, ModuleCoverage, SuiteMode, TreeSelection,
+)
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
@@ -1427,8 +1429,10 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
-                detail = stream_diagnostic(error.stderr if isinstance(error.stderr, bytes) else b'')
-                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds: {detail}') from error
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b''
+                started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
+                failure = GuestResultUnavailable if started else GuestUnavailable
+                raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 
@@ -1546,9 +1550,13 @@ def stream_diagnostic(stderr: bytes) -> str:
     return ' '.join(stderr.decode(errors='replace').split())[-1200:] or 'no diagnostic'
 
 
+class GuestResultUnavailable(GuestUnavailable):
+    """The guest started tests and supplied no usable result."""
+
+
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
-    return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
+    return (GuestResultUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -1771,12 +1779,13 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
                            bundle_reason=reply.bundle_reason, module_skips=skips)
 
 
-def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
+def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float | None,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
           assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | str:
     """Return the guest gate result, a run the guest did not take, or the reason the guest route failed.
 
     The assignment is the one the gate checked at its start. The route consumes its launch permission.
+    A None module limit uses the configured full-run limit.
     """
     from scripts.aws_target import cloud_gate
     from scripts.build_queue import mac_run
@@ -1791,6 +1800,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         settings = new_run_settings()
         if not isinstance(settings, GuestSettings):
             return settings
+        run_time_limit_seconds = settings.run_time_limit_seconds
+        if module_time_limit_s is None:
+            module_time_limit_s = run_time_limit_seconds
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()
@@ -1805,7 +1817,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                                origin_main=source.origin_main, runner_commit=source.runner_commit, mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
-                               module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
+                               module_time_limit_s=module_time_limit_s, run_time_limit_seconds=run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
         dispatch = None
         try:
@@ -1831,6 +1843,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(' '.join((str(error), *notes)))
+    except (GuestEndUnproven, GuestResultUnavailable) as error:
+        notes = cast(list[str], getattr(error, '__notes__', []))
+        raise GateResultUnknown(f'{TARGET}: ' + ' '.join((str(error), *notes))) from error
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))

@@ -159,6 +159,8 @@ lint_config_state() {
 # LINT_CONFIG_FORCE=1 makes every known check report on: a pre-push gate
 # (validate_ci.sh) must not silently no-op because a dev-loop switch is off,
 # so it sets this per step on every check it does not itself gate.
+# The background sweep after a step sets it to 0, so sweep=off stops that sweep
+# (invoke.sh sweep_after_step).
 lint_config_enabled() {
     if [[ "${LINT_CONFIG_FORCE:-0}" == "1" ]]; then
         if ! _lint_config_is_op "$1"; then

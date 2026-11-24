@@ -1,6 +1,10 @@
 """Script phone texts and named cases reviewed before delivery."""
+import re
+from functools import partial
+
 from scripts.notify.gpu_xid import XID_MEANINGS
-from scripts.notify.push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate, decision_values
+from scripts.notify.push_texts import (ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate,
+                                       TemplateValues, decision_values)
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -11,6 +15,50 @@ from scripts.notify.push_texts import ActionTemplate, NoActionNeeded, PushExampl
 def waiting_tests(count: int) -> str:
     """Name the tests that wait for the Mac."""
     return "1 test waits" if count == 1 else f"{count} tests wait"
+
+
+def mac_idle_unreachable_values(given: dict[str, str]) -> TemplateValues:
+    """Preserve the elapsed time in the values that reach send.py."""
+    if "minutes" not in given:
+        raise ValueError("mac_idle.unreachable: missing value minutes")
+    displayed = dict(given)
+    del displayed["minutes"]
+    return TemplateValues(displayed, dict(given))
+
+
+def nightly_result_values(given: dict[str, str]) -> TemplateValues:
+    """Keep the sender values and display the outcome in the title."""
+    required = {"branch", "time", "outcome", "types", "tests"}
+    if given.keys() != required:
+        raise ValueError(f"nightly.result: missing values {sorted(required - given.keys())}, "
+                         + f"extra values {sorted(given.keys() - required)}")
+    return TemplateValues({"outcome": given["outcome"]}, dict(given))
+
+
+def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> TemplateValues:
+    """Keep sender values that the text does not display."""
+    missing = sorted(set(hidden) - given.keys())
+    if missing:
+        raise ValueError(f"missing values {missing}")
+    displayed = {field: value for field, value in given.items() if field not in hidden}
+    return TemplateValues(displayed, dict(given))
+
+
+def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
+    """Shorten the held-push sentence for the title."""
+    if "held" not in given:
+        raise ValueError("silence.auto_off: missing values ['held']")
+    held = given["held"]
+    displayed = dict(given)
+    if held == "No pushes were held while you were away.":
+        displayed["held"] = "no held pushes"
+    elif held == "The push held while you were away comes next.":
+        displayed["held"] = "1 held push comes next"
+    elif count := re.fullmatch(r"The ([0-9]+) pushes held while you were away come next\.", held):
+        displayed["held"] = f"{count[1]} held pushes come next"
+    else:
+        raise ValueError(f"silence.auto_off: unknown held value {held!r}")
+    return TemplateValues(displayed, dict(given))
 
 
 NATE_ADHOC_TEXT_ID = "nate.adhoc"
@@ -48,7 +96,7 @@ ENTRIES = (
             "unit": "types", "assigned": "03:05 EST"})),
         purpose="sdlc assigned the failed nightly check to a unit director."),
     PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
-        "The nightly check of {branch} finished at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        "",
         (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
                                "types": "passed", "tests": "passed"}),
          PushExample("tests_failed", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
@@ -61,7 +109,8 @@ ENTRIES = (
              + "shutdown/test_restart.py, settings/test_settings.py, whoami/test_usage.py and 12 more"}),
          PushExample("did_not_finish", {"branch": "main", "time": "03:53 EST", "outcome": "failed",
                                        "types": "did not run", "tests": "did not finish"})),
-        purpose="The nightly check finished. It says which parts passed."),
+        purpose="The nightly check finished. The title gives the result.",
+        header=False, expand_values=nightly_result_values),
     PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}"),
         "The nightly check of {branch} did not run at {time}.\nWhy: {reason}.",
         (PushExample("fetch_failed", {"branch": "main", "time": "03:53 EST",
@@ -91,12 +140,13 @@ ENTRIES = (
         + "Recommendation: Acknowledge after you read the report.",
         (PushExample("report", {"session": "natedev", "machine": "natedev", "report": "12 of 12 phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment"}),),
         purpose="A build report reminds you to acknowledge its review report.", session=SessionTemplate("{session}"), agent_written=True),
-    PushText("mac_idle.unreachable", "Mac idle watch", "blocked", "Mac tests stopped",
+    PushText("mac_idle.unreachable", "Mac idle watch", "blocked", "Mac does not answer; {tests}",
         ActionTemplate("Wake the Mac or check its network."),
-        "Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.",
+        "",
         (PushExample("one_test", {"minutes": "10", "tests": waiting_tests(1)}),
          PushExample("three_tests", {"minutes": "12", "tests": waiting_tests(3)})),
-        purpose="The Mac does not answer while natedev tests wait for it."),
+        purpose="The Mac does not answer while natedev tests wait for it.",
+        expand_values=mac_idle_unreachable_values),
     PushText("machine_watch.unreachable", "Machine watch", "blocked", "Builds cannot reach {machine}",
         ActionTemplate("Turn on the {machine} build machine and check its network connection."),
         "For {minutes} min, the build queue could not connect to the {machine} build machine. "
@@ -184,7 +234,7 @@ ENTRIES = (
          PushExample("uncovered_empty", {"account": "claude4", "remaining": "0%"})),
         purpose="A Claude account runs low, and no move is set up for it."),
     PushText("quota.claude_expiry", "quota_alert", "note", "{account} runs out {empty_at}",
-        ActionTemplate("Type /agents move <role> <account>"),
+        ActionTemplate("In the natedev session, type /agents move <role> <account>"),
         "",
         (PushExample("forecast", {"account": "claude3", "empty_at": "Sun 11-22 07:00 EST"}),),
         purpose="A Claude account is expected to run out soon and has no scheduled move."),
@@ -303,11 +353,6 @@ ENTRIES = (
             "free": "140.0 GiB", "floor": "150.0 GiB",
             "recommendation": "Review ~/old-output first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."})),
         purpose="A low-disk alert recommends one folder for natedev review."),
-    PushText("sweep.disk_floor_recovered", "disk_floor", "note", "{machine} disk space is back", NoActionNeeded(),
-        "{machine} has {free} free, above the {rearm} line. The next fall below {floor} sends one alert.",
-        (PushExample("natedev", {"machine": "natedev", "free": "156.0 GiB", "rearm": "155.0 GiB", "floor": "150.0 GiB"}),
-         PushExample("Mac", {"machine": "Mac", "free": "156.0 GiB", "rearm": "155.0 GiB", "floor": "150.0 GiB"})),
-        purpose="The disk stayed above the rearm line after a delivered low-space alert."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),
@@ -318,13 +363,12 @@ ENTRIES = (
         purpose="Cleanup did not free enough disk on natedev. Delete your files."),
     # GPU watch examples use the Xid codes in the user's 2026-10-30 alert request.
     PushText("nixos.gpu_stopped", "gpu", "decision", "natedev GPU stopped",
-        ActionTemplate("Restart natedev to bring the GPU back."),
-        "The GPU stopped at {time}. Both displays are dark. "
-        + "The cause is a known bug in the NVIDIA firmware. "
-        + "The kernel reported Xid {xid}: {meaning}.",
+        ActionTemplate("Restart natedev."),
+        "",
         (PushExample("xid_79_night", {"xid": "79", "meaning": XID_MEANINGS["79"], "time": "02:17 EDT"}),
          PushExample("xid_119", {"xid": "119", "meaning": XID_MEANINGS["119"], "time": "14:05 EDT"})),
-        purpose="natedev's GPU stopped, and both displays are dark."),
+        purpose="natedev's GPU stopped, and both displays are dark.",
+        expand_values=partial(hide_sender_values, hidden=("xid", "meaning", "time"))),
     # Current ups.nix: low-runtime shutdown at five minutes or 30% charge.
     PushText("nixos.ups_battery", "ups", "blocked", "Power outage threatens open work",
         ActionTemplate("Save your open work on the natedev computer now."),
@@ -334,24 +378,24 @@ ENTRIES = (
         (PushExample("typical", {"charge": "80", "minutes": "20"}),
          PushExample("shutdown_threshold", {"charge": "30", "minutes": "5"})),
         purpose="Power is out, and natedev runs on battery. Save your work."),
-    PushText("nixos.ups_replace_battery", "ups", "note", "UPS battery needs replacing",
+    PushText("nixos.ups_replace_battery", "ups", "note", "natedev UPS battery is worn out",
         ActionTemplate("Replace the battery in the natedev UPS."),
-        "The natedev UPS reports that its battery is worn out. During a power outage it may not keep natedev on long enough to shut down safely.",
+        "",
         (PushExample("typical", {}),),
         purpose="The UPS battery is worn out and needs replacement."),
     PushText("nixos.ups_no_contact", "ups", "note", "natedev lost contact with its UPS",
         ActionTemplate("Check the USB cable between the UPS and natedev."),
-        "natedev cannot read its UPS. During a power outage it gets no warning and cannot shut down safely.",
+        "",
         (PushExample("typical", {}),),
         purpose="natedev cannot read the UPS and needs its USB connection checked."),
-    PushText("nixos.ups_power_back", "ups", "note", "Power is back", NoActionNeeded(),
-        "Mains power is back on the natedev computer. Battery charge: {charge}%.",
+    PushText("nixos.ups_power_back", "ups", "note", "Power is back on natedev", NoActionNeeded(),
+        "",
         (PushExample("typical", {"charge": "80"}),),
-        purpose="Mains power returned to natedev after a battery alert."),
-    PushText("nixos.ups_shutdown", "ups", "blocked", "Power outage stopped the computer",
-        ActionTemplate("When power returns, start natedev if it stays off for three minutes."),
-        "The natedev computer is shutting down because its backup battery is low. "
-        + "Work cannot resume until it starts again. It should start automatically when mains power returns.",
+        purpose="Mains power returned to natedev after a battery alert.",
+        header=False, expand_values=partial(hide_sender_values, hidden=("charge",))),
+    PushText("nixos.ups_shutdown", "ups", "blocked", "Power out: natedev shuts down",
+        ActionTemplate("When power returns, start natedev if it stays off for 3 minutes."),
+        "",
         (PushExample("typical", {}),),
         purpose="Power is out, and the battery is low. natedev shuts down."),
     PushText("mac.locked", "{sender}", "blocked", "Mac locked: GPU shots stopped",
@@ -489,17 +533,17 @@ ENTRIES = (
         session=SessionTemplate("{session}")),
     # Auto silence (user spec, 2026-10-20: "a very compact format"): auto_silence.py sends one when the
     # user goes idle, before silence starts, and one when their next prompt ends it.
-    PushText("silence.auto_on", "{sender}", "note", "{sender} auto silence on", NoActionNeeded(),
-        "Idle {minutes} min.",
+    PushText("silence.auto_on", "{sender}", "note", "Auto silence on after {minutes} min idle", NoActionNeeded(),
+        "",
         (PushExample("typical", {"sender": "natedev", "minutes": "45"}),
          PushExample("long_idle", {"sender": "natedev", "minutes": "1440"})),
         purpose="You went idle, and auto silence starts to keep pushes.",
         header=False),
-    PushText("silence.auto_off", "{sender}", "note", "{sender}: you are back", NoActionNeeded(),
-        "{held}",
+    PushText("silence.auto_off", "{sender}", "note", "You are back: {held}", NoActionNeeded(),
+        "",
         (PushExample("typical", {"sender": "natedev", "held": "The 3 pushes held while you were away come next."}),
          PushExample("one_held", {"sender": "natedev", "held": "The push held while you were away comes next."}),
          PushExample("none_held", {"sender": "natedev", "held": "No pushes were held while you were away."})),
         purpose="You came back, and auto silence ended.",
-        header=False),
+        header=False, expand_values=silence_auto_off_values),
 )

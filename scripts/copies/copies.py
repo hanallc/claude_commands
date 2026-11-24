@@ -47,7 +47,8 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names, verify_command,
+    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+    StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -64,6 +65,7 @@ LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
 
 
 @dataclass(frozen=True)
@@ -2605,6 +2607,19 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def take_prepared_gate_handoff() -> bool:
+    """Consume the pipe token passed to the prepared gate."""
+    try:
+        reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
+        if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
+            return False
+        with os.fdopen(reader, "rb", buffering=0) as pipe:
+            os.set_blocking(reader, False)
+            return pipe.read(1) == b"1"
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
@@ -2640,13 +2655,27 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         arguments = [part.replace("{tree}", str(tree)) for part in command]
         environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
         before = publication_candidates(tree, target, arguments, args.publish)
+
+        def launch() -> subprocess.CompletedProcess[str]:
+            child_environment = {**os.environ, **environment}
+            _ = child_environment.pop(PREPARED_GATE_FD, None)
+            pass_fds = locks
+            with ExitStack() as handoff:
+                if command_program(arguments) in GATE_SCRIPTS:
+                    reader, writer = os.pipe()
+                    _ = handoff.callback(os.close, reader)
+                    with os.fdopen(writer, "wb") as pipe:
+                        _ = pipe.write(b"1")
+                    child_environment[PREPARED_GATE_FD] = str(reader)
+                    pass_fds = (*locks, reader)
+                return subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=child_environment, text=True)
+
         if isinstance(prepared, AdmittedCommandCopy):
-            result = prepared.admission.run_gate(lambda: subprocess.run(
-                arguments, cwd=tree, pass_fds=locks, env={**os.environ, **environment}, text=True))
+            result = prepared.admission.run_gate(launch)
             if result.stderr:
                 _ = sys.stderr.write(result.stderr)
         else:
-            result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env={**os.environ, **environment})
+            result = launch()
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         selection = PublicationSelection.CHANGED
         if command_exit == 0 and not isinstance(verification, VerifyCommand):
@@ -2663,13 +2692,19 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
     targets = first_step.gate_targets(command, source, args.targets)
     if not targets:
         raise CopyError("gate-step requires a gate command and placement targets")
-    with first_step.admitted_run(command, source, targets=targets) as admitted:
-        admitted.handoff(source)
-        result = admitted.run_gate(lambda: subprocess.run(command, cwd=source, pass_fds=args.lease_fd,
-                                                          check=False, text=True))
-        if result.stderr:
-            _ = sys.stderr.write(result.stderr)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    status = 0
+    try:
+        with first_step.admitted_run(command, source, targets=targets) as admitted:
+            admitted.handoff(source)
+            result = subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
+            if result.stderr:
+                _ = sys.stderr.write(result.stderr)
+            status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except Exception as error:
+        if status not in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            raise
+        print(f"Gate cleanup failed. {error}", file=sys.stderr, flush=True)
+    return status
 
 
 def captured_path(root: Path, number: int, path: Path) -> Path:
@@ -2918,8 +2953,11 @@ def mirror_run(args: CopyArguments) -> int:
         command = command_tail(args.command)
         if not command:
             raise CopyError("remote mirror requires a command")
-        environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, COMMAND_LOCKS.get()))}
-        answer = subprocess.run(command, pass_fds=COMMAND_LOCKS.get(), env=environment)
+        descriptors = COMMAND_LOCKS.get()
+        if args.action == "mirror-use":
+            descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
+        environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
+        answer = subprocess.run(command, pass_fds=descriptors, env=environment)
         return answer.returncode
 
 

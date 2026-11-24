@@ -182,7 +182,7 @@ class LimitTests(unittest.TestCase):
         self.assertEqual((status, output), (0, "none\n"))
 
     def test_a_compile_passes_without_sccache_and_the_cargo_wrapper_is_off(self) -> None:
-        # Use a C compile because the merge gate rejects tests that start Cargo or rustc.
+        # Use a C compile because the gate rejects tests that start Cargo or rustc.
         _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
         cargo_home, cache = self.root / "cargo", self.root / "sccache"
         cargo_home.mkdir()

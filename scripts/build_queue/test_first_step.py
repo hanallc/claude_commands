@@ -63,6 +63,14 @@ class FirstStepTests(unittest.TestCase):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source, requested="mac"), ("mac",))
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("mac-linux",))
 
+    def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            command = (*GATE_COMMAND[:2], "--nightly")
+            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev"))
+
     def test_hana_gate_has_no_default_targets(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "hana")
@@ -101,31 +109,29 @@ class FirstStepTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
 
-    def test_named_module_gate_keeps_the_guest_excluded_from_placement(self) -> None:
-        self.check_named_gate_candidates(MODULE_GATE_COMMAND,
-            placement.FixedExclusion("--module runs only on natedev"), "natedev")
+    def test_named_module_gate_keeps_both_explicit_targets_eligible(self) -> None:
+        self.check_named_gate_candidates(MODULE_GATE_COMMAND)
 
-    def test_named_module_gate_refuses_targets_without_natedev(self) -> None:
-        with PlacementFixture() as fixture:
-            source = gate_source(fixture, "claude_commands")
-            with (mock.patch.object(records, "process_start_time", return_value="123"),
-                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
-                  mock.patch.object(queue_place, "wait_for_placement",
-                      side_effect=first_step.FirstStepRefused("The gate reached the queue")) as place):
-                with self.assertRaisesRegex(first_step.FirstStepRefused, r"^gate\.py --module runs only on natedev$"):
-                    with first_step.admitted_run(MODULE_GATE_COMMAND, source, targets=("mac-linux",)):
-                        self.fail("The module gate received a placement")
-                place.assert_not_called()
+    def test_named_module_gate_accepts_a_guest_only_target(self) -> None:
+        self.check_named_gate_candidates(MODULE_GATE_COMMAND, targets=("mac-linux",))
+
+    def test_named_module_gate_offers_the_guest_by_default(self) -> None:
+        self.check_named_gate_candidates(MODULE_GATE_COMMAND, targets=None)
 
     def test_named_plain_gate_keeps_both_targets_eligible(self) -> None:
-        self.check_named_gate_candidates(GATE_COMMAND, placement.AllowedHost(), "mac-linux")
+        self.check_named_gate_candidates(GATE_COMMAND)
 
-    def check_named_gate_candidates(self, command: tuple[str, ...],
-                                    guest_eligibility: placement.AllowedHost | placement.FixedExclusion,
-                                    target: str) -> None:
+    def check_named_gate_candidates(self, command: tuple[str, ...], *,
+                                    targets: tuple[str, ...] | None = ("natedev", "mac-linux")) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             owner = fixture.fixture_owner(os.getpid(), "123")
+            guest = mac_linux_candidate()
+            if targets is None:
+                with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "", "BUILDLOG_RESERVED_STEP": ""}):
+                    targets = first_step.gate_targets(command, source=source)
+                self.assertEqual(targets, ("mac-linux", "natedev"))
+            candidates = (guest, local_candidate(fixture)) if "natedev" in targets else (guest,)
 
             def grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted | wire.Assignment:
                 _ = publish_candidate(fixture, request)
@@ -136,14 +142,14 @@ class FirstStepTests(unittest.TestCase):
             with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
                   mock.patch.object(records, "process_start_time", return_value=owner.start_time),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
-                  mock.patch.object(client, "acquire_placement", side_effect=grant),
+                  mock.patch.object(client, "acquire_placement", side_effect=grant) as acquire,
                   mock.patch.object(client, "cancel_placement", return_value=wire.Ok())):
-                with first_step.admitted_run(command, source, targets=("natedev", "mac-linux")) as admitted:
+                with first_step.admitted_run(command, source, targets=targets) as admitted:
                     placed = admitted.grant
                     assert isinstance(placed, first_step.GatePlacement)
-                    self.assertEqual(placed.grant.assignment.destination.target, target)
-                    guest = replace(mac_linux_candidate(), eligibility=guest_eligibility)
-                    self.assertEqual(placed.request.constraints.candidates, (guest, local_candidate(fixture)))
+                    self.assertEqual(placed.grant.assignment.destination.target, "mac-linux")
+                    self.assertEqual(placed.request.constraints.candidates, candidates)
+                    acquire.assert_called_once_with(placed.request)
 
     def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
         position = SlotQueuePosition("episode", 3)
@@ -163,7 +169,7 @@ class FirstStepTests(unittest.TestCase):
               mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
               mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel):
             admitted.handoff(Path("/fixture"))
-            # The gate ends the reservation after it confirms the assignment.
+            # The gate keeps the reservation through the suites.
             release.assert_not_called()
             cancel.assert_not_called()
             self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
@@ -190,12 +196,15 @@ class FirstStepTests(unittest.TestCase):
                 targets = first_step.gate_targets(command, source=source) if use_default else expected[::-1]
                 if use_default:
                     self.assertEqual(targets, expected)
-                    for arguments in (("--tests-only", "--module=fixture/test_gate.py"),
-                                      ("--nightly", "--merge-branch", "main", "--unit", "fixture"),
-                                      ("--promote-only", "--merge-branch", "main")):
-                        local_only = (*GATE_COMMAND[:2], *arguments)
-                        self.assertEqual(first_step.gate_targets(local_only, source=source), ())
-                        self.assertEqual(first_step.gate_targets(local_only, source=source, requested="natedev"),
+                    nightly = (*GATE_COMMAND[:2], "--nightly", "--merge-branch", "main", "--unit", "fixture")
+                    self.assertEqual(first_step.gate_targets(nightly, source=source), expected)
+                    modules = (*GATE_COMMAND, "--module=fixture/test_gate.py")
+                    promote = (*GATE_COMMAND[:2], "--promote-only", "--merge-branch", "main")
+                    with mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": ""}):
+                        self.assertEqual(first_step.gate_targets(modules, source=source), expected)
+                    self.assertEqual(first_step.gate_targets(promote, source=source), ())
+                    for explicit in (modules, promote):
+                        self.assertEqual(first_step.gate_targets(explicit, source=source, requested="natedev"),
                                          ("natedev",))
                     _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev,mac,hana-aws\n")
                     self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
@@ -274,7 +283,7 @@ class FirstStepTests(unittest.TestCase):
                     self.assertFalse(admitted.assignment_file.exists())
                     admitted.handoff(fixture.root)
                     self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
-                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing)
+                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing, "handed_off")
                 placement_grant.assert_not_called()
 
     def test_close_after_verify_cancels_the_completed_remote_placement(self) -> None:
