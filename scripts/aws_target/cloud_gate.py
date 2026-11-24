@@ -159,7 +159,7 @@ def cooling_zones(rows: Sequence[dict[str, object]], now: float, cooldown: int) 
             and now - cooldown <= float(str(row['time'])) <= now}
 
 
-def availability() -> Available | Unavailable:
+def availability(mode: gate.SuiteMode = gate.SuiteMode.GATE) -> Available | Unavailable:
     """Check local deployment, capacity and spending evidence without reserving resources."""
     try:
         values = settings()
@@ -185,13 +185,18 @@ def availability() -> Available | Unavailable:
         checked_at = time.time()
         now = int(checked_at)
         cooldown = values.whole('capacity_cooldown_seconds')
+        history = run_cost.read_placement_run_history(directory, checked_at, values, policy, policy.text('region'))
+        eligible = run_cost.gate_variant_eligibility(variants, history.evidence, mode.value,
+                                                    max_gate_minutes=values.whole('max_gate_minutes'))
+        if not eligible.variants:
+            return Unavailable('Every gate type and region has a median gate time above max_gate_minutes')
         quotas = gate_quota_capacity(directory, snapshot, now, max_age=policy.whole('price_max_age_seconds'),
                                      cooldown=cooldown)
-        ready = [variant for variant in variants if (fit := quotas.fit(variant)).known
+        ready = [variant for variant in eligible.variants if (fit := quotas.fit(variant)).known
                  and not fit.full and not fit.recently_refused]
         if not ready:
             return Unavailable('No gate variant has current Spot quota room')
-        zones = cooling_zones(run_cost.gate_launch_history(directory, checked_at, cooldown), checked_at, cooldown)
+        zones = cooling_zones(history.launch_rows, checked_at, cooldown)
         if all((variant.region, variant.instance_type, variant.zone) in zones for variant in ready):
             return Unavailable('All gate variants with Spot quota room are in a zone refusal cooldown')
         proposed = gate_booking(values, 'placement-preview', now, now + values.whole('lifetime_minutes') * 60)
@@ -778,8 +783,7 @@ class GateWorker:
         history = run_cost.read_placement_run_history(self.book.directory, now, values, policy, self.api.region)
         zones = cooling_zones(history.launch_rows, now, cooldown)
         cap = values.whole('max_gate_minutes')
-        eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, history.evidence, mode,
-            now=now, max_age=max_age, max_gate_minutes=cap, live_prices=live_prices)
+        eligibility = run_cost.gate_variant_eligibility(variants, history.evidence, mode, max_gate_minutes=cap)
         for (size, region), box in sorted(eligibility.slow_box_seconds.items()):
             print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
                   + f'is above max_gate_minutes={cap}.', flush=True)
@@ -792,12 +796,15 @@ class GateWorker:
             key = (variant.region, variant.instance_type, variant.zone)
             fit = quotas.fit(variant)
             return fit.recently_refused, fit.full, key in zones
-        if not eligibility.prices:
+        zone_prices = run_cost.current_zone_prices(self.book.directory, now, max_age)
+        zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+        prices = run_cost.deployed_gate_prices(eligibility.variants, zone_prices)
+        if not prices:
             return sorted(eligibility.variants, key=capacity_order)
         pricing = run_cost.GateRunPricing.from_config(values, history.evidence, self.api.region, (mode,))
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[tuple[bool, bool, bool], bool, Decimal, int, int]:
             position, variant = item
-            price = eligibility.prices.get(variant)
+            price = prices.get(variant)
             cost = pricing.expected_usd(price, variant.instance_type, variant.region) if price is not None else Decimal(0)
             return capacity_order(variant), price is None, cost, type_rank(variant), position
         return [variant for _, variant in sorted(enumerate(eligibility.variants), key=order)]
@@ -1494,14 +1501,18 @@ def _start_reconcile_if_due(directory: Path, rows: Sequence[ledger.GateReservati
         _ = service(reconcile_command(directory))
 
 
-def start_reconcile_service(command: Sequence[str], timeout: float) -> None:
-    """Submit a service without waiting for its work to finish."""
+def start_reconcile_service(command: Sequence[str], timeout: float, *, existing_unit: str = '') -> None:
+    """Submit a service and accept an existing submission of the named unit."""
     # The admission service can run without a user session environment.
     runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
-    result = subprocess.run(command, env={**os.environ, 'XDG_RUNTIME_DIR': runtime}, check=False,
+    result = subprocess.run(command, env={**os.environ, 'XDG_RUNTIME_DIR': runtime, 'LC_ALL': 'C'}, check=False,
                             capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        raise OSError(result.stderr.strip() or f'systemd-run exited with status {result.returncode}')
+        detail = result.stderr.strip()
+        if existing_unit and detail == (f'Failed to start transient service unit: Unit {existing_unit}.service '
+                                        + 'was already loaded or has a fragment file.'):
+            return
+        raise OSError(detail or f'systemd-run exited with status {result.returncode}')
 
 
 _reconcile_start_warnings: set[tuple[str, int]] = set()

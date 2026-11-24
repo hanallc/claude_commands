@@ -3713,21 +3713,30 @@ def run_direct_tests(args: GateArguments, mode: SuiteMode, target: GateTarget) -
     """Keep one admission through the direct gate and its retries."""
     source = Path(args.repo).expanduser().resolve()
     # A wrapper with a supplied placement owns the retry loop.
-    if args.modules or not isinstance(target, NoGateAssignment):
-        with gate_suite_target(args, source, target) as assigned:
-            return run_tests_only(args, mode, assigned)
+    if not isinstance(target, NoGateAssignment):
+        return run_tests_only(args, mode, target)
 
     with first_step.admitted_run(args.command, source) as admitted:
-        admitted.handoff(source)
-
-        def run() -> subprocess.CompletedProcess[str]:
+        def assigned_target() -> GateTarget:
             grant = admitted.grant
             if not isinstance(grant, first_step.GatePlacement):
                 raise GateAssignmentRefused("The queue returned no gate placement")
             placed = grant.grant
             if not first_step.assignment_matches_source(placed.assignment, source):
                 raise GateAssignmentRefused("The requested source does not match the gate placement source")
-            return subprocess.CompletedProcess(args.command, run_tests_only(args, mode, placement_target(placed)))
+            return placement_target(placed)
+
+        if args.modules:
+            assigned = assigned_target()
+            admitted.handoff(source)
+            status = run_tests_only(args, mode, assigned)
+            admitted.unsettled = status == GATE_UNSETTLED_LAUNCH_STATUS
+            return status
+
+        admitted.handoff(source)
+
+        def run() -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args.command, run_tests_only(args, mode, assigned_target()))
 
         result = admitted.run_gate(run)
         if result.stderr:

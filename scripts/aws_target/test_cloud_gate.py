@@ -742,6 +742,33 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
             self.advance(1)
             self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
 
+    def test_availability_applies_the_mode_time_limit_before_zone_cooldowns(self) -> None:
+        directory = self.state
+        region = 'us-east-2'
+        fast, slow = 'm7a.4xlarge', 'm7a.8xlarge'
+        config = self.root / 'cloud_gate.conf'
+        numeric_settings(config, {'capacity_cooldown_seconds': '30'})
+        cap = conf.read(config).whole('max_gate_minutes') * 60
+        regional = {**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'fixture-image'}
+        cloud_gate.save(directory / 'gate-deployment.json', {**self.deployment, 'regions': [regional]})
+        cloud_gate.save(directory / 'spot-prices.json', {'regions': [
+            {'region': region, 'read_at': int(self.now), 'standard_vcpus': '32', 'gpu_vcpus': '0'}]})
+        with self.book.transaction() as state:
+            state.observations.clear()
+        self.gate_history([(fast, region, cap), (slow, region, cap + 60)])
+        for zone in ('a', 'b'):
+            cloud_gate.append_launch(directory, {'time': self.now, 'result': 'refused', 'region': region,
+                'instance_type': fast, 'availability_zone': zone, 'error_code': 'InsufficientInstanceCapacity'},
+                gate_job=GATE_JOB_NOT_RECORDED)
+        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=directory),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
+              mock.patch.object(time, 'time', side_effect=lambda: self.now),
+              mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Availability uses local files'))):
+            self.assertIn('zone refusal cooldown', self.unavailable_reason())
+            self.assertIsInstance(cloud_gate.availability(gate.SuiteMode.TARGETED), cloud_gate.Available)
+            self.advance(31)
+            self.assertIsInstance(cloud_gate.availability(), cloud_gate.Available)
+
     @override
     def setUp(self) -> None:
         super().setUp()

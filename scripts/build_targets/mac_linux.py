@@ -1194,7 +1194,7 @@ def reconcile_unproven(episode: str, attempt: int) -> None:
                    '--property=UMask=0077', '--working-directory=' + str(Path(__file__).resolve().parents[2]),
                    *overrides, sys.executable, '-m', 'scripts.build_targets.mac_linux',
                    '--reconcile-end', episode, str(attempt)]
-        cloud_gate.start_reconcile_service(command, SSH_CONNECT_TIMEOUT_SECONDS)
+        cloud_gate.start_reconcile_service(command, SSH_CONNECT_TIMEOUT_SECONDS, existing_unit=unit)
     except Exception as error:
         _warn_guest_reconcile(unit, str(error) or type(error).__name__)
 

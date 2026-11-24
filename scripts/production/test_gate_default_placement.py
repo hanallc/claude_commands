@@ -249,6 +249,33 @@ class GateDefaultPlacementTests(unittest.TestCase):
             else:
                 self.assertEqual(target, gate.AwsGateAssignment(placed('aws').assignment))
 
+    def test_standalone_named_gate_keeps_exit_80_when_cancel_fails(self) -> None:
+        with TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_memory_config(repo / 'build_admission.conf', **{'program_first_peak_gib.gate': '4'})
+            _ = (repo / 'build_targets.conf').write_text(
+                'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n')
+
+            def place(request: wire.PlacementRequest, _reason: str) -> wire.Assignment:
+                destination, = (item.destination for item in request.constraints.candidates)
+                return wire.Assignment(placement.PlacementAssignment(request.episode, 'attempt', destination,
+                    request.constraints.source_key, request.owner, request.constraints.session, request.since))
+
+            arguments = ['--tests-only', '--module', 'fixture/test_ok.py']
+            with (mock.patch.dict(os.environ, {'PATH': os.environ['PATH'], 'CONF_DIR': directory, 'HOME': directory,
+                                               'CLAUDE_SESSION_NAME': 'gate-fixture'}, clear=True),
+                  mock.patch.object(build_folders, 'repo_word', return_value='claude'),
+                  mock.patch.object(build_folders, 'tool_folder', return_value=nullcontext(repo)),
+                  mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
+                  mock.patch.object(gate, 'outer_reservation', return_value=None),
+                  mock.patch.object(queue_place, 'wait_for_placement', side_effect=place),
+                  mock.patch.object(admission_client, 'cancel_placement',
+                                    side_effect=wire.AdmissionUnavailable('The queue is unavailable')) as cancel,
+                  mock.patch.object(gate, 'run_tests_only', return_value=GATE_UNSETTLED_LAUNCH_STATUS) as run):
+                self.assertEqual(gate.main(arguments), GATE_UNSETTLED_LAUNCH_STATUS)
+            run.assert_called_once()
+            cancel.assert_called_once()
+
     def test_named_module_selection_uses_the_exact_tree_and_has_no_pass_certificate(self) -> None:
         for name, route in (('aws', cloud_gate), ('mac-linux', mac_linux)):
             assignment = placed(name)

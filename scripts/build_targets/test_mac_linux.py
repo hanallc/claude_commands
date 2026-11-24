@@ -952,6 +952,30 @@ fi
         self.assertEqual(prove.call_args_list, [call(armed)] * 3)
         self.assertEqual(errors.getvalue().splitlines(), ['Mac Linux guest reconcile failed: guest unavailable'])
 
+    def test_reconcile_unproven_does_not_warn_for_an_existing_submission(self) -> None:
+        attempt = 23
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+        episode = self.placed.episode
+        armed = mac_linux.ArmedGuestAttempt('guest-run', 'f' * 32, 'boot-id', 10, 'user', '/fixture')
+        with (patch.object(mac_linux, 'transfer_source',
+                           side_effect=mac_linux.GuestEndUnproven('guest unavailable', armed)),
+              self.assertRaises(mac_linux.GuestEndUnproven)):
+            _ = self.route()
+
+        def duplicate(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            unit = next(word.removeprefix('--unit=') for word in command if word.startswith('--unit='))
+            return subprocess.CompletedProcess(list(command), 1, '',
+                f'Failed to start transient service unit: Unit {unit}.service was already loaded or has a fragment file.\n')
+
+        with (patch.object(subprocess, 'run', side_effect=duplicate) as start,
+              patch.object(mac_linux, 'prove_kept_guest_end', return_value=mac_linux.GuestEndPending('guest unavailable')),
+              redirect_stderr(io.StringIO()) as errors):
+            mac_linux.reconcile_unproven(episode, attempt)
+            start.assert_called_once()
+            self.assertEqual(errors.getvalue(), '')
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(errors.getvalue(), 'Mac Linux guest reconcile failed: guest unavailable\n')
+
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,
               patch.object(mac_linux, 'send_guest_execution', side_effect=wire.AdmissionUnavailable('fixture refusal'))):
