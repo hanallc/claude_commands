@@ -29,7 +29,7 @@ class TargetedTestTests(MergeGateFixture):
         super().setUp()
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.checkout)
         _ = self.enterContext(mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True))
-        _ = self.enterContext(mock.patch.object(gate, "gate_start_target", return_value="natedev"))
+        _ = self.enterContext(mock.patch.object(gate, "checked_gate_target", return_value="natedev"))
         # The fixture's main branch has no full gate pass.
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
                                  "landing_branches=fixture-landing\nscan_roots=\n")
