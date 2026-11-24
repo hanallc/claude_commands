@@ -21,11 +21,11 @@ from unittest import mock
 from scripts.build_hold import cargo_folder
 from scripts.build_queue import queue_place
 from scripts.build_queue.queue_place import PopenArguments
-from scripts.buildlog import store
+from scripts.build_targets import mac_linux
 from scripts.lib import build_folder_lock, build_folders
 from scripts.production import hand_made, hand_made_limit
 from scripts.production.hand_made_route import Program, Refused
-from scripts.production.test_hand_made import FakePlace, clear_build_variables, namespace_members
+from scripts.production.test_hand_made import FakePlace, clear_build_variables
 from scripts.worktree import worktrees
 
 BWRAP = shutil.which("bwrap")
@@ -103,7 +103,7 @@ class LimitTests(unittest.TestCase):
                 os.close(status_write)
             output, _ = process.communicate(timeout=300)
             status = process.returncode
-            return status, output.decode(errors="replace"), not hand_made_limit.setup_failed(status, status_read)
+            return status, output.decode(errors="replace"), not mac_linux.setup_failed(status, status_read)
         finally:
             os.close(status_read)
 
@@ -181,27 +181,25 @@ class LimitTests(unittest.TestCase):
         status, output, _ = self.limited(["sh", "-c", "echo ${SSH_AUTH_SOCK:-none}"])
         self.assertEqual((status, output), (0, "none\n"))
 
-    # The natedev route is the only one that starts the private sccache server, so natedev must run this test.
-    # Another host without sccache, such as the Mac Linux guest, skips it.
-    @unittest.skipIf(store.host_name() != hand_made.LOCAL_MACHINE
-                     and shutil.which("sccache", path=program_path()) is None,
-                     "sccache is not on PATH, and this host is not natedev")
-    def test_a_compile_through_sccache_passes_and_its_private_sccache_server_ends_with_the_run(self) -> None:
-        # A C compile: the merge gate fails a module that starts cargo or rustc.
+    def test_a_compile_passes_without_sccache_and_the_cargo_wrapper_is_off(self) -> None:
+        # Use a C compile because the merge gate rejects tests that start Cargo or rustc.
         _ = (self.checkout / "tiny.c").write_text("int main(void) { return 0; }\n")
-        cache = self.root / "sccache"
+        cargo_home, cache = self.root / "cargo", self.root / "sccache"
+        cargo_home.mkdir()
         cache.mkdir()
-        script = ("sccache cc -c tiny.c -o tiny.o && sccache --show-stats && readlink /proc/self/ns/pid "
-                  + "&& cat /proc/[0-9]*/comm")
-        status, output, ran = self.limited(["sh", "-c", script], self.environment(SCCACHE_DIR=str(cache)))
+        config = '[build]\nrustc-wrapper = "sccache"\n'
+        _ = (cargo_home / "config.toml").write_text(config)
+        environment = self.environment(CARGO_HOME=str(cargo_home), SCCACHE_DIR=str(cache),
+            RUSTC_WRAPPER="sccache", CARGO_BUILD_RUSTC_WRAPPER="sccache")
+        script = ("""test "$RUSTC_WRAPPER" = "" && test "$CARGO_BUILD_RUSTC_WRAPPER" = "" """
+                  + """&& test ! -e "$1" && cat "$CARGO_HOME/config.toml" """
+                  + "&& cc -c tiny.c -o tiny.o && cat /proc/[0-9]*/comm")
+        status, output, ran = self.limited(["sh", "-eu", "-c", script, "compile", str(cache)], environment)
         self.assertEqual((status, ran), (0, True), output)
         self.assertTrue((self.checkout / "tiny.o").exists())
-        requests = next(line for line in output.splitlines() if line.startswith("Compile requests "))
-        self.assertGreater(int(requests.split()[-1]), 0, output)
-        # The private server ran in the limit, with its socket in the attempt temp folder.
-        self.assertIn("sccache", output.split("pid:[", 1)[1].splitlines()[1:])
-        self.assertTrue((self.temp / "sccache.sock").exists())
-        self.assertEqual(namespace_members("pid:[" + output.split("pid:[", 1)[1].split("]", 1)[0] + "]"), [])
+        self.assertTrue(output.startswith(config), output)
+        self.assertNotIn("sccache", output.removeprefix(config).splitlines())
+        self.assertFalse((self.temp / "sccache.sock").exists())
 
     def test_a_tiny_python_test_folder_passes(self) -> None:
         (self.checkout / "tests").mkdir()
@@ -254,14 +252,14 @@ class LimitTests(unittest.TestCase):
         for folder in (self.root / "link", Path("/"), home.parent):
             with self.subTest(folder=folder):
                 words = hand_made_limit.limit_argv("bwrap", Program(("true",), self.checkout, None, ()), self.temp,
-                                                   {"HOME": str(home), "SCCACHE_DIR": str(folder)}, 3)
+                                                   {"HOME": str(home), "CARGO_TARGET_DIR": str(folder)}, 3)
                 self.assertNotIn(str(folder), [words[index + 1] for index, word in enumerate(words) if word == "--bind"])
         # A read only bind can have a link into /nix/store, as ~/.cargo/config.toml has.
-        self.assertTrue(hand_made_limit.bindable(Path("/run/current-system/sw/bin/sh"), home, read=True))
-        self.assertFalse(hand_made_limit.bindable(Path("/run/current-system/sw/bin/sh"), home, read=False))
+        self.assertTrue(mac_linux.bindable(Path("/run/current-system/sw/bin/sh"), home, read=True))
+        self.assertFalse(mac_linux.bindable(Path("/run/current-system/sw/bin/sh"), home, read=False))
 
     def test_an_entry_of_a_system_folder_that_root_does_not_own_is_hidden(self) -> None:
-        entry = next(hand_made_limit.unowned(Path("/etc")), None)
+        entry = next(mac_linux.unowned(Path("/etc")), None)
         if entry is None:
             self.skipTest("each entry of /etc is owned by root")
         status, output, _ = self.limited(["sh", "-c", f"ls -A {entry}; cat {entry} 2>/dev/null; echo end"])
@@ -318,7 +316,7 @@ class NatedevRunTests(unittest.TestCase):
         run = hand_made.NatedevRun(place, self.program, self.root / "tmp")
         with mock.patch.object(shutil, "which", return_value=None), self.assertRaises(Refused) as caught:
             _ = run.run(hand_made.OutputCopy(io.BytesIO(), None))
-        self.assertEqual(str(caught.exception), hand_made_limit.BWRAP_MISSING)
+        self.assertEqual(str(caught.exception), mac_linux.BWRAP_MISSING)
         self.assertEqual((place.started, run.started_at), ([], None))
 
     def test_a_limit_that_bwrap_cannot_set_up_starts_nothing_and_names_bwrap(self) -> None:
@@ -334,7 +332,7 @@ class NatedevRunTests(unittest.TestCase):
         run = hand_made.NatedevRun(place, self.program, self.root / "tmp")
         with mock.patch.object(hand_made_limit, "limit_argv", broken), self.assertRaises(Refused) as caught:
             _ = run.run(hand_made.OutputCopy(output, None))
-        self.assertEqual(str(caught.exception), hand_made_limit.BWRAP_FAILED.format(status=1))
+        self.assertEqual(str(caught.exception), mac_linux.BWRAP_FAILED.format(status=1))
         self.assertIn(b"bwrap", output.getvalue())
         self.assertIsNone(run.started_at)
         self.assertFalse((self.program.repo / "ran").exists())
@@ -539,6 +537,11 @@ class NatedevRunTests(unittest.TestCase):
 
     def test_a_cargo_run_does_the_folder_steps_only_when_the_wrapper_does(self) -> None:
         clear = {"CARGO_FOLDER_CHECKED": "", "BUILDLOG_STEP_SCOPE": ""}
+        # The value of the own scope skips the steps; a value from another scope is stale.
+        cgroup = self.root / "cgroup"
+        _ = cgroup.write_text("0::/user.slice/builds.slice/builds-detached.slice/run-42.scope\n")
+        own_scope = {**clear, "CARGO_WRAPPER_CGROUP_FILE": str(cgroup),
+                     "BUILDLOG_STEP_SCOPE": "/sys/fs/cgroup/user.slice/builds.slice/builds-detached.slice/run-42.scope"}
         for argv, variables, due in (
                 (("cargo", "build"), clear, True), (("cargo", "+nightly", "--config", "x", "test"), clear, True),
                 (("cargo", "clippy", "--build-info"), clear, True), (("cargo", "test", "--", "--help"), clear, True),
@@ -547,7 +550,8 @@ class NatedevRunTests(unittest.TestCase):
                 (("cargo", "nextest", "--version"), clear, False), (("cargo", "mend", "--build-info"), clear, False),
                 (("cargo", "metadata"), clear, False), (("cargo", "--color", "build", "tree"), clear, False),
                 (("cargo", "build"), {**clear, "CARGO_FOLDER_CHECKED": "1"}, False),
-                (("cargo", "build"), {**clear, "BUILDLOG_STEP_SCOPE": "/step.scope"}, False)):
+                (("cargo", "build"), {**clear, "BUILDLOG_STEP_SCOPE": "/step.scope"}, True),
+                (("cargo", "build"), own_scope, False)):
             with (self.subTest(argv=argv, variables=variables), mock.patch.dict(os.environ, variables),
                   mock.patch.object(cargo_folder, "checked_step", return_value=cargo_folder.NoOutputLock()) as step,
                   ExitStack() as held):
@@ -670,18 +674,17 @@ class OutputFolderTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config")}):
             self.assertEqual(hand_made_limit.tools_refusal(root / "worktree", {"PATH": str(root / "bin")}), "")
 
-    def test_an_output_or_sccache_folder_that_holds_or_is_in_a_tool_folder_is_refused(self) -> None:
+    def test_an_output_folder_that_holds_or_is_in_a_tool_folder_is_refused(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         checkout = root / "worktree"
         for folder in (checkout, root / "config", root / "cache"):
             folder.mkdir()
         scripts = Path(hand_made_limit.__file__).resolve().parents[1]
-        cases = (({"CARGO_TARGET_DIR": str(scripts)}, scripts), ({"SCCACHE_DIR": str(root / "config")}, root / "config"),
-                 ({"SCCACHE_DIR": str(root / "cache")}, root / "cache"))
         with mock.patch.dict(os.environ, {"CONF_DIR": str(root / "config"), "XDG_CACHE_HOME": str(root / "cache")}):
-            for values, bind in cases:
-                with self.subTest(values=values):
-                    self.assertEqual(hand_made_limit.tools_refusal(checkout, {"HOME": str(root), **values}),
+            for bind in (scripts, root / "config", root / "cache"):
+                with self.subTest(bind=bind):
+                    self.assertEqual(hand_made_limit.tools_refusal(checkout,
+                                                                  {"HOME": str(root), "CARGO_TARGET_DIR": str(bind)}),
                                      hand_made_limit.TOOLS_REFUSAL.format(bind=bind))
             self.assertEqual(hand_made_limit.tools_refusal(checkout, {"HOME": str(root)}), "")
 

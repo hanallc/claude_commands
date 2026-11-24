@@ -150,6 +150,18 @@ class MacRunTests(unittest.TestCase):
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start + "-other"))
         self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
 
+    def test_claim_kind_reads_the_mac_linux_claim_id_prefix(self) -> None:
+        with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+            guest, = claim_state.read_claims(self.paths)
+            # The claim id is the one guest marker, so the record has no second one.
+            self.assertNotIn("mac_kind", guest.record)
+            self.assertIs(mac_test.claim_kind(guest.record), mac_test.MacClaimKind.GUEST)
+        native = self.native_claim(self.repository("hana"))
+        self.assertEqual(mac_test.command_claim(native, self.paths, watch_claim=False), 0)
+        mirror, = claim_state.read_claims(self.paths)
+        self.assertNotIn("mac_kind", mirror.record)
+        self.assertIs(mac_test.claim_kind(mirror.record), mac_test.MacClaimKind.MIRROR)
+
     def test_quoted_origin_uses_the_shared_repository_scope(self) -> None:
         config = self.checkout / ".git/config"
         origin = ORIGIN

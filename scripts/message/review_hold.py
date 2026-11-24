@@ -20,6 +20,7 @@ from scripts.lib.user_zone import user_zone
 
 
 URGENT_PREFIX = "URGENT:"
+RELEASED_AT = "Released at "
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,8 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
     if message.text.startswith(URGENT_PREFIX):
         return False
     count = _count_file(session)
+    if _carries_held_notice(message.text, _held_file(count)):
+        return False
     path = _state_file(count)
     if not (count.exists() or path.exists()):
         return False
@@ -258,10 +261,21 @@ def numbered_entries(messages: tuple[ReviewMessage, ...]) -> str:
     return "\n\n".join(entries)
 
 
+def _notice_source(path: Path) -> str:
+    """The notice text between its message count and its release header."""
+    return f' from the review in {path}, under "'
+
+
 def held_notice(count: int, path: Path, header: str) -> str:
     if count == 1:
-        return f'1 held message from the review in {path}, under "{header}". Read it at your own pace.'
-    return f'{count} held messages from the review in {path}, under "{header}". Read them at your own pace.'
+        return f'1 held message{_notice_source(path)}{header}". Read it at your own pace.'
+    return f'{count} held messages{_notice_source(path)}{header}". Read them at your own pace.'
+
+
+def _carries_held_notice(text: str, path: Path) -> bool:
+    """A release batch names the held messages file on a line of its own, so it passes an open hold."""
+    pattern = r"(?m)^\d+ held messages?" + re.escape(_notice_source(path) + RELEASED_AT)
+    return re.search(pattern, text) is not None
 
 
 def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only: bool) -> str:
@@ -273,8 +287,8 @@ def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only
         return ""
     target = _held_file(count)
     released = datetime.fromtimestamp(at, timezone.utc)
-    header = "Released at " + (_zone_time(released, "%H:%M:%S", unreadable="review hold: release time in UTC")
-                               or f"{released:%H:%M:%S} UTC")
+    header = RELEASED_AT + (_zone_time(released, "%H:%M:%S", unreadable="review hold: release time in UTC")
+                            or f"{released:%H:%M:%S} UTC")
     with _locked(_state_file(count)):
         descriptor = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
@@ -414,7 +428,14 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
                 else:
                     state = _end_review(path, state)
             write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
-            held = _reserve(path, state, delivery) if isinstance(state.last_activity, EndedReview) else ()
+            if isinstance(state.last_activity, EndedReview):
+                held = _reserve(path, state, delivery)
+                # The user is back in a review with open items, so the hold starts again.
+                # A release in transport passes the open hold by its notice; messages it left wait for the hold end.
+                if _read_count(count) and _enabled(conf.read("send")):
+                    _write_state(path, replace(_read_state(count, path), last_activity=at, release_pending=False))
+            else:
+                held = ()
         _emit_saved(count, path, held, at, emit, record_keys)
 
 

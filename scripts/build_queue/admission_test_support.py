@@ -134,11 +134,13 @@ class ObservedAdmissionServer(service.AdmissionServer):
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
                  check_access: Callable[[str], None], before_admission: Callable[[], None],
-                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         self.check_access: Callable[[str], None] = check_access
         self.before_admission: Callable[[], None] = before_admission
         self.wake_lock: threading.Lock = threading.Lock()
-        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path, host_probe=host_probe)
+        super().__init__(state_dir, clock, readings, proc, fault=fault, socket_path=socket_path, host_probe=host_probe,
+                         job_start_reader=job_start_reader)
 
     @override
     def close(self) -> None:
@@ -301,6 +303,7 @@ class PrivateReadings:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.host_path: Path = root / "meminfo"
+        self.pressure_path: Path = root / "pressure"
         self.counts: Counter[str] = Counter()
 
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
@@ -312,7 +315,7 @@ class PrivateReadings:
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host, policy=policy)
+        return gate.read_pressure(host, policy=policy, pressure_path=self.pressure_path)
 
     def build_space(self, floor: int) -> records.NoBuildSpaceHold:
         self.counts[f"build_space:{floor}"] += 1
@@ -440,6 +443,8 @@ class AdmissionFixture(ExitStack):
             self.loop_access: threading.RLock = threading.RLock()
             self.serving_active: threading.Event = threading.Event()
             self.loop_permission: threading.local = threading.local()
+            # The job start of each CI front pid; a fixture never reads a real runner process.
+            self.job_starts: dict[int, records.CiJobStart] = {}
             self.server: ObservedAdmissionServer = self.new_server()
         except BaseException:
             self.close()
@@ -449,10 +454,14 @@ class AdmissionFixture(ExitStack):
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
                                          fault=self.fault, socket_path=self.socket_path, check_access=self.require_loop_turn,
-                                         before_admission=self.advance_idle_spacing, host_probe=self.read_provider)
+                                         before_admission=self.advance_idle_spacing, host_probe=self.read_provider,
+                                         job_start_reader=self.read_job_start)
         if start:
             server.start()
         return server
+
+    def read_job_start(self, owner: wire.Owner) -> records.CiJobStart:
+        return self.job_starts.get(owner.pid, records.NO_JOB_START)
 
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         return placement.HostEvidenceUnavailable(key, self.clock.now(), "the fixture has no provider transport")
@@ -705,7 +714,7 @@ class AdmissionFixture(ExitStack):
 
     def hold_starts(self, *, unreadable: bool = False) -> None:
         """Hold new starts without creating a running reservation."""
-        path = self.root / "pressure"
+        path = self.readings.pressure_path
         if unreadable:
             path.unlink()
         else:

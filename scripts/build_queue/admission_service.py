@@ -41,6 +41,7 @@ from scripts.lib.proc_text import read_proc_text
 from scripts.build_queue import admission_code
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
+from scripts.build_queue import ci_job_start
 from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
@@ -457,6 +458,8 @@ class WaiterPlace:
     move_id: str = field(default="", kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
     run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
+    # The saved job start keeps the place of a CI step through a service restart.
+    ci_job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -465,7 +468,7 @@ def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | w
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
         queue_identity=gate.queue_life_identity(row), move_id=row.get("move_id", ""),
-        ci_runner=row.get("ci_runner", ""), run=run)
+        ci_runner=row.get("ci_runner", ""), run=run, ci_job_start=records.waiter_job_start(row))
 
 
 @dataclass(frozen=True)
@@ -1688,6 +1691,7 @@ class StateIntents:
 class ServiceEstimatedAdmission(wire.AdmitRequest):
     """Keep the runner separate from the unit used for priority."""
     runner: str = field(kw_only=True)
+    job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
 
 
 def wait_line_name(waiting: WaitingAdmission) -> str:
@@ -1742,7 +1746,8 @@ class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
                  capture_root: Path = CARGO_CAPTURE_ROOT,
-                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None) -> None:
+                 host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] | None = None,
+                 job_start_reader: Callable[[wire.Owner], records.CiJobStart] | None = None) -> None:
         state_dir = state_dir.resolve()
         self.writes: ServiceStateWrites = ServiceStateWrites(state_dir)
         self.writes.require()
@@ -1750,6 +1755,9 @@ class AdmissionServer:
         self.clock: Clock = clock
         self.readings: Readings = readings
         self.proc: Proc = proc
+        # An older CI front sends no job start, so the service reads it from the runner process.
+        self.job_start_reader: Callable[[wire.Owner], records.CiJobStart] = (job_start_reader if job_start_reader is not None
+            else lambda owner: ci_job_start.read_queue_job_start(owner.pid, owner.start_time, proc.path))
         self.fault: Callable[[str], None] = fault
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
@@ -2150,13 +2158,13 @@ class AdmissionServer:
                 continue
             row = gate.rank_waiter(waiting.row, records.NormalOrder())
             run = waiting.request.run if isinstance(waiting.request, wire.AdmitRequest) else wire.NO_RUN
-            row["order_since"] = self._run_order_since(row["since"], run)
+            row["order_since"] = self._order_since(row["since"], run, records.waiter_job_start(row))
             rows.append((self.state_dir / records.waiter_owner(row), row))
         for request in self.placement_requests.values():
             if request.episode in self.waiters or not self._placement_waiting(request):
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
-            row["order_since"] = self._run_order_since(row["since"], request.run)
+            row["order_since"] = self._order_since(row["since"], request.run, records.waiter_job_start(row))
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return rows
 
@@ -2175,8 +2183,10 @@ class AdmissionServer:
                 grant = self.reservations.get(place.episode)
                 row: records.Waiter = (grant.queue_waiter if grant is not None else
                     {**place.queue_identity, "need": 0, "ci_runner": place.ci_runner})
+                if isinstance(place.ci_job_start, records.JobStart):
+                    row = {**row, "ci_job_start": place.ci_job_start}
                 ranked = gate.rank_waiter({**row, "move_id": place.move_id,
-                    "order_since": self._run_order_since(place.since, place.run)}, records.NormalOrder())
+                    "order_since": self._order_since(place.since, place.run, place.ci_job_start)}, records.NormalOrder())
                 key = records.waiter_owner(row) if grant is not None else place.move_id
                 rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
@@ -2402,7 +2412,9 @@ class AdmissionServer:
         if key not in self.run_places and self._run_alive(run):
             self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
-    def _run_order_since(self, since: float, run: wire.RunIdentity | wire.NoRun) -> float:
+    def _order_since(self, since: float, run: wire.RunIdentity | wire.NoRun, job_start: records.CiJobStart) -> float:
+        """Rank a step at the earliest of its arrival, the first step of its run, and the start of its CI job."""
+        since = records.job_order_since(since, job_start)
         if isinstance(run, wire.RunIdentity):
             place = self.run_places.get(records.run_owner(run.pid, run.start_time))
             if place is not None:
@@ -2494,6 +2506,8 @@ class AdmissionServer:
             row["job"] = identity.job
         if isinstance(request, ServiceEstimatedAdmission):
             row["ci_runner"] = request.runner
+            if isinstance(request.job_start, records.JobStart):
+                row["ci_job_start"] = request.job_start
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -3195,7 +3209,7 @@ class AdmissionServer:
             represented.add(owner)
             waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
-                records.ReadingUnavailable("waiting for placement"), row.get("unit", ""),
+                records.MachineChoiceWait(), row.get("unit", ""),
                 project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
                 route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner],
@@ -3249,14 +3263,18 @@ class AdmissionServer:
                 if not isinstance(evidence, execution_identity.ObservedExecution):
                     evidence = next((execution for reference, execution in host_evidence.executions
                         if reference == saved.provider), evidence)
-            if not isinstance(saved.state, placement.CurrentAssignment) and not retained:
+            current = isinstance(saved.state, placement.CurrentAssignment)
+            if not current and not retained:
                 continue
             identity = request.identity
             guest = assignment.destination.target == "mac-linux"
-            confirmed = (confirmed_guest_run(assignment, evidence)
-                         if isinstance(saved.permission, placement.PermissionConsumed)
-                         and self.current_assignments.get(assignment.episode) == key
-                         and isinstance(saved.state, placement.CurrentAssignment) else None)
+            consumed = (current and self.current_assignments.get(assignment.episode) == key
+                        and isinstance(saved.permission, placement.PermissionConsumed))
+            confirmed = confirmed_guest_run(assignment, evidence) if consumed else None
+            local = request.local
+            counter = (progress.read_counter(Path(local.sidecar))
+                       if guest and consumed and isinstance(local, wire.LocalAdmissionContext) and local.sidecar
+                       else progress.NoCounter())
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
             if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
@@ -3267,7 +3285,7 @@ class AdmissionServer:
                 assignment_host=assignment.destination.host, verify=identity.verify,
                 assignment_target=assignment.destination.target if guest else "",
                 placement_candidates=saved.placement_candidates or self._placement_candidate_reading(request),
-                confirmed_guest_run=confirmed,
+                confirmed_guest_run=confirmed, counter=counter,
                 route=request.route if guest else records.DIRECT_CARGO, job=identity.job if guest else GATE_JOB_NOT_RECORDED,
                 mac_placement=f"{assignment.episode}/{assignment.attempt}"
                     if assignment.destination.provider == "mac" or confirmed is not None else "",
@@ -3332,6 +3350,7 @@ class AdmissionServer:
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
                 reason, row.get("unit", ""), route=records.waiter_route(row),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
+                ci_job_start=records.waiter_job_start(row),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
                 what=row.get("what", "")))
@@ -5353,7 +5372,19 @@ done
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
             isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version,
-            runner=request.runner)
+            runner=request.runner, job_start=self._request_job_start(request))
+
+    def _request_job_start(self, request: wire.ServiceEstimateRequest) -> records.CiJobStart:
+        """Use the sent job start, or find it for a CI request from an older front that sent none.
+
+        A job start saved with the place of the same episode is kept, so a later failed read cannot drop it.
+        """
+        if isinstance(request.job_start, records.JobStart) or not request.runner:
+            return request.job_start
+        place = self.places.get(_place_key(request.owner, request.since))
+        if place is not None and place.episode == request.episode and isinstance(place.ci_job_start, records.JobStart):
+            return place.ci_job_start
+        return self.job_start_reader(request.owner)
 
     @staticmethod
     def _stored_caller(session: str, name: str, unit: str, *,

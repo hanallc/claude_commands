@@ -43,7 +43,8 @@ from scripts.build_hold.owning_session import owning_session
 from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement, queue_place
 from scripts.build_queue.queue_place import HeldReservation, QueuePlaceRefused
 from scripts.build_targets import build_targets
-from scripts.build_targets.mac_linux import COMPILED_START, TOOL_FOLDERS, entry_kind, main_folder
+from scripts.build_targets.mac_linux import (BWRAP_FAILED, BWRAP_MISSING, COMPILED_START, TOOL_FOLDERS, bindable,
+                                             entry_kind, home_folder, main_folder, setup_failed)
 from scripts.buildlog import parse, record, store, treekey
 from scripts.lib import build_steps, models_registry
 from scripts.lib.build_steps import HAND_MADE
@@ -65,10 +66,9 @@ UV_VALUE_LETTERS = "CPfipw"
 ENV_VALUE_OPTIONS = ("--argv0", "--chdir", "--split-string", "--unset")
 # Variables that the program also gets when they are set; the model sees each one with its value.
 SHOWN_VARIABLES = frozenset({"PKG_CONFIG_PATH", "LIBCLANG_PATH", "LD_LIBRARY_PATH", "BINDGEN_EXTRA_CLANG_ARGS",
-                             "SCCACHE_DIR", "RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE",
-                             "NIX_LDFLAGS"})
+                             "CARGO_TARGET_DIR", "CC", "CXX", "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS"})
 # Passed folder variables, split at ":"; each entry must be an absolute folder outside the checkout.
-PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH", "SCCACHE_DIR")
+PATH_LIST_VARIABLES = ("PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "LIBCLANG_PATH")
 # The characters that split a word into values, as in --config build.target-dir="/tmp/x".
 VALUE_SEPARATORS = re.compile(r"""[\s=,:;"']""")
 # Each file under this folder is fixed, so a tool can run a file from a folder under it.
@@ -77,7 +77,7 @@ STORE = "/nix/store/"
 INSTALLED_WRAPPER = hand_made_limit.CHECKER / "scripts" / hand_made_limit.BUILD_HOLD / "cargo"
 WRITE_REFUSAL = ("the real path of {path} is in {bind}, which the run writes, so a run can change a program that a "
                  + "later run starts; use a program and a PATH folder outside the checkout, the build output folder, "
-                 + "SCCACHE_DIR and the cargo registry and git folders")
+                 + "and the cargo registry and git folders")
 # The cargo word that keeps the installed wrapper as the start file; its clean rule needs files that the limit hides.
 CLEAN = "clean"
 CLEAN_REFUSAL = ("a hand made run cannot clean the build output: the build-hold cargo wrapper cleans it with files "
@@ -282,9 +282,9 @@ def written_paths(repo: Path) -> list[Path]:
     """The paths that the run writes on natedev. The limit binds only a bindable path, so only such a path is
     one."""
     environment = program_environment()
-    home = hand_made_limit.home_folder(environment)
+    home = home_folder(environment)
     return [Path(os.path.normpath(bind)) for bind in hand_made_limit.write_binds(repo, environment)
-            if hand_made_limit.bindable(bind, home, read=False)]
+            if bindable(bind, home, read=False)]
 
 
 def write_refusal(path: Path, written: Sequence[Path]) -> str | None:
@@ -704,7 +704,7 @@ class NatedevRun:
         """
         bwrap = shutil.which("bwrap")
         if bwrap is None:
-            raise Refused(hand_made_limit.BWRAP_MISSING)
+            raise Refused(BWRAP_MISSING)
         environment = program_environment()
         with ExitStack() as held:
             lock = hand_made_limit.held_output(self.program.argv, self.program.repo, environment, held,
@@ -726,9 +726,9 @@ class NatedevRun:
             tail = hand_made_limit.OutputTail(output)
             with process:
                 status = stream(process, tail)
-            if hand_made_limit.setup_failed(status, status_read):
+            if setup_failed(status, status_read):
                 self.started_at = None
-                raise Refused(hand_made_limit.BWRAP_FAILED.format(status=status))
+                raise Refused(BWRAP_FAILED.format(status=status))
             if hand_made_limit.offline_failure(self.program.argv, status, tail.tail):
                 raise Refused(hand_made_limit.NO_NETWORK)
             return status

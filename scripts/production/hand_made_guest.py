@@ -18,14 +18,13 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_jobs import HAND_MADE
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
 from scripts.build_targets import mac_linux
+from scripts.production.hand_made_limit import NO_NETWORK, OutputTail, offline_failure
 from scripts.production.hand_made_route import (Line, MachineFailed, MachineRun, Output, Placed, Program, Refused,
                                                 in_checkout, note, start_unknown, stream)
 
 MACHINE = mac_linux.TARGET
 # The queue ends a place when its holder ends, so a place with live guest work stays until then.
 STILL_LIVE = "the guest run may still be live; the queue ends the place when this run ends"
-# The guest has no read limit like the natedev one in hand_made_limit.py, so it takes no hand made run yet.
-NO_READ_LIMIT = "the guest has no read limit yet"
 
 
 class GuestFailed(MachineFailed):
@@ -69,8 +68,6 @@ def guest_refusal(program: Program) -> str:
     file of the checkout that the copy holds at the same path. A guest that is off takes no run; a guest in
     retry backoff is no refusal, and the queue line waits for the backoff end.
     """
-    if NO_READ_LIMIT:
-        return NO_READ_LIMIT
     try:
         settings = mac_linux.new_run_settings()
     except mac_linux.route_errors() as error:
@@ -154,11 +151,12 @@ class GuestRun:
         return found
 
     def run(self, output: Output) -> int:
-        """Send the checkout and run the argv in the guest.
+        """Send the checkout and run the argv in the guest, under the guest read limit.
 
         The guest finds the first word in its numbered copy or on its own PATH, and refuses a word that can
         start a guest file that the check did not read; that refusal ends the attempt, as on the Mac. It gives
-        the program its own variables and no input. The output is one pipe.
+        the program its own variables and no input. The output is one pipe. A cargo failure from offline mode
+        ends the attempt as the no network refusal, as on natedev.
         """
         try:
             process = self.command.start(self.program.repo, self.program.argv, work=HAND_MADE.step, unit=self.unit,
@@ -171,8 +169,11 @@ class GuestRun:
                 raise start_unknown(MACHINE, f"the guest got the command and gave no start line: {error}") from error
             raise GuestFailed(f"guest start: {error}") from error
         self.started_at = time.time()
+        tail = OutputTail(output)
         with process:
-            self.status = stream(process, output)
+            self.status = stream(process, tail)
+        if offline_failure(self.program.argv, self.status, tail.tail):
+            raise Refused(NO_NETWORK)
         return self.status
 
     def unproven(self, failure: BaseException | None) -> str:

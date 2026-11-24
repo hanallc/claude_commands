@@ -19,21 +19,24 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 
 from scripts.build_queue import admission_client as client
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
+from scripts.build_queue.ci_job_start import job_start, queue_job_start
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation
+from scripts.lib import cancellation, process_stat
 from scripts.lib.descendants import adopt_descendants
 
 
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
+PROC_ROOT = process_stat.PROC_ROOT
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,9 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("cargo admission owner has no process identity")
+    boot_start = job_start(pid, PROC_ROOT)
+    if os.environ.get("GITHUB_ACTIONS") == "true" and boot_start is None:
+        print("::warning::build queue: no readable Runner.Worker ancestor, so this step has no job start", file=sys.stderr)
     argv = [command, *arguments]
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)
@@ -143,10 +149,12 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         sidecar = directory / "cargo.cgroup"
         _ = sidecar.write_text("")
         sidecar.chmod(0o644)
+        now = client.CLOCK.now()
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
-            client.CLOCK.now(), str(sidecar), repository, worktree,
+            now, str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
-            route=records.direct_cargo_route())
+            route=records.direct_cargo_route(),
+            job_start=queue_job_start(boot_start, now=now, boot_now=time.clock_gettime(time.CLOCK_BOOTTIME)))
         with ExitStack() as reservation:
             try:
                 held = reservation.enter_context(queue_place.held_reservation(request))
