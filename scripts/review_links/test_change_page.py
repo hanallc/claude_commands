@@ -47,6 +47,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
 from scripts.review_links import new_item_dialog, question_record, reply_tokens, review_actions, review_items, review_submissions
+from scripts.review_links.server_test_support import started_review_server
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -151,12 +152,6 @@ class BrowserForms(HTMLParser):
 
 
 SEND_MESSAGE = change_page.send_message
-
-
-class ChangePageTestServer(serve.ReviewLinksServer):
-    @override
-    def service_actions(self) -> None:
-        """Tests invoke recovery when their records are ready."""
 
 
 # The Memory bar record predates structured question parts.
@@ -846,30 +841,12 @@ class ChangePageTests(unittest.TestCase):
         # Restart tests enable legacy recovery after they create the records.
         with (patch.object(change_page, "recover_pending"),
               patch.object(serve, "loaded_module_stamps", return_value={})):
-            server = self.enterContext(self.started_review_server())
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         self.port = server.server_port
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
         self.addCleanup(server.shutdown)
-
-    @contextmanager
-    def started_review_server(self) -> Generator[serve.ReviewLinksServer]:
-        startup_workers: list[threading.Thread] = []
-
-        def record_worker(*, target: Callable[[], None], daemon: bool) -> threading.Thread:
-            worker = threading.Thread(target=target, daemon=daemon)
-            startup_workers.append(worker)
-            return worker
-
-        # Track the recovery workers. The Review cache owns its worker.
-        with patch.object(serve, "threading", wraps=threading, Thread=record_worker):
-            server = ChangePageTestServer(("127.0.0.1", 0), self.root)
-        with server:
-            for worker in startup_workers:
-                worker.join(TEST_HANG_GUARD_SECS)
-                self.assertFalse(worker.is_alive(), "Startup recovery did not finish.")
-            yield server
 
     def write_delivery_config(self, tries: int = 3, pause: int = 0) -> None:
         _ = write_config_fixture(self.temporary / "config/review_links.conf",
@@ -1415,7 +1392,7 @@ class ChangePageTests(unittest.TestCase):
             "attempt": "legacy", "state": "pending", "kind": "verdict"}))
         self.messages.clear()
         self.delivery_done.clear()
-        with self.started_review_server():
+        with started_review_server(("127.0.0.1", 0), self.root):
             self.assertTrue(self.delivery_done.is_set())
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
         self.assertIn("C1: works", self.messages[0][2])
@@ -3669,7 +3646,7 @@ class ChangePageTests(unittest.TestCase):
         question = status.ask(self.page, "C1", "Which groups?")
         assert isinstance(question, change_page.QuestionDelivery)
         self.delivery_done.clear()
-        with self.started_review_server():
+        with started_review_server(("127.0.0.1", 0), self.root):
             self.assertTrue(self.delivery_done.is_set())
         saved = status.slots(self.page, "C1").question
         self.assertEqual(saved, change_page.OpenQuestion(question.question_id, "Which groups?", change_page.NoDelivery()))
@@ -3682,7 +3659,7 @@ class ChangePageTests(unittest.TestCase):
             assert isinstance(feedback, change_page.QuestionDelivery)
             count = len(self.messages)
             self.delivery_done.clear()
-            with self.started_review_server():
+            with started_review_server(("127.0.0.1", 0), self.root):
                 self.assertTrue(self.delivery_done.is_set())
             recovered = change_page.DeliveryStatus(self.root).slots(self.page, "C3").question
             self.assertIsInstance(recovered, change_page.OpenFeedback)

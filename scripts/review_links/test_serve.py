@@ -48,6 +48,7 @@ from scripts.build_queue import memory_feed
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
+from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, update_registration,
@@ -180,7 +181,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending")):
-            server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root))
         server.review_cache.synchronize()
         self._server = server
         review_posts = self.review_posts
@@ -199,7 +200,6 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         server.RequestHandlerClass = ReviewFixtureHandler
         self.port = server.server_port
-        self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 5)
@@ -3467,7 +3467,7 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
-            server = self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.root, initialize_review=True))
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
         server.review_cache.synchronize()
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
         self.port = server.server_port
