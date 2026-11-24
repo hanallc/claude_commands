@@ -820,7 +820,8 @@ The Mac retains its single slot per repository.
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
 The copy stays kept if `stop-checkout` cannot confirm it is clear.
-The queue sends the run token on SSH input.
+The queue sends the run token on SSH input after the smoke worker requests it.
+Shell startup, the test, and cleanup read stdin from `/dev/null`.
 It accepts the exit status from the final output line after it reads the ready line.
 It checks the run token in both lines.
 It keeps the run record if the final status is missing or invalid.

@@ -273,9 +273,16 @@ def shell_session() -> OwningSession | NoOwningSession:
 def smoke_session(placement: MacPlacement, command: list[str], ssh: contextlib.ExitStack) -> subprocess.Popen[str]:
     """Run the numbered copy with the SSH input open."""
     work = (
-        'typeset +x smoke_cookie; IFS= read -r smoke_cookie || exit 1\n'
-        f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)}\n"
-        'builtin printf "\\nmac_smoke_complete=%s:%s\\n" "$smoke_cookie" "$?"'
+        'typeset +x smoke_cookie=""\n'
+        f"MAC_PLACEMENT={shlex.quote(placement_value(placement))} {shlex.join(command)} 3<&0 </dev/null |\n"
+        'while IFS= read -r line || [[ -n $line ]]; do\n'
+        '    if [[ $line == mac_smoke_complete=* && $line != *:* ]]; then\n'
+        '        smoke_cookie=${line#*=}\n'
+        '    fi\n'
+        '    builtin print -r -- "$line"\n'
+        'done\n'
+        'smoke_status=$pipestatus[1]\n'
+        '[[ -z $smoke_cookie ]] || builtin printf "mac_smoke_complete=%s:%s\\n" "$smoke_cookie" "$smoke_status"'
     )
     process = ssh.enter_context(subprocess.Popen(
         ["ssh", *BATCH_MODE, placement.host, "/bin/zsh -f -c " + shlex.quote(work)],
@@ -302,11 +309,23 @@ class SmokeMissingStatus:
 SmokeResult = SmokeNotReady | SmokeFinalStatus | SmokeMissingStatus
 
 
-def read_smoke_ready(output: TextIO, cookie: str) -> bool:
+SMOKE_TOKEN_REQUEST = "mac_smoke_request\n"
+
+
+def read_smoke_ready(output: TextIO, input_stream: TextIO, cookie: str) -> bool:
     ready = f"mac_smoke_complete={cookie}"
+    sent = False
     for line in output:
+        if line == SMOKE_TOKEN_REQUEST:
+            if not sent:
+                _ = input_stream.write(cookie + "\n")
+                input_stream.flush()
+                sent = True
+            continue
         if line == ready + "\n":
-            return True
+            if sent:
+                return True
+            continue
         if not line.startswith(ready + ":"):
             print(line, end="", flush=True)
     return False
@@ -334,6 +353,7 @@ def run_smoke_work(work: str, cleanup: str) -> int:
     from scripts.lib.build_folders import COPY_KEEP_ENV
 
     token_length = 32
+    print("\n" + SMOKE_TOKEN_REQUEST, end="", flush=True)
     cookie_line = sys.stdin.buffer.readline(token_length + 1)
     cookie = cookie_line[:-1]
     if len(cookie) != token_length or not cookie_line.endswith(b"\n"):
@@ -377,7 +397,7 @@ def run_smoke_work(work: str, cleanup: str) -> int:
             _ = group.wait()
         _ = group.stdout.close()
         cleared = subprocess.run(["/bin/zsh", "-c", cleanup, "cleanup-copy", str(checkout)], cwd=home,
-                                 env=environment)
+                                 env=environment, stdin=subprocess.DEVNULL)
     if disconnected:
         return 1
     status = group.wait()
@@ -530,10 +550,7 @@ def run_attempt(
                             smoke = smoke_session(placement, command, ssh)
                             remote.state = RemoteState.LIVE
                             assert smoke.stdin is not None and smoke.stdout is not None
-                            # The shell and the worker each read one line from SSH input.
-                            _ = smoke.stdin.write(f"{cookie}\n{cookie}\n")
-                            smoke.stdin.flush()
-                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), cookie)
+                            smoke_ready = read_smoke_ready(cast(TextIO, smoke.stdout), cast(TextIO, smoke.stdin), cookie)
                             if smoke_ready:
                                 status = 0
                         else:
