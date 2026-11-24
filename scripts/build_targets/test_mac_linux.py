@@ -867,7 +867,7 @@ fi
             before, line = path.read_bytes().splitlines()
             self.assertEqual(before, partial)
             self.assertEqual(json.loads(line), expected)
-            self.assertEqual(synced, [(entry.stat().st_ino, path.read_bytes()) for entry in (path, path.parent)])
+            self.assertEqual(synced[:2], [(entry.stat().st_ino, path.read_bytes()) for entry in (path, path.parent)])
             raise wire.AdmissionUnavailable('fixture socket outage')
 
         with (patch.object(mac_linux, 'time', return_value=123.5),
@@ -1209,7 +1209,8 @@ fi
                 self.placed = replace(self.placed, attempt=f'{attempt:032x}')
                 transfer = (patch.object(mac_linux, 'transfer_source', side_effect=mac_linux.GuestEndUnproven(reason, armed))
                             if attempt == 52 else nullcontext())
-                with (transfer, patch.object(mac_linux, '_end_proofs_path', side_effect=[path, path.parent, path.parent]),
+                with (transfer, patch.object(target_config, 'mac_linux_end_proof_journal',
+                                             side_effect=[path, path.parent, path.parent]),
                       patch.object(mac_linux, 'send_guest_execution') as report, redirect_stderr(io.StringIO())):
                     outcome = self.route('main-probe-failure')
                 blocked = self.blocked(outcome)
@@ -1731,6 +1732,42 @@ fi
             self.assertEqual(self.route(), 'mac-linux: fixture journal directory sync failed')
         consume.assert_not_called()
         self.assert_guest_clean()
+
+    def test_new_journal_ancestors_must_sync_before_consume_even_after_a_failed_sync(self) -> None:
+        new_root = self.root / 'new' / 'target-state'
+        path = new_root / 'mac-linux' / 'end-proofs.jsonl'
+        fsync = os.fsync
+        failed = False
+        synced: list[int] = []
+
+        def record_sync(fd: int) -> None:
+            nonlocal failed
+            inode = os.fstat(fd).st_ino
+            if not failed and new_root.is_dir() and inode == new_root.stat().st_ino:
+                failed = True
+                raise OSError('fixture ancestor sync failed')
+            fsync(fd)
+            synced.append(inode)
+
+        consume = admission_client.consume_permission
+
+        def check_launch(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+            expected = [entry.stat().st_ino for entry in (path, path.parent, new_root, new_root.parent, self.root)]
+            first = synced.index(expected[0])
+            self.assertEqual(synced[first:first + len(expected)], expected)
+            return consume(request)
+
+        with (patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(new_root)}),
+              patch.object(os, 'fsync', side_effect=record_sync),
+              patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
+            self.assertEqual(self.route(), 'mac-linux: fixture ancestor sync failed')
+            send.assert_not_called()
+            self.assertTrue(path.is_file())
+            synced.clear()
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        send.assert_called_once()
 
     def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
         refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),

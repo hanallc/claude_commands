@@ -141,6 +141,14 @@ class GateWorkerOwner:
 
 
 @dataclass(frozen=True)
+class NoGateCleanupOwnerCheck:
+    """The update is independent of a cleanup selection."""
+
+
+NO_GATE_CLEANUP_OWNER_CHECK = NoGateCleanupOwnerCheck()
+
+
+@dataclass(frozen=True)
 class NoGateTrial:
     pass
 
@@ -799,6 +807,20 @@ class ObservationRejected(ValueError):
 
 class LedgerUnavailable(ValueError):
     """Evidence cannot establish a safe spending decision."""
+
+
+class GateCleanupSuperseded(LedgerUnavailable):
+    """The booking closed or changed owner after cleanup selected it."""
+
+
+def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
+                               owner: GateWorkerOwner | GateOwnerUnknown) -> None:
+    """Check the cleanup selection while the ledger lock is held."""
+    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+    if booking is None or not gate_is_open(booking):
+        raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking is no longer open')
+    if booking.owner != owner:
+        raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking owner changed')
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -2506,9 +2528,12 @@ class CostLedger:
             reason = 'monthly_limit'
         return reason
 
-    def gate_region(self, attempt: str, region: str) -> None:
+    def gate_region(self, attempt: str, region: str, *,
+                    expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK) -> None:
         """Retain the region before AWS can accept a launch."""
         with self._locked() as state:
+            if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
+                require_gate_cleanup_owner(state, attempt, expected_owner)
             state.gate_reservations = [replace(row, region=region) if row.attempt == attempt else row
                                        for row in state.gate_reservations]
             self._save(state)
@@ -2530,9 +2555,12 @@ class CostLedger:
             state.gate_quota_refusals.append(GateQuotaRefusal(pool, state.live_gate_vcpus(now).get(pool, 0), int(now)))
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '',
+                     expected_owner: GateWorkerOwner | GateOwnerUnknown | NoGateCleanupOwnerCheck = NO_GATE_CLEANUP_OWNER_CHECK) -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
+            if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
+                require_gate_cleanup_owner(state, attempt, expected_owner)
             if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
                 return
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
