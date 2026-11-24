@@ -30,7 +30,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TextIO, TypedDict, cast, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.boot_identity import boot_identity
 from scripts.lib.process_failure import failure_detail
+from scripts.lib import process_start
 from scripts.lib.user_zone import user_zone
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import override_guard
@@ -39,9 +42,10 @@ from scripts.build_hold.shared_state_defaults import (
     DEFAULT_HOLDER_DIRECTORY as DEFAULT_HOLDER_DIRECTORY,
     DEFAULT_RELEASE_DIRECTORY as DEFAULT_RELEASE_DIRECTORY,
     DEFAULT_PROC_ROOT,
+    StopConfirmation,
     StopStatus as StopStatus,
     holder_directory as holder_directory,
-    read_stop_confirmation,
+    read_stop_confirmation_state,
     release_directory as release_directory,
     stop_confirmation_path as stop_confirmation_path,
     write_stop_confirmation,
@@ -76,6 +80,11 @@ class StoppedRun(TypedDict):
     label: str
     staff_id: str
     director_dir: str
+    pid: NotRequired[int]
+    proc_start: NotRequired[str]
+    boot_id: NotRequired[str]
+    record_path: NotRequired[str]
+    owner_session: NotRequired[str]
 
 
 class ReleaseEntry(TypedDict):
@@ -101,6 +110,7 @@ class HoldCycle(TypedDict):
     entries: list[ReleaseEntry]
     release_started_at: str
     stop_logs: NotRequired[list[str]]
+    independent_waits: NotRequired[dict[str, bool]]
 
 
 class ReleaseRecordReadError(ValueError):
@@ -118,6 +128,7 @@ class CycleReleaseNotices(TypedDict):
     recipients: dict[str, str]
     runs: NotRequired[list[ReleaseEntry]]
     stop_requests: NotRequired[list[StopRequest]]
+    stop_waits: NotRequired[list[str]]
 
 
 class BroadcastReleaseNotice(TypedDict):
@@ -163,6 +174,7 @@ class CycleNoticesToSend:
     cycle: HoldCycle
     entries: list[ReleaseEntry]
     unresolved_stops: int
+    absent_confirmations: list[ReleaseEntry]
 
 
 class ReleaseNoticeReadError(ReleaseRecordReadError):
@@ -1201,7 +1213,20 @@ def read_cycle() -> HoldCycle | NoCycle:
 def read_stopped_run(value: object) -> StoppedRun:
     match value:
         case {"id": str(run_id), "label": str(label), "staff_id": str(staff_id), "director_dir": str(directory)} if run_id and label:
-            return {"id": run_id, "label": label, "staff_id": staff_id, "director_dir": directory}
+            run: StoppedRun = {"id": run_id, "label": label, "staff_id": staff_id, "director_dir": directory}
+            if isinstance(value, dict):
+                fields = cast(dict[str, object], value)
+                match fields:
+                    case {"pid": int(pid), "proc_start": str(start), "boot_id": str(boot)} if pid > 0 and start and boot:
+                        run.update(pid=pid, proc_start=start, boot_id=boot)
+                    case _:
+                        pass
+                if isinstance(path := fields.get("record_path"), str) and Path(path).is_absolute():
+                    run["record_path"] = path
+                # Old staff-only captures did not record the command's session.
+                if isinstance(owner := fields.get("owner_session"), str) and owner and fields.get("owner_from_staff") is not True:
+                    run["owner_session"] = owner
+            return run
         case _:
             raise ValueError("invalid stopped run in release record")
 
@@ -1232,6 +1257,12 @@ def read_hold_cycle(path: Path) -> HoldCycle:
         if any(not isinstance(name, str) or not isinstance(session_id, str)
                for session_id, name in cast(dict[object, object], recipients).items()):
             raise ValueError("invalid recipients: expected string names and session IDs")
+        independent_waits = cycle.get("independent_waits", {})
+        if not isinstance(independent_waits, dict) or any(
+            not isinstance(session, str) or not isinstance(independent, bool)
+            for session, independent in cast(dict[object, object], independent_waits).items()
+        ):
+            raise ValueError("invalid wait registrations")
         if "stop_logs" in cycle:
             logs = cycle["stop_logs"]
             if not isinstance(logs, list) or any(
@@ -1341,6 +1372,11 @@ def read_release_intent(path: Path) -> ReleaseIntent | NoReleaseIntent:
             for key, value in cast(dict[object, object], recipients).items()
         ):
             raise ValueError("invalid release intent: recipients")
+        stop_waits = notice_fields.get("stop_waits", [])
+        if not isinstance(stop_waits, list) or any(
+            not isinstance(session, str) for session in cast(list[object], stop_waits)
+        ):
+            raise ValueError("invalid release intent: stop registrations")
         runs = notice_fields.get("runs", [])
         if not isinstance(runs, list):
             raise ValueError("invalid release intent: stopped runs")
@@ -1428,7 +1464,7 @@ def stopped_run_entries(entries: Sequence[ReleaseEntry]) -> dict[str, ReleaseEnt
 def release_entries(cycle: HoldCycle, recipients: Mapping[str, str],
                     saved_runs: Sequence[ReleaseEntry] = ()) -> list[ReleaseEntry]:
     first = first_release_entries(cycle)
-    runs = stopped_run_entries([*cycle["entries"], *saved_runs])
+    runs = stopped_run_entries([*cycle["entries"], *(read_restart_entry(entry) for entry in saved_runs)])
     owners = {entry["session_id"].removeprefix("codex:") for entry in runs.values()}
     return [*runs.values(), *(first[session_id] if session_id in first else new_entry(session_id, name)
                              for session_id, name in recipients.items() if session_id.removeprefix("codex:") not in owners)]
@@ -1455,17 +1491,21 @@ def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastRele
         raise ReleaseNoticeReadError(path, str(error)) from error
     runs = list(notices.get("runs", []))
     unresolved = 0
+    absent_confirmations: list[ReleaseEntry] = []
     for request in notices.get("stop_requests", []):
         match stop_request_status(request):
             case "stopped":
                 runs.append(request["entry"])
-            case None:
+            case "absent":
+                absent_confirmations.append(request["entry"])
+                unresolved += 1
+            case "unreadable":
                 unresolved += 1
             case "not_stopped":
                 pass
     entries = [entry for entry in release_entries(cycle, notices["recipients"], runs)
                if release_notice_pending(entry)]
-    return CycleNoticesToSend(cycle, entries, unresolved)
+    return CycleNoticesToSend(cycle, entries, unresolved, absent_confirmations)
 
 
 def pending_release_status_lines() -> list[str]:
@@ -1583,6 +1623,55 @@ def finish_release_intent(held: ReleaseLockHeld, intent: ReleaseIntent) -> str:
     return result
 
 
+def discard_restart_notices(held: ReleaseLockHeld, record: RecordedRelease, cycle: HoldCycle,
+                            dropped: set[str]) -> None:
+    """Remove discarded notices from both release records."""
+    if not dropped:
+        return
+    held.require(record.path)
+    notices = record.intent["notices"]
+    assert notices["kind"] == "cycle"
+    stop_waits = set(notices.get("stop_waits", []))
+    first = first_release_entries(cycle)
+    independent_waits = cycle.get("independent_waits", {})
+    restart_entries = [*cycle["entries"], *notices.get("runs", []),
+                       *(request["entry"] for request in notices.get("stop_requests", []))]
+    discarded = [entry for entry in restart_entries if "run" in entry and entry["run"]["id"] in dropped]
+    owners = {entry["session_id"].removeprefix("codex:") for entry in discarded}
+    for session in tuple(notices["recipients"]):
+        owner = session.removeprefix("codex:")
+        independent = independent_waits.get(session)
+        if owner in owners and independent is not True and (independent is False or session in stop_waits):
+            wait = first.get(session)
+            del notices["recipients"][session]
+            _ = cycle["recipients"].pop(session, None)
+            _ = independent_waits.pop(session, None)
+            if wait is not None:
+                cycle["entries"].remove(wait)
+    notices["runs"] = [entry for entry in notices.get("runs", [])
+                       if "run" not in entry or entry["run"]["id"] not in dropped]
+    notices["stop_requests"] = [request for request in notices.get("stop_requests", [])
+                                if "run" not in (entry := request["entry"]) or entry["run"]["id"] not in dropped]
+    forget_restart_notices(cycle, dropped)
+    write_text_atomic(record.path, json.dumps(record.intent, ensure_ascii=False) + "\n")
+
+
+def forget_restart_notices(cycle: HoldCycle, dropped: set[str]) -> None:
+    cycle["entries"] = [entry for entry in cycle["entries"]
+                        if "run" not in entry or entry["run"]["id"] not in dropped]
+    save_cycle(cycle)
+
+
+def invalid_pending_restarts(pending: CycleNoticesToSend) -> set[str]:
+    """Check unsent restarts with a readable or absent confirmation."""
+    confirmed = stopped_run_entries(pending.entries)
+    unsent = stopped_run_entries([*pending.entries, *pending.absent_confirmations])
+    delivered = {entry["run"]["id"] for entry in pending.cycle["entries"]
+                 if "run" in entry and not release_notice_pending(entry)}
+    return {run_id for run_id, entry in unsent.items() if run_id not in delivered
+            and restart_evidence(entry, confirmed=run_id in confirmed) == "invalid"}
+
+
 def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> str:
     intent = record.intent
     directory = Path(intent["holder_directory"])
@@ -1633,7 +1722,25 @@ def finish_recorded_notices(held: ReleaseLockHeld, record: RecordedRelease) -> s
             changed = True
         if changed:
             save_cycle(cycle)
-        result = send_cycle_notices(cycle, pending.entries)
+        dropped = invalid_pending_restarts(pending)
+        if dropped:
+            discard_restart_notices(held, record, cycle, dropped)
+            pending = release_notices(intent)
+            assert isinstance(pending, CycleNoticesToSend)
+            cycle = pending.cycle
+        attempted_waits = {entry["session_id"] for entry in pending.entries if "run" not in entry}
+        expired = send_cycle_notices(cycle, pending.entries)
+        if expired:
+            discard_restart_notices(held, record, cycle, expired)
+            pending = release_notices(intent)
+            assert isinstance(pending, CycleNoticesToSend)
+            _ = send_cycle_notices(pending.cycle, [entry for entry in pending.entries
+                                                   if "run" not in entry and entry["session_id"] not in attempted_waits])
+            pending = release_notices(intent)
+            assert isinstance(pending, CycleNoticesToSend)
+        result = not_reached_detail(pending.cycle)
+        if dropped or expired:
+            result = f" Dropped {len(dropped | expired)} invalid restart notices." + result
         if pending.unresolved_stops:
             return result + f" Pending stop confirmations: {pending.unresolved_stops}."
         if any(release_notice_pending(entry) for entry in pending.entries):
@@ -1685,16 +1792,18 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
         cycle = read_cycle_for_change(held)
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return
+        independent_waits = cycle.setdefault("independent_waits", {})
         for name, session_id in recipients:
             if session_id:
                 cycle["recipients"][session_id] = name
+                independent_waits[session_id] = True
                 for entry in cycle["entries"]:
                     if "run" not in entry and entry["session_id"] == session_id:
                         entry["name"] = name
         save_cycle(cycle)
 
 
-def register_wait(session_id: str, name: str = "") -> str:
+def register_wait(session_id: str, name: str = "", *, independent: bool = True) -> str:
     if not session_id:
         return "NoSessionId: hold remains active; this session cannot register"
     if not has_holder_file(holder_directory()):
@@ -1706,6 +1815,8 @@ def register_wait(session_id: str, name: str = "") -> str:
         if isinstance(cycle, NoCycle):
             return "no hold cycle: wait for the release broadcast"
         _ = cycle["recipients"].setdefault(session_id, name or session_id)
+        independent_waits = cycle.setdefault("independent_waits", {})
+        independent_waits[session_id] = independent or independent_waits.get(session_id, False)
         if session_id not in first_release_entries(cycle):
             cycle["entries"].append(new_entry(session_id, cycle["recipients"][session_id]))
         save_cycle(cycle)
@@ -1730,20 +1841,36 @@ def save_stop_confirmation(held: ReleaseLockHeld, request_id: str, status: StopS
     write_stop_confirmation(path, status)
 
 
-def stop_request_status(request: StopRequest) -> StopStatus | None:
-    status = read_stop_confirmation(request["id"])
-    if status is not None:
+def stop_request_status(request: StopRequest) -> StopConfirmation:
+    status = read_stop_confirmation_state(request["id"])
+    if status in ("stopped", "not_stopped"):
         return status
     runner_record = request.get("runner_record")
     run = request["entry"].get("run")
-    if runner_record and run is not None:
-        from scripts.agents import detached_runs
+    if not runner_record or run is None:
+        return status
 
-        if detached_runs.confirms_hold_stop(Path(runner_record), run["id"], request["id"]):
+    from scripts.agents import detached_runs, worker_lifecycle
+
+    path = Path(runner_record)
+    try:
+        if detached_runs.confirms_hold_stop(path, run["id"], request["id"]):
             return "stopped"
-        # Prune can copy the confirmation and remove the record during this read.
-        return read_stop_confirmation(request["id"])
-    return None
+        for source in (path, path.with_suffix(detached_runs.CONFIRMED_STOP_SUFFIX)):
+            fields = worker_lifecycle.read_json_object(source)
+            if not fields and not source.exists():
+                continue
+            recorded_run = fields.get("run_id")
+            requests = fields.get("hold_stop_requests", [])
+            if (not isinstance(recorded_run, str) or not isinstance(requests, list)
+                    or any(not isinstance(item, str) for item in cast(list[object], requests))):
+                return "unreadable"
+            if recorded_run == run["id"] and request["id"] in requests:
+                return "unreadable"
+    except (OSError, ValueError):
+        return "unreadable"
+    # Prune can copy the confirmation before it removes the run record.
+    return read_stop_confirmation_state(request["id"])
 
 
 def read_restart_entry(value: object) -> ReleaseEntry:
@@ -1812,12 +1939,14 @@ def release_notice(holders: Mapping[str, Mapping[str, str]]) -> str:
     """Name each released hold in the user's time zone."""
     descriptions: list[str] = []
     zone = user_zone()
+    today = datetime.now(zone).date()
     for key, holder in holders.items():
         name = holder.get("name", key)
         purpose = holder.get("purpose", "")
         work = f" for {purpose}" if purpose else ""
-        started = aware_instant(holder["since"]).astimezone(zone).strftime("%H:%M:%S %Z")
-        descriptions.append(f"{name} hold{work}, from {started}")
+        started = aware_instant(holder["since"]).astimezone(zone)
+        form = "%H:%M:%S %Z" if started.date() == today else "%m-%d %H:%M:%S %Z"
+        descriptions.append(f"{name} hold{work}, from {started.strftime(form)}")
     return RELEASE_NOTICE + " Released holds: " + "; ".join(descriptions) + "."
 
 
@@ -1859,35 +1988,110 @@ def send_session_release(entry: ReleaseEntry, notice: str) -> ReleaseNoticeResul
     return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
 
 
-def send_stopped_run_release(entry: ReleaseEntry, run: StoppedRun, notice: str,
-                             membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult:
-    from scripts.production import staff, worker_admission
+def process_restart_recipient(environment: Mapping[str, str]) -> RunAgent | NoRunAgent:
+    thread = environment.get("CODEX_THREAD_ID", "")
+    session = environment.get("CLAUDE_CODE_SESSION_ID", "")
+    if thread:
+        return RunAgent(f"codex:{thread}")
+    return RunAgent(session) if session else NoRunAgent()
 
-    worker = (membership.by_member_reference(run["staff_id"] or entry["session_id"].removeprefix("codex:"))
-              if membership is not None else None)
+
+RestartEvidence = Literal["matches", "invalid", "unreadable"]
+
+
+def staff_session_evidence(staff_id: str, session: str) -> RestartEvidence:
+    """Check which session the recorded staff member owns."""
+    if not staff_id:
+        return "matches"
+    from scripts.production import staff
+
+    try:
+        membership = staff.initial_snapshot()
+    except staff.StaffUnreadable:
+        return "unreadable"
+    owner = membership.by_id(staff.StaffId(staff_id))
+    return "matches" if owner is not None and owner.current_session == session.removeprefix("codex:") else "invalid"
+
+
+def restart_environment(pid: int, proc_root: Path) -> dict[str, str]:
+    return dict(item.decode("utf-8", "replace").split("=", 1)
+                for item in (proc_root / str(pid) / "environ").read_bytes().split(b"\0") if b"=" in item)
+
+
+def restart_evidence(entry: ReleaseEntry, *, confirmed: bool) -> RestartEvidence:
+    """Check saved evidence against the current process and run record."""
+    from scripts.agents import worker_lifecycle
+
+    run = entry.get("run")
+    assert run is not None
+    session = run.get("owner_session", "")
+    pid, start, boot = run.get("pid", 0), run.get("proc_start", ""), run.get("boot_id", "")
+    if not pid or not start or not boot or not session or session != entry["session_id"]:
+        return "invalid"
+    path = run.get("record_path")
+    try:
+        if boot_identity(PROC_ROOT) != boot:
+            return "invalid"
+        if path:
+            record_path = Path(path)
+            record = worker_lifecycle.read_json_object(record_path)
+            if record or record_path.exists():
+                command = record.get("command_pid", record.get("command_group"))
+                match record, command:
+                    case ({"run_id": str(run_id), "status": "running" | "finished",
+                           "command_started": str(command_started), "staff_id": str(staff_id)}, int(command_pid)):
+                        if (run_id, command_pid, command_started, staff_id) != (run["id"], pid, start, run["staff_id"]):
+                            return "invalid"
+                    case _:
+                        return "unreadable"
+            elif not confirmed:
+                return "invalid"
+        current = process_start.proc_table_start(pid, PROC_ROOT)
+        if isinstance(current, process_start.Started) and current.start == start:
+            try:
+                environment = restart_environment(pid, PROC_ROOT)
+            except (FileNotFoundError, ProcessLookupError):
+                current = process_start.proc_table_start(pid, PROC_ROOT)
+                if isinstance(current, process_start.Started):
+                    return "invalid"
+            else:
+                if process_restart_recipient(environment) != RunAgent(session):
+                    return "invalid"
+                process_staff = environment.get("BUILDLOG_OWNER_STAFF_ID", "")
+                if (process_staff or not path) and process_staff != run["staff_id"]:
+                    return "invalid"
+                current = process_start.proc_table_start(pid, PROC_ROOT)
+        if isinstance(current, process_start.Unreadable):
+            return "unreadable"
+        if current == process_start.Started(start) or (
+                confirmed and (current == process_start.Zombie(start) or isinstance(current, process_start.Gone))):
+            return staff_session_evidence(run["staff_id"], session)
+        return "invalid"
+    except (OSError, ValueError):
+        return "unreadable"
+
+
+def send_stopped_run_release(entry: ReleaseEntry, run: StoppedRun, notice: str,
+                             membership: staff.StaffSnapshot | None) -> ReleaseNoticeResult | None:
+    """Check the stop evidence after resolving the address."""
+    session = run.get("owner_session", "")
+    if not session or session != entry["session_id"]:
+        return None
+    worker = membership.by_current_session(session.removeprefix("codex:")) if membership is not None else None
     name = worker.name if worker is not None else entry["name"]
     notice += f" Restart the stopped run {run['label']} for {name}."
     notice += f" Run ID {run['id']}."
-    if worker is None:
-        result = send_session_release(entry, notice)
-    elif worker.kind == "worker" and (
-        entry["session_id"].startswith("codex:")
-        or membership is not None and isinstance(membership.backends.get(worker.id), staff.CodexBackend)
-    ):
-        result = send_release_to(entry, f"codex:{worker.current_session}", notice)
-    else:
-        result = send_release_to(entry, str(worker.id), notice)
-    if not isinstance(result, (ReleaseWorkerClosed, RecipientGone)):
-        return result
-    if membership is None:
-        return ReleaseSendFailed("staff membership is unavailable")
-    director = membership.parent_of(worker) if worker is not None else None
-    if director is None and run["director_dir"]:
-        try:
-            director = worker_admission.parent(membership, run=Path(run["director_dir"]))
-        except (worker_admission.RunOwnerUnavailable, staff.StaffUnreadable) as error:
-            return ReleaseSendFailed(str(error))
-    return result if director is None else send_release_to(entry, str(director.id), notice)
+    recipient = None if session.startswith("codex:") else socket_for(session)
+    evidence = restart_evidence(entry, confirmed=True)
+    if evidence == "invalid":
+        return None
+    if evidence == "unreadable":
+        return ReleaseSendFailed("restart evidence is unreadable")
+    if recipient is None:
+        return send_release_to(entry, session, notice)
+    if isinstance(recipient, RecipientLive):
+        return send_release(entry, recipient.socket, notice)
+    return recipient if isinstance(recipient, RecipientGone) else ReleaseSendFailed(recipient.reason)
 
 
 def send_release_broadcast(notice: str) -> None:
@@ -1928,18 +2132,24 @@ def notify_release(cycle: HoldCycle) -> str:
 
 
 def notify_released_cycle(cycle: HoldCycle) -> str:
-    return send_cycle_notices(cycle, [entry for entry in release_entries(cycle, cycle["recipients"])
-                                     if entry["delivery"] == "NotAttempted"])
+    if has_holder_file(holder_directory()):
+        return ""
+    entries = [entry for entry in release_entries(cycle, cycle["recipients"])
+               if entry["delivery"] == "NotAttempted"]
+    dropped = send_cycle_notices(cycle, entries)
+    if dropped:
+        forget_restart_notices(cycle, dropped)
+        return f" Dropped {len(dropped)} invalid restart notices." + not_reached_detail(cycle)
+    return not_reached_detail(cycle)
 
 
-def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str:
+def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> set[str]:
     from scripts.production import staff
 
     # The release lock prevents a same-session re-hold between this check and a send.
-    if has_holder_file(holder_directory()):
-        return ""
-    if not entries:
-        return not_reached_detail(cycle)
+    dropped: set[str] = set()
+    if not entries or has_holder_file(holder_directory()):
+        return dropped
 
     without_staff: set[str] = set()
     try:
@@ -1953,6 +2163,7 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
     for entry in entries:
         if has_holder_file(holder_directory()):
             break
+        run = entry.get("run")
         if entry not in cycle["entries"]:
             cycle["entries"].append(entry)
         entry["delivery"] = "NotAttempted"
@@ -1962,9 +2173,13 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
         session_id = entry["session_id"]
         codex = session_id.startswith("codex:")
         notice = release_notice(cycle["holders"])
-        run = entry.get("run")
-        result = (send_session_release(entry, notice) if run is None
-                  else send_stopped_run_release(entry, run, notice, membership))
+        if run is None:
+            result = send_session_release(entry, notice)
+        else:
+            result = send_stopped_run_release(entry, run, notice, membership)
+            if result is None:
+                dropped.add(run["id"])
+                continue
         if isinstance(result, ReleaseDelivered):
             entry["delivery"] = "Delivered"
         elif isinstance(result, ReleaseQueued):
@@ -1973,14 +2188,14 @@ def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str
             entry["delivery"] = "WorkerClosed" if run is None else "RecipientGone"
         elif isinstance(result, RecipientGone):
             entry["delivery"] = "RecipientGone"
-            if not release_notice_pending(entry) and session_id in without_staff:
+            if run is None and not release_notice_pending(entry) and session_id in without_staff:
                 _ = cycle["recipients"].pop(session_id, None)
         else:
             entry["delivery"] = "DeliveryFailed"
             if run is not None or codex:
                 print(f"build_hold: release notice for {entry['session_id']}: {result.reason}", file=sys.stderr)
         save_cycle(cycle)
-    return not_reached_detail(cycle)
+    return dropped
 
 
 def release_cycle(directory: Path, name: str, *, resume: bool = False,
@@ -2013,6 +2228,8 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
                 collect_stop_notices(cycle, notices)
+                notices["stop_waits"] = [session for session, independent in cycle.get("independent_waits", {}).items()
+                                         if not independent]
             intent = {"holder_key": holder.key, "holder_name": holder.name, "holder_purpose": holder.purpose,
                       "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
                       "released_at": clock().isoformat(), "notices": notices}

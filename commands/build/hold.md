@@ -68,6 +68,8 @@ The enforcer exits after the last holder file disappears.
 Release skips a recipient when it confirms that both the staff row and the session are absent.
 Release lists a missing session with a staff row under `Not reached`.
 The sender skips closed Codex workers with no route. Their next assignment resumes them.
+Release sends a restart notice to the original session when the stop is confirmed and the saved evidence matches.
+Release removes invalid restart notices from the pending record and reports the count.
 On `No hold cycle: broadcast this release to every session.`, use `/notify_top_level --here`.
 On `Not reached, tell them yourself: ...`, tell each named session.
 `release --resume` completes pending notices only when no holder file remains.
