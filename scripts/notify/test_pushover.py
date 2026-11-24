@@ -397,6 +397,44 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(silence.read_kept(), [])
         self.assertEqual(posted, [footed(push["message"], "legacy-owner", "none (free text)")])
 
+    def test_silence_drops_old_restart_failure_without_resume_values(self) -> None:
+        push: silence.KeptPush = {"source": "shutdown", "priority": "0", "title": "Claude coding work remains stopped",
+            "message": "Action: In the Claude session named natedev on the natedev computer, run /agents restart claude4.\n"
+                       + "After your restart request, 5 sessions on Claude account claude4 did not restart on natedev.",
+            "detail": "", "key": "resume-ended:old", "text_id": "shutdown.restart_failed"}
+        post = mock.Mock(side_effect=AssertionError("posted an old restart action"))
+        self.silence_on()
+        self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
+        self.assertEqual(silence.read_kept(), [])
+        self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
+        post.assert_not_called()
+        entries = pushover.LOG_FILE.read_text().splitlines()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(json.loads(entries[0])["outcome"], "dropped: restart failure lacks saved resume values")
+
+    def test_silence_renders_a_named_old_restart_failure_again(self) -> None:
+        push: silence.KeptPush = {"source": "shutdown", "priority": "0", "title": "Claude coding work remains stopped",
+            "message": "Action: In the Claude session named natedev on the natedev computer, run /agents restart claude4.\n"
+                       + "After your restart request, trunk on Claude account claude4 did not restart on natedev.",
+            "detail": "", "key": "resume-ended:old", "text_id": "shutdown.restart_failed"}
+        posted: list[dict[str, list[str]]] = []
+
+        def post(_url: str, data: bytes) -> tuple[int, bytes]:
+            posted.append(urllib.parse.parse_qs(data.decode()))
+            return 200, b'{"status":1}'
+
+        self.silence_on()
+        self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(silence.off(lambda _argv: 0, lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
+        self.assertEqual(silence.read_kept(), [])
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["title"], ["trunk did not start on claude4"])
+        action = "Action: In the natedev session, run: /agents resume trunk --to claude4"
+        self.assertEqual(posted[0]["message"], [footed(action, "shutdown", "shutdown.restart_failed")])
+
     def test_decision_templates_review_agent_values_at_each_send(self) -> None:
         for text_id in ("decision.choices", "review_watch.acknowledge"):
             entry = next(entry for entry in push_texts.catalog() if entry.id == text_id)

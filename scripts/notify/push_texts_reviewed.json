@@ -1208,14 +1208,73 @@
   },
   "shutdown.restart_failed": {
     "one_long_name": {
-      "reviewer": "opus",
-      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
-      "time": "2026-11-07T12:59:46.071567-05:00"
+      "objections": [
+        {
+          "quote": "account-migration\u2026 did not start on claude3",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "claude3",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "account-migration\u2026 did not start on claude3",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "/agents resume account-migration-verification --to claude3",
+          "rule": "first-150-stand-alone"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain adhoc review Nov 24 11:41 PST, \"yes\" to: title \"trunk did not start on claude4\"; action \"In the natedev session, run: /agents resume trunk --to claude4\"; no body; no message for a unit that its watchdog starts again; no-name case \"A session did not start on claude4\"; reviewer: claude-opus-5-5",
+      "sha256": "1cfa7ae480ccee94fe5f20e16b86c32c1e1b58add7362477606b0133f51022d5",
+      "time": "2026-11-24T16:23:49.297665-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
-      "time": "2026-11-07T12:59:38.245148-05:00"
+      "objections": [
+        {
+          "quote": "trunk did not start on claude4",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "trunk did not start on claude4",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "trunk did not start on claude4",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "the body names the trunk pane or session, which the Action line does not name",
+          "rule": "push-one-action"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain adhoc review Nov 24 11:41 PST, \"yes\" to: title \"trunk did not start on claude4\"; action \"In the natedev session, run: /agents resume trunk --to claude4\"; no body; no message for a unit that its watchdog starts again; no-name case \"A session did not start on claude4\"; reviewer: claude-opus-5-5",
+      "sha256": "1cfa7ae480ccee94fe5f20e16b86c32c1e1b58add7362477606b0133f51022d5",
+      "time": "2026-11-24T16:23:42.738478-05:00"
+    },
+    "unnamed": {
+      "objections": [
+        {
+          "quote": "codex2",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "A session did not start on codex2",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "A session did not start on codex2",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "In the natedev session, run: /agents resume 019b3a40-4250-7000-8000-000000000103 --to codex2",
+          "rule": "first-150-stand-alone"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain adhoc review Nov 24 11:41 PST, \"yes\" to: title \"trunk did not start on claude4\"; action \"In the natedev session, run: /agents resume trunk --to claude4\"; no body; no message for a unit that its watchdog starts again; no-name case \"A session did not start on claude4\"; reviewer: claude-opus-5-5",
+      "sha256": "1cfa7ae480ccee94fe5f20e16b86c32c1e1b58add7362477606b0133f51022d5",
+      "time": "2026-11-24T16:23:56.264699-05:00"
     }
   },
   "silence.auto_off": {

@@ -17,7 +17,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
 from enum import Enum
@@ -80,6 +80,68 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
 
 class AgentsUsageTests(unittest.TestCase):
+    def test_resume_forwards_a_mac_staff_row_through_ssh(self) -> None:
+        host = "Nates-MacBook-Pro-2023"
+        row = staff.StaffRow(StaffId("unit-row"), "unit", "alpha", staff.StaffRoot(),
+            current_session=StaffId("alpha-session"), worktree=staff.PresentWorktree(host, Path("/mac/alpha")),
+            unit_type=staff.UnitDetails("direct"))
+        record = staff.StaffSnapshot((row,))
+
+        def run_ssh(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
+            command = shlex.split(argv[4].partition(";")[0])
+            self.assertEqual(command[-6:],
+                ["resume", "--here", "--why=retry after exit", "--to=claude 4", "--", row.id])
+            with (mock.patch.object(shutdown, "local_machine", return_value=host),
+                  mock.patch.object(shutdown, "other_machine", return_value="natedev")):
+                code, output, errors = self.invoke(command[2:])
+            self.assertEqual((code, errors), (0, ""))
+            return subprocess.CompletedProcess(argv, 0, output + f"rc={code}\n", "")
+
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, shutdown_fixture_configuration(Path(folder))),
+              mock.patch.object(shutdown, "local_machine", return_value="natedev"),
+              mock.patch.object(shutdown, "other_machine", return_value="mac"),
+              mock.patch.object(remote, "other_machine", return_value="mac"),
+              mock.patch.object(staff, "initial_snapshot", return_value=record),
+              mock.patch.object(staff, "row_operation", return_value=nullcontext()),
+              mock.patch.object(herdr, "reboot_lock", return_value=nullcontext()),
+              mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(row.current_session, "pane", "claude4")) as resume,
+              mock.patch.object(subprocess, "run", side_effect=run_ssh) as ssh):
+            code, output, errors = self.invoke(["resume", row.name, "--to", "claude 4", "--why", "retry after exit"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("Claude is up on claude4", output)
+        resume.assert_called_once_with(str(row.id), why="retry after exit", to="claude 4")
+        ssh.assert_called_once()
+
+    def test_resume_refuses_unknown_or_unreachable_machines(self) -> None:
+        cases: tuple[tuple[str, list[str], str, int], ...] = (
+            ("", [], "the staff row has no machine", 0),
+            ("unlisted-host", [], "unknown machine 'unlisted-host'", 0),
+            ("mac", ["--here"], "session is on mac", 0),
+            ("mac", [], "cannot reach mac to resume the session", 1),
+        )
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, shutdown_fixture_configuration(Path(folder))),
+              mock.patch.object(shutdown, "local_machine", return_value="natedev"),
+              mock.patch.object(shutdown, "other_machine", return_value="mac"),
+              mock.patch.object(remote, "other_machine", return_value="mac"),
+              mock.patch.object(herdr, "reboot_lock", return_value=nullcontext()),
+              mock.patch.object(stop_resume, "resume") as resume):
+            for host, flags, message, calls in cases:
+                with self.subTest(host=host, flags=flags):
+                    location = staff.PresentWorktree(host, Path("/fixture/alpha")) if host else staff.WorktreeUnfilled()
+                    row = staff.StaffRow(StaffId("unit-row"), "unit", "alpha", staff.StaffRoot(),
+                        current_session=StaffId("alpha-session"), worktree=location, unit_type=staff.UnitDetails("direct"))
+                    with (mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                          mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                              ["ssh"], 255, "", "connection refused")) as ssh):
+                        code, output, errors = self.invoke(["resume", row.name, *flags])
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(message, errors)
+                    self.assertEqual(ssh.call_count, calls)
+            resume.assert_not_called()
+
     def test_resume_dwight_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
         with (mock.patch.object(test_stop_resume, "write_config_fixture", write_pinned_fixture_setting),
               mock.patch.object(test_stop_resume, "write_machine_config", shutdown_fixture_configuration),

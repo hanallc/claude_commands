@@ -44,6 +44,7 @@ except FileNotFoundError:
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -61,7 +62,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
-from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID
+from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID, RESTART_FAILED_TEXT_ID
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -598,10 +599,37 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
 
 
+def _update_kept_restart_failure(message: str) -> push_texts.RenderedPush | None:
+    """Read the session and account from the saved legacy text."""
+    action, _, body = message.partition("\n")
+    prefix = "Action: In the Claude session named natedev on the natedev computer, run /agents restart "
+    if not action.startswith(prefix) or not action.endswith("."):
+        return None
+    account = action[len(prefix):-1]
+    prefix = "After your restart request, "
+    if not body.startswith(prefix):
+        return None
+    session, found, _ = body[len(prefix):].partition(f" on Claude account {account} did not restart on ")
+    if not found or re.match(r"(?:one|[0-9]+) sessions?\b", session, re.IGNORECASE):
+        return None
+    try:
+        return push_texts.render(RESTART_FAILED_TEXT_ID, session=session, account=account, identity="")
+    except ValueError:
+        return None
+
+
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
+    title, message = push["title"], push["message"]
     reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
+    if push["text_id"] == RESTART_FAILED_TEXT_ID and (
+            title == "Claude coding work remains stopped" or "/agents restart " in message.partition("\n")[0]):
+        rendered = _update_kept_restart_failure(message)
+        if rendered is None:
+            reason = "restart failure lacks saved resume values"
+        else:
+            title, message = rendered.posted_title, rendered.message
     if push["text_id"] in TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
         reason = TOKEN_APPROVAL_REQUIRED
     if reference["kind"] == "question":
@@ -627,7 +655,7 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
-    return post_message(push["source"], priority, push["title"], push["message"], keys_file, post, detail,
+    return post_message(push["source"], priority, title, message, keys_file, post, detail,
                         push["key"], push["text_id"])
 
 

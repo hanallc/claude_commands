@@ -368,6 +368,16 @@ New escalate holds retain their registered template and values.
   - `listing(entries)` gives one line per entry, sorted by id: the id in one column, then its purpose. `shown(entry)` gives the entry's purpose, its template with the `{placeholders}` (Title, Session, Action, body, as the phone lays them out) and its first example filled through `render_entry`. `review.py list` and `review.py show <id>` print them with no network and no reviewer; an unknown id prints `No template named <id>.` and the list, and exits 1. `/nate`, `/nate help` and `/nate usage` print the `adhoc`, `silence` and `show` lines and then `review.py list`; `/nate show <id>` prints `review.py show <id>` (user request, 2026-10-21).
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
+- `shutdown.restart_failed` uses the title `{session} did not start on {account}`.
+  The title uses an ellipsis when it shortens a long name or account.
+  The title fits 44 characters.
+  An unnamed session appears as `A session` in the title.
+  The action is `In the natedev session, run: /agents resume {session} --to {account}`.
+  The command uses the full name when it is unique.
+  The command uses the session ID when the name is missing or shared.
+  The push has no body.
+  At silence release, Pushover reads the session and account from the old saved text and renders the current push.
+  Pushover drops an old push with one log entry if the saved text lacks either value.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `nightly.result` reports the branch, finish time, type result and full test result.
   `nightly.not_run` reports the reason that the checks could not start.

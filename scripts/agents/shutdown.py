@@ -479,6 +479,39 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
         stop_resume.ClaudeUp))
 
 
+def _forward_resume(row: staff.StaffRow, options: CommandLine) -> int | None:
+    """Resume a staff row on its configured workstation."""
+    machine = stop_resume.member_machine(row)
+    if machine and unit_machine_is_local(machine):
+        return None
+    if not machine:
+        print(f"{row.name}: resume refused because the staff row has no machine", file=sys.stderr)
+        return 1
+    if options.here:
+        print(f"{row.name}: session is on {machine}", file=sys.stderr)
+        return 1
+    route = remote.machine_alias(machine)
+    if isinstance(route, remote.MachineNameRefused):
+        print(f"{row.name}: {route.reason}", file=sys.stderr)
+        return 1
+    if route.alias != other_machine():
+        print(f"{row.name}: no resume route to {machine}", file=sys.stderr)
+        return 1
+    arguments = ["resume", "--here", f"--why={options.why}"]
+    if options.to is not None:
+        arguments.append(f"--to={options.to}")
+    arguments.extend(("--", str(row.id)))
+    code, output = run_remote(arguments)
+    if code == 255:
+        print(f"{row.name}: cannot reach {machine} to resume the session", file=sys.stderr)
+        return 1
+    if output:
+        print(output)
+    elif code:
+        print(f"{row.name}: resume failed on {machine} (status {code})", file=sys.stderr)
+    return code
+
+
 def _lifecycle(options: CommandLine) -> int:
     from scripts.production import session_staff
 
@@ -499,6 +532,14 @@ def _lifecycle(options: CommandLine) -> int:
         rows = [row] if row is not None else []
         if not rows:
             if options.command == "resume":
+                named = [member for member in record.rows if member.name == options.session]
+                if len(named) == 1:
+                    forwarded = _forward_resume(named[0], options)
+                    if forwarded is not None:
+                        return forwarded
+                if options.here:
+                    print(f"{options.session}: no staff row on this machine", file=sys.stderr)
+                    return 1
                 return _result_code(stop_resume.resume(options.session, why=why, to=options.to))
             raise staff.StaffNotFound(staff.StaffId(options.session))
     code = 0
@@ -507,6 +548,10 @@ def _lifecycle(options: CommandLine) -> int:
             if isinstance(row.worktree, staff.RemovedWorktree):
                 print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                 code = 2
+                continue
+            forwarded = _forward_resume(row, options)
+            if forwarded is not None:
+                code = max(code, forwarded)
                 continue
             with staff.row_operation(str(row.id)):
                 started = False
@@ -632,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("session", nargs="?")
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
+            _ = command.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
             _ = command.add_argument("--retired", action="store_true")
             _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")

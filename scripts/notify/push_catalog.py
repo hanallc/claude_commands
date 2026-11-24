@@ -1,5 +1,6 @@
 """Script phone texts and named cases reviewed before delivery."""
 import re
+import shlex
 from functools import partial
 
 from scripts.notify.gpu_xid import XID_MEANINGS
@@ -33,6 +34,35 @@ def nightly_result_values(given: dict[str, str]) -> TemplateValues:
         raise ValueError(f"nightly.result: missing values {sorted(required - given.keys())}, "
                          + f"extra values {sorted(given.keys() - required)}")
     return TemplateValues({"outcome": given["outcome"]}, dict(given))
+
+
+RESTART_FAILED_TEXT_ID = "shutdown.restart_failed"
+_RESTART_FAILED_SUFFIX = " did not start on "
+
+
+def restart_failed_values(given: dict[str, str]) -> TemplateValues:
+    """Fit the session name in the title and keep the full resume argument."""
+    required = {"session", "identity", "account"}
+    extra = given.keys() - required - {"reference"}
+    missing = required - given.keys()
+    if missing or extra:
+        raise ValueError(f"{RESTART_FAILED_TEXT_ID}: missing values {sorted(missing)}, extra values {sorted(extra)}")
+    account = given["account"]
+    session = given["session"]
+    reference = given.get("reference") or session or given["identity"]
+    if not reference.strip() or not account.strip():
+        raise ValueError(f"{RESTART_FAILED_TEXT_ID}: the resume reference and account are required")
+    title_session = session or "A session"
+    width = 44 - len(_RESTART_FAILED_SUFFIX)
+    account_room = width - min(len(title_session), len("A session"))
+    title_account = account if len(account) <= account_room else account[:account_room - 1] + "…"
+    title_room = width - len(title_account)
+    if len(title_session) > title_room:
+        title_session = title_session[:title_room - 1].rstrip(" -_./:\t–—") + "…"
+    target = [f"--to={account}"] if account.startswith("-") else ["--to", account]
+    command = [*target, "--", reference] if reference.startswith("-") else [reference, *target]
+    return TemplateValues({"session": title_session, "account": title_account,
+                           "resume_arguments": shlex.join(command)}, dict(given))
 
 
 def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> TemplateValues:
@@ -193,18 +223,17 @@ ENTRIES = (
             "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
-    PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
-        "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
-        + "Coding work stays stopped until the restart succeeds.\n\n"
-        + "The restart gave this error: {cause}.\n\n"
-        + "The command retries only stopped sessions. Running sessions keep their work.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "5 sessions",
-             "cause": "window failed to open"}),
-         PushExample("one_long_name", {"account": 'claude3', "machine": "Mac",
-             "stopped": "1 session",
-             "cause": "restart prompt not submitted"})),
-        purpose="One restart problem sends one push with the failed session count."),
+    PushText(RESTART_FAILED_TEXT_ID, "shutdown", "decision", "{session}" + _RESTART_FAILED_SUFFIX + "{account}",
+        ActionTemplate("In the natedev session, run: /agents resume {resume_arguments}"),
+        "",
+        (PushExample("typical", {"session": "trunk", "identity": "019b3a40-4250-7000-8000-000000000101",
+             "account": "claude4"}),
+         PushExample("one_long_name", {"session": "account-migration-verification", "identity": "019b3a40-4250-7000-8000-000000000102",
+             "account": "claude3"}),
+         PushExample("unnamed", {"session": "", "identity": "019b3a40-4250-7000-8000-000000000103",
+             "account": "codex2"})),
+        purpose="A session resume failed and needs a retry.",
+        expand_values=restart_failed_values),
     PushText("quota.claude_next_move", "quota_alert", "note", "{account} has {remaining} left with no move",
         ActionTemplate("Set a move on the Accounts page"),
         "",
