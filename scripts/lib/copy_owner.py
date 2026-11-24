@@ -5,8 +5,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import sys
 
-from scripts.agents.remote import local_machine
+from scripts.buildlog.store import host_name
 from scripts.lib import copy_record, scratch
 from scripts.production import staff
 
@@ -47,7 +48,8 @@ def recorded_owner(source: Path, *, intent: scratch.RemovalIntentAccess) -> str:
         if isinstance(owner, str):
             return checked_owner(owner)
     try:
-        member = staff.local_snapshot().by_worktree(local_machine(), source.resolve())
+        machine = host_name() or ("mac" if sys.platform == "darwin" else "natedev")
+        member = staff.local_snapshot().by_worktree(machine, source.resolve())
         if member is not None:
             return str(member.id)
     except staff.StaffUnreadable:
