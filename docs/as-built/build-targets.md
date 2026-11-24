@@ -43,14 +43,28 @@ A held target admits only work that its hold rules permit.
 
 ### Gate placement
 
-A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
-The caller checks the targets in `targets` in the order the file lists them.
-It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-The current rules permit natedev and `mac-linux` for a full gate and for nightly suites.
+A gate from the claude repository requests placement on eligible targets in `build_targets.conf`.
+The caller checks the targets in the order that the file lists them.
+It omits targets with `enabled.<target>=off` and applies the fixed placement rules.
+The canonical `scripts/production/gate.py` can request a scaler from the registry.
+A scaler has `kind.<target>=scaler` and a `settings.<target>` file.
+The queue reads `enabled.<target>` from the registry.
+It checks the local slot limit and daily spending room before it grants the scaler.
+The live registry has no AWS scaler entry.
+Nightly suites can use natedev or `mac-linux`.
 Named module tests and promotion without tests use natedev.
+An invocation through a legacy script or Python module cannot request AWS.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 Hana gates have no repository default.
-The Builds page shows both candidates while a gate with both targets waits or runs.
+A gate without an assignment runs locally.
+An AWS assignment with no test verdict exits 79 or 80.
+The caller requests no second assignment for that episode.
+
+Use this command when the registry includes an enabled scaler named `claude-aws`.
+
+```sh
+BUILDLOG_GATE_TARGETS=claude-aws ./scripts/lib/py scripts/production/gate.py --affected
+```
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
