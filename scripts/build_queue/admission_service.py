@@ -1347,15 +1347,6 @@ def same_remote_resource(first: placement.PlacementDestination, second: placemen
             and scopes_overlap(first.scope, second.scope, mac=first.provider == "mac"))
 
 
-def mac_only_request(request: wire.PlacementRequest) -> bool:
-    """Identify requests that require the Mac."""
-    selection, route = request.constraints.selection, request.route
-    return (isinstance(selection, placement.MacOnlyHost)
-            or isinstance(route, target_config.MacOnly)
-            or isinstance(selection, placement.PinnedHost) and selection.target == "mac"
-            or isinstance(route, target_config.PinnedTarget) and route.target == "mac")
-
-
 @dataclass(frozen=True)
 class PlacementHold:
     """An older waiting request that permits a remote destination but has no current free reading for it."""
@@ -4990,12 +4981,11 @@ done
             return self._placement_status(terminal[-1].assignment)
         candidates = self.placement_eligibility.get(request.episode, ())
         selection = request.constraints.selection
-        if mac_only_request(request):
+        if isinstance(selection, placement.MacOnlyHost):
             refusal = next((candidate.eligibility.reason for candidate in candidates
                 if candidate.destination.target == "mac"
                 and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                and (candidate.eligibility.reason == "disk"
-                     or isinstance(selection, placement.MacOnlyHost) and candidate.eligibility.reason != "busy")), "")
+                and candidate.eligibility.reason != "busy"), "")
             if refusal:
                 return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),

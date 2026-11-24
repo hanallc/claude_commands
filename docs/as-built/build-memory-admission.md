@@ -2811,7 +2811,6 @@ A local reservation keeps its saved place until the service sees processes in it
 The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
-A Mac disk exclusion refuses a request that selects or pins the Mac as its only target.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
 The table identifies waits that a build hold blocks.

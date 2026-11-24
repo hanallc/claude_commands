@@ -43,7 +43,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
-from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, MAC_ONLY, PinnedTarget
+from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -3178,21 +3178,6 @@ class MacOrderTests(unittest.TestCase):
     @staticmethod
     def assigned(fixture: PlacementFixture, *requests: wire.PlacementRequest) -> list[str]:
         return [request.episode for request in requests if request.episode in fixture.server.current_assignments]
-
-    def test_disk_refuses_each_mac_only_route(self) -> None:
-        for selection, route in ((placement.MacOnlyHost(), ANY_ELIGIBLE_TARGET),
-                                 (placement.ConfiguredOrder(), MAC_ONLY),
-                                 (placement.PinnedHost("mac"), ANY_ELIGIBLE_TARGET),
-                                 (placement.ConfiguredOrder(), PinnedTarget("mac"))):
-            with (self.subTest(selection=selection, route=route), PlacementFixture() as fixture,
-                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
-                request = placement_request(fixture)
-                request = replace(request, route=route, constraints=replace(request.constraints, selection=selection))
-                _ = publish_candidate(fixture, request, placement.TemporaryExclusion("disk"))
-                reply, = fixture.server.handle_request(request)
-                assert isinstance(reply, wire.DispatchStatus), reply
-                self.assertEqual(reply.retry, placement.DoNotRetry("disk"))
-                self.assertNotIn(request.episode, fixture.server.current_assignments)
 
     def test_the_older_request_is_probed_next_and_takes_the_mac(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
