@@ -659,10 +659,6 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
                 reason = "question closed"
             elif opening.since != reference["since"]:
                 reason = "question reopened"
-    elif reference["kind"] == "review_watch":
-        from scripts.production import review_regime
-        if review_regime.acknowledged():
-            reason = "report acknowledged"
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)

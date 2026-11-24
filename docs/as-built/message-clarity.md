@@ -364,7 +364,14 @@ New escalate holds retain their registered template and values.
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked`, `alert.decision`, `decision.choices`, and `review_watch.acknowledge` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False, one_line: bool = False)` and `PushExample(name, values)`.
+    The `purpose` field says when the script sends the push. It has one line of at most 72 characters.
+    The fingerprint excludes `purpose`. An edit to `purpose` keeps the approval.
+    With `header=False`, the phone shows only the title and the body.
+    `catalog()` refuses `header=False` on an entry with an action or a session.
+    `nate.adhoc` uses `header=False`. The fingerprint includes `header` only when it is False.
+    `nate.adhoc`, `alert.blocked`, `alert.decision`, and `decision.choices` have `agent_written=True`.
+    The fingerprint excludes `agent_written`. `agent_written(text_id: str) -> bool` returns False for unknown IDs.
   - `one_line=True` (item 172, 2026-11-22): the push posts no title, so the phone shows the app name, and the message is the rendered title alone. It has no `No action needed.` line, no action line and no body; the `Sent by:` footer stays. `catalog()` refuses `one_line` on an entry with an action, a session or a body. `RenderedPush.posted_title` is empty for such a text, and `posted_body` is the line. `pushover.parse` and the `review.py texts` approval review both build the Draft from these two, so the approval judges the posted form. `pushover.fields` leaves out an empty `title`. `shown()` and `texts --ask` print `Title: none (the phone shows the app name)`. `fingerprint` includes `one_line` only when it is True. `quota.codex_next_move` and `quota.codex_workers_stay` set it.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
@@ -374,10 +381,11 @@ New escalate holds retain their registered template and values.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (priority 0 without an in-window `--due`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `nightly.result` reports the branch, finish time, type result and full test result.
-  `nightly.not_run` reports the reason that the checks could not start.
+  `nightly.not_run` shows `Nightly check did not run`, the reason, and the next scheduled run in the user's time zone.
   Both texts use sender `nightly`, need `note`, and key `nightly-result`.
-  The result requires no action. The failure text includes an action.
-  The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
+  The gate sends `nightly.not_run` with an empty action.
+  `ActionTemplate(omit_when_empty=True)` omits the action line when its value is empty.
+  The timer keeps the `github-warmup` action line when GitHub credentials are cold.
   Silence keeps only the newest push and delivers it when silence ends.
   The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
@@ -682,7 +690,8 @@ At release, a closed question drops its push.
 An open question with a different `since` also drops its push.
 A same-minute reopening keeps `since`, so release sends the push because the question is open again.
 A missing or unreadable question record permits delivery and adds an anomaly to `pushover.jsonl`.
-A kept `review_watch.acknowledge` push drops when `review_regime.acknowledged()` reports acknowledgment.
 Legacy kept pushes without a reference still release.
 The release output counts delivered pushes and dropped pushes separately.
 Immediate delivery does not apply these release checks.
+
+The 2026-11-24 change removed the review watch and its push.
