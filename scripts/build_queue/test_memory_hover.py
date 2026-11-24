@@ -271,10 +271,13 @@ class MemoryHoverTests(unittest.TestCase):
         rendered = cast(list[str], self.page_expression("(()=>{" + setup + "renderWalk(data);"
             + "return [$('walk').innerHTML, ...data.walk.map(row => tooltipHtml('row:'+row.key, data))];})()", data, walk=True))
         root = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
-        self.assertEqual([cell.text for cell in root.findall(".//thead/tr/th")],
-                         ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens"])
-        self.assertEqual([cell.text for cell in root.findall(".//tr[@class='queue-head']/th")],
-                         ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU"])
+        for selector, labels in (
+            (".//thead/tr/th", ["Stage", "Done", "Dur", "Verify", "Step", "Pid", "Machine", "vCPU", "Tokens"]),
+            (".//tr[@class='queue-head']/th", ["#", "Done", "Waiting", "Verify", "Step", "Pid", "Machine", "vCPU"]),
+        ):
+            headers = root.findall(selector)
+            self.assertEqual([cell.text for cell in headers[:-1]], labels)
+            self.assertEqual((headers[-1].get("class"), headers[-1].text), ("row-action", None))
         self.assertEqual(root.findall(".//*[@class='unit']") + root.findall(".//*[@class='slot']"), [])
         for key, verify, step in (("row:fixture-run-0", "test", "nextest hana"), ("row:fixture-run-2", "", "gate"),
                                   ("wait:fixture-wait-0", "", "test affected")):
@@ -2154,7 +2157,7 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
 
     def test_page_reload_compares_the_loaded_page_on_start_and_on_visibility(self) -> None:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        loop = html[(start := html.index("const consoleHidden =")):html.index("</script>", start)]
         javascript = """
 const [initial, shown] = JSON.parse(process.argv[1]);
 let stamp = initial, reloads = 0;

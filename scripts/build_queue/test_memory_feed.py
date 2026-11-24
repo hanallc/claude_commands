@@ -999,8 +999,8 @@ process.stdout.write(JSON.stringify({
             page = memory_feed.reading()
         row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
         self.assertEqual(row["unit"], unit)
-        self.assertEqual(row["name"], "cloud-unit integrate")
-        self.assertEqual(row.get("name_parts"), [{"kind": "staff", "text": unit}, {"kind": "text", "text": " integrate"}])
+        self.assertEqual(row["name"], "cloud-unit: integrate")
+        self.assertEqual(row.get("name_parts"), [{"kind": "staff", "text": unit}, {"kind": "text", "text": ": integrate"}])
         self.assertIn('data-color-text="role.unit-director"', page.get("staff_names", {}).get(unit, ""))
 
     def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
@@ -1194,12 +1194,14 @@ process.stdout.write(JSON.stringify({
         command.parent.mkdir()
         _ = command.write_bytes(b"python3\0targeted_test.py\0--full\0")
         _ = write_config_fixture(self.root / "build_steps.conf",
-                                 "names.test-all=test all\nabout.test-all=\nabout.gate-job=\nchanges.default=no branch\n")
+                                 "names.test-all=test all\nabout.test-all=runs every test\nabout.gate-job=\n"
+                                 + "changes.default=no branch\n")
         with mock.patch.object(admission_client, "view", return_value=reading):
             page = memory_feed.reading()
         row, = page["waiters"]
+        # Every row has a description (b1ea3138c0); a run with no unit keeps the default changes text.
         self.assertEqual(row.get("changes"), "no branch")
-        self.assertNotIn("about", row)
+        self.assertEqual(row.get("about"), "runs every test")
         self.assertEqual(row["unit"], "")
         self.assertIn("test all", row["name"])
 
