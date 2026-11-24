@@ -963,6 +963,18 @@ class TestOwnedConfigTests(unittest.TestCase):
         faults = twin_faults(Path(conf.__file__).resolve().parents[2] / "config", conf.test_config_path)
         self.assertEqual(faults, [], "\n".join(faults))
 
+    def test_config_copy_keeps_values_when_the_file_has_no_twin(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        source = root / "config"
+        source.mkdir()
+        (root / "test_config").mkdir()
+        contents = b"# whole: 1..\ncount=8\n"
+        _ = (source / "limits.conf").write_bytes(contents)
+
+        copied = conf.copy_for_test(source, root / "fixture")
+
+        self.assertEqual((copied / "limits.conf").read_bytes(), contents)
+
     def test_runtime_copies_shift_the_test_owned_value_after_a_live_tune(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         source = root / "checkout"

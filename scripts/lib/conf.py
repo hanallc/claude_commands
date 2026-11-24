@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -744,11 +745,13 @@ def fixture_config_lines(source: Path, existing: str, overrides: str, *,
 
 
 def copy_config_file_fixture(source: Path, destination: Path, *, explicit: bool = False) -> Path:
-    """Copy one test config and shift its inherited numeric values."""
+    """Copy a config file and shift numeric values from its test-owned twin."""
     if source.parent.name == "config":
         owned = source.parent.with_name("test_config") / source.name
-        if owned.is_file():
-            source = owned
+        if not owned.is_file():
+            _ = shutil.copyfile(source, destination)
+            return destination
+        source = owned
     if explicit or source.name in _TEST_CONFIG_DEFAULTS:
         contents = "\n".join(fixture_config_lines(source, "", "", explicit=explicit)) + "\n"
     else:
