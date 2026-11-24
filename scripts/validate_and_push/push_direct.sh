@@ -20,7 +20,7 @@ BRANCH="${PUSH_TARGET_BRANCH:-$(git branch --show-current)}"
 DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
 DEFAULT_BRANCH="${DEFAULT_BRANCH#origin/}"
 
-SHA="$(git rev-parse HEAD)"
+SHA=""
 PUSHED=true
 PUBLISH_ONLY=false
 FOLLOW_PUBLISHED=false
@@ -31,17 +31,21 @@ CI_PUSH_REPO="${CI_PUSH_REPO:-}"
 # CI points release the merge lock before they wait for a run.
 # The publication receipt is the final line: <sha> <pushed|contained>.
 case "${1:-}" in
+  --commit)
+    [ "$#" -eq 2 ] || { echo 'usage: push_direct.sh --commit <sha>' >&2; exit 64; }
+    SHA="${2:?--commit needs a SHA}"
+    ;;
   --publish-only)
     [ "$#" -eq 2 ] || { echo 'usage: push_direct.sh --publish-only <sha>' >&2; exit 64; }
     PUBLISH_ONLY=true
-    SHA="$2"
+    SHA="${2:?--publish-only needs a SHA}"
     ;;
   --dispatch-published)
     [ "$#" -eq 3 ] || {
       echo 'usage: push_direct.sh --dispatch-published <sha> <workflow>' >&2
       exit 64
     }
-    SHA="$2"
+    SHA="${2:?--dispatch-published needs a SHA}"
     CI_WORKFLOW="$3"
     ;;
   --follow-published)
@@ -50,7 +54,7 @@ case "${1:-}" in
       exit 64
     }
     FOLLOW_PUBLISHED=true
-    SHA="$2"
+    SHA="${2:?--follow-published needs a SHA}"
     CI_WORKFLOW="${4:-}"
     CI_EVENT="${5:-}"
     DISPATCH_RESULT="${6:-}"
@@ -63,6 +67,13 @@ case "${1:-}" in
   '') ;;
   *) echo "push_direct.sh: unknown argument: $1" >&2; exit 64 ;;
 esac
+if [ -z "$SHA" ]; then
+  SHA="$(git rev-parse HEAD)"
+fi
+if [[ ! "$SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+  echo 'push_direct.sh: publication requires a full commit SHA' >&2
+  exit 64
+fi
 
 if [ -n "$CI_WORKFLOW" ]; then
   : "${CI_PUSH_REPO:?}"
@@ -92,9 +103,7 @@ publish_branch() {
     "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/land_main.py" \
       --checkout "$PWD" --commit "$SHA" --branch "$BRANCH" || PUSH_STATUS=$?
   elif [ "$PUSHED" = true ]; then
-    PUSH_COMMIT=HEAD
-    if [ -n "${CI_VALIDATED_BASE:-}" ]; then PUSH_COMMIT="$SHA"; fi
-    git push origin "${PUSH_COMMIT}:refs/heads/${BRANCH}" || PUSH_STATUS=$?
+    git push origin "${SHA}:refs/heads/${BRANCH}" || PUSH_STATUS=$?
   fi
   if [ "$PUSH_STATUS" -ne 0 ]; then
     if [ -n "${CI_VALIDATED_BASE:-}" ]; then

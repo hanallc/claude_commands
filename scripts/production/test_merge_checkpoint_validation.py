@@ -6,13 +6,14 @@ from scripts.production import checkpoint_gate
 
 from contextlib import redirect_stdout
 from io import StringIO
+import json
 import os
 import sys
 import tomllib
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import final
+from typing import cast, final
 
 from scripts.production import merge_checkpoint
 from scripts.production import staff
@@ -74,9 +75,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), result.before)
         self.assertEqual(self.events("validate_and_push.sh"), [[
-            "--quick", "--to", "production", "--fix-commit",
+            "--quick", "--validate-only", "--fix-commit",
             "ci(example): format fixes after alpha phase 2",
         ]])
+        self.assertEqual(self.events("checkpoint-test"), [])
         self.assertEqual(self.events("review_regime.py"), [])
     def test_cancel_prior_reaches_validate_and_push_only_when_requested(self) -> None:
         self.push = "validate_and_push"
@@ -88,14 +90,18 @@ with (state / "validation-locks").open("a") as output:
         first = self.checkpoint()
         first_result = self.run_checkpoint(first)
         self.assertEqual(first_result.process.returncode, 0, first_result.process.stderr + first_result.process.stdout)
+        first_tip = self.git("rev-parse", "HEAD")
         second = self.checkpoint(content="second\n")
         second_result = self.run_checkpoint(second, "--cancel-prior", phase="3")
         self.assertEqual(second_result.process.returncode, 0,
                          second_result.process.stderr + second_result.process.stdout)
         calls = self.events("validate_and_push.sh")
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn("--cancel-prior", calls[0])
-        self.assertIn("--cancel-prior", calls[1])
+        self.assertEqual(calls, [
+            ["--quick", "--validate-only", "--fix-commit", "ci(example): format fixes after alpha phase 2"],
+            ["--to", "production", "--publish-tested", first_tip],
+            ["--quick", "--validate-only", "--fix-commit", "ci(example): format fixes after alpha phase 3"],
+            ["--to", "production", "--publish-tested", self.git("rev-parse", "HEAD"), "--cancel-prior"],
+        ])
         common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
         self.assertEqual((self.state / "validation-locks").read_text().splitlines(),
                          [str(common / "main-push.lock")] * len(calls))
@@ -177,10 +183,24 @@ with (state / "validation-locks").open("a") as output:
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""
         self.production_doc()
+        self.executable(self.bin / "checkpoint-test", STUB + '''
+import subprocess
+tip = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=TEST_HANG_GUARD_SECS)
+(state / "tested-tip").write_text(tip.strip())
+''')
         sha = self.checkpoint()
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertEqual(len(self.events("validate_and_push.sh")), 1)
+        tip = (self.state / "tested-tip").read_text()
+        self.assertEqual(tip, self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.events("validate_and_push.sh"), [
+            ["--quick", "--validate-only", "--fix-commit", "ci(example): format fixes after alpha phase 2"],
+            ["--to", "production", "--publish-tested", tip],
+        ])
+        rows = [cast(dict[str, object], json.loads(line))
+                for line in (self.state / "events.jsonl").read_text().splitlines()]
+        commands = [row["command"] for row in rows if row["command"] in ("validate_and_push.sh", "checkpoint-test")]
+        self.assertEqual(commands, ["validate_and_push.sh", "checkpoint-test", "validate_and_push.sh"])
         self.assertIn("promote: ok — no promotion configured", result.process.stdout)
         self.assertEqual(self.events("ssh"), [])
     def test_delivers_line_is_merge_body_before_trailer(self) -> None:
@@ -317,7 +337,6 @@ with (state / "refreshed-test-locks").open("a") as output:
                 with self.assertRaises(checkpoint_gate.Stop) as stopped:
                     if may_undo:
                         _ = merge_checkpoint.prepare_checkpoint(production, before)
-                        _ = merge_checkpoint.push_git(production, True)
                     else:
                         _ = merge_checkpoint.refresh_pushed_tip(production, before)
                 error = stopped.exception

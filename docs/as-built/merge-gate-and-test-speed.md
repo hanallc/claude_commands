@@ -1000,6 +1000,8 @@ A reset that moves HEAD requires origin to match the recorded published tip or t
 The stop sends every notice before it writes result records.
 Rollback and result-record errors appear after the notices.
 Each run starts a fresh shared test log. Tests after main moves append to the same log.
+If the production uses validation, its formatter fixes enter the candidate before the batch tests run.
+Publication and promotion use that tested SHA.
 Publication rollback checks the live origin before it restores the tip.
 It also removes unpublished formatter commits.
 

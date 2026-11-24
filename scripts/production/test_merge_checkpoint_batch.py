@@ -122,9 +122,12 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                     if outcome == "push failure":
                         failure_command = """
 import subprocess
+if "--validate-only" in args:
+    raise SystemExit(0)
+tip = args[args.index("--publish-tested") + 1]
 origin = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True,
                         text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
-subprocess.run(["git", "push", origin, "HEAD:refs/heads/production"],
+subprocess.run(["git", "push", origin, tip + ":refs/heads/production"],
                check=True, timeout=TEST_HANG_GUARD_SECS)
 """
                     else:
@@ -174,8 +177,8 @@ print("still waiting for memory: src/alpha.txt", file=sys.stderr, flush=True)
                         self.assertEqual(tip, start)
                         self.assertEqual(self.git("rev-parse", "HEAD"), start)
                     self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), start)
-                    self.assertEqual(self.events("checkpoint-test"), [[]])
-                    self.assertEqual(len(self.events("validate_and_push.sh")), 1)
+                    self.assertEqual(self.events("checkpoint-test"), [[]] if outcome == "push failure" else [])
+                    self.assertEqual(len(self.events("validate_and_push.sh")), 2 if outcome == "push failure" else 1)
                     self.assertNotIn("batch: retry", result.stdout)
                     notices = [line for line in result.stdout.splitlines() if line.startswith("send ")]
                     if outcome in ("one unit push failure", "earlier step push failure"):
@@ -1037,8 +1040,11 @@ raise SystemExit(1)
         self.executable(self.bin / "validate_and_push.sh", STUB + r'''
 import subprocess
 trigger = Path("src/formatter-trigger.txt")
+if "--publish-tested" in args:
+    tip = args[args.index("--publish-tested") + 1]
+    subprocess.run(["git", "push", "origin", tip + ":refs/heads/production"], check=True, timeout=TEST_HANG_GUARD_SECS)
+    raise SystemExit(0)
 if not trigger.is_file():
-    subprocess.run(["git", "push", "origin", "production"], check=True, timeout=TEST_HANG_GUARD_SECS)
     raise SystemExit(0)
 trigger.write_text("formatted\n")
 subprocess.run(["git", "commit", "-am", "Format alpha"], check=True, timeout=TEST_HANG_GUARD_SECS)

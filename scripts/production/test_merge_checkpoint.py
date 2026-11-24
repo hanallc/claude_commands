@@ -39,6 +39,7 @@ from scripts.production.merge_checkpoint_test_support import (
 
 MAC_RECOVERY = ("{ [ ! -f scripts/lib/waiting_rows.py ] || "
                 + "scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; }")
+MAC_TEST_TIP = "a" * 40
 
 
 def setUpModule() -> None:
@@ -681,6 +682,8 @@ if "-E" not in args:
                     formatter_edit = (f"Path({rust_file!r}).write_text('partial formatter edit\\n')\n"
                                       if failure == "validation rollback" else "")
                     self.executable(self.bin / "validate_and_push.sh", STUB + f"""
+if {step.startswith("direct push")!r} and "--validate-only" in args:
+    raise SystemExit(0)
 print("=== STEP: {step} ===", flush=True)
 {formatter_edit}print({diagnostic!r}, flush=True)
 print({validation!r}, flush=True)
@@ -1204,6 +1207,62 @@ raise SystemExit(1)
     def test_blocked_retest_keeps_an_operator_commit(self) -> None:
         self.assert_moved_merge_tip_cancels_publication(move_during_retest=True,
                                                        retest_status=os.EX_TEMPFAIL)
+
+    def test_validation_fixes_are_tested_before_the_fixed_sha_is_published(self) -> None:
+        self.push = "validate_and_push"
+        self.promotions = str(self.promote)
+        self.production_doc()
+        checkpoint = self.checkpoint()
+        self.executable(self.bin / "validate_and_push.sh", STUB + r'''
+import subprocess
+def git(*arguments):
+    return subprocess.check_output(["git", *arguments], text=True, timeout=TEST_HANG_GUARD_SECS).strip()
+
+if "--validate-only" in args:
+    Path("formatted.txt").write_text(git("rev-parse", "HEAD") + "\n")
+    git("add", "formatted.txt")
+    git("commit", "-m", "Formatter fix")
+    with (state / "validated-tips").open("a") as output:
+        output.write(git("rev-parse", "HEAD") + "\n")
+else:
+    tip = args[args.index("--publish-tested") + 1]
+    git("commit", "--allow-empty", "-m", "Operator commit")
+    git("push", "origin", tip + ":refs/heads/production")
+''')
+        tested: list[str] = []
+        main_updates: list[str] = []
+        checkpoint_tests = merge_checkpoint.checkpoint_tests
+
+        def capture_test(production: production_doc.ProductionDocument, paths: tuple[str, ...],
+                         source: str, commands: tuple[tuple[str, ...], ...], flakes: frozenset[str],
+                         scratch_folder: Path, tip: str, flaky_tests: frozenset[str], *,
+                         before_merge_tip: str = "", ledger: production_doc.ProductionDocument | None = None) -> str:
+            self.assertIn("formatted.txt", paths)
+            tested.append(tip)
+            result = checkpoint_tests(production, paths, source, commands, flakes, scratch_folder, tip, flaky_tests,
+                                      before_merge_tip=before_merge_tip, ledger=ledger)
+            if len(tested) == 1:
+                main_updates.append(self.push_main_change("new-main.txt", "Main advanced\n"))
+            return result
+
+        with mock.patch.object(merge_checkpoint, "checkpoint_tests", side_effect=capture_test):
+            result = self.run_checkpoint(checkpoint, "--cancel-prior").process
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(tested, (self.state / "validated-tips").read_text().splitlines())
+        self.assertEqual(len(tested), 2)
+        tip = tested[-1]
+        self.assertEqual(self.git("merge-base", main_updates[0], tip), main_updates[0])
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit")
+        self.assertIn(f"validated and pushed {tip}", result.stdout)
+        self.assertEqual((self.state / "notified-tip").read_text(), tip)
+        self.assertEqual(self.events("validate_and_push.sh")[-1],
+                         ["--to", "production", "--publish-tested", tip, "--cancel-prior"])
+        merges = self.git("rev-list", "--first-parent", "--merges", tip).splitlines()
+        self.assertEqual({row["merge_commit"] for row in self.receipts()}, set(merges))
+
     def test_merge_tests_that_are_not_commands_are_refused_by_name_before_the_merge(self) -> None:
         """cargo-liner wrote packages and a crate directory where the line wants commands."""
         (self.checkout / "crates/tui_pane").mkdir(parents=True)
@@ -1358,19 +1417,19 @@ class MacPromotionPathTests(unittest.TestCase):
         assert isinstance(promotion.mac, production_doc.MacCheckout)
         done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
         with mock.patch("scripts.production.merge_checkpoint.subprocess.run", return_value=done) as run:
-            _ = merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
+            _ = merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"), MAC_TEST_TIP)
         argv = cast(list[str], run.call_args.args[0])
         self.assertEqual(argv[:2], ["ssh", "mac"])
         return argv[2]
 
     def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
         remote = self.remote_command("mac `~/.claude`")
-        self.assertTrue(remote.startswith(f'cd "$HOME"/.claude && {MAC_RECOVERY} && tip=$(git ls-remote'), remote)
+        self.assertTrue(remote.startswith(f'cd "$HOME"/.claude && {MAC_RECOVERY} && tip={MAC_TEST_TIP}'), remote)
         self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
 
     def test_absolute_mac_path_is_kept(self) -> None:
         remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
-        self.assertTrue(remote.startswith(f"cd '/Users/someone/my repo' && {MAC_RECOVERY} && tip=$(git ls-remote"), remote)
+        self.assertTrue(remote.startswith(f"cd '/Users/someone/my repo' && {MAC_RECOVERY} && tip={MAC_TEST_TIP}"), remote)
 
     def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
         cases = (("offline", 255, "", "", main_publish.MacPullPending),
@@ -1393,15 +1452,16 @@ class MacPromotionPathTests(unittest.TestCase):
                                       + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
-                    waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
+                    pull = main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), state, MAC_TEST_TIP)
+                    waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure", (pull,))
                     if text or expected is not main_publish.MacPullPending:
                         main_publish.queue(waiting)
                     if expected is checkpoint_gate.Stop:
                         with self.assertRaises(checkpoint_gate.Stop):
-                            _ = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state)
+                            _ = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state, MAC_TEST_TIP)
                         self.assertEqual(main_publish.read_queue(), waiting)
                         continue
-                    outcome = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state)
+                    outcome = merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state, MAC_TEST_TIP)
                     self.assertIsInstance(outcome, expected)
                     pending = main_publish.read_queue()
                     if expected is main_publish.MacPullPending:
@@ -1409,7 +1469,8 @@ class MacPromotionPathTests(unittest.TestCase):
                         assert isinstance(pending, main_publish.PendingMacPull)
                         self.assertEqual(pending.text, text)
                         self.assertIn("Mac asleep", pending.reason)
-                        self.assertEqual(len(list((state / "zone").iterdir())), 1)
+                        self.assertEqual(pending.pulls, (pull,))
+                        self.assertEqual(list((state / "zone").glob("*.json")), [main_publish.queue_path()])
                         if text:
                             self.assertEqual((pending.label, pending.since), (waiting.label, waiting.since))
                     elif text:
@@ -1440,26 +1501,26 @@ print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
                     "# whole: 1..\nMAC_PULL_TRIES=1\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
                 offline = state / "offline"
                 offline.touch()
-                targets = ((PurePosixPath("~/custom checkout"), state / "first-source"),
-                           (PurePosixPath("/Users/fixture/second checkout"), state / "second-source"))
+                targets = ((PurePosixPath("~/custom checkout"), state / "first-source", MAC_TEST_TIP),
+                           (PurePosixPath("/Users/fixture/second checkout"), state / "second-source", "b" * 40))
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "ZONE_SSH": str(ssh),
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
                     if text:
                         main_publish.queue(main_publish.PendingMacPull("zone", text, "2026-11-08", "offline"))
-                    for mac, source in targets:
-                        self.assertIsInstance(merge_checkpoint.pull_mac_checkout(mac, source), main_publish.MacPullPending)
+                    for mac, source, tip in targets:
+                        self.assertIsInstance(merge_checkpoint.pull_mac_checkout(mac, source, tip),
+                                              main_publish.MacPullPending)
                     offline.unlink()
-                    self.assertIsInstance(merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state),
+                    self.assertIsInstance(merge_checkpoint.pull_mac_checkout(PurePosixPath("~/.claude"), state, MAC_TEST_TIP),
                                           main_publish.MacPulled)
                     self.assertIsInstance(main_publish.read_queue(), main_publish.PendingMacPull)
                     before_drain = len((state / "ssh.log").read_text().splitlines())
                     _ = zone.drain(state, pulled=None)
                     commands = [cast(list[str], json.loads(line))[-1]
                                 for line in (state / "ssh.log").read_text().splitlines()[before_drain:]]
-                    for mac, source in targets:
-                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && {MAC_RECOVERY} && tip=$(git ls-remote" in command
-                                            and f"natedev:{source} main" in command for command in commands), commands)
+                    for mac, source, tip in targets:
+                        self.assertIn(main_publish.mac_pull_command(mac, source, tip=tip), commands)
                     if text:
                         self.assertTrue(any("broadcast.py" in command and text in command for command in commands), commands)
                     self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)

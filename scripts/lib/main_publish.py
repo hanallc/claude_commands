@@ -1,8 +1,11 @@
 """Commit a main-checkout change, push it, and send or queue the Mac pull."""
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -40,6 +43,7 @@ class MacPullSourceUnrecorded:
 class MacCheckoutPull:
     mac: PurePosixPath
     source: Path | MacPullSourceUnrecorded
+    tip: str = ""
 
 
 DEFAULT_MAC_CHECKOUT = PurePosixPath("~/.claude")
@@ -78,8 +82,6 @@ class MacPullFailed:
 ZONE_SSH_LIMIT = CommandTimeLimit(120)
 PUBLICATION_PREFIXES = ("tune(", "zone(", "user zone: ")
 REGISTRY_SUBJECT = "config(models): "
-# A landing merges a main move made only of these commits, on config/ paths only, with no retest.
-SETTINGS_SUBJECTS = (*PUBLICATION_PREFIXES, REGISTRY_SUBJECT)
 
 
 def _timeout_detail(error: subprocess.TimeoutExpired) -> str:
@@ -241,22 +243,28 @@ def remote_path(path: PurePosixPath) -> str:
     return shlex.quote(text)
 
 
-def mac_pull_command(mac: PurePosixPath, source: Path) -> str:
-    """Fetch main without shared fetch state and move to its advertised tip; waiting rows stay live."""
+def mac_pull_command(mac: PurePosixPath, source: Path, *, tip: str = "") -> str:
+    """Fetch the specified commit or current main and preserve waiting rows."""
     url = f"natedev:{shlex.quote(str(source))}"
+    select_tip = f"tip={shlex.quote(tip)}" if tip else f"tip=$(git ls-remote {url} refs/heads/main | cut -f1)"
+    fetch_ref = '"$tip"' if tip else "main"
+    allow_contained = "WAITING_ROWS_ALLOW_CONTAINED=1 " if tip else ""
+    install = (f"git fetch -q --no-write-fetch-head {url} {fetch_ref} "
+               "&& if [ -f scripts/lib/waiting_rows.py ]; "
+               f'then {allow_contained}scripts/lib/py scripts/lib/waiting_rows.py fast-forward "$tip"; '
+               'else git merge -q --ff-only "$tip"; fi')
+    if tip:
+        # An older Mac helper can run before the pull installs the new helper.
+        install = f'{{ git merge-base --is-ancestor "$tip" HEAD 2>/dev/null || {{ {install}; }}; }}'
     return (f"cd {remote_path(mac)} "
             "&& { [ ! -f scripts/lib/waiting_rows.py ] || scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; } "
-            f"&& tip=$(git ls-remote {url} refs/heads/main | cut -f1) "
-            f"&& git fetch -q --no-write-fetch-head {url} main "
-            "&& if [ -f scripts/lib/waiting_rows.py ]; "
-            "then scripts/lib/py scripts/lib/waiting_rows.py fast-forward \"$tip\"; "
-            "else git merge -q --ff-only \"$tip\"; fi; printf 'rc=%s\\n' \"$?\"")
+            f"&& {select_tip} && {install}; printf 'rc=%s\\n' \"$?\"")
 
 
 def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_MAC_CHECKOUT,
-             time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> MacPulled | MacPullFailed:
+             tip: str = "", time_limit: CommandTimeLimit = ZONE_SSH_LIMIT) -> MacPulled | MacPullFailed:
     """Return the completed Mac pull or its failure reason."""
-    done = ssh(mac_pull_command(mac, checkout), ssh_program=ssh_program, time_limit=time_limit)
+    done = ssh(mac_pull_command(mac, checkout, tip=tip), ssh_program=ssh_program, time_limit=time_limit)
     if isinstance(done, str):
         return MacPullFailed(done)
     match = re.search(r"(?:^|\n)rc=(\d+)", done.stdout)
@@ -285,29 +293,43 @@ def read_queue() -> PendingMacPull | NoPendingMacPull:
     for value in cast(list[object], fields.get("pulls", [{"mac": str(DEFAULT_MAC_CHECKOUT), "source": ""}])):
         row = cast(dict[str, object], value)
         source = str(row["source"])
-        pulls.append(MacCheckoutPull(PurePosixPath(str(row["mac"])), Path(source) if source else MacPullSourceUnrecorded()))
+        tip = row.get("tip", "")
+        if not isinstance(tip, str):
+            return NoPendingMacPull()
+        pulls.append(MacCheckoutPull(PurePosixPath(str(row["mac"])),
+                                    Path(source) if source else MacPullSourceUnrecorded(), tip))
     return PendingMacPull(cast(str, fields["zone"]), cast(str, fields["text"]),
                           cast(str, fields["since"]), cast(str, fields["reason"]), tuple(pulls))
 
 
+@contextmanager
+def _locked_mac_queue() -> Generator[None]:
+    path = queue_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def queue(change: PendingMacPull) -> None:
     """Coalesce pulls while retaining an earlier zone notice that still needs delivery."""
-    previous = read_queue()
-    if isinstance(previous, PendingMacPull):
-        pulls = {pull.mac: pull for pull in previous.pulls}
-        pulls.update((pull.mac, pull) for pull in change.pulls)
-        change = replace(change, pulls=tuple(pulls.values()))
-        if not change.text and previous.text:
-            change = replace(change, label=previous.label, text=previous.text, since=previous.since)
-    _write_queue(change)
+    with _locked_mac_queue():
+        previous = read_queue()
+        if isinstance(previous, PendingMacPull):
+            pulls = {(pull.mac, bool(pull.tip)): pull for pull in previous.pulls}
+            pulls.update(((pull.mac, bool(pull.tip)), pull) for pull in change.pulls)
+            change = replace(change, pulls=tuple(pulls.values()))
+            if not change.text and previous.text:
+                change = replace(change, label=previous.label, text=previous.text, since=previous.since)
+        _write_queue(change)
 
 
 def _write_queue(change: PendingMacPull) -> None:
     path = queue_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps(dict(zone=change.label, text=change.text,
                                            since=change.since, reason=change.reason,
-                                           pulls=[dict(mac=str(pull.mac), source=str(pull.source) if isinstance(pull.source, Path) else "")
+                                           pulls=[dict(mac=str(pull.mac), tip=pull.tip,
+                                                       source=str(pull.source) if isinstance(pull.source, Path) else "")
                                                   for pull in change.pulls]), indent=2) + "\n")
 
 
@@ -316,13 +338,31 @@ def queue_pull_only(label: str, reason: str, *, pulls: tuple[MacCheckoutPull, ..
     queue(PendingMacPull(label, "", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), reason, pulls))
 
 
-def clear_pull_only(mac: PurePosixPath = DEFAULT_MAC_CHECKOUT, *, notice_delivered: bool = False) -> None:
-    """Clear a completed pull and retain any waiting zone notice."""
-    pending = read_queue()
-    if isinstance(pending, PendingMacPull):
-        pending = replace(pending, pulls=tuple(pull for pull in pending.pulls if pull.mac != mac),
-                          text="" if notice_delivered else pending.text)
-        if pending.pulls or pending.text:
-            _write_queue(pending)
-        else:
-            queue_path().unlink(missing_ok=True)
+def _save_pending_pull(pending: PendingMacPull) -> None:
+    if pending.pulls or pending.text:
+        _write_queue(pending)
+    else:
+        queue_path().unlink(missing_ok=True)
+
+
+def clear_pull_only(mac: PurePosixPath = DEFAULT_MAC_CHECKOUT, *, tip: str = "", source: Path | None = None) -> None:
+    """Clear a completed pull. Use the source to check ancestry of a published SHA."""
+    with _locked_mac_queue():
+        pending = read_queue()
+        if isinstance(pending, PendingMacPull):
+            pulls = tuple(pull for pull in pending.pulls if pull.mac != mac or not (
+                pull.tip == tip or (
+                    tip and pull.tip and source is not None
+                    and git(source, "merge-base", "--is-ancestor", "--", pull.tip, tip).returncode == 0
+                )
+            ))
+            if pulls != pending.pulls:
+                _save_pending_pull(replace(pending, pulls=pulls))
+
+
+def clear_zone_notice(text: str) -> None:
+    """Clear the delivered notice and retain all pending pulls."""
+    with _locked_mac_queue():
+        pending = read_queue()
+        if isinstance(pending, PendingMacPull) and not pending.pulls and pending.text == text:
+            _save_pending_pull(replace(pending, text=""))

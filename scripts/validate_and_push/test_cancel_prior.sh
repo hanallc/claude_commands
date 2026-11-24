@@ -11,6 +11,7 @@ cp "$SCRIPT_DIR/validate_and_push.sh" "$SCRIPT_DIR/push_direct.sh" "$TEST_DIR/sc
 cat > "$TEST_DIR/scripts/run_validation.sh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+touch "$VALIDATION_RAN"
 STUB
 cat > "$TEST_DIR/scripts/choose_push_path.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -33,14 +34,16 @@ cat > "$TEST_DIR/lib/land_main.py" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 branch=
+commit=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --branch) branch="$2"; shift 2 ;;
-    --checkout|--commit) shift 2 ;;
+    --commit) commit="$2"; shift 2 ;;
+    --checkout) shift 2 ;;
     *) exit 64 ;;
   esac
 done
-git push origin "HEAD:refs/heads/$branch"
+git push origin "$commit:refs/heads/$branch"
 if [ "${HOOK_EXIT_STATUS:-0}" -ne 0 ]; then
   echo "HookFailed: exit $HOOK_EXIT_STATUS"
   echo "Rerun: land_main.py --branch $branch" >&2
@@ -57,7 +60,7 @@ printf '\n' >> "$GIT_CALLS"
 case "$1 $2" in
   'push origin') ;;
   'branch --show-current') printf '%s\n' 'ci-test-branch' ;;
-  'symbolic-ref --quiet') printf '%s\n' 'origin/ci-test-branch' ;;
+  'symbolic-ref --quiet') printf '%s\n' "${GIT_DEFAULT_BRANCH:-origin/ci-test-branch}" ;;
   'rev-parse HEAD') printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
   *) printf 'unexpected git call: %s\n' "$*" >&2; exit 1 ;;
 esac
@@ -128,7 +131,7 @@ set -euo pipefail
 STUB
 chmod +x "$TEST_DIR/bin/git" "$TEST_DIR/bin/gh" "$TEST_DIR/bin/sleep"
 
-export GIT_CALLS="$TEST_DIR/git_calls" GH_CALLS="$TEST_DIR/gh_calls"
+export GIT_CALLS="$TEST_DIR/git_calls" GH_CALLS="$TEST_DIR/gh_calls" VALIDATION_RAN="$TEST_DIR/validation-ran"
 export PATH="$TEST_DIR/bin:$PATH"
 failed=0
 
@@ -148,7 +151,7 @@ run_case() {
   : > "$GH_CALLS"
   bash "$TEST_DIR/scripts/$script" "$@" > "$TEST_DIR/stdout" 2> "$TEST_DIR/stderr" || actual_status=$?
   if [[ "$actual_status" != "$expected_status" ]] ||
-    [[ "$(line_count 'push origin HEAD:refs/heads/ci-test-branch ' "$GIT_CALLS")" != "$expected_pushes" ]]; then
+    [[ "$(line_count 'push origin aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/ci-test-branch ' "$GIT_CALLS")" != "$expected_pushes" ]]; then
     printf 'FAIL %s: push or exit status (got %s, expected %s)\n' "$name" "$actual_status" "$expected_status"
     cat "$GIT_CALLS" "$GH_CALLS" "$TEST_DIR/stdout" "$TEST_DIR/stderr"
     failed=1
@@ -199,6 +202,19 @@ live_queries_are_exact() {
 if run_case 'superseded live runs are cancelled' 0 --to ci-test-branch --cancel-prior; then
   check_case 'superseded live runs are cancelled' both_older_runs_cancelled
   check_case 'live lookup uses one exact query per status' live_queries_are_exact
+fi
+
+rm -f "$VALIDATION_RAN"
+if CI_VALIDATED_BASE=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa GIT_DEFAULT_BRANCH=origin/main \
+    run_case 'a tested SHA goes straight to publication' 0 --to ci-test-branch \
+      --publish-tested aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cancel-prior; then
+  if [[ ! -e "$VALIDATION_RAN" ]] && [[ "$(line_count 'rev-parse HEAD ' "$GIT_CALLS")" == 0 ]] &&
+      both_older_runs_cancelled; then
+    printf 'PASS a tested SHA goes straight to publication\n'
+  else
+    printf 'FAIL a tested SHA goes straight to publication\n'
+    failed=1
+  fi
 fi
 
 if run_case 'push without cancellation leaves runs alone' 0 --to ci-test-branch; then
@@ -306,6 +322,21 @@ fi
 case_name='failed dispatch leaves prior runs when cancellation is disabled'
 if CANCEL_PRIOR=false run_case "$case_name" 1 "${dispatch_args[@]}"; then
   check_case "$case_name" dispatch_leaves_old_runs
+fi
+
+tested=cccccccccccccccccccccccccccccccccccccccc
+: > "$GIT_CALLS"
+: > "$GH_CALLS"
+if GIT_DEFAULT_BRANCH=origin/main PUSH_TARGET_BRANCH=ci-test-branch \
+    bash "$TEST_DIR/scripts/push_direct.sh" --publish-only "$tested" > "$TEST_DIR/stdout" 2> "$TEST_DIR/stderr" &&
+    [[ "$(line_count "push origin $tested:refs/heads/ci-test-branch " "$GIT_CALLS")" == 1 ]] &&
+    [[ "$(line_count 'rev-parse HEAD ' "$GIT_CALLS")" == 0 ]] &&
+    [[ "$(tail -n 1 "$TEST_DIR/stdout")" == "$tested pushed" ]]; then
+  printf 'PASS publish-only pins the non-default branch push to the supplied SHA\n'
+else
+  printf 'FAIL publish-only pins the non-default branch push to the supplied SHA\n'
+  cat "$GIT_CALLS" "$TEST_DIR/stdout" "$TEST_DIR/stderr"
+  failed=1
 fi
 
 exit "$failed"

@@ -633,6 +633,69 @@ class MainPublishTests(PublicationTestCase):
                     self.assertEqual(repo.git(mac, "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes"),
                                      "\n".join(line for line in refs.splitlines() if " refs/remotes/" in line))
 
+    def test_publish_only_pushes_the_supplied_sha_when_the_branch_moves(self) -> None:
+        repo = self.repository
+        _ = repo.git(repo.checkout, "switch", "-qc", "production")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "production")
+        _ = repo.git(repo.checkout, "commit", "--allow-empty", "-qm", "Tested commit")
+        tested = repo.head()
+        real_git = shutil.which("git")
+        assert real_git is not None
+        git_wrapper = repo.programs / "git"
+        _ = git_wrapper.write_text(
+            '#!/bin/sh\nif [ "$1" = push ]; then\n'
+            + f'  {shlex.quote(real_git)} commit --allow-empty -qm "Operator commit" || exit "$?"\n'
+            + f'fi\nexec {shlex.quote(real_git)} "$@"\n',
+        )
+        git_wrapper.chmod(0o755)
+        script = Path(__file__).resolve().parents[1] / "validate_and_push/push_direct.sh"
+        done = subprocess.run(["bash", str(script), "--publish-only", tested], cwd=repo.checkout,
+                              env=repo.env, capture_output=True, text=True, check=True,
+                              timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(done.stdout.splitlines()[-1], f"{tested} pushed")
+        self.assertEqual(repo.git(repo.origin, "rev-parse", "refs/heads/production"), tested)
+        self.assertEqual(repo.git(repo.checkout, "log", "-1", "--format=%s"), "Operator commit")
+
+    def test_mac_fetches_the_published_sha_after_source_main_moves(self) -> None:
+        repo = self.repository
+        mac = repo.root / "Mac checkout"
+        _ = repo.git(repo.root, "clone", "-q", str(repo.checkout), str(mac))
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "Published change")
+        tip = repo.head()
+        _ = repo.git(repo.checkout, "commit", "--allow-empty", "-qm", "Operator commit")
+        command = main_publish.mac_pull_command(PurePosixPath(str(mac)), repo.checkout, tip=tip)
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
+                                          "GIT_CONFIG_VALUE_0": "natedev:"}):
+            result = subprocess.run(["sh", "-c", command], check=True, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.stdout.strip(), "rc=0")
+        self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), tip)
+        self.assertNotEqual(repo.head(), tip)
+
+    def test_mac_pull_accepts_an_installed_descendant_of_the_published_sha(self) -> None:
+        repo = self.repository
+        tip = repo.head()
+        _ = repo.git(repo.checkout, "commit", "--allow-empty", "-qm", "Newer published change")
+        installed = repo.head()
+        mac = repo.root / "Mac checkout"
+        _ = repo.git(repo.root, "clone", "-q", str(repo.checkout), str(mac))
+        helper = mac / "scripts/lib/waiting_rows.py"
+        helper.parent.mkdir(parents=True)
+        helper.touch()
+        py = helper.with_name("py")
+        _ = py.write_text('#!/bin/sh\nshift\n'
+                          + f'exec {shlex.quote(sys.executable)} {shlex.quote(str(waiting_rows.__file__))} "$@"\n')
+        py.chmod(0o755)
+        command = main_publish.mac_pull_command(PurePosixPath(str(mac)), repo.checkout, tip=tip)
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
+                                          "GIT_CONFIG_VALUE_0": "natedev:"}):
+            result = subprocess.run(["sh", "-c", command], check=True, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), installed)
+
     def test_remote_git_failure_returns_a_named_failure_after_a_successful_ssh_connection(self) -> None:
         repo = self.repository
         _ = repo.ssh.write_text('#!/bin/sh\necho "pull refused" >&2\nprintf "rc=1\\n"\n')

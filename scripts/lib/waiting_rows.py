@@ -730,9 +730,11 @@ def apply_move(checkout: Path, rows: WaitingRows, pending: LockedJournal) -> Non
         pending.restore(checkout, "HEAD")
 
 
-def move_to(checkout: Path, target: str, *, fast_forward: bool = False, expected_head: str = "") -> None:
+def move_to(checkout: Path, target: str, *, fast_forward: bool = False,
+            allow_contained: bool = False, expected_head: str = "") -> None:
     with locked_journal(journal_path()) as pending:
-        move = move_target(checkout, target, pending, fast_forward=fast_forward, expected_head=expected_head)
+        move = move_target(checkout, target, pending, fast_forward=fast_forward,
+                           allow_contained=allow_contained, expected_head=expected_head)
         if move.head != move.tip:
             apply_move(checkout, check_move(checkout, move, pending), pending)
 
@@ -750,7 +752,8 @@ def main(arguments: list[str] | None = None) -> int:
         return 2
     checkout = Path.cwd()
     try:
-        move_to(checkout, argv[1], fast_forward=True)
+        move_to(checkout, argv[1], fast_forward=True,
+                allow_contained=os.environ.get("WAITING_ROWS_ALLOW_CONTAINED") == "1")
     except (OSError, UnicodeError) as error:
         print(f"waiting_rows: {error}", file=sys.stderr)
         return 1

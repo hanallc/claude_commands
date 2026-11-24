@@ -20,6 +20,8 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 1. Argument parsing sets `CANCEL_PRIOR=true`.
 2. `run_validation.sh` runs. If it fails, `set -e` exits before any push, so nothing is cancelled.
    On Linux, all queued steps in the full validation share one [run place](build-memory-admission.md#the-verify-run-place).
+   A merge checkpoint runs `--validate-only` before its merge tests.
+   It then supplies the tested SHA through `--publish-tested`.
 3. Both direct paths follow the same order:
    - The `--to <branch>` path exports `PUSH_TARGET_BRANCH` to `push_direct.sh`.
    - The default path runs `push_direct.sh` once `choose_push_path.sh` has chosen `direct`.
@@ -36,7 +38,7 @@ Other branches take no main push lock.
 
 ### `cancel_prior_runs`
 
-- **Inputs.** The branch is `PUSH_TARGET_BRANCH`, or `git branch --show-current` when that is unset. The sha is the full `git rev-parse HEAD`, because `gh run list --commit` returns nothing for a short sha.
+- **Inputs.** The branch is `PUSH_TARGET_BRANCH` or the current branch. The command uses the supplied full SHA or reads HEAD once before publication.
 - **Workflow names come from the pushed sha's own runs:**
   `gh run list --branch B --commit SHA --json workflowName --jq '[.[].workflowName | select(. != null)] | unique[]'`
 - **Live runs: one call per workflow and status**, for `queued` and then `in_progress`:
@@ -63,11 +65,14 @@ Output lines:
 
 ### The showrunner rule
 
-The rule appears in `produce.md` at <MergeCheckpoint/> (`merge_checkpoint.py --cancel-prior` passes the flag to the `--quick` push of a green merge, and is refused with `Push: git`) and at <CIPoint/> (`ci_points.py ci start --cancel-prior`). Before the push, check for an older CI run on the merge branch that is still queued or running. Add `--cancel-prior` when this push replaces that run and no CI point is watching its result or diagnosing a red run. The command blocks in those sections leave the flag out; the showrunner adds it push by push.
+The rule appears in `produce.md` at <MergeCheckpoint/> and <CIPoint/>.
+The checkpoint passes the flag to `--publish-tested` and refuses it with `Push: git`.
+Check for an older queued or running CI run on the branch.
+Add `--cancel-prior` if the push replaces that run and no CI point needs its result.
 
 ### The test
 
-Run `bash scripts/validate_and_push/test_cancel_prior.sh`. It exits 0 when all nine checks pass, and it needs `jq` on `PATH`.
+Run `bash scripts/validate_and_push/test_cancel_prior.sh` with `jq` on `PATH`.
 
 - **Setup.** It copies `validate_and_push.sh` and `push_direct.sh` into a `mktemp -d` directory, which is removed on exit. Three stub scripts sit beside the copies:
   - `run_validation.sh` does nothing.

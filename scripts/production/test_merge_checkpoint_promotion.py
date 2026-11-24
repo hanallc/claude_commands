@@ -477,10 +477,12 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             check_lock("into")
             original_into(path, branch, reason, gates)
 
-        def pull(mac: Path, source: Path) -> None:
+        def pull(mac: PurePosixPath, source: Path, tip: str) -> main_publish.MacPulled:
             self.assertEqual(mac, self.root / "mac-installed")
             self.assertEqual(source, self.promote)
+            self.assertEqual(tip, self.git("rev-parse", "main", cwd=self.origin))
             check_lock("mac")
+            return main_publish.MacPulled()
 
         def zone(mac: PurePosixPath) -> None:
             self.assertEqual(mac, self.root / "mac-installed")
@@ -532,7 +534,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_handoff_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=True)
 
-    def test_main_move_of_settings_commits_merges_with_no_retest(self) -> None:
+    def test_main_move_of_settings_commits_retests_the_new_tip(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
         checkpoint = self.checkpoint()
@@ -544,39 +546,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         setting = self.push_main_change("config/alpha.conf", "limit=2\n", "tune(alpha): limit=2")
         resumed = self.run_checkpoint(checkpoint).process
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertIn("main moved only by settings commits", resumed.stdout)
-        self.assertEqual(self.events("checkpoint-test"), test_events)
+        self.assertEqual(self.events("checkpoint-test"), [*test_events, []])
         tip = self.git("rev-parse", "main", cwd=self.origin)
         self.assertEqual(self.git("merge-base", "--is-ancestor", setting, tip), "")
         self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tip), "")
-
-    def test_settings_commits_only_needs_settings_subjects_and_config_paths(self) -> None:
-        repo = self.root / "settings-history"
-        _ = self.git("init", "-q", "-b", "main", str(repo), cwd=self.root)
-        _ = self.git("config", "user.name", "Checkpoint Test", cwd=repo)
-        _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=repo)
-
-        def commit(relative: str, subject: str) -> str:
-            self.write(repo, relative, subject + "\n")
-            _ = self.git("add", relative, cwd=repo)
-            _ = self.git("commit", "-q", "-m", subject, cwd=repo)
-            return self.git("rev-parse", "HEAD", cwd=repo)
-
-        base = commit("README", "base")
-        tuned = commit("config/alpha.conf", "tune(alpha): limit=2")
-        registry = commit("config/models.conf", main_publish.REGISTRY_SUBJECT + "add a model")
-        self.assertTrue(merge_checkpoint.settings_commits_only(repo, registry, base))
-        self.assertFalse(merge_checkpoint.settings_commits_only(repo, tuned, tuned))
-        code = commit("config/beta.conf", "fix(beta): a code change")
-        self.assertFalse(merge_checkpoint.settings_commits_only(repo, code, registry))
-        outside = commit("scripts/alpha.py", "tune(alpha): outside config")
-        self.assertFalse(merge_checkpoint.settings_commits_only(repo, outside, code))
-        _ = self.git("checkout", "-q", "-b", "side", base, cwd=repo)
-        side = commit("config/gamma.conf", "zone(user): side")
-        _ = self.git("checkout", "-q", "main", cwd=repo)
-        _ = self.git("merge", "-q", "--no-ff", "-m", "tune(merge): a merge", side, cwd=repo)
-        merged = self.git("rev-parse", "HEAD", cwd=repo)
-        self.assertFalse(merge_checkpoint.settings_commits_only(repo, merged, outside))
 
     def test_handoff_retest_blocks_main_push_until_promotion_finishes(self) -> None:
         self.promotions = str(self.promote)
@@ -670,13 +643,13 @@ with lock.open("a") as held:
         started: list[float] = []
         spans: list[float] = []
 
-        def tests(request: merge_checkpoint.MergeRequest, paths: tuple[str, ...], merge_head: str) -> str:
+        def tests(request: merge_checkpoint.MergeRequest, paths: tuple[str, ...], merge_head: str, test_tip: str) -> str:
             self.assert_main_push_lock_available()
-            return original_tests(request, paths, merge_head)
+            return original_tests(request, paths, merge_head, test_tip)
 
-        def push(production: Production, may_undo: bool) -> str:
+        def push(production: Production, tested_tip: str) -> str:
             started.append(time.monotonic())
-            return original_push(production, may_undo)
+            return original_push(production, tested_tip)
 
         def promote_with_contender(checkout: Path, branch: str, tip: str) -> (
                 merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
@@ -754,6 +727,33 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
         self.assertIn(f"already pushed at {pushed}", retried.process.stdout)
         self.assertIn(f"promote: ok — {self.promote} already at {pushed}\n", retried.process.stdout)
+    def test_promotion_lands_the_published_tip_when_local_main_moves_after_the_check(self) -> None:
+        self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
+        self.production_doc()
+        checkpoint = self.checkpoint()
+        landed_shas: list[str] = []
+        original_land = land_main.land
+
+        def advance_main(checkout: Path, commit: str) -> land_main.Landed:
+            _ = self.git("commit", "--allow-empty", "-m", "Operator commit", cwd=checkout)
+            landed = original_land(checkout, commit)
+            landed_shas.append(landed.commit)
+            return landed
+
+        with mock.patch.object(land_main, "land", side_effect=advance_main):
+            result = self.run_checkpoint(checkpoint).process
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip = self.git("rev-parse", "production", cwd=self.origin)
+        self.assertEqual(landed_shas, [tip])
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
+        self.assertEqual(self.git("log", "-1", "--format=%s", cwd=self.promote), "Operator commit")
+        self.assertEqual(self.git("rev-parse", "HEAD^", cwd=self.promote), tip)
+        mac, = self.events("ssh")
+        self.assertIn(f"tip={tip}", mac[-1])
+        self.assertIn('fetch -q --no-write-fetch-head natedev:' + str(self.promote) + ' "$tip"', mac[-1])
+        self.assertEqual([row["merge_commit"] for row in self.receipts()], [tip])
+
     def test_local_foreign_main_commit_never_reaches_origin(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
@@ -849,11 +849,11 @@ with lock.open("a") as held:
             missing_at.append("prepare")
             return original_prepare(production, merge_head, published_tip=published_tip)
 
-        def push_without_refs(production: ProductionDocument, may_undo: bool) -> str:
+        def push_without_refs(production: ProductionDocument, tested_tip: str) -> str:
             _ = self.git("update-ref", "-d", "refs/remotes/origin/production", cwd=production.checkout)
             self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/production", cwd=production.checkout), "")
             missing_at.append("push")
-            return original_push(production, may_undo)
+            return original_push(production, tested_tip)
 
         def promote_without_refs(checkout: Path, branch: str, tip: str) -> (
                 merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |

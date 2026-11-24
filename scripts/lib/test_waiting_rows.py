@@ -796,6 +796,23 @@ waiting_rows.move_to(Path.cwd(), sys.argv[1], fast_forward=True)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), newer)
         self.assertIn("limit=8", (self.checkout / path).read_text())
 
+    def test_pinned_mac_pull_accepts_a_descendant_installed_before_the_lock(self) -> None:
+        path = "config/example.conf"
+        older = self.peer_change(path, "limit=5", "limit=7")
+        newer = self.peer_change(path, "limit=7", "limit=8")
+        flock = fcntl.flock
+
+        def finish_newer_pull(descriptor: int, operation: int) -> None:
+            if operation == fcntl.LOCK_EX:
+                self.run_git(self.checkout, "merge", "--ff-only", newer)
+            flock(descriptor, operation)
+
+        with (chdir(self.checkout), mock.patch.object(fcntl, "flock", finish_newer_pull),
+              mock.patch.dict(os.environ, {"WAITING_ROWS_ALLOW_CONTAINED": "1"})):
+            self.assertEqual(waiting_rows.main(["fast-forward", older]), 0)
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), newer)
+        self.assertIn("limit=8", (self.checkout / path).read_text())
+
     def test_other_new_keys_refuse_the_move_and_change_nothing(self) -> None:
         path = "config/statusline.conf"
         _ = self.peer_change(path, STATUSLINE, "account.claude1=yellow\n")

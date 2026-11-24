@@ -161,6 +161,7 @@ The first checkpoint test runs outside the lock.
 Retests run inside it, so main cannot move under a tested tip.
 This retest is the one lock hold through long work; other main pushers hold the lock only for their fetch, merge and push.
 The checkpoint push, interrupted promotion, and child handoff share this loop.
+A child handoff retry tests the remote SHA if its completion record does not name that SHA.
 `push_rollback` restores the original tip before publication when origin retains its old tip.
 It handles `checkpoint_gate.Stop`, `OSError`, and `ValueError`.
 The loop's yield lies outside its preparation rollback scope.
@@ -200,7 +201,7 @@ The helper does not change `os.environ`.
 `held_environment(checkout)` gives a named child `MAIN_PUSH_LOCK_HELD` with the absolute lock path.
 It refuses when the process does not hold that lock.
 A child accepts a matching marker from its start environment.
-Only `merge_checkpoint.push_validate` passes this environment to share its hold with the validation shell.
+The checkpoint passes this environment to its validation and publication commands.
 Detached gate children receive the plain environment and take their own locks.
 
 The shell entry runs a command and returns its exit status:
@@ -210,12 +211,9 @@ scripts/lib/py -m scripts.lib.main_push_lock --checkout "$PWD" -- git push origi
 ```
 
 Only main publication takes this lock.
-The checkpoint retest hold remains the exception for long work.
-When `tested_main_push` finds that main moved only by settings commits, it merges them and pushes with no retest.
-A settings commit has one parent, a subject in `main_publish.SETTINGS_SUBJECTS`, and only `config/` paths.
-The subjects are `tune(`, `zone(`, `user zone: ` and `config(models): `.
-Any other commit in the move, a fast track fix included, makes the landing retest as before.
-nate approved this narrower gate (sdlc [60b4a578], 2026-11-14).
+The checkpoint holds the lock through retests.
+When main moves, `tested_main_push` merges main and retests the new commit.
+This includes main moves that only change settings.
 Other pushers release their holds before tests, validation, Mac pulls, and CI waits.
 
 | Pusher | Protected step |
@@ -232,24 +230,21 @@ Other pushers release their holds before tests, validation, Mac pulls, and CI wa
 
 ## Mac pulls and visible change ownership
 
-`PendingMacPull` stores pending `MacCheckoutPull(mac, source)` entries and an optional zone notice.
+`PendingMacPull` stores pending `MacCheckoutPull(mac, source, tip)` entries and an optional zone notice.
 The shared queue is `<ZONE_STATE>/mac.json`, or `<XDG_STATE_HOME>/zone/mac.json` by default.
-Entries coalesce by Mac path.
-Clearing one completed target preserves other targets and an undelivered notice.
+The queue lock protects updates.
+The queue keeps the latest pinned and unpinned requests for each Mac path.
+A completed pinned pull clears a pinned request on the same path if the installed SHA contains the queued SHA.
 An old queue without a `pulls` field means one `~/.claude` pull with an unrecorded source.
 An explicit empty list means the pulls finished and only the notice can remain.
 
 After its configured retries, promotion queues SSH exit 255 without a remote `rc=` line and returns `MacPullPending`.
 An answering Mac whose pull fails still fails promotion.
-`zone.py drain --pulled <path>` skips only the target already pulled by promotion.
-It pulls the other pending targets before it sends the notice.
-`main_publish.mac_pull_command(mac, source)` builds the remote command for `main_publish.pull_mac` and `merge_checkpoint.pull_mac_checkout`.
+`zone.py drain --pulled <path>` sends the notice when all pulls are complete.
+The regular drain completes any pending pulls before it sends the notice.
+`main_publish.mac_pull_command(mac, source, tip=tip)` builds the command for immediate and queued pulls.
+The command accepts an installed descendant of a pinned SHA.
 `main_publish.remote_path` supplies the shared remote path quoting.
-The command is:
-
-```sh
-cd <remote_path(mac)> && tip=$(git ls-remote <url> refs/heads/main | cut -f1) && git fetch -q --no-write-fetch-head <url> main && git merge -q --ff-only "$tip"; printf 'rc=%s\n' "$?"
-```
 
 Here, `<url>` is `natedev:<shlex-quoted source>`.
 The fetch writes no `FETCH_HEAD` or shared ref.

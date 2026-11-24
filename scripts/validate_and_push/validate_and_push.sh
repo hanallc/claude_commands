@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --to and --fix-commit support periodic CI points; showrunner merges also use
 # --quick and may use --cancel-prior.
-#   --to <branch>          push HEAD to origin/<branch> instead of the current
+#   --to <branch>          push the selected commit to origin/<branch>
 #                          branch; always the direct path, so a run on the
 #                          default branch reaches CI without landing on it
 #   --fix-commit <message> commit validation fixes as a new commit with this
@@ -18,13 +18,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 #   --quick                run only the cargo-mend, rustfmt and taplo steps
 #                          (see validate_ci.sh)
 #   --validate-only        run validation without choosing a push path or pushing
+#   --publish-tested <sha> push this tested commit to the branch named by --to
 #   --cancel-prior         cancel superseded queued or running CI after a push
 PUSH_TARGET_BRANCH=""
 CANCEL_PRIOR=false
 VALIDATE_ONLY=false
+TESTED_SHA=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --validate-only) VALIDATE_ONLY=true; shift ;;
+    --publish-tested) TESTED_SHA="${2:?--publish-tested needs a SHA}"; shift 2 ;;
     --to) PUSH_TARGET_BRANCH="${2:?--to needs a branch name}"; shift 2 ;;
     --fix-commit) export VALIDATE_FIX_COMMIT_MESSAGE="${2:?--fix-commit needs a message}"; shift 2 ;;
     --quick) export VALIDATE_QUICK=1; shift ;;
@@ -34,6 +37,16 @@ while [ "$#" -gt 0 ]; do
 done
 
 export CANCEL_PRIOR
+
+if [ -n "$TESTED_SHA" ]; then
+  if [ "$VALIDATE_ONLY" = true ] || [ -z "$PUSH_TARGET_BRANCH" ]; then
+    echo '--publish-tested requires --to and cannot run with --validate-only' >&2
+    exit 64
+  fi
+  echo "=== STEP: direct push to ${PUSH_TARGET_BRANCH} ==="
+  CI_VALIDATED_BASE="" PUSH_TARGET_BRANCH="$PUSH_TARGET_BRANCH" \
+    exec bash "${SCRIPT_DIR}/push_direct.sh" --commit "$TESTED_SHA"
+fi
 
 echo "=== STEP: validation ==="
 bash "${SCRIPT_DIR}/run_validation.sh"

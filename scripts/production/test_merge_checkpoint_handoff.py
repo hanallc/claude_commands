@@ -9,15 +9,16 @@ import shutil
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest.mock import patch
 
-from scripts.production import change_review
+from scripts.production import change_review, checkpoint_gate, merge_checkpoint
 from scripts.production.staff_test_support import isolated_staff_file
 
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import STUB, MergeCheckpointFixture, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -219,6 +220,85 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         retried = self.run_handoff(checkpoint)
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
         self.assertEqual(review.read_bytes(), written)
+
+    def test_unpublished_handoff_retests_after_the_pending_marker_is_removed(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        remote = self.git("rev-parse", "production", cwd=self.origin)
+        with (patch.object(merge_checkpoint, "publish_checkpoint", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.run_handoff(checkpoint)
+        merge = self.git("rev-parse", "HEAD")
+        self.assertFalse(merge_checkpoint.handoff_tests_pending_path(self.checkout, checkpoint).exists())
+        self.assertEqual(self.events("checkpoint-test"), [[]])
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), remote)
+
+        _ = self.git("commit", "--allow-empty", "-m", "Operator commit")
+        tip = self.git("rev-parse", "HEAD")
+        resumed = self.run_handoff(checkpoint)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(self.events("checkpoint-test"), [[], []])
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
+        self.assertEqual((self.state / "notified-tip").read_text(), tip)
+        self.assertIn(f"merged as {merge}; pushed at {tip}", self.log.read_text())
+        self.assertEqual([row["merge_commit"] for row in self.receipts()], [merge])
+
+    def test_pushed_handoff_retests_a_newer_remote_tip_before_promotion(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        main_before = self.git("rev-parse", "main", cwd=self.origin)
+        stop = checkpoint_gate.Stop("promote", "failed", "fixture interrupted promotion", "retry the hand-off")
+        with patch.object(merge_checkpoint, "promote_handoff", side_effect=stop):
+            interrupted = self.run_handoff(checkpoint)
+        self.assertEqual(interrupted.returncode, 1, interrupted.stdout + interrupted.stderr)
+        self.assertIn("fixture interrupted promotion", interrupted.stdout)
+        merge = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
+        notifications = self.events("style_sync.py")
+        receipts = self.receipts()
+
+        writer = self.root / "remote-writer"
+        _ = self.git("clone", "-qb", "production", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("-c", "user.name=Writer", "-c", "user.email=writer@example.invalid",
+                     "commit", "--allow-empty", "-qm", "Later production change", cwd=writer)
+        candidate = self.git("rev-parse", "HEAD", cwd=writer)
+        _ = self.git("push", "origin", "production", cwd=writer)
+        self.executable(self.bin / "checkpoint-test", STUB + '''
+import subprocess
+tip = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=TEST_HANG_GUARD_SECS).strip()
+with (state / "retried-tips").open("a") as output:
+    output.write(tip + "\\n")
+if (state / "red-retry").exists():
+    raise SystemExit(1)
+''')
+        red = self.state / "red-retry"
+        red.touch()
+        rejected = self.run_handoff(checkpoint)
+        self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+        self.assertIn("merge test 1 failed", rejected.stdout)
+        self.assertEqual((self.state / "retried-tips").read_text().splitlines(), [candidate, candidate])
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main_before)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), main_before)
+        self.assertEqual(self.events("style_sync.py"), notifications)
+        self.assertEqual(self.receipts(), receipts)
+        self.assertEqual(self.events("send.py"), [])
+        self.assertFalse(self.log.exists())
+
+        red.unlink()
+        completed = self.run_handoff(checkpoint)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual((self.state / "retried-tips").read_text().splitlines(), [candidate] * 3)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), candidate)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), candidate)
+        self.assertEqual((self.state / "notified-tip").read_text(), candidate)
+        self.assertIn(f"merged as {merge}; pushed at {candidate}", self.log.read_text())
+
     def test_handoff_runs_package_tests_and_writes_the_checkpoint_test_log(self) -> None:
         _ = self.child_production()
         self.write(self.unit, "crates/widget/Cargo.toml", '[package]\nname="widget"\nversion="0.1.0"\n')

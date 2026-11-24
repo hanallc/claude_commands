@@ -276,14 +276,14 @@ Each local Promote checkout must exist before the command pushes.
   The gate-record lock precedes `main_push_lock`.
   Nested calls in one process share the hold for the same repository.
   Only a child with an explicit `held_environment` shares that hold through `MAIN_PUSH_LOCK_HELD`.
-  `push_validate` passes this environment to the validation shell.
+  Checkpoint validation and publication pass this environment to the shell.
   Detached gate children receive the plain environment and take their own locks.
   The checkpoint releases the gate-record lock before local promotion.
   It retains `main-push.lock` through the last local push to main.
   Mac pulls and result delivery occur after that lock is released.
   Publication records survive promotion failure.
   A style notice becomes complete only after successful delivery.
-  A completed child handoff retry changes nothing and sends no second notice.
+  A child handoff retry reuses the test result for the SHA in its completion record.
   Local and Mac promotion use the [shared edited-path check](merge-gate-and-test-speed.md#the-gate-scriptsproductionmerge_gatepy).
 - **Review numbers.** The unit obtains `--review-trial` from `progress_history.py review-trial`.
   The checkpoint command passes `--phase-id <phase id>` for the phase it checkpoints.
@@ -310,6 +310,9 @@ Each local Promote checkout must exist before the command pushes.
   5. *merge*: `<scratch>/merge_<short>.msg` (subject `Merge <unit> phase <N>[ shrink] (<short>) into <merge branch>`, body `--delivers` or `Phase plan shrink.`, then trailers), `merge --no-ff -q -F`.
   6. *test*: `prepare_checkpoint` merges `origin/main` before test selection.
      It selects every changed path from the tip before the checkpoint merge through the prepared tip.
+     `ValidateAndPush` runs `validate_and_push.sh --quick --validate-only` before the merge tests.
+     If validation makes fixes, the merge tests use the fixed commit and include its changed paths.
+     An unpublished handoff runs the tests again on resume.
      Packages run through `verify.sh test`, and changed examples run through `verify.sh example`.
      Then each configured Merge tests command runs without a shell.
      Gate commands run through `copies.py run --repo <checkout> --commit <tested tip> -- <command>`.
@@ -319,7 +322,7 @@ Each local Promote checkout must exist before the command pushes.
      Admission uses `BUILDLOG_UNIT` or the calling session's unit from the staff record.
      Before publication, check that the merge checkout and branch still point to the tested tip.
      A moved tip cancels publication with status 77 and keeps the local changes.
-     The direct Git push uses the checked commit ID as the source.
+     The push uses the tested commit ID as the source.
      A failed validation can roll back formatter commits from this run.
      The branch reflog must show only updates from this validation since the checked commit.
      `parse_merge_tests` reads backticked entries before the first unquoted parenthesis and splits them with `shlex`.
@@ -353,7 +356,8 @@ Each local Promote checkout must exist before the command pushes.
      A batch stops at its first red test step and returns every row with the failed step and the row's test selection.
   9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
-     Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
+     Otherwise, it keeps the lock and merges main.
+     It validates the new commit when required, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
      `push_git` pushes without another merge.
      A main conflict aborts the merge and reports `push: held` with the conflicting paths.
@@ -361,11 +365,14 @@ Each local Promote checkout must exist before the command pushes.
      The next queued item can proceed.
      Preparation failure restores the tip before this run when origin still has its old tip.
      An interrupted promotion and a child handoff use the same test loop.
+     A child handoff without a completion record for the remote SHA tests that SHA before promotion.
+     If the retry merges new changes from main, one test run covers both sets of changes.
      Each caller retains its own rollback rule for a failed push.
-     `ValidateAndPush` uses `validate_and_push.sh --quick --to <merge branch>` with the configured fix subject and optional `--cancel-prior`.
+     `ValidateAndPush` uses `validate_and_push.sh --to <merge branch> --publish-tested <sha>` with optional `--cancel-prior`.
      Local promotion fast-forwards each main checkout to the pushed tip and keeps its waiting setting rows live.
+     The push to main uses the published SHA.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
-     Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
+     Mac promotion passes the published SHA to `pull_mac_checkout` with the first Promote checkout as source.
      The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
      It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
@@ -860,11 +867,12 @@ Pane labels do not identify a consultation.
   The broadcast then reaches both machines. The commit of only that row, the push and the Mac pull follow.
   A failed publication keeps the zone live and exits 2; the notes timer publishes it later.
   A failed Mac write queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
-  Pending pulls retain each Mac path and source.
+  Pending pulls retain the Mac path, source, and any published SHA.
   A bare call drains the queue before it returns.
   Promotion runs `zone.py drain --pulled <path>` after a successful pull.
-  The drain skips only that path and pulls every other pending target before sending the notice.
-  Clearing one target preserves other targets and an undelivered notice.
+  A pinned pull clears a queued request when the installed SHA contains the queued SHA.
+  Unpinned requests stay queued for a regular drain.
+  The drain sends the notice after the pending pulls finish.
   A legacy queue without `pulls` represents one default `~/.claude` pull.
   `ZONE_SSH`, `ZONE_BROADCAST`, and `ZONE_STATE` select private test dependencies.
   A repeated request commits an uncommitted zone even when its stored value already matches.
@@ -1305,9 +1313,10 @@ Copied pane marks do not select rows.
 
 - The remote `rc=` line identifies a Mac pull result.
   SSH exit 255 without that line identifies an unreachable Mac after the configured retries.
-  Promotion queues that target and source, reports the pending pull, and continues.
+  Promotion queues the target, source, and published SHA.
+  Promotion reports the pending pull and continues.
   Other pull failures still fail promotion.
-  The Mac pulls from `natedev:<first Promote checkout>`.
+  Both immediate and queued pulls fetch the published SHA from `natedev:<first Promote checkout>`.
 
 - `merge_checkpoint.py` accepts a Merge tests command only with status zero.
 

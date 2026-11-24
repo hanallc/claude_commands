@@ -15,7 +15,7 @@ import unittest
 from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast, override
 from unittest import mock
 
@@ -245,30 +245,102 @@ class SetTests(unittest.TestCase):
             self.assertIn("broadcast.py", calls[-1][-1])
             self.assertFalse(self.queued().exists())
 
+    def test_queued_mac_pull_uses_the_published_sha_after_main_moves(self) -> None:
+        mac = self.root / "Mac checkout"
+        _ = self.git(self.root, "clone", "-q", str(self.checkout), str(mac))
+        _ = self.git(self.checkout, "commit", "--allow-empty", "-qm", "Published change")
+        published_tip = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        _ = self.git(self.checkout, "push", "-q", "origin", "main")
+        pull = main_publish.MacCheckoutPull(PurePosixPath(str(mac)), self.checkout, published_tip)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            main_publish.queue_pull_only("checkpoint", "Mac offline", pulls=(pull,))
+        _ = self.git(self.checkout, "commit", "--allow-empty", "-qm", "Operator commit")
+        _ = (self.fakes / "ssh").write_text('#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n')
+        self.env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
+                         "GIT_CONFIG_VALUE_0": "natedev:"})
+
+        result = self.run_zone("drain")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mac: took the checkpoint change", result.stdout)
+        self.assertEqual(self.git(mac, "rev-parse", "HEAD").strip(), published_tip)
+        self.assertFalse(self.queued().exists())
+
+    def test_an_old_mac_pull_leaves_a_newer_queued_sha(self) -> None:
+        mac = main_publish.DEFAULT_MAC_CHECKOUT
+        older = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        _ = self.git(self.checkout, "commit", "--allow-empty", "-qm", "Newer checkpoint")
+        newer = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        before = main_publish.MacCheckoutPull(mac, self.checkout, older)
+        after = main_publish.MacCheckoutPull(mac, self.checkout, newer)
+        notice = "Zone changed"
+
+        def finish_older_pull(*_args: object, **_kwargs: object) -> main_publish.MacPulled:
+            main_publish.queue_pull_only("newer checkpoint", "Mac offline", pulls=(after,))
+            return main_publish.MacPulled()
+
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            main_publish.queue(main_publish.PendingMacPull("zone", notice, "earlier", "offline", (before,)))
+            with mock.patch.object(main_publish, "pull_mac", side_effect=finish_older_pull) as pull:
+                _ = zone.drain(self.checkout, pulled=None)
+            pull.assert_called_once_with(self.checkout, mac=mac, tip=older, ssh_program=self.env["ZONE_SSH"])
+            self.assertEqual(main_publish.read_queue(),
+                             main_publish.PendingMacPull("zone", notice, "earlier", "Mac offline", (after,)))
+            _ = zone.drain(self.checkout, pulled=mac)
+            self.assertEqual(self.log("ssh.log"), [])
+
+            with mock.patch.object(main_publish, "pull_mac", return_value=main_publish.MacPulled()) as pull:
+                _ = zone.drain(self.checkout, pulled=None)
+            pull.assert_called_once_with(self.checkout, mac=mac, tip=newer, ssh_program=self.env["ZONE_SSH"])
+            self.assertIn(notice, self.log("ssh.log")[-1][-1])
+            self.assertFalse(self.queued().exists())
+
+    def test_pinned_promotion_leaves_an_unpinned_request_and_its_notice_queued(self) -> None:
+        mac = main_publish.DEFAULT_MAC_CHECKOUT
+        pull = main_publish.MacCheckoutPull(mac, self.checkout)
+        notice = "Zone changed"
+        waiting = main_publish.PendingMacPull("zone", notice, "earlier", "offline", (pull,))
+        tip = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            main_publish.queue(waiting)
+            main_publish.queue_pull_only("checkpoint", waiting.reason,
+                                         pulls=(main_publish.MacCheckoutPull(mac, self.checkout, tip),))
+            main_publish.clear_pull_only(mac, tip=tip, source=self.checkout)
+
+        drained = self.run_zone("drain", "--pulled", str(mac))
+
+        self.assertEqual(drained.returncode, 0, drained.stderr)
+        self.assertEqual(self.log("ssh.log"), [])
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(main_publish.read_queue(), waiting)
+
+        drained = self.run_zone("drain")
+
+        self.assertEqual(drained.returncode, 0, drained.stderr)
+        calls = self.log("ssh.log")
+        self.assertEqual(len(calls), 2)
+        self.assertIn(f"natedev:{self.checkout} main", calls[0][-1])
+        self.assertIn(notice, calls[1][-1])
+        self.assertFalse(self.queued().exists())
+
     def test_a_promotion_that_pulled_the_mac_sends_only_the_message(self) -> None:
-        _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
-        _ = self.run_zone("set", "Curacao")
-        (self.fakes / "OFFLINE").unlink()
-        before = len(self.log("ssh.log"))
-        drained = self.run_zone("drain", "--pulled", "~/.claude")
-        self.assertIn("mac: took the America/Curacao change", drained.stdout)
-        calls = self.log("ssh.log")[before:]
+        mac = main_publish.DEFAULT_MAC_CHECKOUT
+        queued_tip = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        _ = self.git(self.checkout, "commit", "--allow-empty", "-qm", "Published change")
+        installed_tip = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        pull = main_publish.MacCheckoutPull(mac, self.checkout, queued_tip)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            main_publish.queue(main_publish.PendingMacPull("zone", "Zone changed", "earlier", "offline", (pull,)))
+            main_publish.clear_pull_only(mac, tip=installed_tip, source=self.checkout)
+
+        drained = self.run_zone("drain", "--pulled", str(mac))
+
+        self.assertIn("mac: took the zone change", drained.stdout)
+        calls = self.log("ssh.log")
         self.assertEqual(len(calls), 1)
         self.assertIn("broadcast.py", calls[0][-1])
-        self.assertEqual(self.run_zone("drain", "--pulled", "~/.claude").stdout, "")
-
-        with self.subTest(pulled="~/custom checkout"):
-            _ = (self.fakes / "OFFLINE").write_text("")
-            _ = self.run_zone("set", "Paris")
-            before = self.queued().read_bytes()
-            drained = self.run_zone("drain", "--pulled", "~/custom checkout")
-            self.assertEqual(drained.returncode, 0, drained.stderr)
-            self.assertEqual(self.queued().read_bytes(), before)
-            (self.fakes / "OFFLINE").unlink()
-            drained = self.run_zone("drain", "--pulled", "~/custom checkout")
-            self.assertEqual(drained.returncode, 0, drained.stderr)
-            self.assertIn("broadcast.py", self.log("ssh.log")[-1][-1])
-            self.assertFalse(self.queued().exists())
+        self.assertFalse(self.queued().exists())
+        self.assertEqual(self.run_zone("drain", "--pulled", str(mac)).stdout, "")
 
     def test_an_ambiguous_name_changes_nothing(self) -> None:
         result = self.run_zone("set", "AST")

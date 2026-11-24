@@ -4,7 +4,8 @@
   zone.py                   the zone, its label and offset, and the time now; sends a queued Mac change
   zone.py set NAME          change it. NAME is an IANA zone (America/Curacao), the city of one
                             (Curacao, "New York"), or a label (AST) that only one zone uses
-  zone.py drain [--pulled PATH]  send a change queued while the Mac was offline
+  zone.py drain                complete queued pulls and send the zone notice
+  zone.py drain --pulled PATH  send the zone notice if all pulls are complete
 
 `set` writes config/user_zone.conf live at once on natedev and on the Mac, as /tune does, and
 tells every session on both machines with broadcast.py --all. The commit on main, the push and
@@ -152,23 +153,28 @@ def notice(zone: str, before: str) -> str:
 
 
 def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
-    """Pull each pending checkout, then send its queued zone notice."""
+    """Complete pending pulls during a regular drain. Send the notice after all pulls finish."""
     change = read_queue()
     if isinstance(change, main_publish.NoPendingMacPull):
         return []
+    if pulled is not None and change.pulls:
+        return [f"mac: the {change.label} change still waits since {change.since}"]
     for pull in change.pulls:
-        if pull.mac != pulled:
-            source = pull.source if isinstance(pull.source, Path) else checkout
-            if source is None:
-                return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
-            outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=os.environ.get("ZONE_SSH") or "ssh")
-            if isinstance(outcome, main_publish.MacPullFailed):
-                return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
-        main_publish.clear_pull_only(pull.mac)
+        source = pull.source if isinstance(pull.source, Path) else checkout
+        if source is None:
+            return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
+        outcome = main_publish.pull_mac(source, mac=pull.mac, tip=pull.tip,
+                                        ssh_program=os.environ.get("ZONE_SSH") or "ssh")
+        if isinstance(outcome, main_publish.MacPullFailed):
+            return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
+        main_publish.clear_pull_only(pull.mac, tip=pull.tip, source=source)
+    if isinstance(pending := read_queue(), main_publish.PendingMacPull) and pending.pulls:
+        return [f"mac: the {pending.label} change still waits since {pending.since}"]
     delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
-    main_publish.clear_pull_only(notice_delivered=True)
+    if change.text:
+        main_publish.clear_zone_notice(change.text)
     return [f"mac: took the {change.label} change queued at {change.since}; message {summary}"]
 
 
@@ -231,8 +237,8 @@ def main(arguments: list[str]) -> int:
             case ["set", name]:
                 return set_zone(name)
             case ["drain"] | ["drain", "--pulled", _]:
-                checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
                 pulled = PurePosixPath(arguments[2]) if len(arguments) == 3 else None
+                checkout = None if pulled is not None or platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
                 for line in drain(checkout, pulled=pulled):
                     print(line)
                 return 0
