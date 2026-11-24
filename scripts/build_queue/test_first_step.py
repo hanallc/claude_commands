@@ -490,7 +490,7 @@ class FirstStepTests(unittest.TestCase):
             source = gate_source(fixture, "claude_commands")
             configured = conf.read("build_targets").text("targets").split(",")
             expected = tuple(name for name in configured if name not in ("mac", "hana-aws"))
-            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "", client.RESERVED_STEP_ENV: ""}):
                 targets = first_step.gate_targets(command, source=source) if use_default else expected[::-1]
                 if use_default:
                     self.assertEqual(targets, expected)
@@ -498,8 +498,7 @@ class FirstStepTests(unittest.TestCase):
                     self.assertEqual(first_step.gate_targets(nightly, source=source), expected)
                     modules = (*GATE_COMMAND, "--module=fixture/test_gate.py")
                     promote = (*GATE_COMMAND[:2], "--promote-only", "--merge-branch", "main")
-                    with mock.patch.dict(os.environ, {"BUILDLOG_RESERVED_STEP": ""}):
-                        self.assertEqual(first_step.gate_targets(modules, source=source), expected)
+                    self.assertEqual(first_step.gate_targets(modules, source=source), expected)
                     self.assertEqual(first_step.gate_targets(promote, source=source), ())
                     for explicit in (modules, promote):
                         self.assertEqual(first_step.gate_targets(explicit, source=source, requested="natedev"),

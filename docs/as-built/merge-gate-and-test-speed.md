@@ -511,7 +511,9 @@ Modules share the CPU slots and use the memory governor.
 A failed module can run once more alone.
 A named run on natedev has no time limit.
 On `mac-linux`, `run.time_limit_seconds` limits each module and the full run.
-Named runs create no gate record or passed-tree entry.
+Named runs on natedev or `mac-linux` create no gate record.
+The controller imports a `gate_run` record for a completed prepared named gate on AWS.
+Named runs create no pass certificate or passed-tree entry.
 The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.

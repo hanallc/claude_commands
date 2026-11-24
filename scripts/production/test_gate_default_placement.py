@@ -537,6 +537,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                   mock.patch.object(gate, 'outer_reservation', return_value=parent if nested else None),
                   mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment]),
+                  mock.patch.object(first_step, 'gate_targets', wraps=first_step.gate_targets) as targets,
                   mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(
                       inherited_admission(assignment))) as admit,
                   mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
@@ -544,6 +545,8 @@ class GateDefaultPlacementTests(unittest.TestCase):
             self.assertEqual(admit.call_count, int(not nested))
             target = cast(gate.GateTarget, run.call_args.args[-1])
             self.assertEqual(target, 'natedev' if nested else gate.MacLinuxAssignment(assignment.assignment))
+            if nested:
+                targets.assert_not_called()
 
     def test_standalone_named_gate_keeps_exit_80_when_cancel_fails(self) -> None:
         with TemporaryDirectory() as directory:
