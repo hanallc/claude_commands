@@ -310,7 +310,8 @@ The Machine cell shows one bright Apple icon with a 🐧 badge.
 The Apple icon has a white fill and a black outline in light and dark modes.
 The cell shows the unconfirmed state next to the icon. A confirmed row shows the icon alone.
 The tooltip shows `Runs on` and `Named targets`.
-The shared tooltip wraps long fields within its box. The tooltip adjusts its position to fit the viewport when it opens or its content changes.
+The tooltip wraps long fields and fits the visible viewport when it opens, its content changes, or the window changes size.
+The tooltip clips content that exceeds the available height and lets clicks reach the rows beneath it.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
