@@ -1598,7 +1598,8 @@ fi
 
 CMD="${1:-}"
 case "$CMD" in
-    check|test|lint|doc|build|example|final|example-test|*,*) ;;
+    check|test|lint|doc|build|example|final|example-test) ;;
+    *,*) ;;
     *) usage; exit 2 ;;
 esac
 
