@@ -1025,6 +1025,26 @@ class ReviewLinksServerTests(unittest.TestCase):
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
         self.assertEqual(rows["C1"]["Verdict"], "works: The held answer.")
 
+    def test_a_held_review_answer_reports_a_delivery_failure_after_saving(self) -> None:
+        case = self.review_fixture(changes=1)
+        key = "page-owner/C1"
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        form = case.card_body(cache.get(), key, "not works", "The proof failed.")
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(send_hold, "RELEASE_GRACE_SECONDS", 0.0),
+              patch.object(change_page, "send_to_staff", side_effect=OSError("The owner is offline."))):
+            status, hold, fields = self.held_http("POST", review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertEqual((status, hold), (202, "held"))
+            status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
+            self.assertEqual((status, hold, answer.get("answer")), (200, "", "not works: The proof failed."))
+            self.assertEqual(answer.get("send_failure"), "Delivery failed: The owner is offline.")
+            self.assertFalse(answer["delivery_pending"])
+        rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
+        self.assertEqual(rows["C1"]["Verdict"], "not works: The proof failed.")
+
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
         default = case.ready_submission_recipient()

@@ -613,18 +613,19 @@ document.addEventListener('click',event=>{
 })();'''
 
 
-# The server holds a marked send for undo_seconds (send_hold.py). heldFetch shows a fading Undo for that time,
-# as an email client does. Undo throws SendUndone, so the caller keeps the words for an edit.
-# After the time ends, heldFetch returns the response of the real send, so each page keeps its own result code.
-# The Undo shows in the top page, inside an open modal dialog when there is one, so a card frame or a dialog
-# cannot hide it. The card scripts and the New item dialog both load this script, so it defines its two names once.
+# The server holds a marked send for undo_seconds (send_hold.py).
+# heldFetch shows a fading Undo toast on the top page or in its open modal dialog.
+# Undo throws SendUndone. After the hold, heldFetch returns the response of the real send.
+# New item and linked Review callers close their dialogs before the hold and reopen them on Undo or failure.
+# The card and dialog scripts share one definition of heldFetch and SendUndone in each frame.
 HELD_SEND_STYLE = '''
 [data-send-undo-stack]{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;
 display:grid;gap:8px;margin:0;width:max-content;max-width:calc(100vw - 32px)}
 [data-send-undo]{position:relative;display:flex;align-items:center;gap:16px;padding:10px 10px 12px 16px;
 border:1px solid var(--border,#2d3748);border-radius:8px;background:var(--nav,#141b28);color:var(--text,#e4eaf4);
-box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden}
-[data-send-undo] button{padding:4px 10px;border:0;border-radius:4px;background:none;color:var(--accent,#c2d4ff);
+box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden;min-width:0}
+[data-send-undo] span{min-width:0;overflow-wrap:anywhere}
+[data-send-undo] button{flex:none;padding:4px 10px;border:0;border-radius:4px;background:none;color:var(--accent,#c2d4ff);
 font:600 14px/20px system-ui,sans-serif;cursor:pointer}
 [data-send-undo] button:is(:hover,:focus-visible){background:#fff2}
 [data-send-undo-bar]{position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--accent,#c2d4ff);
@@ -639,7 +640,7 @@ function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-function showSendUndo(hold,seconds){
+function showSendUndo(hold,seconds,receiver){
  const host=sendUndoHost(),view=host.defaultView || window;
  if(!host.querySelector('style[data-send-undo-style]')){
   const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
@@ -651,7 +652,8 @@ function showSendUndo(hold,seconds){
  }
  // The stack moves to the top open modal dialog, or to the body, so no dialog hides it or makes it inert.
  const rehome=()=>{
-  const place=[...host.querySelectorAll('dialog')].filter(dialog=>dialog.matches(':modal')).pop() || host.body;
+  const place=host.activeElement?.closest('dialog:modal') ||
+   [...host.querySelectorAll('dialog:modal')].pop() || host.body;
   if(stack.parentElement!==place) place.append(stack);
  };
  rehome();
@@ -659,7 +661,9 @@ function showSendUndo(hold,seconds){
  watch.observe(host.body,{subtree:true,childList:true,attributes:true,attributeFilter:['open']});
  const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
  const bar=host.createElement('div');
- toast.dataset.sendUndo='';text.textContent='Sending';button.type='button';button.textContent='Undo';
+ const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
+ toast.dataset.sendUndo='';text.textContent=receiver || receiver===null ? sent : 'Sending.';
+ button.type='button';button.textContent='Undo';
  bar.dataset.sendUndoBar='';toast.append(text,button,bar);stack.append(toast);
  // The Undo stays clear for the first half of the time, then fades out until the send leaves.
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
@@ -675,6 +679,16 @@ function showSendUndo(hold,seconds){
    if(done) return;
    done=true;remove();resolve(undone);
   };
+  const reportResult=async(response,late=false)=>{
+   const result=await response?.clone().json().catch(()=>null);
+   if(!late && !result?.send_failure){remove();return;}
+   const summary=response?.ok && result && !result.send_failure
+    ? (result.no_message ? 'Saved.' : sent)
+    : result?.send_failure || result?.reason || result?.error || 'The send result is unavailable.';
+   text.textContent=(late ? 'Too late to undo. ' : '')+summary;
+   fade.cancel();toast.style.display='';
+   pause(3000).then(remove);
+  };
   // A closed console or card frame sends at once.
   const closed=()=>{
    if(done) return;
@@ -686,7 +700,12 @@ function showSendUndo(hold,seconds){
   view.addEventListener('pagehide',closed);
   // A card frame that goes away takes its toast with it, so it sends at once too.
   if(view!==window) addEventListener('pagehide',closed);
-  fade.finished.then(()=>finish(false),()=>{});
+  fade.finished.then(()=>{
+   if(done) return;
+   done=true;
+   button.remove();bar.remove();toast.style.display='none';
+   resolve(reportResult);
+  },()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
    let answer=null;
@@ -694,32 +713,53 @@ function showSendUndo(hold,seconds){
     try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
    }
    if(answer?.ok){finish(true);return;}
-   done=true;resolve(false);
-   // A 409 says the server released the send before the Undo reached it.
-   text.textContent=answer?.status===409 ? 'Too late to undo. Sent.' : 'Undo failed. The send can still leave.';
+   done=true;
    button.remove();bar.remove();fade.cancel();
+   if(answer?.status===409){
+    text.textContent='Too late to undo. Checking the result…';
+    resolve(response=>reportResult(response,true));
+    return;
+   }
+   text.textContent='Undo failed. The send can still leave.';
+   resolve(false);
    pause(3000).then(remove);
   });
  });
 }
-async function heldFetch(url,init={}){
+async function heldFetch(url,init={},receiver){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const first=await fetch(url,{...init,headers});
  if(first.headers.get('X-Send-Hold')!=='held') return first;
  const {hold,seconds}=await first.json();
- if(await showSendUndo(hold,seconds)) throw new SendUndone();
+ const undo=await showSendUndo(hold,seconds,receiver);
+ if(undo===true) throw new SendUndone();
  // A server restart drops the connection; the held send waits in its file, so read its result again.
  for(let failures=0;;){
   try{
    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-   if(response.headers.get('X-Send-Hold')!=='pending') return response;
+   if(response.headers.get('X-Send-Hold')!=='pending'){
+    if(typeof undo==='function') await undo(response);
+    return response;
+   }
   }catch(error){
-   if(++failures>=30) throw error;
+   if(++failures>=30){
+    if(typeof undo==='function') await undo();
+    throw error;
+   }
    await pause(1000);
   }
  }
 }
-window.SendUndone=SendUndone;window.heldFetch=heldFetch;
+function sendActionReceiver(form,data){
+ const action=data.get('outcome');
+ const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
+ if(action==='approve' && data.get('assignee')){
+  const option=form.elements.assignee?.selectedOptions[0];
+  return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
+ }
+ return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+}
+window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
 })();
 '''
 

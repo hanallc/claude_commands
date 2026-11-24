@@ -232,6 +232,21 @@ class ReviewPageTests(unittest.TestCase):
     def question(self, title: str = 'Which layout should the page use?') -> str:
         return self.fixture.file_user_question(title)
 
+    def test_legacy_question_names_the_answer_relay_in_both_views(self) -> None:
+        asker = fixture_member('producer', name='question-asker')
+        key = self.fixture.file_user_question(asker=asker)
+        snapshot = review_page.build_snapshot(self.root)
+        review = snapshot.body(key).decode()
+        browser = self.fixture.browser('questions')[2]
+        for page in (review, browser):
+            labels = re.search(r'data-send-labels="([^"]+)"', page)
+            assert labels is not None
+            self.assertIn('"answer": "question-asker"', html.unescape(labels[1]))
+        delivery, _ = review_page.submit(self.root, self.card_body(snapshot, key, 'answer', 'Use wide cards.'),
+                                         self.status, snapshot=snapshot)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (asker.id,))
+
     def ready_submission_recipient(self) -> staff.StaffRow:
         doc = self.fixture.production
         issues = doc.parent / 'native-proposals'
@@ -5375,8 +5390,9 @@ const nativeFetch=fetch;
 window.fetch=async(url,options={})=>{
  if(options.method!=='POST') return {ok:true,text:async()=>window.refreshMarkup};
  if(url==='/results') return nativeFetch(url,options);
+ if(String(url).endsWith('/undo')) return Response.json({});
  window.posts.push(new URLSearchParams(options.body));
- return {headers:new Headers(),ok:true,json:async()=>({answer:'approved',state:'Done'})};
+ return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
 };
 </script>""".replace('MARKUP', json.dumps(source).replace('</', '<\\/'))
         page = source.replace('<script>', setup+'<script>', 1)
@@ -5391,7 +5407,7 @@ window.fetch=async(url,options={})=>{
   const panel=document.createElement('template');
   panel.innerHTML=text;
   panel.content.querySelector('[name="revision"]').value='fixture-'+revision;
-  if(revision===2){
+  if(revision===2 && __REMOVE_OPTION__){
    const option=[...panel.content.querySelectorAll('[name="assignee"] option')]
     .find(option=>option.value===ASSIGNEE);
    option.remove();
@@ -5421,16 +5437,28 @@ window.fetch=async(url,options={})=>{
   const name=form.elements.assignee.selectedOptions[0].textContent;
   const refreshed=await refresh();
   const unavailable=refreshed.elements.assignee.selectedOptions[0];
-  check(refreshed!==form && unavailable.value===ASSIGNEE && unavailable.textContent===name+' — not available',
-        'Refresh keeps the unavailable assignee selected.');
+  check(refreshed!==form && unavailable.value===ASSIGNEE &&
+        unavailable.textContent===(__REMOVE_OPTION__ ? name+' — not available' : name),
+        'Refresh keeps the assignee selected.');
   refreshed.requestSubmit(refreshed.querySelector('[value="approve"]'));
   check(window.posts.length===1 && window.posts[0].get('outcome')==='approve' &&
-        window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the unavailable assignee ID.');
+        window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the selected assignee ID.');
+  const until=performance.now()+8000,host=window.top.document;
+  while(!host.querySelector('[data-send-undo]')){
+   if(performance.now()>until) throw new Error('The Approve toast did not show.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+  const toast=host.querySelector('[data-send-undo]');
+  const expected=__REMOVE_OPTION__ ? 'Sending.' : 'Sent to '+name+'.';
+  check(toast.querySelector('span').textContent===expected,'The toast uses the current selected assignee.');
+  toast.querySelector('button').click();
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>""".replace('KEY', json.dumps(proposal)).replace('ASSIGNEE', json.dumps(self.fixture.unit.id))
-        self.assertEqual(firefox_probe_results((page+probe).encode()), [[]])
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                self.assertEqual(firefox_probe_results((page+probe.replace('__REMOVE_OPTION__', json.dumps(removed))).encode()), [[]])
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
         _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
@@ -5445,6 +5473,11 @@ window.fetch=async(url,options={})=>{
         body = review_page.build_snapshot(self.root).body(proposal).decode()
         self.assertIn('Run fewer checks.', body, 'The open card loads the issue text.')
         self.assertNotIn('proposal_id', body, 'The issue front matter stays off the card.')
+        efficiency_body = review_page.build_snapshot(self.root).body(efficiency).decode()
+        self.assertIn('&quot;decline&quot;: null', efficiency_body)
+        report = self.investigation()
+        report_body = review_page.build_snapshot(self.root).body(f'investigation/{report.owner}/{report.id}').decode()
+        self.assertIn('&quot;read&quot;: null', report_body)
         commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
         for key, command in commands.items():
             with self.subTest(key=key, action='approve'):
@@ -5603,18 +5636,10 @@ window.fetch=async(url,options={})=>{
   words.value=fixture.words;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
-  const confirmation=dialog.querySelector('#new-item-saved');
-  const confirmed=new Promise(resolve=>{
-   const observer=new MutationObserver(()=>{
-    if(!confirmation.hidden){observer.disconnect();resolve();}
-   });
-   observer.observe(confirmation,{attributes:true,attributeFilter:['hidden']});
-  });
+  const created=new Promise(resolve=>document.addEventListener('review-item-created',resolve,{once:true}));
   dialog.querySelector('[type="submit"]').click();
-  await confirmed;
-  check(dialog.open && confirmation.textContent==='Saved '+fixture.id+'.',
-        'The shared dialog shows the saved ID.');
-  dialog.querySelector('[data-done]').click();
+  const event=await created;
+  check(!dialog.open && event.detail.id===fixture.id,'Send closes the dialog and reports the saved ID.');
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -6165,6 +6190,8 @@ window.fetch=async(url,options)=>{
   form.elements.feedback.value=words;
   form.requestSubmit(form.querySelector('[value="works"]'));
   await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+  check(host.querySelector('[data-send-undo] span').textContent==='Sent to page-owner and builder-unit.',
+        'The toast names every receiver of the verdict with words.');
   host.querySelector('[data-send-undo] button').click();
   const cardForm=()=>row()?.isConnected && !row().hidden ? recordDetails(row())?.querySelector('[data-review-form]') : null;
   const undone=()=>cardForm()?.querySelector('[data-send-status]').textContent==='Undone. Edit and send again.';

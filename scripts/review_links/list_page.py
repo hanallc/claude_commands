@@ -593,6 +593,9 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
+    keeper = names.members.by_id(entry.keeper)
+    if keeper is not None:
+        attrs += f' data-send-receiver="{html.escape(keeper.name, quote=True)}"'
     panel = f'list-detail-{index}'
     row_id = html.escape(entry.key.replace("/", "-"), quote=True)
     number = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}" '
@@ -876,14 +879,20 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
 
 
 def deliver(submission: ListActionSubmission) -> None:
+    _ = deliver_with_outcome(submission)
+
+
+def deliver_with_outcome(submission: ListActionSubmission) -> change_page.DeliveryOutcome:
     """Send saved List words with the shared retry and alert helpers."""
     delivery = submission.delivery if isinstance(submission, ListUnparkSubmission) else submission
     if isinstance(delivery, change_page.NoMessageDelivery):
-        return
+        return change_page.DeliveryUnconfirmed()
     if isinstance(delivery, ListQuestionDelivery):
-        change_page.deliver(delivery.delivery, delivery.status)
-        return
+        return change_page.deliver_with_outcome(delivery.delivery, delivery.status)
+    outcome: change_page.DeliveryOutcome = change_page.DeliveryUnconfirmed()
+
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
+        nonlocal outcome
         settings = conf.read("review_links")
         tries = settings.whole("delivery_tries")
         message = (f"List page: nate's words for item {item.number}\n{feedback.words}"
@@ -894,12 +903,15 @@ def deliver(submission: ListActionSubmission) -> None:
         failures = change_page.send_with_retries(change_page.SENDER, (recipient,), message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key)
         if not failures:
+            outcome = change_page.DeliveryConfirmed()
             return replace(feedback, state="sent")
+        outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != recipient)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+    return outcome
 
 
 def recover_pending() -> None:
@@ -1055,6 +1067,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         else:
             counts = counts_strip(members, names)
     content = (STYLE + page_frame.title("The List", "list")
+               + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
@@ -1219,7 +1232,7 @@ function startListSave(){
 function refreshAfterListSave(needed){
  refreshNeeded ||= needed;
  if(saving) return;
- if(savedReview) void refreshSavedReview();
+ if(savedReviews.size) void refreshSavedReview();
  else if(refreshNeeded) void pageRefresh.refresh(true);
 }
 const drafts=new Map();
@@ -1585,7 +1598,9 @@ function bindFeedbackForm(form){
    };
    try{
     // Words wait on the server for Undo; read, park and remove act at once.
-    const response=await (usesWords ? heldFetch : fetch)(location.pathname,{method:'POST',body:data});
+    const options={method:'POST',body:data};
+    const response=await (usesWords ? heldFetch(location.pathname,options,current.dataset.sendReceiver)
+                                   : fetch(location.pathname,options));
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1840,6 +1855,8 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || dateTimePickerOpen(document) || !current()) return;
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
+ reviewRefreshError.textContent='';
+ reviewRefreshError.hidden=true;
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
   tableView.finishDeliveryWindow(delivery);
  return pageRefreshFacts(page);
@@ -1884,7 +1901,9 @@ const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
 const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"]') ? window.frameElement : null;
-let activeReview,savedReview,refreshingReview=false;
+let activeReview,refreshingReview=false;
+const savedReviews=new Set(),returnedReviews=[];
+const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
  const style=listHost?.ownerDocument.createElement('style');
@@ -1925,33 +1944,52 @@ function restoreReviewLink({key,selector,detail,position}){
   });
  }
 }
+function showReviewCard(card){
+ activeReview=card;
+ card.frame.hidden=false;
+ card.restoreHost=fitReviewDialog();
+ reviewClose.disabled=card.frame.hasAttribute('data-saving');
+ reviewDialog.showModal();
+}
+function hideReviewCard(card){
+ if(activeReview!==card) return;
+ activeReview=null;
+ reviewDialog.close();
+ card.restoreHost();
+ card.frame.hidden=true;
+ if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
+}
+function reopenReturnedReview(){
+ if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
+}
 function closeReviewCard(){
  const card=activeReview;
  if(!card || card.frame.hasAttribute('data-saving')) return;
- activeReview=null;
  reviewMotion.finish();
- reviewDialog.close();
- card.restoreHost?.();
+ hideReviewCard(card);
  card.frame.remove();
  reviewClose.disabled=false;
- if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
+ reopenReturnedReview();
 }
 async function refreshSavedReview(){
- if(saving || refreshingReview || !savedReview) return;
- const card=savedReview;
+ if(saving || refreshingReview || !savedReviews.size) return;
+ const cards=[...savedReviews];
  refreshingReview=true;
  const version=listSaveVersion;
  await pageRefresh.refresh(true);
- const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(card.link.key)+'"]');
- if(activeReview===card && row?.hasAttribute('data-list-review-version')) await listCounts;
+ if(cards.some(card=>content.querySelector('[data-list-item][data-list-review-version][data-key="'+
+    CSS.escape(card.link.key)+'"]'))) await listCounts;
  refreshingReview=false;
- if(savedReview!==card || version!==listSaveVersion){
+ if(version!==listSaveVersion){
   void refreshSavedReview();
   return;
  }
- savedReview=null;
- if(activeReview===card)
-  void reviewMotion.switchCard(card.frame,null,()=>{if(activeReview===card) closeReviewCard();});
+ for(const card of cards){
+  savedReviews.delete(card);
+  if(activeReview===card) void reviewMotion.switchCard(card.frame,null,()=>{if(activeReview===card) closeReviewCard();});
+  else card.frame.remove();
+ }
+ void refreshSavedReview();
 }
 if(listHost) new MutationObserver(()=>{
  if(!listHost.hidden) return;
@@ -1969,7 +2007,7 @@ document.addEventListener('click',event=>{
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=link.href;
- const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog()};
+ const card={frame,link:reviewLinkPlace(link)};
  activeReview=card;
  frame.addEventListener('load',()=>{
   const doc=frame.contentDocument;
@@ -1979,14 +2017,30 @@ document.addEventListener('click',event=>{
    }
   });
  });
- frame.addEventListener('review-card-busy',()=>{reviewClose.disabled=frame.hasAttribute('data-saving');});
- frame.addEventListener('review-card-saved',()=>{
+ frame.addEventListener('review-card-sending',()=>{
+  hideReviewCard(card);
+  reopenReturnedReview();
+ });
+ frame.addEventListener('review-card-busy',()=>{
+  const busy=frame.hasAttribute('data-saving');
+  if(activeReview===card) reviewClose.disabled=busy;
+  else if(!busy){
+   returnedReviews.push(card);
+   reopenReturnedReview();
+  }
+ });
+ frame.addEventListener('review-card-saved',event=>{
+  if(activeReview===card) reviewClose.disabled=false;
+  if(event.detail){
+   reviewRefreshError.textContent=event.detail;
+   reviewRefreshError.hidden=false;
+  }
   reviewSaveVersion++;
-  savedReview=card;
+  savedReviews.add(card);
   refreshAfterListSave(false);
  });
  reviewDialog.append(frame);
- reviewDialog.showModal();
+ showReviewCard(card);
 });
 tableView.place();
 tableView.bind();bindListControls();tableView.apply(true);

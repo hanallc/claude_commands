@@ -923,6 +923,17 @@ def builds_operator(peer: tuple[str, int]) -> bool:
         return False
 
 
+def held_delivery_result(outcome: change_page.DeliveryOutcome, no_message: bool = False) -> dict[str, object]:
+    """Report the transport result without changing the status of the saved action."""
+    if no_message:
+        return {"no_message": True}
+    if isinstance(outcome, change_page.FailedDelivery):
+        return {"send_failure": "Delivery failed: " + outcome.last_error}
+    if isinstance(outcome, change_page.DeliveryUnconfirmed):
+        return {"send_failure": "The sender has not confirmed delivery."}
+    return {}
+
+
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
 
@@ -1499,6 +1510,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, RuntimeError, subprocess.SubprocessError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved. Try again.", error)
             return
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+            delivery = change_page.finish_verdict_cleanup(delivery, server.delivery_status)
+            result = self.deliver_review(server, delivery, report_outcome=True)
+            self.json_response(200, {"answer": answer, **held_delivery_result(result, isinstance(delivery, change_page.NoMessageDelivery))})
+            return
         try:
             self.json_response(200, {"answer": answer})
         finally:
@@ -1959,6 +1975,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             later = saved.item.times.later
             result.update(state=saved.item.state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+            delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
+            outcome = self.deliver_review(server, delivery, report_outcome=True)
+            result.update(held_delivery_result(outcome, not pending))
+            result['delivery_pending'] = False
+            if pending:
+                self.publish_review_delivery(server, key)
+            self.json_response(200, result)
+            return
         with server.item_delivery(pending) as check:
             if check:
                 result['delivery'] = check
@@ -1967,10 +1992,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             finally:
                 _ = self.deliver_review(server, change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status))
                 if pending:
-                    try:
-                        server.review_cache.publish_delivery_result(key)
-                    except (OSError, ValueError, RuntimeError) as error:
-                        print(f"review-links Review delivery refresh {key}: {error}", file=sys.stderr)
+                    self.publish_review_delivery(server, key)
+
+    def publish_review_delivery(self, server: ReviewLinksServer, key: str) -> None:
+        try:
+            server.review_cache.publish_delivery_result(key)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"review-links Review delivery refresh {key}: {error}", file=sys.stderr)
 
     def deliver_review(self, server: ReviewLinksServer,
                        delivery: change_page.MessageDelivery | change_page.NoMessageDelivery, *,
@@ -2221,14 +2249,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         action = fields["action"][0]
         delivery = submission.delivery if isinstance(submission, list_page.ListUnparkSubmission) else submission
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
+        state = {"read": "read", "question": "saved"}.get(action, "sent")
+        reply = {"state": state, "delivery_pending": pending, **saved_fields}
+        if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
+            reply["unpark_outcome"] = submission.response_outcome(current).value
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+            try:
+                outcome = list_page.deliver_with_outcome(submission)
+            except OSError as error:
+                print(f"review-links delivery status: {error}", file=sys.stderr)
+                outcome = change_page.DeliveryUnconfirmed()
+            reply.update(held_delivery_result(outcome, not pending))
+            reply["delivery_pending"] = False
+            self.json_response(200, reply)
+            return
         with server.item_delivery(pending) as check:
             try:
-                state = {"read": "read", "question": "saved"}.get(action, "sent")
-                reply = {"state": state, "delivery_pending": pending, **saved_fields}
                 if check:
                     reply["delivery"] = check
-                if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
-                    reply["unpark_outcome"] = submission.response_outcome(current).value
                 self.json_response(200, reply)
             finally:
                 try:
@@ -2272,6 +2310,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         except OSError as error:
             self.browser_failure(503, "The image could not be changed. Try again.", error)
+            return
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1" and isinstance(delivery, change_page.MessageDelivery):
+            outcome = self.deliver_review(server, delivery, report_outcome=True)
+            self.json_response(200, {"state": "done", **held_delivery_result(outcome)})
             return
         try:
             self.json_response(200, {"state": "done"})

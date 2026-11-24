@@ -4079,9 +4079,11 @@ class ChangePageTests(unittest.TestCase):
   if(!current) show();
   const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');
   field.value='Keep these words.';
-  const saving=save(row,form,'works');
-  check(current!==row && row.dataset.pending==='false','Works shows the next change during the hold.');
+  const saving=save(row,form,'not works');
+  check(current!==row && row.dataset.pending==='false','Does not work shows the next change during the hold.');
   await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+  check(host.querySelector('[data-send-undo] span').textContent==='Sent to page-owner and builder-unit.',
+   'The toast names both receivers.');
   host.querySelector('[data-send-undo] button').click();
   await saving;
   check(row.dataset.pending==='true' && !form.hidden && field.value==='Keep these words.',
@@ -4093,7 +4095,7 @@ class ChangePageTests(unittest.TestCase):
   open?.click();
   check(current===row,'Open it shows the change again.');
   await save(row,form,'skip');
-  check(JSON.stringify(posts)===JSON.stringify([['works','1'],['skip',null]]),'Skip sends no hold header.');
+  check(JSON.stringify(posts)===JSON.stringify([['not works','1'],['skip',null]]),'Skip sends no hold header.');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();

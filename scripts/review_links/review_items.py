@@ -235,6 +235,7 @@ class ChangeSource:
     assignment: change_routing.ChangeAssignment
     slots: delivery_state.DeliverySlots
     handed_at: datetime | None = None
+    validators: tuple[staff.StaffId, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -455,14 +456,14 @@ def validation_log_label(words: str, validator: str) -> str:
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
                 members: staff.StaffSnapshot, queue: str, current: Path,
                 slots: delivery_state.DeliverySlots, *, handed_at: datetime | None = None,
-                validator: staff.StaffId | None = None) -> ReviewItem:
+                validators: tuple[staff.StaffId, ...] = ()) -> ReviewItem:
     """Project a change once for the page, counts and queue."""
     prefix = path.stem.removeprefix(change_review.PREFIX)
     routed = assignment.owner
     owner = next((member for member in members.rows if member.name == routed.tab), None)
     routed_id = owner.id if owner is not None else staff.StaffId(routed.tab)
     state = change_state(row, slots)
-    identity = (validator or staff.StaffId('')) if state == ReviewState.VALIDATING else routed_id
+    identity = (validators[0] if validators else staff.StaffId('')) if state == ReviewState.VALIDATING else routed_id
     source = staff.StaffId(row.get('Producer', '') or routed_id)
     entry = change_review.row_entries([row])[0]
     filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
@@ -507,7 +508,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
         ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN
         else ('question',) if state == ReviewState.VALIDATING and identity else (),
-        ChangeSource(path, row, assignment, slots, handed_at), entry.urgency, after, queue,
+        ChangeSource(path, row, assignment, slots, handed_at, validators), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
         review_events.waiting_why(slots.waiting_why))
@@ -598,10 +599,9 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                     queues[queue_source] = queue, current
                 queue, current = queues[queue_source]
                 recipients = validation_recipients(fields) if state == ReviewState.VALIDATING else ()
-                validator = recipients[0] if recipients else None
                 found.append(change_item(path, row, assignment, members, queue, current, slots,
                                          handed_at=handoff_time(fields) if state == ReviewState.VALIDATING else None,
-                                         validator=validator))
+                                         validators=recipients))
     return found
 
 

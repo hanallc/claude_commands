@@ -53,7 +53,8 @@ def status_configuration() -> Generator[None]:
             yield
 
 
-def firefox_probe_results(page: bytes) -> list[list[str]]:
+def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = None,
+                          dark: bool = False) -> list[list[str]]:
     """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
     results: list[list[str]] = []
     complete = threading.Event()
@@ -87,9 +88,17 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
         try:
             profile = Path(temporary) / "profile"
             profile.mkdir()
-            run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+            options: list[str] = []
+            environment = os.environ.copy()
+            if window_size is not None:
+                width, height = window_size
+                options.extend(("--window-size", f"{width},{height}"))
+                environment.update(MOZ_HEADLESS_WIDTH=str(width), MOZ_HEADLESS_HEIGHT=str(height))
+            if dark:
+                _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+            run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile), *options,
                                      "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                    timeout=45)
+                                    timeout=45, env=environment)
             if run.returncode:
                 raise AssertionError(run.stderr)
         finally:

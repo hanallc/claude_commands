@@ -196,6 +196,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     names = staff_names.for_page(names, members)
     member = members.by_id(staff.StaffId(record["owner"]))
     shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
+    receiver = f' data-send-receiver="{html.escape(name, quote=True)}"' if member is not None else ""
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
@@ -204,7 +205,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
     returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
-            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
+            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{receiver}>'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{shown_owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
@@ -482,7 +483,7 @@ function bind(root) {
     sending++;
     try {
       if (!question) await motion.removeCard(card, apply);
-      const response = await heldFetch(location.pathname, {method: 'POST', body});
+      const response = await heldFetch(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);

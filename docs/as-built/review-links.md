@@ -711,10 +711,13 @@ A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
 Review reuses gzip bytes for an unchanged page shell with its current owner control.
 A Bug with a screenshot also includes the viewport.
-The dialog shows the saved item ID after Send on Review and the other pages outside The List.
-Select **Done** to close the confirmation.
-Review starts its refresh when Send succeeds.
-When the confirmation closes, Review opens the new item if it matches the current filters.
+**Send** closes the New item dialog at once.
+The user can work on the page while the fading **Undo** toast shows.
+**Undo** reopens the dialog with the same type, recipient, words, images and page capture.
+A failed send reopens the draft and shows the error.
+A retry after a lost response sends the original request again.
+If that retry confirms the original save, the dialog reopens with any edits made after the lost response.
+Review refreshes when Send succeeds and opens the new item if it matches the current filters.
 Review tells you when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
@@ -1221,6 +1224,9 @@ Back and Forward can open an item that the table filters hide.
 Select the row again to collapse it.
 Expanding or collapsing a row preserves the table filters and sort order.
 A linked Review card opens over the expanded row.
+An answer that supports **Undo** closes the card at once.
+**Undo** or a failed answer reopens the card with its draft and the result message.
+A successful answer refreshes the List.
 The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
@@ -2231,20 +2237,32 @@ The 202 body gives the hold id and `seconds`, the Undo time.
 Nothing is saved and nothing is sent before the time ends.
 When `undo_seconds` is zero, the server does not hold the send and handles it at once.
 
-The page shows a toast with the word Sending, an **Undo** button and a bar at the bottom center of the top page.
+The toast says `Sent to <name>.` and shows an **Undo** button and a bar.
+If the page has no receiver name, the toast says "Sending."
+For an action that saves without a message, the toast says "Saved."
+The toast uses the recipient name shown when the user presses **Send**.
+If a draft can recover an earlier filing, the toast says "Sending."
+The toast appears at the bottom center of the top page. Long names wrap.
 The toast uses the console colors.
 The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
 **Undo** posts `/send-hold/<id>/undo`. The server replaces the saved request with an undone mark and answers 200.
 A repeated Undo, after a lost answer, also gets 200.
-The page then shows "Undone. Edit and send again." and keeps the words, the item and the dialog.
+The page then shows "Undone. Edit and send again." and keeps the draft.
+The New item dialog and the linked Review card reopen with the draft.
+You can open a new draft or another linked card while a send waits.
+The List keeps a separate recovery slot for each unresolved draft in the browser tab.
+If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
+A successful List refresh clears the error.
 A change browser answer goes back in the list with an **Open it** button.
 When the console page or the card frame of the send closes, the page removes the toast and posts
 `/send-hold/<id>/send`. The server then sends the request at once.
 
 One second after the time ends, the server sends the saved request to its own bound address.
 The normal handler then saves and sends, as for a send that does not wait.
-An undo after that time gets 409, and the send continues. The toast then says "Too late to undo. Sent."
+If delivery fails after a confirmed save, the toast shows the delivery failure. The action stays saved.
+An Undo after release gets 409.
+The toast waits for the result, then shows `Too late to undo. Sent to <name>.`, the save text, or the failure.
 An Undo that fails two times says "Undo failed. The send can still leave."
 The page reads `GET /send-hold/<id>`, with the same Tailscale and origin checks as the New item options.
 The server answers 202 with `X-Send-Hold: pending` until the send ends.

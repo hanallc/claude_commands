@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -512,6 +513,10 @@ class ImagesTests(ImagesFixture):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_undo_returns_the_card_and_says_edit_and_send_again(self) -> None:
         _ = self.register()
+        owner = self.owner
+        assert owner is not None
+        name = "Shot owner " + "W" * 80
+        members = staff.StaffSnapshot((replace(owner, name=name),))
         probe = r"""<script>
 (async () => {
  const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
@@ -533,20 +538,38 @@ class ImagesTests(ImagesFixture):
   const card = document.querySelector('[data-images] article'), form = card.querySelector('form');
   const status = form.querySelector('[data-image-status]');
   form.elements.feedback.value = 'Too dark.';
-  form.requestSubmit(form.querySelector('button[value="feedback"]'));
-  await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
-  host.querySelector('[data-send-undo] button').click();
-  await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
-  check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
-  check(posts.length === 1 && posts[0].get('action') === 'feedback', 'Undo sends nothing more.');
+  const view = host.defaultView;
+  check(view.innerWidth === 390 && view.matchMedia('(prefers-color-scheme: dark)').matches,
+        'The browser uses the phone width and dark theme.');
+  for (const action of ['feedback', 'approved']) {
+   form.requestSubmit(form.querySelector('button[value="' + action + '"]'));
+   await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
+   const toast = host.querySelector('[data-send-undo]'), text = toast.querySelector('span');
+   const button = toast.querySelector('button'), box = toast.getBoundingClientRect();
+   check(text.textContent === 'Sent to ' + __RECEIVER__ + '.' && button.textContent === 'Undo',
+         'The toast names the image owner and offers Undo.');
+   check(box.left >= 0 && box.right <= view.innerWidth && button.getBoundingClientRect().right < box.right,
+         'The phone viewport shows the toast and its button.');
+   const style = view.getComputedStyle(text);
+   check(text.clientHeight > parseFloat(style.lineHeight) && text.scrollWidth <= text.clientWidth,
+         'The full receiver name wraps inside the toast.');
+   check(view.getComputedStyle(toast).backgroundColor === 'rgb(20, 27, 40)' &&
+         style.color === 'rgb(228, 234, 244)', 'The toast uses its dark colors.');
+   button.click();
+   await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
+   check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
+  }
+  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved', 'Undo sends nothing more.');
  } catch (error) {
   failures.push(String(error));
  }
  await realFetch('/results', {method: 'POST', body: JSON.stringify(failures)});
 })();
 </script>"""
-        page = images.render(self.status).decode().replace("</body>", probe + "</body>")
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        with patch.object(staff, "snapshot", return_value=members):
+            page = images.render(self.status).decode()
+        page = page.replace("</body>", probe.replace("__RECEIVER__", json.dumps(name)) + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode(), window_size=(390, 860), dark=True), [[]])
 
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
@@ -557,7 +580,7 @@ class ImagesTests(ImagesFixture):
         token = images.request_token("token", record["id"])
         self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
-            + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
+            + f' data-owner="{record['owner']}" data-owner-name="shot-owner" data-send-receiver="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'

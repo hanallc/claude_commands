@@ -27,6 +27,7 @@ from scripts.lib.atomic_file import write_text_atomic
 
 HOLD_PATH = "/send-hold"
 HOLD_HEADER = "X-Undo-Hold"
+REPLAY_HEADER = "X-Undo-Replay"
 HOLD_FOLDER = ".review-link-holds"
 # The request headers that a replay needs. The handlers read the body, its type, and the origin checks.
 REPLAY_HEADERS = frozenset(("content-type", "origin", "host", "accept"))
@@ -351,6 +352,7 @@ def replay_to(address: str, port: int) -> Replay:
             connection.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
             for name, value in headers.items():
                 connection.putheader(name, value)
+            connection.putheader(REPLAY_HEADER, "1")
             connection.putheader("Content-Length", str(len(body)))
             connection.endheaders(body)
             answer = connection.getresponse()

@@ -1350,37 +1350,36 @@ async function inspect(){
  if(!phone){
   const timeout=win.AbortSignal.timeout,deadlines=[];
   win.AbortSignal.timeout=milliseconds=>{deadlines.push(milliseconds);return timeout(milliseconds);};
-  for(const dismiss of ['close','escape','outside']){
-   const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView;
-   const savedForm=saved.querySelector('[data-review-form]');
-   let finishRead,beginRead;
-   const reading=new Promise(resolve=>{beginRead=resolve;});
-   const heldRead=new Promise(resolve=>{finishRead=resolve;});
-   win.fetch=(url,options)=>{
-    if(url===win.location.pathname && options?.signal){
-     beginRead();return heldRead;
-    }
-    return fetchList(url,options);
-   };
-   savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response(JSON.stringify({answer:'Works'})));
-   savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
-   await reading;
-   check(dialog.open && !close.disabled,'A saved verdict enables Close before the List refresh ends.');
-   if(dismiss==='close') close.click();
-   if(dismiss==='escape') saved.body.dispatchEvent(new savedWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-   if(dismiss==='outside'){
-    dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
-    dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
+  const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView,savedFrame=savedWindow.frameElement;
+  const savedForm=saved.querySelector('[data-review-form]');
+  let finishRead,beginRead;
+  const reading=new Promise(resolve=>{beginRead=resolve;});
+  const heldRead=new Promise(resolve=>{finishRead=resolve;});
+  win.fetch=(url,options)=>{
+   if(url===win.location.pathname && options?.signal){
+    beginRead();return heldRead;
    }
-   check(!dialog.open && doc.activeElement===link('sdlc/C1'),'The pending List refresh allows '+dismiss+'.');
-   const pageStatus=doc.querySelector('[data-page-status]');
-   const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
-   finishRead(new win.Response(null,{status:503}));
-   await readFailed;
-   await animationFrames(win);
-   if(dialog.open) close.click();
-  }
-  check(deadlines.length>=3 && deadlines.every(value=>value===7000),
+   return fetchList(url,options);
+  };
+  savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response('Invalid JSON'));
+  savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
+  await reading;
+  check(!dialog.open && doc.activeElement===link('sdlc/C1'),
+   'The card stays closed and returns focus during the List refresh.');
+  const notice=doc.querySelector('[data-review-refresh-error]');
+  check(!notice.hidden && notice.textContent==='Saved; the item could not refresh.',
+   'The List reports the unreadable response from a confirmed save.');
+  const currentSearch=doc.querySelector('#list-search');
+  currentSearch.focus();
+  check(doc.activeElement===currentSearch,'Search stays available during the List refresh.');
+  const pageStatus=doc.querySelector('[data-page-status]');
+  const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
+  finishRead(new win.Response(null,{status:503}));
+  await readFailed;
+  await changed(dialog,()=>!savedFrame.isConnected,'the saved frame is removed');
+  check(!notice.hidden,'A failed refresh keeps the error visible.');
+  check(!dialog.open && doc.activeElement===currentSearch,'A failed refresh leaves the card closed and preserves focus.');
+  check(deadlines.length>0 && deadlines.every(value=>value===7000),
    'List refresh uses the configured seven-second request timeout.');
   win.AbortSignal.timeout=timeout;
   win.fetch=fetchList;
@@ -1403,7 +1402,7 @@ async function inspect(){
   listForm.querySelector('[value="tell"]').click();
   check(!!listForm.dataset.sending,'The List action starts before the Review save.');
  }
- const card=await readCard(readyLink),cardWin=card.defaultView;
+ const card=await readCard(readyLink),cardWin=card.defaultView,sendingFrame=cardWin.frameElement;
  const formInCard=()=>card.querySelector('[data-review-form]');
  const status=()=>card.querySelector('[data-review-card-notice]').textContent;
  const button=outcome=>formInCard().querySelector('[value="'+outcome+'"]');
@@ -1420,25 +1419,44 @@ async function inspect(){
    };
   }
   const fetchCard=cardWin.fetch.bind(cardWin);
-  let releaseFailure;
-  const failure=new Promise(resolve=>{releaseFailure=resolve;});
-  cardWin.fetch=(url,options)=>{
-   if(options?.method==='POST' && ++reviewPosts===1) return failure;
+  let undoRequests=0,sendReads=0;
+  const hold='/send-hold/'+'a'.repeat(24);
+  cardWin.fetch=async(url,options)=>{
+   if(url===hold+'/undo'){
+    undoRequests++;
+    return cardWin.Response.json({outcome:'undone'});
+   }
+   if(url===hold){
+    sendReads++;
+    return cardWin.Response.json({reason:'The test save failed.'},{status:503});
+   }
+   if(url===cardWin.location.pathname && options?.method==='POST' && ++reviewPosts<=2){
+    return cardWin.Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+   }
    return fetchCard(url,options);
   };
   const words='Keep these words through the failure and conflict.';
   formInCard().elements.feedback.value=words;
   submit('feedback');
+  check(!dialog.open && sendingFrame.isConnected,'Send closes the modal and keeps the card frame.');
+  const toast=()=>document.querySelector('[data-send-undo]');
+  await changed(document.body,()=>toast()?.querySelector('button'),'the Review Undo toast shows');
+  check(!dialog.open && toast().parentElement.parentElement===document.body,'The toast shows on the available page.');
+  check(toast().querySelector('span').textContent==='Sent to sdlc.','The toast names the linked card owner.');
+  const other=await readCard(link('sdlc/C2'));
+  check(dialog.open && other.querySelector('[data-state="Done"]') && sendingFrame.hidden,
+   'A second card opens while the send waits.');
   close.click();
-  dialog.dispatchEvent(new win.Event('cancel',{cancelable:true}));
-  card.body.dispatchEvent(new cardWin.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-  dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
-  dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
-  check(dialog.open && close.disabled,'Close, Escape, and a click outside keep a saving card open.');
-  releaseFailure(new cardWin.Response(JSON.stringify({reason:'The test save failed.'}),{status:503}));
-  await changed(dialog,()=>!close.disabled,'the refusal enables Close');
+  toast().querySelector('button').click();
+  await changed(dialog,()=>dialog.open && !close.disabled,'Undo reopens the card');
+  check(undoRequests===1 && sendReads===0 && status()==='Undone. Edit and send again.' &&
+   formInCard().elements.feedback.value===words,'Undo restores the card and its words.');
+  submit('feedback');
+  await changed(document.body,()=>toast()?.querySelector('button'),'the next Review Undo toast shows');
+  toast().getAnimations()[0].finish();
+  await changed(dialog,()=>dialog.open && !close.disabled,'the refusal reopens the card');
   check(status()==='Not saved: The test save failed.','The failure remains visible.');
-  check(dialog.open && formInCard().elements.feedback.value===words,'The open card shows the failure and keeps the words.');
+  check(sendReads===1 && formInCard().elements.feedback.value===words,'Failure restores the card and its words.');
   await checkReviewCardConflict(card,'short',check,advance);
   delayRefresh=true;
  }
@@ -1451,28 +1469,31 @@ async function inspect(){
    }
   });
   const observer=new win.MutationObserver(()=>{
-   if(!dialog.open){saveObserver.disconnect();observer.disconnect();resolve();}
+   if(!sendingFrame.isConnected){saveObserver.disconnect();observer.disconnect();resolve();}
   });
   saveObserver.observe(notice,{childList:true});
   observer.observe(doc.body,{childList:true,subtree:true,attributes:true,attributeFilter:['open']});
  });
  submit('works');
+ check(!dialog.open,'The verdict closes the dialog at Send.');
  if(!phone){
   await changed(card.body,()=>status().startsWith('Saved:'),'the verdict is saved');
   await animationFrames(win);
-  check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
+  check(!dialog.open && listReads===0 && row()===before,'The Review refresh waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
   await changed(doc.body,()=>!win.recordDetails(row()).querySelector('textarea[name="words"]').form.dataset.sending,
    'the refused List action ends');
-  check(listReads===1 && dialog.open && !close.disabled && button('works').disabled,
+  check(listReads===1 && !dialog.open && button('works').disabled,
    'A refused List action starts one refresh and keeps the saved form disabled.');
   submit('works');
-  check(reviewPosts===3,'The saving form sends no second POST during the refresh.');
+  check(reviewPosts===4,'The saving form sends no second POST during the refresh.');
   releaseRefresh();
  }
  await refreshed;
- if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260],['IFRAME',180]]),
-  'The overlay uses the configured card fade durations.');
+ if(!phone) check(doc.querySelector('[data-review-refresh-error]').hidden,
+  'A good refresh clears the previous error.');
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260]]),
+  'Show updates uses the configured card fade durations.');
  check(doc.querySelector('[data-list]')!==listBefore && row()===before &&
   row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
   'The refresh displays the saved verdict.');
@@ -6145,6 +6166,8 @@ window.fetch=async(_url,options)=>{
  words.value='Tell morty after Undo.';words.dispatchEvent(new Event('input'));
  submit('tell');
  await until(()=>document.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+ check(document.querySelector('[data-send-undo] span').textContent==='Sent to morty.',
+  'The toast names the record keeper.');
  document.querySelector('[data-send-undo] button').click();
  await until(()=>notice.textContent==='Undone. Edit and send again.','The row did not say that the send was undone.');
  check(words.value==='Tell morty after Undo.','After Undo the Tell keeps its words.');

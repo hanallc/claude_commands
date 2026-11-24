@@ -248,6 +248,10 @@ HELD_SEND_PROBE = r"""<script>
 (async () => {
  const failures = [], calls = [], hold = 'a'.repeat(24), late = 'b'.repeat(24), flaky = 'c'.repeat(24);
  const modal = 'd'.repeat(24), closing = 'e'.repeat(24), broken = 'f'.repeat(24);
+ const lateFailure = '1'.repeat(24), deliveryFailure = '2'.repeat(24);
+ let releaseResult, readingResult;
+ const read = new Promise(resolve => { readingResult = resolve; });
+ const result = new Promise(resolve => { releaseResult = resolve; });
  const host = window.top.document;
  const check = (ok, label) => { if (!ok) failures.push(label); };
  const wait = ms => new Promise(done => setTimeout(done, ms));
@@ -258,10 +262,18 @@ HELD_SEND_PROBE = r"""<script>
   if (url === '/send') return new Response(JSON.stringify({hold, seconds: 1.2}), {status: 202, headers: {'X-Send-Hold': 'held'}});
   if (url === '/late') return new Response(JSON.stringify({hold: late, seconds: 5}), {status: 202, headers: {'X-Send-Hold': 'held'}});
   if (url === '/flaky') return new Response(JSON.stringify({hold: flaky, seconds: .2}), {status: 202, headers: {'X-Send-Hold': 'held'}});
-  for (const [path, id] of [['/modal', modal], ['/closing', closing], ['/broken', broken]])
+  for (const [path, id] of [['/modal', modal], ['/closing', closing], ['/broken', broken],
+                           ['/late-failure', lateFailure], ['/delivery-failure', deliveryFailure]])
    if (url === path) return new Response(JSON.stringify({hold: id, seconds: 30}), {status: 202, headers: {'X-Send-Hold': 'held'}});
   if (url === '/send-hold/' + broken + '/undo') throw new TypeError('offline');
-  if (url === '/send-hold/' + late + '/undo') return new Response('{"outcome":"already sent"}', {status: 409});
+  if ([late, lateFailure].some(id => url === '/send-hold/' + id + '/undo'))
+   return new Response('{"outcome":"already sent"}', {status: 409});
+  if (url === '/send-hold/' + lateFailure) {
+   readingResult();
+   return result;
+  }
+  if (url === '/send-hold/' + deliveryFailure)
+   return Response.json({saved:true,send_failure:'Delivery failed: The owner is offline.'});
   if (url === '/send-hold/' + flaky && calls.filter(([, called]) => called === url).length < 2) throw new TypeError('restart');
   if (url === '/plain') return new Response('{"plain":true}', {status: 200});
   if (url.endsWith('/undo')) return new Response('{"outcome":"undone"}', {status: 200});
@@ -275,7 +287,8 @@ HELD_SEND_PROBE = r"""<script>
  const undone = heldFetch('/send', {method: 'POST', body: 'words'});
  await wait(100);
  const toast = host.querySelector('[data-send-undo]');
- check(toast?.textContent === 'SendingUndo', 'The Undo toast shows in the top page.');
+ check(toast?.querySelector('span')?.textContent === 'Sending.' && toast.querySelector('button')?.textContent === 'Undo',
+       'An unknown receiver shows Sending and Undo in the top page.');
  check(calls[0]?.[2] === '1', 'The send carries the hold header.');
  toast?.querySelector('button')?.click();
  try {
@@ -299,21 +312,40 @@ HELD_SEND_PROBE = r"""<script>
  check(!host.querySelector('[data-send-undo]'), 'The toast goes after the send.');
  const plain = await heldFetch('/plain', {method: 'POST', body: 'words'});
  check((await plain.json()).plain === true, 'A send that the server does not hold returns at once.');
- const lateSend = heldFetch('/late', {method: 'POST', body: 'words'});
+ const lateSend = heldFetch('/late', {method: 'POST', body: 'words'}, 'the owner');
  await wait(100);
  host.querySelector('[data-send-undo] button')?.click();
  check((await lateSend).status === 200, 'A late Undo gives the real response.');
- check(host.querySelector('[data-send-undo]')?.textContent === 'Too late to undo. Sent.', 'A late Undo says the send left.');
+ check(host.querySelector('[data-send-undo]')?.textContent === 'Too late to undo. Sent to the owner.',
+       'A late Undo still names the receiver.');
  const flakyStarted = performance.now();
  check((await heldFetch('/flaky', {method: 'POST', body: 'words'})).status === 200, 'A lost result read is read again.');
  check(performance.now() - flakyStarted >= 1000, 'The read waits before it tries again.');
  const newestToast = () => [...host.querySelectorAll('[data-send-undo]')].at(-1);
+ const failedLate = heldFetch('/late-failure', {method: 'POST', body: 'words'}, 'the owner');
+ await wait(100);
+ newestToast().querySelector('button').click();
+ await read;
+ check(newestToast().textContent === 'Too late to undo. Checking the result…',
+       'A late Undo waits for the send result.');
+ releaseResult(Response.json({send_failure:'Delivery failed.'}));
+ check((await failedLate).ok && newestToast().textContent === 'Too late to undo. Delivery failed.',
+       'A late Undo reports the delivery failure after a confirmed save.');
+ const failedDelivery = heldFetch('/delivery-failure', {method: 'POST', body: 'words'}, 'the owner');
+ await wait(100);
+ const deliveryToast = newestToast();
+ deliveryToast.getAnimations()[0].finish();
+ const failedResponse = await failedDelivery;
+ check(failedResponse.ok && (await failedResponse.json()).saved, 'A failed delivery keeps the save.');
+ check(deliveryToast.textContent === 'Delivery failed: The owner is offline.' &&
+       getComputedStyle(deliveryToast).opacity === '1', 'Normal release shows the delivery failure.');
  const stack = () => host.querySelector('[data-send-undo-stack]');
  const dialog = host.createElement('dialog');
  host.body.append(dialog);
- const inDialog = heldFetch('/modal', {method: 'POST', body: 'words'});
+ const inDialog = heldFetch('/modal', {method: 'POST', body: 'words'}, null);
  await wait(100);
  const dialogToast = newestToast();
+ check(dialogToast.querySelector('span').textContent === 'Saved.', 'An action with no message shows Saved.');
  check(stack()?.parentElement === host.body, 'The toast starts in the page body.');
  dialog.showModal();
  await wait(50);
