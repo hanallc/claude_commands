@@ -136,7 +136,8 @@ In merge mode, it undoes the merge and reports the rollback.
 Status 79 identifies a refusal before tests started.
 Status 80 identifies a run with no verdict or a launch that still needs settlement.
 A direct gate or `copies.py gate-step` uses one placement.
-`copies.py gate-step` preserves status 79 or 80 if cancellation fails and reports the cleanup error on standard error.
+`copies.py run` and `copies.py gate-step` preserve status 79 or 80 if cleanup fails.
+They report the cleanup error on standard error.
 Checkpoint and bump treat these statuses as blocked.
 A nightly gate reports the refusal to its production owner and records no red test result.
 When `copies.py run` owns placement, it reports the claim failure to the queue on status 79.
@@ -150,7 +151,12 @@ An eligible named machine can take the run while the guest is in backoff.
 A fresh reading that still excludes the guest keeps it out of placement.
 If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
-Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
+The command uses `{tree}` for its checkout or repository argument.
+A base check uses the prepared base commit.
+A copy setup failure blocks the checkpoint and reports the test log path.
+The checkpoint skips the rerun and the base check after a copy setup failure.
+Bump gates use `copies.py gate-step` when they have placement targets.
 A claude gate uses the configured targets that its placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate reports status 80 and gives the reason.
