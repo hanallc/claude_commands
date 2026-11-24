@@ -505,6 +505,7 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
   <script>
   (() => {
     const actions = document.currentScript.previousElementSibling;
+    for (const button of actions.children) button.dataset.windowPlace = button.getAttribute("aria-controls");
     const owner = window.pageActionsArea?.()?.querySelector(".page-owner");
     if (owner) {
       const newItem = owner.querySelector("[data-owner-new]");
@@ -525,7 +526,7 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
   </script>
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
-  <div class="pressure"><button type="button" class="pill" id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog" data-page-action="builds-pressure"><span class="pd"></span><span id="pill-t">pressure –</span></button></div>
+  <div class="pressure"><button type="button" class="pill" id="pill" data-tip="pill" aria-haspopup="dialog" aria-controls="builds-swap-dialog" data-page-action="builds-pressure" data-window-place="builds-swap-dialog"><span class="pd"></span><span id="pill-t">pressure –</span></button></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -1901,11 +1902,13 @@ const currentBuildsTooltip = key => latest ? buildsTooltipHtml(key, latest) : ""
 const tip = document.getElementById("tip");
 // A modal dialog covers the page, so the tooltip shows from inside the open dialog.
 const tips = hoverTips(tip, key => {
+  if (key === "pill" && document.getElementById("builds-swap-dialog").open) return "";
   const host = document.querySelector("dialog[open]") ?? document.body;
   if (tip.parentElement !== host) host.append(tip);
   return currentBuildsTooltip(key);
 });
 const showTip = tips.show, hideTip = tips.hide;
+document.getElementById("pill").addEventListener("click", hideTip);
 function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 __PAGE_REFRESH_SCRIPT__

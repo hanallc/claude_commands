@@ -333,13 +333,19 @@ try {
   let confirmedQueueLine = null;
   const undoAnchors = new Map();
   const server = createServer(async (req, res) => {
-    if (req.url === '/console/review/new-item') {
+    if (req.url.split('?', 1)[0] === '/console/review/new-item') {
       res.writeHead(200, {'Content-Type':'application/json'});
       if (req.method === 'POST') {
         const chunks = [];
         for await (const chunk of req) chunks.push(chunk);
-        submittedItem = JSON.parse(Buffer.concat(chunks));
-        res.end(JSON.stringify({id:'Q1'}));
+        const payload = JSON.parse(Buffer.concat(chunks));
+        if (payload.page_capture) {
+          server.emit('page-capture', payload.page_capture);
+          res.end('{}');
+        } else {
+          submittedItem = payload;
+          res.end(JSON.stringify({id:'Q1'}));
+        }
       } else {
         res.end(JSON.stringify({token:'proof-token',recipients:[
           {id:'fixture-hana',name:'hana',proposal:true}, {id:'fixture-builds',name:'builds',proposal:true}
@@ -1484,9 +1490,11 @@ try {
               const opened=await evaluate(`(() => {
                 const dialog=document.querySelector('#${action}-dialog'), body=dialog.querySelector('.console-dialog-body');
                 return {modal:dialog.matches(':modal'),right:dialog.getBoundingClientRect().right,
+                  capturePlace:pageCapturePlace(),
                   sideways:body.scrollWidth-body.clientWidth};
               })()`);
               assert.ok(opened.modal, action+' does not open its dialog.');
+              assert.equal(opened.capturePlace, '/memory_live.html#console-window=' + action + '-dialog');
               assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
               assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
               if (action==='builds-swap') {
@@ -1510,21 +1518,38 @@ try {
               })()`);
               assert.deepEqual(closed,{open:false,focus:action},action+' does not close or return focus.');
             }
-            // The pressure pill opens the swap dialog, and Escape returns focus to the pill.
-            const pill=await evaluate(`(() => {
-              const box=document.querySelector('#pill').getBoundingClientRect();
-              return {x:box.left+box.width/2,y:box.top+box.height/2};
-            })()`);
-            await call('Input.dispatchMouseEvent',{type:'mousePressed',...pill,button:'left',buttons:1,clickCount:1});
-            await call('Input.dispatchMouseEvent',{type:'mouseReleased',...pill,button:'left',buttons:0,clickCount:1});
-            assert.ok(await evaluate("document.querySelector('#builds-swap-dialog').open"),'The pressure pill does not open the swap dialog.');
-            for (const type of ['keyDown','keyUp'])
-              await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
-            const pillClosed=await evaluate(`(async () => {
-              await new Promise(resolve => requestAnimationFrame(resolve));
-              return {open:document.querySelector('#builds-swap-dialog').open,focus:document.activeElement.id};
-            })()`);
-            assert.deepEqual(pillClosed,{open:false,focus:'pill'},'The swap dialog does not return focus to the pressure pill.');
+            // The pressure pill opens Swap without its tooltip. Escape returns focus to the pill.
+            for (const input of ['mouse', 'keyboard', 'touch']) {
+              if (input === 'touch') await call('Emulation.setTouchEmulationEnabled', {enabled:true});
+              const pill=await evaluate(`(() => {
+                hideTip();
+                const button = document.querySelector('#pill');
+                button.focus({preventScroll:true});
+                const box = button.getBoundingClientRect();
+                return {x:box.left+box.width/2,y:box.top+box.height/2};
+              })()`);
+              if (input === 'mouse') {
+                await call('Input.dispatchMouseEvent',{type:'mouseMoved',...pill});
+                await call('Input.dispatchMouseEvent',{type:'mousePressed',...pill,button:'left',buttons:1,clickCount:1});
+                await call('Input.dispatchMouseEvent',{type:'mouseReleased',...pill,button:'left',buttons:0,clickCount:1});
+              } else if (input === 'keyboard') {
+                await pressSpace();
+              } else {
+                await call('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[pill]});
+                await call('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+              }
+              const pillOpened = await evaluate(`({open:document.querySelector('#builds-swap-dialog').open,
+                tip:document.querySelector('#tip').classList.contains('on')})`);
+              assert.deepEqual(pillOpened,{open:true,tip:false},'Swap or its tooltip is wrong for '+input+'.');
+              for (const type of ['keyDown','keyUp'])
+                await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+              const pillClosed=await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                return {open:document.querySelector('#builds-swap-dialog').open,focus:document.activeElement.id};
+              })()`);
+              assert.deepEqual(pillClosed,{open:false,focus:'pill'},'The swap dialog does not return focus to the pressure pill.');
+              if (input === 'touch') await call('Emulation.setTouchEmulationEnabled', {enabled:false});
+            }
             // A queue outage closes an open section dialog and hides the section buttons with the cards.
             const outage=await evaluate(`(async () => {
               document.querySelector('[data-page-action="builds-swap"]').click();
@@ -3664,6 +3689,31 @@ try {
           await saveScreenshot('after-dark-desktop',{captureBeyondViewport:true,clip:endClip});
           await evaluate("document.querySelector('#builds-swap-dialog [data-close]').click()");
         }
+
+        await show(base);
+        const [[captureRequest]] = await Promise.all([
+          once(server, 'page-capture', {signal:AbortSignal.timeout(5000)}),
+          evaluate(`(() => {
+            document.querySelector('#pill').click();
+            document.querySelector('#builds-swap-dialog [data-owner-new]').click();
+            return document.querySelector('#review-new-item').matches(':modal');
+          })()`).then(open => assert.ok(open, 'New item does not open above Swap.')),
+        ]);
+        assert.equal(captureRequest.place, '/memory_live.html#console-window=builds-swap-dialog');
+        const captureDialogs = await evaluate(`(async () => {
+          const frame = document.createElement('iframe');
+          frame.src = ${JSON.stringify(captureRequest.place)};
+          frame.style.cssText = 'position:fixed;left:-2000px;width:1400px;height:1100px';
+          const loaded = new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));
+          document.body.append(frame);
+          try {
+            await loaded;
+            return [...frame.contentDocument.querySelectorAll('dialog:modal')].map(dialog => dialog.id);
+          } finally {
+            frame.remove();
+          }
+        })()`);
+        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The screenshot address does not restore Swap.');
 
         if (comparisonImages) {
           await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
