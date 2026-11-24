@@ -1008,6 +1008,8 @@ async function save(row,form,outcome){
  clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
+ const skip=outcome==='skip';
+ if(skip) data.set('feedback','');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
  const moveOn=notice=>{
@@ -1016,33 +1018,49 @@ async function save(row,form,outcome){
   else show();
   motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
- // Works and Does not work show the next change at once; a failed save puts the change back.
- const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
- if(early) moveOn('Saving review.');
+ const early=skip || kind!=='questions' && (outcome==='works' || outcome==='not works');
+ const savingNotice=skip ? 'Saving skip.' : 'Saving review.';
+ if(early) moveOn(savingNotice);
  try{
-  // A Skip only moves the item, so it needs no Undo.
   const options={method:'POST',body:data,headers:{Accept:'application/json'}};
-  const response=await (outcome==='skip' ? fetch(form.action,options)
-                                      : heldFetch(form.action,options,sendActionReceiver(form,data)));
+  const response=await heldFetch(form.action,options,skip ? null : sendActionReceiver(form,data));
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
   state.textContent=reply.answer ? 'Saved: '+reply.answer :
    outcome==='question' ? ''' + json.dumps(page_frame.QUESTION_WAITING.format(owner_role="showrunner")) + r''' :
    outcome==='feedback' ? 'The showrunner will act on this' :
-   outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
+   outcome==='followup' ? 'Follow-up sent to the asker' : skip ? 'Moved to the end of the list' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   saved=true;
-  if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
-  else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
+  if(skip){
+   const showSkipped=!saveNotice.hidden && saveNotice.textContent===savingNotice;
+   rows=rows.filter(card=>card!==row);rows.push(row);
+   row.dataset.pending='true';form.hidden=false;
+   if(!current && navigation===position+1) go(row.dataset.key);
+   else show();
+   if(showSkipped){saveNotice.textContent='Skipped.';saveNotice.hidden=false;}
+  }
+  if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : 'Answer saved.');
+  else if(!skip && !saveNotice.hidden && saveNotice.textContent===savingNotice) saveNotice.textContent='Review saved.';
  }catch(error){
   const undone=error instanceof SendUndone;
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
   row.dataset.saveState=undone ? '' : 'failed'; state.textContent=undone ? reason : 'Not saved: '+reason;
   if(early){
-   row.dataset.pending='true';form.hidden=false;show();
+   row.dataset.pending='true';form.hidden=false;
+   if(skip && undone){
+    form.querySelectorAll('button[name=outcome]').forEach(button=>button.removeAttribute('aria-pressed'));
+    if(navigation===position+1){
+     go(row.dataset.key);
+     saveNotice.textContent='Undone.';saveNotice.hidden=false;
+     return;
+    }
+   }
+   show();
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   saveNotice.replaceChildren((undone ? 'Undone: ' : 'Not saved: ')+row.dataset.shown+'. '+(undone ? '' : reason+' ')
+   const heading=row.dataset.shown ?? row.querySelector('h1').textContent;
+   saveNotice.replaceChildren((undone ? 'Undone: ' : 'Not saved: ')+heading+'. '+(undone ? '' : reason+' ')
     +'It is back in the list. ',open);
    saveNotice.hidden=false;
   }
