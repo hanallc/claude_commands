@@ -2453,10 +2453,19 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
-        rollback_merge(repo, baseline)
-        if isinstance(recovery, GateRecovery):
-            recovery.rollback = ""
-            recovery.save()
+        try:
+            rollback_merge(repo, baseline)
+            if isinstance(recovery, GateRecovery):
+                recovery.rollback = ""
+                recovery.save()
+        except Exception as cleanup_error:
+            if not isinstance(error, MacLinuxTookNoRun):
+                raise
+            if isinstance(recovery, GateRecovery):
+                # Keep the recovery record when cleanup fails.
+                recovery.rollback = baseline
+            detail = str(cleanup_error) or type(cleanup_error).__name__
+            raise MacLinuxTookNoRun(f"{error}; merge cleanup failed: {detail}") from cleanup_error
         refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
         raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
