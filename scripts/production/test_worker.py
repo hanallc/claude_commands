@@ -26,8 +26,9 @@ from unittest.mock import call, patch
 from uuid import UUID
 
 from scripts.lib.fixture_test_support import set_up_fixture
-from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, restart_support, shutdown, stop_resume, worker_lifecycle
 from scripts.agents import pane_record
+from scripts.agents.test_support import write_machine_config
 from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
@@ -675,7 +676,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
 
-    def test_restore_resumes_a_stopped_worker_with_a_result_after_done(self) -> None:
+    def test_restore_after_production_pause_and_resume_with_a_result_after_done(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane, _ = self.agent.submitted[-1]
         row = self.agent.row(pane)
@@ -685,8 +686,27 @@ class WorkerCommandTests(unittest.TestCase):
         result.update(pane_dispatch_id=dispatch.instance_id, delivery=f"sent: worker {row.name} at {pane}")
         atomic_file.write_text_atomic(path, json.dumps(result))
         self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
-        _ = self.fixture.world.stop(row, self.fixture.world)
-        state = worker_panes.observe_worker(self.fixture.parent.id, row, staff.snapshot())
+        parent = self.fixture.parent
+        owner = staff.snapshot().parent_of(parent)
+        assert owner is not None
+        write_machine_config(self.fixture.root / "conf")
+        running = stop_resume.ClaudeUp(str(parent.current_session), "w1:p0", "fixture")
+        with (patch.dict(os.environ, {"USER_ZONE": "UTC"}),
+              patch.object(herdr, "reboot_lock_path", return_value=self.fixture.root / "reboot.lock"),
+              patch.object(stop_resume, "running_on_account", return_value=running),
+              patch.object(restart_support, "send_message", return_value={"kind": "sent"}) as send_message,
+              redirect_stderr(io.StringIO()) as lifecycle_errors):
+            self.assertEqual(shutdown.main(["pause", "--production", owner.name, "--why", "review"]),
+                             0, lifecycle_errors.getvalue())
+            self.assertEqual(self.fixture.world.stops, [str(row.current_session)])
+            self.assertIsInstance(self.fixture.parent.paused, staff.Paused)
+            state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
+            self.assertIsInstance(state, worker_panes.StoppedWorker)
+            self.assertEqual(shutdown.main(["resume", "--production", owner.name]), 0, lifecycle_errors.getvalue())
+        self.assertIsInstance(self.fixture.parent.paused, staff.Active)
+        send_message.assert_called_with(f"session:{parent.current_session}", "agents lifecycle",
+                                        "Continue where you stopped. Resume your existing workers. Do not open new workers.")
+        state = worker_panes.observe_worker(parent.id, row, staff.snapshot())
         self.assertIsInstance(state, worker_panes.StoppedWorker)
         notices = len(self.fixture.prompts())
 
@@ -929,6 +949,34 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertCountEqual(result.panes, [PaneWorkerResume(busy.row.id, UnsubmittedAssignment("dispatch-impl", ("assign.sh", "same command"))),
                                              PaneWorkerResume(idle.row.id, IdleWorker())])
         self.assertEqual(result.results, [])
+
+    def test_resume_workers_keeps_both_steps_when_a_detached_record_is_unreadable(self) -> None:
+        from scripts.lib.resume_message import BusyPass, PaneWorkerResume
+
+        first, second = sorted((self.opened("impl"), self.opened("fix")), key=lambda opened: opened.row.id)
+        steps: list[PaneWorkerResume] = []
+        for opened in (first, second):
+            row = opened.row
+            dispatch = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="8", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["assign.sh"], prompt=self.prompt,
+                kind="impl", lens="")
+            self.agent.append(opened.pane, "user", f"End your final reply with DONE {dispatch}.")
+            steps.append(PaneWorkerResume(row.id, BusyPass(dispatch)))
+            if opened == first:
+                self.agent.append(opened.pane, "assistant", f"Report.\nDONE {dispatch}")
+
+        self.agent.append(first.pane, "user", "Detached run: other-check\nRun finished: private verification")
+        path, result = self.detached_record(first.row, "other-check")
+        result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {first.row.name} at {first.pane}")
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        broken = path.with_name("old.json")
+        atomic_file.write_text_atomic(broken, "{")
+
+        with redirect_stderr(io.StringIO()) as errors:
+            resumes = worker.resume_workers(self.fixture.parent.id, staff.snapshot())
+        self.assertEqual(resumes.panes, steps)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(f"anomaly: {first.row.name}: {broken}: worker state unreadable", errors.getvalue())
 
     def test_resume_workers_keeps_a_claude_child_launcher_without_a_native_pass(self) -> None:
         from scripts.lib.resume_message import BusyPass, IdleWorker, PaneWorkerResume, Resumable, Unavailable, resume_message

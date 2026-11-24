@@ -1299,8 +1299,14 @@ def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatc
     receipt = transcript_receipt(worker_admission.conversation_entries(row, backend, set()),
         DispatchPrompt(dispatch.instance_id, include_stage_two=True), DoneReply(dispatch.instance_id)).receipt
     if isinstance(receipt, DispatchAwaitingReply) and isinstance(receipt.matching_done, DispatchComplete):
-        _, other_passes = detached_runs.worker_results(run / worker_lifecycle.DETACHED_RUNS_DIR, row,
-                                                       since=0, pane_dispatch_id=dispatch.instance_id)
+        try:
+            _, other_passes = detached_runs.worker_results(run / worker_lifecycle.DETACHED_RUNS_DIR, row,
+                                                           since=0, pane_dispatch_id=dispatch.instance_id)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except (OSError, worker_lifecycle.WorkerStateUnreadable) as error:
+            unit_runs.report_anomaly(f"anomaly: {row.name}: {error}")
+            return receipt
         if other_passes.issuperset(receipt.runs):
             return receipt.matching_done
     return receipt

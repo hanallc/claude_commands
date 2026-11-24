@@ -638,6 +638,7 @@ Director notes reuse shared dispatch history reads.
 A matching DONE or a finished record suppresses the resume step for that pass.
 A later detached result from that pass still requires another matching DONE.
 Restore preserves DONE when the record links the later result to another pass.
+If the detached record is unreadable, resume reports it and uses that worker's transcript receipt.
 Restore uses the worker pane with the proved native identity for its continuation.
 It checks that the worker is idle. The prompt checks the native identity again before it sends input.
 The decision reads the record and transcript once per worker and uses the restart's shared run index.
