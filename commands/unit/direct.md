@@ -762,7 +762,7 @@ while another phase is open.
 already have been cleared by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
 
-In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,
+In `single`, also run <RunAsBuilt/>, then run `finish-run --status completed`,
 apply <RetainPhaseReservation/>, report that no checkpoint release was
 attempted, run `bash ~/.claude/scripts/direct/end_session.sh`, and end. Other
 modes continue.

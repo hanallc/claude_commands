@@ -750,6 +750,25 @@ class UnitPhasesTests(unittest.TestCase):
                                   detail_rows(rendered, "roles"))
                     self.assertNotIn("— working", rendered)
 
+    def test_board_shows_active_run_as_built_worker_work(self) -> None:
+        member = self.member("document")
+        worker = census_worker("writer", member.id)
+        events: list[dict[str, object]] = [
+            self.phase_event("phase_finished", "1", status="completed"),
+            {"event_type": "pass_started", "phase_id": "as-built", "phase_title": "Run as-built",
+             "phase_instance_id": "", "pass_instance_id": "writer", "pass_kind": "impl", "worker_id": worker.staff_id},
+        ]
+        plan = typed_record(self.root / "plan.md", "done")
+        _ = self.write_run(member, "document", [("1", "Delivery 1")], events)
+
+        rendered = self.blocks([member], {member.name: plan}, workers=[worker])
+
+        self.assertIn("**document** — working", rendered)
+        self.assertIn(("Now", "Run as-built", "Implementation worker runs it"), detail_rows(rendered, member.name))
+        events.append({"event_type": "pass_finished", "phase_id": "as-built", "pass_instance_id": "writer"})
+        _ = self.write_run(member, "document", [("1", "Delivery 1")], events)
+        self.assertNotIn("Run as-built", self.blocks([member], {member.name: plan}, workers=[worker]))
+
     def test_task_is_the_newest_open_activity_before_the_open_pass(self) -> None:
         member = self.member("activity")
         tail = [self.phase_event("pass_started", "board", pass_instance_id="pass", pass_kind="impl"),

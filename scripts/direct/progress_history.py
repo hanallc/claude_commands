@@ -1331,6 +1331,8 @@ def _start_phase(args: argparse.Namespace) -> None:
         owner = unit_runs.run_owner(state, record)
         if isinstance(owner, staff.StaffRow) and isinstance(owner.run, staff.OpenRun):
             raise SystemExit(f"{owner.name}: another run is open")
+    if any(pass_recorder.is_as_built_pass(passed) for passed in pass_recorder.open_passes(state).values()):
+        raise SystemExit("Finish the as-built pass first.")
     now = pass_recorder.now_epoch()
     phase_id = pass_recorder.arg_string(args, "phase_id", "ad hoc")
     phase_dir = phase_reservation.phase_directory(session_dir, phase_id)
@@ -1511,18 +1513,10 @@ def _launch_check(
 
 
 def _checked_launch(
-    args: argparse.Namespace, state: dict[str, object], session_dir: Path,
+    args: argparse.Namespace, state: dict[str, object], session_dir: Path, membership: staff.StaffSnapshot,
 ) -> tuple[dict[str, object], LaunchCheck]:
-    """Validate a named open phase and its launch without changing any pass."""
-    pass_recorder.require_launch_admission(args, state, session_dir)
-    phase_id = pass_recorder.optional_arg(args, "phase_id")
-    if not phase_id:
-        _ = recorder_state.only_open_phase(state)
-        _launch_refused(state, args, "Missing phase: --phase-id is required for a recorded run")
-    phase = pass_recorder.open_phase_named(state, phase_id)
-    if phase is None:
-        open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
-        _launch_refused(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {pass_recorder.CLOSED_PHASE_RULE}")
+    """Check the launch without changing any pass or phase."""
+    phase = pass_recorder.launch_phase(args, state, session_dir, membership, _launch_refused)
     return phase, _launch_check(args, state, phase, session_dir)
 
 
@@ -1533,8 +1527,9 @@ def check_assigned_review_launch(run: Path, phase: str, prompt: Path, lens: str)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if isinstance(_recorder_artifacts.get(), OrdinaryRecorderRun):
             raise ValueError(f"{run}: the enrolled review owner changed")
-        state = _read_state(run)
-        recorded_phase, launch_check = _checked_launch(args, state, run)
+        membership = staff.initial_snapshot()
+        state = _read_state(run, record=membership)
+        recorded_phase, launch_check = _checked_launch(args, state, run, membership)
         if lens == "ux":
             event = pass_recorder.record_event(state, "launch_checked", pass_recorder.now_epoch(),
                                                phase_record=recorded_phase)
@@ -1742,7 +1737,7 @@ def _start_pass(args: argparse.Namespace,
     if isinstance(selection, pass_recorder.DispatchSelection):
         pass_recorder.validate_dispatch_selection(state, selection, team_slot, pass_recorder.optional_arg(args, "phase_id"))
     # Name the phase when more than one phase is open.
-    phase, launch_check = _checked_launch(args, state, session_dir)
+    phase, launch_check = _checked_launch(args, state, session_dir, membership)
     launcher_pid = pass_recorder.arg_integer(args, "launcher_pid", os.getppid())
     early_id = pass_recorder.optional_arg(args, "early_review_pass_id")
     dispatch_fields: dict[str, object] = {
@@ -6982,6 +6977,17 @@ class InterruptedWorkerPasses:
     worker_ids: tuple[staff.StaffId, ...] = ()
 
 
+def _interrupt_passes(session_dir: Path, state: dict[str, object],
+                     passes: dict[str, dict[str, object]], now: float) -> list[staff.StaffId]:
+    interrupted: list[staff.StaffId] = []
+    for slot, record in sorted(passes.items()):
+        if _close_slot_pass(session_dir, state, slot, "interrupted", now):
+            identity = pass_recorder.string(record.get("worker_id"))
+            if identity:
+                interrupted.append(staff.StaffId(identity))
+    return interrupted
+
+
 def _close_interrupted_workers(passes: InterruptedWorkerPasses) -> None:
     if not passes.worker_ids:
         return
@@ -7064,12 +7070,7 @@ def _finish_phase_with_wait_lock(
     for wait in external_waits:
         if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
             _end_wait({"history_file": str(_external_wait_file())}, wait, now, unclosed=True)
-    interrupted: list[staff.StaffId] = []
-    for slot, record in sorted(pass_recorder.phase_passes(state, instance_id).items()):
-        identity = staff.StaffId(pass_recorder.string(record.get("worker_id")))
-        if _close_slot_pass(session_dir, state, slot, "interrupted", now):
-            if identity:
-                interrupted.append(identity)
+    interrupted = _interrupt_passes(session_dir, state, pass_recorder.phase_passes(state, instance_id), now)
     _close_active_activity(session_dir, state, phase, "interrupted", "", now)
     _ = _clear_armed_review(session_dir, state, phase, "phase ended", now)
     status = pass_recorder.arg_string(args, "status")
@@ -7165,6 +7166,9 @@ def _record_run_end(request: RunEndRequested, session_dir: Path) -> InterruptedW
         finish_args = argparse.Namespace(session_dir=str(session_dir), phase_id=phase_id, status=run_status)
         interrupted.extend(_finish_phase(finish_args).worker_ids)
     state = _read_state(session_dir)
+    as_built = {slot: passed for slot, passed in pass_recorder.open_passes(state).items()
+                if pass_recorder.is_as_built_pass(passed)}
+    interrupted.extend(_interrupt_passes(session_dir, state, as_built, now))
     phase = _last_finished_phase(state)
     if phase is not None:
         _close_active_activity(session_dir, state, phase, "interrupted", "", now)

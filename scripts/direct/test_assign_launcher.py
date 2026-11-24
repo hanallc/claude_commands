@@ -1104,6 +1104,82 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.native.fixture.world.requests[0][1][self.native.fixture.world.requests[0][1].index("--sandbox") + 1], "read-only")
         self.assertEqual(len(self.native.agent.submitted), 1)
 
+    def test_as_built_dispatches_after_the_last_phase_finishes(self) -> None:
+        self.record("finish-phase", "--phase-id", "7", "--status", "completed")
+        state_path = self.session_dir / recorder_state.STATE_FILENAME
+        before = read_object(state_path)
+        phase_events = [event for event in self.events() if str(event["event_type"]).startswith("phase_")]
+        _ = self.prompt.write_text("Write the run's as-built documentation.\n")
+
+        _ = self.successful("implement", "--phase", "as-built")
+        _ = self.successful("implement", "--phase", "as-built")
+
+        self.assertEqual(self.turn_starts, 1)
+        after = read_object(state_path)
+        self.assertEqual(recorder_state.open_phases(after), [])
+        self.assertEqual(after["phase"], before["phase"])
+        self.assertEqual([event for event in self.events() if str(event["event_type"]).startswith("phase_")], phase_events)
+        started, = [event for event in self.events() if event["event_type"] == "pass_started"]
+        finished, = [event for event in self.events() if event["event_type"] == "pass_finished"]
+        self.assertEqual((started["phase_id"], started["phase_instance_id"]), ("as-built", ""))
+        self.assertEqual((finished["pass_instance_id"], finished["status"]), (started["pass_instance_id"], "completed"))
+        directory = self.session_dir / "phases/as-built"
+        self.assertEqual((directory / "impl_status").read_text(), "done\n")
+        self.assertFalse((directory / "phase_baseline").exists())
+
+    def test_as_built_dispatch_refuses_an_open_phase(self) -> None:
+        _ = self.prompt.write_text("Write the run's as-built documentation.\n")
+
+        result = self.launch("implement", "--phase", "as-built")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Run as-built requires no open phases. Open phases: 7.", result.stderr)
+        self.assertEqual(self.turn_starts, 0)
+        self.assertFalse((self.session_dir / "phases/as-built").exists())
+
+    def test_as_built_dispatch_requires_a_valid_home_checkout(self) -> None:
+        self.record("finish-phase", "--phase-id", "7", "--status", "completed")
+        _ = self.prompt.write_text("Write the run's as-built documentation.\n")
+        membership = staff.local_snapshot()
+        owner_id = self.native.fixture.parent.id
+        for worktree in (staff.WorktreeUnfilled(),
+                         staff.PresentWorktree("natedev", self.home / "missing-home")):
+            with self.subTest(worktree=worktree):
+                rows = tuple(replace(row, worktree=worktree) if row.id == owner_id else row for row in membership.rows)
+                write_text_atomic(Path(os.environ["STAFF_FILE"]), replace(membership, rows=rows).encode())
+
+                result = self.launch("implement", "--phase", "as-built")
+
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("home", result.stderr)
+                self.assertEqual(self.native.fixture.world.launches, [])
+                self.assertFalse((self.session_dir / "phases/as-built").exists())
+
+    def test_as_built_dispatch_refuses_a_finished_run_before_check_launch(self) -> None:
+        self.record("finish-run", "--status", "completed")
+        _ = self.prompt.write_text("Write the run's as-built documentation.\n")
+
+        result = self.launch("implement", "--phase", "as-built")
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Run as-built requires an open run.", result.stderr)
+        self.assertEqual(self.native.fixture.world.launches, [])
+        self.assertFalse((self.session_dir / "phases/as-built").exists())
+        self.assertFalse(any(event["event_type"] == "launch_refused" for event in self.events()))
+
+    def test_as_built_dispatch_refuses_a_cwd_outside_the_home_checkout(self) -> None:
+        self.record("finish-phase", "--phase-id", "7", "--status", "completed")
+        _ = self.prompt.write_text("Write the run's as-built documentation.\n")
+        other_checkout = self.home / "rust" / "project"
+
+        result = self.launch("implement", "--phase", "as-built", "--cwd", str(other_checkout))
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"--cwd must resolve to the run home checkout {self.project}.", result.stderr)
+        self.assertEqual(self.native.fixture.world.launches, [])
+        self.assertFalse((self.session_dir / "phases/as-built").exists())
+        self.assertFalse(any(event["event_type"] == "pass_started" for event in self.events()))
+
     def test_unsafe_phase_ids_are_refused_before_opening_a_thread(self) -> None:
         for phase in (".", "..", "../escape", "nested/phase", "other phase"):
             with self.subTest(phase=phase):
