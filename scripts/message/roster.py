@@ -405,6 +405,10 @@ def shown_name(entry: RosterEntry) -> ShownName:
                      else NoRegistryName())
 
 
+class UnreadableSessionRecordProblem(str):
+    """The diagnostic for a session record that the registry could not read."""
+
+
 @dataclass(frozen=True)
 class Roster:
     entries: list[RosterEntry]
@@ -610,10 +614,13 @@ class RosterSnapshot:
     def encode(self) -> str:
         # Older peers accept extra snapshot keys but reject extra entry keys.
         closed_workers = [index for index, entry in enumerate(self.result.entries) if is_closed_worker(entry)]
+        unreadable_records = [index for index, problem in enumerate(self.result.problems)
+                              if isinstance(problem, UnreadableSessionRecordProblem)]
         return json.dumps({"tag": "RosterSnapshot", "entries": [
             _snapshot_entry(entry) for entry in self.result.entries
         ], "problems": self.result.problems,
             **({"closed_workers": closed_workers} if closed_workers else {}),
+            **({"unreadable_session_record_problems": unreadable_records} if unreadable_records else {}),
             **({"warnings": self.result.warnings} if self.result.warnings else {})})
 
     @classmethod
@@ -627,6 +634,14 @@ class RosterSnapshot:
         raw_problems = cast(list[object], problems)
         if not all(isinstance(problem, str) for problem in raw_problems):
             raise ValueError("snapshot problems must be strings")
+        decoded_problems = cast(list[str], raw_problems)
+        unreadable_records = values.get("unreadable_session_record_problems", [])
+        if not isinstance(unreadable_records, list):
+            raise ValueError("snapshot unreadable session record problems must be a list")
+        for index in cast(list[object], unreadable_records):
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(decoded_problems):
+                raise ValueError("snapshot unreadable session record problem index is invalid")
+            decoded_problems[index] = UnreadableSessionRecordProblem(decoded_problems[index])
         if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in cast(list[object], warnings)):
             raise ValueError("snapshot warnings must be strings")
         rows = [_decode_entry(entry) for entry in cast(list[object], entries)]
@@ -640,7 +655,7 @@ class RosterSnapshot:
             if row.role != "worker" or not isinstance(row.reach, CannotReceiveMessages):
                 raise ValueError("snapshot closure requires an unreachable worker")
             rows[index] = replace(row, worker_closure=WorkerClosure.CONFIRMED)
-        return cls(Roster(rows, cast(list[str], raw_problems), cast(list[str], warnings)))
+        return cls(Roster(rows, decoded_problems, cast(list[str], warnings)))
 
 
 def is_closed_worker(entry: RosterEntry) -> bool:
@@ -1469,8 +1484,10 @@ def _read_local_roster(environment: Mapping[str, str], *, membership: staff.Staf
     machine = machine_name()
     directory = sessions.sessions_dir()
     for path in registry.unreadable:
-        reason = f"cannot list {path}" if path == directory else f"cannot read {path}"
-        _problem(problems, "Claude session records", reason)
+        if path == directory:
+            _problem(problems, "Claude session records", f"cannot list {path}")
+        else:
+            problems.append(UnreadableSessionRecordProblem(f"Claude session records: cannot read {path}"))
     newest: dict[str, SessionRecord] = {}
     for record in sessions.running_records(registry):
         _ = newest.setdefault(record["sessionId"], record)
@@ -1612,8 +1629,10 @@ def peer_snapshot(environment: Mapping[str, str],
     except (ValueError, TypeError):
         detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
         return PeerNotReached(host, detail[0] if detail else "invalid roster snapshot")
-    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems],
-                  [f"{host}: {warning}" for warning in result.warnings])
+    problems = [UnreadableSessionRecordProblem(f"{host}: {problem}")
+                if isinstance(problem, UnreadableSessionRecordProblem) else f"{host}: {problem}"
+                for problem in result.problems]
+    return Roster(result.entries, problems, [f"{host}: {warning}" for warning in result.warnings])
 
 
 def peer_roster(environment: Mapping[str, str],
