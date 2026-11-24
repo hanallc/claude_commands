@@ -228,7 +228,7 @@ class HandoffClientTests(unittest.TestCase):
             with (mock.patch.dict(os.environ),
                   mock.patch.object(client, "release", return_value=wire.Ok()) as released):
                 # A gate keeps the grant through the handoff; gate.py ends it after its assignment check.
-                first_step.FirstStepAdmission(position, first_step.GatePlacement(local, request), path).handoff(fixture.root)
+                first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(local, request), path).handoff(fixture.root)
                 released.assert_not_called()
 
     def test_a_release_carries_its_ending_and_an_older_release_reads_as_a_result(self) -> None:

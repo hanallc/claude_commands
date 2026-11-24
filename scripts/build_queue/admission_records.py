@@ -120,6 +120,8 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+    guest_execution_observed: bool = False
+    guest_proof_required: bool = False
     confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
