@@ -182,7 +182,7 @@ def scaler_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], bo
 
 
 class GuestSettlementProvider(Protocol):
-    def settlement(self, episode: str, attempt: int) -> placement.Settled | placement.Pending: ...
+    def settlement(self, episode: str, attempt: int, *, legacy_holder_ended: bool) -> placement.Settled | placement.Pending: ...
 
 
 def mac_linux_provider() -> GuestSettlementProvider:
@@ -190,10 +190,11 @@ def mac_linux_provider() -> GuestSettlementProvider:
     return cast(GuestSettlementProvider, cast(object, import_module("scripts.build_targets.mac_linux")))
 
 
-def guest_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], bool]) -> placement.DispatchPathState:
+def guest_settlement(episode: str, attempt: int, *, legacy_holder_ended: bool,
+                     holds_slot: Callable[[], bool]) -> placement.DispatchPathState:
     try:
         provider = mac_linux_provider()
-        result = provider.settlement(episode, attempt)
+        result = provider.settlement(episode, attempt, legacy_holder_ended=legacy_holder_ended)
     except AttributeError:
         return placement.DispatchPathPending("Mac Linux settlement is unavailable")
     if isinstance(result, placement.Pending):
@@ -4259,6 +4260,11 @@ done
                 and saved.holder.host == self.host
                 and not self._live(wire.Owner(saved.holder.pid, saved.holder.start_time)))
 
+    def _confirmed_local_holder_ended(self, holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed) -> bool:
+        """Check the saved holder against a fresh process reading."""
+        return (isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host
+                and not owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time))
+
     def _unconfirmed_holder_owner_ended(self, saved: records.SavedPlacementAssignment) -> bool:
         """A claim with no confirmed holder frees its assignment after its submitting owner ends.
 
@@ -5108,13 +5114,11 @@ done
         The gate reports no claim, so the reply settles the attempt as for an available permission.
         A new process read confirms the end, because the last system reading can still show the gate.
         """
-        holder = saved.holder
         return (saved.assignment.destination.target == "mac-linux"
                 and isinstance(saved.permission, placement.PermissionConsumed)
                 and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
                 and not saved.guest_execution_observed
-                and isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host
-                and not owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time))
+                and self._confirmed_local_holder_ended(saved.holder))
 
     def _holder_matches(self, owner: placement.SubmittingOwner, holder: placement.ClaimHolderIdentity) -> bool:
         if holder.host != self.host:
@@ -5322,6 +5326,7 @@ done
 
         def read_dispatch() -> placement.DispatchPathState:
             return guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
+                legacy_holder_ended=self._confirmed_local_holder_ended(saved.holder),
                 holds_slot=lambda: not self.closed and self.current_assignments.get(episode) == attempt_key)
 
         if self._dispatch_settlement_pending(saved, read_dispatch):
