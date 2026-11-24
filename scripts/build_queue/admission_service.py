@@ -6597,6 +6597,7 @@ done
                 if (isinstance(saved, records.SavedPlacementAssignment) and saved.assignment == assignment
                         and (saved.state == placement.ClosedAssignment("completed")
                              or isinstance(saved.state, placement.CurrentAssignment)
+                             and saved.guest_proof_required
                              and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
                              and isinstance(saved.terminal_report.outcome, placement.AttemptCompleted))):
                     return [self._placement_status(assignment, check_lifetime=False)]
