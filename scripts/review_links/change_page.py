@@ -926,11 +926,11 @@ def run_question_delivery[Recipient, Result](
     return QuestionRun(results, None, attempts)
 
 
-def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) -> None:
+def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) -> DeliveryOutcome:
     """Publish the send marker before calling the transport."""
     job = delivery.job
     if isinstance(job, NoQuestionJob) or not job.start.acquire(blocking=False):
-        return
+        return DeliveryUnconfirmed()
     path = status.path(delivery.page, delivery.row)
     try:
         sending = replace(job.record, revision=job.record.revision + 1, state=QuestionSendState.SENDING)
@@ -961,7 +961,7 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                         _finish_unstarted_question(status, path, run.error, job.record, sending)
                 except (OSError, ValueError) as error:
                     _defer_question_error(status, path, delivery.row, error)
-            return
+            return DeliveryUnconfirmed()
         retry_error = run.error
         failed = result.state is QuestionSendState.FAILED and not unconfirmed
         if isinstance(retry_error, ClosedQuestionSource) and result.state not in (
@@ -973,11 +973,11 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
             with status.locked():
                 advance_question_attempt(path, sending, result)
         except StaleQuestionAttempt:
-            return
+            return DeliveryUnconfirmed()
         except (OSError, ValueError) as error:
             _defer_question_error(status, path, delivery.row, error)
             if failed:
-                return
+                return DeliveryUnconfirmed()
             raise
         if result.state is QuestionSendState.UNKNOWN and result.earlier_unconfirmed:
             status.defer_question(path)
@@ -988,10 +988,10 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                 with _lock_open_question_source(status, result):
                     pass
             except ClosedQuestionSource:
-                return
+                return DeliveryUnconfirmed()
             except Exception as error:
                 print(f"review-links question alert {delivery.row}: " + " ".join(str(error).splitlines()), file=sys.stderr)
-                return
+                return DeliveryUnconfirmed()
             owner = verified.saved.alert_owner
             recipients: tuple[staff.StaffId, ...] = ()
             if owner is not None:
@@ -1004,8 +1004,13 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                 _ = alert_delivery_failures([DeliveryFailure(result.recipient_id, result.error)], run.attempts,
                                             source=delivery.page.review_list, row=delivery.row,
                                             message=delivery.message, recipients=recipients, attempt=delivery.attempt)
+        if result.state in (QuestionSendState.SENT, QuestionSendState.QUEUED):
+            return DeliveryConfirmed()
+        if failed:
+            return FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, result.error)
+        return DeliveryUnconfirmed()
     except StaleQuestionAttempt:
-        return
+        return DeliveryUnconfirmed()
     finally:
         _ = job.release()
         status.question_jobs.discard(job.lock)
@@ -2672,7 +2677,7 @@ def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
 
 
 def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, intent: DeliveryIntent,
-                            question: OpenQuestion) -> None:
+                            question: OpenQuestion) -> DeliveryOutcome:
     """Use the same send loop for a question stored in Review delivery slots."""
     page, row = delivery.page, delivery.row
     started = False
@@ -2720,22 +2725,22 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         if isinstance(error, StaleQuestionAttempt):
             if finished and intent.kind == "verdict":
                 status.send_pending_alerts(status.closeout_path(page, row))
-            return
+            return DeliveryUnconfirmed()
         failures = [result for result in run.results.values() if isinstance(result, DeliveryFailure)]
         if isinstance(error, ClosedQuestionSource):
             with status.locked():
                 slots = status.slots(page, row)
                 if intent in slots.intents() and review_open_question(page, slots, intent) == question:
                     status.finish_intent_locked(delivery, slots, intent)
-            return
+            return DeliveryUnconfirmed()
         if isinstance(error, reply_tokens.UnavailableReplyToken):
             _defer_question_error(status, status.path(page, row), row, error, delivery=delivery)
-            return
+            return DeliveryUnconfirmed()
         if QuestionSendState.UNKNOWN in run.results.values():
             status.defer_question(status.path(page, row), delivery)
             if error is not None:
                 print(f"review-links question {row}: " + " ".join(str(error).splitlines()), file=sys.stderr)
-            return
+            return DeliveryUnconfirmed()
         reason = " ".join(str(error).splitlines()) if error is not None else ""
         if error is not None and not failures:
             failures = [DeliveryFailure(MissingRecipient(), reason)]
@@ -2760,7 +2765,7 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         with status.locked():
             slots = status.slots(page, row)
             if intent not in slots.intents() or review_open_question(page, slots, intent) != question:
-                return
+                return DeliveryUnconfirmed()
             if intent.kind == "question" and (isinstance(result, NoFailedDelivery) or relayed):
                 status.write_save_receipt(page, row, intent)
             status.record_result_locked(delivery, result, alerts, question_relayed=relayed,
@@ -2772,8 +2777,10 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
             status.send_pending_alerts(status.closeout_path(page, row))
         if error is not None:
             print(f"review-links question {row}: {reason}", file=sys.stderr)
+        return result if isinstance(result, FailedDelivery) else DeliveryConfirmed()
     except (OSError, ValueError) as failure:
         _defer_question_error(status, status.path(page, row), row, failure, delivery=delivery)
+        return DeliveryUnconfirmed()
     finally:
         status.release_recovery_claims((delivery.attempt,))
 
@@ -2788,8 +2795,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
     if isinstance(delivery, NoMessageDelivery):
         return DeliveryUnconfirmed()
     if isinstance(delivery, PageQuestionSend):
-        deliver_page_question(delivery, status)
-        return DeliveryUnconfirmed()
+        return deliver_page_question(delivery, status)
     tracked_review = False
     page = delivery.page
     confirm = isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request"))
@@ -2823,8 +2829,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
                         return DeliveryUnconfirmed()
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(page, delivery.row), "sending")
     if isinstance(question, OpenQuestion):
-        deliver_review_question(delivery, status, intent, question)
-        return DeliveryUnconfirmed()
+        return deliver_review_question(delivery, status, intent, question)
     try:
         outbound = outbound_review_message(delivery)
     except (OSError, ValueError) as error:

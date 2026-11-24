@@ -10,7 +10,6 @@ import re
 import shlex
 import select
 import shutil
-import signal
 import socket
 import subprocess
 import tempfile
@@ -19,7 +18,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator, Mapping
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,7 +34,7 @@ from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import conf, file_lock
-from scripts.lib.process_group import send_process_group
+from scripts.lib.process_group import run_process_group, stop_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
@@ -46,7 +45,7 @@ from scripts.production import (change_review, change_routing, delivery_state, i
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, go_ledger, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_page
+from scripts.review_links import review_items, review_page, send_hold
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.browser_test_support import assert_status_states
@@ -170,28 +169,12 @@ def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bo
     return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
 
 
-def _stop_browser(process: subprocess.Popen[bytes]) -> None:
-    try:
-        with suppress(ProcessLookupError):
-            send_process_group(process.pid, signal.SIGTERM)
-        with suppress(subprocess.TimeoutExpired):
-            _ = process.wait(timeout=10)
-        # The browser can exit before its child processes.
-        with suppress(ProcessLookupError):
-            send_process_group(process.pid, signal.SIGKILL)
-        _ = process.wait(timeout=10)
-    finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-
-
 class _Browser:
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self.process: subprocess.Popen[bytes] = process
         self.closed: bool = False
         self.resources: ExitStack = ExitStack()
-        _ = self.resources.callback(_stop_browser, process)
+        _ = self.resources.callback(stop_process_group, process)
 
     def close(self) -> None:
         if not self.closed:
@@ -462,6 +445,8 @@ class ListPageTests(unittest.TestCase):
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
             + "# whole: 1..300\npage_request_timeout_seconds=15\n"
             + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
+            # Undo is off, so each send saves at once; test_send_hold and test_serve check the wait.
+            + "# whole: 0..60\nundo_seconds=0\n"
             + "# range: 0.5..60\nframe_retry_seconds=2\n"
             + "# range: 0.001..\ntailscale_check_seconds=60\n"
             + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
@@ -511,8 +496,8 @@ class ListPageTests(unittest.TestCase):
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
                 screenshot = path if path is not None else root / "page.png"
-                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
-                                      capture_output=True, text=True, timeout=45, env=environment)
+                return run_process_group([*command, "--screenshot", str(screenshot), destination],
+                                         timeout=45, env=environment)
         try:
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
@@ -709,14 +694,18 @@ document.body.append(result);
   dialog.querySelector('[name="kind"][value="investigation"]').click();
   words.value=__WORDS__;
   words.dispatchEvent(new Event('input',{bubbles:true}));
+  let filed=false;
+  document.addEventListener('review-item-created',()=>{filed=true;},{once:true});
+  const settled=()=>filed || dialog.open && !error.hidden && !send.disabled;
   send.click();
+  if(dialog.open) throw new Error('Send did not close the window.');
+  await until(document.body,settled);
   if(__RETRY__){
-   await until(dialog,()=>!dialog.open || !error.hidden && !send.disabled);
-   if(!dialog.open) throw new Error('The lost reply closed the window before the retry.');
+   if(!dialog.open) throw new Error('The lost reply did not reopen the window.');
    send.click();
+   await until(document.body,settled);
   }
-  await until(dialog,()=>!dialog.open || !error.hidden && !send.disabled);
-  if(dialog.open) throw new Error(error.textContent);
+  if(!filed || dialog.open) throw new Error(error.textContent || 'The List did not confirm the item.');
   result.textContent=JSON.stringify([]);
  } catch(error){
   result.textContent=JSON.stringify([String(error)]);
@@ -735,13 +724,14 @@ document.body.append(result);
                 super().html_response(status, content, delivery_pending=delivery_pending, builds_version=builds_version)
 
             @override
-            def json_response(self, status: int, fields: Mapping[str, object]) -> None:
+            def json_response(self, status: int, fields: Mapping[str, object], *,
+                              hold: send_hold.HoldHeader | None = None) -> None:
                 if self.command == "POST" and self.path == review_page.NEW_ITEM_PATH and "id" in fields:
                     saved.append((status, fields))
                     if lose_reply and len(saved) == 1 and status == 200:
                         self.close_connection = True
                         return
-                super().json_response(status, fields)
+                super().json_response(status, fields, hold=hold)
 
         with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "key-state"),
                                      "REBUILD_NEEDS_DIR": str(self.root / "rebuild-needs")}),
@@ -1539,37 +1529,36 @@ async function inspect(){
  if(!phone){
   const timeout=win.AbortSignal.timeout,deadlines=[];
   win.AbortSignal.timeout=milliseconds=>{deadlines.push(milliseconds);return timeout(milliseconds);};
-  for(const dismiss of ['close','escape','outside']){
-   const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView;
-   const savedForm=saved.querySelector('[data-review-form]');
-   let finishRead,beginRead;
-   const reading=new Promise(resolve=>{beginRead=resolve;});
-   const heldRead=new Promise(resolve=>{finishRead=resolve;});
-   win.fetch=(url,options)=>{
-    if(url===win.location.pathname && options?.signal){
-     beginRead();return heldRead;
-    }
-    return fetchList(url,options);
-   };
-   savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response(JSON.stringify({answer:'Works'})));
-   savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
-   await reading;
-   check(dialog.open && !close.disabled,'A saved verdict enables Close before the List refresh ends.');
-   if(dismiss==='close') close.click();
-   if(dismiss==='escape') saved.body.dispatchEvent(new savedWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-   if(dismiss==='outside'){
-    dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
-    dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
+  const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView,savedFrame=savedWindow.frameElement;
+  const savedForm=saved.querySelector('[data-review-form]');
+  let finishRead,beginRead;
+  const reading=new Promise(resolve=>{beginRead=resolve;});
+  const heldRead=new Promise(resolve=>{finishRead=resolve;});
+  win.fetch=(url,options)=>{
+   if(url===win.location.pathname && options?.signal){
+    beginRead();return heldRead;
    }
-   check(!dialog.open && doc.activeElement===link('sdlc/C1'),'The pending List refresh allows '+dismiss+'.');
-   const pageStatus=doc.querySelector('[data-page-status]');
-   const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
-   finishRead(new win.Response(null,{status:503}));
-   await readFailed;
-   await animationFrames(win);
-   if(dialog.open) close.click();
-  }
-  check(deadlines.length>=3 && deadlines.every(value=>value===7000),
+   return fetchList(url,options);
+  };
+  savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response('Invalid JSON'));
+  savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
+  await reading;
+  check(!dialog.open && doc.activeElement===link('sdlc/C1'),
+   'The card stays closed and returns focus during the List refresh.');
+  const notice=doc.querySelector('[data-review-refresh-error]');
+  check(!notice.hidden && notice.textContent==='Saved; the item could not refresh.',
+   'The List reports the unreadable response from a confirmed save.');
+  const currentSearch=doc.querySelector('#list-search');
+  currentSearch.focus();
+  check(doc.activeElement===currentSearch,'Search stays available during the List refresh.');
+  const pageStatus=doc.querySelector('[data-page-status]');
+  const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
+  finishRead(new win.Response(null,{status:503}));
+  await readFailed;
+  await changed(dialog,()=>!savedFrame.isConnected,'the saved frame is removed');
+  check(!notice.hidden,'A failed refresh keeps the error visible.');
+  check(!dialog.open && doc.activeElement===currentSearch,'A failed refresh leaves the card closed and preserves focus.');
+  check(deadlines.length>0 && deadlines.every(value=>value===7000),
    'List refresh uses the configured seven-second request timeout.');
   win.AbortSignal.timeout=timeout;
   win.fetch=fetchList;
@@ -1592,7 +1581,7 @@ async function inspect(){
   listForm.querySelector('[value="tell"]').click();
   check(!!listForm.dataset.sending,'The List action starts before the Review save.');
  }
- const card=await readCard(readyLink),cardWin=card.defaultView;
+ const card=await readCard(readyLink),cardWin=card.defaultView,sendingFrame=cardWin.frameElement;
  const formInCard=()=>card.querySelector('[data-review-form]');
  const status=()=>card.querySelector('[data-review-card-notice]').textContent;
  const button=outcome=>formInCard().querySelector('[value="'+outcome+'"]');
@@ -1609,25 +1598,44 @@ async function inspect(){
    };
   }
   const fetchCard=cardWin.fetch.bind(cardWin);
-  let releaseFailure;
-  const failure=new Promise(resolve=>{releaseFailure=resolve;});
-  cardWin.fetch=(url,options)=>{
-   if(options?.method==='POST' && ++reviewPosts===1) return failure;
+  let undoRequests=0,sendReads=0;
+  const hold='/send-hold/'+'a'.repeat(24);
+  cardWin.fetch=async(url,options)=>{
+   if(url===hold+'/undo'){
+    undoRequests++;
+    return cardWin.Response.json({outcome:'undone'});
+   }
+   if(url===hold){
+    sendReads++;
+    return cardWin.Response.json({reason:'The test save failed.'},{status:503});
+   }
+   if(url===cardWin.location.pathname && options?.method==='POST' && ++reviewPosts<=2){
+    return cardWin.Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+   }
    return fetchCard(url,options);
   };
   const words='Keep these words through the failure and conflict.';
   formInCard().elements.feedback.value=words;
   submit('feedback');
+  check(!dialog.open && sendingFrame.isConnected,'Send closes the modal and keeps the card frame.');
+  const toast=()=>document.querySelector('[data-send-undo]');
+  await changed(document.body,()=>toast()?.querySelector('button'),'the Review Undo toast shows');
+  check(!dialog.open && toast().parentElement.parentElement===document.body,'The toast shows on the available page.');
+  check(toast().querySelector('span').textContent==='Sent to sdlc.','The toast names the linked card owner.');
+  const other=await readCard(link('sdlc/C2'));
+  check(dialog.open && other.querySelector('[data-state="Done"]') && sendingFrame.hidden,
+   'A second card opens while the send waits.');
   close.click();
-  dialog.dispatchEvent(new win.Event('cancel',{cancelable:true}));
-  card.body.dispatchEvent(new cardWin.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
-  dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
-  dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
-  check(dialog.open && close.disabled,'Close, Escape, and a click outside keep a saving card open.');
-  releaseFailure(new cardWin.Response(JSON.stringify({reason:'The test save failed.'}),{status:503}));
-  await changed(dialog,()=>!close.disabled,'the refusal enables Close');
+  toast().querySelector('button').click();
+  await changed(dialog,()=>dialog.open && !close.disabled,'Undo reopens the card');
+  check(undoRequests===1 && sendReads===0 && status()==='Undone. Edit and send again.' &&
+   formInCard().elements.feedback.value===words,'Undo restores the card and its words.');
+  submit('feedback');
+  await changed(document.body,()=>toast()?.querySelector('button'),'the next Review Undo toast shows');
+  toast().getAnimations()[0].finish();
+  await changed(dialog,()=>dialog.open && !close.disabled,'the refusal reopens the card');
   check(status()==='Not saved: The test save failed.','The failure remains visible.');
-  check(dialog.open && formInCard().elements.feedback.value===words,'The open card shows the failure and keeps the words.');
+  check(sendReads===1 && formInCard().elements.feedback.value===words,'Failure restores the card and its words.');
   await checkReviewCardConflict(card,'short',check,advance);
   delayRefresh=true;
  }
@@ -1640,28 +1648,31 @@ async function inspect(){
    }
   });
   const observer=new win.MutationObserver(()=>{
-   if(!dialog.open){saveObserver.disconnect();observer.disconnect();resolve();}
+   if(!sendingFrame.isConnected){saveObserver.disconnect();observer.disconnect();resolve();}
   });
   saveObserver.observe(notice,{childList:true});
   observer.observe(doc.body,{childList:true,subtree:true,attributes:true,attributeFilter:['open']});
  });
  submit('works');
+ check(!dialog.open,'The verdict closes the dialog at Send.');
  if(!phone){
   await changed(card.body,()=>status().startsWith('Saved:'),'the verdict is saved');
   await animationFrames(win);
-  check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
+  check(!dialog.open && listReads===0 && row()===before,'The Review refresh waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
   await changed(doc.body,()=>!win.recordDetails(row()).querySelector('textarea[name="words"]').form.dataset.sending,
    'the refused List action ends');
-  check(listReads===1 && dialog.open && !close.disabled && button('works').disabled,
+  check(listReads===1 && !dialog.open && button('works').disabled,
    'A refused List action starts one refresh and keeps the saved form disabled.');
   submit('works');
-  check(reviewPosts===3,'The saving form sends no second POST during the refresh.');
+  check(reviewPosts===4,'The saving form sends no second POST during the refresh.');
   releaseRefresh();
  }
  await refreshed;
- if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260],['IFRAME',180]]),
-  'The overlay uses the configured card fade durations.');
+ if(!phone) check(doc.querySelector('[data-review-refresh-error]').hidden,
+  'A good refresh clears the previous error.');
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['ARTICLE',180],['ARTICLE',260]]),
+  'Show updates uses the configured card fade durations.');
  check(doc.querySelector('[data-list]')!==listBefore && row()===before &&
   row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),
   'The refresh displays the saved verdict.');
@@ -3141,7 +3152,7 @@ document.body.append(result);
 let countRequests=[],sendCounts;
 window.fetch=async (url,options)=>{
  countRequests.push([url,options.cache]);
- return new Promise(resolve=>{sendCounts=()=>resolve({ok:true,text:async()=>MARKUP});});
+ return new Promise(resolve=>{sendCounts=()=>resolve({headers:new Headers(),ok:true,text:async()=>MARKUP});});
 };
 </script>""".replace("MARKUP", json.dumps(response))
                 probe = """
@@ -3266,7 +3277,7 @@ AbortSignal.timeout=milliseconds=>{
 window.fetch=(url,options)=>{
  if(!String(url).includes('?counts=')) return Promise.resolve(new Response(page));
  return new Promise((resolve,reject)=>{
-  const request={url,signal:options.signal,finish:markup=>resolve({ok:true,text:()=>Promise.resolve(markup)})};
+  const request={url,signal:options.signal,finish:markup=>resolve({headers:new Headers(),ok:true,text:()=>Promise.resolve(markup)})};
   requests.push(request);
   request.signal.addEventListener('abort',()=>reject(request.signal.reason));
  });
@@ -3766,7 +3777,7 @@ const requests=[];let finishPost;
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
- return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
+ return new Promise(resolve=>finishPost=result=>resolve({headers:new Headers(),ok:result.ok!==false,status:result.ok===false ? 400 : 200,
   json:async()=>({unread:'false',...result})}));
 };
 </script>'''
@@ -3800,7 +3811,7 @@ window.fetch=async(_path,options={})=>{
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
   await choose('working','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
-  finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
+  finishPost({headers:new Headers(),ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
    refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
@@ -4051,7 +4062,7 @@ window.fetch=async(_path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+  finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.reason ? 400 : 200,
    json:async()=>({unread:'true',...result})});
  });
 };
@@ -6441,6 +6452,40 @@ window.fetch=async(_url,options)=>{
 ''', reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_undo_keeps_the_words_and_leaves_the_row_unsent(self) -> None:
+        self.browser_action_sequence(r'''
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ const before={state:row.dataset.state,unread:row.dataset.unread};
+ const listFetch=window.fetch;let undos=0;
+ window.fetch=async(path,options={})=>{
+  if(String(path).endsWith('/undo')){undos++;return Response.json({outcome:'undone'});}
+  if(options.method==='POST' && !requests.length){
+   requests.push(new URLSearchParams(options.body));
+   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return listFetch(path,options);
+ };
+ const words=form.elements.words,notice=form.querySelector('[data-send-status]');
+ words.value='Tell morty after Undo.';words.dispatchEvent(new Event('input'));
+ submit('tell');
+ await until(()=>document.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
+ check(document.querySelector('[data-send-undo] span').textContent==='Sent to morty.',
+  'The toast names the record keeper.');
+ document.querySelector('[data-send-undo] button').click();
+ await until(()=>notice.textContent==='Undone. Edit and send again.','The row did not say that the send was undone.');
+ check(words.value==='Tell morty after Undo.','After Undo the Tell keeps its words.');
+ check(row.dataset.state===before.state && row.dataset.unread===before.unread,
+  'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
+ check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
         steps = r'''
  const view=document.querySelector('[data-record-inline-view]');
@@ -6513,7 +6558,7 @@ window.fetch=async(_url,options)=>{
  let countReads=0,lastPageQuery;
  window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
-  if(query.has('counts')){countReads++;return Promise.resolve({ok:true,text:async()=>DEFERRED_LINKS});}
+  if(query.has('counts')){countReads++;return Promise.resolve({headers:new Headers(),ok:true,text:async()=>DEFERRED_LINKS});}
   if(options?.method!=='POST') lastPageQuery=query;
   return fetchPage(url,options);
  };
@@ -7322,8 +7367,8 @@ window.fetch=async(path,options={})=>{
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
-  failPostBody=()=>resolve({ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
-  finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
+  failPostBody=()=>resolve({headers:new Headers(),ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
+  finishPost=result=>resolve({headers:new Headers(),ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
    json:async()=>({unread:'true',...result})});
  });
 };
@@ -7812,7 +7857,7 @@ window.fetch=async(path,options={})=>{
         setup = '''<script>
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
- return {ok:true,json:async()=>({unread:'UNREAD'})};
+ return {headers:new Headers(),ok:true,json:async()=>({unread:'UNREAD'})};
 };
 </script>'''
         probe = '''<script>
@@ -8207,7 +8252,7 @@ window.fetch=async(_path,options={})=>{
    row.dataset.unread='false';row.querySelector('.list-dot')?.remove();recordDetails(row).querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
-  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',
+  const result={headers:new Headers(),ok:true,status:200,json:async()=>({state:'sent',unread:'false',
    ...(fields.get('action')==='remove' ? {item_state:'Closed'} : {})})};
   if(holdPost) return await new Promise(resolve=>finishPost=(reply=result)=>resolve(reply));
   return result;
@@ -8483,7 +8528,7 @@ try{
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  check(reads.length===3,'The shared status event makes no List request during a row save.');
- finishPost({ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
+ finishPost({headers:new Headers(),ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
  holdPost=false;finishPost=undefined;
  await refused;
  check(reads.length===3 && refreshed.isConnected,'A refused row save makes no List request after the event.');
