@@ -660,6 +660,13 @@ class ExecutionReport(CallerCode):
 
 
 @dataclass(frozen=True)
+class SettlementRequest(CallerCode):
+    """Ask the queue to confirm settlement for an exact scaler attempt."""
+    request_id: str
+    assignment: placement.PlacementAssignment
+
+
+@dataclass(frozen=True)
 class PlacementEvidenceWait:
     """Placement waits for host evidence."""
 
@@ -725,7 +732,8 @@ Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest
            | ReleaseRequest | WidthRequest | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
-           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
+           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport
+           | SettlementRequest | PrerequisiteReport | CancelPlacement)
 
 Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
          | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
@@ -742,7 +750,7 @@ _REQUESTS: dict[str, type] = {
     "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
-    "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
+    "consume_permission": ConsumePermission, "execution_report": ExecutionReport, "settlement": SettlementRequest,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
     _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
@@ -757,7 +765,8 @@ REPLY_TYPES: dict[str, type] = {
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
     "local_placement_granted": LocalPlacementGranted, "placement_status": PlacementStatusReply,
 }
-_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission,
+                    ExecutionReport, SettlementRequest, PrerequisiteReport, CancelPlacement,
                     PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 

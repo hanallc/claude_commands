@@ -315,7 +315,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         path = self.state / "gate-assignment.json"
         admission_wire.write_assignment(path, reply)
         admitted = first_step.FirstStepAdmission(SlotQueuePosition(reply.assignment.episode, reply.assignment.since),
-            first_step.GatePlacement(reply, request), path)
+            first_step.OwnedGatePlacement(reply, request), path)
         admitted.handoff(self.checkout)
         self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
         return reply, admitted
@@ -805,7 +805,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                                        destination=request.constraints.candidates[0].destination)
             admission_wire.write_assignment(path, admission_wire.Assignment(guest_assignment))
             admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest_assignment.episode, guest_assignment.since),
-                first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
+                first_step.OwnedGatePlacement(admission_wire.Assignment(guest_assignment), request), path)
 
             def guest_or_queue_status(episode: str, attempt: str) -> admission_wire.PlacementStatusReply:
                 if attempt == guest_assignment.attempt:
@@ -866,7 +866,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         path = self.write_gate_assignment(guest_assignment)
         self.set_placement_status(guest_assignment, placement.CurrentAssignment())
         admitted = first_step.FirstStepAdmission(SlotQueuePosition("episode", 1.0),
-            first_step.GatePlacement(admission_wire.Assignment(guest_assignment), request), path)
+            first_step.OwnedGatePlacement(admission_wire.Assignment(guest_assignment), request), path)
 
         def settle(_refusal: admission_wire.ClaimFailure) -> admission_wire.DispatchStatus:
             return admission_wire.DispatchStatus(guest_assignment, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER),

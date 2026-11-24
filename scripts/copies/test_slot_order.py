@@ -24,7 +24,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import execution_identity
-from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement, queue_place
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
@@ -316,6 +316,27 @@ class SlotOrderTests(unittest.TestCase):
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
 
+    def test_scratch_gate_keeps_the_program_grant_without_placement(self) -> None:
+        owner = fixture_member("showrunner", name="scratch-owner")
+        production = Production(self.root / "production.md", owner.name, "main", self.source,
+                                self.root / "production.log", ZoneInfo("UTC"), owner)
+        unit = waiting.Unit("scratch-unit", "", "main", self.source, None, owner.id)
+        command = shlex.join((sys.executable, str(self.source / "gate.py"), "--tests-only"))
+
+        def run(_command: object, **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertNotIn("BUILDLOG_PLACEMENT_FILE", os.environ)
+            return subprocess.CompletedProcess(command, 0)
+
+        with (mock.patch.object(waiting, "named_unit", return_value=unit),
+              mock.patch.object(waiting, "subprocess", SimpleNamespace(run=run, STDOUT=subprocess.STDOUT)),
+              mock.patch.object(copies, "standing", return_value=nullcontext(self.source)),
+              mock.patch.object(build_folders, "repo_word", return_value="claude"),
+              mock.patch.object(first_step, "_program_grant", return_value=wire.Admitted("program", 1, "test", "", "", {})) as admit,
+              mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
+              mock.patch.object(first_step, "_placement_grant", side_effect=AssertionError("scratch gate placement"))):
+            waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
+        admit.assert_called_once()
+
     def test_bump_queue_command_waits_before_it_creates_a_slot(self) -> None:
         self.queue.hold_starts()
         tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
@@ -336,7 +357,7 @@ class SlotOrderTests(unittest.TestCase):
                   side_effect=AssertionError("the pending bump gate sent a result")),
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             _ = bump_gate.run_gate(path)
-        request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
+        request = next(request for request in self.requests if isinstance(request, wire.AdmitRequest))
         self.assertEqual(request.identity.job, StepJob("test-all"))
 
     def test_bump_admission_selects_the_package_from_its_tip(self) -> None:
@@ -406,7 +427,7 @@ class SlotOrderTests(unittest.TestCase):
                 offset = len(self.requests)
                 with first_step.admitted_run(command, self.source) as admitted:
                     admitted.handoff(self.source)
-                requests = [request for request in self.requests[offset:] if isinstance(request, wire.PlacementRequest)]
+                requests = [request for request in self.requests[offset:] if isinstance(request, wire.AdmitRequest)]
                 self.assertTrue(requests)
                 self.assertEqual({request.profile.step for request in requests}, {expected})
 

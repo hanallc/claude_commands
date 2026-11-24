@@ -36,17 +36,31 @@ class FirstStepRefused(RuntimeError):
         self.exit_code: int = exit_code
 
 
+class PlacementExhausted(FirstStepRefused):
+    """The queue has no remaining candidate for this request."""
+
+
 @dataclass(frozen=True)
 class HandedOff:
     """The command now owns the next admission of this run."""
 
 
 @dataclass(frozen=True)
-class GatePlacement:
-    """The gate uses this assignment until its caller ends."""
+class OwnedGatePlacement:
+    """This caller owns placement, retry, and cleanup."""
 
     grant: wire.LocalPlacementGranted | wire.Assignment
-    request: wire.PlacementRequest | None
+    request: wire.PlacementRequest
+
+
+@dataclass(frozen=True)
+class InheritedGatePlacement:
+    """The live wrapper owns retry and cleanup."""
+
+    grant: wire.LocalPlacementGranted | wire.Assignment
+
+
+GatePlacement = OwnedGatePlacement | InheritedGatePlacement
 
 
 @dataclass
@@ -85,23 +99,22 @@ class FirstStepAdmission:
         # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
-        request = grant.request
-        if request is not None and isinstance(request.local, wire.LocalAdmissionContext):
-            os.environ['BUILDLOG_PLACEMENT_SIDECAR'] = request.local.sidecar
+        if isinstance(grant, OwnedGatePlacement) and isinstance(grant.request.local, wire.LocalAdmissionContext):
+            os.environ['BUILDLOG_PLACEMENT_SIDECAR'] = grant.request.local.sidecar
 
     def place_again(self, request: wire.PlacementRequest) -> None:
         """Place the gate again with its original request and pass the new assignment to the next run."""
         grant = self.grant
-        if not isinstance(grant, GatePlacement) or grant.request != request:
+        if not isinstance(grant, OwnedGatePlacement) or grant.request != request:
             raise wire.AdmissionUnavailable('only the original gate request can be placed again')
-        self.grant = GatePlacement(_placement_grant(request), request)
+        self.grant = OwnedGatePlacement(_placement_grant(request), request)
         client.write_assignment(self.assignment_file, self.grant.grant)
         self._hand_gate(self.grant)
 
     def run_gate(self, run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
         """Run the gate and retry only when the queue permits a new attempt."""
         grant = self.grant
-        if not isinstance(grant, GatePlacement) or grant.request is None:
+        if not isinstance(grant, OwnedGatePlacement):
             return run()
         return run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
 
@@ -112,9 +125,9 @@ class FirstStepAdmission:
             _ = queue_place.release_place(grant.reservation, 1, grant.cleanup_timing)
         elif isinstance(grant, wire.LocalPlacementGranted):
             _ = client.finish_step(self.assignment_file, 1, 'slot preparation failed')
-        elif isinstance(grant, wire.Assignment) or isinstance(grant, GatePlacement) and grant.request is not None:
-            assignment = grant.grant.assignment if isinstance(grant, GatePlacement) else grant.assignment
-            reason = 'the gate caller ended' if isinstance(grant, GatePlacement) else 'slot preparation failed'
+        elif isinstance(grant, (wire.Assignment, OwnedGatePlacement)):
+            assignment = grant.grant.assignment if isinstance(grant, OwnedGatePlacement) else grant.assignment
+            reason = 'the gate caller ended' if isinstance(grant, OwnedGatePlacement) else 'slot preparation failed'
             try:
                 _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, assignment.episode,
                     assignment.owner, reason))
@@ -149,7 +162,10 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
     if isinstance(answer, client.LeftQueue):
         raise FirstStepRefused('the caller left before first-step admission', 75)
     if isinstance(answer, wire.DispatchStatus):
-        raise FirstStepRefused(answer.reason or 'the first placement ended before admission')
+        reason = answer.reason or 'the first placement ended before admission'
+        if isinstance(answer.assignment, placement.UnknownAssignment) and isinstance(answer.retry, placement.DoNotRetry):
+            raise PlacementExhausted(reason)
+        raise FirstStepRefused(reason)
     return answer
 
 
@@ -217,6 +233,7 @@ def run_gate_with_placement(
             previous = read_assignment(assignment_file).assignment
             if not assignment_matches_request(previous, request):
                 raise wire.AdmissionUnavailable('the gate assignment does not match the request')
+            retry_notice = ''
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
                 refusal = read_gate_claim_failure(assignment_file, request)
                 settled = client.claim_failure(refusal)
@@ -227,15 +244,21 @@ def run_gate_with_placement(
                         and not (previous.destination.provider == 'scaler'
                                  and isinstance(settled.state, placement.CurrentAssignment))):
                     raise wire.AdmissionUnavailable('the queue did not permit a retry for the gate attempt')
-                destination = refusal.assignment.destination
+                destination = previous.destination
                 reason = 'did not answer' if refusal.reason == placement.MAC_LINUX_NO_ANSWER else refusal.reason
-                print(f'placement: retry — {destination.host} ({destination.target}) {reason}. '
-                      + 'Requesting placement again.', flush=True)
+                retry_notice = (f'placement: retry — {destination.host} ({destination.target}) {reason}. '
+                                + 'Received a replacement assignment.')
+            else:
+                client.request_settlement(wire.SettlementRequest(uuid4().hex, previous))
             place_again(request)
             replacement = read_assignment(assignment_file).assignment
             if (not assignment_matches_request(replacement, request)
                     or replacement.attempt == previous.attempt):
                 raise wire.AdmissionUnavailable('the queue did not provide a replacement assignment')
+            if retry_notice:
+                print(retry_notice, flush=True)
+        except PlacementExhausted:
+            return subprocess.CompletedProcess(request.constraints.command, result.returncode, '', 'Gate placement blocked\n')
         except (OSError, ValueError, wire.AdmissionUnavailable, FirstStepRefused) as error:
             return subprocess.CompletedProcess(request.constraints.command, result.returncode, '',
                                                f'Gate placement blocked. {error}\n')
@@ -318,7 +341,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
         local=queue_place.local_context(local))
 
 
-def checked_gate_assignment(command: Sequence[str], file: Path, targets: tuple[str, ...]
+def checked_gate_assignment(command: Sequence[str], source: Path, file: Path, targets: tuple[str, ...]
                             ) -> wire.Assignment | wire.LocalPlacementGranted:
     """Check that a live wrapper owns the current assignment for this gate."""
     from scripts.build_hold import build_hold
@@ -337,6 +360,9 @@ def checked_gate_assignment(command: Sequence[str], file: Path, targets: tuple[s
         raise FirstStepRefused('the placement owner has a different gate job')
     if targets and assignment.destination.target not in targets:
         raise FirstStepRefused('the placement target is outside the caller target list')
+    key = treekey.tree_key(str(source))
+    if key is None or assignment.source_key != execution_identity.SourceKeyKnown(key):
+        raise FirstStepRefused('the requested source does not match the placement source')
     status = client.placement_status(assignment.episode, assignment.attempt).status
     if (not isinstance(status, KnownPlacementStatus) or status.assignment != assignment
             or not isinstance(status.state, placement.CurrentAssignment)):
@@ -346,7 +372,7 @@ def checked_gate_assignment(command: Sequence[str], file: Path, targets: tuple[s
 
 @contextmanager
 def admitted_run(command: Sequence[str], source: Path, *,
-                 targets: tuple[str, ...] = ()) -> Generator[FirstStepAdmission]:
+                 targets: tuple[str, ...] = (), place_unnamed_gate: bool = True) -> Generator[FirstStepAdmission]:
     """Admit the first step before any caller takes or prepares a slot."""
     gate = command_program(command) in GATE_SCRIPTS
     if targets and not gate:
@@ -355,13 +381,19 @@ def admitted_run(command: Sequence[str], source: Path, *,
     if inherited is not None:
         try:
             file = Path(inherited)
-            grant = checked_gate_assignment(command, file, targets)
+            grant = checked_gate_assignment(command, source, file, targets)
         except (OSError, ValueError, wire.AdmissionUnavailable) as error:
             raise FirstStepRefused(str(error)) from error
         assignment = grant.assignment
-        yield FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since), GatePlacement(grant, None), file)
+        yield FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since), InheritedGatePlacement(grant), file)
         return
-    gate_selection = (targets or gate_targets(command, source) or ('natedev',)) if gate else ()
+    gate_selection = targets
+    if gate and place_unnamed_gate and not gate_selection:
+        from scripts.build_targets.gate_targets import is_claude_gate_source, natedev_only_flag
+
+        gate_selection = gate_targets(command, source)
+        if not gate_selection and natedev_only_flag(tuple(command)) is not None and is_claude_gate_source(source):
+            gate_selection = ('natedev',)
     start = records.process_start_time(os.getpid())
     if start is None:
         raise FirstStepRefused('the command has no live process identity')
@@ -390,15 +422,15 @@ def admitted_run(command: Sequence[str], source: Path, *,
             if isinstance(verify, VerifyCommand):
                 request = _verify_request(verify, source, folder, owner, position)
                 grant = _placement_grant(request)
-            elif gate:
+            elif gate_selection:
                 gate_request = _gate_request(command, source, gate_selection, owner, position, run,
                                              folder / 'placement.cgroup')
-                grant = GatePlacement(_placement_grant(gate_request), gate_request)
+                grant = OwnedGatePlacement(_placement_grant(gate_request), gate_request)
             else:
                 grant = _program_grant(command, source, owner, position, run)
             admitted = FirstStepAdmission(position, grant, assignment_file)
             try:
-                if isinstance(grant, GatePlacement):
+                if isinstance(grant, OwnedGatePlacement):
                     client.write_assignment(assignment_file, grant.grant)
                 elif isinstance(grant, (wire.LocalPlacementGranted, wire.Assignment)):
                     client.write_assignment(assignment_file, grant)
