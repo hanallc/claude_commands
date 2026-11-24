@@ -96,6 +96,7 @@ For each item, in order:
 5. Run the shared **reader test** and **comprehension gate** on each item before the user sees it, prepared items included. Then show the item.
 6. **Wait for the user's response.**
    - If the user picks `elaborate` (also: "more", "detail", "expand", "why"): add one new rationale, constraint, or example relevant to the current item. Do not broaden scope or dump the raw item. Then re-present the same choices and wait again.
+   - If the user picks `simplify`, follow **Simplify the item** below.
    - If the user says they are lost, confused, or asks what the introduced concepts mean, treat that as a failed initial explanation and stop asking for a decision. Apply repair-downward-then-upward from the shared file: **the upward repair here is Step 3.5** — run it now, whether or not it ran earlier. Re-running it mid-walk costs one turn; iterating item detail at ever finer grain costs many and does not terminate.
    - If the user asks a clarifying question, answer it without recording a decision or advancing. Re-present the choices only when useful.
    - If the user proposes a modification, restate only the revised decision, update the recommendation or example as needed, and wait for explicit acknowledgment before recording it.
@@ -105,6 +106,16 @@ Do not ask "continue or add more?" between items — assume continue unless the 
 
 After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
 Run it again when the user returns to a closed item; include that item in the count.
+
+### Simplify the item
+
+1. Rewrite the same item in simpler words. Keep every technical detail and add no facts or rationale.
+2. Save both complete versions in private scratch files. Send the versions and one line about how the first version failed:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/adhoc_review/simplify_report.py --from <session-name> report --before <file> --after <file> --failure <line>`
+3. Keep the report ID and the simplified item file while the item is open. Show only the simplified item with the same choices.
+4. If the user gives feedback on the rewrite, apply it to the explanation. Save their exact words in a private scratch file. Use the report ID to send the feedback:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/adhoc_review/simplify_report.py --from <session-name> feedback --report <id> --item <after-file> --words <file>`
+   Keep the report and delivery result out of the review.
 
 ## Step 5: Wrap up
 
