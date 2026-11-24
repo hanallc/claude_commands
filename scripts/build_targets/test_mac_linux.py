@@ -1,7 +1,7 @@
 """Test the Mac Linux route with a local SSH fixture."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
 from dataclasses import replace
 from datetime import timedelta
@@ -804,6 +804,75 @@ fi
         self.assertEqual(self.route(), 'mac-linux is off (build_targets.conf enabled.mac-linux=off)')
         self.assert_guest_clean()
 
+    def test_guest_end_proof_is_durable_before_the_report_send_fails(self) -> None:
+        assignment = replace(self.placed, attempt=f'{16:032x}')
+        destination = assignment.destination
+        claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                 'claim-fixture', assignment.episode, assignment.attempt)
+        armed = mac_linux.ArmedGuestAttempt('different-guest-arm-id', 'f' * 32, 'boot-id', 10, 'user', '/fixture')
+        dispatch = mac_linux.GuestGateDispatch(assignment, claim, started=armed, settled=True)
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        path.parent.mkdir(parents=True)
+        partial = b'{"unfinished":'
+        _ = path.write_bytes(partial)
+        expected = {'attempt': execution_identity.attempt_key(assignment.episode, assignment.attempt),
+                    'claim': claim.claim_id, 'result': 'proven', 'detail': 'The guest confirmed the run ended',
+                    'written_at': 123.5}
+        real_fsync = os.fsync
+        synced: list[bytes] = []
+
+        def sync(fd: int) -> None:
+            with path.open('rb') as reader, self.assertRaises(BlockingIOError):
+                fcntl.flock(reader, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            real_fsync(fd)
+            synced.append(path.read_bytes())
+
+        def failed_send(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertEqual(request.assignment, assignment)
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(timeout, 1)
+            before, line = path.read_bytes().splitlines()
+            self.assertEqual(before, partial)
+            self.assertEqual(json.loads(line), expected)
+            self.assertEqual(synced, [path.read_bytes()])
+            raise wire.AdmissionUnavailable('fixture socket outage')
+
+        with (patch.object(mac_linux, 'time', return_value=123.5),
+              patch.object(os, 'fsync', side_effect=sync),
+              patch.object(mac_linux, 'send_guest_execution', side_effect=failed_send) as send,
+              redirect_stderr(io.StringIO()) as errors):
+            mac_linux.settle_guest_dispatch(dispatch, 0)
+        send.assert_called_once()
+        self.assertIn('fixture socket outage', errors.getvalue())
+        self.assertEqual(mac_linux.settlement(assignment.episode, 16), placement.Settled())
+
+    def test_guest_settlement_reads_only_a_complete_matching_proof(self) -> None:
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        episode = 'fixture-episode'
+        attempt = 16
+
+        def proof(owner: str, number: int, result: str) -> bytes:
+            row = {'attempt': execution_identity.attempt_key(owner, f'{number:032x}'),
+                   'claim': 'fixture-claim', 'result': result, 'detail': 'fixture detail', 'written_at': 123.0}
+            return (json.dumps(row) + '\n').encode()
+
+        self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+        self.assertFalse(path.parent.exists())
+        path.parent.mkdir(parents=True)
+        history = (b'bad JSON\n\xff\n' + proof(episode, attempt, 'unproven')
+                   + proof('another-episode', attempt, 'proven') + proof(episode, attempt + 1, 'proven'))
+        _ = path.write_bytes(history)
+        self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+        self.assertEqual(path.read_bytes(), history)
+        with path.open('ab') as writer:
+            fcntl.flock(writer, fcntl.LOCK_EX)
+            _ = writer.write(proof(episode, attempt, 'proven').rstrip(b'\n'))
+            writer.flush()
+            self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+            _ = writer.write(b'\n')
+            writer.flush()
+            self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
+
     def test_started_guest_reports_start_and_settlement_for_its_placement(self) -> None:
         reports: list[wire.ExecutionReport] = []
 
@@ -814,6 +883,11 @@ fi
             if isinstance(request.path, placement.DispatchPathSettled):
                 self.assertEqual(self.trace.read_text().splitlines()[-1], 'cleanup')
                 self.assertEqual(claim_state.read_claims(claim_state.state_paths(mac_linux.GUEST_CLAIM_TARGET)), ())
+                path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+                line, = path.read_bytes().splitlines()
+                proof = cast(dict[str, object], json.loads(line))
+                self.assertEqual(proof['claim'], self.consumed[0][0].claim.claim_id)
+                self.assertEqual(proof['result'], 'proven')
                 return wire.DispatchStatus(self.placed, placement.ClosedAssignment('completed'),
                                            placement.PermissionConsumed(1.0))
             return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
@@ -832,11 +906,75 @@ fi
         assert isinstance(identity, execution_identity.CloudExecution)
         self.assertEqual((identity.target, identity.attempt), (mac_linux.TARGET, self.placed.attempt))
 
-    def test_guest_without_a_start_line_reports_no_execution(self) -> None:
+    def test_guest_without_a_start_line_saves_end_proof_and_reports_no_execution(self) -> None:
+        attempt = 16
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
         with patch.object(mac_linux, 'send_guest_execution') as report:
-            result = self.route('disconnect-before-copy')
-        self.assertIsInstance(result, mac_linux.GuestNotStarted)
+            reason = self.not_started(self.route('disconnect-before-copy'))
+        self.assertIn('Guest cleanup: ended', reason)
         report.assert_not_called()
+        self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
+
+    def test_reconcile_unproven_guest_after_the_route_returns(self) -> None:
+        attempt = 23
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+        episode = self.placed.episode
+        armed = mac_linux.ArmedGuestAttempt('guest-run', 'f' * 32, 'boot-id', 10, 'user', '/fixture')
+        with (patch.object(mac_linux, 'transfer_source',
+                           side_effect=mac_linux.GuestEndUnproven('guest unavailable', armed)),
+              patch.object(mac_linux, 'send_guest_execution') as report):
+            with self.assertRaises(mac_linux.GuestEndUnproven):
+                _ = self.route()
+        report.assert_not_called()
+
+        def submit(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('--no-block', command)
+            self.assertNotIn('--wait', command)
+            self.assertEqual(command[-3:], ['--reconcile-end', episode, str(attempt)])
+            return subprocess.CompletedProcess(list(command), 0, '', '')
+
+        with (patch.object(subprocess, 'run', side_effect=submit) as start,
+              patch.object(mac_linux, 'prove_kept_guest_end', side_effect=[
+                  mac_linux.GuestEndPending('guest unavailable'),
+                  mac_linux.GuestEndPending('guest unavailable'),
+                  mac_linux.GuestEndProven()]) as prove,
+              redirect_stderr(io.StringIO()) as errors):
+            mac_linux.reconcile_unproven(episode, attempt + 1)
+            start.assert_not_called()
+            for _index in range(3):
+                self.assertIsInstance(mac_linux.settlement(episode, attempt), placement.Pending)
+                mac_linux.reconcile_unproven(episode, attempt)
+                self.assertEqual(prove.call_count, _index)
+                mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(mac_linux.settlement(episode, attempt), placement.Settled())
+            mac_linux.reconcile_unproven(episode, attempt)
+            self.assertEqual(start.call_count, 3)
+        self.assertEqual(prove.call_args_list, [call(armed)] * 3)
+        self.assertEqual(errors.getvalue().splitlines(), ['Mac Linux guest reconcile failed: guest unavailable'])
+
+    def test_reconcile_unproven_does_not_warn_for_an_existing_submission(self) -> None:
+        attempt = 23
+        self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+        episode = self.placed.episode
+        armed = mac_linux.ArmedGuestAttempt('guest-run', 'f' * 32, 'boot-id', 10, 'user', '/fixture')
+        with (patch.object(mac_linux, 'transfer_source',
+                           side_effect=mac_linux.GuestEndUnproven('guest unavailable', armed)),
+              self.assertRaises(mac_linux.GuestEndUnproven)):
+            _ = self.route()
+
+        def duplicate(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            unit = next(word.removeprefix('--unit=') for word in command if word.startswith('--unit='))
+            return subprocess.CompletedProcess(list(command), 1, '',
+                f'Failed to start transient service unit: Unit {unit}.service was already loaded or has a fragment file.\n')
+
+        with (patch.object(subprocess, 'run', side_effect=duplicate) as start,
+              patch.object(mac_linux, 'prove_kept_guest_end', return_value=mac_linux.GuestEndPending('guest unavailable')),
+              redirect_stderr(io.StringIO()) as errors):
+            mac_linux.reconcile_unproven(episode, attempt)
+            start.assert_called_once()
+            self.assertEqual(errors.getvalue(), '')
+            mac_linux.reconcile_guest_end(episode, attempt)
+            self.assertEqual(errors.getvalue(), 'Mac Linux guest reconcile failed: guest unavailable\n')
 
     def test_guest_report_failure_warns_once_and_keeps_the_result(self) -> None:
         with (redirect_stderr(io.StringIO()) as errors,
@@ -1538,8 +1676,9 @@ fi
                   patch.object(mac_linux, 'sleep', advance),
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0),
                   patch.object(mac_linux, 'prove_guest_end', wraps=mac_linux.prove_guest_end) as proof):
-                result = mac_linux.route(self.repo, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
-                                         selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
+                with self.assertRaises(mac_linux.GuestEndUnproven) as raised:
+                    _ = mac_linux.route(self.repo, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
+                                        selected=ALL_MODULES, gate_job=GATE_JOB_NOT_RECORDED, assignment=self.placed)
                 first, = attempts
                 failure, = unproven
                 assert isinstance(failure, mac_linux.GuestEndUnproven), failure
@@ -1548,11 +1687,17 @@ fi
                 self.assertTrue(candidate.endswith('/candidate'))
                 note = f'Cannot remove bundle ref {candidate}'
                 self.assertTrue(any(note in line for line in failure.__notes__))
-                self.assertIn(note, str(result))
+                self.assertIs(raised.exception, failure)
                 (self.repo / '.git' / f'{candidate}.lock').unlink()
                 _ = self.git('update-ref', '-d', candidate)
                 self.assertIn('guest unreachable: fixture-guest did not confirm the run ended '
-                              + f'within 2 seconds ({key})', str(result))
+                              + f'within 2 seconds ({key})', str(failure))
+                path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+                line, = path.read_bytes().splitlines()
+                row = cast(dict[str, object], json.loads(line))
+                self.assertEqual(row['attempt'], execution_identity.attempt_key(self.placed.episode, self.placed.attempt))
+                self.assertEqual(row['claim'], self.consumed[0][0].claim.claim_id)
+                self.assertEqual((row['result'], row['detail']), ('unproven', str(failure)))
                 self.assertIs(eligibility.read_backoff(time.time(), mac_linux.TARGET), eligibility.NO_BACKOFF)
                 proof.assert_called_once_with(settings, first, proof_deadline=2.0)
                 self.assertEqual(now, 2.0)
@@ -1562,7 +1707,9 @@ fi
                 self.assertEqual(owner.split()[1], first.attempt)
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
 
-                self.assertIn('The guest run lock is held', str(self.route()))
+                with self.assertRaises(mac_linux.GuestEndUnproven) as second:
+                    _ = self.route()
+                self.assertTrue(any('The guest run lock is held' in line for line in second.exception.__notes__))
                 self.assertEqual(lock.read_text(), owner)
                 self.assertEqual(subprocess.call(['flock', '-x', '-n', lock, 'true'], timeout=2), 1)
                 self.assertFalse((self.guest_home / 'build').exists())
@@ -1714,15 +1861,15 @@ fi
                 return mac_linux.GuestEndPending('fixture cleanup pending')
 
             try:
-                with (patch.object(mac_linux, 'prove_guest_end', pending), redirect_stderr(blocked_stderr)):
-                    result = self.route()
-                    returned = time.monotonic()
+                with (patch.object(mac_linux, 'prove_guest_end', pending), redirect_stderr(blocked_stderr),
+                      self.assertRaisesRegex(mac_linux.GuestEndUnproven, 'guest unreachable: fixture-guest')):
+                    _ = self.route()
+                returned = time.monotonic()
             finally:
                 if started:
                     guard.cancel()
                     guard.join()
         first_probe, = started
-        self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assertLess(returned - first_probe, 1.75)
 
     def test_local_read_past_the_proof_deadline_starts_no_cleanup_ssh(self) -> None:
@@ -1741,11 +1888,11 @@ fi
             return contents
 
         with (patch.object(Path, 'read_text', read_with_delay),
-              patch.object(mac_linux, 'monotonic', lambda: now)):
-            result = self.route()
-        # The run command and the cleanup command each read the helper once; the cleanup read passes the deadline.
+              patch.object(mac_linux, 'monotonic', lambda: now),
+              self.assertRaisesRegex(mac_linux.GuestEndUnproven, 'guest unreachable: fixture-guest')):
+            _ = self.route()
+        # The cleanup command reads the helper after the run command. The cleanup read passes the deadline.
         self.assertEqual(now, 2.5)
-        self.assertIn('guest unreachable: fixture-guest', str(result))
         self.assert_guest_clean('probe', 'arm', 'run')
 
     def test_proof_received_at_the_deadline_refuses(self) -> None:
@@ -1759,9 +1906,9 @@ fi
             return mac_linux.GuestEndProven()
 
         with (patch.object(mac_linux, 'monotonic', lambda: now),
-              patch.object(mac_linux, 'prove_guest_end', late_proof)):
-            result = self.route()
-        self.assertIn('guest unreachable: fixture-guest', str(result))
+              patch.object(mac_linux, 'prove_guest_end', late_proof),
+              self.assertRaisesRegex(mac_linux.GuestEndUnproven, 'guest unreachable: fixture-guest')):
+            _ = self.route()
 
     def test_cleanup_error_timeout_or_unexpected_reply_is_pending(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
@@ -1811,12 +1958,15 @@ fi
             (76, '', 'The guest run lock is still held.\n',
              mac_linux.GuestEndPending('The guest run lock is still held.')),
         ):
-            with self.subTest(status=status), patch.object(
-                    subprocess, 'run', return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh:
+            with (self.subTest(status=status),
+                  patch.dict(os.environ, {'BUILDLOG_PLACEMENT_SIDECAR': '/fixture/reservation.cgroup'}),
+                  patch.object(subprocess, 'run',
+                               return_value=subprocess.CompletedProcess(command, status, stdout, stderr)) as ssh):
+                environment = {key: value for key, value in os.environ.items() if key != 'BUILDLOG_PLACEMENT_SIDECAR'}
                 self.assertEqual(mac_linux.prove_kept_guest_end(armed), expected)
                 ssh.assert_called_once_with(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                             errors='replace', timeout=mac_linux.GUEST_CLEANUP_TIMEOUT_SECONDS,
-                                            check=False)
+                                            check=False, env=environment)
 
     def test_keyboard_interrupt_proves_the_end_before_release(self) -> None:
         def interrupt_source(process: subprocess.Popen[bytes], bootstrap: bytes, _timeout: int,

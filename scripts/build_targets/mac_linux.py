@@ -14,6 +14,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, suppre
 from dataclasses import dataclass, field
 from enum import StrEnum
 import errno
+import fcntl
 import hashlib
 from io import BytesIO
 import json
@@ -48,7 +49,7 @@ from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport
-    from scripts.build_queue.placement import PlacementAssignment, ProviderClaimReference
+    from scripts.build_queue.placement import Pending, PlacementAssignment, ProviderClaimReference, Settled
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
@@ -1077,16 +1078,157 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
-def report_guest_end(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, status: int) -> None:
-    """Report the exact guest attempt after the guest proves that it ended."""
+def _end_proofs_path() -> Path:
+    return target_config.ssh_target_state_directory(TARGET) / 'end-proofs.jsonl'
+
+
+def _append_guest_end(dispatch: GuestGateDispatch, evidence: GuestEndProven | ArmedGuestAttempt, detail: str) -> None:
+    from scripts.build_queue.execution_identity import attempt_key
+
+    assignment = dispatch.assignment
+    _write_guest_end(attempt_key(assignment.episode, assignment.attempt), dispatch.claim.claim_id, evidence, detail)
+
+
+def _write_guest_end(key: str, claim: str, evidence: GuestEndProven | ArmedGuestAttempt, detail: str) -> None:
+    result = 'proven' if isinstance(evidence, GuestEndProven) else 'unproven'
+    row: dict[str, object] = {'attempt': key, 'claim': claim, 'result': result, 'detail': detail, 'written_at': time()}
+    if isinstance(evidence, ArmedGuestAttempt):
+        row['armed'] = evidence.to_record()
+    path = _end_proofs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, 'a+b') as journal:
+        fcntl.flock(journal, fcntl.LOCK_EX)
+        if os.fstat(fd).st_size:
+            _ = journal.seek(-1, os.SEEK_END)
+            if journal.read(1) != b'\n':
+                # Keep the old bytes and end the damaged line before the new row.
+                _ = journal.write(b'\n')
+        _ = journal.write((json.dumps(row) + '\n').encode())
+        journal.flush()
+        os.fsync(fd)
+
+
+@dataclass(frozen=True)
+class GuestEndRecovery:
+    """The exact Mac claim and guest run that still need an end proof."""
+
+    key: str
+    claim: str
+    armed: ArmedGuestAttempt
+
+
+def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndRecovery:
+    from scripts.build_queue.execution_identity import attempt_key
+    from scripts.build_queue.placement import Pending, Settled
+
+    key = attempt_key(episode, f'{attempt:032x}')
+    result: Pending | GuestEndRecovery = Pending('The Mac Linux guest end remains unproven')
+    try:
+        with _end_proofs_path().open('rb') as journal:
+            for line in journal:
+                if not line.endswith(b'\n'):
+                    continue
+                try:
+                    row = ledger.mapping(cast(object, json.loads(line)))
+                    when = row.get('written_at')
+                    claim = row.get('claim')
+                    if (row.get('attempt') != key or not isinstance(claim, str) or not claim
+                            or not isinstance(row.get('detail'), str) or not isinstance(when, (int, float))
+                            or isinstance(when, bool) or not math.isfinite(when)):
+                        continue
+                    if row.get('result') == 'proven':
+                        return Settled()
+                    if row.get('result') == 'unproven' and 'armed' in row:
+                        saved = ledger.mapping(row['armed'])
+                        armed = ArmedGuestAttempt(ledger.text(saved, 'attempt'), ledger.text(saved, 'machine_id'),
+                            ledger.text(saved, 'boot_id'), ledger.instant(saved, 'deadline_ns'),
+                            ledger.text(saved, 'guest_user'), ledger.text(saved, 'checkout'))
+                        result = GuestEndRecovery(key, claim, armed)
+                except (ValueError, OverflowError, RecursionError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return Pending(f'The Mac Linux end proof journal is unavailable: {error}')
+    return result
+
+
+def settlement(episode: str, attempt: int) -> Settled | Pending:
+    """Read the proof for the exact queue attempt."""
+    from scripts.build_queue.placement import Pending
+
+    result = _read_guest_end(episode, attempt)
+    return Pending('The Mac Linux guest end remains unproven') if isinstance(result, GuestEndRecovery) else result
+
+
+def _warn_guest_reconcile(unit: str, detail: str) -> None:
+    """Record one warning per attempt across service starts."""
+    try:
+        folder = _end_proofs_path().parent / 'end-proof-warnings'
+        folder.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(folder / unit, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        print('Mac Linux guest reconcile failed: ' + ' '.join(detail.split()), file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _guest_reconcile_unit(episode: str, attempt: int) -> str:
+    from scripts.build_queue.execution_identity import attempt_key
+
+    key = attempt_key(episode, f'{attempt:032x}')
+    return 'mac-linux-reconcile-' + hashlib.sha256(key.encode()).hexdigest()
+
+
+def reconcile_unproven(episode: str, attempt: int) -> None:
+    """Start recovery of a saved guest attempt without waiting for SSH."""
+    from scripts.aws_target import cloud_gate
+
+    unit = _guest_reconcile_unit(episode, attempt)
+    try:
+        if not isinstance(_read_guest_end(episode, attempt), GuestEndRecovery):
+            return
+        overrides = [f'--setenv={key}={os.environ[key]}'
+                     for key in ('CONF_DIR', 'BUILD_TARGETS_STATE_DIR', 'PATH') if key in os.environ]
+        command = ['systemd-run', '--user', '--no-block', '--collect', '--unit=' + unit,
+                   '--property=UMask=0077', '--working-directory=' + str(Path(__file__).resolve().parents[2]),
+                   *overrides, sys.executable, '-m', 'scripts.build_targets.mac_linux',
+                   '--reconcile-end', episode, str(attempt)]
+        cloud_gate.start_reconcile_service(command, SSH_CONNECT_TIMEOUT_SECONDS, existing_unit=unit)
+    except Exception as error:
+        _warn_guest_reconcile(unit, str(error) or type(error).__name__)
+
+
+def reconcile_guest_end(episode: str, attempt: int) -> None:
+    """Use the saved guest identity to prove the end after the route returns."""
+    unit = _guest_reconcile_unit(episode, attempt)
+    try:
+        recovery = _read_guest_end(episode, attempt)
+        if not isinstance(recovery, GuestEndRecovery):
+            return
+        proof = prove_kept_guest_end(recovery.armed)
+        if isinstance(proof, GuestEndPending):
+            _warn_guest_reconcile(unit, proof.detail)
+            return
+        _write_guest_end(recovery.key, recovery.claim, proof, 'The guest confirmed the run ended')
+    except Exception as error:
+        _warn_guest_reconcile(unit, str(error) or type(error).__name__)
+
+
+def settle_guest_dispatch(dispatch: GuestGateDispatch, status: int) -> None:
+    """Save the end proof and report any execution observed for this attempt."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
     assignment = dispatch.assignment
-    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
-    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
-        execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
-        placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
     try:
+        _append_guest_end(dispatch, GuestEndProven(), 'The guest confirmed the run ended')
+        if dispatch.started is None:
+            return
+        execution = execution_identity.CloudExecution(
+            TARGET, dispatch.started.boot_id, dispatch.started.machine_id, assignment.attempt)
+        request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+            execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
+            placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
         with conf.diagnostics(report=False):
             timeout = conf.read('build_admission').number('query_timeout_seconds')
         reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
@@ -1661,12 +1803,19 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(' '.join((str(error), *notes)))
+    except GuestEndUnproven as error:
+        if dispatch is not None:
+            try:
+                _append_guest_end(dispatch, error.armed, str(error))
+            except OSError as journal_error:
+                error.add_note(f'Cannot save the Mac Linux guest end: {journal_error}')
+        raise
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
     finally:
-        if dispatch is not None and dispatch.settled and dispatch.started is not None:
-            report_guest_end(dispatch.started, dispatch, status)
+        if dispatch is not None and dispatch.settled:
+            settle_guest_dispatch(dispatch, status)
 
 
 def sandboxed_suite_command(tmp: Path, command: Sequence[str]) -> list[str]:
@@ -2098,7 +2247,9 @@ def run_copy(request_path: Path, reply: int) -> None:
 
 
 if __name__ == '__main__':
-    if sys.argv[2:3] == [RUN_COPY]:
+    if sys.argv[1:2] == ['--reconcile-end']:
+        reconcile_guest_end(sys.argv[2], int(sys.argv[3]))
+    elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
     else:
         raise SystemExit(run_guest(Path(sys.argv[1])))
