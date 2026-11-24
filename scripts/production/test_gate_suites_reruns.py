@@ -8,6 +8,7 @@ import subprocess
 from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
+from scripts.build_queue import queue_place
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import FIXTURE_FOLDERS, gate_suites
@@ -241,6 +242,18 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.assertTrue(run.passed, output.getvalue())
         self.assertFalse(any(call["tool"] == "systemd-run" for call in self.calls()))
         self.assertIn("Module scope skipped: BUILDLOG_SCOPE=0", output.getvalue())
+
+    def test_existing_builds_slice_skips_the_probe(self) -> None:
+        self.environment["BUILDLOG_SCOPE"] = "1"
+        self.write(self.state / "scope-fails", "fail")
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(queue_place, "in_builds_slice", return_value=True), \
+                mock.patch.object(gate, "in_builds_slice", return_value=True), redirect_stdout(output):
+            run = gate.run_suites(self.checkout)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertFalse(any(call["tool"] == "systemd-run" for call in self.calls()))
+        self.assertIn("Module scope skipped: gate already runs in builds.slice", output.getvalue())
 
     def fail_scope_probe(self, manager_exit: int) -> None:
         _ = self.environment.pop("BUILDLOG_SCOPE", None)

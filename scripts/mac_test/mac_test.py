@@ -640,7 +640,7 @@ def machine_off_on_purpose(target: str, asking_session: AskingSession | NoAsking
         pass
     switch = "offload" if target_config.uses_legacy_mac_layout(configured.platform) else "enabled"
     try:
-        # Only a usable live switch can show that the user turned the target off.
+        # Use Git history for a missing switch. Treat an invalid live switch as unavailable.
         if not conf.read(configured.settings).value(switch, conf.on_off, recover_invalid=False):
             return OffOnPurpose(f"{switch}=off")
     except ConfigError:

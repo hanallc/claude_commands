@@ -20,7 +20,9 @@ For a missing file, a missing key without a code default, or an invalid value, t
 The reader warns when it uses a committed value.
 The value must pass the limits in its revision.
 Recovery prefers a value that also passes the current setting's limit.
-A reader call with `recover_invalid=False` requires a live value or a code default.
+With `recover_invalid=False`, the reader refuses an invalid live value.
+The reader still checks Git history for a missing file or a missing key without a code default.
+A copy without Git history cannot recover a missing value.
 Without a usable value, the reader raises `conf.Unusable`.
 A missing key reports `<path>: <key> is missing; add it to <path>`.
 A missing file adds `; the file does not exist` to that message.
