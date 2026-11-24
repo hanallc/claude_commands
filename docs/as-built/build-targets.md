@@ -41,6 +41,17 @@ A held target admits only work that its hold rules permit.
   Cloud gates and teardown read the AWS state folder without target registration.
   [AWS cloud gates and the former build target](builds-aws-target.md) describes that state.
 
+### Gate placement
+
+A gate from the claude repository requests placement on every eligible target in `build_targets.conf`.
+The caller checks the targets in `targets` in the order the file lists them.
+It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
+The current rules permit natedev and mac-linux for a full gate.
+Named module tests, nightly gates, and promotion without tests use natedev.
+Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
+Hana gates have no repository default.
+The Builds page shows both candidates while a gate with both targets waits or runs.
+
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
 - `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free(kept_claims) | Running(jobs: tuple[RunningJob, ...], kept_claims) | Held(holder, reason, since, end: HoldEnd, holder_session, kept_claims) | Unreachable(reason) | StateUnreadable(reason)`, with `RunningJob(what, since, idle: IdleSince(when) | NotSeenIdle, holder_session)`, `KeptClaim(what, repository, since, holder_session)` (`kept_claims: tuple[KeptClaim, ...]`, default empty), `holder_session: HolderSession(session_id) | NoHolderSession` (default `NO_HOLDER_SESSION`) and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`. All are frozen dataclasses.

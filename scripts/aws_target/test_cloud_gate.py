@@ -1571,6 +1571,27 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertIsInstance(cloud_gate.log_progress('Runner: 0 modules, whole machine, 32 CPUs\n'),
                               progress_profile.NoCounter)
 
+    def test_module_progress_counts_a_path_with_a_space(self) -> None:
+        log = ('Runner: 1 modules, whole machine, 16 CPUs\n'
+               + 'fixture/test_has space.py exit=0 seconds=1.00\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 1))
+
+    def test_module_progress_excludes_the_type_check(self) -> None:
+        log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+               + 'fixture/test_one.py exit=0 seconds=1.00\n'
+               + 'types/basedpyright exit=1 seconds=2.00\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 2))
+
+    def test_module_progress_ignores_malformed_numbers(self) -> None:
+        oversized = '9' * 5000
+        log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
+               + f'Runner: {oversized} modules, whole machine, 16 CPUs\n'
+               + f'Runner: 1 modules, whole machine, {oversized} CPUs\n'
+               + 'fixture/test_one.py exit=0 seconds=1.00\n'
+               + f'fixture/test_two.py exit={oversized} seconds=1.00\n'
+               + 'fixture/test_three.py exit=0 seconds=unavailable\n')
+        self.assertEqual(cloud_gate.log_progress(log), progress_profile.ProgressCounter('modules', 1, 2))
+
     def test_each_log_download_publishes_cloud_state_and_latest_failures(self) -> None:
         self.fake.log = ('Runner: 2 modules, whole machine, 16 CPUs\n'
                         + 'fixture/test_one.py exit=1 seconds=1.00\n'
