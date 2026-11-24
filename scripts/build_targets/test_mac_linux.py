@@ -2570,8 +2570,8 @@ fi
         attempts = [job for job in result.executions if job.module == 'test_first.py']
         self.assertEqual([job.returncode for job in attempts], [1, 0])
         self.assertEqual(attempts[0].output, 'fixture first failure')
-        self.assertIn('--- fixture/test_first.py passed on rerun alone; first run exit=1 ---',
-                      output.getvalue())
+        label = '--- fixture/test_first.py passed on rerun alone; first run exit=1 ---'
+        self.assertEqual(output.getvalue().count(label), 1)
         self.assertIn('fixture first failure', output.getvalue())
         self.assertIn('Mac Linux guest gate passed: 2 modules', output.getvalue())
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
