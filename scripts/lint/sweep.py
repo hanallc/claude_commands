@@ -607,23 +607,15 @@ class OpenPhoneCrossing:
     rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
 
 
-class ReturnPushPolicy(Enum):
-    ALLOWED = "allowed"
-    SUPPRESSED = "suppressed"
-
-
 @dataclass(frozen=True)
-class RecoveringPhoneCrossing:
-    """Retire the fall key before the permitted return delivery."""
+class RetiringPhoneCrossing:
+    """The fall key still needs retirement after recovery."""
 
     identity: str
-    receipt: CrossingReceipt = CrossingReceipt.PENDING
-    retired: bool = False
-    rearm: BelowRearmLine | AboveRearmLine = BelowRearmLine()
-    return_policy: ReturnPushPolicy = ReturnPushPolicy.ALLOWED
+    rearm: BelowRearmLine | AboveRearmLine
 
 
-PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing | RecoveringPhoneCrossing
+PhoneCrossing = AbovePhoneFloor | OpenPhoneCrossing | RetiringPhoneCrossing
 
 
 @dataclass(frozen=True)
@@ -3230,10 +3222,10 @@ def read_floor_record(path: Path) -> NoFloorRecord | FloorRecord:
             since = saved_channels.get("rearm_since")
             rearm = AboveRearmLine(float(since)) if _finite_number(since) else BelowRearmLine()
             try:
-                if "recovery" in saved_channels:
-                    crossing = RecoveringPhoneCrossing(identity, CrossingReceipt(saved_channels.get("recovery")),
-                                                       saved_channels.get("retired") is True, rearm,
-                                                       ReturnPushPolicy(saved_channels.get("return_policy", "allowed")))
+                if saved_channels.get("retiring") is True or "recovery" in saved_channels:
+                    # Old recovery records can already have retired the fall key.
+                    if saved_channels.get("retired") is not True:
+                        crossing = RetiringPhoneCrossing(identity, rearm)
                 else:
                     crossing = OpenPhoneCrossing(identity, CrossingReceipt(saved_channels.get("natedev")),
                                                 CrossingReceipt(saved_channels.get("phone")), rearm)
@@ -3319,8 +3311,7 @@ def write_floor_record(path: Path, record: FloorRecord) -> None:
         if isinstance(crossing, OpenPhoneCrossing):
             saved_crossing.update(natedev=crossing.natedev.value, phone=crossing.phone.value)
         else:
-            saved_crossing.update(recovery=crossing.receipt.value, retired=crossing.retired,
-                                  return_policy=crossing.return_policy.value)
+            saved_crossing["retiring"] = True
         data["phone_crossing"] = saved_crossing
     if isinstance(record.failure, FailurePending):
         data["failure"] = {"status": record.failure.event.status, "detail": record.failure.event.detail}
@@ -3917,14 +3908,8 @@ def send_floor_alert(message: str, *,
     return send_holder_message("natedev", message, repeat=repeat, lint_settings=lint_settings)
 
 
-class FallPushRetirement(Enum):
-    NO_KEPT_PUSH = "no_kept_push"
-    DROPPED_KEPT_PUSH = "dropped_kept_push"
-    FAILED = "failed"
-
-
 def retire_floor_fall(identity: str, *, machine: FloorMachine,
-                      lint_settings: conf.ConfigRead) -> FallPushRetirement:
+                      lint_settings: conf.ConfigRead) -> bool:
     """Retire the fall key on natedev, where silence keeps both machines' pushes."""
     from scripts.notify import silence
 
@@ -3938,14 +3923,11 @@ def retire_floor_fall(identity: str, *, machine: FloorMachine,
                                 timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: cannot retire the fall push: {error}", file=sys.stderr)
-        return FallPushRetirement.FAILED
-    dropped = re.search(r"(?m)^dropped ([0-9]+) kept push(?:es)?$", result.stdout)
+        return False
+    dropped = re.search(r"(?m)^dropped [0-9]+ kept push(?:es)?$", result.stdout)
     if result.returncode or dropped is None:
         print(f"lint sweep: cannot retire the fall push: {result.stderr or result.stdout}", file=sys.stderr)
-    if dropped is None:
-        return FallPushRetirement.FAILED
-    return (FallPushRetirement.DROPPED_KEPT_PUSH if int(dropped.group(1))
-            else FallPushRetirement.NO_KEPT_PUSH)
+    return dropped is not None
 
 
 from scripts.message import sessions
@@ -4435,55 +4417,17 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
 
     def recover(current: FloorRecord, free: int, save: Callable[[FloorRecord], bool]) -> FloorRecord:
         crossing = current.phone_crossing
-        if isinstance(crossing, AbovePhoneFloor) or (
-                isinstance(crossing, RecoveringPhoneCrossing) and crossing.receipt is CrossingReceipt.ACCEPTED):
+        if isinstance(crossing, AbovePhoneFloor):
             return current
         if free <= phone_rearm:
             return replace(current, phone_crossing=replace(crossing, rearm=BelowRearmLine()))
         now = time.time()
         interval = crossing.rearm if isinstance(crossing.rearm, AboveRearmLine) else AboveRearmLine(now)
-        crossing = replace(crossing, rearm=interval)
-        current = replace(current, phone_crossing=crossing)
         if now - interval.since < rearm_seconds:
-            return current
-        if isinstance(crossing, OpenPhoneCrossing):
-            policy = (ReturnPushPolicy.ALLOWED if crossing.phone is CrossingReceipt.ACCEPTED
-                      else ReturnPushPolicy.SUPPRESSED)
-            crossing = RecoveringPhoneCrossing(crossing.identity, rearm=interval, return_policy=policy)
-            current = replace(current, phone_crossing=crossing)
-        if not save(current):
-            return current
-        if not crossing.retired:
-            return_policy = crossing.return_policy
-            # Save uncertainty before retirement can remove a kept fall push.
-            crossing = replace(crossing, return_policy=ReturnPushPolicy.SUPPRESSED)
-            current = replace(current, phone_crossing=crossing)
-            if not save(current):
-                return current
-            retired = retire_floor_fall(crossing.identity, machine=machine, lint_settings=lint_settings)
-            if retired is FallPushRetirement.FAILED:
-                return current
-            if (retired is FallPushRetirement.DROPPED_KEPT_PUSH
-                    or return_policy is ReturnPushPolicy.SUPPRESSED):
-                return replace(current, phone_crossing=AbovePhoneFloor())
-            crossing = replace(crossing, retired=True, return_policy=return_policy)
-            current = replace(current, phone_crossing=crossing)
-            if not save(current):
-                return current
-        if crossing.receipt is CrossingReceipt.PENDING and disk_floor_channels() is FloorAlertChannels.NATEDEV_AND_PHONE:
-            if TYPE_CHECKING:
-                from scripts.notify.push_texts import render
-            else:
-                prepare_push_texts()
-                from scripts.notify.push_texts import render
-            phone = render("sweep.disk_floor_recovered", machine=machine.value,
-                           free=gib(free), rearm=gib(phone_rearm), floor=gib(phone_floor))
-            delivery = send_phone_push(phone,
-                repeat=CrossingSendKey(f"phone-recovered:{crossing.identity}",
-                                       lint_settings.number("sweep_crossing_repeat_minutes")), lint_settings=lint_settings)
-            if delivery.accepted:
-                current = replace(current, phone_crossing=replace(crossing, receipt=CrossingReceipt.ACCEPTED))
-            _ = save(current)
+            return replace(current, phone_crossing=replace(crossing, rearm=interval))
+        current = replace(current, phone_crossing=RetiringPhoneCrossing(crossing.identity, interval))
+        if save(current) and retire_floor_fall(crossing.identity, machine=machine, lint_settings=lint_settings):
+            return replace(current, phone_crossing=AbovePhoneFloor())
         return current
 
     def finalize(previous: NoFloorRecord | FloorRecord, save: Callable[[FloorRecord], bool]) -> FloorRecord:
@@ -4501,7 +4445,7 @@ def notify_floor_problem(outcome: FloorOutcome | tmp_sweep.SweepAssessment, *, l
                                   else os.path.expanduser("~"))
                 current = recover(current, free, save)
                 crossing = current.phone_crossing
-                if free < phone_floor and isinstance(crossing, (AbovePhoneFloor, RecoveringPhoneCrossing)):
+                if free < phone_floor and isinstance(crossing, (AbovePhoneFloor, RetiringPhoneCrossing)):
                     current = replace(current, phone_crossing=OpenPhoneCrossing(uuid.uuid4().hex))
             except OSError as error:
                 print(f"lint sweep: cannot measure the phone floor: {error}", file=sys.stderr)

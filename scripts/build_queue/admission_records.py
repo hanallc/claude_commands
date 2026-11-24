@@ -1,7 +1,8 @@
 """Shared admission records, configuration and wait phrases."""
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable, Mapping, Sequence
+from bisect import bisect_right
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -150,11 +151,11 @@ class GpuTestSlots:
     repositories: frozenset[str]
 
     def holds(self, repository: str, step: str) -> bool:
-        return repository in self.repositories and step in GPU_TEST_STEPS
+        return repository in self.repositories and step in TEST_BINARY_STEPS
 
 
-# These steps run test binaries; a GPU repository's tests open render apps.
-GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
+# These steps run test binaries. A GPU repository's tests open render apps, and rule 20 holds no place after them.
+TEST_BINARY_STEPS = frozenset({"nextest", "test", "t", "test-affected", "gate"})
 NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 # A hand made run counts in the run limit of its machine and repository, as a gate does.
 REPOSITORY_GATE_STEPS = frozenset({"gate", "test-affected", HAND_MADE.step})
@@ -331,7 +332,7 @@ class TestPhaseNeed:
     form: TestPhaseNeedForm
     margin: float
 
-FinalOutcomeName = Literal["completed", "failed", "killed", "owner_gone"]
+FinalOutcomeName = Literal["completed", "failed", "killed", "owner_gone", "handed_off"]
 
 
 class QueueLifeIdentity(TypedDict):
@@ -351,7 +352,7 @@ class FinalizationIntent(TypedDict):
     scoped: bool
     outcome: FinalOutcomeName
     ended_at: str
-    end_kind: NotRequired[Literal["step_end", "token_return"]]
+    end_kind: NotRequired[Literal["step_end", "token_return", "handoff"]]
     history_start: NotRequired[int]
     queue_identity: NotRequired[QueueLifeIdentity]
     status: NotRequired[int]
@@ -1161,6 +1162,7 @@ class QueueMoveMember:
     """Identify a queue row and show if it can move."""
     row_id: str
     movable: bool = field(default=True, kw_only=True)
+    kept_before: int = field(default=0, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1170,7 @@ class QueueMoveLine:
     """Keep the move revision and the order of the queue rows."""
     revision: str
     members: tuple[QueueMoveMember, ...]
+    kept_runs: tuple[str, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1198,6 +1201,8 @@ class WaitingStep:
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
+    # "failed" or "waiting": the run took the place of an older run of its unit (rules 13 and 20).
+    took_place: str = field(default="", kw_only=True)
     what: str = field(default="", kw_only=True)
 
 
@@ -1455,6 +1460,68 @@ class QueueInputs:
         object.__setattr__(self, "ordered", [(path, stored_waiter(row)) for path, row in self.ordered])
 
 
+# The test jobs take each other's place (rules 13 and 20); every other job matches on its exact name.
+TEST_JOB_FAMILY = frozenset({"test-affected", "test-modules", "test-all", "verify-test"})
+
+
+def run_job_name(job: StepJob | GateJobNotRecorded, verify: VerifyStep) -> str:
+    """Name the job of a run's first request as build_steps.conf does, or give "" for a run with no job."""
+    if isinstance(job, StepJob):
+        return f"verify-{job.step}" if job.step in VERIFY_VERBS else job.step
+    if isinstance(verify, VerifyCall):
+        return f"verify-{verify.verb}"
+    return ""
+
+
+def place_kind(job: str) -> str:
+    """Runs of one unit and repository take each other's place when their jobs have the same kind."""
+    return "test" if job in TEST_JOB_FAMILY else job
+
+
+# "failed": a step released with a status other than 0. "no_result": the owner of its only step ended with no release.
+HeldPlaceEnd = Literal["failed", "no_result"]
+
+
+@dataclass(frozen=True)
+class HeldPlace:
+    """The arrival time of a failed run, kept for the next run of its unit and job kind.
+
+    Rule 20 holds the place when the only step of the run failed, or when a step failed before the tests started.
+    """
+    unit: str
+    repository: str
+    job: str
+    since: float
+    failed_at: float
+    ends_at: float
+    # The run_owner key of the run that ended.
+    failed_run: str
+    machines: tuple[str, ...]
+    replaces: int
+    ended: HeldPlaceEnd
+    failed_step: str = field(default="", kw_only=True)
+    # The view assigns a number from the current waiting order.
+    position: int = field(default=0, kw_only=True)
+
+
+def kept_place_order(held: tuple[HeldPlace, ...], rows: Iterable[Waiter],
+                     order: Callable[[Waiter], tuple[int, float, float, int]],
+                     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY,
+                     ) -> tuple[list[HeldPlace], Iterator[int]]:
+    """Return the kept places and the count that ranks before each waiter."""
+    if not held:
+        return [], (0 for _ in rows)
+    entries = priority.entries if isinstance(priority, QueuePriority) else ()
+    ranks = {entry["unit"]: PriorityUnit(entry["unit"], index) for index, entry in enumerate(entries)}
+    # At the same priority and time, a kept place precedes a waiter.
+    ranked = sorted(((order(RankedWaiter(pid=0, start_time="", need=0, since=place.since,
+                                        order=ranks.get(place.unit, NormalOrder()))), place)
+                     for place in held), key=lambda pair: pair[0])
+    keys = [key for key, _ in ranked]
+    kept = [place for _, place in ranked]
+    return kept, (bisect_right(keys, order(row)) for row in rows)
+
+
 @dataclass(frozen=True)
 class QueueRead:
     """The queue reading holds its view, explanation, ordered waiters, and diagnostics."""
@@ -1462,6 +1529,39 @@ class QueueRead:
     explanation: QueueExplanation
     ordered: list[tuple[Path, RankedWaiter]]
     diagnostics: tuple[ConfigurationDiagnostic, ...] = ()
+    held_places: tuple[HeldPlace, ...] = field(default=(), kw_only=True)
+
+    def waiting_with_order_times(self) -> Iterator[tuple[WaitingStep, float]]:
+        """Return waiting steps in view order with the times used to rank them."""
+        order_times = {(row["pid"], row["since"]): row["order_since"] for _, row in self.ordered if "order_since" in row}
+        for step in self.view.waiting:
+            yield step, order_times.get((step.pid, step.since), job_order_since(step.since, step.ci_job_start))
+
+    def number_held_places(self, held: tuple[HeldPlace, ...],
+                           order: Callable[[Waiter], tuple[int, float, float, int]],
+                           priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY) -> tuple[HeldPlace, ...]:
+        """Insert kept places by queue rank in the published order."""
+        if not held:
+            return ()
+        by_owner: dict[tuple[int, float], Waiter] = {(row["pid"], row["since"]): row for _, row in self.ordered}
+        rows: list[Waiter] = []
+        for step, since in self.waiting_with_order_times():
+            row = by_owner.get((step.pid, step.since), Waiter(
+                pid=step.pid, start_time="", need=step.need, since=step.since))
+            rows.append({**row, "order_since": since})
+        kept, counts = kept_place_order(held, rows, order, priority)
+        numbered: list[HeldPlace] = []
+        # The final count inserts the kept places after the last waiter.
+        for preceding, count in enumerate((*counts, len(kept))):
+            while len(numbered) < count:
+                numbered.append(replace(kept[len(numbered)], position=preceding + len(numbered) + 1))
+        return tuple(numbered)
+
+    def numbered_held_places(self, order: Callable[[Waiter], tuple[int, float, float, int]]) -> tuple[HeldPlace, ...]:
+        """Number kept places from a view that predates published positions."""
+        if any(not place.position for place in self.held_places):
+            return self.number_held_places(self.held_places, order)
+        return self.held_places
 
 
 @dataclass(frozen=True)
@@ -1562,6 +1662,19 @@ def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, .
             print(diagnostic.diagnostic, file=sys.stderr)
 
 TEST_PHASE_MARGIN_FALLBACK = 1.2
+REPLACE_AFTER_FAIL_MAX_KEY = "replace_after_fail.max_times"
+
+
+@dataclass(frozen=True)
+class ReplaceAfterFail:
+    """Rule 20: how many times a failed run keeps its place, and how long a held place waits."""
+    max_times: int
+    time_limit_seconds: float
+
+
+@dataclass(frozen=True)
+class ReplaceAfterFailNotRead:
+    """The configuration has no replace-after-fail settings, so no ended run keeps its place."""
 
 
 @dataclass(frozen=True)
@@ -1594,6 +1707,8 @@ class MemoryConfig:
     program_stop_seconds: float
     peak_wave_seconds: float
     free_floor_gib: int | None = field(default=None, kw_only=True)
+    replace_after_fail: ReplaceAfterFail | ReplaceAfterFailNotRead = field(
+        default=ReplaceAfterFailNotRead(), kw_only=True)
     diagnostics: tuple[ConfigurationDiagnostic, ...] = field(default=(), compare=False)
 
 
@@ -1708,7 +1823,10 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 program_sample_seconds=number("program_sample_seconds"), program_stop_seconds=number("program_stop_seconds"),
                 peak_wave_seconds=number("peak_wave_seconds"),
                 free_floor_gib=whole("free_floor_gib")
-                    if settings_read.effective_key("free_floor_gib") in values else None)
+                    if settings_read.effective_key("free_floor_gib") in values else None,
+                replace_after_fail=ReplaceAfterFail(whole(REPLACE_AFTER_FAIL_MAX_KEY),
+                                                    whole("replace_after_fail.time_limit_minutes") * 60.0)
+                    if settings_read.effective_key(REPLACE_AFTER_FAIL_MAX_KEY) in values else ReplaceAfterFailNotRead())
         finally:
             diagnostics = configuration_diagnostics(messages)
     config = replace(config, diagnostics=diagnostics)

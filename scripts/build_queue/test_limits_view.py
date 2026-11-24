@@ -99,7 +99,10 @@ class BuildLimitsTests(unittest.TestCase):
             self.configure_hana(fixture)
             request = self.hana_request(fixture)
             grant = only_admitted(fixture.server.handle_request(request))
+            before, = fixture.server.handle_request(wire.ViewRequest())
             fixture.release(grant)
+            self.assertEqual(fixture.server.handle_request(wire.ViewRequest()), [before])
+            _ = fixture.run_pass()
             reply, = fixture.server.handle_request(wire.ViewRequest())
             assert isinstance(reply, wire.ViewReply)
             reading = reply.reading

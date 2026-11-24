@@ -39,8 +39,9 @@ prevents a saved pass. `--tree` requires `--saved`.
 
 Builds can run on any eligible target. A remote build prints `binary: <target>:<path>`.
 Use `--local "<why>"` for a Linux-only test or a binary that must run on natedev.
-Name the Linux requirement or the local launch. A reservation reason is refused. Use `/build:mac block <why>` for a Mac hold, only on nate's explicit request.
-Before CI, either machine can answer a test, including merge gates.
+Name the Linux requirement or the local launch. The command refuses a reservation reason.
+Use `/build:mac block <why>` for a Mac hold only on Nate's explicit request.
+Before CI, either machine can run tests, including gate jobs.
 
 ### Batch verification
 
