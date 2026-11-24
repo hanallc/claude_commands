@@ -898,6 +898,18 @@ Capacity refusals and unsupported types select the next variant.
 The canonical `scripts/production/gate.py` can run suites on an AWS queue assignment.
 The queue offers AWS only when the target registry lists an enabled scaler.
 The live registry has no AWS scaler entry.
+Keep the AWS machine off until `awsfix` is on main.
+
+The item 291 closure review found seven defects.
+
+1. A pending launch can block its own cleanup by using the last slot or the remaining budget.
+2. Assigned reconciliation can use the caller's AWS account.
+3. Placement can miss a booking during journal closure, and the worker can use different booking terms.
+4. The `{tree}` placeholder can prevent AWS admission for a canonical gate.
+5. An isolated launcher in another checkout can lose the gate job identity.
+6. A repeat can lose a saved verdict and reset the retry count.
+7. The Builds page omits current assigned AWS gates.
+
 The queue checks slot availability and daily spending room before it grants AWS.
 The budget check counts each current grant until the worker records its booking.
 The queue reads the registry again when it returns an unused grant or consumes launch permission.
