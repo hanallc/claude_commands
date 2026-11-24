@@ -443,7 +443,7 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
   It refuses subprocess calls, so the tests run no Cargo command.
   Its fixture replaces the shared pacer with a controlled clock and sleep.
   The tests import the checker by package name.
-  The merge gate discovers both modules under `scripts/bevy_migration_plan`.
+  The gate discovers both modules under `scripts/bevy_migration_plan`.
 - **Two copies of the requirement rule.** `upstream.release_requirement` and `get_bevy_dependency_requirement` hold the same rule, and both percent-encode the version in the lookup address. A change to one needs the same change in the other.
 
 ## Why

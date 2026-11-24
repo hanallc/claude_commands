@@ -31,7 +31,9 @@ from scripts.build_queue import admission_client as client, mac_run, queue_snaps
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import limits_view, memory_feed
 from scripts.build_queue.admission_jobs import StepJob
-from scripts.build_queue.admission_test_support import AdmissionFixture, FixedSystemReader, ObservedAdmissionServer, only_admitted, GIB
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, FixedSystemReader, GIB, ObservedAdmissionServer, only_admitted,
+)
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
@@ -570,7 +572,7 @@ class CargoFolderTests(unittest.TestCase):
                 client.WaitOutput()(reply.wait)
             self.assertIn("head: waits for the build in the same Cargo folder", output.getvalue())
 
-    def test_view_releases_the_folder_before_the_next_pass(self) -> None:
+    def test_view_keeps_the_cargo_folder_wait_until_the_next_pass(self) -> None:
         with PlacementFixture() as fixture:
             folder = str(fixture.root / "target")
             first = local_cargo_request(fixture)
@@ -589,7 +591,9 @@ class CargoFolderTests(unittest.TestCase):
             head = viewed.reading.explanation.head
             assert isinstance(head, records.HeadExplanation)
             self.assertEqual(head.waiter.pid, second.owner.pid)
-            self.assertNotIsInstance(head.cause, placement.CargoFolderWait)
+            self.assertIsInstance(head.cause, placement.CargoFolderWait)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.caller_reservations()), {second.episode})
 
     def test_mixed_request_uses_a_free_remote_slot_when_the_local_folder_is_busy(self) -> None:
         for another_remote_step in (False, True):
@@ -1456,54 +1460,60 @@ class PlacementTests(unittest.TestCase):
             now = fixture.clock.now()
             _ = backoff.write_text(str(now + 1))
             os.utime(backoff, (now, now))
-            _ = publish_candidate(fixture, request)
-            first, = fixture.server.handle_request(request)
-            assert isinstance(first, wire.PlacementWait), first
-            self.assertEqual(first.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
-            recorded = (placement.CandidateEligibility(
-                guest.destination, placement.TemporaryExclusion("the guest is in retry backoff")),)
-            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
-            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
-            self.assertEqual(tuple(snapshot.inputs.placement_candidates.values()), (recorded,))
-            reply, = fixture.server.handle_request(wire.ViewRequest())
-            assert isinstance(reply, wire.ViewReply)
-            decoded = wire.parse_reply(wire.encode_reply(reply))
-            assert isinstance(decoded, wire.ViewReply)
-            row, = decoded.reading.view.waiting
-            self.assertEqual((row.pid, row.since, row.placement_candidates),
-                             (request.owner.pid, request.since, recorded))
-            fixture.clock.advance(2)
-            waiting, = fixture.server.handle_request(request)
-            assert isinstance(waiting, wire.PlacementWait), waiting
-            self.assertEqual(waiting.eligibility[0].eligibility,
-                             placement.TemporaryExclusion("mac_linux_reading_required"))
-            _ = publish_candidate(fixture, request)
-            assignment = assignment_for(fixture, request)
-            claim = adopt_assignment(fixture, request, assignment)
-            execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
-                guest.destination.host, "host-generation-a", 700001, "guest-start"))
-            _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
-                placement.PrelaunchRefused("fixture")))
-            with mock.patch.object(mac_run, "claim_held", return_value=True):
-                granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
-            self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
-            wrong = replace(assignment, attempt="another-attempt")
-            _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
-            reply, = fixture.server.handle_request(wire.ViewRequest())
-            assert isinstance(reply, wire.ViewReply)
-            pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
-            self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
+            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
+                _ = publish_candidate(fixture, request)
+                first, = fixture.server.handle_request(request)
+                assert isinstance(first, wire.PlacementWait), first
+                self.assertEqual(first.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+                recorded = (placement.CandidateEligibility(
+                    guest.destination, placement.TemporaryExclusion("the guest is in retry backoff")),)
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual(tuple(snapshot.inputs.placement_candidates.values()), (recorded,))
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                row, = decoded.reading.view.waiting
+                self.assertEqual((row.pid, row.since, row.placement_candidates),
+                                 (request.owner.pid, request.since, recorded))
+                fixture.clock.advance(2)
+                _ = fixture.run_pass()
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.PlacementWait), waiting
+                self.assertEqual(waiting.eligibility[0].eligibility,
+                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                _ = publish_candidate(fixture, request)
+                _ = fixture.run_pass()
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                    guest.destination.host, "host-generation-a", 700001, "guest-start"))
+                _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
+                    placement.PrelaunchRefused("fixture")))
+                _ = fixture.run_pass()
+                with mock.patch.object(mac_run, "claim_held", return_value=True):
+                    granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
+                self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
+                wrong = replace(assignment, attempt="another-attempt")
+                _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
+                self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
 
-            _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
-            reply, = fixture.server.handle_request(wire.ViewRequest())
-            assert isinstance(reply, wire.ViewReply)
-            decoded = wire.parse_reply(wire.encode_reply(reply))
-            assert isinstance(decoded, wire.ViewReply)
-            running, = (row for row in decoded.reading.view.running if row.assignment_target == "mac-linux")
-            self.assertEqual((running.pid, running.execution, running.placement_candidates),
-                             (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
-            self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
-            self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
+                _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                assert isinstance(decoded, wire.ViewReply)
+                running, = (row for row in decoded.reading.view.running if row.assignment_target == "mac-linux")
+                self.assertEqual((running.pid, running.execution, running.placement_candidates),
+                                 (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
+                self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+                self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
@@ -2020,6 +2030,7 @@ class PlacementTests(unittest.TestCase):
                     offload.report_placement_result(controller, adapter_request, result)
                 fixture.clock.advance(0.01)
                 _ = publish_candidate(fixture, request, placement.TemporaryExclusion("disk"))
+                fixture.server.run_once(0)
                 granted, = fixture.connect(request).replies()
                 self.assertIsInstance(granted, wire.LocalPlacementGranted)
                 if not isinstance(granted, wire.LocalPlacementGranted):
@@ -2265,7 +2276,7 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(assignment_for(fixture, other).destination, destination)
 
     def test_a_guest_gate_that_took_no_run_after_its_consume_closes_for_a_retry(self) -> None:
-        # The last system reading can still show the gate after it ends.
+        # The last system reading can still show the gate when copies.py reports the failure.
         for proof_required, start_pending in ((False, False), (False, True), (True, False)):
             settle = mock.Mock(return_value=placement.Pending("guest end unknown"))
             with (self.subTest(proof_required=proof_required, start_pending=start_pending),
@@ -2301,6 +2312,7 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual(settled.retry, placement.RetryAt(fixture.clock.now()))
                 if not proof_required and not start_pending:
                     self.assertEqual(settled.state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+                    self.assertNotIn(assignment.episode, fixture.server.current_assignments)
                     replacement, = fixture.server.handle_request(request)
                     assert isinstance(replacement, wire.LocalPlacementGranted), replacement
                     self.assertEqual(replacement.assignment.destination.target, "natedev")
@@ -3236,6 +3248,9 @@ class PlacementTests(unittest.TestCase):
                     renewed = fixture.server.assignments[key].assignment
                     self.assertNotEqual(renewed.attempt, assigned.attempt)
                     self.assertEqual((renewed.destination, renewed.since), (assigned.destination, assigned.since))
+                    repeated, = fixture.server.handle_request(request)
+                    assert isinstance(repeated, wire.Assignment)
+                    self.assertEqual(repeated.assignment, renewed)
 
     def test_an_older_settings_refusal_without_a_generation_can_retry(self) -> None:
         with PlacementFixture() as fixture:

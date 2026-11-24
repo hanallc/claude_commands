@@ -562,7 +562,7 @@ class FirstStepTests(unittest.TestCase):
                     self.assertNotIn("BUILDLOG_PLACEMENT_SIDECAR", os.environ)
                     self.assertFalse(admitted.assignment_file.exists())
                 program.assert_called_once()
-                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing)
+                release.assert_called_once_with(PROGRAM_GRANT.reservation, 0, PROGRAM_GRANT.cleanup_timing, "handed_off")
                 place.assert_not_called()
 
     def test_close_after_verify_cancels_the_completed_remote_placement(self) -> None:
