@@ -298,7 +298,6 @@ The `[mac_idle]` section of `config/mac_test.conf` supplies these defaults:
 | Key | Default | Purpose |
 |---|---:|---|
 | `alert_seconds` | 180 | Delay before the view alert and showrunner message |
-| `push_seconds` | 600 | Not read. The machine watch uses `excluded_notice_seconds.mac` in `build_targets.conf` |
 | `stale_seconds` | 300 | Maximum age of a saved reading |
 | `repeat_minutes` | 1440 | Minimum repeat window for an outage |
 | `send_timeout_s` | 180 | Timeout for a phone send |

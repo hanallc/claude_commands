@@ -1484,7 +1484,7 @@ From builds (not the user), 2026-11-14 15:10: the user could not understand the 
 
 - Cause of the 13:22 push: a kept claim (holder cargo-liner). The kept-claim takeover 5214a5d reached `~/.claude` main at 12:41, but the admission service ran from its 12:01 start until 13:40. The takeover is live since that restart.
 - A free Mac, an idle claim, a block and the disk case send no phone push. `watch_once` sends them as the one message to builds (`notify_outage`), and free-Mac repairs still run.
-- An unreachable Mac with waiting calls past `alert_seconds` messages builds once. After `push_seconds` it pushes `mac_idle.unreachable` once (need blocked, key `mac-idle-<since>`) and runs no repairs. The unreachable state writes `idle.json`, so its outage start holds across passes.
+- An unreachable Mac with waiting calls past `alert_seconds` messages builds once. When the machine watch decides (`excluded_notice_seconds.mac` in `build_targets.conf`), it pushes `mac_idle.unreachable` once (need blocked, key `mac-idle-<since>`) and runs no repairs. The unreachable state writes `idle.json`, so its outage start holds across passes.
 - `mac_idle.unreachable` (`push_catalog.py`): title "Mac tests stopped", action "Wake the Mac or check its network.", body "Mac tests stopped {minutes} min ago." and "{tests}; builds cannot reach the Mac." `waiting_tests()` writes "1 test waits" or "N tests wait".
 - `mac_idle.py cleared --since <since>` is the push's clears-when. It exits 1 while the fresh saved alert is unreachable with that start and waiting tests; else 0.
 - `mac_idle.stuck`, `mac_idle.blocked` and `mac_idle_reservation` are gone from the catalog and from `push_texts_reviewed.json`. The unreadable state does not change.
