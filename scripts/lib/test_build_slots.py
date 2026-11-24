@@ -396,6 +396,30 @@ class BuildSlotsTests(unittest.TestCase):
         self.assertIn(str(path), output.getvalue())
 
     def test_assigned_copy_recovers_cargo_reset_after_sigkill(self) -> None:
+        self.assert_cargo_reset_recovers(self.interrupt_cargo_reset())
+
+    def test_assigned_copy_recovers_cargo_reset_under_a_linked_build_root(self) -> None:
+        real_root = self.root / "real-build"
+        real_root.mkdir()
+        build_root = build_folders.build_root()
+        build_root.symlink_to(real_root, target_is_directory=True)
+        path = self.interrupt_cargo_reset()
+        self.assertTrue(path.is_relative_to(build_root))
+        self.assertTrue(path.resolve().is_relative_to(real_root))
+
+        lock_path = path / "target.lock"
+        with lock_path.open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (self.assertRaisesRegex(BlockingIOError, "assigned copy 2"),
+                  build_slots.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                                        work="next", purpose="test", selection=build_slots.ExactSlotRequest(2))):
+                self.fail("The assigned copy admitted a job while the target lock was held")
+            self.assertTrue(os.path.samestat(lock_path.stat(), os.fstat(lock.fileno())))
+            self.assertIn("cargo_removal", self.lease(path))
+
+        self.assert_cargo_reset_recovers(path)
+
+    def interrupt_cargo_reset(self) -> Path:
         reset = """
 import os
 from pathlib import Path
@@ -430,7 +454,9 @@ with build_slots.take_copy(Path(sys.argv[1]), sys.argv[2], showrunner="builds", 
                          {"removal_stage": stage.name, "copy_device": identity.st_dev, "copy_inode": identity.st_ino})
         self.assertEqual((stage / "old").read_text(), "old Cargo output")
         self.assertFalse((path / "target").exists())
+        return path
 
+    def assert_cargo_reset_recovers(self, path: Path) -> None:
         with build_slots.take_copy(self.source, self.base, showrunner="builds", unit="queue",
                                   work="next", purpose="test", selection=build_slots.ExactSlotRequest(2)) as copy:
             self.assertEqual(copy.path, path)

@@ -1126,7 +1126,7 @@ def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, field
         if (not isinstance(record, NumberedCopySource) or record.source != spec.slot_checkout.source
                 or not may_remove_folder_tree(path, record.git_directory)):
             raise ValueError("copy has no matching source record")
-        _recover_copy_cargo(path, lease)
+        _recover_copy_cargo(path, directory, lease)
         _copy_identity_fields(fields, record)
         fields["commit"] = record.commit
         return True
@@ -1157,18 +1157,25 @@ def _current_copy_lock(path: Path, directory: int) -> None:
         raise ValueError(f"{path}: the numbered copy lock changed")
 
 
-def _recover_copy_cargo(path: Path, fields: Mapping[str, object]) -> None:
+def _recover_copy_cargo(path: Path, directory: int, fields: Mapping[str, object]) -> None:
     if _CARGO_REMOVAL not in fields:
         return
     raw = fields[_CARGO_REMOVAL]
     if not isinstance(raw, dict) or (stage := StagedRemoval.read(cast(dict[str, object], raw))) is None:
         raise ValueError(f"{path}: invalid Cargo removal record")
     target = path / "target"
-    if not stage.recover(target, parent_identity=_recorded_directory(fields, "copy")):
-        raise FileExistsError(f"{target}: the staged Cargo output could not be removed")
-    if release_removed_folder(target) not in (FolderPairRelease.RELEASED, FolderPairRelease.PAIR_ABSENT,
-                                              FolderPairRelease.FOLDER_PRESENT):
-        raise FileExistsError(f"{target}: the Cargo removal lock could not be released")
+    copy_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        identity = CopyDirectoryIdentity.from_stat(os.fstat(copy_fd))
+        if identity != _recorded_directory(fields, "copy") or not build_folder_lock.parent_current(target, copy_fd):
+            raise ValueError(f"{target}: the numbered copy changed")
+        if not stage.recover(target, dir_fd=copy_fd):
+            raise FileExistsError(f"{target}: the staged Cargo output could not be removed")
+        released = _release_removed_folder_at(target, copy_fd, reject_parent_links=False)
+        if released not in (FolderPairRelease.RELEASED, FolderPairRelease.PAIR_ABSENT, FolderPairRelease.FOLDER_PRESENT):
+            raise FileExistsError(f"{target}: the Cargo removal lock could not be released")
+    finally:
+        os.close(copy_fd)
 
 
 def reset_numbered_copy_cargo(path: Path) -> bool:
@@ -1179,7 +1186,7 @@ def reset_numbered_copy_cargo(path: Path) -> bool:
         fields = _read_folder_lease(path, directory)
         identity = _recorded_directory(fields, "copy")
         target = path / "target"
-        _recover_copy_cargo(path, fields)
+        _recover_copy_cargo(path, directory, fields)
 
         def record_stage(tree: CheckedRemovalTree) -> None:
             if (CopyDirectoryIdentity.from_stat(os.fstat(tree.parent)) != identity
@@ -1881,8 +1888,8 @@ class StagedRemoval:
     def fields(self) -> dict[str, object]:
         return {"removal_stage": self.name, "copy_device": self.device, "copy_inode": self.inode}
 
-    def recover(self, source: Path, *, parent_identity: CopyDirectoryIdentity | None = None) -> bool:
-        return recover_staged_folder(source, self.name, self.device, self.inode, parent_identity=parent_identity)
+    def recover(self, source: Path, *, dir_fd: int | None = None) -> bool:
+        return recover_staged_folder(source, self.name, self.device, self.inode, dir_fd=dir_fd)
 
 
 def _staging_identity(info: os.stat_result) -> dict[str, object]:
@@ -2472,33 +2479,40 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
     if _parent_has_symlink(path.parent):
         return FolderPairRelease.PARENT_LINK
     for _attempt in range(2):
-        with ExitStack() as stack:
+        with ExitStack() as parents:
             try:
-                directory = stack.enter_context(build_folder_lock.folder_parent(path, Path(path.anchor), create=False))
+                directory = parents.enter_context(build_folder_lock.folder_parent(path, Path(path.anchor), create=False))
             except FileNotFoundError:
                 return FolderPairRelease.PARENT_ABSENT
-            if _folder_exists(path, directory):
-                return FolderPairRelease.FOLDER_PRESENT
-            lock_name = path.name + ".lock"
-            names = (path.name + ".lease.json", lock_name)
-            present = {name for name in names if _folder_exists(path.with_name(name), directory)}
-            if not present:
-                return FolderPairRelease.PAIR_ABSENT
             try:
-                lease = _hold_free_lease(path, directory, stack, wait=False, create=True)
+                return _release_removed_folder_at(path, directory, reject_parent_links=True)
             except BuildFolderParentChanged:
                 continue
-            if not isinstance(lease, HeldFolderRemovalLease):
-                return FolderPairRelease.LOCK_HELD
-            removed = lease.unlink_matching_sidecars(lease.sidecar_identities(), reject_parent_links=True)
-            if present <= removed and lock_name in removed:
-                return FolderPairRelease.RELEASED
-            if removed:
-                return FolderPairRelease.PARTIAL
-            if _folder_exists(path, directory):
-                return FolderPairRelease.FOLDER_PRESENT
-            return FolderPairRelease.PAIR_KEPT
     return FolderPairRelease.LOCK_HELD
+
+
+def _release_removed_folder_at(path: Path, directory: int, *, reject_parent_links: bool) -> FolderPairRelease:
+    if not build_folder_lock.parent_current(path, directory):
+        raise BuildFolderParentChanged(str(path.parent))
+    if _folder_exists(path, directory):
+        return FolderPairRelease.FOLDER_PRESENT
+    lock_name = path.name + ".lock"
+    names = (path.name + ".lease.json", lock_name)
+    present = {name for name in names if _folder_exists(path.with_name(name), directory)}
+    if not present:
+        return FolderPairRelease.PAIR_ABSENT
+    with ExitStack() as locks:
+        lease = _hold_free_lease(path, directory, locks, wait=False, create=True)
+        if not isinstance(lease, HeldFolderRemovalLease):
+            return FolderPairRelease.LOCK_HELD
+        removed = lease.unlink_matching_sidecars(lease.sidecar_identities(), reject_parent_links=reject_parent_links)
+        if present <= removed and lock_name in removed:
+            return FolderPairRelease.RELEASED
+        if removed:
+            return FolderPairRelease.PARTIAL
+        if _folder_exists(path, directory):
+            return FolderPairRelease.FOLDER_PRESENT
+        return FolderPairRelease.PAIR_KEPT
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
@@ -2514,18 +2528,17 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
     return remove_build_folder(path, dir_fd=directory, wait=wait)
 
 
-def recover_staged_folder(source: Path, name: str, device: int, inode: int, *,
-                          parent_identity: CopyDirectoryIdentity | None = None) -> bool:
+def recover_staged_folder(source: Path, name: str, device: int, inode: int, *, dir_fd: int | None = None) -> bool:
     """Resolve the staging folder recorded in the source removal intent."""
     if _HIDDEN_REMOVAL.fullmatch(name) is None or name == source.name:
         return False
     path = source.with_name(name)
+    if dir_fd is not None:
+        return _recover_staged_folder(path, dir_fd, wait=False, identity=(device, inode))
     with ExitStack() as parents:
         try:
             directory = parents.enter_context(build_folder_lock.folder_parent(path, source.parent, create=False))
         except FileNotFoundError:
-            return False
-        if parent_identity is not None and parent_identity != CopyDirectoryIdentity.from_stat(os.fstat(directory)):
             return False
         return _recover_staged_folder(path, directory, wait=False, identity=(device, inode))
 
