@@ -1395,6 +1395,7 @@ class PublishedPlacement:
     input_event_count: int
     request_digest: bytes
     reply: wire.PlacementWait | wire.Assignment | wire.LocalPlacementGranted
+    evidence_expires_at: float
 
 
 @dataclass
@@ -2942,6 +2943,7 @@ class AdmissionServer:
                                      self.clock.monotonic() + config.source_check_seconds)
         policy = config.policy
         self.last_diagnostics = config.diagnostics
+        evidence_started_at = self.clock.now()
         evidence_keys: PlacementEvidenceKeys = {}
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
@@ -3023,7 +3025,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        self.published.placements = self._publish_placement_replies()
+        self.published.placements = self._publish_placement_replies(evidence_keys, evidence_started_at)
         interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
@@ -3373,16 +3375,30 @@ class AdmissionServer:
         placements = self.published.placements if isinstance(self.published, PublishedReplies) else {}
         self.published = PublishedReplies(view, explain, positions, placements)
 
-    def _publish_placement_replies(self) -> dict[str, PublishedPlacement]:
+    def _publish_placement_replies(self, keys: PlacementEvidenceKeys, started_at: float) -> dict[str, PublishedPlacement]:
         input_event_count = self.input_event_count
+        deadlines: dict[str, float] = {}
+        for (episode, _destination), key in keys.items():
+            if not isinstance(key, placement.HostEvidenceKey):
+                continue
+            evidence = self.host_observations.get(key)
+            if isinstance(evidence, placement.FreshHostEvidence):
+                try:
+                    expires_at = evidence.observed_at + self._evidence_lifetime(key)
+                except (OSError, ValueError):
+                    continue
+                if expires_at >= started_at:
+                    deadlines[episode] = min(deadlines.get(episode, float("inf")), expires_at)
         replies: dict[str, PublishedPlacement] = {}
         for episode, request in self.placement_requests.items():
             request_digest = self.placement_request_digests.get(episode)
             if request_digest is None or not self._placement_owner_live(request.owner):
                 continue
-            reply = self._placement_reply(request, self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
+            reply = self._placement_reply(request,
+                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys)
             if not isinstance(reply, wire.DispatchStatus):
-                replies[episode] = PublishedPlacement(input_event_count, request_digest, reply)
+                replies[episode] = PublishedPlacement(input_event_count, request_digest, reply,
+                    deadlines.get(episode, float("inf")))
         return replies
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
@@ -4118,7 +4134,8 @@ done
         key = self._placement_evidence_key(submitted, saved.assignment.destination, keys)
         return key if isinstance(key, placement.EvidenceNeeded) else self.host_evidence(key)
 
-    def _assignment_state(self, saved: records.SavedPlacementAssignment) -> placement.AssignmentState:
+    def _assignment_state(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None
+                          ) -> placement.AssignmentState:
         """Project placement lifetime without changing records or requesting evidence."""
         if isinstance(saved.state, placement.ClosedAssignment):
             return saved.state
@@ -4134,7 +4151,7 @@ done
                 return placement.ClosedAssignment("local run has ended")
             if isinstance(self._lifetime(reservation), gate.EndedStep):
                 return placement.ClosedAssignment("local execution has ended")
-        elif self._provider_claim_released(saved, self._provider_release_evidence(saved)):
+        elif self._provider_claim_released(saved, self._provider_release_evidence(saved, keys)):
             return placement.ClosedAssignment("provider claim released")
         return saved.state
 
@@ -4590,7 +4607,8 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
-    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
+    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder,
+                         keys: PlacementEvidenceKeys | None = None
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
@@ -4644,7 +4662,7 @@ done
         position = self.published.wait_positions.get(owner, 0) if isinstance(self.published, PublishedReplies) else 0
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
-            state = self._assignment_state(saved)
+            state = self._assignment_state(saved, keys)
             if isinstance(state, placement.ClosedAssignment) and saved.assignment.destination.provider == "local":
                 return self._placement_status(saved.assignment, state.reason)
             if isinstance(state, placement.ClosedAssignment):
@@ -5211,11 +5229,15 @@ done
             digest = connection.placement_request_digest if isinstance(connection, Connection) else None
             if digest is None:
                 digest = hashlib.sha256(wire.encode_request(request).encode().removesuffix(b"\n")).digest()
-            if (isinstance(self.published, PublishedReplies)
+            if (isinstance(self.pending_configuration, NoPass)
+                    and isinstance(self.published, PublishedReplies)
                     and (published := self.published.placements.get(request.episode)) is not None
                     and published.input_event_count == self.input_event_count
-                    and published.request_digest == digest):
-                return [published.reply]
+                    and published.request_digest == digest
+                    and self.clock.now() <= published.evidence_expires_at):
+                saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
+                if saved is None or not self._ended_claim_holder(saved):
+                    return [published.reply]
             previous = self.placement_requests.get(request.episode)
             identity = self._placement_identity(request)
             members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP

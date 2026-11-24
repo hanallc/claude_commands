@@ -215,6 +215,8 @@ The service publishes placement waits and grants after each pass.
 The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
 Each published placement reply carries its request digest and the current input event count.
 A poll uses the published reply when the request digest and input event count both match.
+Pending admission configuration and expired provider evidence prevent reuse.
+An ended claim holder also prevents reuse. The owner can then ask the service to close the attempt under the usual provider rules.
 Reuse needs no pass or state write if the caller version matches.
 Readings, process exits, configuration changes and queue changes advance the count.
 The pass timer also advances the count so the next pass can read the provider journal and check deadlines.

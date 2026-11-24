@@ -253,6 +253,26 @@ class PlacementStatusTests(unittest.TestCase):
                     assert isinstance(configuration, gate.UsableAdmissionConfiguration)
                     self.assertEqual(configuration.config.waiting_pass_seconds, 2)
 
+    def test_placement_poll_rejects_expired_provider_evidence_before_the_next_pass(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            blocked = placement.TemporaryExclusion("busy")
+            _ = publish_candidate(fixture, request, blocked)
+            with mock.patch.object(fixture.server, "_evidence_lifetime", return_value=1.25):
+                fixture.clock.advance(1)
+                initial, = fixture.server.handle_request(request)
+                assert isinstance(initial, wire.PlacementWait)
+                self.assertEqual(initial.eligibility[0].eligibility, blocked)
+                self.assertEqual(fixture.server.handle_request(request), [initial])
+                fixture.clock.advance(0.5)
+                self.assertLess(fixture.clock.monotonic(), fixture.server.next_pass)
+                repeated, = fixture.server.handle_request(request)
+                assert isinstance(repeated, wire.PlacementWait)
+                self.assertEqual(repeated.eligibility[0].eligibility,
+                                 placement.EvidenceNeeded("provider evidence expired"))
+
     def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
 
