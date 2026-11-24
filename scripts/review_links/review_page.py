@@ -492,7 +492,8 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
                 sources.skipped(path, item.id, error)
                 unavailable_cards.add(item.key)
-                summary = card_entry(replace(item, title='Card unavailable'), members, names, zone)
+                summary = card_entry(replace(item, title='Card unavailable', log=(),
+                                             answer_time=question_path.NO_ANSWER_TIME), members, names, zone)
             else:
                 assets.update(record_assets)
                 origin = review_items.submission_origin(item)
@@ -1948,13 +1949,16 @@ const firstReviewCard=(()=>{
 })();
 '''
 
-SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.DATE_TIME_SCRIPT
-          + REVIEW_CARD_SCRIPT + r'''(reviewPlace => {
-''' + question_path.queue_script() + '''
+REVIEW_QUEUE_SCRIPT = (question_path.queue_script() + '''
 const reviewQueues=''' + json.dumps(review_items.QUEUE_BY_STATE) + ''';
 const showsForQueue=''' + json.dumps({
     queue: 'open' if state == ReviewState.OPEN else state for state, queue in review_items.QUEUE_BY_STATE.items()
-}) + r''';
+}) + ';\n')
+
+
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.DATE_TIME_SCRIPT
+          + REVIEW_CARD_SCRIPT + r'''(reviewPlace => {
+''' + REVIEW_QUEUE_SCRIPT + r'''
 let content=document.querySelector('[data-review]');
 const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map(),recovering=new Map();
