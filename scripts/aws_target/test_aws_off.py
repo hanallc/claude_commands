@@ -61,7 +61,7 @@ class AwsOffTests(CostFixture):
             _ = aws_target.hourly(self.settings, self.state)
             outcome = cloud_gate.run(self.root, mode=gate.SuiteMode.GATE, full=False,
                                      module_time_limit_s=1800, service=service)
-        self.assertEqual(outcome, cloud_gate.LocalFallback(CLOUD_GATES_OFF))
+        self.assertEqual(outcome, cloud_gate.CloudDeclined(CLOUD_GATES_OFF))
         service.assert_not_called()
         transport = HanaGpuNextestTransport(self.root / 'cloud_gate.conf', 'hana-gpu')
         self.assertEqual(hana_placement_adapter.gpu_setup(transport), HanaStepRefused(CLOUD_GATES_OFF))
