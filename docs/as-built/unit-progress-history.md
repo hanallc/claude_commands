@@ -331,8 +331,8 @@ progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-do
 progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
 pass_record.py start-pass ...        # launcher only
 pass_record.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
-progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
-progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
+progress_history.py start-activity --session-dir <dir> --label <label> --activity <text> [--started-at <ISO with zone>]
+progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>] [--finished-at <ISO with zone>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
@@ -381,6 +381,9 @@ Both events carry `backfilled: true` and `recorded_at`.
 The time must be in the past or present.
 The finish must follow the start.
 The phase table excludes those events from gap samples.
+`start-activity --started-at` and `finish-activity --finished-at` follow the same rules.
+An activity cannot start before its phase starts.
+A back-dated start closes the active activity as `interrupted` at that time, or at the present time if the active activity started later.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's

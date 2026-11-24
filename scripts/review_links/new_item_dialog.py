@@ -288,7 +288,7 @@ class PageRecipient(StrEnum):
 @dataclass(frozen=True)
 class NewItemRequest:
     request_id: str
-    kind: SubmissionKind
+    kind: SubmissionKind | Literal["enhancement"]
     recipient_id: staff.StaffId
     words: str
     evidence: Evidence
@@ -604,7 +604,8 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
-    kind = read_kind(data.get("kind"))
+    kind_value = data.get("kind")
+    kind = "enhancement" if kind_value == "enhancement" else read_kind(kind_value)
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
@@ -751,23 +752,38 @@ def read_request_id(value: object) -> str:
     return identity
 
 
-def read_words(value: object, label: str) -> str:
-    return _text(value, label, MAX_WORDS_LENGTH)
+def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enhancement"] | None = None) -> str:
+    """Check the user's words before adding the Enhancement prefix."""
+    words = _text(value, label, MAX_WORDS_LENGTH)
+    return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
+
+_SPARKLES = """<!-- @license lucide-static v0.468.0 - ISC -->
+<svg aria-hidden="true" focusable="false" class="lucide lucide-sparkles"
+    xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+  <path d="M20 3v4" />
+  <path d="M22 5h-4" />
+  <path d="M4 17v2" />
+  <path d="M5 18H3" />
+</svg>"""
 
 KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          (SubmissionKind.QUESTION, "Question", "circle-help"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
-         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"))
+         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
+         ("enhancement", "Enhancement", "sparkles"))
 
 
 def render() -> str:
     """Render the dialog that the page owner button opens."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
-        + f'<span data-button-face>{page_frame.icon_svg(icon)}<span data-kind-label>{label}</span></span></label>'
+        + f'<span data-button-face>{_SPARKLES if icon == "sparkles" else page_frame.icon_svg(icon)}'
+        + f'<span data-kind-label>{label}</span></span></label>'
         for kind, label, icon in KINDS)
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
@@ -871,6 +887,7 @@ STYLE = '''
 #review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
 #review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
+#review-new-item .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
 #review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item [data-recipient-group] { display: flow-root; }
@@ -1558,11 +1575,12 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
-  let saved, usedPreview = false;
+  let saved, submittedKind, usedPreview = false;
   setError('');
   setSending(true);
   try {
    const item = await submissionPayload();
+   submittedKind = item.kind;
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
    const sendItem = () => post({...item, token});
    let result;
@@ -1618,9 +1636,10 @@ SCRIPT = r'''(() => {
     startCapture();
     updateSend();
     send.focus();
-   } else if (onList) {
+   } else if (onList || submittedKind === 'enhancement') {
     close({sent: true});
-    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+    dialog.dispatchEvent(new CustomEvent(onList ? 'review-item-created' : 'review-item-saved',
+      {bubbles: true, detail: saved}));
    } else {
     showConfirmation(saved);
     dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
