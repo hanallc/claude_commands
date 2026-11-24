@@ -664,7 +664,6 @@ class CargoFolderTests(unittest.TestCase):
 class PlacementTests(unittest.TestCase):
     def test_invalid_guest_index_keeps_the_guest_and_scaler_busy(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(
                   settlement=mock.Mock(return_value=placement.Pending("guest end unproven"))))):
@@ -721,7 +720,6 @@ class PlacementTests(unittest.TestCase):
             return True
 
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(service, "mac_linux_provider", return_value=provider),
               mock.patch.object(service, "send_admission_alert", side_effect=send, create=True)):
@@ -789,7 +787,10 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(check="startup message"):
                 startup, = [line for line in warnings.getvalue().splitlines() if "queue unit: run" in line]
                 self.assertIn(attempt, startup)
-                self.assertIn("-m scripts.aws_target.cloud_gate --reconcile --directory ", startup)
+                python = Path(service.__file__).resolve().parents[1] / "lib/py"
+                command = shlex.join((str(python), "-m", "scripts.aws_target.cloud_gate", "--reconcile",
+                                      "--directory", str(fixture.root / "target-state" / "aws")))
+                self.assertIn(f"{attempt!r} (ledger-wide cleanup, queue unit: run {command})", startup)
                 LauncherHangGuard("Send startup alert").event(sent)
                 alert.assert_called_once_with("builds", startup)
 
@@ -807,7 +808,6 @@ class PlacementTests(unittest.TestCase):
         settle = mock.Mock(return_value=placement.Settled())
         provider = mock.Mock(spec=["settlement"], settlement=settle)
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(service, "mac_linux_provider", return_value=provider)):
             request = mac_linux_and_natedev_request(fixture, natedev=False)
@@ -854,7 +854,6 @@ class PlacementTests(unittest.TestCase):
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
         provider = mock.Mock(spec=["settlement"], settlement=settle)
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(service, "mac_linux_provider", return_value=provider)):
             request = mac_linux_and_natedev_request(fixture, natedev=False)
@@ -1365,8 +1364,12 @@ class PlacementTests(unittest.TestCase):
         with TemporaryDirectory() as outside:
             inherited = Path(outside) / "not-a-directory"
             _ = inherited.write_text("fixture")
-            with mock.patch.dict(os.environ, {"CONF_DIR": str(inherited)}), PlacementFixture() as fixture:
+            inherited_environment = dict.fromkeys(("CONF_DIR", "BUILD_TARGETS_STATE_DIR", "GATE_STATE_DIR"),
+                                                  str(inherited))
+            with mock.patch.dict(os.environ, inherited_environment), PlacementFixture() as fixture:
                 self.assertEqual(conf.directory(), fixture.root)
+                self.assertEqual(Path(os.environ["BUILD_TARGETS_STATE_DIR"]), fixture.root / "target-state")
+                self.assertEqual(Path(os.environ["GATE_STATE_DIR"]), fixture.root / "gate-state")
             self.assertEqual(list(Path(outside).iterdir()), [inherited])
 
     def test_gate_constraints_name_the_guest_and_natedev(self) -> None:
@@ -1376,8 +1379,7 @@ class PlacementTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             _ = mac_linux_fixture(fixture, enabled="off")
             with (mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("claude")),
-                  mock.patch.object(build_folders, "repo_word", return_value="claude"),
-                  mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")})):
+                  mock.patch.object(build_folders, "repo_word", return_value="claude")):
                 constraints = build_targets.fixed_placement_constraints(fixture.root, "", "lint",
                     ("scripts/production/gate.py", "--affected"), SUBMITTING_SESSION, "source-a")
             self.assertEqual(constraints.candidates, (mac_linux_candidate(), local_candidate(fixture)))
@@ -1399,9 +1401,8 @@ class PlacementTests(unittest.TestCase):
                 guest = mac_linux_candidate()
                 request = placement_request(fixture)
                 request = replace(request, constraints=replace(request.constraints, candidates=(guest, local_candidate(fixture))))
-                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
-                    _ = publish_candidate(fixture, request)
-                    reply, = fixture.server.handle_request(request)
+                _ = publish_candidate(fixture, request)
+                reply, = fixture.server.handle_request(request)
                 if not reason:
                     assert isinstance(reply, wire.Assignment), reply
                     self.assertEqual(reply.assignment.destination, guest.destination)
@@ -1430,12 +1431,11 @@ class PlacementTests(unittest.TestCase):
             now = fixture.clock.now()
             _ = backoff.write_text(str(now + 1))
             os.utime(backoff, (now, now))
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
-                _ = publish_candidate(fixture, request)
-                wait, = fixture.server.handle_request(request)
-                assert isinstance(wait, wire.PlacementWait), wait
-                _ = fixture.run_pass()
-                reply, = fixture.server.handle_request(wire.ViewRequest())
+            _ = publish_candidate(fixture, request)
+            wait, = fixture.server.handle_request(request)
+            assert isinstance(wait, wire.PlacementWait), wait
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
             decoded = wire.parse_reply(wire.encode_reply(reply))
             assert isinstance(decoded, wire.ViewReply), decoded
             row, = decoded.reading.view.waiting
@@ -1453,60 +1453,59 @@ class PlacementTests(unittest.TestCase):
             now = fixture.clock.now()
             _ = backoff.write_text(str(now + 1))
             os.utime(backoff, (now, now))
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
-                _ = publish_candidate(fixture, request)
-                first, = fixture.server.handle_request(request)
-                assert isinstance(first, wire.PlacementWait), first
-                self.assertEqual(first.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
-                recorded = (placement.CandidateEligibility(
-                    guest.destination, placement.TemporaryExclusion("the guest is in retry backoff")),)
-                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
-                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
-                self.assertEqual(tuple(snapshot.inputs.placement_candidates.values()), (recorded,))
-                reply, = fixture.server.handle_request(wire.ViewRequest())
-                assert isinstance(reply, wire.ViewReply)
-                decoded = wire.parse_reply(wire.encode_reply(reply))
-                assert isinstance(decoded, wire.ViewReply)
-                row, = decoded.reading.view.waiting
-                self.assertEqual((row.pid, row.since, row.placement_candidates),
-                                 (request.owner.pid, request.since, recorded))
-                fixture.clock.advance(2)
-                waiting, = fixture.server.handle_request(request)
-                assert isinstance(waiting, wire.PlacementWait), waiting
-                self.assertEqual(waiting.eligibility[0].eligibility,
-                                 placement.TemporaryExclusion("mac_linux_reading_required"))
-                _ = publish_candidate(fixture, request)
-                assignment = assignment_for(fixture, request)
-                claim = adopt_assignment(fixture, request, assignment)
-                execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
-                    guest.destination.host, "host-generation-a", 700001, "guest-start"))
-                _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
-                    placement.PrelaunchRefused("fixture")))
-                with mock.patch.object(mac_run, "claim_held", return_value=True):
-                    granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
-                self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
-                wrong = replace(assignment, attempt="another-attempt")
-                _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
-                reply, = fixture.server.handle_request(wire.ViewRequest())
-                assert isinstance(reply, wire.ViewReply)
-                pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
-                self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
+            _ = publish_candidate(fixture, request)
+            first, = fixture.server.handle_request(request)
+            assert isinstance(first, wire.PlacementWait), first
+            self.assertEqual(first.eligibility[0].eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+            recorded = (placement.CandidateEligibility(
+                guest.destination, placement.TemporaryExclusion("the guest is in retry backoff")),)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(tuple(snapshot.inputs.placement_candidates.values()), (recorded,))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            decoded = wire.parse_reply(wire.encode_reply(reply))
+            assert isinstance(decoded, wire.ViewReply)
+            row, = decoded.reading.view.waiting
+            self.assertEqual((row.pid, row.since, row.placement_candidates),
+                             (request.owner.pid, request.since, recorded))
+            fixture.clock.advance(2)
+            waiting, = fixture.server.handle_request(request)
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual(waiting.eligibility[0].eligibility,
+                             placement.TemporaryExclusion("mac_linux_reading_required"))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                guest.destination.host, "host-generation-a", 700001, "guest-start"))
+            _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
+                placement.PrelaunchRefused("fixture")))
+            with mock.patch.object(mac_run, "claim_held", return_value=True):
+                granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
+            self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
+            wrong = replace(assignment, attempt="another-attempt")
+            _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
+            self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
 
-                _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
-                reply, = fixture.server.handle_request(wire.ViewRequest())
-                assert isinstance(reply, wire.ViewReply)
-                decoded = wire.parse_reply(wire.encode_reply(reply))
-                assert isinstance(decoded, wire.ViewReply)
-                running, = (row for row in decoded.reading.view.running if row.assignment_target == "mac-linux")
-                self.assertEqual((running.pid, running.execution, running.placement_candidates),
-                                 (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
-                self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
-                self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
+            _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            decoded = wire.parse_reply(wire.encode_reply(reply))
+            assert isinstance(decoded, wire.ViewReply)
+            running, = (row for row in decoded.reading.view.running if row.assignment_target == "mac-linux")
+            self.assertEqual((running.pid, running.execution, running.placement_candidates),
+                             (700001, execution, (placement.CandidateEligibility(guest.destination, ALLOWED_HOST),)))
+            self.assertEqual(running.confirmed_guest_run, {"target": "mac-linux", "attempt": assignment.attempt})
+            self.assertEqual(running.mac_placement, f"{assignment.episode}/{assignment.attempt}")
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
     def test_a_native_mac_assignment_keeps_every_named_target_and_exclusion(self) -> None:
         with PlacementFixture() as fixture:
-            backoff = mac_linux_fixture(fixture, enabled="off")
+            _ = mac_linux_fixture(fixture, enabled="off")
             registry = fixture.root / "build_targets.conf"
             _ = registry.write_text(registry.read_text().replace("targets=", "targets=mac,", 1)
                                     + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
@@ -1515,14 +1514,13 @@ class PlacementTests(unittest.TestCase):
             guest = mac_linux_candidate()
             local = replace(local_candidate(fixture), eligibility=placement.FixedExclusion("command"))
             request = replace(request, constraints=replace(request.constraints, candidates=(guest, native, local)))
-            with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(backoff.parents[1])}):
-                _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(native,))))
-                assignment = assignment_for(fixture, request)
-                self.assertEqual(assignment.destination, native.destination)
-                reply, = fixture.server.handle_request(wire.ViewRequest())
-                assert isinstance(reply, wire.ViewReply)
-                decoded = wire.parse_reply(wire.encode_reply(reply))
-                assert isinstance(decoded, wire.ViewReply)
+            _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(native,))))
+            assignment = assignment_for(fixture, request)
+            self.assertEqual(assignment.destination, native.destination)
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            decoded = wire.parse_reply(wire.encode_reply(reply))
+            assert isinstance(decoded, wire.ViewReply)
             running, = (row for row in decoded.reading.view.running if row.assignment_host == native.destination.host)
             self.assertEqual(running.placement_candidates, (
                 placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("the guest is off")),
@@ -2329,7 +2327,6 @@ class PlacementTests(unittest.TestCase):
 
     def check_observed_legacy_guest(self, *, holder_ends: bool, owner_ends: bool) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch("scripts.aws_target.cloud_gate.start_reconcile_service") as submit):
             request = mac_linux_and_natedev_request(fixture)
@@ -2363,7 +2360,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_silent_guest_retries_after_the_guest_proves_no_start(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(mac_linux, "reconcile_unproven")):
             request = mac_linux_and_natedev_request(fixture, natedev=False)
@@ -2409,7 +2405,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_silent_guest_holds_its_slot_while_a_start_is_pending(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             request = mac_linux_and_natedev_request(fixture, natedev=False)
             key = publish_candidate(fixture, request).key
@@ -2439,7 +2434,6 @@ class PlacementTests(unittest.TestCase):
 
     def test_guest_settlement_request_waits_for_the_pending_start_to_clear(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(mac_linux, "reconcile_unproven")):
             request = mac_linux_and_natedev_request(fixture, natedev=False)
@@ -2507,7 +2501,6 @@ class PlacementTests(unittest.TestCase):
     def test_guest_replacement_times_out_but_keeps_the_unsettled_slot(self) -> None:
         settle = mock.Mock(return_value=placement.Pending("guest end unproven"))
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(service, "mac_linux_provider", return_value=mock.Mock(settlement=settle))):
             request = mac_linux_and_natedev_request(fixture)
@@ -2555,7 +2548,6 @@ class PlacementTests(unittest.TestCase):
     def test_late_guest_proof_cannot_restart_a_replacement(self) -> None:
         for silent in (False, True):
             with (self.subTest(silent=silent), PlacementFixture(private_child_starts=True) as fixture,
-                  mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
                   mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
                   mock.patch.object(mac_linux, "reconcile_unproven")):
                 request = mac_linux_and_natedev_request(fixture)
@@ -2590,9 +2582,58 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.DispatchStatus)
                 self.assertNotIn(guest.episode, fixture.server.current_assignments)
 
+    def test_unindexed_guest_replacement_expires_after_restart(self) -> None:
+        send = mock.Mock(return_value=True)
+        with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
+              mock.patch.object(service, "send_admission_alert", send),
+              mock.patch.object(mac_linux, "reconcile_unproven") as reconcile):
+            request = mac_linux_and_natedev_request(fixture)
+            key = publish_candidate(fixture, request).key
+            guest = assignment_for(fixture, request)
+            holder = guest_gate(fixture, guest)
+            authorized, = consume_guest_permission(fixture, guest, holder)
+            assert isinstance(authorized, wire.FirstAuthorization)
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            state = service.read_state(fixture.state_dir)
+            state.current_assignments[guest.episode] = "missing"
+            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+            fixture.restart()
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
+            self.assertIn(attempt, fixture.server.manual_guest_settlement)
+            fixture.end_owner(holder)
+
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            started = fixture.clock.now()
+            fixture.restart()
+            fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS - 1)
+            self.assertIsInstance(fixture.server.handle_request(request)[0], wire.PlacementWait)
+            fixture.clock.advance(1)
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.DispatchStatus), reply
+            self.assertEqual(reply.assignment, guest)
+            self.assertIsInstance(reply.retry, placement.DoNotRetry)
+            self.assertIn(guest.attempt, reply.reason)
+            saved = service.read_state(fixture.state_dir).assignments[attempt]
+            self.assertIsInstance(saved.state, placement.CurrentAssignment)
+            report = saved.terminal_report
+            assert isinstance(report, placement.TerminalAttemptReport)
+            self.assertEqual(report.received_at, started)
+
+            _ = fixture.run_pass()
+            worker = fixture.server.host_readers[key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), key)
+            reconcile.assert_not_called()
+            write_guest_no_start_proof(fixture, authorized.claim)
+            self.assertEqual(worker.probe_next(), key)
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.DispatchStatus), reply
+            self.assertEqual(reply.state, placement.ClosedAssignment("cancelled"))
+            self.assertNotIn(guest.episode, fixture.server.current_assignments)
+
     def test_guest_with_proof_required_waits_after_both_holders_exit(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
-              mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(fixture.root / "target-state")}),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(mac_linux, "reconcile_unproven")):
             request = mac_linux_and_natedev_request(fixture, natedev=False)
@@ -2610,6 +2651,11 @@ class PlacementTests(unittest.TestCase):
             with mock.patch.object(mac_run, "claim_held", return_value=True):
                 self.assertIsInstance(fixture.server.handle_request(decoded)[0], wire.FirstAuthorization)
                 self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.DispatchStatus)
+            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
+            fixture.restart()
+            saved = fixture.server.assignments[attempt]
+            self.assertTrue(saved.guest_proof_required)
+            self.assertFalse(saved.guest_execution_observed)
             observed = execution_identity.ObservedExecution(execution_identity.CloudExecution(
                 guest.destination.target, "guest-boot", "guest-machine", guest.attempt))
             _ = fixture.server.handle_request(wire.ExecutionReport("started", guest, claim, observed))
@@ -2621,7 +2667,6 @@ class PlacementTests(unittest.TestCase):
             assert isinstance(worker, ManualEvidenceWorker)
             self.assertEqual(worker.probe_next(), key)
             _ = fixture.run_pass()
-            attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
             saved = fixture.server.assignments[attempt]
             self.assertTrue(saved.guest_proof_required)
             self.assertIsInstance(saved.state, placement.CurrentAssignment)

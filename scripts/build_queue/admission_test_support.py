@@ -427,6 +427,8 @@ class AdmissionFixture(ExitStack):
                       if (self.root / "meminfo").exists() else fake_memory_readings(
                           self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
             environment = {**memory,
+                "BUILD_TARGETS_STATE_DIR": str(self.root / "target-state"),
+                "GATE_STATE_DIR": str(self.root / "gate-state"),
                 "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
                 "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
                 "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),

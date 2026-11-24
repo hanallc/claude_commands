@@ -2058,7 +2058,7 @@ class AdmissionServer:
         for key in sorted(scalers):
             command = [python, "-m", "scripts.aws_target.cloud_gate", "--reconcile", "--directory",
                        str(target_config.ssh_target_state_directory("aws"))]
-            steps.append(f"{key!r} (queue unit: run {shlex.join(command)})")
+            steps.append(f"{key!r} (ledger-wide cleanup, queue unit: run {shlex.join(command)})")
         message = "memory admission: placement settlement requires manual recovery. " + ", ".join(steps)
         print(message, file=sys.stderr, flush=True)
         try:
@@ -4330,16 +4330,23 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
                 and not self._placement_owner_live(saved.assignment.owner))
 
-    def _recover_abandoned_attempt(self, episode: str) -> None:
-        """Recover a silent attempt when its coordinator asks for placement again."""
-        saved = self.assignments.get(self.current_assignments.get(episode, ""))
-        if saved is None or not isinstance(saved.terminal_report, placement.NoTerminalReport):
-            return
-        if is_mac_linux_guest(saved.assignment.destination):
-            if (_holds_consumed_guest_slot(saved) and isinstance(saved.provider, placement.ProviderClaimReference)
+    def _recover_abandoned_attempt(self, request: wire.PlacementRequest) -> None:
+        """Start settlement when the coordinator asks to replace a silent attempt."""
+        for key, saved in self.assignments.items():
+            assignment = saved.assignment
+            if (assignment.episode == request.episode and assignment.owner == request.owner
+                    and assignment.since == request.since and _holds_consumed_guest_slot(saved)
+                    and isinstance(saved.provider, placement.ProviderClaimReference)
+                    and isinstance(saved.terminal_report, placement.NoTerminalReport)
                     and self._confirmed_local_holder_ended(saved.holder)):
-                _ = self._request_settlement(wire.SettlementRequest(saved.assignment))
-        elif (isinstance(saved.state, placement.CurrentAssignment)
+                _ = self._record_settlement_request(key, saved, GUEST_SETTLEMENT_REQUESTED)
+
+        if request.episode not in self.placement_requests:
+            return
+        saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
+        if (saved is not None and not is_mac_linux_guest(saved.assignment.destination)
+                and isinstance(saved.terminal_report, placement.NoTerminalReport)
+                and isinstance(saved.state, placement.CurrentAssignment)
                 and self._ended_claim_holder(saved) and self._next_claim_takes_over(saved)):
             report = self._lost_report()
             self._close_for_report(replace(saved, terminal_report=report), report, persist_change=False)
@@ -4795,18 +4802,24 @@ done
                                   for attempt in self.assignments.values()))
         owner = records.run_owner(request.owner.pid, request.owner.start_time)
         position = self.published.wait_positions.get(owner, 0) if isinstance(self.published, PublishedReplies) else 0
-        guest = next((attempt for attempt in self.assignments.values()
-                      if attempt.assignment.episode == request.episode and _holds_consumed_guest_slot(attempt)), None)
-        if guest is not None:
-            expired = self._expire_guest_replacement(guest)
-            if expired is not guest:
-                key = execution_identity.attempt_key(guest.assignment.episode, guest.assignment.attempt)
-                self.assignments[key] = expired
-                self.persist()
-                self.next_pass = self.clock.monotonic()
-            report = expired.terminal_report
-            if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.outcome, placement.AttemptCancelled):
+        guest_waiting = False
+        for key, guest in self.assignments.items():
+            if guest.assignment.episode != request.episode or not is_mac_linux_guest(guest.assignment.destination):
+                continue
+            if _holds_consumed_guest_slot(guest):
+                guest_waiting = True
+                expired = self._expire_guest_replacement(guest)
+                if expired is not guest:
+                    self.assignments[key] = expired
+                    self.persist()
+                    self.next_pass = self.clock.monotonic()
+                guest = expired
+            report = guest.terminal_report
+            if (isinstance(guest.permission, placement.PermissionConsumed)
+                    and isinstance(report, placement.TerminalAttemptReport)
+                    and isinstance(report.outcome, placement.AttemptCancelled)):
                 return self._placement_status(guest.assignment, report.outcome.reason, check_lifetime=False)
+        if guest_waiting:
             return wire.PlacementWait(request.episode, request.since, position,
                 self.placement_eligibility.get(request.episode, ()), provider_diagnostics=diagnostics,
                 mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
@@ -5346,17 +5359,24 @@ done
             return wire.Ok()
         if self.current_assignments.get(assignment.episode) != key:
             return wire.Refused("the attempt is not current")
-        if isinstance(saved.terminal_report, placement.NoTerminalReport):
-            outcome = SCALER_SETTLEMENT_REQUESTED if scaler else GUEST_SETTLEMENT_REQUESTED
-            terminal = placement.TerminalAttemptReport(outcome,
-                placement.DispatchPathPending("launch settlement is pending"), self.clock.now())
-            saved = replace(saved, terminal_report=terminal)
-            self.assignments[key] = saved
-            self.persist()
+        outcome = SCALER_SETTLEMENT_REQUESTED if scaler else GUEST_SETTLEMENT_REQUESTED
+        saved = self._record_settlement_request(key, saved, outcome)
         if scaler:
             self._settle_scaler_attempt(saved)
         self.next_pass = self.clock.monotonic()
         return wire.Ok()
+
+    def _record_settlement_request(self, key: str, saved: records.SavedPlacementAssignment,
+                                   outcome: placement.AttemptDeclined) -> records.SavedPlacementAssignment:
+        if not isinstance(saved.terminal_report, placement.NoTerminalReport):
+            return saved
+        terminal = placement.TerminalAttemptReport(outcome,
+            placement.DispatchPathPending("launch settlement is pending"), self.clock.now())
+        saved = replace(saved, terminal_report=terminal)
+        self.assignments[key] = saved
+        self.persist()
+        self.next_pass = self.clock.monotonic()
+        return saved
 
     def _settle_scaler_attempt(self, saved: records.SavedPlacementAssignment, *, persist_change: bool = True) -> None:
         """Release the scaler slot only when the report or ledger proves settlement."""
@@ -5548,7 +5568,6 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
-                self._recover_abandoned_attempt(request.episode)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:
@@ -5556,6 +5575,7 @@ done
                 except (OSError, ValueError) as error:
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
+            self._recover_abandoned_attempt(request)
             if (isinstance(connection, Connection) and previous == request
                     and not isinstance(self.system_reader, NoSystemReader)
                     and self.system_reader.latest.started_monotonic <= self.last_pass_started
