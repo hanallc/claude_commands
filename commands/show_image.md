@@ -1,6 +1,6 @@
 ---
 description: Show an image to the user on the console Images page.
-argument-hint: "<image path> <caption> | <before path> <after path> <caption>"
+argument-hint: "<image path> <title> | <before path> <after path> <title>"
 ---
 
 # Show image
@@ -15,17 +15,19 @@ Check the light mode and phone width yourself when the change needs them.
 
 ## Steps
 
-1. Write a caption. A caption is the change in the fewest plain words that stay accurate, such as "Not Approved button removed".
-   Add a second line, `Look for: <place>`, only when the change is hard to find.
-   File the before and after shots of a change as one pair. The page labels each image, so the caption needs no `Before:` or `After:`.
-2. Find your fixed staff id: the `id` in your staff row.
+1. Write a short, single-line title that says what the image shows.
+   Add one `--look-for` for each point the user needs to check.
+   File the before and after shots of a change as one pair.
+2. Set `staff_id` to the `id` in your staff row.
    `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <your worktree path>` prints the row.
-3. Register each image or pair:
+3. Register the image or pair.
    ```sh
-   ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image <path> | --before <path> --after <path>) --caption "<caption>" --owner <your staff id> (--change <id> | --phase <id>)
+   ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register \
+     --before before.png --after after.png --title "Review filter layout" \
+     --look-for "The owner filter is below State." --owner "$staff_id" --change sdlc/C12
    ```
-   - A pair shows its two images side by side on one card, with one caption, one Feedback field and one set of answer buttons. On a narrow window the before image is on top.
-   - Use `--change` for a change review row, such as `sdlc/C12`. Use `--phase` for phase work.
+   - Use `--image PATH` for a single image.
+   - Use `--change` for a change review row. Use `--phase` for phase work.
    - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
    - It copies the images, so you can delete the source files after it prints `registered`.
 4. Give the user the `Image link:` that the command prints for each image or pair. Write it as the full URL in plain text, never as a Markdown link or a wikilink.

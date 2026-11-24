@@ -171,7 +171,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Review and Placement disk POC.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Studio, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`, except the Placement disk POC page.
 That page is a standalone document with its own layout and styles, and it has no status line.
@@ -265,7 +265,7 @@ Review retains typed text across refresh and holds replacement during an active 
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-Accounts, AWS, Builds, Disks, Images, List and Review put the title and status line in the same place.
+Accounts, AWS, Builds, Disks, Images, List, Studio and Review put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -1630,6 +1630,65 @@ Each count links to its existing page.
 The strip omits proposals and efficiencies.
 Closed items show no check text in the page or CLI.
 
+### The Studio page
+
+`/console/studio.html` shows the List rows with one picture tab for each producer.
+The navigation label is Studio, with the Lucide `clapperboard` icon, and the page title is The Studio.
+Its `config/console.conf` block follows the List block.
+`studio_page.STUDIO_VIEW` is a `list_page.ListView`, so the page uses the List rows, filters, script and status line.
+`list_page.LIST_VIEW` keeps the List output unchanged.
+The Studio shows its Producer row as picture tabs above the filters, not beside the words box. The Owner and Show rows and the words box stay.
+`ListView.placement` puts the List Producer chips beside the words box and the Studio tabs above the filters.
+A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
+
+The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.
+They use the same `staff:<id>` values and the same `#producer=<id>` fragment as the List.
+All is first. Then each active producer that is not retired follows in name order, also with a count of 0.
+A producer that has rows but no active staff row also gets a tab.
+Each tab shows a picture with the name and the item count on it. A click filters the rows to that producer.
+The counts change with the Owner, Show and words filters, as on the List.
+
+`studio_avatar_root` in `config/review_links.conf` names the picture folder.
+The All tab reads the folder `all`. A producer tab reads the folder named by its staff ID.
+A picture has three files: `NN-64.webp`, `NN-128.webp` and `NN-256.webp`.
+Each render lists each folder and picks one picture number at random for each tab. The page does not read `index.json`.
+The `<img>` uses the 128 file as `src` and all three files in `srcset`.
+A missing root, a missing folder, or a folder with no complete picture shows the initial of the name in a circle.
+A page refresh copies the `src` and `srcset` of each `img[data-keep-src]` into the new content.
+So a picture changes only when the page loads.
+
+`GET /console/studio/avatars/<folder>/<NN>-<size>.webp` serves one picture.
+The folder is `all` or a 36-character staff ID. The size is 64, 128 or 256.
+The request gets the Tailscale, host and origin checks of a Review attachment request, and a failure gets 403.
+Any other name, a link below the root, a missing file, or a file over 64 KB gets 404.
+A picture goes out as `image/webp` with `Cache-Control: max-age=86400`.
+
+On the Studio, `data-list-path` on `[data-list]` sets the path for row actions and item-state reads to `/console/studio.html`.
+The List uses `location.pathname` for these requests.
+`serve.LIST_VIEWS` maps each path to its view, so both paths use one POST handler with the same Tailscale, origin and form-token checks.
+The view sets the item panels in an action answer, so a Studio action keeps the Studio panel.
+A page refresh reads `location.pathname`, so the Studio refreshes as the Studio.
+
+Each producer has one top priority item: the `top_item` List number in its staff row.
+`ListView.top_priority` is `TopPriority.SHOWN` for the Studio and `TopPriority.HIDDEN` for the List, so the List does not change.
+`list_page.top_priority_mark` reads the mark at render time.
+An item is the top item when it is open, its producer is an active producer row, and that row names its number.
+A Closed or missing item reads as no top item, and the page writes nothing when an item closes.
+A flag before the title marks the top item in its row, also on the All tab.
+Each other open item of an active producer has the button **Make top priority** in its panel. An item of a retired or unknown producer shows neither the flag nor the button.
+`list_page.top_button` gives the button to both panel forms: beside Remove, or beside Mark read and Unpark when the item waits for an answer.
+The button posts the action `top`. `the_list.make_top_priority` names the item as the top item of its producer, so it takes the place of the old one.
+The List path refuses `top`. The refresh after the save moves the flag and the band.
+
+The band is above the filters on a producer tab and hidden on All.
+It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
+A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
+The page renders one band for each top item and one band for no top item.
+A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
+`CONSOLE_DOCUMENTS` maps the Studio path to `list`, so New item and its screenshot use the List owner, `page.list.owner`.
+`page.studio.owner` sets the owner when the console shows the Studio as unavailable.
+The Studio uses the List status age limit and has no `status.studio` key.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.
@@ -1638,17 +1697,21 @@ The console lists it as **Images**, with the Lucide `image` icon.
 A showrunner or unit registers each image, or a before and after pair, with one command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --title "TITLE" [--look-for "POINT"]... --owner STAFF_ID (--change ID | --phase ID)
 ```
 
-- The caption is the change in the fewest plain words that stay accurate. It adds a second line, `Look for: <place>`, only when the change is hard to find.
+- The title says what the image shows. Give one `--look-for` for each point the user needs to check.
+- `max_chars.image_title` in `config/review_links.conf` limits the title to 80 characters.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
-- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
+- The title and each optional point must each contain one nonempty line.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  The record stores `title` and the `look_for` list. It also stores the full text in `caption` for older services.
+  The page uses the full `caption` as the title if the record has no `title`.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
@@ -1659,11 +1722,12 @@ A showrunner or unit registers each image, or a before and after pair, with one 
 
 Each card shows, in this order:
 
-1. The caption as the card title, in a larger font.
-2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
-4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved** and **Send Feedback**.
+1. The full title in normal weight at the List title size. The title wraps when it exceeds the card width.
+2. The optional points as bullets in the secondary text color.
+3. The details with aligned labels for the owner, subject, and time.
+4. The image link. A pair shows both images under **Before** and **After** labels.
+5. The **Feedback** field. `feedback_rows` in `config/review_links.conf` sets its height.
+6. The **Approved**, **Send Feedback**, and **Ask question** buttons.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
@@ -1684,7 +1748,8 @@ The modal dialog takes focus and uses the image's alt text as its accessible nam
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The Images page shows every waiting image, oldest first, with no age filter.
-A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
+A pair shares one title, bullet list, details block, Feedback field, and set of answer buttons.
+The owner can delete both images with one command.
 On a page 1108px or wider, a single card is 680px wide while the group panel is 300px or narrower, and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card.
@@ -1719,7 +1784,8 @@ The server sends one message to the owner's staff id, resolved to its current se
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
 A `Feedback:` line follows when the user wrote text.
-Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
+The message includes the image links, the title, any points to check, the subject, and the delete command.
+The question message also includes the title and any points to check.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
 A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.
@@ -1746,26 +1812,30 @@ The page loads three.js from cdnjs. Served page documents send no Content-Securi
 The status line names each waiting rebuild in the `For you:` row.
 The same row shows the count of other open actions or `Unavailable` when the count fails.
 Each render checks whether the rebuild cache needs a refresh.
-The page combines the cached system comparison with open rebuild needs.
+The page combines the cached system comparison with open rebuild needs and completed requests.
 The server serves it only in a folder that holds the browser manifest.
 It has no navigation entry; `?page=rebuilds` opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
-Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.
-Each owner shows once, as a heading, and the owner with the newest change comes first.
-Under an owner, the changes go newest first, and changes with the same shown time share one time.
-The time is a column at the left, with the reasons of that time beside it.
-The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
-`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
-A commit's reason is its subject and its time is the author time.
-Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
-A filed need is a change with its requester (else the affected session) as owner, its creation time and its reason.
-A need covers its own commit, so that commit shows once.
+Each machine block shows open request reasons and groups them by requester.
+The affected session appears when a request has no requester.
+The Commits section lists subjects for commits without an open request.
+The section lists commits on the configured ref after the verified running revision.
+`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`.
+The status line refresh writes that file.
+The commit author time appears beside the subject.
+The `Claude-Session` line identifies the author through the transcript for that Remote Control session.
+Each section groups entries by owner.
+The owner with the newest entry appears first.
+Entries with the same owner and displayed time share one time.
 Names come from the current staff record as `<name> (<kind>)`.
 An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
 The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour), in gray text that keeps at least 4.5:1 contrast.
 A listed machine without a recorded change list shows `The change list is not available yet.`
-When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
+When no machine needs a rebuild, the page shows `No rebuilds needed.`, with a count of 0 and an empty label.
+Completed requests remain available below the waiting machines.
+They appear once per machine and commit, newest completion first.
+The page names each damaged archive and shows the valid records.
 
 Machine headings use 20px text; owner headings use 17px; the changes use 15px.
 The content column is up to 1060px wide.
@@ -2175,7 +2245,7 @@ It exits with status 0 when the folder disappears.
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
 
-The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+The shared check covers POST requests, New item token requests, Go token requests, Review attachment requests, and Studio picture requests.
 These requests require a single `Host` header for the server's bound address and port.
 The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
 On port 80, the server also accepts either host without a port.
@@ -2362,6 +2432,8 @@ The page, the footer and `/next` use these same folder readers.
 
 `placement_disk.file` in `config/console.conf` names the Placement disk POC file; see [Placement disk POC page](#placement-disk-poc-page).
 A `~` at the start of the path expands to the home folder.
+`studio_avatar_root` in `config/review_links.conf` names the Studio picture folder; see [The Studio page](#the-studio-page).
+It must be an absolute path or start with `~`.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.

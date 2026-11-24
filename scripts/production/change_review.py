@@ -572,9 +572,37 @@ def _print_warning(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+@dataclass
+class _ReadinessCommits:
+    pending: dict[Path, tuple[str, int]] = field(default_factory=dict)
+    failures: dict[Path, str] = field(default_factory=dict)
+
+    def add(self, path: Path, subject: str, wrote: bool) -> None:
+        previous, writes = self.pending.get(path, (subject, 0))
+        self.pending[path] = (subject if wrote else previous, writes + wrote)
+
+    def commit(self) -> None:
+        for path, (subject, _) in self.pending.items():
+            try:
+                with _list_lock(path):
+                    _commit([path], subject, readiness=self)
+            except OSError as error:
+                self.failures[path] = next(iter(str(error).splitlines()), type(error).__name__)
+
+    def report(self) -> None:
+        if self.failures:
+            writes = sum(self.pending[path][1] for path in self.failures)
+            details = [f"{path.name}: {reason}" for path, reason in self.failures.items()]
+            summary = (f"change review: {writes} new list write(s) not committed. "
+                       + f"{len(self.failures)} unresolved commit attempt(s).")
+            separator = " " if len(details) == 1 else "\n  "
+            _print_warning(summary + separator + separator.join(details))
+
+
 def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
           what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning,
-          publish: Callable[[Path, str], None] | None = None) -> Result:
+          publish: Callable[[Path, str], None] | None = None,
+          readiness: _ReadinessCommits | None = None) -> Result:
     """Change the list's lines under the lock, then write and commit them.
 
     A change that raises an error writes nothing. The lock is the list's directory.
@@ -588,15 +616,21 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
             text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
             lines = text.splitlines(keepends=True)
             result = write(lines)
-            if lines != text.splitlines(keepends=True):
+            wrote = lines != text.splitlines(keepends=True)
+            if wrote:
                 _sort(path, lines)
                 _stamp(path, lines, production, day)
                 (publish or write_text_atomic)(path, "".join(lines))
-        _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
+        subject = f"{_owner(path)} {what(result)}"
+        if readiness is None:
+            _commit([path], subject, report_warning=report_warning)
+        else:
+            readiness.add(path, subject, wrote)
         return result
 
 
-def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str], None] = _print_warning) -> None:
+def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str], None] = _print_warning,
+            readiness: _ReadinessCommits | None = None) -> None:
     """Commit only the lists through Git plumbing, without refreshing the index."""
     folder = paths[0].parent
 
@@ -648,7 +682,10 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                         raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
         reason = next(iter(str(error).splitlines()), type(error).__name__)
-        report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
+        if readiness is None:
+            report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
+        else:
+            readiness.failures[paths[0]] = reason
 
 
 def _table(path: Path, lines: list[str], section: str) -> tuple[list[str], int, int]:
@@ -768,7 +805,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                 record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
                 on_hold: Callable[[PublicationChange], None] | None = None,
                 merge_changes: Sequence[PublicationChange] = (), added_at: datetime | None = None,
-                on_image_problem: Callable[[PublicationChange, str], None] = _refuse_image_problem) -> list[str]:
+                on_image_problem: Callable[[PublicationChange, str], None] = _refuse_image_problem,
+                readiness: _ReadinessCommits | None = None) -> list[str]:
     """Add changes to To review with fixed staff IDs from record.
 
     owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
@@ -862,7 +900,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             visible = [WrittenReviewRow(path, row) for row in pending_rows]
             raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
 
-    rows = _edit(path, production, day, write, what, publish=publish)
+    rows = _edit(path, production, day, write, what, publish=publish, readiness=readiness)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -2496,7 +2534,21 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
                     review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                     selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                     known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
-    """Add live changes on origin/main, or release one completed step of one merge."""
+    """Add live changes on origin/main, or release one completed step of one merge.
+
+    Try the vault lock once per list after the scan. Report any uncommitted lists together.
+    """
+    commits = _ReadinessCommits()
+    try:
+        return _scan_ready_rows(repo, production, merge_branch, review_list, record, selection, known_producer, commits)
+    finally:
+        commits.commit()
+        commits.report()
+
+
+def _scan_ready_rows(repo: Path, production: Path, merge_branch: str, review_list: Path | None,
+                     record: staff.StaffSnapshot | None, selection: ReadinessScan | CompletedStep,
+                     known_producer: KnownMergeProducer | UnknownProducer, commit_report: _ReadinessCommits) -> list[WrittenReviewRow]:
     repo = repo.expanduser().resolve()
     try:
         fetched = subprocess.run(["git", "-C", str(repo), "fetch", "origin", "main"],
@@ -2618,7 +2670,8 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
             try:
                 written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
                                       on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem,
+                                      readiness=commit_report)
             except ReviewListDurabilityUnconfirmed as error:
                 raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error
             except (ChangeReviewError, OSError, UnicodeError) as error:

@@ -56,7 +56,7 @@ from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import console_tune, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
-from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, test_review_page
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, placement_disk, review_actions, review_later, review_page, review_items, serve, studio_page, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -93,7 +93,8 @@ def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = write_config_fixture(configuration / "change_review.conf")
     _ = write_config_fixture(configuration / "review_links.conf",
-        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n")
+        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n"
+        + f"studio_avatar_root={configuration / 'studio-avatars'}\n")
     _ = write_config_fixture(configuration / "console.conf",
         "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
         + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
@@ -705,7 +706,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             HttpReply(200, "image/png", image.png))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
-    def test_shared_dialog_opens_from_all_ten_served_console_pages(self) -> None:
+    def test_shared_dialog_opens_from_all_eleven_served_console_pages(self) -> None:
         from scripts.build_queue import memory_files
         from scripts.disks import disks_page
         from scripts.review_links.test_new_item_dialog import DialogFixture, capture_dialogs
@@ -735,6 +736,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             "placement_disk": placement_disk.PAGE_PATH,
             "rebuilds": f"/console/{change_page.REBUILDS_NAME}",
             "review": review_page.PAGE_PATH,
+            "studio": studio_page.PAGE_PATH,
         }
         probe = b"""<script>
 (async ()=>{
@@ -763,7 +765,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.subTest(page=page):
                     response = self.request(path)
                     self.assertEqual(response.status, 200, response.body)
-                    self.assertIn(f'data-page-owner="{page}"'.encode(), response.body)
+                    # The Studio document keeps the List New item flow.
+                    owner_page = serve.CONSOLE_DOCUMENTS.get(path, page)
+                    self.assertIn(f'data-page-owner="{owner_page}"'.encode(), response.body)
                     self.assertIn(f'aria-label="New item for {owner.name}"'.encode(), response.body)
                     documents[index] = response.body.replace(b"</body>", probe + b"</body>")
                     fixtures[index] = DialogFixture(self.root)
@@ -4910,7 +4914,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["cache-control"], "no-store")
         self.assertEqual(json.loads(body), {"available": True, "count": 2, "other_count": 1, "rebuild_machines": ["mac"]})
-        read.assert_called_once_with(include_comparison_reason=False)
+        read.assert_called_once_with(include_running_revision=False)
+        partial = replace(snapshot, unavailable=(for_you.UnavailableSource("rebuild needs", "Bad record.", partial=True),))
+        with patch.object(for_you, "read", return_value=partial):
+            status, _, body = self.head("/console/for-you.json?view=count")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"available": False, "partial": True, "other_count": 1,
+                                           "rebuild_machines": ["mac"]})
 
     def test_for_you_count_view_keeps_rebuilds_when_the_read_exceeds_the_recursion_limit(self) -> None:
         rebuild = rebuild_row.RebuildAnswer(("natedev", "mac"), False)
@@ -4973,6 +4983,96 @@ class ReviewLinksServerTests(unittest.TestCase):
             failed = self.request(list_page.PAGE_PATH)
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
+
+    def test_studio_serves_the_list_rows_under_picture_tabs(self) -> None:
+        _, item = self.list_keeper_item("Read the Studio page")
+        response = self.request(studio_page.PAGE_PATH)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertIn(b"<title>The Studio</title>", response.body)
+        self.assertIn(b'<div class="studio-tabs">', response.body)
+        self.assertIn(item.title.encode(), response.body)
+        self.assertEqual(response.body.count(b'aria-label="Producer" data-filter-row="producer">'), 1)
+        self.assertIn(f'data-list-path="{studio_page.PAGE_PATH}"'.encode(), response.body)
+        with (patch.object(list_page, "render", side_effect=OSError("fixture read failed")),
+              redirect_stderr(StringIO()) as log):
+            failed = self.request(studio_page.PAGE_PATH)
+        self.assertEqual(failed.status, 503)
+        self.assertIn(b"The Studio page is not available.", failed.body)
+        self.assertIn("review-links studio: fixture read failed", log.getvalue())
+
+    def test_studio_top_priority_post_names_the_item_and_refuses_other_requests(self) -> None:
+        morty, item = self.list_keeper_item("Make this the top item")
+        _, closed = self.list_keeper_item("A closed item")
+        record = [staff.StaffSnapshot((morty,))]
+
+        def name_top_item(identity: staff.StaffId, top_item: staff.TopItem) -> staff.StaffRow:
+            named = replace(morty, top_item=top_item)
+            self.assertEqual(identity, morty.id)
+            record[0] = staff.StaffSnapshot((named,))
+            return named
+
+        def current_record(*_arguments: object, **_options: object) -> staff.StaffSnapshot:
+            return record[0]
+
+        def fields(entry: the_list.ListItem) -> dict[str, str]:
+            request = uuid4().hex
+            return {"keeper": morty.id, "id": entry.id, "request": request,
+                    "token": list_page.request_token(self.root, morty.id, entry.id, request),
+                    "action": "top", "words": "", "until": ""}
+
+        with (patch.object(staff, "snapshot", side_effect=current_record),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(staff, "set_producer_top_item", side_effect=name_top_item) as write):
+            _ = the_list.close(morty.id, closed.id, "Done", source="nate")
+            refusals = ((list_page.PAGE_PATH, fields(item), "", 400), (studio_page.PAGE_PATH, fields(closed), "", 400),
+                        (studio_page.PAGE_PATH, {**fields(item), "token": "bad"}, "", 400),
+                        (studio_page.PAGE_PATH, fields(item), "https://elsewhere.invalid", 403))
+            for path, body, origin, status in refusals:
+                with self.subTest(path=path, id=body["id"], origin=origin):
+                    self.assertEqual(self.post(path, urlencode(body), origin=origin)[0], status)
+            with (patch.object(self.server, "verified_tailscale_address", ""),
+                  patch.object(serve, "tailscale_ip", return_value="100.64.0.9")):
+                self.assertEqual(self.post(studio_page.PAGE_PATH, urlencode(fields(item)))[0], 403)
+            write.assert_not_called()
+            code, body = self.post(studio_page.PAGE_PATH, urlencode(fields(item)))
+            self.assertEqual(code, 200, body)
+            page = self.request(studio_page.PAGE_PATH).body.decode()
+        write.assert_called_once_with(morty.id, staff.TopItem(item.number))
+        response = cast(dict[str, str], json.loads(body))
+        self.assertEqual(response["state"], "saved")
+        self.assertNotIn("Make top priority", response["detail_html"])
+        self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
+        self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
+
+    def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
+        avatars = self.root.parent.resolve() / "studio-avatars"
+        pictures = avatars / "all"
+        pictures.mkdir(parents=True)
+        picture = b"RIFF\x10\x00\x00\x00WEBPVP8 fixture"
+        _ = (pictures / "01-64.webp").write_bytes(picture)
+        _ = (pictures / "02-64.webp").write_bytes(b"x" * (studio_page.MAX_AVATAR_BYTES + 1))
+        (pictures / "03-64.webp").symlink_to(self.outside)
+        (avatars / "a898cb38-dbac-4751-b72b-d0b14ab9c38d").symlink_to(pictures, target_is_directory=True)
+        _ = self.enterContext(patch.object(studio_page, "avatar_root", return_value=avatars))
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        served = self.request(f"{studio_page.AVATAR_PATH}/all/01-64.webp")
+        self.assertEqual((served.status, served.content_type, served.body), (200, "image/webp", picture))
+        self.assertEqual(served.headers["cache-control"], "max-age=86400")
+        self.assertEqual(served.headers["x-content-type-options"], "nosniff")
+        for name in ("all/01-32.webp", "all/1-64.webp", "all/04-64.webp", "all/02-64.webp", "all/03-64.webp",
+                     "a898cb38-dbac-4751-b72b-d0b14ab9c38d/01-64.webp", "outside/01-64.webp",
+                     "all/../all/01-64.webp", "all/01-64.webp/x", "all/01-64.png"):
+            with self.subTest(name=name):
+                self.assertEqual(self.request(f"{studio_page.AVATAR_PATH}/{name}").status, 404)
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        connection.request("GET", f"{studio_page.AVATAR_PATH}/all/01-64.webp", headers={"Host": "elsewhere.invalid"})
+        response = connection.getresponse()
+        _ = response.read()
+        self.assertEqual(response.status, 403)
+        with (patch.object(self.server, "verified_tailscale_address", ""),
+              patch.object(serve, "tailscale_ip", return_value="100.64.0.9")):
+            self.assertEqual(self.request(f"{studio_page.AVATAR_PATH}/all/01-64.webp").status, 403)
 
     def test_list_serves_published_review_links_and_counts_in_separate_requests(self) -> None:
         case = self.review_fixture(changes=1)

@@ -459,7 +459,13 @@ Each local Promote checkout must exist before the command pushes.
   A directory lock protects every write without a separate lock file.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
-  A failed commit prints `written but not committed`; the next write commits the complete list.
+  Commits share the vault's main push lock with the other Git writers.
+  At the end of a readiness scan, the scan tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
+  The scan reports each unresolved list and its commit errors in one warning at the end.
+  The warning counts new writes separately from attempts to commit existing content.
+  Other list writes report a commit failure immediately.
+  The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
   Every new or edited visible row requires a registered image.
@@ -593,6 +599,8 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Make an open item the top priority item of its producer with `top-priority --id L<n>`.
+   A producer can name only its own item. Morty can name the item of any producer.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.

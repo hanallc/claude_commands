@@ -36,7 +36,7 @@ REVIEW_PLACE_SCRIPT = review_legacy.SCRIPT + r"""function legacyReviewPlace(para
 }
 """
 ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "server", "hard-drive", "image", "message-circle-question", "panel-left-close",
-                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search", "torus"))
+                        "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search", "torus", "clapperboard"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 # The console folder keeps the items each page held when the user last opened it, for every browser.
 SEEN_NAME = ".review-link-seen.json"
@@ -241,6 +241,8 @@ def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
     payload: dict[str, object] = {**for_you_count(snapshot), "rebuild_machines": status.rebuild_machines}
     if isinstance(status.other_count, int):
         payload["other_count"] = status.other_count
+    if status.partial:
+        payload["partial"] = True
     return payload
 
 

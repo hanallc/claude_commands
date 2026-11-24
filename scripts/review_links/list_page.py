@@ -10,7 +10,7 @@ import secrets
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
@@ -87,6 +87,40 @@ class ListRecord(NamedTuple):
     @property
     def key(self) -> str:
         return f"{self.keeper}/{self.item.id}"
+
+
+class TopPriority(Enum):
+    """Whether a List view shows each producer's top priority item."""
+
+    SHOWN = "the band, the row flag and the Make top priority button"
+    HIDDEN = "no top priority marks"
+
+
+class TopPriorityMark(Enum):
+    """The top priority mark of one open item in a List view."""
+
+    HIDDEN = "no mark: the view shows none, or the item has no active producer"
+    TOP_ITEM = "the flag: the item is the top priority item of its producer"
+    MAKE_TOP = "the Make top priority button"
+
+
+STATE_TONES = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
+               the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
+               the_list.ItemState.DONE: "room"}
+TOP_FLAG = ('<svg class="list-top-flag" viewBox="0 0 16 16" aria-hidden="true" focusable="false">'
+            '<path d="M3 1v14h1.7V9.6h3.1l.6 1.4H13V3.4H9.2L8.6 2H4.7V1z"/></svg>')
+
+
+def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: the_list.ListItem) -> TopPriorityMark:
+    """Read the top item at render time: a closed item, or one of another producer, is not a top item."""
+    if shown is TopPriority.HIDDEN:
+        return TopPriorityMark.HIDDEN
+    producer = members.by_id(item.producer)
+    # Only an active producer has a top item, so the item of any other row shows neither the flag nor the button.
+    if (item.state == the_list.ItemState.CLOSED or producer is None or producer.kind != "producer"
+            or isinstance(producer.retirement, staff.RetiredProducer)):
+        return TopPriorityMark.HIDDEN
+    return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
 def page_url() -> str:
@@ -369,16 +403,23 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
-def feedback_form(entry: ListRecord, secret: str, *, keeper_name: str, parking_label: str = "") -> str:
+def top_button(mark: TopPriorityMark) -> str:
+    """Render the Make top priority button of an item panel."""
+    return '<button name="action" value="top">Make top priority</button>' if mark is TopPriorityMark.MAKE_TOP else ''
+
+
+def feedback_form(entry: ListRecord, secret: str, *, keeper_name: str, parking_label: str = "",
+                  mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
+    top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     keeper_label = html.escape(keeper_name, quote=True)
     words_label = f"Your words for {keeper_label} about this item"
     parked = '' if parking_label else ' hidden'
     note = 'Parked until ' + parking_label if parking_label else ''
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
-            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
+            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
             + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
             + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
@@ -523,8 +564,10 @@ def review_version(item: the_list.ListItem) -> str:
     return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
-def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool) -> str:
-    if not parking_label and not unread:
+def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool,
+                          mark: TopPriorityMark) -> str:
+    top = top_button(mark)
+    if not parking_label and not unread and not top:
         return ""
     parked = '' if parking_label else ' hidden'
     unpark = parked if entry.item.state != the_list.ItemState.CLOSED else ' hidden'
@@ -534,7 +577,7 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
     return ('<form method="post" data-feedback-form data-waiting-actions>' + signed_form_fields(entry, secret)
             + '<input type="hidden" name="words"><input type="hidden" name="until">'
             + f'<p data-parked-detail{parked}>{note}</p>'
-            + '<div class="list-actions">' + read
+            + '<div class="list-actions">' + read + top
             + '<div class="list-parking-actions">'
             + f'<button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button></div></div>'
             + '<span role="status" data-send-status></span></form>')
@@ -542,20 +585,21 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
-                    reviews: ReviewDisplay, parking_label: str) -> str:
+                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark) -> str:
     sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
-                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
+                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
+                    mark=mark))
     return detail_panel(entry, sections, today, names, unread_answers)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-            unread_answers: frozenset[str], *, parking_label: str) -> str:
+            unread_answers: frozenset[str], *, parking_label: str, mark: TopPriorityMark) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
-        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label)
+        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark)
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
@@ -565,14 +609,15 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     questions = panel_questions(item, today, unread_answers, visibility.failed)
     keeper = names.members.by_id(entry.keeper)
     form = feedback_form(entry, secret, keeper_name=keeper.name if keeper is not None else "the record keeper",
-                         parking_label=parking_label)
+                         parking_label=parking_label, mark=mark)
     return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
         entry, sections + questions + form, today, names, unread_answers)
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, parked: bool, open_question: bool,
-              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str]) -> str:
+              visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str],
+              mark: TopPriorityMark) -> str:
     item = entry.item
     owner = owner_name(names.members, item.owner)
     producer = owner_name(names.members, item.producer)
@@ -599,11 +644,12 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
               + f'aria-label="Show item {item.number}" id="list-toggle-{row_id}">'
               + f'<span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
+    if mark is TopPriorityMark.TOP_ITEM:
+        title = ('<span class="list-top-mark" role="img" aria-label="Top priority" title="Top priority">'
+                 + TOP_FLAG + '</span>' + title)
     if item.unit:
         title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
-    tone = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
-            the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
-            the_list.ItemState.DONE: "room"}.get(item.state, "muted")
+    tone = STATE_TONES.get(item.state, "muted")
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
         state += '<small data-open-question-note>Morty answering</small>'
@@ -640,7 +686,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
              title, state, field_html("next_step", item.next_step, today, names), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
-    body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label)
+    body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
+                   mark=mark)
     revision = detail_revision(item, body)
     return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
@@ -712,16 +759,17 @@ class SavedActionState(TypedDict):
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
                        park_request: str = "",
                        review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                       include_detail: bool = False) -> SavedActionState:
+                       include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN) -> SavedActionState:
     owner = staff.StaffId(keeper)
     return action_state(owner, the_list.load(owner, identity), status=status,
-                        park_request=park_request, review_records=review_records, include_detail=include_detail)
+                        park_request=park_request, review_records=review_records, include_detail=include_detail,
+                        top_priority=top_priority)
 
 
 def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                  status: change_page.DeliveryStatus | None = None, park_request: str = "",
                  review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                 include_detail: bool = False) -> SavedActionState:
+                 include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN) -> SavedActionState:
     zone = user_zone()
     today = the_list.now()
     local_today = today.astimezone(zone)
@@ -760,7 +808,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
             saved["review_summary_html"] = review_summary(item, reviews, today)
         secret = form_secret(reading.root)
         body = details(ListRecord(owner, item), local_today, secret, reviews, names,
-                       visibility, unread_answers, parking_label=parked_until)
+                       visibility, unread_answers, parking_label=parked_until,
+                       mark=top_priority_mark(top_priority, members, item))
         if waiting:
             saved["waiting_details_html"] = body
         if include_detail:
@@ -786,7 +835,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
 
 def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
                 review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                include_detail: bool = False) -> tuple[ListActionSubmission, SavedActionState | None]:
+                include_detail: bool = False,
+                top_priority: TopPriority = TopPriority.HIDDEN) -> tuple[ListActionSubmission, SavedActionState | None]:
     """Accept signed item actions for the record keeper."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if (set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"}
@@ -804,6 +854,8 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
+    if action == "top" and top_priority is TopPriority.HIDDEN:
+        raise question_record.AnswerRefused("this page has no top priority items")
     read_edit = None
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
@@ -815,7 +867,8 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
         return delivery, None
     try:
         item = read_edit.item if read_edit is not None else the_list.load(keeper, identity)
-        state = action_state(keeper, item, status=status, review_records=review_records, include_detail=True)
+        state = action_state(keeper, item, status=status, review_records=review_records, include_detail=True,
+                             top_priority=top_priority)
     except Exception as error:
         print(f"review-links List saved {identity}: {error}", file=sys.stderr)
         return delivery, None
@@ -847,6 +900,9 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
         changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice).item
+    elif action == "top":
+        _ = the_list.make_top_priority(keeper, identity)
+        return change_page.NoMessageDelivery()
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(keeper, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
@@ -981,9 +1037,82 @@ def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner
               for label, identity, count in choices)]
 
 
+type ProducerControl = Callable[[staff.StaffSnapshot, Counter[the_list.ItemOwner]], str]
+
+
+def producer_chip_row(members: staff.StaffSnapshot, producers: Counter[the_list.ItemOwner]) -> str:
+    """Render the Producer chips."""
+    return record_table.chip_row('Producer', staff_chips(members, producers), 'all')
+
+
+class ProducerPlacement(Enum):
+    """Where a List view puts its Producer control."""
+
+    ABOVE_FILTERS = "above the filters"
+    BESIDE_WORDS = "beside the words box"
+
+
+@dataclass(frozen=True)
+class ListView:
+    """The page around the List rows: its names, its path, its style, its Producer control and its top items."""
+
+    title: str
+    log_name: str
+    path: str
+    style: str
+    producer: ProducerControl
+    placement: ProducerPlacement
+    top_priority: TopPriority
+
+
+LIST_VIEW = ListView("The List", "list", PAGE_PATH, '', producer_chip_row, ProducerPlacement.BESIDE_WORDS,
+                     TopPriority.HIDDEN)
+TOP_LABEL = '<span class="list-top-label">' + TOP_FLAG + 'Top priority</span>'
+NO_TOP_ITEM = ('<div class="list-top-what"><b>No top priority item</b>'
+               + '<div class="list-top-next">Open an item and click "Make top priority".</div></div>')
+
+
+def top_band(value: str, content: str) -> str:
+    return (f'<section class="list-top-band" data-top-band="{html.escape(value, quote=True)}" aria-label="Top priority">'
+            + TOP_LABEL + content + '</section>')
+
+
+def css_string(value: str) -> str:
+    """Quote a value for a CSS attribute selector; a hex escape keeps every other character literal."""
+    return '"' + "".join(char if char.isascii() and (char.isalnum() or char in "-_:") else f"\\{ord(char):x} "
+                         for char in value) + '"'
+
+
+def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_names.StaffNames) -> str:
+    """Render each producer's top item band and one band for a producer without one.
+
+    The style shows only the band of the pressed Producer chip, so a chip click makes no request.
+    """
+    bands: list[str] = []
+    values: list[str] = []
+    for entry in sorted(top_items, key=lambda entry: entry.item.producer):
+        item = entry.item
+        value = f"staff:{item.producer}"
+        values.append(css_string(value))
+        bands.append(top_band(value, f'<div class="list-top-what"><b>#{item.number} {html.escape(item.title)}</b>'
+                              + '<div class="list-top-next">' + field_html("next_step", item.next_step, today, names)
+                              + '</div></div>'
+                              + f'<div class="list-top-meta"><span class="list-state {STATE_TONES.get(item.state, "muted")}">'
+                              + html.escape(item.state.value) + '</span>'
+                              + '<small>ETA ' + html.escape(eta_cell_text(item.eta, today)) + '</small></div>'))
+    chip = '[data-list]:has([data-filter-row="producer"] [aria-pressed="true"]'
+    rules = ['.list-top-band{display:none}',
+             chip + ':not([data-filter-value="all"]' + ''.join(f',[data-filter-value={value}]' for value in values)
+             + ')) [data-top-band="none"]{display:flex}',
+             *(f'{chip}[data-filter-value={value}]) [data-top-band={value}]{{display:flex}}' for value in values)]
+    return ('<div class="list-top-bands"><style>' + '\n'.join(rules) + '</style>'
+            + ''.join(bands) + top_band("none", NO_TOP_ITEM) + '</div>')
+
+
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
            status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK) -> bytes:
+           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK,
+           view: ListView = LIST_VIEW) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
@@ -1011,7 +1140,11 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     rows: list[str] = []
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
+    top_items: list[ListRecord] = []
     for index, (entry, parked) in enumerate(ordered_items):
+        mark = top_priority_mark(view.top_priority, members, entry.item)
+        if mark is TopPriorityMark.TOP_ITEM:
+            top_items.append(entry)
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
         open_question = the_list.has_open_question(entry.item)
@@ -1030,7 +1163,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         rows.append(
             item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                      open_question=open_question, visibility=visibility, unread_answers=unread_answers))
+                      open_question=open_question, visibility=visibility, unread_answers=unread_answers, mark=mark))
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
@@ -1054,16 +1187,21 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
+    producer_control = view.producer(members, producers)
+    action_path = f' data-list-path="{view.path}"' if view.path != PAGE_PATH else ''
+    content = (STYLE + view.style + page_frame.title(view.title, "list")
+               + f'<div data-list{action_path} data-refresh-seconds="{seconds}"'
+               + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
+               + (producer_control if view.placement is ProducerPlacement.ABOVE_FILTERS else '')
+               + (top_bands(top_items, today, names) if view.top_priority is TopPriority.SHOWN else '')
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
                + '<div class="list-producer-filter">'
-               + record_table.chip_row('Producer', staff_chips(members, producers), 'all')
+               + (producer_control if view.placement is ProducerPlacement.BESIDE_WORDS else '')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')
@@ -1085,7 +1223,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
                + record_table.render_inline_detail()
                + '<script>' + SCRIPT + '</script>')
-    return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
+    return page_frame.rendered(change_page.document(content, view.title), started, read_at)
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
@@ -1208,6 +1346,7 @@ const chipFor=data=>{
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
 let content=document.querySelector('[data-list]');
+const actionPath=content.dataset.listPath || location.pathname;
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
 function listRequestSignal(){
@@ -1584,7 +1723,7 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+    const response=await fetch(actionPath,{method:'POST',body:data});
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -1668,7 +1807,7 @@ function bindFeedbackForm(form){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
       if(parks) query.set('park-request',attempt.request);
-      const response=await fetch(location.pathname+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+      const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
      }catch(_){}
@@ -1852,6 +1991,10 @@ function applyListSnapshot(fresh){
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter && !nextFooter.childNodes.length)
   nextFooter.replaceChildren(...footer.childNodes);
+ for(const picture of content.querySelectorAll('img[data-keep-src]')){
+  const next=fresh.querySelector('img[data-keep-src="'+CSS.escape(picture.dataset.keepSrc)+'"]');
+  for(const name of ['src','srcset']) next?.setAttribute(name,picture.getAttribute(name));
+ }
  restoreEvidenceDetails(fresh);
  const key=tableView.openItem?.dataset.key;
  const nextItem=key && rowIn(fresh,key);
@@ -1879,7 +2022,8 @@ function applyListSnapshot(fresh){
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
 const reviewMotion=createCardMotion(()=>content);
-const listHost=window.frameElement?.matches('iframe[data-console-page="list"]') ? window.frameElement : null;
+const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
+ ? window.frameElement : null;
 let activeReview,savedReview,refreshingReview=false;
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');

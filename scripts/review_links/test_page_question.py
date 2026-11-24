@@ -240,7 +240,7 @@ class PageQuestionTests(unittest.TestCase):
                 item = f"{number:012x}"
                 folder = store.root / item
                 folder.mkdir(parents=True)
-                image: image_store.ImageRecord = {"id": item, "file": "gate.png", "caption": "The gate",
+                image: image_store.ImageRecord = {"id": item, "file": "gate.png", "title": "The gate", "look_for": [],
                     "owner": "fixture-owner", "subject": "Test", "registered_at": "2026-11-20T12:00:00+00:00"}
                 image_store.write_record(folder, image)
                 target = change_page.image_question_target(folder / image_store.RECORD, image)
