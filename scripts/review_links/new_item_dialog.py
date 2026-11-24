@@ -288,7 +288,7 @@ class PageRecipient(StrEnum):
 @dataclass(frozen=True)
 class NewItemRequest:
     request_id: str
-    kind: SubmissionKind
+    kind: SubmissionKind | Literal["enhancement"]
     recipient_id: staff.StaffId
     words: str
     evidence: Evidence
@@ -605,7 +605,8 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
-    kind = read_kind(data.get("kind"))
+    kind_value = data.get("kind")
+    kind = "enhancement" if kind_value == "enhancement" else read_kind(kind_value)
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
@@ -763,8 +764,10 @@ def read_request_id(value: object) -> str:
     return identity
 
 
-def read_words(value: object, label: str) -> str:
-    return _text(value, label, MAX_WORDS_LENGTH)
+def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enhancement"] | None = None) -> str:
+    """Check the user's words before adding the Enhancement prefix."""
+    words = _text(value, label, MAX_WORDS_LENGTH)
+    return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
 SCHEDULED_KIND = "scheduled"
@@ -814,11 +817,23 @@ def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
                                read_words(fields.get("words"), "Your words"), page)
 
 
+_SPARKLES = """<!-- @license lucide-static v0.468.0 - ISC -->
+<svg aria-hidden="true" focusable="false" class="lucide lucide-sparkles"
+    xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+  <path d="M20 3v4" />
+  <path d="M22 5h-4" />
+  <path d="M4 17v2" />
+  <path d="M5 18H3" />
+</svg>"""
+
 KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          (SubmissionKind.QUESTION, "Question", "circle-help"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
          (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
+         ("enhancement", "Enhancement", "sparkles"),
          (SCHEDULED_KIND, "Scheduled", "clock-alert"))
 
 
@@ -826,7 +841,8 @@ def render() -> str:
     """Render the dialog that the page owner button opens."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
-        + f'<span data-button-face>{page_frame.icon_svg(icon)}<span data-kind-label>{label}</span></span></label>'
+        + f'<span data-button-face>{_SPARKLES if icon == "sparkles" else page_frame.icon_svg(icon)}'
+        + f'<span data-kind-label>{label}</span></span></label>'
         for kind, label, icon in KINDS)
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
@@ -874,7 +890,7 @@ def render() -> str:
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
-   <p id="new-item-saved" role="status" hidden></p>
+   <p id="new-item-saved" data-saved-confirmation role="status" hidden></p>
    <div data-send-controls>
     <button type="button" data-later-draft hidden>Edit a separate draft</button>
     <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button>
@@ -885,7 +901,7 @@ def render() -> str:
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
                                        footer=footer, form=True, body_class='new-item-body')
     return (f'<style>{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
-            f'<script>{SCRIPT.replace("__LIMITS__", limits)}</script>')
+            f'<script>{page_frame.HELD_SEND_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
 
 
 PAGE_STATE_STYLE = '''
@@ -906,112 +922,113 @@ PAGE_STATE_STYLE = '''
 
 STYLE = '''
 /* Keep the page at the same scroll position when a save adds a row. */
-:root:has(#review-new-item[open]) { overflow-anchor: none; }
-#review-new-item button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
-#review-new-item button:disabled { opacity: .55; cursor: default; }
-#review-new-item button:focus-visible, #review-new-item textarea:focus-visible,
-#review-new-item input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
-#review-new-item .new-item-body:not([hidden]) {
+:root:has(:is(#review-new-item,[data-new-item-draft])[open]) { overflow-anchor: none; }
+:is(#review-new-item,[data-new-item-draft]) button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
+:is(#review-new-item,[data-new-item-draft]) button:disabled { opacity: .55; cursor: default; }
+:is(#review-new-item,[data-new-item-draft]) button:focus-visible, :is(#review-new-item,[data-new-item-draft]) textarea:focus-visible,
+:is(#review-new-item,[data-new-item-draft]) input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-body {
  display: grid; align-content: start; gap: 18px;
 }
-#review-new-item fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
-#review-new-item legend, #review-new-item h3 {
+:is(#review-new-item,[data-new-item-draft]) fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
+:is(#review-new-item,[data-new-item-draft]) legend, :is(#review-new-item,[data-new-item-draft]) h3 {
  margin: 0 0 8px; padding: 0; font-size: 11px; line-height: 1.3; font-weight: 500;
  text-transform: uppercase; color: var(--ink-3, #9a988f);
 }
-#review-new-item .new-item-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-#review-new-item .new-item-chip { position: relative; display: inline-flex; max-width: 100%; }
-#review-new-item .new-item-chip[hidden] { display: none; }
-#review-new-item .new-item-chip input {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip { position: relative; display: inline-flex; max-width: 100%; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[hidden] { display: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input {
  position: absolute; width: 1px; height: 1px; padding: 0; margin: 0; opacity: 0;
 }
-#review-new-item .new-item-chip > span {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip > span {
  display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 999px;
  border: 1px solid var(--line, #34332f); color: var(--ink-2, #c3c2b7);
  font-size: 14px; overflow-wrap: anywhere; cursor: pointer;
 }
-#review-new-item .new-item-chip input:checked + span,
-#review-new-item button[type="submit"], #review-new-item [data-done] {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input:checked + span,
+:is(#review-new-item,[data-new-item-draft]) button[type="submit"] {
  background: #2670c5; color: white; border-color: transparent;
 }
-#review-new-item .new-item-chip svg { width: 16px; height: 16px; flex: none; }
-#review-new-item .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
-#review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
-#review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
-#review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
-#review-new-item .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
-#review-new-item [data-scheduled-help] { margin: 0; color: var(--ink-2); }
-#review-new-item.scheduled-locked .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
-#review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-#review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
-#review-new-item [data-recipient-group] { display: flow-root; }
-#review-new-item [data-recipient-group] > legend { float: left; margin-right: 12px; }
-#review-new-item [data-owner-reason] {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip svg { width: 16px; height: 16px; flex: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
+:is(#review-new-item,[data-new-item-draft]) [data-scheduled-help] { margin: 0; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]).scheduled-locked .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
+:is(#review-new-item,[data-new-item-draft]) [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+:is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
+:is(#review-new-item,[data-new-item-draft]) [data-recipient-group] > legend { float: left; margin-right: 12px; }
+:is(#review-new-item,[data-new-item-draft]) [data-owner-reason] {
  margin: 0 0 8px; font-size: 12px; line-height: 1.2; text-align: right; text-wrap: balance; overflow-wrap: anywhere;
  color: var(--ink-3, #9a988f);
 }
-#review-new-item [data-recipients-status], #review-new-item [data-recipients] { clear: both; }
-#review-new-item textarea {
+:is(#review-new-item,[data-new-item-draft]) [data-recipients-status], :is(#review-new-item,[data-new-item-draft]) [data-recipients] { clear: both; }
+:is(#review-new-item,[data-new-item-draft]) textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
  background: var(--bg, #121211); color: inherit; font: 16px/1.45 system-ui, sans-serif;
 }
-#review-new-item textarea::placeholder { color: var(--ink-3, #9a988f); }
-#review-new-item[data-page-bug] textarea { resize: none; }
-#review-new-item .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
-#review-new-item .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
-#review-new-item h2:focus { outline: none; }
-#review-new-item .sent-details h4 { margin: 0 0 11px; }
-#review-new-item [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
-#review-new-item [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
-#review-new-item .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
-#review-new-item .sent-details .new-item-page-capture { font-size: 14px; }
-#review-new-item .sent-details .new-item-previews { margin-top: 10px; }
-#review-new-item .capture-slot {
+:is(#review-new-item,[data-new-item-draft]) textarea::placeholder { color: var(--ink-3, #9a988f); }
+:is(#review-new-item,[data-new-item-draft])[data-page-bug] textarea { resize: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+:is(#review-new-item,[data-new-item-draft]) h2:focus { outline: none; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details h4 { margin: 0 0 11px; }
+:is(#review-new-item,[data-new-item-draft]) [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
+:is(#review-new-item,[data-new-item-draft]) [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .sent-details .new-item-page-capture { font-size: 14px; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details .new-item-previews { margin-top: 10px; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot {
  position: relative; width: min(320px, 100%); aspect-ratio: 1440 / 1000; margin-top: 10px;
  overflow: hidden; background: var(--card); border-radius: 7px; border: 1px solid var(--line);
 }
-#review-new-item .capture-slot a, #review-new-item [data-taking] { position: absolute; inset: 0; }
-#review-new-item .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
-#review-new-item .capture-slot a span {
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a, :is(#review-new-item,[data-new-item-draft]) [data-taking] { position: absolute; inset: 0; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a span {
  position: absolute; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;
  border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--ink);
 }
-#review-new-item .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
-#review-new-item [data-taking]:not([hidden]) {
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
+:is(#review-new-item,[data-new-item-draft]) [data-taking]:not([hidden]) {
  display: flex; justify-content: center; align-items: center; gap: 9px; color: var(--ink-2); font-size: 14px;
 }
-#review-new-item .capture-spinner {
+:is(#review-new-item,[data-new-item-draft]) .capture-spinner {
  width: 14px; height: 14px; border: 2px solid var(--line);
  border-top-color: var(--accent); border-right-color: var(--accent); border-radius: 50%;
 }
-#review-new-item .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
-#review-new-item .new-item-preview {
+:is(#review-new-item,[data-new-item-draft]) .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview {
  position: relative; border: 1px solid var(--line, #34332f); border-radius: 7px;
  max-width: 100%; background: var(--bg, #121211);
 }
-#review-new-item .new-item-preview img { display: block; width: 145px; height: 80px; object-fit: contain; }
-#review-new-item .new-item-preview button {
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview img { display: block; width: 145px; height: 80px; object-fit: contain; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview button {
  position: absolute; top: 3px; right: 3px; width: 28px; height: 28px; padding: 0;
  border: 1px solid #6c6b66; border-radius: 5px; background: #1a1a19; color: #f0efec;
 }
-#review-new-item footer { padding-block: 0 20px; }
-#review-new-item footer > div:not([hidden]) {
+:is(#review-new-item,[data-new-item-draft]) footer { padding-block: 0 20px; }
+:is(#review-new-item,[data-new-item-draft]) footer > div:not([hidden]) {
  display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line, #34332f);
  padding-top: 14px;
 }
-#review-new-item [data-replace-capture]:not([hidden]) { display: flex; gap: 8px; flex-wrap: wrap; }
-#review-new-item [data-send-controls] { flex-wrap: wrap; }
-#review-new-item footer button, #review-new-item [data-replace-capture] button {
+:is(#review-new-item,[data-new-item-draft]) [data-replace-capture]:not([hidden]) { display: flex; gap: 8px; flex-wrap: wrap; }
+:is(#review-new-item,[data-new-item-draft]) [data-send-controls] { flex-wrap: wrap; }
+:is(#review-new-item,[data-new-item-draft]) footer button, :is(#review-new-item,[data-new-item-draft]) [data-replace-capture] button {
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
-#review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
-#review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
-#review-new-item #new-item-saved { margin: 0 0 12px; white-space: pre-line; }
+:is(#review-new-item,[data-new-item-draft]) [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
+:is(#review-new-item,[data-new-item-draft]) [data-saved-confirmation] { margin: 0 0 12px; white-space: pre-line; }
 @media (max-width: 480px) {
- #review-new-item footer { padding-bottom: 14px; }
- #review-new-item .new-item-body { gap: 14px; }
+ :is(#review-new-item,[data-new-item-draft]) footer { padding-bottom: 14px; }
+ :is(#review-new-item,[data-new-item-draft]) .new-item-body { gap: 14px; }
 }
 '''
 
@@ -1019,15 +1036,55 @@ STYLE = '''
 SCRIPT = r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
- const dialog = document.querySelector('#review-new-item');
- const heading = dialog.querySelector('#new-item-title');
+ const original = document.querySelector('#review-new-item');
+ const template = original.cloneNode(true);
+ const drafts = [];
+ const listSendKey = 'console.list.pending-send';
+ const listDraftPrefix = listSendKey + '.';
+ const listStatePrefix = listDraftPrefix + 'state.';
+ const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
+ const submittedKey = 'console.new-item.submitted';
+ const submittedPrefix = submittedKey + '.';
+ let nextDraft = 0;
+
+ function storedListDraft() {
+  try {
+   const legacy = sessionStorage.getItem(listSendKey);
+   if (legacy !== null) {
+    try {
+     const draft = browserDraftId.test(legacy) ? {id: legacy, recipient: null} : JSON.parse(legacy);
+     if (typeof draft?.id === 'string' && browserDraftId.test(draft.id)) {
+      const key = listDraftPrefix + draft.id;
+      if (sessionStorage.getItem(key) === null) {
+       sessionStorage.setItem(key, draft.recipient || '');
+       if (typeof draft.awaitingSend === 'boolean')
+        sessionStorage.setItem(listStatePrefix + draft.id, String(draft.awaitingSend));
+      }
+     }
+    } catch (_) {}
+    sessionStorage.removeItem(listSendKey);
+   }
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key.startsWith(listDraftPrefix)) continue;
+    const id = key.slice(listDraftPrefix.length);
+    if (!browserDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const state = sessionStorage.getItem(listStatePrefix + id);
+    return {id, recipient: sessionStorage.getItem(key) || null, awaitingSend: state === null ? undefined : state === 'true'};
+   }
+  } catch (_) {}
+  return null;
+ }
+
+function bindDraft(dialog, fresh = false) {
+ const heading = dialog.querySelector('h2');
  heading.tabIndex = -1;
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
  const recipientGroup = dialog.querySelector('[data-recipient-group]');
  const ownerReason = dialog.querySelector('[data-owner-reason]');
- const ownerReasonText = ownerReason.querySelector('#review-new-item-owner-reason');
+ const ownerReasonText = ownerReason.querySelector('span');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const wordsPlaceholder = words.placeholder;
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
@@ -1045,14 +1102,11 @@ SCRIPT = r'''(() => {
  const scheduledHelp = dialog.querySelector('[data-scheduled-help]');
  const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
  const sendNotice = dialog.querySelector('[data-send-disabled]');
- const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
+ const confirmation = dialog.querySelector('[data-saved-confirmation]'), done = dialog.querySelector('[data-done]');
  const closeButton = dialog.querySelector('[data-close]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, closeButton,
                  dialog.querySelector('[data-cancel]')];
- const listSendKey = 'console.list.pending-send';
- const submittedKey = 'console.new-item.submitted';
- const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
@@ -1061,7 +1115,7 @@ SCRIPT = r'''(() => {
  let captureSession, pageContext, savedItem, laterDraft, laterBase;
  let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
  let separateFromNativeDraft = false, nativeListEdit, separateListEdit;
- let draftDatabase;
+ let draftDatabase, submittedStorageKey;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -1087,11 +1141,6 @@ SCRIPT = r'''(() => {
   return submittedDraft?.mode === 'edit-later';
  }
 
- function canEditDuringRetry() {
-  return submittedDraft?.mode === 'retry' && submittedDraft.payload.page === 'list' &&
-    Boolean(submittedDraft.payload.defer_capture);
- }
-
  function pendingPayload() {
   if (isRecovering()) return submittedDraft.payload;
  }
@@ -1106,7 +1155,7 @@ SCRIPT = r'''(() => {
   const recipient = recipientChips.querySelector('input:checked');
   const scheduled = isScheduled();
   const recovering = isRecovering();
-  const locked = (recovering && !canEditDuringRetry()) || (scheduled && !!savedItem);
+  const locked = recovering || (scheduled && !!savedItem);
   dialog.classList.toggle('scheduled-locked', scheduled && locked);
   words.readOnly = locked;
   includePage.disabled = sending || locked;
@@ -1170,14 +1219,11 @@ SCRIPT = r'''(() => {
  }
 
  function editDraft(event) {
-  const retry = canEditDuringRetry();
-  if (sending || (isRecovering() && !retry)) return;
+  if (sending || isRecovering()) return;
   if (event?.target.name === 'kind') {
-   if (!retry) {
-    discardCapture();
-    if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
-    ensureDraftId();
-   }
+   discardCapture();
+   if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
+   ensureDraftId();
    showRecipients();
    showBugPage();
    storeListDraft();
@@ -1190,7 +1236,6 @@ SCRIPT = r'''(() => {
    showOwnerReason();
   }
   if (event?.target === includePage && !pendingPayload()) startCapture();
-  if (retry) laterDraft = {...editSnapshot(), id: undefined};
   showSentDetails();
   setError('');
   updateSend();
@@ -1207,7 +1252,7 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
-  if (sending || isScheduled() || (isRecovering() && !canEditDuringRetry())) return;
+  if (sending || isScheduled() || isRecovering()) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -1289,9 +1334,10 @@ SCRIPT = r'''(() => {
   showRecipients();
  }
 
- async function post(payload, keepalive = false) {
-  const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                          body: JSON.stringify(payload), keepalive});
+ async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
+  const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify(payload), keepalive};
+  const response = await (hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options));
   return responseData(response, 'Could not send this item.');
  }
 
@@ -1460,7 +1506,7 @@ SCRIPT = r'''(() => {
   replaceCapture.hidden = !choosing;
   const key = submittedDraft?.payload.capture_key;
   const hasOriginalPreview = key && (captureSession?.capture.key === key || captureSession?.image?.key === key);
-  if (isRecovering() && (choosing || !hasOriginalPreview || !captureSession?.image)) {
+  if (isRecovering() && (choosing || !hasOriginalPreview || captureSession?.image === null)) {
    slot.hidden = true;
    expired.hidden = !choosing;
    fallback.hidden = choosing || !includePage.checked;
@@ -1554,7 +1600,7 @@ SCRIPT = r'''(() => {
   clearCapturePreview(session);
   showSentDetails();
   if (!used && !session.sent) {
-   void session.key.then(key => key && post({token: session.token, discard_capture: key}, true)).catch(() => {});
+   void session.key.then(key => key && post({token: session.token, discard_capture: key}, {keepalive: true})).catch(() => {});
   }
  }
 
@@ -1565,30 +1611,16 @@ SCRIPT = r'''(() => {
   session.image = null;
  }
 
- function storedListDraft() {
-  try {
-   const stored = sessionStorage.getItem(listSendKey);
-   if (!stored) return null;
-   if (stored.startsWith('r6-') && browserDraftId.test(stored)) return {id: stored, recipient: null};
-   const draft = JSON.parse(stored);
-   if (typeof draft?.id !== 'string' || !browserDraftId.test(draft.id)) return null;
-   const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
-   return {id: draft.id, recipient, awaitingSend: draft.awaitingSend};
-  } catch (_) { return null; }
- }
-
  function isShippedListDraft(draft) {
   return draft?.id.startsWith('r6-') && draft.awaitingSend === undefined;
  }
 
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId || isEditingLater() || canEditDuringRetry() ||
+  if (ownerPage !== 'list' || !draftId || isEditingLater() ||
       separateFromNativeDraft || !sendNotice.hidden) return;
   try {
-   sessionStorage.setItem(listSendKey, JSON.stringify({
-    id: draftId, recipient: selectedRecipient,
-    awaitingSend: awaitingNativeRecovery ? undefined : awaitingEarlierSend
-   }));
+   sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   if (!awaitingNativeRecovery) sessionStorage.setItem(listStatePrefix + draftId, String(awaitingEarlierSend));
   } catch (_) {}
  }
 
@@ -1608,39 +1640,52 @@ SCRIPT = r'''(() => {
  }
 
  async function storeSubmittedDraft(draft) {
-  const earlier = sessionStorage.getItem(submittedKey);
+  const id = draft.payload.request_id;
+  const key = submittedStorageKey || (sessionStorage.getItem(submittedKey) ? submittedPrefix + id : submittedKey);
+  const earlier = sessionStorage.getItem(key);
   let pointer;
   try {
-   sessionStorage.setItem(submittedKey, JSON.stringify(draft));
+   sessionStorage.setItem(key, JSON.stringify(draft));
   } catch (failure) {
    if (failure?.name !== 'QuotaExceededError') throw failure;
-   await draftTransaction('readwrite', store => store.put(draft, draft.payload.request_id));
-   pointer = draft.payload.request_id;
-   sessionStorage.setItem(submittedKey, pointer);
+   await draftTransaction('readwrite', store => store.put(draft, id));
+   pointer = id;
+   sessionStorage.setItem(key, pointer);
   }
   if (earlier && browserDraftId.test(earlier) && earlier !== pointer) {
    void draftTransaction('readwrite', store => store.delete(earlier)).catch(() => {});
   }
+  submittedStorageKey = key;
   submittedDraft = draft;
  }
 
  async function restoreSubmittedDraft() {
   if (submittedDraft) return submittedDraft;
-  const stored = sessionStorage.getItem(submittedKey);
-  if (!stored) return;
-  const draft = browserDraftId.test(stored)
-   ? await draftTransaction('readonly', store => store.get(stored)) : JSON.parse(stored);
-  const id = draft?.payload?.request_id || '';
-  const prefix = draft?.payload?.kind === 'scheduled' ? 's1-' : 'r6-';
-  if (browserDraftId.test(id) && id.startsWith(prefix)) submittedDraft = {...draft, mode: draft.mode || 'retry'};
-  else throw new Error('Could not restore the submitted New item.');
+  const keys = draftId ? [submittedPrefix + draftId, submittedKey] :
+   [...Object.keys(sessionStorage).filter(key => key.startsWith(submittedPrefix)), submittedKey];
+  for (const key of keys) {
+   const stored = sessionStorage.getItem(key);
+   if (!stored) continue;
+   const saved = browserDraftId.test(stored)
+    ? await draftTransaction('readonly', store => store.get(stored)) : JSON.parse(stored);
+   const id = saved?.payload?.request_id || '';
+   const prefix = saved?.payload?.kind === 'scheduled' ? 's1-' : 'r6-';
+   if (!browserDraftId.test(id) || !id.startsWith(prefix)) throw new Error('Could not restore the submitted New item.');
+   if (drafts.some(other => other !== draft && other.id === id)) continue;
+   submittedDraft = {...saved, mode: saved.mode || 'retry'};
+   submittedStorageKey = key;
+   break;
+  }
   return submittedDraft;
  }
 
  function clearSubmittedDraft() {
-  const stored = sessionStorage.getItem(submittedKey);
-  sessionStorage.removeItem(submittedKey);
+  if (!submittedDraft) return;
+  const key = submittedStorageKey;
+  const stored = sessionStorage.getItem(key);
+  sessionStorage.removeItem(key);
   submittedDraft = undefined;
+  submittedStorageKey = undefined;
   if (stored && browserDraftId.test(stored)) {
    void draftTransaction('readwrite', store => store.delete(stored)).catch(() => {});
   }
@@ -1648,11 +1693,14 @@ SCRIPT = r'''(() => {
 
  function finishDraft() {
   clearSubmittedDraft();
+  if (ownerPage === 'list' && draftId && !separateFromNativeDraft) {
+   try {
+    sessionStorage.removeItem(listDraftPrefix + draftId);
+    sessionStorage.removeItem(listStatePrefix + draftId);
+   } catch (_) {}
+  }
   draftId = undefined;
   awaitingEarlierSend = awaitingNativeRecovery = false;
-  if (ownerPage === 'list' && !separateFromNativeDraft) {
-   try { sessionStorage.removeItem(listSendKey); } catch (_) {}
-  }
  }
 
  function replaceImages(files) {
@@ -1819,7 +1867,7 @@ SCRIPT = r'''(() => {
  }
 
  function close({sent = false, acknowledged = false} = {}) {
-  if (!dialog.open || sending) return;
+  if (sending || (!sent && !dialog.open)) return;
   const result = savedItem;
   if (result?.attachment_warning) {
    if (!acknowledged) return;
@@ -1846,22 +1894,27 @@ SCRIPT = r'''(() => {
   }
   discardCapture();
   opening.abort();
-  dialog.close();
+  if (dialog.open) hideDialog();
   keepDraft = !returnToNative && !sent && !result &&
     Boolean(submittedDraft || awaitingEarlierSend || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list' || !storedListDraft()) finishDraft();
+   if (!returnToNative) finishDraft();
+   if (result) showConfirmation();
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
    previews.hidden = true;
   }
-  if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
-  if (result) {
-   showConfirmation();
-   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+  if (fresh && !keepDraft) {
+   dialog.remove();
+   drafts.splice(drafts.indexOf(draft), 1);
   }
+ }
+
+ function hideDialog() {
+  dialog.close();
+  if (launcher?.isConnected) launcher.focus({preventScroll: true});
  }
 
  function setSending(value) {
@@ -1882,7 +1935,7 @@ SCRIPT = r'''(() => {
   if (!keepDraft || !submittedDraft) pageContext = collectPageContext();
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId) {
+  if (ownerPage === 'list' && !draftId && !keepDraft) {
    const stored = storedListDraft();
    if (stored) {
     draftId = stored.id;
@@ -1937,10 +1990,6 @@ SCRIPT = r'''(() => {
  }
 
  form.addEventListener('input', editDraft);
- window.addEventListener('pagehide', () => { if (!sending) discardCapture(); });
- window.addEventListener('pageshow', event => {
-  if (event.persisted && dialog.open) startCapture();
- });
  bindConsoleDialog(dialog, close);
  dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
  done.addEventListener('click', () => close({acknowledged: true}));
@@ -1979,6 +2028,7 @@ SCRIPT = r'''(() => {
   let saved, usedPreview = false, posted = false;
   setError('');
   setSending(true);
+  if (!isScheduled()) hideDialog();
   try {
    const item = await submissionPayload();
    if (submittedDraft?.payload !== item) {
@@ -1997,7 +2047,8 @@ SCRIPT = r'''(() => {
    const sendItem = () => {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
-    return post({...item, token});
+    const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
+    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined});
    };
    let result;
    try {
@@ -2006,7 +2057,7 @@ SCRIPT = r'''(() => {
     if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
-    if (!pendingPayload() && selectedRecipient !== item.recipient_id) return;
+    if (!pendingPayload() && selectedRecipient !== item.recipient_id) throw failure;
     result = await sendItem();
    }
    const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
@@ -2015,6 +2066,17 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
+   if (!dialog.open) dialog.showModal();
+   if (failure instanceof SendUndone) {
+    if (!hadEarlierSend) {
+     clearSubmittedDraft();
+     awaitingEarlierSend = false;
+     if (captureSession) captureSession.sent = false;
+     storeListDraft();
+    }
+    setError(failure.message);
+    return;
+   }
    if (posted && !failure?.definiteRefusal && submittedDraft && !isRecovering()) {
     showSubmittedDraft(submittedDraft);
     try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
@@ -2064,6 +2126,7 @@ SCRIPT = r'''(() => {
    setSending(false);
   }
   if (saved?.attachment_warning) {
+   if (!dialog.open) dialog.showModal();
    showConfirmation(saved);
    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
   } else if (saved) {
@@ -2073,26 +2136,64 @@ SCRIPT = r'''(() => {
    showLaterDraft();
    showSentDetails();
    if (keepEdits) {
+    if (!dialog.open) dialog.showModal();
     setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
     dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
     startCapture();
     updateSend();
     send.focus();
-   } else if (onList && !saved.id.startsWith('L')) {
+   } else if (!saved.id.startsWith('L')) {
     close({sent: true});
-    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+    const target = dialog.isConnected ? dialog : document;
+    if (!onList) target.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+    target.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
    } else {
     showConfirmation(saved);
     dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
    }
   } else {
    send.focus();
+   return;
   }
  });
 
+ const draft = {
+  dialog, open,
+  get id() { return draftId; },
+  get sending() { return sending; },
+  pagehide() { if (!sending) discardCapture(); },
+  pageshow() { if (dialog.open) startCapture(); },
+ };
+ return draft;
+}
+
+ drafts.push(bindDraft(original));
+ function newDraft() {
+  const dialog = template.cloneNode(true), suffix = '-' + (++nextDraft);
+  dialog.dataset.newItemDraft = '';
+  dialog.id += suffix;
+  for (const element of dialog.querySelectorAll('[id]')) element.id += suffix;
+  for (const attr of ['aria-labelledby', 'aria-describedby', 'for'])
+   for (const element of [dialog, ...dialog.querySelectorAll('[' + attr + ']')]) {
+    if (element.hasAttribute(attr))
+     element.setAttribute(attr, element.getAttribute(attr).split(' ').map(id => id + suffix).join(' '));
+   }
+  original.after(dialog);
+  const draft = bindDraft(dialog, true);
+  drafts.push(draft);
+  return draft;
+ }
+ window.addEventListener('pagehide', () => drafts.forEach(draft => draft.pagehide()));
+ window.addEventListener('pageshow', event => {
+  if (event.persisted) drafts.forEach(draft => draft.pageshow());
+ });
  document.addEventListener('click', event => {
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
-  if (page) void open(trigger, page);
+  if (!page) return;
+  const active = drafts.find(draft => draft.dialog.open && draft.dialog.contains(trigger));
+  if (!active && drafts.some(draft => draft.dialog.open)) return;
+  const draft = active || drafts.findLast(draft => !draft.sending) || newDraft();
+  void draft.open(trigger, page);
  });
 })();'''

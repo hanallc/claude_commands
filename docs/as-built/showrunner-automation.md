@@ -550,7 +550,7 @@ Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
-Old records without the field default to morty.
+Old records without the field use their record keeper.
 `record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -570,11 +570,16 @@ The List ends a delivery park automatically when the producer sets the item stat
 Linked changes supply review information on the List.
 The List shows a waiting panel while each unanswered question has a pending send or confirmed delivery.
 If a question send fails, the item shows Question not delivered.
-The `the_list.py list` command still shows the item.
-The saved recipient uses `the_list.py answer` to save an answer and mark the item unread.
-Morty can answer any List question.
-Without `--keeper`, `answer` uses the caller's List folder if it holds the item, and morty's folder if not.
-The saved recipient and the record keeper can answer with the keeper's staff ID in `--keeper`.
+The `the_list.py list` command still shows the item when it is in morty's folder.
+The `the_list.py answer` command accepts answers from the saved recipient, the record keeper, or morty.
+A saved answer marks the item unread.
+Use `answer --keeper` to select the item's folder.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, or morty's folder otherwise.
+`update` uses morty's folder by default.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -600,6 +605,21 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+
+`ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
+The ids are `A1`, `A2` and on for each item.
+Only the item's producer or morty can open an ask. The target must have a staff row.
+`--config` marks a settings.json, CLAUDE.md or config change. The page shows the same button for it.
+Each ask stores the kind, What, Why, the target, the config flag, the opened time, the closed time and the go id.
+The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
+An open ask makes the item unread, and the log gets an “Ask opened” line.
+The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
+When no ask that shows a box stays open, the item becomes read if it has no other unread change.
+An ask whose target has no staff row shows no box.
+A Go that leaves no ask with a box on a Waiting for nate item also sets Working and asks the producer for the next step, as Mark read does.
+A Go message that does not reach a recipient adds a “Go not delivered” log line.
+nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
 
 Add or update a Scheduled item with `--state Scheduled --start <time> --do <words>`.
 Use an ISO time with an offset or an IANA zone in brackets.
@@ -672,12 +692,13 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-Producers can update their items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
-Updates use the caller's staff name as the log source.
-On add, `--producer` defaults to the caller. The CLI refuses another producer or `--number`.
-The CLI saves these items in morty's store on the machine where it runs. Every producer runs on natedev.
-Producers can park, unpark, close, and reopen their own items.
-These commands require `--source` and save its words as the log source.
+Producers can update their own items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
+Their updates use the caller's staff name as the log source.
+Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
+The CLI refuses another producer and `--number` on their `add`.
+The CLI saves new items in morty's store on the machine where it runs. Every producer runs on natedev.
+`park`, `unpark`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
+These commands require `--source` and use its words as the log source.
 Close clears the parking time.
 The writer checks the assigned producer under the same lock as the save.
 Only morty can change the owner or producer of an existing item.
@@ -700,15 +721,15 @@ An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+Use `--done-when` to name every result the item needs before it can close.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
 The CLI reads character limits in `config/the_list.conf` when add or update sets the applicable field.
 
 | Config key | Limit |
 | --- | --- |
-| `latest_status_max_chars` | 200 characters for the latest status |
-| `next_step_max_chars` | 160 characters for the next step |
-| `done_when_max_chars` | 160 characters for done-when |
-| `evidence_line_max_chars` | 300 characters for each replacement or appended evidence line |
+| `max_chars.latest_status` | 200 characters for the latest status |
+| `max_chars.next_step` | 160 characters for the next step |
+| `max_chars.evidence_line` | 300 characters for each replacement or appended evidence line |
 | `series_run_limit` | 730 runs per series, including the start |
 | `confirm_wait_minutes` | 15 minutes for the owner to confirm a scheduled run |
 
@@ -716,7 +737,7 @@ The CLI refuses a write if the applicable text setting is missing, invalid, or t
 The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in morty's List folder.
+References use numbers in the folder of the item that the command edits.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.

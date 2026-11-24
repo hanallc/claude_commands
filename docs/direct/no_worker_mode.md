@@ -51,6 +51,18 @@ Run them from `${WORKING_DIR}` with the normal phase ID and paths.
    Include the `rerun` lens when <DualReview/> requires it.
    Save each review result under `${PHASE_DIR}` and record review activities with `start-activity` and `finish-activity`.
    These are director reviews, with no claim of independent worker review.
+   Before you dispatch a subagent review, note the time with `date -Iseconds`.
+   That time is its `--started-at` value.
+   Record the review after it returns, with its real start and end times:
+
+   ```sh
+   "$PY" "$DIRECT/progress_history.py" start-activity --session-dir "${SESSION_DIR}" --label "Subagent review" --activity "<what it reviewed>" --started-at "<its start, ISO with zone>"
+   "$PY" "$DIRECT/progress_history.py" finish-activity --session-dir "${SESSION_DIR}" --finished-at "<its end, ISO with zone>" --result "<result>"
+   ```
+
+   The back-dated `start-activity` closes the open director activity.
+   If that work continues, start its activity again.
+   Record each subagent finding with `findings.py open ... --caught-by worker`.
 4. Record findings through <FindingsLedger/> and run its existing commands:
 
    ```sh

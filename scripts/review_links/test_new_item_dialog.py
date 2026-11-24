@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -16,8 +15,10 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions, serve
+from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -78,7 +79,6 @@ const check = (ok, description) => { if (!ok) failures.push(description); };
 const dialog = document.querySelector('dialog'), body = dialog.querySelector('.new-item-body');
 const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
 const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
-const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
 const launch = document.querySelector('[data-owner-new]'), png = '__PNG__';
 const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
 const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
@@ -130,23 +130,20 @@ async function confirmEarlierSend() {
  return await saved;
 }
 async function sendSaved() {
- const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
- const shown = new Promise((resolve, reject) => {
+ const created = new Promise((resolve, reject) => {
+  const onCreated = event => { observer.disconnect(); resolve(event); };
   const observer = new MutationObserver(() => {
-   if (confirmation.hidden && error.hidden) return;
+   if (error.hidden || send.disabled) return;
    observer.disconnect();
-   if (confirmation.hidden) reject(new Error(error.textContent));
-   else resolve(confirmation.textContent);
+   document.removeEventListener('review-item-created', onCreated);
+   reject(new Error(error.textContent));
   });
-  observer.observe(dialog, {attributes:true, subtree:true, attributeFilter:['hidden']});
+  document.addEventListener('review-item-created', onCreated, {once:true});
+  observer.observe(dialog, {attributes:true, subtree:true, attributeFilter:['hidden','disabled']});
  });
  send.click();
- const message = await shown;
- check(dialog.open && document.activeElement === done && send.disabled,
-       'Send keeps the confirmation open with focus on Done.');
- done.click();
  const event = await created;
- check(message === 'Saved ' + event.detail.id + '.', 'The dialog shows the saved ID.');
+ check(closeToLauncher(), 'Send closes the dialog and returns focus.');
  return event;
 }
 (async () => {
@@ -163,7 +160,7 @@ async function sendSaved() {
    check(dialog.open && dialog.matches(':modal'), 'The dialog opens as a native modal.');
    check(document.activeElement.id === 'new-item-title' &&
          dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug is selected when the dialog opens.');
-   check([...dialog.querySelectorAll('[name="kind"]')].length === 6, 'Six keyboard-selectable types are present.');
+   check(dialog.querySelectorAll('[name="kind"]').length === 7, 'Seven keyboard-selectable types are present.');
    check(!!recipient() && recipient().tabIndex === 0, 'To uses native keyboard-selectable radios.');
    check(send.disabled, 'Send needs words and a recipient.');
    dialog.querySelector('[name="include_page"]').click();
@@ -209,7 +206,6 @@ async function sendSaved() {
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
    check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
-   check(closeToLauncher(), 'Done closes the confirmation and returns focus.');
 
    await open({kind:'question'});
    check(!textarea.value && dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft.');
@@ -330,6 +326,22 @@ async function sendSaved() {
     return ownerPosts.slice(start).map(post => post.page_capture ? 'capture' :
      post.discard_capture ? 'discard' : post.request_id ? 'send' : 'unknown').sort().join(',');
    }
+   const discardsSince = start => ownerPosts.slice(start).filter(post => post.discard_capture);
+   function waitForDiscards(start, count) {
+    return new Promise((resolve, reject) => {
+     const deadline = setTimeout(() => {
+      discarded = undefined;
+      reject(new Error('The page did not discard the expected captures.'));
+     }, 4000);
+     discarded = () => {
+      if (discardsSince(start).length < count) return;
+      clearTimeout(deadline);
+      discarded = undefined;
+      resolve();
+     };
+     discarded();
+    });
+   }
    function whenShown(element) {
     if (!element.hidden) return Promise.resolve();
     return new Promise(resolve => {
@@ -346,7 +358,7 @@ async function sendSaved() {
     check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
-    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Scheduled', 'The dialog has all six types.');
+    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement,Scheduled', 'The dialog has all seven types.');
    }
    async function sendOwner() {
     selectType('feedback');
@@ -385,18 +397,19 @@ async function sendSaved() {
    const beforeSkipped = ownerPosts.length;
    await openOwner();
    checkbox.click();
-   const skippedCapture = new Promise(resolve => { discarded = resolve; });
+   const skippedCapture = waitForDiscards(beforeSkipped, 2);
    await sendOwner();
    await skippedCapture;
    const skipped = ownerPosts.findLast(post => post.request_id);
    check(requestsSince(beforeSkipped) === 'capture,capture,discard,discard,send' &&
-         !skipped.capture_key && skipped.evidence.kind === 'none' && ownerPosts.at(-1).discard_capture === captureKey,
+         !skipped.capture_key && skipped.evidence.kind === 'none' &&
+         discardsSince(beforeSkipped).every(post => post.discard_capture === captureKey),
          'Send with the box unchecked discards the capture.' + ' Requests: ' + requestsSince(beforeSkipped));
 
    const beforeCancel = ownerPosts.length;
    await openOwner();
    await whenShown(shot);
-   const canceled = new Promise(resolve => { discarded = resolve; });
+   const canceled = waitForDiscards(beforeCancel, 2);
    dialog.querySelector('[data-cancel]').click();
    await canceled;
    check(requestsSince(beforeCancel) === 'capture,capture,discard,discard' &&
@@ -601,7 +614,7 @@ async function sendSaved() {
     const retry = ownerPosts.findLast(post => post.request_id);
     check(retry.request_id === first.request_id && retry.capture_key === first.capture_key,
           'The retry uses the same draft ID and capture key.');
-    check(dialog.open && confirmation.hidden && textarea.value === wordsBeforeRetry &&
+    check(dialog.open && textarea.value === wordsBeforeRetry &&
           error.textContent === alreadyFiled, 'The notice keeps the draft open with its words.');
     await whenShown(shot);
     const renewedKey = captureKey;
@@ -708,7 +721,7 @@ OWNER_OPTIONS_PROBE = r"""
   if (!dialog.open) throw new Error('The owner button must open the dialog.');
   await loaded;
   const types = [...dialog.querySelectorAll('[data-kind-label]')].map(label => label.textContent);
-  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Scheduled', 'All six types appear in order.');
+  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement,Scheduled', 'All seven types appear in order.');
   check(dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug starts selected.');
   const inputs = () => [...recipients.querySelectorAll('input')];
   check(inputs().map(input => input.value).join() === __RECIPIENTS__.map(row => row.id).join(),
@@ -766,36 +779,46 @@ OWNER_OPTIONS_PROBE = r"""
   inputs().find(input => input.value === alternate.value).click();
   check(selected() === alternate.value && !send.disabled && status.hidden,
         'An explicit selection enables Send and hides the notice.');
-  scheduledInput.click();
-  words.value = 'Check the queue. Start Fri Jan 15 2027 13:00. Repeat Daily.';
-  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
-  const sendResponse = window.fetch;
-  let posted;
-  window.fetch = (path, options) => {
-   if (path === '/console/review/new-item' && options?.body) {
-    const payload = JSON.parse(options.body);
-    if (payload.kind === 'scheduled') {
-     posted = payload;
-     return Promise.resolve(Response.json({id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.', readback:[
-      'Starts: Fri Jan 15 2027 13:00 PST (16:00 EST)', 'Repeats: Daily'
-     ]}));
+  if (__SEND_SCHEDULED__) {
+   scheduledInput.click();
+   words.value = 'Check the queue. Start Fri Jan 15 2027 13:00. Repeat Daily.';
+   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   const sendResponse = window.fetch;
+   let posted;
+   window.fetch = (path, options) => {
+    if (path === '/console/review/new-item' && options?.body) {
+     const payload = JSON.parse(options.body);
+     if (payload.kind === 'scheduled') {
+      posted = payload;
+      return Promise.resolve(Response.json({id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.', readback:[
+       'Starts: Fri Jan 15 2027 13:00 PST (16:00 EST)', 'Repeats: Daily'
+      ]}));
+     }
     }
-   }
-   return sendResponse(path, options);
-  };
-  const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
-  send.click();
-  await saved;
-  check(posted?.recipient_id === alternate.value && posted.words === words.value &&
-        posted.page_recipient === 'selected' && !('capture_key' in posted),
-        'Scheduled sends the selected owner and words without capture fields.');
-  check(/^s1-[0-9a-f]{32}$/.test(posted?.request_id), 'Changing the kind to Scheduled creates a Scheduled draft ID.');
-  check(!hidden(dialog.querySelector('[data-saved-controls]')) && scheduledInput.checked &&
-        dialog.querySelector('#new-item-saved').textContent.includes('Saved List item 12.') &&
-        dialog.querySelector('#new-item-saved').textContent.includes('Repeats: Daily'),
-        'The confirmation shows the saved List number, repeat, and selected type.');
-  check(dialog.querySelector('#new-item-saved').textContent.includes('Producer: morty.'),
-        'The confirmation names the mapped producer.');
+    return sendResponse(path, options);
+   };
+   const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+   send.click();
+   await saved;
+   check(posted?.recipient_id === alternate.value && posted.words === words.value &&
+         posted.page_recipient === 'selected' && !('capture_key' in posted),
+         'Scheduled sends the selected owner and words without capture fields.');
+   check(/^s1-[0-9a-f]{32}$/.test(posted?.request_id), 'Changing the kind to Scheduled creates a Scheduled draft ID.');
+   check(!hidden(dialog.querySelector('[data-saved-controls]')) && scheduledInput.checked &&
+         dialog.querySelector('#new-item-saved').textContent.includes('Saved List item 12.') &&
+         dialog.querySelector('#new-item-saved').textContent.includes('Repeats: Daily'),
+         'The confirmation shows the saved List number, repeat, and selected type.');
+   check(dialog.querySelector('#new-item-saved').textContent.includes('Producer: morty.'),
+         'The confirmation names the mapped producer.');
+  } else {
+   dialog.querySelector('[data-kind="enhancement"] input').click();
+   words.value = 'Show the next check in the row.';
+   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   const saved = new Promise(resolve => document.addEventListener('review-item-saved', resolve, {once:true}));
+   send.click();
+   check(!dialog.open && document.activeElement === buttons[0], 'Send closes the dialog and restores focus at once.');
+   check((await saved).detail.id === 'I1', 'Send reports the saved Enhancement.');
+  }
  } catch (error) { failures.push(String(error)); }
  await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
  parent.postMessage('finished', location.origin);
@@ -1054,11 +1077,10 @@ const whenVisible = element => {
  });
 };
 const send = async () => {
- const confirmation = dialog.querySelector('#new-item-saved');
+ const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
  dialog.querySelector('[type="submit"]').click();
- await whenVisible(confirmation);
- check(dialog.open && confirmation.textContent === 'Saved I1.', 'The Bug dialog shows the saved ID.');
- dialog.querySelector('[data-done]').click();
+ const event = await created;
+ check(!dialog.open && event.detail.id === 'I1', 'The Bug dialog closes and reports the saved ID.');
 };
 (async () => {
  try {
@@ -1121,7 +1143,6 @@ const send = async () => {
    check(captured.script_errors.length === 20 && captured.script_errors[0].message === 'Error 2'
          && captured.script_errors[0].line === 9 && captured.script_errors[0].column === 3
          && captured.script_errors.at(-1).message === 'Rejected', 'The request keeps the last twenty script errors.');
-   check(dialog.open === false, 'Done closes the confirmation.');
 
    holdCapture = true;
    await open();
@@ -1191,7 +1212,9 @@ const send = async () => {
    check(listFirst.request_id.startsWith('r6-') && listFirst.capture_key &&
          JSON.stringify(wire[started]) === JSON.stringify(listFirst),
          'The List retries with the original capture key and draft ID.');
-   check(dialog.open && words.value === 'Keep these edits for a new Send.',
+   const editNotice = dialog.querySelector('.new-item-error');
+   check(dialog.open && words.value === 'Keep these edits for a new Send.' && !editNotice.hidden &&
+         editNotice.textContent === 'Saved I1. Your edits are still in the dialog.',
          'The dialog keeps the edits after it confirms the original Send.');
 
    words.value = '';
@@ -1219,8 +1242,8 @@ const send = async () => {
 """
 
 
-def bug_fixture_page(*, photo: bool = False) -> bytes:
-    probe = BUG_PROBE.replace("__PHOTO__", json.dumps(photo))
+def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
+    probe = script.replace("__PHOTO__", json.dumps(photo))
     return (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Review</title>'
             f'{page_frame.PAGE_SCRIPT_ERRORS}<style>{console_theme.CSS}{page_frame.OWNER_STYLE.removeprefix("<style>").removesuffix("</style>")}'
@@ -1235,6 +1258,133 @@ def bug_fixture_page(*, photo: bool = False) -> bytes:
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 
 
+UNDO_PROBE = r"""
+const failures = [];
+const check = (value, description) => { if (!value) failures.push(description); };
+const wire = [], fetchHTTP = window.fetch, host = window.top.document;
+const outcome = __OUTCOME__;
+const held = '/send-hold/' + 'a'.repeat(24), saved = {id:'I1',key:'bug/owner/I1'};
+let realSends = 0;
+window.fetch = async (path, options = {}) => {
+ path = String(path);
+ if (path === held + '/undo') return Response.json({outcome:'undone'});
+ if (path === held) {
+  realSends++;
+  return outcome === 'failure' ? Response.json({error:'The test send failed.'},{status:503}) : Response.json(saved);
+ }
+ if (!path.startsWith('/console/review/new-item')) return fetchHTTP(path, options);
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[
+  {id:'owner',name:'sdlc',proposal:true}, {id:'chosen',name:'chosen producer',proposal:true},
+ ]});
+ const payload = JSON.parse(options.body);
+ // The screenshot stays pending, so the first Send keeps its item for a retry.
+ if (payload.page_capture) return new Promise(() => {});
+ wire.push([payload, new Headers(options.headers).get('X-Undo-Hold')]);
+ if (wire.length === 1) return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ return Response.json(saved);
+};
+const dialog = document.querySelector('dialog');
+const launch = document.querySelector('[data-owner-new]');
+const words = dialog.querySelector('textarea'), error = dialog.querySelector('.new-item-error');
+const send = dialog.querySelector('[type="submit"]');
+const until = async (test, label) => {
+ const end = performance.now() + 8000;
+ while (!test()) {
+  if (performance.now() > end) throw new Error(label);
+  await new Promise(resolve => setTimeout(resolve, 20));
+ }
+};
+const type = text => {
+ words.value = text;
+ words.dispatchEvent(new Event('input', {bubbles:true}));
+};
+(async () => {
+ try {
+  launch.click();
+  await until(() => dialog.querySelector('[data-recipients] input:checked'), 'The dialog did not load its recipients.');
+  dialog.querySelector('[name="recipient_id"][value="chosen"]').click();
+  type('The first words.');
+  const input = new DataTransfer();
+  const bytes = Uint8Array.from(atob('__PNG__'), character => character.charCodeAt(0));
+  input.items.add(new File([bytes], 'pasted.png', {type:'image/png'}));
+  const paste = new ClipboardEvent('paste', {cancelable:true});
+  Object.defineProperty(paste, 'clipboardData', {value:input});
+  words.dispatchEvent(paste);
+  const image = dialog.querySelector('[data-previews] img')?.src;
+  await until(() => !send.disabled, 'Send did not become available.');
+  const events = [];
+  for (const name of ['review-item-saved', 'review-item-created']) {
+   document.addEventListener(name, event => events.push([name, event.detail.id, dialog.open]));
+  }
+  send.click();
+  check(!dialog.open && document.activeElement === launch, 'Send closes the dialog and returns focus at once.');
+  const toast = () => host.querySelector('[data-send-undo]');
+  await until(() => toast()?.querySelector('button'), 'The Undo toast did not show.');
+  check(toast().querySelector('span').textContent === 'Sent to chosen producer.',
+        'The toast names the selected recipient.');
+  check(toast().querySelector('button').textContent === 'Undo', 'The toast offers Undo.');
+  check(!dialog.open && toast().parentElement.parentElement === host.body && events.length === 0 && realSends === 0,
+        'The page stays available while the send waits.');
+  if (outcome === 'second-draft') {
+   launch.click();
+   const second = document.querySelector('dialog[open]');
+   check(second && second !== dialog && !second.querySelector('textarea').value,
+         'New item opens an empty second draft during the hold.');
+   second.querySelector('textarea').value = 'Keep a separate second draft.';
+   second.querySelector('[data-close]').click();
+  }
+  const undo = outcome.startsWith('undo') || outcome === 'second-draft';
+  if (undo) toast().querySelector('button').click();
+  else {
+   const [fade] = toast().getAnimations();
+   check(fade.effect.getTiming().duration === 30000, 'The toast uses the duration from the server.');
+   fade.finish();
+  }
+  if (undo || outcome === 'failure') {
+   await until(() => dialog.open && !error.hidden && !send.disabled, 'The dialog did not reopen for editing.');
+   check(error.textContent === (undo ? 'Undone. Edit and send again.' : 'The test send failed.'),
+         'The dialog shows the result above the draft.');
+   check(words.value === 'The first words.' && dialog.querySelector('[name="kind"]:checked')?.value === 'bug' &&
+         dialog.querySelector('[name="recipient_id"]:checked')?.value === 'chosen',
+         'The dialog restores the type, recipient and words.');
+   check(image && dialog.querySelector('[data-previews] img')?.src === image, 'The dialog restores the pasted image.');
+   check(dialog.querySelector('[name="include_page"]').checked && !dialog.querySelector('[data-capture-slot]').hidden,
+         'The dialog restores the pending page capture.');
+   check(!toast() && events.length === 0 && realSends === (undo ? 0 : 1),
+         'The page sends no success event after Undo or failure.');
+   if (outcome === 'second-draft') {
+    dialog.querySelector('[data-close]').click();
+    launch.click();
+    check(document.querySelector('dialog[open] textarea')?.value === 'Keep a separate second draft.',
+          'Undo restores the first draft and keeps the second draft separate.');
+   }
+   if (outcome !== 'undo-resend') return;
+   type('The edited words.');
+   send.click();
+  }
+  await until(() => events.length === 2, 'The successful Send did not report the saved item.');
+  check(JSON.stringify(events) === JSON.stringify([
+   ['review-item-saved', 'I1', false], ['review-item-created', 'I1', false]
+  ]), 'Send closes the dialog before it reports the saved item.');
+  check(!toast(), 'The Undo toast disappears.');
+  if (undo) {
+   check(wire.length === 2 && wire[0][0].words === 'The first words.' &&
+         wire[1][0].words === 'The edited words.' && wire[1][1] === '1',
+         'The Send after Undo posts the edited words.');
+   check(wire[0][0].capture_key && wire[1][0].capture_key === wire[0][0].capture_key &&
+         JSON.stringify(wire[1][0].defer_capture) === JSON.stringify(wire[0][0].defer_capture),
+         'The Send after Undo uses the same page capture.');
+  } else {
+   check(wire.length === 1 && wire[0][0].kind === 'bug' && wire[0][1] === '1', 'Send holds the Bug once.');
+  }
+ } catch (failure) {
+  failures.push(String(failure));
+ } finally {
+  await fetchHTTP('/results', {method:'POST', body:JSON.stringify(failures)});
+ }
+})();
+"""
+
 LIST_RETRY_PROBE = r'''
 const failures = [];
 const check = (ok, description) => { if (!ok) failures.push(description); };
@@ -1248,8 +1398,14 @@ const shippedUnsent = __SHIPPED_UNSENT__, later = dialog.querySelector('[data-la
 const launch = document.querySelector('[data-owner-new]');
 const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
 const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
-const probeKey = 'test-list-first-send', draftKey = 'console.list.pending-send';
+const probeKey = 'test-list-first-send', draftPrefix = 'console.list.pending-send.';
+const draftKey = 'console.list.pending-send';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+function storeShippedPointer(id, value) {
+ sessionStorage.removeItem(draftPrefix + id);
+ sessionStorage.removeItem(draftPrefix + 'state.' + id);
+ sessionStorage.setItem(draftKey, value);
+}
 history.replaceState(null, '', '/console/list.html' + location.search);
 const posts = [], fetchHTTP = window.fetch;
 let captures = 0;
@@ -1283,8 +1439,17 @@ window.fetch = async (path, options) => {
 };
 function waitFor(test) {
  if (test()) return Promise.resolve();
- return new Promise(resolve => {
-  const observer = new MutationObserver(() => { if (test()) { observer.disconnect(); resolve(); } });
+ return new Promise((resolve, reject) => {
+  const observer = new MutationObserver(() => {
+   if (!test()) return;
+   clearTimeout(deadline);
+   observer.disconnect();
+   resolve();
+  });
+  const deadline = setTimeout(() => {
+   observer.disconnect();
+   reject(new Error('The List draft did not reach the expected state.'));
+  }, 8000);
   observer.observe(dialog, {attributes:true, childList:true, subtree:true});
  });
 }
@@ -1306,7 +1471,10 @@ function pasteListImage() {
  words.dispatchEvent(event);
 }
 async function checkSeparateScheduledDraft() {
- const pending = () => JSON.parse(sessionStorage.getItem(draftKey) || 'null');
+ const pending = () => {
+  const key = Object.keys(sessionStorage).find(key => key.startsWith(draftPrefix + 'r6-'));
+  return key && {id: key.slice(draftPrefix.length), recipient: sessionStorage.getItem(key)};
+ };
  const recipientsReady = () => !!dialog.querySelector('[name="recipient_id"]:checked');
  const waitForStep = (test, step) => Promise.race([
   waitFor(test), new Promise((resolve, reject) => setTimeout(() => reject(new Error(step)), 2500))
@@ -1317,7 +1485,7 @@ async function checkSeparateScheduledDraft() {
   dialog.querySelector('[name="recipient_id"]:checked').dispatchEvent(new Event('input', {bubbles:true}));
   const {id, recipient} = pending();
   check(/^r6-/.test(id) && !posts.length, 'Recipient selection stores a native draft before Send.');
-  sessionStorage.setItem(draftKey, JSON.stringify({id, recipient}));
+  storeShippedPointer(id, JSON.stringify({id, recipient}));
   sessionStorage.setItem(probeKey, JSON.stringify({id, recipient}));
  } else if (!restored.scheduled) {
   await waitForStep(recipientsReady, 'The shipped draft did not restore its recipient.');
@@ -1389,22 +1557,31 @@ async function checkListRetry() {
          'Reload locks the submitted List draft and displays Retry.');
   }
   if (send.disabled) throw new Error('Send is disabled.');
+  if (restored && !shippedPointer) {
+   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+   send.click();
+   const result = await Promise.race([
+    created, waitFor(sendFinished).then(() => { throw new Error(error.textContent); })
+   ]);
+   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
+         'Reload keeps the draft ID and sends the original payload.');
+   check(result.detail.id === 'I1' && !dialog.open, 'The original Send returns the saved item and closes the dialog.');
+   check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'The saved response clears the draft slot.');
+   return true;
+  }
   send.click();
   await waitFor(sendFinished);
   if (restored) {
    check(editable() && !words.readOnly, 'A saved item response unlocks the draft.');
-   if (shippedPointer) {
-    check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].kind === restored.kind &&
-          posts[0].recipient_id === restored.recipient_id && posts[0].words === restored.words && !posts[0].images.length,
-          'Native recovery uses the shipped ID, kind, recipient, and words.');
-    check(!scheduled.disabled, 'Scheduled is available after native recovery.');
-   } else {
-    check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
-          'Reload keeps the draft ID and sends the original payload.');
-   }
+   check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].kind === restored.kind &&
+         posts[0].recipient_id === restored.recipient_id && posts[0].words === restored.words && !posts[0].images.length,
+         'Native recovery uses the shipped ID, kind, recipient, and words.');
+   check(!scheduled.disabled, 'Scheduled is available after native recovery.');
    check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
          'The retry shows the first saved item ID.');
-   check(!sessionStorage.getItem(draftKey), 'An already filed response clears the draft ID.');
+   check(!sessionStorage.getItem(draftKey) && sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'An already filed response clears the draft slot and the migrated pointer.');
   } else if (reloadAfterSend && !failures.length) {
    check(words.readOnly && send.textContent === 'Retry', 'The lost reply locks Retry before reload.');
    sessionStorage.setItem(probeKey, JSON.stringify(posts[0]));
@@ -1412,8 +1589,8 @@ async function checkListRetry() {
     check(posts[0].images.length === 1, 'The first Send includes the pasted image.');
     sessionStorage.removeItem('console.new-item.submitted');
     const {request_id, recipient_id} = posts[0];
-    sessionStorage.setItem(draftKey, shippedPointer === 'id' ? request_id :
-                           JSON.stringify({id: request_id, recipient: recipient_id}));
+    storeShippedPointer(request_id, shippedPointer === 'id' ? request_id :
+                        JSON.stringify({id: request_id, recipient: recipient_id}));
    }
    location.reload();
    return false;
@@ -1437,6 +1614,8 @@ async function checkListRetry() {
          posts[2].capture_key.startsWith(posts[0].request_id) && posts[2].capture_key !== firstKey &&
          posts[2].defer_capture, 'Retry requests a new capture after the first one expires.');
    check(!sessionStorage.getItem(draftKey), 'A successful Send clears the draft ID.');
+   check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'A successful Send clears the draft slot.');
   }
   return true;
 }
@@ -1452,6 +1631,94 @@ async function checkListRetry() {
  parent.postMessage('finished', location.origin);
 })();
 '''
+
+
+TWO_LIST_DRAFTS_PROBE = r"""
+const failures = [], posts = [];
+const fetchHTTP = window.fetch;
+const prefix = 'console.list.pending-send.', probeKey = 'test-list-drafts';
+const earlier = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+const endpoint = '/console/review/new-item';
+const check = (ok, message) => { if (!ok) failures.push(message); };
+window.fetch = async (path, options) => {
+ if (path.startsWith('/send-hold/')) return Response.json({id:'I1'});
+ if (!path.startsWith(endpoint)) return fetchHTTP(path, options);
+ if (!options?.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[
+  {id:'owner',name:'sdlc',proposal:true}, {id:'other',name:'producer',proposal:true},
+ ]});
+ const item = JSON.parse(options.body);
+ if (!item.request_id) return Response.json({});
+ posts.push(item);
+ const hold = String(posts.length).repeat(24);
+ return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+};
+async function waitFor(test) {
+ const end = performance.now() + 8000;
+ while (!test()) {
+  if (performance.now() > end) throw new Error('The dialog or toast did not appear.');
+  await new Promise(resolve => setTimeout(resolve, 20));
+ }
+}
+async function send(words = '', select = '') {
+ document.querySelector('[data-owner-new]').click();
+ const dialog = document.querySelector('dialog[open]');
+ await waitFor(() => dialog.querySelector('input[name=recipient_id]:checked'));
+ const shown = dialog.querySelector('input[name=recipient_id]:checked').value;
+ if (select) dialog.querySelector('input[name=recipient_id][value=' + select + ']').click();
+ if (words) {
+  if (dialog.querySelector('[name=include_page]').checked) dialog.querySelector('[name=include_page]').click();
+  const field = dialog.querySelector('textarea');
+  field.value = words;
+  field.dispatchEvent(new InputEvent('input',{bubbles:true}));
+ }
+ const host = window.top.document;
+ const existing = new Set(host.querySelectorAll('[data-send-undo]'));
+ dialog.querySelector('[type=submit]').click();
+ const freshToast = () => [...host.querySelectorAll('[data-send-undo]')].find(toast => !existing.has(toast));
+ await waitFor(freshToast);
+ return {item:posts.at(-1), shown, toast:freshToast()};
+}
+(async () => {
+ try {
+  if (!earlier) {
+   const first = await send('The first draft.', 'other');
+   const second = await send('The second draft.');
+   check(first.item.request_id !== second.item.request_id, 'Concurrent sends use different draft IDs.');
+   check(first.toast.querySelector('span').textContent === 'Sent to producer.' &&
+         second.toast.querySelector('span').textContent === 'Sent to sdlc.', 'The first sends name their recipients.');
+   check(sessionStorage.getItem(prefix + first.item.request_id) === 'other' &&
+         sessionStorage.getItem(prefix + second.item.request_id) === 'owner',
+         'Each send stores its own recovery slot.');
+   if (!failures.length) {
+    sessionStorage.setItem(probeKey, JSON.stringify(posts));
+    location.reload();
+    return;
+   }
+  } else {
+   const pending = new Map(earlier.map(item => [item.request_id, item]));
+   for (const _ of earlier) {
+    const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+    const {item, shown, toast} = await send();
+    const original = pending.get(item.request_id);
+    check(original?.recipient_id === shown, 'Reload restores the draft ID and its recipient.');
+    check(JSON.stringify(original) === JSON.stringify(item), 'Retry sends the original payload.');
+    check(toast.querySelector('span').textContent === 'Sending.', 'A retry that can recover a filing shows Sending.');
+    toast.getAnimations()[0].finish();
+    await Promise.race([created,
+     new Promise((resolve, reject) => setTimeout(() => reject(new Error('Retry did not report a saved item.')), 8000))
+    ]);
+    pending.delete(item.request_id);
+    check(sessionStorage.getItem(prefix + item.request_id) === null, 'A save removes its own recovery slot.');
+    check([...pending.keys()].every(id => sessionStorage.getItem(prefix + id) !== null),
+          'A save keeps the other recovery slot.');
+   }
+   check(!pending.size, 'The dialog recovers both drafts.');
+  }
+ } catch (error) { failures.push(String(error)); }
+ sessionStorage.removeItem(probeKey);
+ await fetchHTTP('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+"""
 
 
 RECIPIENT_DRAFT_PROBE = r'''
@@ -1583,9 +1850,14 @@ class DialogFixture:
     retire_recipient_on_restart: bool = False
     owner_reason: str = ""
 
+    def __post_init__(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
+
     def environment(self) -> dict[str, str]:
         return {"SHOWRUNNER_STATE_DIR": str(self.root / "state"), "REVIEW_LINKS_ROOT": str(self.root / "review"),
-                "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config")}
+                "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config"),
+                "STAFF_FILE": str(self.root / "staff.json")}
 
 
 def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
@@ -1731,11 +2003,11 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         try:
             profile = output.parent / "profile"
             profile.mkdir()
-            run = subprocess.run(
+            run = run_process_group(
                 ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                  "--window-size", "1440,900", "--screenshot", str(output),
                  f"http://127.0.0.1:{server.server_port}/"],
-                capture_output=True, text=True, timeout=75, check=False)
+                timeout=75)
             if run.returncode:
                 raise AssertionError(run.stderr)
             if not finished.is_set():
@@ -1864,9 +2136,10 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertEqual(fixture.results, [])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
-    def test_owner_button_opens_six_types_and_selects_the_owner_from_all_recipients(self) -> None:
+    def test_owner_button_opens_seven_types_and_selects_the_owner_from_all_recipients(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        probes = {1440: OWNER_OPTIONS_PROBE, 390: OWNER_OPTIONS_PROBE}
+        owner_probe = OWNER_OPTIONS_PROBE.replace("__SEND_SCHEDULED__", "true")
+        probes = {1440: owner_probe, 390: owner_probe}
         for width, kind, page, scenario in ((1280, "scheduled", "builds", "reload"),
                                            (412, "scheduled", "list", "reload"),
                                            (1152, "bug", "builds", "reload"),
@@ -1883,14 +2156,71 @@ class NewItemDialogTests(unittest.TestCase):
                         pages={width: fixture_page(width, photo=False, script=probe) for width, probe in probes.items()})
         self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1100: [], 1090: [], 1080: [], 1040: [], 1000: []})
 
-    def test_render_mounts_one_dialog_with_six_types(self) -> None:
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_send_after_undo_posts_the_edited_words(self) -> None:
+        self.assert_held_send("undo-resend")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_non_list_send_closes_the_dialog_at_send(self) -> None:
+        self.assert_held_send("success")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_undo_reopens_the_new_item_with_the_words(self) -> None:
+        self.assert_held_send("undo")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_new_item_opens_a_second_draft_during_the_hold(self) -> None:
+        self.assert_held_send("second-draft")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_recovers_two_unresolved_drafts_after_reload(self) -> None:
+        page = bug_fixture_page(script=TWO_LIST_DRAFTS_PROBE).replace(
+            b'data-page-owner="review"', b'data-page-owner="list"')
+        self.assertEqual(firefox_probe_results(page), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_failed_held_send_reopens_the_new_item_with_the_error(self) -> None:
+        self.assert_held_send("failure")
+
+    def assert_held_send(self, outcome: str) -> None:
+        probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps(outcome)).replace("__PNG__", PNG)
+        self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_owner_button_selects_the_owner_and_sends_an_enhancement(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        alternate = staff.StaffRow(OTHER_RECIPIENT, "producer", "cargo-liner", staff.StaffRoot(),
+                                   current_session=OTHER_RECIPIENT)
+        fixtures = {width: DialogFixture(temporary / str(width), reject_first_send=False, owner_reason=OWNER_REASON)
+                    for width in (1440, 390)}
+        for fixture in fixtures.values():
+            configuration = fixture.root / "config"
+            configuration.mkdir(parents=True)
+            _ = (configuration / "console.conf").write_text(f"page.builds.owner={OWNER}\n")
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, alternate))):
+            probe = OWNER_OPTIONS_PROBE.replace("__SEND_SCHEDULED__", "false")
+            capture_dialogs(temporary / "options.png", fixtures,
+                            pages={width: fixture_page(width, photo=False, script=probe) for width in fixtures})
+        for width, fixture in fixtures.items():
+            with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
+                self.assertEqual(fixture.results, [])
+                post, = fixture.wire_posts
+                self.assertEqual((post["kind"], post["recipient_id"], post["words"]),
+                                 ("enhancement", OTHER_RECIPIENT, "Show the next check in the row."))
+                record, = investigation.records(OTHER_RECIPIENT)
+                self.assertEqual(record.title, "Enhancement: Show the next check in the row.")
+
+    def test_render_mounts_one_dialog_with_seven_types(self) -> None:
         markup = new_item_dialog.render()
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
-        self.assertEqual(markup.count('type="radio" name="kind"'), 6)
-        self.assertEqual(markup.count('<span data-button-face>'), 6)
+        self.assertEqual(markup.count('type="radio" name="kind"'), 7)
+        self.assertEqual(markup.count('<span data-button-face>'), 7)
         self.assertIn('data-kind="bug"', markup)
         self.assertIn('data-kind="scheduled"', markup)
+        self.assertIn('data-kind="enhancement"', markup)
+        self.assertIn('class="lucide lucide-sparkles"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-sent-details aria-labelledby="sent-details-title"', markup)

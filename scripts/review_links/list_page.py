@@ -24,8 +24,8 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, page_frame, page_question, question_path, record_table, review_link
-from scripts.review_links import review_items, review_page
+from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_question, record_table
+from scripts.review_links import question_path, review_items, review_link, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -83,11 +83,11 @@ CHIP_BY_QUEUE = {
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
-              unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
+              unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     if state is the_list.ItemState.SCHEDULED:
         return ListChip.SCHEDULED
-    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer, later=parked,
+    queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer or open_ask, later=parked,
                                 unread_delivery=unread_delivery, waiting_for_answer=open_question)
     return CHIP_BY_QUEUE[queue]
 
@@ -345,6 +345,17 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = content.action + ": " + html.escape(", ".join(content.keys)) + by
     elif isinstance(content, the_list.EvidenceCopyRemoved):
         body = f"Removed the migration copy of {content.copy} from {FIELD_LABELS['evidence']}" + by
+    elif isinstance(content, (the_list.AskOpened, the_list.GoGiven)):
+        ask = content.ask
+        target = names.html(ask.target, owner_name(names.members, ask.target))
+        if isinstance(content, the_list.AskOpened):
+            body = "Asked nate for " + ("a go" if ask.kind is the_list.AskKind.GO else "approval") + by + ": "
+        else:
+            body = f"<strong>{ASK_BUTTONS[ask.kind]}</strong>" + by + ": "
+        body += html.escape(ask.what) + " → " + target
+    elif isinstance(content, the_list.GoNotDelivered):
+        recipient = names.html(content.recipient, owner_name(names.members, content.recipient))
+        body = "Go not delivered to " + recipient + by + ": " + html.escape(content.ask.what)
     elif isinstance(content, str):
         body = html.escape(content) + by
     else:
@@ -621,8 +632,50 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
     return ''.join(sections)
 
 
+ASK_HEADINGS = {the_list.AskKind.GO: "Needs your go", the_list.AskKind.APPROVAL: "Needs your approval"}
+ASK_BUTTONS = {the_list.AskKind.GO: "Go", the_list.AskKind.APPROVAL: "Approved"}
+ASK_NOTES = {the_list.AskKind.GO: "Pressing Go sends your go to {agent}.",
+             the_list.AskKind.APPROVAL: "Pressing Approved sends your approval to {agent}."}
+STAFF_ROLES = {"showrunner": "a showrunner", "unit": "a unit director", "worker": "a worker", "producer": "a producer"}
+UNIT_ROLES = {"direct": "a unit director", "merge": "the merge director", "style": "the style director"}
+
+
+def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> str:
+    """Name the role as the Go box shows it, such as "the merge director of sdlc" or "the List producer"."""
+    if member.kind == "producer" and member.name == "morty":
+        return "the List producer"
+    role = UNIT_ROLES[member.unit_type.value] if isinstance(member.unit_type, staff.UnitDetails) else STAFF_ROLES[member.kind]
+    parent = names.members.by_id(member.parent.id) if isinstance(member.parent, staff.ReportsTo) else None
+    return role + (" of " + names.html(parent.id, parent.name) if parent is not None else "")
+
+
+def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> str:
+    """Show one box with a Go or Approved button for each open ask."""
+    boxes: list[str] = []
+    row_id = entry.key.replace("/", "-")
+    for ask in the_list.answerable_asks(entry.item, names.members):
+        member = names.members.by_id(ask.target)
+        assert member is not None
+        box_id = html.escape(f"ask-{row_id}-{ask.ask_id}", quote=True)
+        token = signed_token(secret, entry.keeper, entry.item.id, go_ledger.token_prefix(ask.ask_id))
+        hidden = ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
+                         for name, value in (("keeper", entry.keeper), ("id", entry.item.id),
+                                             ("ask", ask.ask_id), ("token", token)))
+        boxes.append(
+            f'<section class="list-ask" data-ask="{ask.ask_id}" aria-labelledby="{box_id}">'
+            + f'<h3 id="{box_id}">{ASK_HEADINGS[ask.kind]}</h3>'
+            + f'<dl><dt>What</dt><dd>{html.escape(ask.what)}</dd>'
+            + f'<dt>Who needs it</dt><dd>{names.html(member.id, member.name)}, {staff_role_html(member, names)}</dd>'
+            + f'<dt>Why</dt><dd>{html.escape(ask.why)}</dd></dl>'
+            + f'<form method="post" action="{go_ledger.GO_PATH}" data-go-form>' + hidden
+            + f'<button type="submit" aria-describedby="{box_id}-note">{ASK_BUTTONS[ask.kind]}</button>'
+            + f'<small id="{box_id}-note">{html.escape(ASK_NOTES[ask.kind].format(agent=member.name))}</small>'
+            + '</form></section>')
+    return '<div class="list-asks">' + ''.join(boxes) + '</div>' if boxes else ''
+
+
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str],
+                 unread_answers: frozenset[str], asks: str = "",
                  schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
@@ -636,7 +689,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
         + field_html(field, value, today, names) + '</section>'
         for field, value in (("state", item.state), ("eta", eta), ("latest_status", item.latest_status),
                              ("next_step", next_step), ("done_when", item.done_when)))
-    return ('<div class="list-panel"><div><div class="list-item-fields">' + fields
+    return ('<div class="list-panel"><div>' + asks + '<div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log) + '</div>')
 
@@ -719,7 +772,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
-    return detail_panel(entry, sections, today, names, unread_answers)
+    return detail_panel(entry, sections, today, names, unread_answers, ask_boxes(entry, secret, names))
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
@@ -739,7 +792,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
                          schedule=schedule, today=today)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, schedule)
+        entry, sections + questions + form, today, names, unread_answers, ask_boxes(entry, secret, names), schedule)
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
@@ -764,10 +817,14 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
                   "unread-answer": str(bool(unread_answers)).lower(),
+                  "open-ask": str(bool(the_list.answerable_asks(item, names.members))).lower(),
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
+    keeper = names.members.by_id(entry.keeper)
+    if keeper is not None:
+        attrs += f' data-send-receiver="{html.escape(keeper.name, quote=True)}"'
     panel = f'list-detail-{index}'
     row_id = html.escape(entry.key.replace("/", "-"), quote=True)
     number = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}" '
@@ -880,6 +937,7 @@ class SavedActionState(TypedDict):
     check_html: str
     waiting_for_answer: str
     open_question: str
+    open_ask: str
     unread_delivery: NotRequired[str]
     unread_answer: NotRequired[str]
     waiting_details_html: NotRequired[str]
@@ -925,6 +983,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     open_question = not scheduled and item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
     visibility = the_list.QuestionAttention() if scheduled else the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
+    open_ask = bool(the_list.answerable_asks(item, staff.snapshot()))
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
@@ -932,6 +991,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                                "check_html": check_row_html(item.next_check, local_today, parked=parked or scheduled),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
+                               "open_ask": str(open_ask).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower(),
                                "unread_answer": str(bool(unread_answers)).lower()}
     if scheduled:
@@ -1165,14 +1225,20 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
 
 
 def deliver(submission: ListActionSubmission) -> None:
+    _ = deliver_with_outcome(submission)
+
+
+def deliver_with_outcome(submission: ListActionSubmission) -> change_page.DeliveryOutcome:
     """Send saved List words with the shared retry and alert helpers."""
     delivery = submission.delivery if isinstance(submission, ListUnparkSubmission) else submission
     if isinstance(delivery, change_page.NoMessageDelivery):
-        return
+        return change_page.DeliveryUnconfirmed()
     if isinstance(delivery, ListQuestionDelivery):
-        change_page.deliver(delivery.delivery, delivery.status)
-        return
+        return change_page.deliver_with_outcome(delivery.delivery, delivery.status)
+    outcome: change_page.DeliveryOutcome = change_page.DeliveryUnconfirmed()
+
     def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
+        nonlocal outcome
         settings = conf.read("review_links")
         tries = settings.whole("delivery_tries")
         message = (f"List page: nate's words for item {item.number}\n{feedback.words}"
@@ -1183,19 +1249,176 @@ def deliver(submission: ListActionSubmission) -> None:
         failures = change_page.send_with_retries(change_page.SENDER, (recipient,), message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key)
         if not failures:
+            outcome = change_page.DeliveryConfirmed()
             return replace(feedback, state="sent")
+        outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != recipient)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+    return outcome
 
 
-def recover_pending() -> None:
-    """Retry each pending request once at server start."""
+def _signed_go(root: Path, body: str) -> tuple[staff.StaffId, str, str, str]:
+    fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
+    if set(fields) != {"keeper", "id", "ask", "token", "page"} or any(len(values) != 1 for values in fields.values()):
+        raise question_record.AnswerRefused("use the Go button on this page")
+    keeper = staff.StaffId(fields["keeper"][0])
+    identity, ask_id = fields["id"][0], fields["ask"][0]
+    if re.fullmatch(r"L[1-9]\d*", identity) is None or the_list.ASK_ID.fullmatch(ask_id) is None:
+        raise question_record.AnswerRefused("the Go does not match this page")
+    prefix = go_ledger.token_prefix(ask_id)
+    token = fields["token"][0].encode()
+    if not any(secrets.compare_digest(token, signed_token(secret, keeper, identity, prefix).encode())
+               for secret in (form_secret(root), bootstrap_form_secret(root))):
+        raise question_record.AnswerRefused("the List token does not match this page")
+    return keeper, identity, ask_id, fields["page"][0]
+
+
+class GoSavedUnsent(OSError):
+    """The List holds the Go, but the server did not send it; the next server start sends it."""
+
+
+def _remove_unheld_go(ledger: Path, keeper: staff.StaffId, identity: str, go_id: str) -> bool | None:
+    """Remove the ledger record only when a read of the item shows that no ask holds this go id.
+
+    Return True when the record is removed and False when an ask holds the go id.
+    Return None when the read fails: the record stays, and `check` and `deliver_go` need a closed ask with this go id.
+    The caller holds the ledger lock, so no Go click is between its record and its List save.
+    """
+    try:
+        item = the_list.load(keeper, identity)
+    except (OSError, ValueError) as error:
+        print(f"review-links List Go {identity}: the ledger record stays; the read failed: {error}", file=sys.stderr)
+        return None
+    if any(ask.go_id == go_id for ask in item.asks):
+        return False
+    go_ledger.remove(ledger, go_id)
+    return True
+
+
+def save_go(root: Path, ledger: Path, body: str, client: str, *,
+            review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK
+            ) -> tuple[str, SavedActionState | None]:
+    """Write the ledger record, then close the ask with its go id."""
+    keeper, identity, ask_id, page = _signed_go(root, body)
+    members = staff.snapshot()
+    item = the_list.load(keeper, identity)
+    ask = next((ask for ask in the_list.answerable_asks(item, members) if ask.ask_id == ask_id), None)
+    target = members.by_id(ask.target) if ask is not None else None
+    if ask is None or target is None:
+        raise question_record.AnswerRefused("This ask is no longer open.")
+    recipients = tuple(dict.fromkeys((target.id, the_list.producer_id(members, "morty"))))
+    with go_ledger.locked(ledger):
+        entry = go_ledger.record(ledger, ask=ask, item=f"{keeper}/{identity}", recipients=recipients, client=client,
+                                 page=page, moment=the_list.now())
+        try:
+            edit = the_list.give_go(keeper, identity, ask_id, entry["go_id"], source="nate")
+        except the_list.SavedReadFailed as error:
+            raise GoSavedUnsent(str(error)) from error
+        except BaseException as error:
+            if _remove_unheld_go(ledger, keeper, identity, entry["go_id"]) is False:
+                raise GoSavedUnsent(str(error)) from error
+            raise
+    try:
+        state = action_state(keeper, edit.item, review_records=review_records, include_detail=True)
+    except Exception as error:
+        print(f"review-links List Go {identity}: {error}", file=sys.stderr)
+        return entry["go_id"], None
+    return entry["go_id"], state
+
+
+def deliver_go(ledger: Path, go_id: str) -> None:
+    """Send the Go to each unsent recipient through the List Tell sender and keep the result in the ledger.
+
+    When the Go moved the item to Working, the producer gets one message with the next step.
+    A producer that is a Go recipient gets the Go and the next step together; another producer gets the next step alone.
+    A failed send alerts the item's showrunners and adds a "Go not delivered" log line for nate, once per recipient.
+    """
+    entry = go_ledger.read(ledger, go_id)
+    found = go_ledger.closed_ask(entry)
+    pending = tuple(staff.StaffId(recipient) for recipient, sent in entry["sent"].items() if not sent)
+    if found is None or not pending:
+        return
+    keeper, item, ask = found
+    members = staff.snapshot()
+    target = members.by_id(ask.target)
+    settings = conf.read("review_links")
+    tries = settings.whole("delivery_tries")
+    pause = settings.number("delivery_pause_seconds")
+    message = go_ledger.message(item, ask, go_id, target.name if target is not None else ask.target)
+    source = the_list.folder(keeper) / f"{item.id}.md"
+    key = change_page.review_delivery_key(source, item.id, go_id)
+    next_step = the_list.go_next_step_request(go_id)
+    notice = the_list.feedback_requests(item).get(next_step)
+    producer = notice.recipient_id(keeper) if notice is not None and notice.state == "pending" else None
+    plain = tuple(recipient for recipient in pending if recipient != producer)
+    failures = change_page.send_with_retries(change_page.SENDER, plain, message, tries, pause, key=key)
+    failed = {failure.recipient for failure in failures}
+    sent = [recipient for recipient in plain if recipient not in failed]
+    if producer is not None and producer in pending:
+        def send(_: the_list.ListItem, saved: the_list.PageFeedback) -> the_list.PageFeedback:
+            missed = change_page.send_with_retries(change_page.SENDER, (producer,), message + "\n" + saved.words,
+                                                   tries, pause, key=key)
+            failures.extend(missed)
+            if missed:
+                return saved
+            sent.append(producer)
+            return replace(saved, state="sent")
+        the_list.deliver_feedback(keeper, item.id, next_step, send)
+    go_ledger.mark(ledger, go_id, "sent", sent)
+    if producer is not None and producer not in entry["sent"]:
+        deliver(ListFeedbackDelivery(keeper, item.id, next_step))
+    # Report each failed recipient to nate once per Go; a resend at a later start reports nothing new.
+    new = [failure for failure in failures if not entry["reported"].get(str(failure.recipient), False)]
+    if not new:
+        return
+    owners = tuple(owner.id for owner in alert_showrunners(item, members) if owner.id not in pending)
+    _ = change_page.alert_delivery_failures(new, tries, source=source, row=item.id, message=message,
+                                            recipients=owners, attempt=go_id, title="List Go needs attention")
+    reported = tuple(staff.StaffId(failure.recipient) for failure in new if isinstance(failure.recipient, str))
+    for recipient in reported:
+        _ = the_list.log_go_not_delivered(keeper, item.id, go_id, recipient)
+    go_ledger.mark(ledger, go_id, "reported", reported)
+
+
+def recover_goes(ledger: Path) -> None:
+    """Send each unsent Go again once at server start, through the same path as a click.
+
+    Remove each record whose item a read shows with no ask that holds its go id.
+    """
+    for go_id in go_ledger.unsent(ledger):
+        try:
+            with go_ledger.locked(ledger):
+                keeper, _, identity = go_ledger.read(ledger, go_id)["item"].partition("/")
+                if _remove_unheld_go(ledger, staff.StaffId(keeper), identity, go_id):
+                    continue
+            deliver_go(ledger, go_id)
+        except (OSError, ValueError) as error:
+            print(f"List Go recovery {go_id}: {error}", file=sys.stderr)
+
+
+def _go_sends_notice(ledger: Path, keeper: staff.StaffId, feedback: the_list.PageFeedback) -> bool:
+    """Find a Go's next-step notice that only the Go path sends: the Go record has its recipient unsent.
+
+    The Go path sends that recipient the Go and the next step in one message.
+    """
+    go_id = the_list.next_step_go_id(feedback.request)
+    if go_id is None:
+        return False
+    try:
+        entry = go_ledger.read(ledger, go_id)
+    except (OSError, ValueError):
+        return False
+    return entry["sent"].get(feedback.recipient_id(keeper)) is False
+
+
+def recover_pending(ledger: Path) -> None:
+    """Retry each pending request once at server start; leave a Go's next-step notice to the Go path."""
     for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
-            if feedback.state == "pending":
+            if feedback.state == "pending" and not _go_sends_notice(ledger, entry.keeper, feedback):
                 try:
                     deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
                 except (OSError, ValueError) as error:
@@ -1318,7 +1541,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         unread_answers = the_list.unread_answer_ids(entry.item)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
                               unread_delivery=the_list.unread_delivery(entry.item),
-                              unread_answer=bool(unread_answers))] += 1
+                              unread_answer=bool(unread_answers),
+                              open_ask=bool(the_list.answerable_asks(entry.item, members)))] += 1
         row_reviews = reviews
         if entry.item.reviews and (
             reviews is LinkedReviewRead.AFTER_RENDER
@@ -1354,6 +1578,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         else:
             counts = counts_strip(members, names)
     content = (STYLE + page_frame.title("The List", "list")
+               + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' {card_motion.attributes()}'
@@ -1500,6 +1725,15 @@ background:var(--ink-2);border-radius:50%}
  border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
 }
 .list-tell>[data-send-status]:empty{display:none}
+.list-ask{border:1px solid var(--warning);border-radius:8px;padding:12px 14px;margin:0 0 12px}
+.list-ask h3{color:var(--warning);margin:0 0 8px}
+.list-ask dl{display:grid;grid-template-columns:7.5rem minmax(0,1fr);gap:4px 12px;margin:0 0 10px}
+.list-ask dt{color:var(--ink-3)}.list-ask dd{margin:0;overflow-wrap:anywhere}
+.list-ask form{display:flex;align-items:center;flex-wrap:wrap;gap:6px 12px}
+.list-ask button{min-height:32px;padding:6px 18px;border:0;border-radius:6px;background:var(--warning);color:#1b1b1b;
+font-weight:600;cursor:pointer}
+.list-ask button:disabled{opacity:.45;cursor:default}
+.list-ask small{color:var(--ink-3)}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
 .list-table .list-row.open :is([data-parked-note],[data-scheduled-note]){display:none}
@@ -1601,7 +1835,7 @@ const chipFor=data=>{
  if(data.state==='Closed') return;
  if(data.state==='Scheduled') return 'scheduled';
  const parked=isParked(data);
- return chipsByQueue[questionQueue(queuesByState[data.state],data.unread==='true' && data.unreadAnswer==='true',
+ return chipsByQueue[questionQueue(queuesByState[data.state],data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
 };
 let content=document.querySelector('[data-list]');
@@ -1616,7 +1850,7 @@ function startListSave(){
 function refreshAfterListSave(needed){
  refreshNeeded ||= needed;
  if(saving) return;
- if(savedReview) void refreshSavedReview();
+ if(savedReviews.size) void refreshSavedReview();
  else if(refreshNeeded) void pageRefresh.refresh(true);
 }
 const drafts=new Map();
@@ -2172,6 +2406,7 @@ function bindFeedbackForm(form){
     }else note?.remove();
    }
    if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
+   if(['true','false'].includes(result.open_ask)) item.dataset.openAsk=result.open_ask;
    const questionNote=item.querySelector('[data-open-question-note]');
    if(item.dataset.openQuestion==='true'){
     if(!questionNote){
@@ -2243,6 +2478,7 @@ function bindFeedbackForm(form){
   };
   const retain=()=>{retainDraft();syncTell();};
   form.retainDraft=retainDraft;
+  form.applySavedState=applySavedState;
   retain();
   words.addEventListener('input',edit);until.addEventListener('input',edit);
   const parkToggle=form.querySelector('[data-later-toggle]');
@@ -2348,7 +2584,10 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+    // Words wait on the server for Undo; read, park and remove act at once.
+    const options={method:'POST',body:data};
+    const response=await (usesWords ? heldFetch(location.pathname,options,current.dataset.sendReceiver)
+                                   : fetch(location.pathname,options));
     saved=response.ok;
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && !scheduleWrite && action!=='remove'));
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -2423,6 +2662,9 @@ function bindFeedbackForm(form){
    }catch(error){
     stale=!tableView.currentItemRequest(request);
     if(item.listRequest!==request) return;
+    // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
+    const undone=error instanceof SendUndone;
+    if(undone) refused=true;
     if(saved){
      clearConfirmedScheduleDraft();
      if(stale) return;
@@ -2472,8 +2714,8 @@ function bindFeedbackForm(form){
      if(restore) restoreLink?.();
      if(!confirmedByReadback){
       if(!stale && (refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
-      const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
+      const message=undone ? error.message : (refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
+      tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:undone ? 'undone' : 'failure',message});
      }
      // The return animation uses the confirmed sort keys.
      if(refused && wasHidden && !item.hidden) tableView.applyAction();
@@ -2532,6 +2774,46 @@ function bindFeedbackForm(form){
    }
   });
 }
+// A Go form sends nate's Go or Approved for one ask; the server closes the ask.
+document.addEventListener('submit',async event=>{
+ const form=event.target instanceof Element ? event.target.closest('form[data-go-form]') : null;
+ if(!form || !content.contains(form)) return;
+ event.preventDefault();
+ const item=recordFromDetail(form),box=form.closest('[data-ask]'),button=form.querySelector('button');
+ if(button.disabled) return;
+ const key=item.dataset.key,hadFocus=box.contains(document.activeElement);
+ const data=new URLSearchParams(new FormData(form));data.set('page',location.href);
+ button.disabled=true;
+ startListSave();
+ const submission=tableView.startAction(item);
+ let saved=false;
+ try{
+  const response=await fetch(form.action,{method:'POST',body:data});
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  saved=true;
+  tableView.preserveRecordRowTop(()=>{
+   const asks=box.parentElement;
+   box.remove();
+   if(!asks.children.length) asks.remove();
+   // The row's feedback form applies the saved state, so a Go that sets Working moves the row as Mark read does.
+   recordDetails(item).querySelector('[data-feedback-form]').applySavedState(result);
+   tableView.applyAction();
+   if(item.hidden && tableView.opened.has(key)){tableView.closeCard(key);tableView.applyAction();}
+  });
+  if(hadFocus && listOwnsFocus()){
+   if(item.hidden) focusAfterQuestion(item);
+   else (recordDetails(item)?.querySelector('[data-go-form] button') ?? item.querySelector('.list-toggle')).focus();
+  }
+ }catch(error){
+  button.disabled=false;
+  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+   {kind:'failure',message:'Not sent: '+(error instanceof Error ? error.message : String(error))});
+ }finally{
+  saving--;
+  refreshAfterListSave(saved);
+ }
+});
 let listCounts=null,reviewSaveVersion=0;
 const listCountsSource=()=>content.querySelector('[data-list-counts-url]');
 function presentReviewLinks(row,links){
@@ -2613,6 +2895,8 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || document.querySelector('.list-schedule-dialog[open]') || dateTimePickerOpen(document) || !current()) return;
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
+ reviewRefreshError.textContent='';
+ reviewRefreshError.hidden=true;
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
   tableView.finishDeliveryWindow(delivery);
  return pageRefreshFacts(page);
@@ -2657,7 +2941,9 @@ const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
 const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"]') ? window.frameElement : null;
-let activeReview,savedReview,refreshingReview=false;
+let activeReview,refreshingReview=false;
+const savedReviews=new Set(),returnedReviews=[];
+const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
  const style=listHost?.ownerDocument.createElement('style');
@@ -2698,33 +2984,52 @@ function restoreReviewLink({key,selector,detail,position}){
   });
  }
 }
+function showReviewCard(card){
+ activeReview=card;
+ card.frame.hidden=false;
+ card.restoreHost=fitReviewDialog();
+ reviewClose.disabled=card.frame.hasAttribute('data-saving');
+ reviewDialog.showModal();
+}
+function hideReviewCard(card){
+ if(activeReview!==card) return;
+ activeReview=null;
+ reviewDialog.close();
+ card.restoreHost();
+ card.frame.hidden=true;
+ if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
+}
+function reopenReturnedReview(){
+ if(!activeReview && returnedReviews.length) showReviewCard(returnedReviews.shift());
+}
 function closeReviewCard(){
  const card=activeReview;
  if(!card || card.frame.hasAttribute('data-saving')) return;
- activeReview=null;
  reviewMotion.finish();
- reviewDialog.close();
- card.restoreHost?.();
+ hideReviewCard(card);
  card.frame.remove();
  reviewClose.disabled=false;
- if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
+ reopenReturnedReview();
 }
 async function refreshSavedReview(){
- if(saving || refreshingReview || !savedReview) return;
- const card=savedReview;
+ if(saving || refreshingReview || !savedReviews.size) return;
+ const cards=[...savedReviews];
  refreshingReview=true;
  const version=listSaveVersion;
  await pageRefresh.refresh(true);
- const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(card.link.key)+'"]');
- if(activeReview===card && row?.hasAttribute('data-list-review-version')) await listCounts;
+ if(cards.some(card=>content.querySelector('[data-list-item][data-list-review-version][data-key="'+
+    CSS.escape(card.link.key)+'"]'))) await listCounts;
  refreshingReview=false;
- if(savedReview!==card || version!==listSaveVersion){
+ if(version!==listSaveVersion){
   void refreshSavedReview();
   return;
  }
- savedReview=null;
- if(activeReview===card)
-  void reviewMotion.switchCard(card.frame,null,()=>{if(activeReview===card) closeReviewCard();});
+ for(const card of cards){
+  savedReviews.delete(card);
+  if(activeReview===card) void reviewMotion.switchCard(card.frame,null,()=>{if(activeReview===card) closeReviewCard();});
+  else card.frame.remove();
+ }
+ void refreshSavedReview();
 }
 if(listHost) new MutationObserver(()=>{
  if(!listHost.hidden) return;
@@ -2742,7 +3047,7 @@ document.addEventListener('click',event=>{
  const frame=document.createElement('iframe');
  frame.title='Review card';
  frame.src=link.href;
- const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog()};
+ const card={frame,link:reviewLinkPlace(link)};
  activeReview=card;
  frame.addEventListener('load',()=>{
   const doc=frame.contentDocument;
@@ -2752,14 +3057,30 @@ document.addEventListener('click',event=>{
    }
   });
  });
- frame.addEventListener('review-card-busy',()=>{reviewClose.disabled=frame.hasAttribute('data-saving');});
- frame.addEventListener('review-card-saved',()=>{
+ frame.addEventListener('review-card-sending',()=>{
+  hideReviewCard(card);
+  reopenReturnedReview();
+ });
+ frame.addEventListener('review-card-busy',()=>{
+  const busy=frame.hasAttribute('data-saving');
+  if(activeReview===card) reviewClose.disabled=busy;
+  else if(!busy){
+   returnedReviews.push(card);
+   reopenReturnedReview();
+  }
+ });
+ frame.addEventListener('review-card-saved',event=>{
+  if(activeReview===card) reviewClose.disabled=false;
+  if(event.detail){
+   reviewRefreshError.textContent=event.detail;
+   reviewRefreshError.hidden=false;
+  }
   reviewSaveVersion++;
-  savedReview=card;
+  savedReviews.add(card);
   refreshAfterListSave(false);
  });
  reviewDialog.append(frame);
- reviewDialog.showModal();
+ showReviewCard(card);
 });
 tableView.place();
 tableView.bind();bindListControls();tableView.apply(true);

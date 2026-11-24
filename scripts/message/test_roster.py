@@ -1261,6 +1261,8 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(Path, "iterdir", list_folder):
             result = roster.roster(os.environ, roster.ThisMachine())
         self.assertIn(f"Claude session records: cannot list {self.sessions}", result.problems)
+        self.assertFalse(any(isinstance(problem, roster.UnreadableSessionRecordProblem)
+                             for problem in result.problems))
         with mock.patch.object(roster, "peer_roster") as peer:
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.LocalRosterIncomplete)
@@ -1273,6 +1275,10 @@ class RosterTests(unittest.TestCase):
         result = roster.roster(os.environ, roster.ThisMachine())
         for path in unreadable:
             self.assertIn(f"Claude session records: cannot read {path}", result.problems)
+        self.assertCountEqual(
+            [problem for problem in result.problems if isinstance(problem, roster.UnreadableSessionRecordProblem)],
+            [f"Claude session records: cannot read {path}" for path in unreadable],
+        )
 
     def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
         run = self.runs / "lost-owner-run"
@@ -2749,6 +2755,16 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(document["problems"], ["mac: Codex daemon: closed"])
         self.assertEqual(len(errors), 1)
         self.assertIn("mac: Codex daemon: closed", errors[0])
+
+    def test_peer_snapshot_preserves_the_unreadable_record_problem_type(self) -> None:
+        message = "Claude session records: cannot read /peer/2.json"
+        self.peer_snapshot(roster.Roster([], [message, roster.UnreadableSessionRecordProblem(message)]), status=1)
+
+        result = roster.peer_roster(os.environ)
+
+        self.assertEqual(result.problems, [f"mac: {message}", f"mac: {message}"])
+        self.assertNotIsInstance(result.problems[0], roster.UnreadableSessionRecordProblem)
+        self.assertIsInstance(result.problems[1], roster.UnreadableSessionRecordProblem)
 
     def test_snapshot_round_trips_every_relationship_reach_thread_and_session_state(self) -> None:
         base = self._entry("base", "freestanding", "session:base")
