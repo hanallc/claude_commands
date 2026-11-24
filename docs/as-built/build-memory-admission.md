@@ -421,6 +421,11 @@ Each step also retains its own owner, episode, and reservation.
 Queue priority remains the first ordering field.
 A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
+A local gate keeps the first step's `since` and run identity when it requests its own reservation.
+It releases the first reservation after the queue grants the new one.
+The queue counts the overlap as one run and reserves the larger memory need.
+The gate keeps its GPU slot during the handoff.
+
 The service retains the run's process watch between steps.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
 When the run ends, waiting steps use their own arrival times for order again.

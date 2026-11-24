@@ -3618,7 +3618,11 @@ class AdmissionServer:
                                 self.places, RegisteredServiceWrites(self.writes),
                                 retire_verify_grant=lambda reservation: self._finish_verify_grant(reservation, started=False)),
             end_kind=end_kind)
-        if ((started or not isinstance(ending, LocalGrantReturned))
+        handoff = gate.gate_handoff_key(record.queue_waiter)
+        gate_still_holds_place = handoff is not None and any(
+            isinstance(other.place, wire.LocalPlace) and gate.gate_handoff_key(other.queue_waiter) == handoff
+            for other in self.reservations.values())
+        if (not gate_still_holds_place and (started or not isinstance(ending, LocalGrantReturned))
                 and isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
