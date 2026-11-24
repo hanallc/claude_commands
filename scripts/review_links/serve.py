@@ -2344,7 +2344,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise ValueError("invalid List Go size")
             body = self.rfile.read(length).decode("utf-8")
             with server.list_store_access():
-                go_id, current = list_page.save_go(server.root, server.store_folder, body, client,
+                go_id, current = list_page.save_go(server.root, server.store_folder, body, client, views=LIST_VIEWS,
                                                    review_records=server.list_review_records())
         except ValueError as error:
             self.browser_failure(400, str(error), error)

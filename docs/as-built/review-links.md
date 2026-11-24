@@ -1967,7 +1967,7 @@ The List uses `location.pathname` for these requests.
 The view sets the item panels in an action answer, so a Studio action keeps the Studio panel.
 A page refresh reads `location.pathname`, so the Studio refreshes as the Studio.
 Both pages use the shared HTML gzip response.
-In both views, **Tell** and **Ask question** use the send hold.
+See [Undo after Send](#undo-after-send) for the actions that use the send hold.
 
 Each producer has one top priority item: the `top_item` List number in its staff row.
 `ListView.top_priority` is `TopPriority.SHOWN` for the Studio and `TopPriority.HIDDEN` for the List, so the List does not change.
@@ -2588,7 +2588,7 @@ A send waits a short time before it leaves, so the user can undo it, as in an em
 These sends wait:
 
 1. Review items: each answer except Later and Validate.
-2. The List uses the hold for **Tell** and **Ask question**. **Mark read** runs immediately.
+2. The List and the Studio hold **Tell** and **Ask question**. **Mark read** runs immediately.
 3. Images: Approved, Send Feedback and Ask question.
 4. The New item dialog on each console page.
 5. The change browser: each answer except Skip.

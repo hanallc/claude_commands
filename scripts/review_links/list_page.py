@@ -17,7 +17,7 @@ from enum import Enum, StrEnum
 from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
-from urllib.parse import parse_qs, quote, unquote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
@@ -1215,7 +1215,7 @@ def _remove_unheld_go(ledger: Path, keeper: staff.StaffId, identity: str, go_id:
     return True
 
 
-def save_go(root: Path, ledger: Path, body: str, client: str, *,
+def save_go(root: Path, ledger: Path, body: str, client: str, *, views: Mapping[str, ListView],
             review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK
             ) -> tuple[str, SavedActionState | None]:
     """Write the ledger record, then close the ask with its go id."""
@@ -1239,7 +1239,13 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *,
                 raise GoSavedUnsent(str(error)) from error
             raise
     try:
-        state = action_state(keeper, edit.item, review_records=review_records, include_detail=True)
+        page_path = urlsplit(page).path
+    except ValueError:
+        page_path = PAGE_PATH
+    view = views.get(page_path, LIST_VIEW)
+    try:
+        state = action_state(keeper, edit.item, review_records=review_records, include_detail=True,
+                             top_priority=view.top_priority)
     except Exception as error:
         print(f"review-links List Go {identity}: {error}", file=sys.stderr)
         return entry["go_id"], None

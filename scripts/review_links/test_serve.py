@@ -1117,7 +1117,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
         _ = self.enterContext(patch.object(change_browser, "browser_manifest", return_value=("token", "")))
         browser = f"/{change_page.CONSOLE_FOLDER}/changes.html"
-        for path in [*sorted(serve.HELD_SEND_PATHS), browser]:
+        for path in (review_page.PAGE_PATH, list_page.PAGE_PATH, images.PAGE_PATH, review_page.NEW_ITEM_PATH, browser):
             with self.subTest(path=path), patch.object(serve.ReviewLinksHandler, "_write_post") as write:
                 status, hold, fields = self.held_http("POST", path, b"outcome=works", headers=marked)
                 self.assertEqual((status, hold), (202, "held"), fields)
@@ -1132,6 +1132,24 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(self.held_http("POST", review_page.PAGE_PATH, b"", headers=marked)[0], 400)
         self.assertEqual(self.held_http("POST", f"{send_hold.HOLD_PATH}/not-an-id/undo")[0], 404)
         self.assertEqual(set(self.hold_states()), {"undone"})
+
+    def test_studio_holds_a_signed_tell_until_undo(self) -> None:
+        morty, item = self.list_keeper_item("A Studio item")
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=60\n")
+        _ = self.enterContext(patch.object(self.server, "verified_tailscale_address", self.server.bound_address))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))))
+        request, token = list_page.signed_item_request(list_page.ListRecord(morty.id, item), list_page.form_secret(self.root))
+        body = urlencode({"keeper": morty.id, "id": item.id, "request": request, "token": token,
+                          "action": "tell", "words": "Check the Studio item.", "until": ""}).encode()
+        with patch.object(list_page, "deliver") as deliver:
+            status, hold, fields = self.held_http("POST", studio_page.PAGE_PATH, body, headers={
+                send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual((status, hold), (202, "held"), fields)
+            self.assertEqual(the_list.load(morty.id, item.id), item)
+            undo = f"{send_hold.HOLD_PATH}/{fields['hold']}/undo"
+            self.assertEqual(self.held_http("POST", undo)[::2], (200, {"outcome": "undone"}))
+        deliver.assert_not_called()
+        self.assertEqual(the_list.load(morty.id, item.id), item)
 
     def raw_held_post(self, headers: list[str], body: bytes) -> bytes:
         """Send one marked Review POST with these extra header lines, end the send side, and return the answer."""
@@ -6302,7 +6320,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 finally:
                     restarted.server_close()
 
-    def go_fixture(self, *, natedev: bool = False, waiting: bool = False, producer: staff.StaffRow | None = None
+    def go_fixture(self, *, natedev: bool = False, waiting: bool = False, producer: staff.StaffRow | None = None,
+                   page_path: str = list_page.PAGE_PATH
                    ) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem, the_list.Ask, str]:
         """Open one Go ask for a unit row; return the signed Go form body.
 
@@ -6329,7 +6348,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                                why="The merge needs nate's go.", config=False, requester=morty.id, source="morty")
         token = list_page.signed_token(list_page.form_secret(self.root), morty.id, item.id, go_ledger.token_prefix(ask.ask_id))
         body = urlencode({"keeper": morty.id, "id": item.id, "ask": ask.ask_id, "token": token,
-                          "page": f"http://127.0.0.1:{self.port}{list_page.PAGE_PATH}"})
+                          "page": f"http://127.0.0.1:{self.port}{page_path}"})
         return morty, unit, the_list.load(morty.id, item.id), ask, body
 
     def go_ledger_records(self) -> list[Path]:
@@ -6403,6 +6422,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(code, 200, reply)
         fields = cast(dict[str, str], json.loads(reply))
         self.assertEqual((fields["item_state"], fields["open_ask"], fields["unread"]), ("Working", "false", "false"))
+        self.assertNotIn('value="top"', fields["detail_html"])
         go_id = self.go_ledger_records()[0].stem
         command = f"update --id {item.id} --source morty --next-step"
         messages = self.sent_messages(delivery)
@@ -6417,6 +6437,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         notice = the_list.feedback_requests(saved)[the_list.go_next_step_request(go_id)]
         self.assertEqual((notice.recipient, notice.state), (morty.id, "sent"))
         self.assertEqual(go_ledger.read(self.root, go_id)["sent"], {unit.id: True, morty.id: True})
+
+    def test_studio_go_keeps_make_top_priority_in_the_saved_panel(self) -> None:
+        _, _, _, _, body = self.go_fixture(waiting=True, page_path=studio_page.PAGE_PATH + "#show=needs-me")
+        code, reply, _ = self.post_go(body)
+        self.assertEqual(code, 200, reply)
+        fields = cast(dict[str, str], json.loads(reply))
+        self.assertEqual((fields["item_state"], fields["open_ask"]), ("Working", "false"))
+        self.assertIn('<button name="action" value="top">Make top priority</button>', fields["detail_html"])
 
     def restart_and_recover_all(self, send: Callable[..., None] | None = None) -> list[tuple[str, str]]:
         """Start a second server that runs the Go and List Tell recoveries; return each send and its message."""
