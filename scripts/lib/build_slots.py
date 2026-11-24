@@ -110,8 +110,9 @@ def slot_cargo_root(settings: conf.ConfigRead) -> Path:
 
 def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
     """Read the repository limit or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
+    host = conf.host_key_name(machine)
+    key = f"slots.{host}.{repository}.max"
+    return settings.whole(key if key in settings.values() else f"slots.{host}.default_max")
 
 
 def _persistent_source(source: Path) -> Path:

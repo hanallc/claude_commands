@@ -8769,7 +8769,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.row_id = self.fixture.worker("impl").id
         self.fixture.world.add(self.row, "w1:p1")
         self.state = self.fixture.root / "messages"
-        _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_SPLIT_RATIO=0.667\n")
+        _ = (self.fixture.root / "conf/direct.conf").write_text("worker_split_ratio=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation",

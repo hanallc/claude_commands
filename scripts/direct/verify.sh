@@ -3913,8 +3913,8 @@ TOKEN_WAITER_PID=""
 TOKEN_WAIT_HOLD_CHECK=""
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)" || exit 2
+TOKEN_HOLD_S="$(conf_value direct verify_token_hold_seconds)" || exit 2
+TOKEN_RENEW_S="$(conf_value direct verify_token_renew_seconds)" || exit 2
 TOKEN_RENEW_S=$(awk -v interval="$TOKEN_RENEW_S" -v hold="$TOKEN_HOLD_S" \
     'BEGIN { if (interval > hold / 3) interval = hold / 3; print interval }')
 token_wait_clock() {

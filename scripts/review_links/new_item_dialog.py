@@ -285,6 +285,19 @@ class PageRecipient(StrEnum):
     SELECTED = "selected"
 
 
+class DefaultSubmissionNotice(StrEnum):
+    FILED_KIND_FROM_REVIEW = "filed-kind-from-review"
+
+
+@dataclass(frozen=True)
+class SubmissionNotice:
+    kind: SubmissionKind | Literal["feedback", "efficiency", "enhancement"]
+    from_command: bool = False
+
+
+type Notice = SubmissionNotice | DefaultSubmissionNotice
+
+
 @dataclass(frozen=True)
 class NewItemRequest:
     request_id: str
@@ -296,6 +309,7 @@ class NewItemRequest:
     page: str = ""
     page_state: BugPageState | None = None
     page_recipient: PageRecipient = PageRecipient.PAGE_OWNER
+    notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
 
 
 @dataclass(frozen=True)
@@ -316,6 +330,7 @@ class ReviewSubmission:
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
     reply_token_nonce: str = ""
     legacy_reply_token: str = field(default="", repr=False, compare=False)
+    notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
 
     def __post_init__(self) -> None:
         if reply_tokens.valid(self.reply_token_sha256):
@@ -600,12 +615,30 @@ def read_bug_page_state(value: object) -> BugPageState | None:
         _text(row.get("title", ""), "Page title", 240, allow_empty=True))
 
 
+def _read_notice(value: object) -> Notice:
+    if value is None or value == DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW:
+        return DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    fields = _mapping(value, "Submission notice")
+    kind = fields.get("kind")
+    from_command = fields.get("from_command", False)
+    if not isinstance(from_command, bool):
+        raise SubmissionError("Invalid submission notice source.")
+    if isinstance(kind, str) and (kind == "feedback" or kind == "efficiency" or kind == "enhancement"):
+        return SubmissionNotice(kind, from_command)
+    return SubmissionNotice(read_kind(kind), from_command)
+
+
 def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind_value = data.get("kind")
     kind = "enhancement" if kind_value == "enhancement" else read_kind(kind_value)
+    notice = _read_notice(data.get("notice"))
+    if isinstance(notice, SubmissionNotice):
+        notice_kind = SubmissionKind.INVESTIGATION if notice.kind in ("feedback", "efficiency") else notice.kind
+        if notice_kind != kind:
+            raise SubmissionError("The submission notice does not match the item type.")
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
@@ -637,7 +670,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         read_request_id(data.get("request_id")), kind,
         staff.StaffId(_text(data.get("recipient_id"), "Recipient ID", 128)),
         _text(data.get("words"), "Your words", MAX_WORDS_LENGTH),
-        evidence, images, page, page_state, page_recipient)
+        evidence, images, page, page_state, page_recipient, notice)
 
 
 def read_image_reference(value: object) -> ImageReference:
@@ -656,6 +689,8 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     fields = cast(dict[str, object], asdict(details))
     fields["evidence"] = evidence_fields(details.evidence)
     _ = fields.pop("legacy_reply_token")
+    if isinstance(details.notice, DefaultSubmissionNotice):
+        _ = fields.pop("notice")
     if not details.reply_token_nonce:
         _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
@@ -709,7 +744,8 @@ def read_submission(value: object) -> ReviewSubmission:
         digest, page, read_bug_page_state(row.get("page_state")), data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
         reply_token_nonce=nonce,
-        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "")
+        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "",
+        notice=_read_notice(row.get("notice")))
 
 
 def hashed_submission_fields(value: dict[str, object], details: ReviewSubmission) -> dict[str, object]:
@@ -1557,7 +1593,8 @@ function bindDraft(dialog, fresh = false) {
   if (!recipient) throw new Error('Select a recipient.');
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
-                   page: ownerPage, page_recipient: 'selected'};
+                   page: ownerPage, page_recipient: 'selected',
+                   ...(type === 'feedback' && {notice: {kind: type}})};
   let key = '';
   if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {

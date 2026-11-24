@@ -270,7 +270,7 @@ class RustReleaseTests(unittest.TestCase):
 
     def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
         config = self.scratch / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = config.write_text("review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
         with (mock.patch.object(review, "NOTIFY_CONFIG", config),
               mock.patch.object(subprocess, "run", return_value=done) as run):

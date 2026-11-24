@@ -293,7 +293,7 @@ def open_worker(turn: ClaudeTurn, *,
             binary = _validate(turn, environment)
             allowed = worker_admission.admit(turn.name, turn.run, reference=turn.staff_id)
             request = worker_admission.assignment_id(turn.prompt)
-            register_seconds = conf.read("direct").whole("CLAUDE_WORKER_REGISTER_WAIT_SECS")
+            register_seconds = conf.read("direct").whole("claude_worker_register_wait_secs")
 
             def start(handoff: worker_admission.FamilyHandoff) -> str:
                 nonlocal created, prepared
@@ -405,7 +405,7 @@ def wait_for_turn(turn: ClaudeTurn, delivered: Delivered) -> int:
     """Read native state and logs until the delivered turn finishes."""
     with _environment(replace(turn, env=delivered.launch_environment or turn.env)) as environment:
         binary = _binary(environment)
-        seconds = float(environment.get("UNIT_WORKER_POLL_SECS") or conf.read("direct").text("CLAUDE_WORKER_POLL_SECS"))
+        seconds = float(environment.get("UNIT_WORKER_POLL_SECS") or conf.read("direct").text("claude_worker_poll_secs"))
         identity = delivered.native_id[:8]
         seen_busy = False
         while True:

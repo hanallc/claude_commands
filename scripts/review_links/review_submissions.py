@@ -479,8 +479,16 @@ def _image_fingerprints(uploads: tuple[_ImageUpload, ...]) -> tuple[tuple[str, s
     return tuple((upload.extension, hashlib.sha256(upload.data).hexdigest()) for upload in uploads)
 
 
-def _fingerprint(payload: list[object]) -> str:
+def _fingerprint(payload: list[object], *,
+                 notice: new_item_dialog.Notice = new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW) -> str:
+    if isinstance(notice, new_item_dialog.SubmissionNotice):
+        payload = [*payload, asdict(notice)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _legacy_draft_fingerprint(request_id: str, request: NewItemRequest, words: str,
+                              uploads: tuple[_ImageUpload, ...]) -> str:
+    return _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)], notice=request.notice)
 
 
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
@@ -489,7 +497,7 @@ def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[
         payload.append(request.page)
     if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
-    return _fingerprint(payload)
+    return _fingerprint(payload, notice=request.notice)
 
 
 def _write_request_file(path: Path, fields: Mapping[str, object]) -> None:
@@ -1610,7 +1618,7 @@ def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidenc
                             asdict(request.page_state) if request.page_state else None, digest]
     if isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee):
         fields.append(delivery.list_assignee.id)
-    return _fingerprint(fields)
+    return _fingerprint(fields, notice=request.notice)
 
 
 @dataclass(frozen=True)
@@ -1664,8 +1672,18 @@ def _matches_list_retry(folder: Path, send: ListDraftSend, intent: new_item_dial
                 return False
         elif isinstance(requested, RequestedListPreview) and isinstance(screenshot, new_item_dialog.NoPageScreenshot):
             return False
-        return item.destination.payload_hash == _browser_payload_hash(
-            request, words, evidence, _decode_images(request.images), screenshot, delivery)
+        uploads = _decode_images(request.images)
+        fingerprint = _browser_payload_hash(request, words, evidence, uploads, screenshot, delivery)
+        if item.destination.payload_hash == fingerprint:
+            return True
+        if (isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee)
+                and isinstance(request.notice, new_item_dialog.SubmissionNotice) and request.notice.from_command
+                and isinstance(item.details.notice, new_item_dialog.DefaultSubmissionNotice)):
+            # An earlier command sent the assignee without the notice.
+            legacy = replace(request, notice=item.details.notice)
+            return item.destination.payload_hash == _browser_payload_hash(
+                legacy, words, evidence, uploads, screenshot, delivery)
+        return False
     except SubmissionError:
         return False
 
@@ -1710,22 +1728,31 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
 
 
 def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
-                      members: staff.StaffSnapshot | None, *, request_kind: str) -> SavedSubmission | None:
-    """Recover old List filings when the original words, kind, images and recipient match."""
+                      members: staff.StaffSnapshot | None, *, request: NewItemRequest) -> SavedSubmission | None:
+    """Recover old List filings when the fingerprint and recipient match."""
     legacy_id = "r2-" + address.request_id[3:]
-    fingerprint = _fingerprint([legacy_id, request_kind, words, _image_fingerprints(uploads)])
-    folder = _request_folder(f"r4-{fingerprint}")
-    if not folder.is_dir():
-        return None
+    exact = _legacy_draft_fingerprint(legacy_id, request, words, uploads)
+    fingerprints = [exact]
+    default_notice = new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    if request.notice == new_item_dialog.SubmissionNotice("feedback"):
+        # Older List drafts sent Feedback as an investigation without a notice.
+        old_request = replace(request, notice=default_notice)
+        fingerprints.append(_legacy_draft_fingerprint(legacy_id, old_request, words, uploads))
     address = replace(address, request_id=legacy_id)
-    with exclusive(folder / ".lock"):
-        for candidate in _list_draft_candidates(folder, address, fingerprint):
-            with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
-                item = _saved_draft(lookup, list_recipient=address.recipient_id)
-                if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
-                    continue
-                saved = item.destination
-                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
+    for fingerprint in fingerprints:
+        folder = _request_folder(f"r4-{fingerprint}")
+        if not folder.is_dir():
+            continue
+        with exclusive(folder / ".lock"):
+            for candidate in _list_draft_candidates(folder, address, fingerprint):
+                with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
+                    item = _saved_draft(lookup, list_recipient=address.recipient_id)
+                    if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
+                        continue
+                    if fingerprint != exact and item.details.notice != default_notice:
+                        continue
+                    saved = item.destination
+                    return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
     return None
 
 
@@ -1793,6 +1820,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     request_id = read_request_id(request.request_id)
     submitted_draft_id = request_id
     kind = SubmissionKind.INVESTIGATION if request.kind == "enhancement" else read_kind(request.kind)
+    notice = request.notice
+    if isinstance(notice, new_item_dialog.DefaultSubmissionNotice) and request.kind == "enhancement":
+        notice = new_item_dialog.SubmissionNotice("enhancement")
     if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
@@ -1811,7 +1841,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
     uploads = _decode_images(request.images)
     if list_draft:
-        previous = _legacy_list_draft(address, words, uploads, members, request_kind=request.kind)
+        previous = _legacy_list_draft(address, words, uploads, members, request=request)
         if previous is not None:
             _check_capture_target(capture_target, previous)
             alias = _request_folder(request_id) / "list-receipt-key"
@@ -1830,7 +1860,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     if browser_draft:
         payload_hash = _browser_payload_hash(request, words, evidence, uploads, screenshot, initial_delivery)
     elif legacy_draft:
-        payload_hash = _fingerprint([request_id, request.kind, words, _image_fingerprints(uploads)])
+        payload_hash = _legacy_draft_fingerprint(request_id, request, words, uploads)
     else:
         payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
@@ -1933,7 +1963,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             proof = reply_tokens.mint()
             details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
-                                       reply_token_nonce=proof.nonce)
+                                       reply_token_nonce=proof.nonce, notice=notice)
             title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []
             staging_started = False

@@ -1322,6 +1322,11 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_new_item_command_files_through_the_handler_and_makes_its_list_item(self) -> None:
         _ = self.check_new_item_command()
 
+    def test_feedback_command_notifies_the_recipient_and_files_an_investigation(self) -> None:
+        words = "The queue chart is easy to read."
+        _ = self.check_new_item_command(kind=new_item.ItemType.FEEDBACK, review_type=review_items.ReviewType.INVESTIGATION,
+                                        words=words, filed_words=words)
+
     def test_new_item_command_reuses_the_draft_after_a_lost_reply(self) -> None:
         for change_mapping in (False, True):
             with self.subTest(change_mapping=change_mapping), self.lose_list_send_response() as responses:
@@ -1346,6 +1351,12 @@ class ReviewLinksServerTests(unittest.TestCase):
         first, = responses
         self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
 
+    def test_new_item_command_reuses_a_draft_filed_without_a_notice(self) -> None:
+        with self.lose_list_send_response() as responses:
+            item = self.check_new_item_command(fail_retry=True, legacy_notice=True)
+        first, = responses
+        self.assertEqual((first["list_number"], first["key"]), (item.number, item.reviews[0]))
+
     def test_new_item_command_saves_the_link_with_the_row(self) -> None:
         with patch.object(the_list, "link", side_effect=OSError("No space left on device")) as link:
             item = self.check_new_item_command()
@@ -1357,6 +1368,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self, *, fail_retry: bool = False, change_mapping: bool = False, kind: new_item.ItemType = new_item.ItemType.BUG,
         review_type: review_items.ReviewType = review_items.ReviewType.BUG,
         words: str = "The frame time graph has a gap.", filed_words: str = "The frame time graph has a gap.",
+        legacy_notice: bool = False,
     ) -> the_list.ListItem:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
@@ -1415,6 +1427,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if not fail_retry and len(posts) == 1:
                     fields["recipient_id"] = morty.id
                     body = json.dumps(fields).encode()
+                if legacy_notice and len(posts) == 1:
+                    _ = fields.pop("notice")
+                    body = json.dumps(fields).encode()
+                    session = "another-session"
+                    path = new_item.draft_path(address, session, unit.id, kind, words)
+                    _ = path.rename(new_item.draft_path(address, session, unit.id, kind, words, legacy=True))
             return exchange(address, method, target, body)
 
         with (patch.object(self.server, "review_cache", cache),
@@ -1460,6 +1478,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(notice["rows"], [item.id])
         self.assertEqual(notice["address"], f"session:{owner.current_session}")
         self.assertIn(title, notice["words"])
+        item_id = cache.get().records[key].id.rsplit("/", 1)[-1]
+        label = kind.capitalize() if kind in (new_item.ItemType.FEEDBACK, new_item.ItemType.ENHANCEMENT) else kind.value
+        expected = f"New {kind.value} {item_id} from Review." if legacy_notice else f"New {label} {item_id}."
+        self.assertEqual(notice["words"].splitlines()[0], expected)
         self.assertEqual(in_lock_reads, [(True, False)])
         producer_line = "" if fail_retry else f" Producer: bob (from {owner.name})."
         self.assertEqual(output.getvalue(),
@@ -1811,6 +1833,35 @@ class ReviewLinksServerTests(unittest.TestCase):
                         key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
                         recipient_key=sent_to.id)
                     self.assertEqual(register.call_count, 2 if later_owner is not None or scenario == "config-reopen" else 1)
+
+    def test_migrated_list_feedback_retry_recovers_the_filing_without_a_notice(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
+                          page="list", request_id="r2-" + uuid4().hex)
+        migrated = replace(request, request_id="r6-" + request.request_id[3:],
+                           page_recipient=new_item_dialog.PageRecipient.SELECTED,
+                           notice=new_item_dialog.SubmissionNotice("feedback"))
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            first = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(first.status, 200, first.body)
+            saved = cast(dict[str, str], json.loads(first.body))
+            for attempt in (migrated, replace(migrated, words="An edit after the old Feedback was filed.")):
+                retry = self.new_item_http(self.new_item_body(attempt), finished=True)
+                self.assertEqual(retry.status, 409, retry.body)
+                fields = cast(dict[str, str], json.loads(retry.body))
+                self.assertEqual((fields["code"], fields["key"]), ("already_filed", saved["key"]))
+
+        send.assert_called_once()
+        record, = investigation.records(owner.id)
+        self.assertEqual((record.id, record.question), (saved["id"], request.words))
+        assert isinstance(record.submission, new_item_dialog.ReviewSubmission)
+        self.assertEqual(record.submission.notice, new_item_dialog.DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW)
 
     def test_f014_standard_new_replays_the_item_filed_for_the_new_page_owner(self) -> None:
         case = self.review_fixture()

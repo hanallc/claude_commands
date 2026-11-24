@@ -224,11 +224,12 @@ def recipient_for(member: staff.StaffRow, options: Options, members: staff.Staff
     return found
 
 
-def request_body(options: Options, kind: _NewItemRequestKind, recipient: staff.StaffId, words: str,
+def request_body(options: Options, item_type: ItemType, recipient: staff.StaffId, words: str,
                  assignee: staff.StaffId, request_id: str) -> bytes:
     """Send the List window fields for a new List draft."""
     return json.dumps({
-        "token": options.token, "request_id": request_id, "kind": kind,
+        "token": options.token, "request_id": request_id, "kind": FILED_KINDS[item_type],
+        "notice": {"kind": item_type, "from_command": True},
         "recipient_id": recipient, "words": words, "evidence": {"kind": "none"}, "images": [],
         "page": "list", "page_recipient": new_item_dialog.PageRecipient.SELECTED.value, "list_assignee": assignee,
     }).encode()
@@ -248,10 +249,12 @@ class NoPendingListDraft:
 
 
 def draft_path(address: for_you.ConsoleAddress, session: str, assignee: staff.StaffId,
-               kind: _NewItemRequestKind, words: str) -> Path:
+               item_type: ItemType, words: str, *, legacy: bool = False) -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
-    scope = json.dumps([address.host, address.port, session, assignee, kind, words])
-    return state / hashlib.sha256(scope.encode()).hexdigest()
+    scope: list[object] = [address.host, address.port, session, assignee, FILED_KINDS[item_type], words]
+    if not legacy:
+        scope.append(item_type)
+    return state / hashlib.sha256(json.dumps(scope).encode()).hexdigest()
 
 
 def read_pending_draft(path: Path) -> PendingListDraft | NoPendingListDraft:
@@ -271,12 +274,12 @@ def save_pending_draft(path: Path, recipient: staff.StaffId) -> PendingListDraft
     return draft
 
 
-def post_item(address: for_you.ConsoleAddress, options: Options, kind: _NewItemRequestKind,
+def post_item(address: for_you.ConsoleAddress, options: Options, item_type: ItemType,
               draft: PendingListDraft, words: str, assignee: staff.StaffId) -> ServerReply:
     """Retry an unconfirmed POST with the same draft ID and recipient."""
     def send(current: Options) -> ServerReply:
         return exchange(address, "POST", review_page.NEW_ITEM_PATH,
-                        request_body(current, kind, draft.recipient, words, assignee, draft.request_id))
+                        request_body(current, item_type, draft.recipient, words, assignee, draft.request_id))
 
     try:
         reply = send(options)
@@ -332,7 +335,6 @@ def main(arguments: list[str] | None = None) -> int:
         caller = members.by_current_session(args.session) if args.session else None
         to = unit_of(member, members) + (", this session" if caller is not None and caller.id == member.id else "")
         result = f"{item_type.value.capitalize()} → {to}."
-        kind = FILED_KINDS[item_type]
         words = words_text(item_type, args.description, args.extra)
         try:
             address = console_address()
@@ -342,10 +344,15 @@ def main(arguments: list[str] | None = None) -> int:
                 print(producer_question(member, mapped, members))
                 return Outcome.NO_PRODUCER
             raise
-        path = draft_path(address, args.session, member.id, kind, words)
+        path = draft_path(address, args.session, member.id, item_type, words)
+        legacy_path = draft_path(address, args.session, member.id, item_type, words, legacy=True)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with exclusive(path.with_suffix(".lock")):
+        with exclusive(legacy_path.with_suffix(".lock")):
             draft = read_pending_draft(path)
+            if isinstance(draft, NoPendingListDraft):
+                legacy_draft = read_pending_draft(legacy_path)
+                if isinstance(legacy_draft, PendingListDraft):
+                    path, draft = legacy_path, legacy_draft
             if isinstance(draft, NoPendingListDraft):
                 mapped = producer_map.producer_for(member.id, members)
                 if isinstance(mapped, producer_map.NoProducer):
@@ -360,7 +367,7 @@ def main(arguments: list[str] | None = None) -> int:
                 result += producer_line(member, mapped)
             else:
                 options = read_options(address)
-            reply = post_item(address, options, kind, draft, words, member.id)
+            reply = post_item(address, options, item_type, draft, words, member.id)
             refused = reply.status == 400 or reply.status == 409 and reply.fields.get("code") != "already_filed"
             if reply.status == 200 or refused:
                 path.unlink()

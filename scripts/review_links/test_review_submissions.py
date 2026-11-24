@@ -28,10 +28,12 @@ from urllib.parse import urlencode
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, urgency
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import change_review, investigation, next_item, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
+from scripts.production import change_review, investigation, next_item, production_admission, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, reply_tokens, review_actions, review_events, review_items, review_page, review_submissions as submissions
 
 OWNER = staff.StaffId("builds-staff")
@@ -224,6 +226,30 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
                 _ = submissions.submit(different)
         self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
+
+    def test_a_notice_change_is_not_an_exact_retry(self) -> None:
+        original = request(submissions.SubmissionKind.INVESTIGATION)
+        feedback = replace(original, notice=new_item_dialog.SubmissionNotice("feedback"))
+        standard = submissions.submit(feedback)
+        self.assertEqual(submissions.submit(feedback).key, standard.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
+            _ = submissions.submit(original)
+
+        legacy = replace(feedback, request_id="r2-" + "a" * 32)
+        first_legacy = submissions.submit(legacy)
+        changed_legacy = submissions.submit(replace(legacy, notice=new_item_dialog.SubmissionNotice("efficiency")))
+        self.assertNotEqual(changed_legacy.key, first_legacy.key)
+        self.assertEqual(submissions.submit(legacy).key, first_legacy.key)
+
+        browser = replace(feedback, request_id="r6-" + "b" * 32)
+        first_browser = submissions.submit(browser)
+        retry = submissions.submit(browser)
+        self.assertEqual(retry.key, first_browser.key)
+        self.assertNotIsInstance(retry, submissions.EditedSubmission)
+        changed_browser = submissions.submit(replace(browser, notice=new_item_dialog.SubmissionNotice("feedback", True)))
+        self.assertIsInstance(changed_browser, submissions.EditedSubmission)
+        self.assertEqual(changed_browser.key, first_browser.key)
+        self.assertEqual(changed_browser.details.notice, browser.notice)
 
     def test_concurrent_draft_sends_reuse_each_recipient_item(self) -> None:
         first = replace(request(), request_id="r2-" + "a" * 32)
@@ -788,19 +814,23 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(saved.id, "P1")
 
     def test_f012_retry_uses_the_native_path_after_wrap_moves_the_document(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, fixture_git_environment(self.root), clear=True)))
         active_doc = self.root / "docs" / "productions" / self.doc.name
         active_doc.parent.mkdir(parents=True)
         _ = active_doc.write_text(self.doc.read_text().replace(str(self.issues), "issues"))
         row = self.members.by_id(OWNER)
         assert row is not None
-        row = replace(row, doc=staff.LiveDoc(local_machine(), active_doc))
+        identity = staff.native_id(fixture_runtime_id("review-wrap-recovery"))
+        row = replace(row, id=identity, current_session=identity, doc=staff.LiveDoc(local_machine(), active_doc))
         active = staff.StaffSnapshot((row,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=active))
+        _ = self.enterContext(patch.object(staff, "authority_snapshot", return_value=active))
+        _ = production_admission.capture_rollout_inventory([identity])
         production = read_production(row)
         native_folder = proposals_folder.issues_folder(active_doc)
         assert native_folder is not None
-        with patch.object(staff, "snapshot", return_value=active):
-            payload = replace(request(submissions.SubmissionKind.PROPOSAL), images=(IMAGE,))
-            saved = submissions.submit(payload)
+        payload = replace(request(submissions.SubmissionKind.PROPOSAL, recipient=identity), images=(IMAGE,))
+        saved = submissions.submit(payload)
         _ = active_doc.write_text(active_doc.read_text().replace("— running.**", "— wrapped.**"))
         _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
         _ = subprocess.run(["git", "-C", str(self.root), "add", "--", str(active_doc)], check=True)
@@ -814,17 +844,18 @@ class ReviewSubmissionTests(unittest.TestCase):
         wrapped_row = replace(row, doc=staff.WrappedDoc(local_machine(),
             self.root / "docs" / "archive" / self.root.name / row.name / active_doc.name))
         assert isinstance(wrapped_row.doc, staff.WrappedDoc)
-        with (patch.object(staff, "snapshot", return_value=active),
-              patch.object(staff, "set_doc", side_effect=OSError("Stop before the wrap commit.")) as set_doc,
+        with (patch.object(staff, "set_doc", side_effect=OSError("Stop before the wrap commit.")) as set_doc,
               patch.object(production_lifecycle, "checkout_ready", return_value=production_lifecycle.PlanLanded("fixture-tip")),
               patch.object(production_lifecycle, "merged_checkpoints", return_value=()),
               patch.object(production_lifecycle, "checked", side_effect=wrap_command)):
             with self.assertRaisesRegex(OSError, "Stop before the wrap commit"):
                 _ = production_lifecycle.wrap(production, active_doc.read_text().splitlines(), True,
                                               production_lifecycle.VerdictMissing(), production_lifecycle.VerdictMissing(), ())
-            set_doc.assert_called_once_with(OWNER, wrapped_row.doc)
+            set_doc.assert_called_once_with(identity, wrapped_row.doc, expected=row.doc)
         self.assertFalse(active_doc.exists())
         self.assertTrue(wrapped_row.doc.path.is_file())
+        text = wrapped_row.doc.path.read_text().replace("- **Proposals:** `issues`", "- **Proposals:** `new-issues`")
+        _ = wrapped_row.doc.path.write_text(text)
         self.assertNotEqual(proposals_folder.issues_folder(wrapped_row.doc.path), native_folder)
         self.assertEqual(submissions.submit(payload, members=staff.StaffSnapshot((wrapped_row,))), saved)
         self.assertEqual(saved.path.parent, native_folder.resolve())

@@ -173,6 +173,7 @@ __PAGE_FRAME_STYLE__
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
+.tip:has(dd.call) :is(dt, dd):not(.call, .folder) { white-space: normal; overflow-wrap: anywhere; }
 .tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden; white-space: normal; }
 .tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
@@ -1706,6 +1707,7 @@ function placeTipAt(tip, x, y, fit, anchor) {
   fit?.(tip, maxHeight);
   const folderTip = tip.querySelector(':scope > .tip:has(dd.folder)');
   if (folderTip) {
+    tip.style.left = "0px";
     folderTip.style.zoom = "";
     const scale = Math.min(1, Math.max(1, clientWidth - 2 * inset) / folderTip.getBoundingClientRect().width);
     if (scale < 1) folderTip.style.zoom = scale;

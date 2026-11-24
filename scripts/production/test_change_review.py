@@ -2706,7 +2706,7 @@ class ChangeIdentityTests(unittest.TestCase):
         _ = self.path.rename(legacy)
         _ = self.doc.write_text(f"- **Change review:** `{legacy}`\n")
         session = next(member.current_session for member in staff.snapshot().rows if member.name == "sdlc")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": session}):
             code, output, error = run("mark-important", "--row", "sdlc/C1")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("C1", output)
