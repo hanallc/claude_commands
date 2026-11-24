@@ -96,16 +96,19 @@ The route returns `GuestNotStarted` with the refusal reason before any upload or
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
-When the proof wait expires, the gate returns status 80 to its placement retry loop.
+When the proof wait expires, the gate returns status 80 after it records the holder's release.
 The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
 The arm checks the saved guest identity before it writes any guest records.
 It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
 It records `proven` when cleanup confirms the end of a run.
-It records `not started` if the gate consumed permission and can prove that no run started.
+It records `not started` if the gate consumed permission and sent no arm request.
 It records `unproven` and saves the armed guest identity when the proof wait expires.
 The route sends a completion report for a run with a start marker.
+If the stream fails without a start marker, proof of the end leaves the start unknown.
 For a proven no-run, it sends a refusal for the consumed claim and releases the holder in the journal.
-The gate requests settlement and keeps the same placement episode for the retry.
+If the consume or arm reply is lost, the route releases the holder in the journal.
+The gate then requests settlement for the exact attempt and keeps the same episode for the retry.
+If the journal cannot record the holder's release, the gate reports the settlement error and exits.
 The queue can acknowledge the end report while it waits to read the proof.
 Each record contains the queue attempt key, the result, the detail, and the wall time.
 Each record includes the Mac claim ID.

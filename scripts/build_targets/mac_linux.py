@@ -213,7 +213,7 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
     """Consume the launch permission of the gate assignment before the guest run starts.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
-    A refused consume, or a queue that does not answer, raises GuestTookNoRun: the guest starts nothing.
+    A lost consume reply leaves the permission unknown. The guest starts nothing.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
     from scripts.buildlog import store
@@ -229,9 +229,12 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
         permission = admission_client.consume_permission(
             wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder))
     except wire.AdmissionUnavailable as error:
-        raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
+        raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
-        raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
+        reason = f'the queue refused the launch permission: {permission.reason}'
+        if isinstance(permission.permission, placement.PermissionConsumed):
+            raise GuestPermissionUnknown(reason)
+        raise GuestTookNoRun(reason)
     return reference
 
 
@@ -526,12 +529,16 @@ class ArmedGuestAttempt:
 
 
 class GuestTookNoRun(GuestUnavailable):
-    """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
+    """The gate saw a refusal or received no start marker before the stream failed."""
+
+
+class GuestPermissionUnknown(GuestTookNoRun):
+    """The queue may hold consumed permission without giving the gate launch authorization."""
 
 
 @dataclass(frozen=True)
 class GuestNotStarted:
-    """The guest took no run: the Mac refused the claim, the guest did not arm, or no test started.
+    """The gate can request a replacement after any required settlement.
 
     The reason names only the cause; the gate says that the guest took no run.
     """
@@ -1524,12 +1531,11 @@ def send_guest_end_report(request: ExecutionReport) -> None:
 
 
 def settle_guest_no_run(dispatch: GuestGateDispatch) -> None:
-    """Save proof and report a refusal for the consumed permission."""
+    """Record that the gate consumed permission and sent no arm request."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
     try:
-        detail = 'The guest confirmed the run ended' if dispatch.settled else 'The gate sent no arm request'
-        _append_guest_end(dispatch, GuestNotStartedProven(), detail)
+        _append_guest_end(dispatch, GuestNotStartedProven(), 'The gate sent no arm request')
         request = wire.ExecutionReport(admission_client.request_id(), dispatch.assignment, dispatch.claim,
             execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER),
             placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
@@ -1823,7 +1829,7 @@ def stream_diagnostic(stderr: bytes) -> str:
 
 
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
-    """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
+    """Keep the diagnostic and mark when the stream gave no start evidence."""
     return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
@@ -2062,14 +2068,29 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
 
     dispatch: GuestGateDispatch | None = None
     launch: GuestLaunchRecovery | None = None
-    no_run_proven = False
     status = 1
 
-    def refused(reason: str) -> GuestNotStarted:
-        nonlocal no_run_proven
-        no_run_proven = (dispatch is not None and dispatch.started is None
-                         and (dispatch.settled or not dispatch.arm_requested))
-        return GuestNotStarted(reason, settlement_required=no_run_proven)
+    def release_launch() -> None:
+        nonlocal launch
+        assert launch is not None
+        saved, launch = launch, None
+        _release_guest_launch(saved)
+
+    def refused(reason: str, *, permission_unknown: bool = False) -> GuestNotStarted | str:
+        if dispatch is None and not permission_unknown:
+            return GuestNotStarted(reason)
+        if dispatch is not None:
+            if dispatch.settled and dispatch.arm_requested:
+                if dispatch.started is None:
+                    reason += '. The guest did not confirm whether the run started.'
+                return f'{TARGET}: {reason}'
+            if not dispatch.arm_requested:
+                settle_guest_no_run(dispatch)
+        try:
+            release_launch()
+        except OSError as error:
+            return f'{TARGET}: {reason}. Cannot release the Mac Linux launch holder: {error}'
+        return GuestNotStarted(reason, settlement_required=True)
 
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
@@ -2125,7 +2146,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return refused(str(error))
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return refused(' '.join((str(error), *notes)))
+        return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown))
     except GuestEndUnproven as error:
         if dispatch is not None:
             try:
@@ -2133,6 +2154,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 launch = None
             except OSError as journal_error:
                 error.add_note(f'Cannot save the Mac Linux guest end: {journal_error}')
+                try:
+                    release_launch()
+                except OSError as release_error:
+                    return (f'{TARGET}: {error}. Cannot save the Mac Linux guest end: {journal_error}. '
+                            f'Cannot release the Mac Linux launch holder: {release_error}')
         raise
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
@@ -2141,14 +2167,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             return refused(detail)
         return f'{TARGET}: {detail}'
     finally:
-        if no_run_proven:
-            assert dispatch is not None
-            settle_guest_no_run(dispatch)
-        elif dispatch is not None and dispatch.settled:
+        if dispatch is not None and dispatch.settled:
             settle_guest_dispatch(dispatch, status)
-        if launch is not None and (no_run_proven or dispatch is None or not dispatch.settled):
+        if launch is not None and (dispatch is None or not dispatch.settled):
             try:
-                _release_guest_launch(launch)
+                release_launch()
             except OSError as error:
                 print(f'Cannot save the Mac Linux guest end: {error}', file=sys.stderr, flush=True)
 
