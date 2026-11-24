@@ -2311,5 +2311,12 @@ class SpotPriceEvidenceTests(CostFixture):
         self.assertEqual(ledger.recent_gate_launches(self.state, 100), (recent,))
 
 
+    def test_all_gate_launches_reads_every_row_and_skips_a_damaged_row(self) -> None:
+        rows = [dict(time=1, result='launched'), dict(time=100, result='refused')]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(
+            json.dumps(rows[0]) + '\n{"time":\n' + json.dumps(rows[1]) + '\n')
+        self.assertEqual(ledger.all_gate_launches(self.state), tuple(reversed(rows)))
+        self.assertEqual(ledger.all_gate_launches(self.root / 'absent'), ())
+
 if __name__ == "__main__":
     _ = unittest.main()

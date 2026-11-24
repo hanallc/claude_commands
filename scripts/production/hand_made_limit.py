@@ -1,8 +1,9 @@
-"""The read limit of a hand made run on natedev.
+"""The natedev paths of the read limit of a hand made run.
 
-bwrap starts the program in a new mount namespace that holds only the bound paths. A path that is not bound
-does not exist for the program, so no word form can make a tool read it. The program has its own network
-with only a loopback, so it reaches no socket or port of another process; cargo runs offline.
+scripts/build_targets/mac_linux.py holds the rule set of the limit, which the guest uses too: bwrap starts the
+program in a new mount namespace that holds only the bound paths. A path that is not bound does not exist for the
+program, so no word form can make a tool read it. The program has its own network with only a loopback, so it
+reaches no socket or port of another process; cargo runs offline.
 Each path comes from the program environment or the tool default; a missing path is not bound.
 """
 from __future__ import annotations
@@ -17,27 +18,15 @@ import shutil
 import subprocess
 
 from scripts.build_hold import cargo_folder
+from scripts.build_targets.mac_linux import (bindable, home_folder, limit_words, output_folder, read_paths,
+                                             written_paths)
 from scripts.lib import conf
 from scripts.production.hand_made_route import Output, Program, Refused, in_checkout
 
-# The folders of the system that the run reads. /bin and /usr hold the /bin/sh and /usr/bin/env links.
-SYSTEM_FOLDERS = tuple(Path(name) for name in ("/nix/store", "/run/current-system", "/etc", "/bin", "/usr"))
-# The system folders in which a user can own an entry; the run does not see such an entry.
-OWNED_FOLDERS = tuple(Path(name) for name in ("/etc", "/bin", "/usr"))
-# No one can change a file here, so a read only bind can have a link into it.
-STORE = Path("/nix/store")
-# The run sees its attempt temp folder at this path, and TMPDIR names it.
-TEMP = Path("/tmp")
-# The socket of the private sccache server of the run, in the attempt temp folder.
-SCCACHE_SOCKET = TEMP / "sccache.sock"
 # The folder of the build-hold cargo wrapper; it runs files from its sibling lib folder.
 BUILD_HOLD = "build_hold"
 # The repository of the tools that check the run: the repository of this code.
 CHECKER = Path(__file__).resolve().parents[2]
-# The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
-CARGO_LOCKS = (".package-cache", ".package-cache-mutate", ".global-cache")
-# The key of the bwrap status line that gives the exit status of the program.
-EXIT_STATUS = re.compile(rb'"exit-code"\s*:')
 TARGET_REFUSAL = "the run builds in {place}; leave out --target-dir, or give that folder"
 OUTPUT_REFUSAL = "the run cannot build in {place}, because {reason}; {advice}"
 # The advice of OUTPUT_REFUSAL when CARGO_TARGET_DIR names the output folder: the target link is then the output.
@@ -46,7 +35,7 @@ NAMED_OUTPUT_ADVICE = "leave out CARGO_TARGET_DIR"
 TARGET_LINK_ADVICE = ("a cargo build in a checkout that has a build folder makes the target link to that folder; "
                       + "make such a checkout with worktrees.py make <repo> <unit> <short-name>")
 TOOLS_REFUSAL = ("the run writes {bind}, which holds or is in the tools that check the run; use a worktree outside "
-                 + "those tools, leave out CARGO_TARGET_DIR, and give SCCACHE_DIR a folder outside those tools")
+                 + "those tools and leave out CARGO_TARGET_DIR")
 # The texts of the cargo errors that offline mode causes, from cargo 1.99.1 runs with CARGO_NET_OFFLINE=true:
 # a git source, a registry resolve, and a crate download.
 OFFLINE_TEXTS = (b"you are in the offline mode (--offline)", b"offline mode (via `--offline`)",
@@ -57,15 +46,7 @@ TAIL_BYTES = 64 * 1024
 ANSI_CODE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
 NO_NETWORK = ("a hand made run has no network, so cargo cannot fetch a dependency; a normal run of this line "
               + "must fetch the dependency first")
-BWRAP_MISSING = "bwrap is not on PATH, so the run cannot start under the read limit; the program did not start"
 FOLDER_STEP_REFUSAL = "the build-hold cargo folder check refused the run, so the program did not start: {reason}"
-BWRAP_FAILED = ("bwrap did not start the program under the read limit (status {status}); the program did not start, "
-                + "and the output above gives the cause")
-
-
-def output_folder(checkout: Path, environment: Mapping[str, str]) -> Path:
-    """The one cargo build output folder of the run: CARGO_TARGET_DIR when it is set, else the checkout target."""
-    return checkout / environment.get("CARGO_TARGET_DIR", "target")
 
 
 def assigned_output(checkout: Path) -> Path | None:
@@ -117,21 +98,6 @@ def held_output(argv: Sequence[str], checkout: Path, environment: Mapping[str, s
     except cargo_folder.STEP_ERRORS as error:
         raise Refused(FOLDER_STEP_REFUSAL.format(reason=error)) from error
     return (output.descriptor,) if isinstance(output, cargo_folder.CheckedOutputLock) else ()
-
-
-def home_folder(environment: Mapping[str, str]) -> Path:
-    return Path(environment.get("HOME") or Path.home())
-
-
-def bindable(path: Path, home: Path, *, read: bool) -> bool:
-    """The limit can bind the path: it exists, it holds no home folder, and no part of it is a link.
-
-    The program can write a read and write folder, so it can put a link there for the next run. A read only
-    bind can have a link into /nix/store, because no one can change that file.
-    """
-    real = Path(os.path.realpath(path))
-    return (os.path.lexists(path) and not home.is_relative_to(path)
-            and (real == Path(os.path.normpath(path)) or (read and real.is_relative_to(STORE))))
 
 
 def python_cache_folder() -> Path:
@@ -214,13 +180,6 @@ def output_refusal(argv: Sequence[str], checkout: Path, environment: Mapping[str
     return ""
 
 
-def shown(folder: Path, kept: Sequence[Path]) -> bool:
-    """A PATH folder that the limit adds: absolute, not in a system folder, and it holds no temp folder or
-    checkout."""
-    return (folder.is_absolute() and not any(folder.is_relative_to(system) for system in SYSTEM_FOLDERS)
-            and not any(path.is_relative_to(folder) for path in kept))
-
-
 def wrapper_folders(path: str) -> list[Path]:
     """The build-hold cargo wrapper folder and its lib folder, when the first cargo on PATH is the wrapper."""
     found = shutil.which("cargo", path=path)
@@ -230,99 +189,26 @@ def wrapper_folders(path: str) -> list[Path]:
     return [folder, folder.parent / "lib"] if folder.name == BUILD_HOLD else []
 
 
-def unowned(folder: Path) -> Iterator[Path]:
-    """Each entry under the folder that root does not own; a link is no entry, because its target is bound or
-    hidden on its own. A folder that cannot be read is skipped: the program cannot read it either."""
-    try:
-        entries = list(os.scandir(folder))
-    except OSError:
-        return
-    for entry in entries:
-        if entry.is_symlink():
-            continue
-        try:
-            owner = entry.stat(follow_symlinks=False).st_uid
-        except OSError:
-            continue
-        if owner != 0:
-            yield Path(entry.path)
-        elif entry.is_dir(follow_symlinks=False):
-            yield from unowned(Path(entry.path))
-
-
-def hidden_words() -> list[str]:
-    """The bwrap words that hide each entry of a system folder that root does not own: an empty read only folder
-    over a folder, /dev/null over a file."""
-    words: list[str] = []
-    for folder in OWNED_FOLDERS:
-        for path in unowned(folder):
-            words += (["--tmpfs", str(path), "--remount-ro", str(path)] if path.is_dir()
-                      else ["--ro-bind", os.devnull, str(path)])
-    return words
-
-
 def write_binds(checkout: Path, environment: Mapping[str, str]) -> Iterator[Path]:
-    """The paths that the run reads and writes, the checkout first."""
-    home = home_folder(environment)
-    cargo_home = Path(environment.get("CARGO_HOME") or home / ".cargo")
-    yield checkout
-    yield from (cargo_home / "registry", cargo_home / "git", *(cargo_home / name for name in CARGO_LOCKS),
-                Path(environment.get("SCCACHE_DIR") or home / ".cache" / "sccache"))
+    """The paths that the run reads and writes, the checkout first, the output folder last."""
+    yield from written_paths(checkout, environment)
     yield bound_output(checkout, environment)
 
 
 def limit_argv(bwrap: str, program: Program, temp: Path, environment: Mapping[str, str], status_fd: int) -> list[str]:
-    """The bwrap words that start the program in its checkout under the read limit.
+    """The bwrap words that start the program in its checkout under the read limit (mac_linux.limit_words).
 
     The program starts from the file that the check found. Each file that the check read, and the start file,
-    stays readable at its real path, also outside the checkout. The attempt temp folder is /tmp, and its bind
-    comes first, so a later bind under /tmp stays visible. A read and write bind comes after each read only
-    bind, so a read and write folder in a read only folder stays writable. Only a bindable path is bound.
-    bwrap writes its status lines to status_fd.
+    stays readable at its real path, also outside the checkout. bwrap writes its status lines to status_fd.
     """
     checkout, start = program.repo, program.start
     argv = [str(start), *program.argv[1:]] if start is not None else list(program.argv)
     files = [Path(os.path.realpath(path))
              for path in (*(path for path, _ in program.checked), *([start] if start is not None else []))]
-    home = home_folder(environment)
-    cargo_home = Path(environment.get("CARGO_HOME") or home / ".cargo")
-    path = environment.get("PATH", "")
-    folders = [Path(entry) for entry in path.split(":") if entry]
-    kept = [temp, checkout]
-    read = [Path(environment.get("RUSTUP_HOME") or home / ".rustup"), cargo_home / "bin",
-            cargo_home / "config.toml", *(folder for folder in folders if shown(folder, kept)),
-            *(file for file in files if not in_checkout(file, checkout))]
-    write = list(write_binds(checkout, environment))
-    words = [bwrap, "--json-status-fd", str(status_fd), "--die-with-parent", "--unshare-pid", "--unshare-net",
-             "--dev", "/dev",
-             "--proc", "/proc", "--bind", str(temp), str(TEMP)]
-    for system in SYSTEM_FOLDERS:
-        words += ["--ro-bind", str(system), str(system)]
-    words += hidden_words()
-    for option, paths in (("--ro-bind", read), ("--bind", write)):
-        for item in dict.fromkeys(paths):
-            if bindable(item, home, read=option == "--ro-bind"):
-                words += [option, str(item), str(item)]
-    # The root of the limit is not writable, so a write to a folder that is not bound fails at once.
-    return [*words, "--remount-ro", "/", "--setenv", "TMPDIR", str(TEMP), "--setenv", "SCCACHE_SERVER_UDS",
-            str(SCCACHE_SOCKET), "--setenv", "CARGO_NET_OFFLINE", "true", "--chdir", str(checkout), "--", *argv]
-
-
-def setup_failed(status: int, status_fd: int) -> bool:
-    """bwrap did not set up the limit or did not start the program.
-
-    bwrap then exits with 1 and writes no exit-code line; it writes that line only when the program ends.
-    """
-    if status != 1:
-        return False
-    os.set_blocking(status_fd, False)
-    data = b""
-    try:
-        while chunk := os.read(status_fd, 65536):
-            data += chunk
-    except BlockingIOError:
-        pass
-    return EXIT_STATUS.search(data) is None
+    read = [*read_paths(environment, [temp, checkout]), *(file for file in files if not in_checkout(file, checkout))]
+    words = limit_words(bwrap, status_fd, temp, checkout, home_folder(environment), read,
+                        write_binds(checkout, environment))
+    return [*words, *argv]
 
 
 @dataclass

@@ -24,7 +24,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import execution_identity
-from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
@@ -90,6 +90,16 @@ try:
 finally:
     client.finish_step(assignment, 0)
 """
+
+
+def memory_pressure_wait(reply: wire.Reply) -> bool:
+    """Accept only a wait caused by memory pressure, as the queue head or behind it."""
+    wait = reply.wait if isinstance(reply, wire.PlacementWait) else reply
+    if not isinstance(wait, wire.Wait):
+        return False
+    reason = wait.reason
+    cause = reason.cause if isinstance(reason, admission_records.HeadAdmissionStatus) else reason
+    return isinstance(cause, admission_records.MemoryPressure)
 
 
 class StartedStep(TypedDict):
@@ -161,6 +171,7 @@ class SlotOrderTests(unittest.TestCase):
             self.replies.append(reply)
             if isinstance(reply, (wire.Wait, wire.PlacementWait)):
                 self.waiting.set()
+            if isinstance(reply, (wire.Wait, wire.PlacementWait, wire.LocalPlacementGranted)):
                 # Wake a file waiter that also ends when its process exits.
                 (self.root / "queue-wait").touch()
             return reply
@@ -275,7 +286,7 @@ class SlotOrderTests(unittest.TestCase):
         checkout = self.slot_root / "origin/slot-order/1"
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
         self.assertFalse((checkout / "target/debug/app").exists())
-        write_pressure_reading(self.queue.root / "pressure")
+        write_pressure_reading(self.queue.readings.pressure_path)
         self.queue.server.wake_loop()
         self.assertEqual(Path(self.next_step(process)["cwd"]), checkout)
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
@@ -353,7 +364,6 @@ class SlotOrderTests(unittest.TestCase):
         path = self.root / "bump.json"
         checkpoint_gate.save_record(path, record)
         self.queue.hold_starts()
-        write_pressure_reading(Path(environment["BUILDLOG_MEMORY_PRESSURE"]), full_avg10=99)
         with (mock.patch.dict(os.environ, {**environment, "MERGE_CHECKPOINT_VERIFY": str(CHECKOUT / "scripts/direct/verify.sh")}),
               mock.patch.object(bump_gate, "run_checkpoint_test_steps",
                   side_effect=AssertionError("the bump command started before admission")),
@@ -501,7 +511,7 @@ placement_once
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
         self.assertFalse(self.slot_root.exists())
         with self.queue.loop_turn():
-            write_pressure_reading(self.queue.root / "pressure")
+            write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
         self.assertTrue(select.select([ready_fd], [], [], TEST_HANG_GUARD_SECS)[0],
             "the copy run did not reach preparation")
@@ -629,15 +639,22 @@ placement_once
             gate_copy = Path(self.next_step(gate_process)["cwd"])
             self.assertEqual(gate_copy, self.slot_root / "verify/slot-order/1")
             self.queue.hold_starts()
-            self.waiting.clear()
+            first_reply = len(self.replies)
             step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
-            self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+            wait_until(lambda: step.poll() is not None or any(memory_pressure_wait(reply)
+                       or isinstance(reply, wire.LocalPlacementGranted) for reply in self.replies[first_reply:]),
+                       self.root, processes=(step,))
+            if not any(memory_pressure_wait(reply) for reply in self.replies[first_reply:]):
+                step.kill()
+                replies = ", ".join(type(reply).__name__ for reply in self.replies[first_reply:])
+                self.fail(f"verify did not wait for memory pressure; replies: {replies}; output: "
+                          + "".join(step.communicate(timeout=TEST_HANG_GUARD_SECS)))
             request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
             self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_folders.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
                 self.assertNotIn(request.episode, self.queue.caller_reservations())
-            write_pressure_reading(self.queue.root / "pressure")
+            write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
             cargo = wait_for_pid(started, processes=(step,))
             checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
@@ -965,7 +982,7 @@ placement_once
                 wait_for_callers(memory_waiters, 1)
                 env_folders = held_folders()
                 self.assertEqual(len(env_folders), 1, "the env wrapper needs its copy before its memory wait")
-                write_pressure_reading(self.queue.root / "pressure")
+                write_pressure_reading(self.queue.readings.pressure_path)
                 self.queue.server.wake_loop()
                 wait_until(lambda: any(first_waiters.iterdir()), first_waiters, processes=(env_caller,))
                 with self.subTest(wait="Cargo token"):
@@ -1010,7 +1027,7 @@ placement_once
                     capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 local_hold.unlink(missing_ok=True)
 
-            write_pressure_reading(self.queue.root / "pressure")
+            write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
             self.assertEqual(len(self.processes), caller_count)
             running = dict(next_running_step() for _ in range(caller_count))
@@ -1147,7 +1164,7 @@ placement_once
         self.assertEqual(build_folders.build_folder_state(snapshot.parent), "held")
         self.assertFalse(self.slot_root.exists())
 
-        write_pressure_reading(self.queue.root / "pressure")
+        write_pressure_reading(self.queue.readings.pressure_path)
         self.queue.server.wake_loop()
         cargo = wait_for_pid(started, processes=(process,))
         checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)

@@ -19,6 +19,7 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 
 1. Argument parsing sets `CANCEL_PRIOR=true`.
 2. `run_validation.sh` runs. If it fails, `set -e` exits before any push, so nothing is cancelled.
+   On Linux, all queued steps in the full validation share one [run place](build-memory-admission.md#the-verify-run-place).
 3. Both direct paths follow the same order:
    - The `--to <branch>` path exports `PUSH_TARGET_BRANCH` to `push_direct.sh`.
    - The default path runs `push_direct.sh` once `choose_push_path.sh` has chosen `direct`.

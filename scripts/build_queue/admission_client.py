@@ -68,6 +68,12 @@ class PlacementConstraintBuilder(Protocol):
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
 
 
+def placement_constraint_builder() -> PlacementConstraintBuilder:
+    """Load the fixed placement policy when a caller needs it."""
+    return cast(PlacementConstraintBuilder, getattr(
+        import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+
+
 CLOCK: ClientClock = SystemClock()
 
 
@@ -2160,8 +2166,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             kind = "test"
         elif kind in ("clippy", "mend-check"):
             kind = "lint"
-        builder = cast(PlacementConstraintBuilder, getattr(
-            import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+        builder = placement_constraint_builder()
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
             cast(placement.CommandKind, kind), tuple(step_argv), session,
             execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),

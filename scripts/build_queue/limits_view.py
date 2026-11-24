@@ -94,6 +94,7 @@ WORDS: Mapping[str | type[object], str | WaitWords] = {
         "{count} runs wait because the queue needs new memory estimates before they can start."),
     records.ReadingUnavailable: WaitWords("1 run waits because the queue cannot check whether it can start.",
         "{count} runs wait because the queue cannot check whether they can start."),
+    records.MachineChoiceWait: WaitWords("1 run waits for a machine choice.", "{count} runs wait for a machine choice."),
     records.NatedevHeld: WaitWords("1 run waits for the hold on natedev to end.",
         "{count} runs wait for the hold on natedev to end."),
     records.MemoryPressure: WaitWords("1 run waits while other work on the machine needs memory.",
@@ -316,7 +317,7 @@ class WaitingCheckout:
     may_wait_on_mac: bool = False
 
 
-def waiting_cause(step: records.WaitingStep) -> records.WaitReason:
+def waiting_cause(step: records.WaitingStep) -> records.WaitingStepReason:
     return step.reason.cause if isinstance(step.reason, records.HeadAdmissionStatus) else step.reason
 
 
@@ -744,7 +745,7 @@ def policy_label(key: str) -> str:
     return recorded_origin(key).removeprefix("https://")
 
 
-def wait_words(reason: records.WaitReason | wire.CloudSlotWait) -> WaitWords:
+def wait_words(reason: records.WaitingStepReason | wire.CloudSlotWait) -> WaitWords:
     if isinstance(reason, records.RunLimitWait):
         name = policy_label(reason.repository)
         machine = clean_label(reason.machine)
@@ -1001,7 +1002,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     waiting_origins = {(waiter["pid"], waiter["since"]): origin for _, waiter in reading.ordered
                        if (origin := recorded_origin(waiter.get("repo_identity", "")))}
 
-    def record_wait(destination: WaitGroups, reason: records.WaitReason | wire.CloudSlotWait, name: str) -> None:
+    def record_wait(destination: WaitGroups, reason: records.WaitingStepReason | wire.CloudSlotWait, name: str) -> None:
         # Keep each policy group separate without publishing private keys.
         policy_index = (policy_wait_indices.setdefault(reason.repository, len(policy_wait_indices) + 1)
                         if isinstance(reason, records.RunLimitWait) else 0)

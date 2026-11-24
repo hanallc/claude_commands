@@ -1339,10 +1339,15 @@ def read_meminfo(path: Path) -> HostMemory:
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
 
 
-def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -> Pressure:
-    """Read PSI once and retain missing evidence for scheduling and display."""
+def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy,
+                  pressure_path: Path | None = None) -> Pressure:
+    """Read PSI once and retain missing evidence for scheduling and display.
+
+    Without pressure_path, BUILDLOG_MEMORY_PRESSURE or the live PSI file supplies the path.
+    """
     readings: dict[str, float] = {}
-    path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+    path = (pressure_path if pressure_path is not None
+            else Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory")))
     check_memory_reading(path)
     try:
         for line in _read_proc_text(path).splitlines():
@@ -2514,7 +2519,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            package=row["package"] if "package" in row else PackageNotRecorded(),
                            job=row.get("job", GATE_JOB_NOT_RECORDED),
                            route=records.waiter_route(row), ci_runner=row.get("ci_runner", ""),
-                           what=row.get("what", ""))
+                           ci_job_start=records.waiter_job_start(row), what=row.get("what", ""))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")

@@ -117,7 +117,6 @@ class EndSessionTests(unittest.TestCase):
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "DESIGN_ROLES_STATE": str(self.root / "designs"),
             "SCRATCH_ROOT": str(self.root / "tracked-scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
         })
         return environment
@@ -343,7 +342,7 @@ class EndSessionTests(unittest.TestCase):
         member = fixture_worker("w7", parent.id, backend=staff.CodexBackend(Path(environment["CODEX_HOME"])))
         _ = record.write_text(json.dumps({
             "worker": "w7", "status": "running", "pid": child.pid, "staff_id": member.id}))
-        environment.update({"SCRATCH_ROOT": str(scratch.parent), "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
+        environment.update({"SCRATCH_ROOT": str(scratch.parent),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json")})
         result = self.run_end(environment)
         self.assertEqual(result.returncode, 0, result.stderr)

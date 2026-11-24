@@ -8,7 +8,8 @@ When this process ends by any signal, the link to the guest ends, and the guest 
 """
 from __future__ import annotations
 
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future
 from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -20,13 +21,17 @@ import math
 from pathlib import Path
 import os
 import re
+from select import PIPE_BUF
+from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
+from threading import Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
 from urllib.parse import urlsplit
@@ -38,20 +43,32 @@ from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import (
+    AllModules, GateJobKind, GateResultUnknown, GateRun, ModuleCoverage, SuiteMode, TreeSelection,
+)
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
-    from scripts.build_queue.placement import PlacementAssignment
+    from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport
+    from scripts.build_queue.placement import PlacementAssignment, ProviderClaimReference
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
-# The guest route holds a repository claim on this Mac target while its run lasts.
-GUEST_CLAIM_TARGET = 'mac'
+GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
+RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
+BOOTSTRAP_DIR = '.git/mac-linux'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
-SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
-       '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
+CONNECT_ATTEMPTS = 3
+# Give the guest port forward time to accept a new connection.
+CONNECT_RETRY_SECONDS = 1
+INNER_CONNECT_READY = 'mac-linux inner SSH ready'
+INNER_CONNECT_MARKER = 'mac-linux inner SSH connect failed'
+INNER_CONNECT_STATUS = 254
+GUEST_ACCEPTED = 'mac-linux command accepted'
+INNER_CONNECT_ERROR = re.compile(
+    r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
+SSH_OPTIONS = ('-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no')
 # Allow time for setup, cleanup, and result transfer.
 TRANSFER_ALLOWANCE_SECONDS = 120
 GUEST_REF_TIMEOUT_SECONDS = 30
@@ -68,6 +85,7 @@ RUN_COPY = '--run-copy'
 ARM_RECORD_PREFIX = 'mac-linux-armed'
 # The guest prints this line, with the attempt, before it starts the argv of a command request.
 RUN_START = 'mac-linux run start'
+GUEST_PROGRESS = 'mac-linux progress '
 # The guest prints this line, with the attempt, to stderr when it has taken the run lock.
 RUN_LOCKED = 'mac-linux run locked'
 # The guest prints this line, with the attempt, when it refuses a command word; it starts nothing after it.
@@ -79,6 +97,27 @@ GUEST_NOT_LOCKED_STATUS = 77
 TOOL_FOLDERS = (Path('/nix/store'), Path('/usr'), Path('/bin'), Path('/sbin'))
 # The first bytes of a compiled program file.
 COMPILED_START = b'\x7fELF'
+# The read limit of a hand made run, on natedev and on the guest, is here for the same reason;
+# scripts/production/hand_made_limit.py adds the natedev paths.
+# The folders of the system that the run reads: the tool folders, the system profile and /etc. /bin and /usr hold
+# the /bin/sh and /usr/bin/env links. A missing folder is not bound.
+SYSTEM_FOLDERS = (*TOOL_FOLDERS, Path('/run/current-system'), Path('/etc'))
+# The system folders in which a user can own an entry; the run does not see such an entry.
+OWNED_FOLDERS = (Path('/etc'), Path('/bin'), Path('/usr'), Path('/sbin'))
+# No one can change a file here, so a read only bind can have a link into it.
+STORE = Path('/nix/store')
+# The run sees its attempt temp folder at this path, and TMPDIR names it.
+TEMP = Path('/tmp')
+# The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
+CARGO_LOCKS = ('.package-cache', '.package-cache-mutate', '.global-cache')
+# The key of the bwrap status line that gives the exit status of the program.
+EXIT_STATUS = re.compile(rb'"exit-code"\s*:')
+# The guest starts the argv with this shell in the limit: it prints the start line ($0), then runs the argv. So a
+# limit that bwrap does not set up prints no start line.
+START_SHELL = 'printf "%s\\n" "$0" && exec "$@"'
+BWRAP_MISSING = 'bwrap is not on PATH, so the run cannot start under the read limit; the program did not start'
+BWRAP_FAILED = ('bwrap did not start the program under the read limit (status {status}); the program did not start, '
+                + 'and the output above gives the cause')
 # The tree entry modes of a regular file.
 FILE_MODES = ('100644', '100755')
 CANCEL_RECORD_PREFIX = 'mac-linux-cancel'
@@ -124,9 +163,42 @@ class GuestSettings:
     def transfer_timeout_seconds(self) -> int:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
-    def command(self, shell: str) -> tuple[str, ...]:
+    def command(self, shell: str, *, diagnose_connect: bool = True, budget_inner_connect: bool = False,
+                connect_timeout: int = SSH_CONNECT_TIMEOUT_SECONDS) -> tuple[str, ...]:
         mac, guest = self.ssh_hops
-        return (*SSH, mac, shlex.join((*SSH, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
+        options = (*SSH_OPTIONS, *eligibility.server_alive_options(self.unreachable_wait_seconds))
+        fixed_timeout = f'ConnectTimeout={connect_timeout}'
+        inner_timeout = '"ConnectTimeout=$guest_connect_timeout"' if budget_inner_connect else fixed_timeout
+        guest_command = shlex.join((*options, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell))))
+        guest_arguments = f'-o {inner_timeout} {guest_command}'
+        inner = f'ssh {guest_arguments}'
+        if diagnose_connect:
+            # Only the SSH client writes this log. The shell reserves one status for a verified connect failure.
+            inner = f'''log=$(mktemp "${{TMPDIR:-/tmp}}/mac-linux-ssh.XXXXXXXXXX") || exit 1
+trap 'rm -f -- "$log"' EXIT
+LC_ALL=C ssh -E "$log" {guest_arguments}
+guest_ssh_status=$?
+if [ "$guest_ssh_status" -eq 255 ] && LC_ALL=C awk '
+    {{ sub(/\\r$/, "") }}
+    NR == 1 && /^ssh: connect to host [^[:space:]]+ port [0-9]+: Connection (reset by peer|refused)$/ {{ found = 1 }}
+    END {{ exit !(NR == 1 && found) }}
+' "$log"; then
+    printf '%s\\n' {shlex.quote(INNER_CONNECT_MARKER)} >&2
+    guest_ssh_status={INNER_CONNECT_STATUS}
+elif [ "$guest_ssh_status" -eq {INNER_CONNECT_STATUS} ]; then
+    printf '%s\\n' 'The guest SSH command exited {INNER_CONNECT_STATUS}.' >&2
+    guest_ssh_status=255
+fi
+cat "$log" >&2
+exit "$guest_ssh_status"'''
+        if budget_inner_connect:
+            inner = f'''printf '%s\\n' {shlex.quote(INNER_CONNECT_READY)}
+IFS= read -r guest_connect_timeout || exit 1
+case "$guest_connect_timeout" in
+    ""|0*|*[!0-9]*) exit 1 ;;
+esac
+{inner}'''
+        return ('ssh', '-o', fixed_timeout, *options, mac, inner)
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
@@ -153,7 +225,8 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
 
 
-def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: PlacementAssignment) -> None:
+def consume_launch_permission(claim: claim_state.ClaimIdentity,
+                              assignment: PlacementAssignment) -> ProviderClaimReference:
     """Consume the launch permission of the gate assignment before the guest run starts.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
@@ -177,6 +250,15 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity, assignment: Plac
         raise GuestTookNoRun(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
         raise GuestTookNoRun(f'the queue refused the launch permission: {permission.reason}')
+    return reference
+
+
+@dataclass(frozen=True)
+class GuestGateDispatch:
+    """The guest gate holds the queue's launch permission for this claim."""
+
+    assignment: PlacementAssignment
+    claim: ProviderClaimReference
 
 
 class GuestRunRequest(TypedDict):
@@ -185,6 +267,7 @@ class GuestRunRequest(TypedDict):
     commit: str
     tree: str
     origin_main: str
+    runner_commit: str
     unit: str
 
 
@@ -239,6 +322,10 @@ class CheckoutSource:
     tree: str
     origin_main: str
     origin_url: str
+    runner_commit: str
+
+    def bundle_tips(self) -> dict[str, str]:
+        return {'candidate': self.commit, 'main': self.origin_main, 'runner': self.runner_commit}
 
 
 @dataclass(frozen=True)
@@ -254,11 +341,35 @@ def check_repository(repo: Path) -> None:
         raise GuestRepositoryRefused(repository)
 
 
+def runner_commit(repo: Path) -> str:
+    """Find the clean runner commit and make its objects available to the bundle."""
+    from scripts.production.gate import checked_git, git
+
+    runner_folder = Path(__file__).resolve().parent
+    try:
+        top, _, commit = checked_git(runner_folder, 'rev-parse', '--show-toplevel', 'HEAD').rpartition('\n')
+        root = Path(top)
+        entries = checked_git(root, 'ls-files', '-v', '-z', '--cached', '--others', '--exclude-standard', '--', 'scripts/')
+        tags = {entry[0] for entry in entries.split('\0') if entry}
+        if any(tag == 'S' or tag.islower() for tag in tags):
+            raise GuestTookNoRun(f'the guest runner scripts have assume-unchanged or skip-worktree flags in {root}')
+        if ('?' in tags
+                or checked_git(root, 'diff', '--cached', '--name-only', commit, '--', 'scripts/')
+                or checked_git(root, 'diff', '--name-only', '--', 'scripts/')):
+            raise GuestTookNoRun(f'the guest runner scripts have uncommitted changes in {root}')
+        if git(repo, 'cat-file', '-e', f'{commit}^{{commit}}').returncode:
+            _ = checked_git(repo, 'fetch', '--no-tags', '--no-write-fetch-head', str(root), commit)
+    except (GateRefused, OSError, subprocess.SubprocessError) as error:
+        raise GuestTookNoRun(f'cannot prepare the guest runner commit: {error}') from error
+    return commit
+
+
 def checkout_source(repo: Path) -> CheckoutSource:
     from scripts.aws_target import cloud_gate
     from scripts.production.gate import checked_git
 
     check_repository(repo)
+    runner = runner_commit(repo)
     head = checked_git(repo, 'rev-parse', 'HEAD')
     origin_main = checked_git(repo, 'rev-parse', '--verify', f'{ORIGIN_MAIN}^{{commit}}')
     tree, dirty = cloud_gate.working_tree(repo)
@@ -267,7 +378,7 @@ def checkout_source(repo: Path) -> CheckoutSource:
     if origin.password or origin.query or ('://' in origin_url and origin.username):
         raise GuestUnavailable('the origin URL must contain no credential')
     commit = checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Mac Linux gate snapshot') if dirty else head
-    return CheckoutSource(head, commit, tree, origin_main, origin_url)
+    return CheckoutSource(head, commit, tree, origin_main, origin_url, runner)
 
 
 def blob_id(data: bytes, object_id_length: int) -> str:
@@ -318,7 +429,7 @@ def candidate_source(repo: Path, selected: AllModules | TreeSelection) -> Candid
             raise GuestUnavailable('selected modules are absent from the checkout')
     coverage = ModuleCoverage.COMPLETE if modules == paths else ModuleCoverage.SUBSET
     return CandidateSource(source.head, source.commit, source.tree, source.origin_main, source.origin_url,
-                           modules, coverage)
+                           source.runner_commit, modules, coverage)
 
 
 def runner_bootstrap(request: GuestRequest | GuestCommandRequest) -> bytes:
@@ -328,7 +439,6 @@ def runner_bootstrap(request: GuestRequest | GuestCommandRequest) -> bytes:
     with BytesIO() as bootstrap:
         with tarfile.open(fileobj=bootstrap, mode='w') as archive:
             archive.addfile(record, BytesIO(manifest))
-            archive.add(Path(__file__).resolve(), arcname='runner.py')
         return bootstrap.getvalue()
 
 
@@ -363,6 +473,52 @@ class GuestMain:
     commit: str
 
 
+def guest_ssh_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    _ = environment.pop('BUILDLOG_PLACEMENT_SIDECAR', None)
+    return environment
+
+
+def inner_connect_failure[Output: (bytes, str)](
+    reply: subprocess.CompletedProcess[Output], *, bundle_stream: bool = False,
+) -> str:
+    if reply.returncode != INNER_CONNECT_STATUS or reply.stdout:
+        return ''
+    stderr = reply.stderr.decode(errors='replace') if isinstance(reply.stderr, bytes) else reply.stderr
+    if bundle_stream:
+        # Git can write this line when SSH closes the local bundle pipe.
+        stderr = ''.join(line for line in stderr.splitlines(keepends=True) if line != 'error: pack-objects died\n')
+    marker = INNER_CONNECT_MARKER + '\n'
+    diagnostic = stderr.removeprefix(marker)
+    return diagnostic.strip() if stderr != diagnostic and INNER_CONNECT_ERROR.fullmatch(diagnostic) else ''
+
+
+def retry_guest_connect[Output: (bytes, str)](
+    run: Callable[[float], subprocess.CompletedProcess[Output]], deadline: float, *, bundle_stream: bool = False,
+) -> subprocess.CompletedProcess[Output]:
+    """Retry only when the inner SSH client could not connect."""
+    diagnostic = ''
+    attempts = 0
+    while (remaining := deadline - monotonic()) > 0:
+        reply = run(remaining)
+        attempts += 1
+        diagnostic = inner_connect_failure(reply, bundle_stream=bundle_stream)
+        if not diagnostic:
+            return reply
+        if attempts == CONNECT_ATTEMPTS or deadline - monotonic() <= CONNECT_RETRY_SECONDS:
+            break
+        sleep(CONNECT_RETRY_SECONDS)
+    if not attempts:
+        raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
+    suffix = 'attempt' if attempts == 1 else 'attempts'
+    raise GuestConnectAttemptsFailed(f'{diagnostic} after {attempts} connect {suffix}')
+
+
+def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
+                          timeout=timeout, check=False, env=guest_ssh_environment())
+
+
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
 if ! command -v bwrap >/dev/null 2>&1; then
@@ -372,8 +528,9 @@ fi
 if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
-    reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False)
+    command = settings.command(shell)
+    reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
+                                monotonic() + settings.unreachable_wait_seconds)
     if reply.returncode:
         raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
     commit = reply.stdout.strip()
@@ -418,6 +575,10 @@ class ArmedGuestAttempt:
 
 class GuestTookNoRun(GuestUnavailable):
     """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
+
+
+class GuestConnectAttemptsFailed(GuestTookNoRun):
+    """The inner SSH connection failed before the guest received a command."""
 
 
 @dataclass(frozen=True)
@@ -474,20 +635,27 @@ def stop_ssh_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
-    arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt,
-                      str(SSH_CONNECT_TIMEOUT_SECONDS)))
+    # Allow the arm reply, the full connect window, and guest lock setup.
+    window = min(GUEST_REF_TIMEOUT_SECONDS, settings.unreachable_wait_seconds)
+    window += settings.unreachable_wait_seconds + SSH_CONNECT_TIMEOUT_SECONDS
+    arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt, str(window)))
     command = settings.command(guest_shell(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {arm}')
-    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True) as process:
-        try:
-            output, errors = process.communicate(timeout=GUEST_REF_TIMEOUT_SECONDS)
-        except BaseException:
-            stop_ssh_process(process)
-            raise
-    if process.returncode:
-        diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
-        raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
-    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', output)
+
+    def send(remaining: float) -> subprocess.CompletedProcess[bytes]:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
+            try:
+                output, errors = process.communicate(timeout=min(GUEST_REF_TIMEOUT_SECONDS, remaining))
+            except BaseException:
+                stop_ssh_process(process)
+                raise
+        return subprocess.CompletedProcess(command, process.returncode, output, errors)
+
+    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
+    if response.returncode:
+        diagnostic = response.stderr.decode(errors='replace').strip() or 'no diagnostic'
+        raise GuestUnavailable(f'guest arm exited {response.returncode}: {diagnostic}')
+    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', response.stdout)
     if reply is None:
         raise GuestUnavailable('the guest did not acknowledge the armed deadline')
     return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), reply[2].decode('ascii'), int(reply[3]),
@@ -646,7 +814,7 @@ unset CLAUDE_CONFIG_DIR CODEX_HOME CONF_DIR PYTHONPATH PYTHONHOME
 if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
-bootstrap="$PWD/.git/mac-linux"
+bootstrap="$PWD/{BOOTSTRAP_DIR}"
 rm -rf -- "$bootstrap"
 mkdir -p -- "$bootstrap/tmp"
 trap 'rm -rf -- "$bootstrap"' EXIT
@@ -680,8 +848,9 @@ git symbolic-ref HEAD refs/heads/main
 git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
+git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$bootstrap"
 umask 022
-./scripts/lib/py "$bootstrap/runner.py" "$bootstrap/request.json"'''
+"$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
     locked_run = f'''set -euo pipefail
@@ -698,7 +867,7 @@ def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
 lock="/proc/$$/fd/8"
 prove_end() {{
     flock -x -n 8 || return 1
-    if ! {cancel}; then
+    if ! {cancel} || ! rm -rf -- {BOOTSTRAP_DIR}; then
         exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
@@ -726,12 +895,17 @@ exit {GUEST_END_PENDING_STATUS}'''
 
 @dataclass(frozen=True)
 class GuestEndProven:
-    """The guest wrote the cancel record under the run lock."""
+    """The guest wrote the cancel record and removed the bootstrap under the run lock."""
 
 
 @dataclass(frozen=True)
 class GuestEndPending:
     detail: str
+
+
+@dataclass(frozen=True)
+class GuestEndConnectPending(GuestEndPending):
+    """The inner SSH client could not connect for this proof request."""
 
 
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
@@ -741,13 +915,15 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
         return GuestEndPending(f'The guest account changed from {armed.guest_user} to {settings.guest_user}.')
     try:
         command = settings.command(cleanup_shell(settings, armed))
-        remaining = proof_deadline - monotonic()
-        if remaining <= 0:
+        now = monotonic()
+        if now >= proof_deadline:
             return GuestEndPending('The proof deadline expired before cleanup SSH.')
-        reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False)
+        reply = run_guest_ssh(command, min(GUEST_CLEANUP_TIMEOUT_SECONDS, settings.unreachable_wait_seconds,
+                                           proof_deadline - now))
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
+    if diagnostic := inner_connect_failure(reply):
+        return GuestEndConnectPending(diagnostic)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
         return GuestEndProven()
     reason = reply.stderr.strip() or f'cleanup SSH exited {reply.returncode}'
@@ -776,6 +952,7 @@ class GuestEndWait:
     retry: bool = False
     proven: bool = False
     first_failure: str = ''
+    connect_attempts: int = 0
 
     def run(self) -> None:
         while not self.proven:
@@ -786,11 +963,18 @@ class GuestEndWait:
             if remaining <= 0:
                 return
             if self.retry:
-                sleep(min(SSH_CONNECT_TIMEOUT_SECONDS, remaining))
+                short_retry = 0 < self.connect_attempts < CONNECT_ATTEMPTS
+                pause = CONNECT_RETRY_SECONDS if short_retry else SSH_CONNECT_TIMEOUT_SECONDS
+                sleep(min(pause, remaining))
                 if monotonic() >= self.deadline:
                     return
+                if not short_retry:
+                    self.connect_attempts = 0
             self.retry = True
+            self.connect_attempts += 1
             proof = prove_guest_end(self.settings, self.armed, proof_deadline=self.deadline)
+            if not isinstance(proof, GuestEndConnectPending):
+                self.connect_attempts = 0
             if monotonic() >= self.deadline:
                 return
             if isinstance(proof, GuestEndProven):
@@ -800,9 +984,12 @@ class GuestEndWait:
 
     def unreachable(self) -> GuestEndUnproven:
         guest = self.settings.ssh_hops[-1]
-        return GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
-                                + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
-                                self.armed)
+        error = GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
+                                 + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
+                                 self.armed)
+        if self.first_failure:
+            error.add_note(f'First cleanup failure: {self.first_failure}')
+        return error
 
     def cleanup_detail(self) -> str:
         return 'Guest cleanup: ended' + (f' after {self.first_failure}' if self.first_failure else '')
@@ -827,7 +1014,7 @@ class BundleReason(StrEnum):
 
 @dataclass(frozen=True)
 class FullBundle:
-    """Send the complete Git history for the candidate and origin/main."""
+    """Send the complete Git history for the candidate, origin/main, and runner."""
 
     reason: BundleReason
 
@@ -865,17 +1052,18 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
     from scripts.production.gate import checked_git
 
     prefix = f'refs/mac-linux/{attempt}'
+    tips = source.bundle_tips()
     active_error: BaseException | None = None
     try:
-        _ = checked_git(repo, 'update-ref', f'{prefix}/candidate', source.commit)
-        _ = checked_git(repo, 'update-ref', f'{prefix}/main', source.origin_main)
+        for name, commit in tips.items():
+            _ = checked_git(repo, 'update-ref', f'{prefix}/{name}', commit)
         yield prefix
     except BaseException as error:
         active_error = error
         raise
     finally:
         failure = active_error
-        for tip in ('candidate', 'main'):
+        for tip in tips:
             ref = f'{prefix}/{tip}'
             try:
                 _ = checked_git(repo, 'update-ref', '-d', ref)
@@ -896,12 +1084,13 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
 def empty_delta_header(repo: Path, source: CheckoutSource, basis: DeltaBundle, prefix: str) -> str:
     from scripts.production.gate import checked_git
 
-    if checked_git(repo, 'rev-list', '--max-count=1', source.commit, source.origin_main, f'^{basis.base}'):
+    tips = source.bundle_tips()
+    if checked_git(repo, 'rev-list', '--max-count=1', *tips.values(), f'^{basis.base}'):
         return ''
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
-    # Git refuses to create a bundle when both tips are already in the prerequisite.
-    return (f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n'
-            + f'{source.commit} {prefix}/candidate\n{source.origin_main} {prefix}/main\n\n')
+    # Git refuses to create a bundle when the prerequisite already has all the tips.
+    refs = ''.join(f'{commit} {prefix}/{name}\n' for name, commit in tips.items())
+    return f'# v3 git bundle\n@object-format={object_format}\n-{basis.base} guest main\n{refs}\n'
 
 
 # Without a count argument, the SSH output is the stream output. With one, send the SSH result to
@@ -919,7 +1108,7 @@ bundle() {
     if [ -n "$header" ]; then
         printf '%s' "$header" && git pack-objects --stdout </dev/null
     else
-        local refs=("$prefix/candidate" "$prefix/main")
+        local refs=("--glob=$prefix/*")
         if [ -n "$base" ]; then
             refs+=("^$base")
         fi
@@ -928,6 +1117,10 @@ bundle() {
 }
 send() {
     if [ -n "$count" ]; then
+        IFS= read -r guest_connect_timeout || exit 1
+        printf '%s\\n' "$guest_connect_timeout" || exit 1
+        # Keep this sender as one process until the guest accepts the command.
+        IFS= read -r upload || exit 1
         { cat && bundle; } | tee >(wc -c >&4) || exit
     else
         { cat && bundle; } || exit
@@ -971,16 +1164,275 @@ def guest_link() -> Generator[int]:
         os.close(link)
 
 
-def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
-                        link: int) -> subprocess.CompletedProcess[bytes]:
-    with subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,)) as stream:
+def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: float) -> DispatchStatus:
+    """Send one execution report within the queue query deadline."""
+    from scripts.build_queue import admission_protocol as wire
+
+    def remaining() -> float:
+        left = deadline - monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
+    try:
+        address = str(wire.admission_socket_path())
+        outgoing = wire.encode_request(request).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(remaining())
+            connection.connect(address)
+            connection.settimeout(remaining())
+            connection.sendall(outgoing)
+            pending = bytearray()
+            while True:
+                connection.settimeout(remaining())
+                data = connection.recv(65536)
+                if not data:
+                    raise wire.AdmissionUnavailable('the queue closed the connection')
+                if (end := data.find(b'\n')) >= 0:
+                    pending.extend(data[:end])
+                    response = wire.parse_reply(bytes(pending), request)
+                    break
+                pending.extend(data)
+    except TimeoutError as error:
+        raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s') from error
+    if isinstance(response, wire.Refused):
+        raise wire.AdmissionUnavailable(response.reason)
+    if not isinstance(response, wire.DispatchStatus):
+        raise wire.AdmissionUnavailable('invalid execution report answer')
+    return response
+
+
+def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
+                       deadline: float, timeout: float) -> None:
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+
+    assignment = dispatch.assignment
+    execution = execution_identity.CloudExecution(TARGET, armed.boot_id, armed.machine_id, assignment.attempt)
+    request = wire.ExecutionReport(admission_client.request_id(), assignment, dispatch.claim,
+                                   execution_identity.ObservedExecution(execution),
+                                   code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+    response = send_guest_execution(request, deadline=deadline, timeout=timeout)
+    if (response.assignment != assignment or not isinstance(response.state, placement.CurrentAssignment)
+            or not isinstance(response.permission, placement.PermissionConsumed) or response.reason):
+        raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
+
+
+def warn_guest_report(reason: str) -> None:
+    print(f'Mac Linux guest queue report failed: {reason}', file=sys.stderr, flush=True)
+
+
+def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
+                       reports: ExitStack) -> None:
+    """Read the timeout before starting the report worker. Bound both waits."""
+    started = monotonic()
+    preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
+    ready: Future[Callable[[], None]] = Future()
+
+    def prepare() -> None:
         try:
-            output, errors = stream.communicate(bootstrap, timeout=timeout)
+            with conf.diagnostics(report=False):
+                timeout = conf.read('build_admission').number('query_timeout_seconds')
+            deadline = min(transfer_deadline, started + timeout)
+            dispatch_deadline = min(preparation_deadline, deadline)
+            if monotonic() >= dispatch_deadline:
+                raise TimeoutError('the queue report deadline expired during configuration')
+            result: Future[None] = Future()
+
+            def report() -> None:
+                try:
+                    if monotonic() >= dispatch_deadline:
+                        raise TimeoutError(f'no answer in {timeout:g} s')
+                    report_guest_start(armed, dispatch, deadline=deadline, timeout=timeout)
+                    if monotonic() >= deadline:
+                        raise TimeoutError(f'no answer in {timeout:g} s')
+                except Exception as error:
+                    result.set_exception(error)
+                else:
+                    result.set_result(None)
+
+            worker = Thread(target=report, daemon=True)
+            worker.start()
+        except Exception as error:
+            ready.set_exception(error)
+            return
+
+        def collect_report() -> None:
+            worker.join(timeout=max(0.0, deadline - monotonic()))
+            if not result.done():
+                raise TimeoutError(f'no answer in {timeout:g} s')
+            result.result()
+
+        ready.set_result(collect_report)
+
+    preparation = Thread(target=prepare, daemon=True)
+    try:
+        preparation.start()
+    except RuntimeError as error:
+        warn_guest_report(str(error))
+        return
+
+    def collect() -> None:
+        preparation.join(timeout=max(0.0, preparation_deadline - monotonic()))
+        if not ready.done():
+            warn_guest_report('the queue report configuration read timed out')
+            return
+        try:
+            ready.result()()
+        except Exception as error:
+            warn_guest_report(str(error) or type(error).__name__)
+
+    _ = reports.callback(collect)
+
+
+def ssh_connect_timeout(remaining: float) -> int:
+    # OpenSSH uses whole seconds. Use one second for the outer hop when the local deadline is shorter.
+    return max(1, min(SSH_CONNECT_TIMEOUT_SECONDS, int(remaining)))
+
+
+def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
+                             armed: ArmedGuestAttempt, dispatch: GuestGateDispatch,
+                             reports: ExitStack, *, connect_deadline: float = math.inf) -> tuple[bytes, bytes]:
+    """Transfer the bootstrap and read the reply, progress records, and diagnostics."""
+    from scripts.aws_target import cloud_gate
+    from scripts.build_queue import progress_profile
+
+    assert stream.stdin is not None and stream.stdout is not None and stream.stderr is not None
+    stream_input = stream.stdin
+    payload = bootstrap
+    connected = connect_deadline == math.inf
+    budget_sent = connected
+    deadline = monotonic() + timeout if connected else connect_deadline
+    mac_ready_line = bytearray(INNER_CONNECT_READY.encode())
+    accepted_line = f'{GUEST_ACCEPTED} {armed.attempt}'.encode()
+    start_line = run_start_line(armed.attempt).encode()
+    progress_prefix = GUEST_PROGRESS.encode()
+    sidecar = os.environ.get('BUILDLOG_PLACEMENT_SIDECAR', '')
+    stdout, stderr = bytearray(), bytearray()
+    reply_line = bytearray()
+    progress = cloud_gate.ModuleProgress()
+    last_counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
+    started = False
+
+    def observe_guest(line: bytes) -> None:
+        nonlocal connected, deadline, payload, started
+        line = line.rstrip(b'\r')
+        if not connected and budget_sent and line == accepted_line:
+            now = monotonic()
+            if now < deadline:
+                connected = True
+                deadline = now + timeout
+                payload = b'\n' + bootstrap
+                if not stream_input.closed:
+                    _ = ready.register(input_fd, EVENT_WRITE)
+        if not connected or started or line != start_line:
+            return
+        started = True
+        start_guest_report(armed, dispatch, deadline, reports)
+
+    def read_reply(data: bytes) -> None:
+        nonlocal last_counter
+        *lines, tail = data.split(b'\n')
+        for line in lines:
+            reply_line.extend(line)
+            if not budget_sent and reply_line == mac_ready_line:
+                if input_fd not in ready.get_map():
+                    _ = ready.register(input_fd, EVENT_WRITE)
+            elif not reply_line.startswith(progress_prefix):
+                stdout.extend(reply_line)
+                stdout.append(10)
+            elif sidecar:
+                with suppress(OSError, ValueError, RecursionError):
+                    record = cast(object, json.loads(reply_line[len(progress_prefix):]))
+                    if isinstance(record, str):
+                        progress.observe(record)
+                        counter = progress.counter()
+                        if isinstance(counter, progress_profile.ProgressCounter) and counter != last_counter:
+                            progress_profile.publish_counter(Path(sidecar), counter)
+                            last_counter = counter
+            reply_line.clear()
+        reply_line.extend(tail)
+
+    input_fd, output_fd, error_fd = stream_input.fileno(), stream.stdout.fileno(), stream.stderr.fileno()
+    sent = parsed = 0
+    try:
+        with DefaultSelector() as ready:
+            if connected:
+                if bootstrap:
+                    _ = ready.register(input_fd, EVENT_WRITE)
+                else:
+                    stream_input.close()
+            _ = ready.register(output_fd, EVENT_READ)
+            _ = ready.register(error_fd, EVENT_READ)
+            while ready.get_map():
+                left = deadline - monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(stream.args, timeout)
+                for key, _events in ready.select(left):
+                    if key.fd == input_fd:
+                        if not budget_sent:
+                            remaining = deadline - monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(stream.args, timeout)
+                            if remaining < 1:
+                                raise GuestTookNoRun('Less than one second remains for the guest SSH connection.')
+                            try:
+                                _ = os.write(input_fd, f'{ssh_connect_timeout(remaining)}\n'.encode())
+                            except BrokenPipeError:
+                                stream_input.close()
+                            budget_sent = True
+                            _ = ready.unregister(input_fd)
+                            continue
+                        try:
+                            sent += os.write(input_fd, payload[sent:sent + PIPE_BUF])
+                        except BrokenPipeError:
+                            sent = len(payload)
+                        if sent == len(payload):
+                            _ = ready.unregister(input_fd)
+                            stream_input.close()
+                        continue
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        _ = ready.unregister(key.fd)
+                        if key.fd == error_fd and parsed < len(stderr):
+                            observe_guest(bytes(stderr[parsed:]))
+                    elif key.fd == output_fd:
+                        read_reply(data)
+                    else:
+                        offset = len(stderr)
+                        stderr.extend(data)
+                        while not (connected and started) and (line_end := stderr.find(b'\n', offset)) >= 0:
+                            observe_guest(bytes(stderr[parsed:line_end]))
+                            parsed = offset = line_end + 1
+        _ = stream.wait(timeout=max(0, deadline - monotonic()))
+    except subprocess.TimeoutExpired as error:
+        error.stdout = bytes(stdout + reply_line)
+        error.stderr = bytes(stderr)
+        if not connected:
+            detail = stream_diagnostic(bytes(stderr))
+            raise GuestTookNoRun(f'The guest SSH connect deadline expired before command acceptance: {detail}') from error
+        raise
+    return bytes(stdout + reply_line), bytes(stderr)
+
+
+def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeout: int,
+                        link: int, armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
+                        connect_deadline: float = math.inf) -> subprocess.CompletedProcess[bytes]:
+    if monotonic() >= connect_deadline:
+        raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
+    with (ExitStack() as reports,
+          subprocess.Popen(command, cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, start_new_session=True, pass_fds=(link,),
+                           env=guest_ssh_environment()) as stream):
+        try:
+            output, errors = communicate_guest_bundle(stream, bootstrap, timeout, armed, dispatch, reports,
+                                                       connect_deadline=connect_deadline)
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
-                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds.') from error
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b''
+                started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
+                failure = GuestResultUnavailable if started else GuestUnavailable
+                raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 
@@ -991,16 +1443,17 @@ def bundle_send(repo: Path, source: CheckoutSource, bundle: FullBundle | DeltaBu
     return BundleSend('', '', BundleForm.FIRST, bundle.reason)
 
 
-def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt,
-                     prefix: str, send: BundleSend, *, count: bool, link: int) -> list[str]:
-    """The local command that sends the bootstrap and the bundle to the armed guest run, then holds the link."""
-    command = settings.command(run_shell(settings, source, bootstrap_bytes, armed))
+def stream_arguments(settings: GuestSettings, shell: str, prefix: str, send: BundleSend, *,
+                     count: bool, link: int, connect_timeout: int = SSH_CONNECT_TIMEOUT_SECONDS) -> list[str]:
+    """Send the bootstrap and bundle, then hold the link."""
+    command = settings.command(shell, diagnose_connect=count, budget_inner_connect=count,
+                               connect_timeout=connect_timeout)
     return ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, send.base, send.header,
             'count' if count else '', str(link), *command]
 
 
 def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
-               prefix: str, bundle: FullBundle | DeltaBundle) -> GuestReply:
+               prefix: str, bundle: FullBundle | DeltaBundle, dispatch: GuestGateDispatch) -> GuestReply:
     bootstrap = runner_bootstrap(request)
     send = bundle_send(repo, source, bundle, prefix)
     armed: ArmedGuestAttempt | None = None
@@ -1021,11 +1474,22 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
+                        armed_for_stream = armed
                         with guest_link() as link:
-                            arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
-                                                         count=True, link=link)
-                            stream = stream_guest_bundle(repo, arguments, bootstrap,
-                                                         settings.transfer_timeout_seconds, link)
+                            acceptance = shlex.quote(f'{GUEST_ACCEPTED} {armed.attempt}')
+                            shell = f"printf '%s\\n' {acceptance} >&2\n"
+                            shell += run_shell(settings, source, len(bootstrap), armed)
+                            connect_deadline = monotonic() + settings.unreachable_wait_seconds
+
+                            def send_stream(remaining: float) -> subprocess.CompletedProcess[bytes]:
+                                arguments = stream_arguments(
+                                    settings, shell, prefix, send, count=True, link=link,
+                                    connect_timeout=ssh_connect_timeout(remaining))
+                                return stream_guest_bundle(
+                                    repo, arguments, bootstrap, settings.transfer_timeout_seconds, link,
+                                    armed_for_stream, dispatch, connect_deadline=connect_deadline)
+
+                            stream = retry_guest_connect(send_stream, connect_deadline, bundle_stream=True)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()
@@ -1047,6 +1511,8 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
         error = end.unreachable()
         if stream is not None and stream.returncode:
             error.add_note(stream_report(stream))
+        if first_error is not None and isinstance(first_error.__cause__, subprocess.TimeoutExpired):
+            error.add_note(str(first_error))
         raise error
 
     cleanup_detail = end.cleanup_detail()
@@ -1077,13 +1543,20 @@ def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, boots
 
 def stream_report(stream: subprocess.CompletedProcess[bytes]) -> str:
     """The exit status and the last 1200 characters of the standard error of the guest stream."""
-    detail = ' '.join(stream.stderr.decode(errors='replace').split())[-1200:]
-    return f'SSH or source stream exited {stream.returncode}: {detail or "no diagnostic"}'
+    return f'SSH or source stream exited {stream.returncode}: {stream_diagnostic(stream.stderr)}'
+
+
+def stream_diagnostic(stderr: bytes) -> str:
+    return ' '.join(stderr.decode(errors='replace').split())[-1200:] or 'no diagnostic'
+
+
+class GuestResultUnavailable(GuestUnavailable):
+    """The guest started tests and supplied no usable result."""
 
 
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
-    return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
+    return (GuestResultUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -1111,10 +1584,11 @@ def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundl
     return DeltaBundle(guest.commit)
 
 
-def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest) -> GuestReply:
+def transfer_source(repo: Path, settings: GuestSettings, source: CandidateSource, request: GuestRequest,
+                    dispatch: GuestGateDispatch) -> GuestReply:
     bundle = guest_bundle(repo, settings)
     with bundle_refs(repo, source, request['attempt']) as prefix:
-        return run_remote(repo, settings, source, request, prefix, bundle)
+        return run_remote(repo, settings, source, request, prefix, bundle, dispatch)
 
 
 @dataclass
@@ -1133,7 +1607,7 @@ class GuestCommand:
 
     def start(self, repo: Path, argv: Sequence[str], *, work: str, unit: str, bootstrap: Path,
               checked: Mapping[Path, bytes]) -> subprocess.Popen[bytes]:
-        """Start one run; the bootstrap file holds the request and the runner while the stream reads them.
+        """Start one run; the bootstrap file holds the request while the stream reads it.
 
         checked holds the bytes of each file of the checkout that the run must find in the commit. A
         failure before the guest starts the argv raises GuestUnavailable with the guest output, and closes
@@ -1149,7 +1623,8 @@ class GuestCommand:
             raise GuestUnavailable(f'the commit for the guest does not hold the checked text of {", ".join(mismatches)}: '
                                    + 'the file changed after the check, or git does not keep it')
         request = GuestCommandRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
-                                      origin_main=source.origin_main, unit=unit, work=work, argv=list(argv),
+                                      origin_main=source.origin_main, runner_commit=source.runner_commit, unit=unit,
+                                      work=work, argv=list(argv),
                                       checked=sorted(files))
         data = runner_bootstrap(request)
         _ = bootstrap.write_bytes(data)
@@ -1158,11 +1633,12 @@ class GuestCommand:
         send = bundle_send(repo, source, bundle, prefix)
         self.armed = arm_guest(self.settings, request['attempt'])
         link = self.refs.enter_context(guest_link())
-        arguments = stream_arguments(self.settings, source, len(data), self.armed, prefix, send, count=False,
-                                     link=link)
+        shell = run_shell(self.settings, source, len(data), self.armed)
+        arguments = stream_arguments(self.settings, shell, prefix, send, count=False, link=link)
         with bootstrap.open('rb') as stdin:
             self.process = subprocess.Popen(arguments, cwd=repo, stdin=stdin, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,))
+                                            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(link,),
+                                            env=guest_ssh_environment())
         try:
             wait_for_start(self.process, request['attempt'])
         except BaseException as error:
@@ -1316,6 +1792,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     from scripts.production import gate
 
     try:
+        # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
+        # run_gate_suites always sends a list for a targeted run without --full, so this guard protects only a future caller.
+        if mode is SuiteMode.TARGETED and not full and isinstance(selected, AllModules):
+            raise GuestUnavailable('the targeted run has no module list from the natedev selection')
         settings = new_run_settings()
         if not isinstance(settings, GuestSettings):
             return settings
@@ -1330,23 +1810,26 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         source = candidate_source(repo, selected)
         relative_type_dirs = [(repo / name).resolve().relative_to(repo).as_posix() for name in type_dirs]
         request = GuestRequest(attempt=uuid4().hex, commit=source.commit, tree=source.tree,
-                               origin_main=source.origin_main, mode=mode.wire, full=full,
+                               origin_main=source.origin_main, runner_commit=source.runner_commit, mode=mode.wire, full=full,
                                selection=list(selected.paths) if isinstance(selected, TreeSelection) else 'all',
                                type_dirs=relative_type_dirs,
                                module_time_limit_s=module_time_limit_s, run_time_limit_seconds=settings.run_time_limit_seconds,
                                jobs=settings.jobs, unit=unit)
+        dispatch = None
         try:
             with mac_linux_reservation(repo, mode, gate_job) as claim:
-                consume_launch_permission(claim, assignment)
-                reply = transfer_source(repo, settings, source, request)
+                dispatch = GuestGateDispatch(assignment, consume_launch_permission(claim, assignment))
+                reply = transfer_source(repo, settings, source, request, dispatch)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:
+            if dispatch is None:
+                raise
             request = request.copy()
             request['attempt'] = uuid4().hex
             with (mac_linux_reservation(repo, mode, gate_job),
                   bundle_refs(repo, source, request['attempt']) as prefix):
                 reply = run_remote(repo, settings, source, request, prefix,
-                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE))
+                                   FullBundle(BundleReason.GUEST_LACKS_PREREQUISITE), dispatch)
                 run = completed_run(reply, request, source)
         if gate.checked_git(repo, 'rev-parse', 'HEAD') != source.head or cloud_gate.working_tree(repo)[0] != source.tree:
             raise GuestUnavailable('the checkout changed during the guest run')
@@ -1356,6 +1839,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(' '.join((str(error), *notes)))
+    except (GuestEndUnproven, GuestResultUnavailable) as error:
+        notes = cast(list[str], getattr(error, '__notes__', []))
+        raise GateResultUnknown(f'{TARGET}: ' + ' '.join((str(error), *notes))) from error
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
@@ -1430,7 +1916,7 @@ def unread_entry(copy: Path, word: str) -> str:
 
     A word with a slash must have no .. and no symbolic link in a part, and its last part must not exist. A word
     with no slash names one entry of the copy, and a plain folder passes: cargo test runs with a test folder.
-    The check uses lstat on each part, so it follows no link outside the sandbox. A missing part ends the path;
+    The check uses lstat on each part, so it follows no link outside the read limit. A missing part ends the path;
     each other lstat error is a refusal, because the guest cannot tell what the path names.
     """
     parts = Path(word).parts
@@ -1464,7 +1950,7 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
     can start a later match. A later word also counts each readable match, because bash finds a script name on
     PATH with no execute bit.
 
-    The check reads PATH outside the sandbox. The sandbox /tmp and /dev/shm start empty, so the sandbox PATH
+    The check reads PATH outside the read limit. The limit /tmp and /dev/shm start empty, so the limit PATH
     finds no file there that the check does not see.
     """
     copy = copy.resolve()
@@ -1492,6 +1978,167 @@ def command_refusal(copy: Path, argv: Sequence[str], checked: Sequence[str], sea
                 return (f'The guest refuses the command word {word}: the guest PATH finds {match}, a program file '
                         + 'that natedev did not read; use a file in the checkout.')
     return ''
+
+
+def home_folder(environment: Mapping[str, str]) -> Path:
+    return Path(environment.get('HOME') or Path.home())
+
+
+def output_folder(checkout: Path, environment: Mapping[str, str]) -> Path:
+    """The one cargo build output folder of the run: CARGO_TARGET_DIR when it is set, else the checkout target."""
+    return checkout / environment.get('CARGO_TARGET_DIR', 'target')
+
+
+def bindable(path: Path, home: Path, *, read: bool) -> bool:
+    """The limit can bind the path: it exists, it holds no home folder, and no part of it is a link.
+
+    The program can write a read and write folder, so it can put a link there for the next run. A read only
+    bind can have a link into /nix/store, because no one can change that file.
+    """
+    real = Path(os.path.realpath(path))
+    return (os.path.lexists(path) and not home.is_relative_to(path)
+            and (real == Path(os.path.normpath(path)) or (read and real.is_relative_to(STORE))))
+
+
+def shown(folder: Path, kept: Sequence[Path]) -> bool:
+    """A PATH folder that the limit adds: absolute, not in a system folder, and it holds no temp folder or
+    checkout."""
+    return (folder.is_absolute() and not any(folder.is_relative_to(system) for system in SYSTEM_FOLDERS)
+            and not any(path.is_relative_to(folder) for path in kept))
+
+
+def unowned(folder: Path) -> Iterator[Path]:
+    """Each entry under the folder that root does not own; a link is no entry, because its target is bound or
+    hidden on its own. A folder that cannot be read is skipped: the program cannot read it either."""
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        try:
+            owner = entry.stat(follow_symlinks=False).st_uid
+        except OSError:
+            continue
+        if owner != 0:
+            yield Path(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            yield from unowned(Path(entry.path))
+
+
+def hidden_words() -> list[str]:
+    """The bwrap words that hide each entry of a system folder that root does not own: an empty read only folder
+    over a folder, /dev/null over a file."""
+    words: list[str] = []
+    for folder in OWNED_FOLDERS:
+        for path in unowned(folder):
+            words += (['--tmpfs', str(path), '--remount-ro', str(path)] if path.is_dir()
+                      else ['--ro-bind', os.devnull, str(path)])
+    return words
+
+
+def read_paths(environment: Mapping[str, str], kept: Sequence[Path]) -> list[Path]:
+    """The paths of the program environment that the run reads: the rustup folder, the cargo bin folder and
+    config, and each PATH folder that the limit adds. kept holds the temp folder and the checkout."""
+    home = home_folder(environment)
+    cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
+    folders = [Path(entry) for entry in environment.get('PATH', '').split(':') if entry]
+    return [Path(environment.get('RUSTUP_HOME') or home / '.rustup'), cargo_home / 'bin', cargo_home / 'config.toml',
+            *(folder for folder in folders if shown(folder, kept))]
+
+
+def written_paths(checkout: Path, environment: Mapping[str, str]) -> list[Path]:
+    """Return the checkout, the Cargo registry and git folders, and the Cargo lock files."""
+    home = home_folder(environment)
+    cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
+    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS)]
+
+
+def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Path, read: Iterable[Path],
+                write: Iterable[Path]) -> list[str]:
+    """The bwrap words that start a program in its checkout under the read limit; the argv comes after them.
+
+    The attempt temp folder is /tmp, and its bind comes first, so a later bind under /tmp stays visible. A read
+    and write bind comes after each read only bind, so a read and write folder in a read only folder stays
+    writable. Only a path that is bindable with the home folder is bound. bwrap writes its status lines to
+    status_fd.
+    """
+    words = [bwrap, '--json-status-fd', str(status_fd), '--die-with-parent', '--unshare-pid', '--unshare-net',
+             '--dev', '/dev', '--proc', '/proc', '--bind', str(temp), str(TEMP)]
+    for system in SYSTEM_FOLDERS:
+        words += ['--ro-bind-try', str(system), str(system)]
+    words += hidden_words()
+    for option, paths in (('--ro-bind', read), ('--bind', write)):
+        for item in dict.fromkeys(paths):
+            if bindable(item, home, read=option == '--ro-bind'):
+                words += [option, str(item), str(item)]
+    # The root of the limit is not writable, so a write to a folder that is not bound fails at once.
+    # Empty wrapper values turn off the Cargo config wrapper.
+    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'CARGO_NET_OFFLINE', 'true',
+            '--setenv', 'RUSTC_WRAPPER', '', '--setenv', 'CARGO_BUILD_RUSTC_WRAPPER', '',
+            '--unsetenv', 'SCCACHE_DIR', '--unsetenv', 'SCCACHE_CACHE_SIZE', '--unsetenv', 'SCCACHE_SERVER_UDS',
+            '--chdir', str(checkout), '--']
+
+
+def setup_failed(status: int, status_fd: int) -> bool:
+    """bwrap did not set up the limit or did not start the program.
+
+    bwrap then exits with 1 and writes no exit-code line; it writes that line only when the program ends.
+    """
+    if status != 1:
+        return False
+    os.set_blocking(status_fd, False)
+    data = b''
+    try:
+        while chunk := os.read(status_fd, 65536):
+            data += chunk
+    except BlockingIOError:
+        pass
+    return EXIT_STATUS.search(data) is None
+
+
+def limited_command(bwrap: str, status_fd: int, tmp: Path, copy: Path, environment: Mapping[str, str], home: Path,
+                    attempt: str, argv: Sequence[str]) -> list[str]:
+    """The bwrap words that start the argv of a hand made run in the numbered copy under the read limit.
+
+    The program writes the copy and its Cargo folders. The copy holds the run home and the build output.
+    The program sees the attempt temp folder as /tmp.
+    The limit binds no path that holds the guest account home. START_SHELL prints the start line in the limit.
+    """
+    write = [*written_paths(copy, environment), output_folder(copy, environment)]
+    words = limit_words(bwrap, status_fd, tmp, copy, home, read_paths(environment, [tmp, copy]), write)
+    return [*words, '/bin/sh', '-c', START_SHELL, run_start_line(attempt), *argv]
+
+
+def refuse_run(reason: str, attempt: str) -> int:
+    """Print the reason and the refused line: the guest started nothing."""
+    print(reason, file=sys.stderr, flush=True)
+    print(run_refused_line(attempt), flush=True)
+    return 1
+
+
+def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[str, str], attempt: str) -> int:
+    """Run the argv of a hand made run under the read limit, with its output on the stream standard output.
+
+    When bwrap is missing or does not set up the limit, the program does not start, and the guest refuses the run.
+    """
+    bwrap = shutil.which('bwrap')
+    if bwrap is None:
+        return refuse_run(BWRAP_MISSING, attempt)
+    status_read, status_write = os.pipe()
+    try:
+        try:
+            command = limited_command(bwrap, status_write, tmp, copy, environment, Path.home(), attempt, argv)
+            status = subprocess.run(command, cwd=copy, env=environment, stdin=subprocess.DEVNULL, check=False,
+                                    pass_fds=(*build_folders.held_build_folder_descriptors(), status_write)).returncode
+        finally:
+            os.close(status_write)
+        if setup_failed(status, status_read):
+            return refuse_run(BWRAP_FAILED.format(status=status), attempt)
+        return status
+    finally:
+        os.close(status_read)
 
 
 def run_guest(request_path: Path) -> int:
@@ -1526,16 +2173,12 @@ def run_guest(request_path: Path) -> int:
                 command = list(request['argv'])
                 refusal = command_refusal(copy.path, command, request['checked'], environment['PATH'])
                 if refusal:
-                    print(refusal, file=sys.stderr, flush=True)
-                    print(run_refused_line(request['attempt']), flush=True)
-                    return 1
-                print(run_start_line(request['attempt']), flush=True)
-                return run_sandboxed(tmp, command, copy.path, environment)
+                    return refuse_run(refusal, request['attempt'])
+                return run_limited(tmp, command, copy.path, environment, request['attempt'])
             if request['type_dirs']:
                 environment['GATE_STATE_DIR'] = str(runtime / 'gate-state')
             reply = os.dup(1)
             try:
-                # The -c entry selects the numbered copy as the Python checkout.
                 return run_sandboxed_gate(tmp, gate_entry_command(request['jobs'], Path(__file__).resolve(),
                                                                   request_path, reply),
                                           copy.path, environment, reply)
@@ -1543,18 +2186,11 @@ def run_guest(request_path: Path) -> int:
                 os.close(reply)
 
 
-def run_sandboxed(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str]) -> int:
-    """Run the argv command in the sandbox, with its standard output on the stream standard output."""
-    return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
-                          check=False, pass_fds=build_folders.held_build_folder_descriptors()).returncode
-
-
 def run_sandboxed_gate(tmp: Path, command: Sequence[str], copy: Path, environment: dict[str, str],
                        reply: int) -> int:
-    """Run the gate in the sandbox, with its standard output on standard error.
+    """Run the gate in the sandbox with its standard output on standard error.
 
-    Only the gate writes to the stream standard output, through the reply descriptor. Output of
-    dbus-run-session or of a service that it starts cannot come before the reply.
+    The gate sends progress and the result through the reply descriptor.
     """
     return subprocess.run(session_command(tmp, command), cwd=copy, env=environment, stdin=subprocess.DEVNULL,
                           stdout=sys.stderr.fileno(), check=False,
@@ -1569,12 +2205,8 @@ def session_command(tmp: Path, command: Sequence[str]) -> list[str]:
 
 
 def gate_entry_command(jobs: int, runner: Path, request_path: Path, reply: int) -> list[str]:
-    """Run the runner in the numbered copy with the argv [runner, request, --run-copy, reply descriptor].
-
-    Python gives a -c entry the argv ['-c', *arguments], so the entry removes '-c' before it runs the runner.
-    """
-    return ['./scripts/lib/py', '-X', f'cpu_count={jobs}',
-            '-c', 'import runpy, sys; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")',
+    """Start the archived runner with the numbered copy as the working directory."""
+    return [str(runner.parents[1] / 'lib/py'), '-X', f'cpu_count={jobs}',
             str(runner), str(request_path), RUN_COPY, str(reply)]
 
 
@@ -1583,11 +2215,7 @@ def guest_request(path: Path) -> GuestRequest | GuestCommandRequest:
 
 
 def run_copy(request_path: Path, reply: int) -> None:
-    """Run the candidate's gate and write one JSON result to the reply descriptor.
-
-    run_sandboxed_gate points standard output at standard error, so only the reply descriptor reaches the stream
-    standard output.
-    """
+    """Run the candidate's gate and send progress and one JSON result on the reply descriptor."""
     os.set_inheritable(reply, False)
     from scripts.copies import copies
     from scripts.lib import build_folders
@@ -1619,23 +2247,28 @@ def run_copy(request_path: Path, reply: int) -> None:
         raise GuestUnavailable('The guest checkout differs from the request.')
     selection = request['selection']
     # The configured gate root (/dev/shm, private to the sandbox) keeps test folders outside the copy and the home.
-    machine = gate.WholeMachine()
     token = copies.COMMAND_LOCKS.set(descriptors)
     # natedev reads this line: a failure before it lets natedev take the gate.
     print(run_start_line(request['attempt']), file=sys.stderr, flush=True)
     try:
-        with build_folders.inherit_build_lock(RUN_LOCK_FD):
+        with (build_folders.inherit_build_lock(RUN_LOCK_FD),
+              os.fdopen(reply, 'w', encoding='utf-8') as output):
+            def send_progress(line: str) -> None:
+                print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
+
+            # Older gate code can omit the progress callback.
+            machine = (gate.WholeMachine(module_progress=send_progress)
+                       if hasattr(gate.WholeMachine, 'module_progress') else gate.WholeMachine())
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),
                                   module_time_limit_s=request['module_time_limit_s'],
                                   time_limit=GateTimeLimit(request['run_time_limit_seconds']))
+            print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
+                              'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
+                  file=output)
     finally:
         copies.COMMAND_LOCKS.reset(token)
-    with os.fdopen(reply, 'w', encoding='utf-8') as output:
-        print(json.dumps({'attempt': request['attempt'], 'commit': commit, 'tree': tree, 'origin_main': origin_main,
-                          'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run)}),
-              file=output)
 
 
 if __name__ == '__main__':

@@ -47,7 +47,8 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names, verify_command,
+    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+    StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names, verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -64,6 +65,7 @@ LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
 
 
 @dataclass(frozen=True)
@@ -741,7 +743,7 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         scratch_settings = conf.read("scratch")
     moment = time.time() if now is None else now
     task = scratch.task_or_default(task, moment, scratch_settings=scratch_settings)
-    destination = scratch.target(task, word, False, scratch_settings=scratch_settings)
+    destination = scratch.target(task, word, scratch_settings=scratch_settings)
     if owner:
         destination = scratch.free_name(destination.parent, clone_owner_prefix(checked_owner(owner)) + destination.name)
     spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=destination.parent,
@@ -1445,11 +1447,27 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
             COMMAND_LOCKS.reset(token)
 
 
+@dataclass(frozen=True)
+class AdmittedCommandCopy:
+    """The caller holds the copy and its first-step admission."""
+
+    tree: Path
+    admission: first_step.FirstStepAdmission
+
+
+@dataclass(frozen=True)
+class DirectCommandCopy:
+    """The caller holds the copy and starts the command directly."""
+
+    tree: Path
+
 
 @contextmanager
-def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
-                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
-    """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
+def _command_copy(
+    owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+    merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (),
+) -> Generator[AdmittedCommandCopy | DirectCommandCopy]:
+    """Hold the copy and any first-step admission through the caller scope."""
     job = command_job(command)
     label = step or (job.step if isinstance(job, StepJob) else "")
     try:
@@ -1465,14 +1483,22 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                 admitted = scope.enter_context(admission)
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command))
                 admitted.handoff(tree)
+                yield AdmittedCommandCopy(tree, admitted)
             else:
-                # OtherCommand has no first queue step to admit.
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
-            yield tree
+                yield DirectCommandCopy(tree)
     except first_step.FirstStepRefused as error:
         failure = CopyError(str(error))
         failure.exit_code = error.exit_code
         raise failure from error
+
+
+@contextmanager
+def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
+                 merge: MergePolicy = NO_MERGE, step: str = "", gate_targets: tuple[str, ...] = ()) -> Generator[Path]:
+    """Admit a queue command before preparing its slot and hold the slot through the caller scope."""
+    with _command_copy(owner, repo, policy, command, merge=merge, step=step, gate_targets=gate_targets) as prepared:
+        yield prepared.tree
 
 
 def list_trees() -> None:
@@ -2581,6 +2607,19 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def take_prepared_gate_handoff() -> bool:
+    """Consume the pipe token passed to the prepared gate."""
+    try:
+        reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
+        if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
+            return False
+        with os.fdopen(reader, "rb", buffering=0) as pipe:
+            os.set_blocking(reader, False)
+            return pipe.read(1) == b"1"
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
@@ -2590,7 +2629,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         captured = ""
         if isinstance(verification, VerifyCommand):
             tree = scope.enter_context(requested_source(source, policy, merge))
-            environment = {**os.environ, "COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
+            prepared = DirectCommandCopy(tree)
+            environment = {"COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
                            "COPIES_STEP_REPOSITORY": str(source),
                            "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(os.getpid()), "UNIT_DETACHED_RUN": "1"}
             target = tree / "target"
@@ -2604,16 +2644,38 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
-            targets = first_step.gate_targets(command, args.targets)
-            tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge, gate_targets=targets))
-            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
+            targets = first_step.gate_targets(command, source, args.targets)
+            prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
+                                                         gate_targets=targets))
+            tree = prepared.tree
+            environment = {"PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
                            "BUILDLOG_PREPARED_COPY": str(tree)}
             target = tree / "target"
             locks = COMMAND_LOCKS.get()
         arguments = [part.replace("{tree}", str(tree)) for part in command]
         environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
         before = publication_candidates(tree, target, arguments, args.publish)
-        result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env=environment)
+
+        def launch() -> subprocess.CompletedProcess[str]:
+            child_environment = {**os.environ, **environment}
+            _ = child_environment.pop(PREPARED_GATE_FD, None)
+            pass_fds = locks
+            with ExitStack() as handoff:
+                if command_program(arguments) in GATE_SCRIPTS:
+                    reader, writer = os.pipe()
+                    _ = handoff.callback(os.close, reader)
+                    with os.fdopen(writer, "wb") as pipe:
+                        _ = pipe.write(b"1")
+                    child_environment[PREPARED_GATE_FD] = str(reader)
+                    pass_fds = (*locks, reader)
+                return subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=child_environment, text=True)
+
+        if isinstance(prepared, AdmittedCommandCopy):
+            result = prepared.admission.run_gate(launch)
+            if result.stderr:
+                _ = sys.stderr.write(result.stderr)
+        else:
+            result = launch()
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         selection = PublicationSelection.CHANGED
         if command_exit == 0 and not isinstance(verification, VerifyCommand):
@@ -2625,18 +2687,24 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
 
 
 def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
-    """Place and run a named gate in the caller's prepared checkout."""
+    """Place and run a gate in the caller's prepared checkout."""
     source = Path(args.repo or "").resolve()
-    targets = first_step.gate_targets(command, args.targets)
+    targets = first_step.gate_targets(command, source, args.targets)
     if not targets:
-        raise CopyError("gate-step requires a gate command and named targets")
-    with first_step.admitted_run(command, source, targets=targets) as admitted:
-        admitted.handoff(source)
-        result = admitted.run_gate(lambda: subprocess.run(command, cwd=source, pass_fds=args.lease_fd,
-                                                          check=False, text=True))
-        if result.stderr:
-            _ = sys.stderr.write(result.stderr)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+        raise CopyError("gate-step requires a gate command and placement targets")
+    status = 0
+    try:
+        with first_step.admitted_run(command, source, targets=targets) as admitted:
+            admitted.handoff(source)
+            result = subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
+            if result.stderr:
+                _ = sys.stderr.write(result.stderr)
+            status = result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except Exception as error:
+        if status not in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS):
+            raise
+        print(f"Gate cleanup failed. {error}", file=sys.stderr, flush=True)
+    return status
 
 
 def captured_path(root: Path, number: int, path: Path) -> Path:
@@ -2960,7 +3028,7 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     run = commands.add_parser("run", help="run a command in a private source copy")
     gate = commands.add_parser("gate-step", help="place a gate in a prepared checkout")
     _ = gate.add_argument("--repo", required=True)
-    _ = gate.add_argument("--targets", required=True)
+    _ = gate.add_argument("--targets", default="")
     _ = gate.add_argument("--lease-fd", action="append", type=int, default=[])
     _ = gate.add_argument("command", nargs=argparse.REMAINDER)
     hold = commands.add_parser("hold", help="run a step in a slot or hold a remote source copy")
