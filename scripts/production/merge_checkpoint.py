@@ -35,7 +35,7 @@ from typing import NamedTuple, cast
 from scripts.lib import build_folders, git_merge_tree
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import change_review, checkpoint_gate, land_runs
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
@@ -299,8 +299,8 @@ def worktree_in_repo(row: staff.StaffRow, main_checkout: Path) -> bool:
     if not isinstance(location, staff.PresentWorktree) or location.machine != remote.local_machine():
         return False
     try:
-        return worktrees.main_checkout(location.path) == main_checkout
-    except worktrees.Refused:
+        return worktree_records.main_checkout(location.path) == main_checkout
+    except worktree_records.Refused:
         return False
 
 
@@ -337,8 +337,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     selected = next((row for row in rows if row.name == unit_names.name(name)), None)
     selected = selected if selected is not None else unit_lookup.unit_row(name, record)
     try:
-        main_checkout = worktrees.main_checkout(production.checkout)
-    except worktrees.Refused as error:
+        main_checkout = worktree_records.main_checkout(production.checkout)
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     parent_production: Production | StaffParentIsDestination = StaffParentIsDestination()
     if selected.parent != staff.ReportsTo(production.owner.id):
