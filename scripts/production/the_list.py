@@ -1613,6 +1613,23 @@ def _unread_log_content(content: LogContent) -> str | dict[str, object]:
     return content if isinstance(content, str) else _log_content(content)
 
 
+_WORKING_CHANGE = FieldChange("Updated", {"state": ItemState.WORKING})
+
+
+def _start_working(item: ListItem, moment: datetime, source: str) -> ListItem:
+    entry = ItemChange(moment, _WORKING_CHANGE, source)
+    return replace(item, state=ItemState.WORKING, log=(*item.log, entry))
+
+
+def _is_tell_move(log: tuple[ItemChange, ...], index: int) -> bool:
+    """Identify the state change saved with the Tell feedback."""
+    if log[index].what != _WORKING_CHANGE or index + 1 == len(log):
+        return False
+    feedback = log[index + 1]
+    return (feedback.source == PAGE_SOURCE and feedback.time == log[index].time
+            and isinstance(feedback.what, PageFeedback) and feedback.what.action == "tell")
+
+
 def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     """Keep an update identity stable when page feedback adds log entries."""
     if not isinstance(item.unread_since, datetime):
@@ -1620,7 +1637,7 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     changes = [(index, entry.time.isoformat(), _unread_log_content(entry.what), entry.source) for index, entry in enumerate(item.log)
                if not (entry.source == PAGE_SOURCE and
                        (isinstance(entry.what, MarkedRead) or entry.what == "Marked read"
-                        or _is_feedback(entry) or is_page_request_receipt(entry)))]
+                        or _is_feedback(entry) or is_page_request_receipt(entry) or _is_tell_move(item.log, index)))]
     text = json.dumps((item.unread_since.isoformat(), changes), ensure_ascii=False)
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
@@ -1660,8 +1677,7 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
         read = replace(item, unread_since=NoTimestamp.UNSET)
         if not isinstance(page_request, PageRequest) or not _waits_for_nate(item, moment):
             return read
-        working = ItemChange(moment, FieldChange("Updated", {"state": ItemState.WORKING}), source)
-        return replace(read, state=ItemState.WORKING, log=(*item.log, working))
+        return _start_working(read, moment, source)
     return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
 
 
@@ -1899,7 +1915,7 @@ def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
-    """Save the request identity, words, and pending state in one locked write."""
+    """Save pending feedback and any Tell state change in one locked write."""
     if not feedback.words.strip() or feedback.state != "pending":
         raise ListError("enter a new request and words for morty")
     store = _store(keeper)
@@ -1912,6 +1928,8 @@ def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) 
         if isinstance(previous, PageRequest):
             raise ListError("this request has no feedback to deliver")
         moment = now()
+        if feedback.action == "tell" and item.state in (ItemState.WAITING_FOR_NATE, ItemState.DELIVERED):
+            item = _start_working(item, moment, PAGE_SOURCE)
         changed = replace(item, updated=moment, log=(*item.log, ItemChange(moment, feedback, PAGE_SOURCE)))
         _validate(changed)
         _ = _save_page_request(store, keeper, changed, request)

@@ -8,6 +8,7 @@ from datetime import datetime
 from enum import StrEnum
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sys
@@ -1597,7 +1598,7 @@ def investigations(doc: Path, record: staff.StaffSnapshot, *, source: str = '', 
 def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identities: QuestionStaff, sources: list[Path] | None,
                     source: str = '') -> tuple[int,str]:
     """Count Questions in the same zone as Review and /next."""
-    if sources is not None:
+    if sources is not None and not os.environ.get('USER_ZONE'):
         sources.append(Path(user_zone_config.CONF))
     zone = user_zone()
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)

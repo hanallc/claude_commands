@@ -321,7 +321,7 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         if not isinstance(text, str) or not text.strip():
             raise InputError(f"{where}.text: expected nonempty text")
         # Read legacy titles so the replacement can name their problems.
-        timing: OutstandingTiming = DeferredUntil(later) if isinstance(later, datetime) else DueNow()
+        timing: OutstandingTiming = DueNow() if isinstance(later, question_path.NoLaterTime) else DeferredUntil(later)
         pending = read_pending_followup(fields.get("followup"), where)
         if pending is not None:
             timing = AwaitingReply(datetime.fromisoformat(pending["sent"]), later)
