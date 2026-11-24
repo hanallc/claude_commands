@@ -26,14 +26,15 @@ from scripts.lib.release_waiter import LocalReleaseEvents
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
-from scripts.copies import copies
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import git_index, process_group
 from scripts.test_times import gate_record
+from scripts.lib.build_steps import GATE_PRELAUNCH_REFUSED_STATUS
+from scripts.production.gate_routes import GateTookNoRun
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
-from scripts.production.test_gate_default_placement import placed
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
 from scripts.production.gate_suites_test_support import GateSuitesFixture
+from scripts.production.test_gate_default_placement import placed
 
 
 @final
@@ -181,13 +182,13 @@ class MergeGateSuitesTests(GateSuitesFixture):
             ("unchanged", False, 0),
             ("document", False, 0),
             ("subject", False, 0),
-            ("subject", True, 1),
+            ("subject", True, GATE_PRELAUNCH_REFUSED_STATUS),
             ("committed-subject", False, 1),
-            ("fallback-edit", True, 1),
-            ("fallback-commit", True, 1),
-            ("fallback-full", True, 1),
+            ("fallback-edit", True, GATE_PRELAUNCH_REFUSED_STATUS),
+            ("fallback-commit", True, GATE_PRELAUNCH_REFUSED_STATUS),
+            ("fallback-full", True, GATE_PRELAUNCH_REFUSED_STATUS),
         )
-        aws = placed("aws")
+        aws = placed("claude-aws")
         for change, decline, status in rows:
             with self.subTest(change=change, decline=decline):
                 _ = self.git(self.checkout, "reset", "--hard", base)
@@ -209,7 +210,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 def route(repo: Path, *, mode: gate.SuiteMode, full: bool,
                           module_time_limit_s: float, selected: gate.AllModules | gate.TreeSelection,
                           gate_job: StepJob | GateJobNotRecorded,
-                          assignment: placement.PlacementAssignment) -> gate.GateRun | str:
+                          assignment: placement.PlacementAssignment) -> gate.GateRun:
                     self.assertEqual(assignment, aws.assignment)
                     self.assertEqual(gate_job, StepJob("test-affected"))
                     self.assertEqual(repo, self.checkout)
@@ -225,21 +226,22 @@ class MergeGateSuitesTests(GateSuitesFixture):
                         if change in ("fallback-commit", "fallback-full"):
                             _ = self.commit(self.checkout, "Add a failing test during the route")
                     if decline:
-                        return "fixture cloud unavailable"
+                        raise GateTookNoRun("fixture cloud unavailable")
                     return gate.GateRun((gate.GateJobResult(
                         "hooks", "test_first.py", int(change == "committed-subject"), 1, ""),), 1, 0)
 
                 arguments = ["--repo", str(self.checkout)]
-                with (mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
-                      mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
+                with (mock.patch.dict(os.environ, self.environment),
+                      mock.patch.object(gate, "select_affected", wraps=affected_modules.select_affected) as select,
                       mock.patch.object(gate, "current_gate_placement", return_value=aws),
                       mock.patch.object(cloud_gate, "route", side_effect=route),
-                      mock.patch.object(gate, "select_affected", wraps=affected_modules.select_affected) as select,
+                      mock.patch.object(gate, "run_suites") as local,
                       contextlib.redirect_stdout(io.StringIO()) as output,
                       contextlib.redirect_stderr(io.StringIO()) as errors):
                     result = gate.main(["--affected", *arguments])
                 self.assertEqual(result, status, output.getvalue() + errors.getvalue())
-                self.assertEqual(select.call_count, 1)
+                select.assert_called_once()
+                local.assert_not_called()
                 if change in ("subject", "committed-subject") or change.startswith("fallback-"):
                     selected, = routed
                     self.assertIsInstance(selected, gate.TreeSelection)
@@ -257,7 +259,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     self.assertIn("(none)", output.getvalue())
                 self.assertEqual(self.module_events(), [])
                 if decline:
-                    self.assertIn("AWS gate failed: fixture cloud unavailable", errors.getvalue())
+                    self.assertIn("fixture cloud unavailable", errors.getvalue())
                     self.assertFalse(any(record["tree"] == cloud_gate.working_tree(self.checkout)[0]
                                          for record in self.pass_records()))
                 self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
@@ -272,8 +274,6 @@ class MergeGateSuitesTests(GateSuitesFixture):
 
         local_result = gate.GateRun((), 1, 0, selection_certified=True)
         subject = self.checkout / "subject.txt"
-        aws = gate.AwsGateAssignment(placed("aws").assignment)
-
         def run_changed_checkout(*_args: object, **_kwargs: object) -> gate.GateRun:
             self.write(subject, "changed during the local run\n")
             return local_result
@@ -290,14 +290,14 @@ class MergeGateSuitesTests(GateSuitesFixture):
 
         _ = self.git(self.checkout, "restore", "subject.txt")
         remote = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),), 1, 0)
+        aws = gate.placement_target(placed("claude-aws"))
         with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(cloud_gate, "route", return_value=remote),
+              mock.patch.object(cloud_gate, "route") as route,
               mock.patch.object(gate, "run_suites", side_effect=run_changed_checkout) as run_types):
-            with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
+            with self.assertRaisesRegex(GateRefused, "^The AWS gate route does not support type checks$"):
                 _ = gate.run_gate_suites(self.checkout, ("scripts",), target=aws)
-            run_types.assert_called_once_with(
-                self.checkout, ("scripts",), gate.DEFAULT_MODULE_TIME_LIMIT_S,
-                source="tests-only", full=False, mode=gate.SuiteMode.GATE, selected=gate.SelectedModules(()))
+            run_types.assert_not_called()
+            route.assert_not_called()
 
         _ = self.git(self.checkout, "restore", "subject.txt")
         with (mock.patch.dict(os.environ, self.environment),
@@ -324,7 +324,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         selection = affected_modules.AffectedSelection(
             affected_modules.CertifiedBase(self.git(self.checkout, "rev-parse", "HEAD"), "2026-01-15T00:00:00+00:00"),
             (), ())
-        aws = gate.AwsGateAssignment(placed("aws").assignment)
+        aws = gate.AwsGateAssignment(placed("claude-aws").assignment)
         for reuse, types in ((True, ()), (False, ()), (False, ("scripts",))):
             for changed in (False, True):
                 with (self.subTest(reuse=reuse, types=types, changed=changed),
@@ -357,11 +357,11 @@ class MergeGateSuitesTests(GateSuitesFixture):
                         if changed:
                             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
                                 _ = gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
-                                                         target=aws)
+                                                         target="natedev" if types else aws)
                             self.assertEqual(self.pass_records(), before)
                         else:
                             self.assertTrue(gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
-                                                                 target=aws).passed)
+                                                                 target="natedev" if types else aws).passed)
                     route.assert_not_called()
                     self.assertEqual(run_local.call_count, int(bool(types)))
 
@@ -372,7 +372,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         head = self.git(self.checkout, "rev-parse", "HEAD")
         selection = affected_modules.AffectedSelection(
             affected_modules.CertifiedBase(head, "2026-01-15T00:00:00+00:00"), (), ())
-        aws = gate.AwsGateAssignment(placed("aws").assignment)
+        aws = gate.AwsGateAssignment(placed("claude-aws").assignment)
 
         def change_during_selection(*_args: object, **_kwargs: object) -> affected_modules.AffectedSelection:
             self.write(self.checkout / "subject.txt", "changed during empty selection\n")
@@ -724,7 +724,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
             _ = excludes.write("\n/subject.txt\n/ignored.txt\n")
         expected = subject.read_bytes()
         marker, notice = self.write_nightly_red_marker()
-        aws = gate.AwsGateAssignment(placed("aws").assignment)
+        aws = gate.AwsGateAssignment(placed("claude-aws").assignment)
         result = gate.GateRun((), 1, 0, selection_certified=True)
 
         def delete_from_index(*_args: object, **_kwargs: object) -> gate.GateRun:

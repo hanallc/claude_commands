@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,7 +35,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
+from scripts.lib import build_folders, build_slots, cancellation, conf, copy_record, file_lock, git_index, git_rescue, process_start, scratch, session_folder
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -2613,29 +2613,36 @@ def command_tail(command: list[str]) -> list[str]:
 
 def take_prepared_gate_handoff() -> bool:
     """Consume the pipe token passed to the prepared gate."""
+    # The pipe skips placement. Only the queue can confirm an AWS assignment.
     try:
         reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
         if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
             return False
         with os.fdopen(reader, "rb", buffering=0) as pipe:
-            os.set_blocking(reader, False)
-            return pipe.read(1) == b"1"
+            return pipe.read(32) == f"{os.getpid()}\n".encode("ascii")
     except (OSError, ValueError, OverflowError):
         return False
 
 
-@contextmanager
-def prepared_gate_handoff(environment: dict[str, str], descriptors: tuple[int, ...]
-                          ) -> Generator[tuple[int, ...]]:
-    """Pass one pipe token to the prepared gate."""
-    reader, writer = os.pipe()
-    try:
-        with os.fdopen(writer, "wb") as pipe:
-            _ = pipe.write(b"1")
+def run_prepared_gate(command: Sequence[str], source: Path, descriptors: tuple[int, ...],
+                      environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Pass the handoff token to this gate process."""
+    with ExitStack() as pipes:
+        reader, writer = os.pipe()
+        _ = pipes.callback(os.close, reader)
+        _ = pipes.callback(os.close, writer)
         environment[PREPARED_GATE_FD] = str(reader)
-        yield (*descriptors, reader)
-    finally:
-        os.close(reader)
+        with subprocess.Popen(command, cwd=source, pass_fds=(*descriptors, reader),
+                              env=environment, text=True) as child:
+            try:
+                _ = os.write(writer, f"{child.pid}\n".encode("ascii"))
+                pipes.close()
+                return subprocess.CompletedProcess(command, child.wait())
+            except BaseException:
+                with cancellation.defer_cleanup_signals():
+                    child.kill()
+                    _ = child.wait()
+                raise
 
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
@@ -2662,7 +2669,8 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
-            targets = first_step.gate_targets(command, source, args.targets)
+            source_arguments = [part.replace("{tree}", str(source)) for part in command]
+            targets = first_step.gate_targets(source_arguments, source, args.targets)
             prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
                                                          gate_targets=targets))
             tree = prepared.tree
@@ -2677,10 +2685,9 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         def launch() -> subprocess.CompletedProcess[str]:
             child_environment = {**os.environ, **environment}
             _ = child_environment.pop(PREPARED_GATE_FD, None)
-            handoff = (prepared_gate_handoff(child_environment, locks) if command_program(arguments) in GATE_SCRIPTS
-                       else nullcontext(locks))
-            with handoff as pass_fds:
-                return subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=child_environment, text=True)
+            if not first_step.canonical_gate_command(arguments, tree):
+                return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
+            return run_prepared_gate(arguments, tree, locks, child_environment)
 
         if isinstance(prepared, AdmittedCommandCopy):
             result = prepared.admission.run_gate(launch)
@@ -2723,17 +2730,12 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
         with first_step.admitted_run(command, source, targets=targets) as admitted:
             admitted.handoff(source)
 
-            def run_assigned() -> subprocess.CompletedProcess[str]:
-                grant = admitted.grant
-                if (isinstance(grant, first_step.GatePlacement)
-                        and grant.grant.assignment.destination.target == "aws"):
-                    environment = {**os.environ, "BUILDLOG_PREPARED_COPY": str(source)}
-                    with prepared_gate_handoff(environment, tuple(args.lease_fd)) as descriptors:
-                        return subprocess.run(command, cwd=source, pass_fds=descriptors, env=environment,
-                                              check=False, text=True)
-                return run()
-
-            result = run_assigned()
+            grant = admitted.grant
+            if isinstance(grant, first_step.GatePlacement) and grant.grant.assignment.destination.provider == "scaler":
+                result = run_prepared_gate(command, source, tuple(args.lease_fd),
+                                           {**os.environ, "BUILDLOG_PREPARED_COPY": str(source)})
+            else:
+                result = run()
             admitted.preserve_exit_status = first_step.is_gate_placement_exit(result.returncode)
     if result.stderr:
         _ = sys.stderr.write(result.stderr)

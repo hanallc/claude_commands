@@ -8,6 +8,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Literal, Protocol, override
 
+from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.production.gate_modules import GateRefused
@@ -142,18 +143,14 @@ class GuestGateBlocked:
     reason: str
 
 
-class WholeGateRoute(Protocol):
-    """Run the whole test selection on one remote machine."""
-
-    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection,
-              gate_job: StepJob | GateJobNotRecorded) -> GateRun | str: ...
-
-
-class CloudGateRoute(WholeGateRoute, Protocol):
-    """Run AWS tests and identify the checked-out tree."""
+class CloudGateRoute(Protocol):
+    """Run the assigned AWS tests and identify the checked-out tree."""
 
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
+
+    def route(self, repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
+                       assignment: placement.PlacementAssignment, selected: AllModules | TreeSelection,
+                       gate_job: StepJob | GateJobNotRecorded) -> GateRun: ...
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,7 @@ from scripts.build_targets import target_config
 from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
 from scripts.lib.build_steps import (
-    OtherCommand, StepJob, command_job, gate_natedev_only_flag, gate_target_kind, parse_command_program,
+    OtherCommand, StepJob, command_job, gate_natedev_only_flag, parse_command_program,
 )
 from scripts.mac_test.claim_state import WHOLE_MAC
 
@@ -28,19 +28,6 @@ def uses_parent_reservation(command: tuple[str, ...]) -> bool:
             and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation))
 
 
-def scaler_enabled(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> bool:
-    """Check both scaler switches before reading provider evidence."""
-    return (registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False)
-            and conf.read(target.settings).value("enabled", conf.on_off, default=False, recover_invalid=False))
-
-
-def scaler_candidate(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> placement.PlacementCandidate:
-    destination = placement.PlacementDestination("scaler", target.name, target.name, WHOLE_MAC)
-    return placement.PlacementCandidate(destination,
-        placement.AllowedHost() if scaler_enabled(registry, target) else placement.FixedExclusion("off"),
-        placement.ExplicitProviderSettings(target.settings))
-
-
 def natedev_only_flag(command: tuple[str, ...]) -> str | None:
     program = parse_command_program(command)
     return None if isinstance(program, OtherCommand) else gate_natedev_only_flag(program[1])
@@ -53,6 +40,35 @@ def is_claude_gate_source(repo_root: Path) -> bool:
         return False
 
 
+def aws_gate_command(repo: Path, command: tuple[str, ...]) -> bool:
+    """Allow AWS for the canonical gate script in the checkout."""
+    program = parse_command_program(command, keep_path=True)
+    if isinstance(program, OtherCommand) or Path(command[0]).name in {"bash", "sh"}:
+        return False
+    root = repo.resolve()
+    path = root / program[0]
+    canonical = root / "scripts/production/gate.py"
+    return (path == canonical and path.resolve() == canonical
+            and "--nightly" not in program[1] and gate_natedev_only_flag(program[1]) is None)
+
+
+def scaler_gate_candidate(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> placement.PlacementCandidate:
+    """Use the registry switch for this scaler."""
+    enabled = registry.value(f"enabled.{target.name}", conf.on_off, default=True, recover_invalid=False)
+    destination = placement.PlacementDestination("scaler", target.name, target.name, WHOLE_MAC)
+    eligibility = placement.AllowedHost() if enabled else placement.FixedExclusion("off")
+    return placement.PlacementCandidate(destination, eligibility, placement.ExplicitProviderSettings(target.settings))
+
+
+def configured_scaler_gate(registry: conf.ConfigRead, name: str) -> placement.PlacementCandidate:
+    """Read the named scaler in the current registry."""
+    for target in target_config.read_registered_targets(selected=name,
+            purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
+        if isinstance(target, target_config.ScalerTarget):
+            return scaler_gate_candidate(registry, target)
+    raise conf.Unusable(f"The scaler {name} is absent from the target registry")
+
+
 def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...] | NoEnabledTarget:
     """Select the enabled targets that can run a Claude gate."""
     if natedev_only_flag(command) is not None or not is_claude_gate_source(repo_root):
@@ -62,14 +78,14 @@ def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[st
     names: list[str] = []
     for target in target_config.read_registered_targets(purpose=target_config.RegistryRead.PLACEMENT, configuration=registry):
         if isinstance(target, target_config.ScalerTarget):
-            if scaler_enabled(registry, target):
+            if (aws_gate_command(repo_root, command)
+                    and isinstance(scaler_gate_candidate(registry, target).eligibility, placement.AllowedHost)):
                 names.append(target.name)
             continue
-        kind = gate_target_kind(target.name)
-        if kind is None:
+        if target.name not in ("natedev", "mac-linux"):
             continue
         enabled = registry.value(f"enabled.{target.name}", conf.on_off,
-                                 default=kind != "mac-linux", recover_invalid=False)
+                                 default=target.name != "mac-linux", recover_invalid=False)
         if not enabled:
             continue
         fixed = builder(repo_root, "", "final", command, NoOwningSession(),

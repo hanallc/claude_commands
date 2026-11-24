@@ -43,22 +43,30 @@ A held target admits only work that its hold rules permit.
 
 ### Gate placement
 
-A gate from the claude repository reads the targets in registry order.
-It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
-Direct full and nightly gates use natedev or `mac-linux`.
-The prepared gate wrappers can use AWS when the queue grants an AWS assignment.
+A gate from the claude repository requests placement on eligible targets in `build_targets.conf`.
+The caller checks the targets in the order that the file lists them.
+It omits targets with `enabled.<target>=off` and applies the fixed placement rules.
+The canonical `scripts/production/gate.py` can request a registered scaler for full and affected suites.
+A scaler has `kind.<target>=scaler` and a `settings.<target>` file.
+The queue reads `enabled.<target>` from the registry.
+It checks the local slot limit and daily spending room before it grants the scaler.
+The live registry has no AWS scaler entry.
+Full, affected, and nightly suites can use natedev or `mac-linux`.
+The admission service requires a [synced Mac Linux state root](mac-test-offload.md#mac-linux-guest-folders) before guest placement.
 Named module tests and promotion without tests use natedev.
-Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
 A nested named module can use its parent reservation.
-A gate that does not request placement uses natedev.
+An invocation through a legacy script or Python module cannot request AWS.
+Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
+Hana gates have no repository default.
+A gate without an assignment runs locally.
+An AWS assignment with no test verdict exits 79 or 80.
+The caller requests no second assignment for that episode.
 
-The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
-The admission service requires a synced [Mac Linux state root](mac-test-offload.md#mac-linux-guest-folders) before guest placement.
-If setup fails, the next guest placement request retries it. Other targets remain available.
-To register a scaler, include its name in `targets` and set `kind.<name>=scaler`.
-Set `settings.<name>=cloud_gate.conf`. The scaler also requires `enabled=on` in that settings file.
-The queue checks whether the scaler is available on each placement pass.
-A scaler assignment uses a cloud slot until the queue confirms settlement.
+Use this command when the registry includes an enabled scaler named `claude-aws`.
+
+```sh
+BUILDLOG_GATE_TARGETS=claude-aws ./scripts/lib/py scripts/production/gate.py --affected
+```
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
@@ -659,6 +667,16 @@ From a `claude_commands` checkout, run the affected tests through the queue with
 ```
 
 Add `--module <module>` after `--affected` to select a module.
+
+`copies.py run` passes a one-use pipe to the copy's own `scripts/production/gate.py`.
+The pipe contains the launched process ID.
+The gate accepts the handoff only when the process ID and checkout both match.
+The handoff lets the gate skip a second placement request.
+The gate uses AWS only after it confirms an AWS assignment with the queue.
+Only the copy's canonical `scripts/production/gate.py` command can request AWS.
+Aliases, wrapper scripts, and module commands can request natedev or Mac Linux.
+A prepared gate without an assignment runs its suites on natedev.
+A gate started by hand in a copy shell requests its own placement.
 
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
 For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
