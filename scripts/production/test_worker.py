@@ -382,7 +382,6 @@ class WorkerCommandTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "TMPDIR": str(root / "worker-tmp"),
             "SCRATCH_ROOT": str(root / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(root / "visible-scratch"),
             "SCRATCH_COPIES_ROOT": str(root / "copies"),
             "SCRATCH_HOLDS": str(root / "scratch-holds.json"),
         })))

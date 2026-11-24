@@ -2590,6 +2590,28 @@ class WorktreeLifecycleTests(unittest.TestCase):
         for path in (tree, output):
             self.assertIn(f"kept for a manual removal list: {path}", gone.stderr)
 
+    def test_a_try_folder_is_a_named_worktree_and_removal_keeps_unsaved_work(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "try-C12")
+        self.assertEqual(tree, self.trees / "origin/demo/try-C12")
+        self.assertEqual(self.git(tree, "branch", "--show-current"), "demo-try-C12")
+        self.assertEqual((tree / "target").readlink(), self.root / "build/origin/demo/try-C12")
+        other = self.make_layout("other", "try-C12")
+        _ = (other / "notes.txt").write_text("work")
+        python = self.home / ".claude/scripts/lib/py"
+        code = "from scripts.worktree.worktrees import remove_named; print(remove_named('demo', 'try-C12'))"
+        removed = self.command(self.repository, [str(python), "-c", code])
+        self.assertEqual((removed.returncode, removed.stdout), (0, "[]\n"), removed.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree} (worktrees, the checkout is selected for removal)",
+                      removed.stderr)
+        self.assertNotIn(str(other), removed.stderr)
+        code = "from scripts.worktree.worktrees import remove_named; print(*remove_named('other', 'try-C12'))"
+        kept = self.command(self.repository, [str(python), "-c", code])
+        self.assertEqual(kept.returncode, 0, kept.stderr)
+        self.assertTrue(kept.stdout.startswith(f"{other} kept: dirty worktree: ?? notes.txt. Save the work, then run: "))
+        self.assertTrue(kept.stdout.endswith(f"worktrees.py remove {other}\n"))
+        self.assertNotIn("kept for a manual removal list", kept.stderr)
+
     def test_make_carries_direnv_permission_only_for_the_allowed_source_file(self) -> None:
         self.layout_fixture()
         source = self.home / "rust/origin"

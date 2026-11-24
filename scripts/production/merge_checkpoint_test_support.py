@@ -267,8 +267,7 @@ def configure_test_environment() -> None:
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         **config_environment(Path(folder.name) / "config"),
-        "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
-        "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
+        "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch"}))
     _ = unittest.enterModuleContext(isolated_staff_file(Path(folder.name) / "staff.json", {}))
 
 

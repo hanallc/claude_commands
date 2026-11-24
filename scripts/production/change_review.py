@@ -57,6 +57,7 @@ from scripts.production.production_doc import (
 from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
+from scripts.worktree import worktrees
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
@@ -99,6 +100,10 @@ _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
+SCRATCH_NOT_REMOVED = "scratch not removed:"
+TRY_FOLDER_NOT_CHECKED = "try folder not checked:"
+# A verdict intent stays for a retry while a line starts with one of these.
+RETRY_PREFIXES = (SCRATCH_NOT_REMOVED, TRY_FOLDER_NOT_CHECKED)
 lists_directory = change_routing.lists_directory
 PREFIX = "change-review - "
 FENCE = "---"
@@ -2038,15 +2043,38 @@ def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
-    """End the scratch task of `row` and return any error.
+    """End the scratch task and the try folder of `row`.
 
+    Return the error lines and the kept try folder lines.
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
         _ = scratch.end(f"row:{_owner(path)}-{row}")
-        return []
+        lines: list[str] = []
     except (conf.Unusable, scratch.ScratchError, OSError) as error:
-        return [f"scratch not removed: {error}"]
+        lines = [f"{SCRATCH_NOT_REMOVED} {error}"]
+    return lines + end_try_folder(path, row)
+
+
+def end_try_folder(path: Path, row: str) -> list[str]:
+    """Remove the try folder `try-<row>` of the row's Producer; return one line for each kept folder or error.
+
+    An empty Producer cell names the list's showrunner, and only a filled cell reads staff.
+    """
+    local = row.rpartition("/")[2]
+    try:
+        found = next((item for item in review_rows(path) if item["#"] == local), None)
+        identity = found.get(PRODUCER, "").strip() if found is not None else ""
+        team = _owner(path)
+        if identity:
+            producer = change_routing.producer_row(staff.snapshot(), staff.StaffId(identity))
+            if isinstance(producer, change_routing.UnroutedChange):
+                return [f"{TRY_FOLDER_NOT_CHECKED} {producer.note}"]
+            team = producer.name
+        return worktrees.remove_named(team, f"try-{local}")
+    except Exception as error:
+        first_line = str(error).partition("\n")[0]
+        return [f"{TRY_FOLDER_NOT_CHECKED} {first_line}"]
 
 
 class VerdictDurabilityUnconfirmed(RuntimeError):
@@ -2177,7 +2205,7 @@ class PendingVerdictCleanup:
                     return []
                 closeout(self.load(self.intent, self.path.parent.resolve()))
                 lines = end_row_scratch(self.path, self.row)
-                if not any(line.startswith('scratch not removed:') for line in lines):
+                if not any(line.startswith(RETRY_PREFIXES) for line in lines):
                     self.intent.unlink(missing_ok=True)
                 return lines
         except Exception as error:

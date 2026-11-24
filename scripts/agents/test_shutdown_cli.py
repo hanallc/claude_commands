@@ -343,7 +343,6 @@ mac.platform=darwin
 mac.hosts=Nates-MacBook-Pro-2023
 """,
     "scratch": """\
-visible_root=~/rust/repro
 holds_file=~/.local/state/scratch/holds.json
 # whole: 1..
 default_life_seconds=86400

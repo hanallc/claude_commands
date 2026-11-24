@@ -436,6 +436,7 @@ A single session is found by id, then exact name.
 A move outside the group account prints that the member returns to the group account at its next resume or restart.
 Ambiguous or unknown sessions return an error.
 A session already on the target returns success.
+When another operation holds its row, the session skips the quota check and the move waits for the row.
 A group move selects its account for future launches, then moves each live member on another account once.
 The `producers` move also resumes eligible stopped Claude producers.
 An empty group still selects its account.
@@ -726,7 +727,8 @@ Each session attempt has its own `move_id`, with a request and one confirmed or 
 The request uses the session process account as its source.
 Saved launch settings cannot replace the requested destination account.
 The notes timer delegates moves to a detached batch before it stops any session.
-A session that owns a live build step moves when its steps end, or after `MOVE_BUILD_WAIT_MINUTES` in `config/shutdown.conf`; the others move at once.
+Each session moves at once, also when it owns a live build step, a queued run or a verify call.
+The resumed session must do its interrupted work again.
 The batch records each outcome when its resume and existing stay observation finish.
 A failed resume uses the existing move failure report to tell the showrunners.
 Blocked notices use the current queue head and target at delivery.

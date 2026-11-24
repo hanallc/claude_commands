@@ -603,7 +603,7 @@ class StaffRoutingTests(unittest.TestCase):
             config.mkdir()
             config_env = config_environment(config)
             _ = write_config_fixture(config / "scratch.conf",
-                                     f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
+                                     f"holds_file={root / 'holds.json'}")
             settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
             _ = (config / "change_review.conf").write_text(settings.read_text())
             _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")

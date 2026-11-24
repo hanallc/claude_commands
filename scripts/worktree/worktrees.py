@@ -107,6 +107,11 @@ class Kept:
 
 
 @dataclass(frozen=True)
+class Clean:
+    """The check found no unsaved work in the checkout."""
+
+
+@dataclass(frozen=True)
 class OriginBranchAbsent:
     """Origin has no branch to delete."""
 
@@ -653,6 +658,13 @@ def check_origin_landing(record: WorktreeRecord, origin: CheckedOriginTip) -> Ch
     return origin
 
 
+def dirty_check(path: Path, *, all_untracked: bool = False) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes and list them on one line."""
+    options = ("--untracked-files=all",) if all_untracked else ()
+    dirty = git(path, "status", "--porcelain", *options).stdout
+    return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines())) if dirty else Clean()
+
+
 def origin_cleanup_tip(repo: Path, branch: str | land_main.RemoteDefaultBranch) -> land_main.AdvertisedBranchTip:
     try:
         return land_main.remote_branch_tip(repo, "origin", branch)
@@ -675,9 +687,8 @@ def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | 
         production_doc.require_removable_checkout(path, path, branch)
     except production_doc.ProductionPathsError as error:
         return Kept(path, str(error))
-    dirty = git(path, "status", "--porcelain").stdout
-    if dirty:
-        return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
+    if isinstance(dirty := dirty_check(path), Kept):
+        return dirty
     if head.returncode == 1:
         return Kept(path, "HEAD is detached")
     repo = main_checkout(path)
@@ -734,9 +745,8 @@ def recorded_worktree_change(path: Path, repo: Path, branch: str) -> str:
     if path.exists():
         if git_files.at(path).common_dir != git_files.at(repo).common_dir:
             return "the worktree belongs to a different repository"
-        dirty = git(path, "status", "--porcelain", "--untracked-files=all").stdout
-        if dirty:
-            return f"dirty worktree: {dirty.rstrip()}"
+        if isinstance(dirty := dirty_check(path, all_untracked=True), Kept):
+            return dirty.reason
         head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
         expected = f"refs/heads/{branch}"
         if head.returncode or head.stdout.strip() != expected:
@@ -1102,6 +1112,45 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
     elif not retain_record:
         release_worktree_pair(path)
         record_file(path).unlink(missing_ok=True)
+
+
+def unsaved_work(path: Path) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes or with commits that are on no remote."""
+    dirty = dirty_check(path)
+    if isinstance(dirty, Clean) and git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes").stdout.strip():
+        return Kept(path, "commits that are on no remote")
+    return dirty
+
+
+def remove_named(unit: str, short_name: str) -> list[str]:
+    """Remove each recorded worktree of `unit` called `short_name`, and keep its branch.
+
+    A worktree with unsaved work stays, and its line names the command to run after the work is saved.
+    A worktree that an error stops stays, and its line names the first line of the error.
+    """
+    lines: list[str] = []
+    for record_path in sorted(state_folder().glob("*.json")):
+        try:
+            record = read_record(record_path)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record.layout, RecordedWorktreeOutput) or (
+                record.layout.unit, record.layout.short_name) != (unit, short_name):
+            continue
+        path, repo = Path(record.path), Path(record.repo)
+        try:
+            state = unsaved_work(path) if path.exists() else Clean()
+            if isinstance(state, Clean):
+                remove_git_checkout(path, repo)
+                continue
+        except (Refused, OSError, ValueError) as error:
+            first_line = str(error).partition("\n")[0]
+            lines.append(f"{path} not removed: {first_line}")
+            continue
+        command = shlex.join(["env", f"--chdir={repo}", str(Path.home() / ".claude/scripts/lib/py"),
+                              str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(path)])
+        lines.append(f"{path} kept: {state.reason}. Save the work, then run: {command}")
+    return lines
 
 
 @dataclass(frozen=True)

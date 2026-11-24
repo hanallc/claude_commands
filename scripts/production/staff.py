@@ -199,6 +199,11 @@ class StaffAbsent(StaffUnreadable):
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
+    def __init__(self, *args: object, holder: str = "") -> None:
+        super().__init__(*args)
+        # The process that holds a busy row, as "pid N: command"; empty when unknown.
+        self.holder: str = holder
+
 
 class UpkeepRowBusy(StaffRefused):
     """Herdr upkeep did not release the row within the wait time."""
@@ -951,8 +956,12 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
+def _holder_fields() -> dict[str, object]:
+    return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+
+
 def _write_slot_holder(lock: IO[bytes]) -> None:
-    holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    holder = _holder_fields()
     with suppress(OSError):
         os.ftruncate(lock.fileno(), 0)
         _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
@@ -1018,8 +1027,9 @@ def _acquire_slot(lock: IO[bytes], name: str) -> None:
                         raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
                     time.sleep(min(0.05, remaining))
                     continue
-            suffix = f" (pid {holder[0]}: {holder[1]})" if holder else ""
-            raise StaffRefused(f"{name}: another operation holds this row{suffix}") from error
+            named = f"pid {holder[0]}: {holder[1]}" if holder else ""
+            raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
+                               holder=named) from error
 
 
 def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
@@ -1145,14 +1155,13 @@ def mark_row_move(key: str, target: str) -> Generator[None]:
             _ = stream.truncate()
             stream.flush()
 
-        pid = os.getpid()
-        owner = process_start.process_start(pid)
-        write({"pid": pid, "start": owner.start, "target": target}
-              if isinstance(owner, process_start.Started) else {})
+        holder = _holder_fields()
+        owner = process_start.process_start(os.getpid())
+        write(holder | {"start": owner.start, "target": target} if isinstance(owner, process_start.Started) else holder)
         try:
             yield
         finally:
-            write({})
+            write(holder)
 
 
 def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:
