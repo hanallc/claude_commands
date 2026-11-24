@@ -16,6 +16,7 @@ DEFAULT_ADMISSION_SOCKET = Path("/run/build-admission/build-admission.sock")
 
 
 StopStatus = Literal["stopped", "not_stopped"]
+StopConfirmation = StopStatus | Literal["absent", "unreadable"]
 
 
 def holder_directory() -> Path:
@@ -43,11 +44,18 @@ def write_stop_confirmation(path: Path, status: StopStatus) -> None:
     write_text_atomic(path, status + "\n")
 
 
-def read_stop_confirmation(request_id: str) -> StopStatus | None:
+def read_stop_confirmation_state(request_id: str) -> StopConfirmation:
     try:
         status = stop_confirmation_path(request_id).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return "absent"
     except (OSError, UnicodeError):
-        return None
+        return "unreadable"
     if status == "stopped":
         return "stopped"
-    return "not_stopped" if status == "not_stopped" else None
+    return "not_stopped" if status == "not_stopped" else "unreadable"
+
+
+def read_stop_confirmation(request_id: str) -> StopStatus | None:
+    status = read_stop_confirmation_state(request_id)
+    return status if status in ("stopped", "not_stopped") else None
