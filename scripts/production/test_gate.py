@@ -367,14 +367,17 @@ class MergeGateCheckpointTests(MergeGateFixture):
             return gate.GateRun((), 0, 0, tests_reused=True)
 
         @contextmanager
-        def admit(command: Sequence[str], source: Path) -> Generator[object]:
+        def admit(command: Sequence[str], source: Path, *, targets: tuple[str, ...]) -> Generator[object]:
             self.assertEqual(command[0], 'gate.py')
             self.assertEqual(source, self.checkout)
+            self.assertEqual(targets, ("natedev",))
+            self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
             self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
             yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.InheritedGatePlacement(assignment))
 
         assignment = placed('natedev')
         with (mock.patch.object(gate, "run_suites", side_effect=suites),
+              mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
               mock.patch.object(first_step, 'admitted_run', side_effect=admit) as admitted,
               mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, assignment])):
             result = self.run_gate()
@@ -765,14 +768,14 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
         self.assert_not_pushed()
 
-    def test_a_mac_linux_guest_that_took_no_run_undoes_the_merge_with_one_line(self) -> None:
+    def test_a_mac_linux_guest_that_took_no_run_undoes_the_merge(self) -> None:
         cause = "the guest did not arm the run: fixture SSH refused the connection"
         with mock.patch.object(gate, "run_gate_suites",
                                side_effect=gate.MacLinuxTookNoRun(f"Mac Linux guest took no run: {cause}")):
             result = self.run_gate()
         self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
-        self.assertEqual(result.stderr.splitlines()[-1:],
-                         [f"Mac Linux guest took no run: {cause}; merge undone, not pushed"])
+        self.assertEqual(result.stderr.splitlines()[-2:],
+                         ["Merge undone. The merge was not pushed.", f"Mac Linux guest took no run: {cause}"])
         self.assertNotIn("REFUSED", result.stderr)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()

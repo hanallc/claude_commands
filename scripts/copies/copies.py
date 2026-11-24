@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,6 +65,7 @@ LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+PREPARED_GATE_FD = "BUILDLOG_PREPARED_GATE_FD"
 
 
 @dataclass(frozen=True)
@@ -2610,6 +2611,33 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def take_prepared_gate_handoff() -> bool:
+    """Consume the pipe token passed to the prepared gate."""
+    try:
+        reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
+        if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
+            return False
+        with os.fdopen(reader, "rb", buffering=0) as pipe:
+            os.set_blocking(reader, False)
+            return pipe.read(1) == b"1"
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
+@contextmanager
+def prepared_gate_handoff(environment: dict[str, str], descriptors: tuple[int, ...]
+                          ) -> Generator[tuple[int, ...]]:
+    """Pass one pipe token to the prepared gate."""
+    reader, writer = os.pipe()
+    try:
+        with os.fdopen(writer, "wb") as pipe:
+            _ = pipe.write(b"1")
+        environment[PREPARED_GATE_FD] = str(reader)
+        yield (*descriptors, reader)
+    finally:
+        os.close(reader)
+
+
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Run verify from a snapshot and other commands under a numbered copy lease."""
     owner = caller_owner()
@@ -2645,13 +2673,21 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         arguments = [part.replace("{tree}", str(tree)) for part in command]
         environment["COPIES_COMMAND_LEASE_FDS"] = ",".join(map(str, locks))
         before = publication_candidates(tree, target, arguments, args.publish)
+
+        def launch() -> subprocess.CompletedProcess[str]:
+            child_environment = {**os.environ, **environment}
+            _ = child_environment.pop(PREPARED_GATE_FD, None)
+            handoff = (prepared_gate_handoff(child_environment, locks) if command_program(arguments) in GATE_SCRIPTS
+                       else nullcontext(locks))
+            with handoff as pass_fds:
+                return subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=child_environment, text=True)
+
         if isinstance(prepared, AdmittedCommandCopy):
-            result = prepared.admission.run_gate(lambda: subprocess.run(
-                arguments, cwd=tree, pass_fds=locks, env={**os.environ, **environment}, text=True))
+            result = prepared.admission.run_gate(launch)
             if result.stderr:
                 _ = sys.stderr.write(result.stderr)
         else:
-            result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env={**os.environ, **environment})
+            result = launch()
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         selection = PublicationSelection.CHANGED
         if command_exit == 0 and not isinstance(verification, VerifyCommand):
@@ -2686,7 +2722,18 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
     else:
         with first_step.admitted_run(command, source, targets=targets) as admitted:
             admitted.handoff(source)
-            result = admitted.run_gate(run)
+
+            def run_assigned() -> subprocess.CompletedProcess[str]:
+                grant = admitted.grant
+                if (isinstance(grant, first_step.GatePlacement)
+                        and grant.grant.assignment.destination.target == "aws"):
+                    environment = {**os.environ, "BUILDLOG_PREPARED_COPY": str(source)}
+                    with prepared_gate_handoff(environment, tuple(args.lease_fd)) as descriptors:
+                        return subprocess.run(command, cwd=source, pass_fds=descriptors, env=environment,
+                                              check=False, text=True)
+                return run()
+
+            result = admitted.run_gate(run_assigned)
     if result.stderr:
         _ = sys.stderr.write(result.stderr)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode

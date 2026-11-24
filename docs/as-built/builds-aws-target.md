@@ -897,6 +897,8 @@ The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
+Direct gate placement uses natedev and `mac-linux`.
+A gate in a prepared checkout can use AWS with a queue assignment.
 The queue offers AWS after `cloud_gate.availability()` confirms the switch, deployment, spend room and Spot quota room.
 This check reads local files and makes no AWS call.
 It checks the per-attempt booking against the daily and monthly caps and the safety reserve.
@@ -911,7 +913,6 @@ The retry uses the next choice in the saved launch order.
 The route keeps its cloud slot across retries.
 The route saves the interruption count and the next choice in `current.json` before each retry.
 An assigned AWS run starts from its claim and clears the saved retry state.
-An unassigned resume restores the saved retry state.
 Each retry gets a new attempt ID.
 The worker checks the current spending caps before each fresh assigned launch.
 The worker confirms cleanup of the interrupted box and reservation before the retry.
@@ -926,8 +927,9 @@ If the reconciler cannot read a launch journal, it prints the file path and keep
 It continues cleanup for the other bookings.
 The queue reads settlement for the exact claim through `settlement()`.
 The queue calls `reconcile_expired()` when it checks pending settlement.
-A direct gate that receives status 80 asks the queue for settlement before it takes a replacement in the same episode.
-If the settlement request or replacement fails after status 80, the direct gate preserves status 80.
+A wrapper that owns the placement request asks the queue for settlement after status 80.
+It keeps the same episode for a permitted replacement.
+If the settlement request or replacement fails, the wrapper preserves status 80.
 `reconcile_expired()` requests the service when a booking for that claim has expired and cleanup is due.
 It reads the exact claim again before submitting the service.
 The call returns before reconciliation completes.

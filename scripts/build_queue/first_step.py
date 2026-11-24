@@ -109,8 +109,7 @@ class FirstStepAdmission:
 
     def _hand_gate(self, grant: GatePlacement) -> None:
         # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
-        # The gate ends that reservation after its assignment check, before it takes its own.
-        # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
+        # The gate uses the reservation for its suites. The cancel returns an unused reservation.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
         if isinstance(grant, OwnedGatePlacement) and isinstance(grant.request.local, wire.LocalAdmissionContext):
@@ -252,7 +251,10 @@ def run_gate_with_placement(
             mac_linux = destination.provider == 'ssh' and destination.target == 'mac-linux'
             retry_notice = ''
             if result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
-                refusal = read_gate_claim_failure(assignment_file, request)
+                try:
+                    refusal = read_gate_claim_failure(assignment_file, request)
+                except FileNotFoundError:
+                    return result
                 settled = client.claim_failure(refusal)
                 waiting_for_settlement = isinstance(settled.state, placement.CurrentAssignment) and (
                     destination.provider == 'scaler' or

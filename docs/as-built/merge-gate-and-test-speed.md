@@ -58,19 +58,21 @@ The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMEN
 The assignment must match the gate's placement episode and submitting process.
 The queue must confirm that the saved attempt is current.
 The gate checks a supplied assignment at startup.
-For `--tests-only` and `--affected` without `--module`, the assignment source key must match the resolved `--repo` checkout.
-Without a supplied assignment, the gate asks `first_step.admitted_run` to place the test checkout.
-The queue offers natedev, the Mac Linux guest and AWS according to the target configuration.
-A direct merge gate asks after it creates the merge tree. The nightly gate asks after it prepares the fetched checkout.
+For `--tests-only` and `--affected`, the assignment source key must match the resolved `--repo` checkout.
+Without a supplied assignment, a direct gate asks `first_step.admitted_run` to place the test checkout.
+The queue offers natedev and the Mac Linux guest for eligible direct gates.
+A direct merge gate asks after it creates the merge tree.
+The nightly gate asks after it prepares the fetched checkout.
 The gate keeps merge writes, validation, push, promotion and nightly publication on natedev.
 The local runner keeps the queue grant until the suites end.
-A standalone `--module` run asks the queue for placement. A nested `--module` run keeps its parent reservation.
-The remote runner tests the requested module list. The result supplies no pass certificate.
-`--promote-only` runs on natedev.
+The suites publish progress to the sidecar from the granted request.
+Named modules and `--promote-only` use natedev.
+A nested named module keeps its parent reservation.
+Named module results supply no pass certificate.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
-An assignment to `aws` runs the tests in AWS and reports the result or refusal to the queue.
-The AWS route runs any required type checks on natedev after the AWS result returns.
+A prepared gate with an AWS assignment runs the tests in AWS.
+The AWS route reports the result or refusal to the queue.
 An assignment to `mac-linux` runs the whole test selection in the Mac Linux guest when `enabled.mac-linux=on`.
 The nightly gate uses the guest for type checks when it finds `basedpyright` and `uv` there.
 If the guest lacks either tool, the nightly gate runs its type checks on natedev.
@@ -100,7 +102,7 @@ Until the queue confirms the guest attempt, the row shows `mac-linux (not confir
 A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the route prints `guest unreachable` with the guest alias from `ssh.hops`.
-The gate returns status 80 to the placement retry loop for that episode.
+The gate returns status 80 to the caller for that episode.
 The route saves the end result in the Mac Linux proof journal before any settlement report.
 The route stops its own cleanup requests.
 The queue can request another proof check for the saved guest attempt while the slot stays held.
@@ -109,32 +111,34 @@ The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
 It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
-The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `; merge undone, not pushed`), writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
-`copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
-The queue also accepts the claim failure after the gate consumed the launch permission, when a new process read shows that the gate process ended.
-The new assignment goes into the same file, and the gate runs again on the assigned machine.
-A direct `--tests-only` or `--affected` gate without `--module` keeps its admission open during retries.
-It reads the current grant and checks the checkout before each attempt.
-The same retry loop handles status 79 and waits for settlement on status 80.
-It keeps the same queue episode and preserves status 80 if the settlement request or replacement fails.
-A gate with an inherited placement returns the retry status to its wrapper.
-The gate verifies an inherited assignment against the resolved checkout before it runs named modules.
-The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
-If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
-A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
-If no named machine remains, the gate step stops with "Gate placement blocked".
-A refused placement during the retry stops the gate step with "Gate placement blocked".
-A failure after the first test started is not placed again: the gate fails.
-`copies.py run` does not place a gate again after a guest decline.
+The gate prints `Mac Linux guest took no run: <cause>`.
+A merge gate also reports that it undid the merge.
+When the guest proves that no test started, the gate can exit with status 79.
+It writes a claim failure next to the assignment file (`<assignment>.claim-failure`).
+Status 80 means the gate has no verdict after the guest could have started tests.
+A direct gate returns the status after one placement request.
+A gate with an inherited placement returns the status to its wrapper.
+A wrapper that owns the placement request uses the exact claim failure to ask for a replacement.
+The queue also accepts a claim failure after a consumed launch permission when it confirms the gate process ended.
+A wrapper can request settlement on status 80.
+For Mac Linux it also needs proof that no tests started before it can request a replacement.
+The wrapper writes a replacement assignment into the same file and runs the gate again.
+The 180-second wait applies to the guest. Another eligible target can take the run immediately.
+If the guest is the only free target, the run waits 180 seconds before it tries the guest again.
+A second guest refusal removes the guest from that episode.
+If placement fails, the wrapper reports the reason and stops.
+`copies.py gate-step` preserves status 79 or 80 when cleanup fails and prints the cleanup error.
+Checkpoint and bump treat these statuses as blocked when the wrapper returns them.
+A nightly gate reports the refusal to its production owner. It records no red test result.
+A confirmed test failure gives status 1.
 Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
-A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+A claude gate uses the configured targets that its placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
-If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
+If the guest cannot return a result after a test started, the gate reports status 80 and gives the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
 A targeted gate can reuse a certified test pass. The guest runs any requested type checks on the Mac.
-When `BUILDLOG_PLACEMENT_FILE` is unset, the gate tries AWS first if it needs to run the test selection.
-If AWS refuses that unassigned run, natedev runs the selection.
+The AWS route requires a current queue assignment and the prepared gate handoff.
 
 On natedev and on the Mac Linux guest, a hand made run starts its program under `bwrap` with a read limit.
 The rule set is in `scripts/build_targets/mac_linux.py` (`limit_words`), because the guest runner can read only that module; `scripts/production/hand_made_limit.py` adds the natedev paths.
@@ -190,7 +194,7 @@ A current assignment to an unsupported target fails and reports the target.
 
 ## Cloud gate route
 
-Merge gates and targeted tests use one fresh Spot instance for each attempt after the user deploys the gate resources.
+The cloud route uses one fresh Spot instance for each attempt after the user deploys the gate resources.
 The route returns the existing `GateRun` and exit behavior.
 The build queue enforces nine cloud slots and shows remote progress.
 
@@ -208,7 +212,8 @@ Production also downloads the request that contains the module list.
 User data contains the download links instead of the program or module paths.
 Production and trial use curl with signed HTTPS links for every box transfer.
 The guest performs no type check and installs no basedpyright package.
-The type check for an AWS nightly assignment runs on natedev.
+The gate runs requested AWS type checks on natedev after the cloud result returns.
+A cloud result that reports a time limit ends the gate before those checks.
 
 The route tries all public zones at `m7a.8xlarge`, then all zones at `m7a.4xlarge`.
 Both sizes use one-time Spot with termination on interruption and shutdown.

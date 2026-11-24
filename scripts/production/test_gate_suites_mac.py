@@ -20,7 +20,7 @@ from unittest import mock
 from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement, progress_profile
 from scripts.build_queue import test_placement as placement_fixture
 from scripts.build_queue.admission_test_support import Exchange, FakeClock, ScriptedTransport, reply_bytes
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -36,6 +36,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, mac_gate
 from scripts.production import mac_gate_process, gate, targeted_test
+from scripts.copies import copies
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.gate_suites_test_support import GateSuitesFixture
@@ -250,9 +251,11 @@ class MacGateSuitesTests(GateSuitesFixture):
                 request = placement_fixture.placement_request(queue)
                 assert isinstance(request.local, admission_wire.LocalAdmissionContext)
                 assert isinstance(request.profile, admission_records.StepProfile)
+                sidecar = str(queue.root / "placement.cgroup")
                 guest_target = placement.PlacementDestination("ssh", "mac-linux", "fixture-mac", claim_state.WHOLE_MAC)
                 request = replace(request, profile=replace(request.profile, step="gate"), local=replace(
-                    request.local, argv=command), constraints=replace(request.constraints, command=command,
+                    request.local, argv=command, sidecar=sidecar),
+                    constraints=replace(request.constraints, command=command,
                     source_key=self.checkout_source_key(),
                     repository=str(self.checkout), candidates=(placement.PlacementCandidate(guest_target),
                                                                placement_fixture.local_candidate(queue))))
@@ -269,7 +272,8 @@ class MacGateSuitesTests(GateSuitesFixture):
                 admission_wire.write_assignment(path, reply)
                 owner = build_hold.ProcessIdentity(assignment.owner.pid, assignment.owner.start_time)
                 with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path),
-                                                  "BUILDLOG_PLACEMENT_EPISODE": assignment.episode}),
+                                                  "BUILDLOG_PLACEMENT_EPISODE": assignment.episode,
+                                                  "BUILDLOG_PLACEMENT_SIDECAR": sidecar}),
                       mock.patch.object(build_hold, "caller_processes", return_value=frozenset({owner})),
                       mock.patch.object(gate, "gate_job_from_process", return_value=job),
                       mock.patch.object(admission_client, "release", side_effect=partial(queue_release, queue)) as released,
@@ -304,7 +308,8 @@ class MacGateSuitesTests(GateSuitesFixture):
         named = tuple(candidate for candidate in (guest, placement_fixture.local_candidate(queue))
                       if candidate.destination.target in targets)
         request = replace(request, profile=replace(request.profile, step="gate"), local=replace(
-            request.local, argv=command), constraints=replace(request.constraints, command=command,
+            request.local, argv=command, sidecar=str(queue.root / "placement.cgroup")),
+            constraints=replace(request.constraints, command=command,
             source_key=self.checkout_source_key(),
             repository=str(self.checkout), candidates=named))
         if guest in named:
@@ -349,7 +354,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         with placement_fixture.PlacementFixture() as queue, mock.patch.dict(os.environ):
             def run_local(repo: Path, *arguments: object, **options: object) -> gate.GateRun:
                 self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
-                self.assertEqual(options["local_grant"], gate.LocalGateAssignment(reply.grant, reply.assignment.owner))
+                grant = cast(gate.LocalGateAssignment, options["local_grant"])
+                self.assertEqual((grant.grant, grant.owner), (reply.grant, reply.assignment.owner))
+                self.assertEqual(grant.sidecar, queue.root / "placement.cgroup")
                 run = cast(gate.GateRun, run_real(repo, *arguments, **options))
                 self.assertEqual(self.queue_state(reply), placement.CurrentAssignment())
                 return run
@@ -383,6 +390,27 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual((status, errors), (0, ""), self.output.getvalue())
         released.assert_called_once_with(reply.grant.reservation, 0, reply.grant.cleanup_timing)
         local.assert_called_once()
+
+    @gate_suites("lib")
+    def test_natedev_suites_publish_progress_to_the_granted_sidecar(self) -> None:
+        publish = progress_profile.publish_counter
+        seen: list[progress_profile.ProgressCounter] = []
+        sidecars: set[Path] = set()
+
+        def read_progress(path: Path, counter: progress_profile.ProgressCounter) -> None:
+            sidecar = Path(os.environ["BUILDLOG_PLACEMENT_SIDECAR"])
+            sidecars.add(sidecar)
+            publish(path, counter)
+            self.assertEqual(progress_profile.read_counter(sidecar), counter)
+            seen.append(counter)
+
+        with mock.patch.object(progress_profile, "publish_counter", side_effect=read_progress):
+            status, errors, _, _, _ = self.run_handed_off_gate(("natedev",))
+        self.assertEqual((status, errors), (0, ""), self.output.getvalue())
+        self.assertEqual(seen[0].done, 0)
+        self.assertEqual(seen[-1].done, seen[-1].total)
+        sidecar, = sidecars
+        self.assertIsInstance(progress_profile.read_counter(sidecar), progress_profile.NoCounter)
 
     @gate_suites("lib")
     def test_a_named_module_gate_keeps_the_natedev_reservation_until_it_finishes(self) -> None:
@@ -673,7 +701,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         assignment = self.gate_assignment("aws", provider="scaler")
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
-        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path),
+                                          "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_linux, "route") as guest,
               mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), 1)
@@ -960,7 +990,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         assignment = self.aws_assignment().assignment
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
-        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path),
+                                          "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_gate_process, "load_mac_gate_route") as load_mac,
               mock.patch.object(sys, "argv", [script, "--tests-only", "--repo", str(self.checkout)]),
               redirect_stderr(io.StringIO()) as errors,
@@ -983,7 +1015,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         assignment = self.aws_assignment().assignment
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
-        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
+        with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path),
+                                          "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(gate, "run_suites") as local):
             status = targeted_test.main(["--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())

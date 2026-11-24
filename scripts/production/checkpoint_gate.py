@@ -240,10 +240,10 @@ def stop_test_without_result(step: CheckpointTestStep, result: subprocess.Comple
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
     gate = command_program(step.command) in GATE_SCRIPTS
     if gate and result.returncode == GATE_UNSETTLED_LAUNCH_STATUS:
-        raise Stop("test", "blocked", f"{step.label} waits for launch settlement. Log {log}",
+        raise Stop("test", "blocked", f"{step.label} waits for launch settlement with gate status {result.returncode}. Log {log}",
                    f"Check the launch settlement in {log}.")
     if gate and result.returncode == GATE_PRELAUNCH_REFUSED_STATUS:
-        raise Stop("test", "blocked", f"{step.label} could not complete placement. Log {log}",
+        raise Stop("test", "blocked", f"{step.label} could not complete placement. Gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
 
 

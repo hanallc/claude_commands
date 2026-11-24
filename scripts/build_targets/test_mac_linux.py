@@ -41,7 +41,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import checkpoint_gate, gate
 from scripts.production.gate_modules import GateRefused
-from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.test_checkpoint_gate import GatePlacementFixture
 
 
@@ -1688,7 +1688,7 @@ fi
               patch.object(mac_linux, 'stop_ssh_process', stop_ssh),
               redirect_stderr(io.StringIO()) as errors):
             try:
-                with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'exceeded 1 seconds'):
+                with self.assertRaisesRegex(mac_linux.GuestResultUnavailable, 'exceeded 1 seconds'):
                     _ = self.run_guest_stream(program, self.root / 'placement.cgroup', timeout=1)
             finally:
                 release.set()
@@ -1701,6 +1701,7 @@ fi
         program = f'import signal, sys; sys.stderr.buffer.write({diagnostic!r}); sys.stderr.flush(); signal.pause()'
         with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'diagnostic:') as caught:
             _ = self.run_guest_stream(program, self.root / 'placement.cgroup', timeout=2)
+        self.assertNotIsInstance(caught.exception, mac_linux.GuestResultUnavailable)
         reason = caught.exception.__cause__
         assert isinstance(reason, subprocess.TimeoutExpired)
         self.assertEqual(reason.stderr, diagnostic)
@@ -2083,11 +2084,11 @@ fi
         _ = self.registry.write_text(self.registry.read_text().replace(f'{key}=20', f'{key}=4'))
         with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30', 'FIXTURE_HELD_LINK': '1'}),
               patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 1),
-              patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6)):
-            reason = self.blocked(self.route('hang'))
+              patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6),
+              self.assertRaisesRegex(GateResultUnknown, 'SSH or guest run exceeded 6 seconds') as result):
+            _ = self.route('hang')
         group = (self.root / 'run.group').read_text()
-        self.assertIn('SSH or guest run exceeded 6 seconds', reason)
-        self.assertIn('Guest cleanup: ended', reason)
+        self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assertEqual(self.run_lock().read_text().split()[0], group)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -2276,7 +2277,9 @@ fi
         self.assert_guest_clean('probe', 'arm', 'fence')
 
     def test_disconnect_before_take_copy_kills_the_run_and_proves_end(self) -> None:
-        reason = self.blocked(self.route('disconnect-before-copy'))
+        with patch.object(mac_linux, 'send_guest_execution') as report:
+            reason = self.blocked(self.route('disconnect-before-copy'))
+        report.assert_not_called()
         self.assertIn('SSH or source stream exited 255', reason)
         self.assertIn('Guest cleanup: ended', reason)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
@@ -2824,9 +2827,9 @@ fi
         _ = configuration.write_text(configuration.read_text().replace('seconds=7', 'seconds=3'))
         with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '3', 'FIXTURE_TRANSFER_SECONDS': '4'}),
               patch.object(mac_linux, 'TRANSFER_ALLOWANCE_SECONDS', 4)):
-            reason = self.blocked(self.route('hang'))
-        self.assertRegex(reason, r'SSH or source stream exited (9|137):')
-        self.assertIn('Guest cleanup: ended', reason)
+            with self.assertRaisesRegex(GateResultUnknown, r'SSH or source stream exited (9|137):') as result:
+                _ = self.route('hang')
+        self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assertTrue((self.root / 'run.group').is_file())
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -2861,10 +2864,11 @@ fi
         self.assertFalse((self.guest_home / 'build').exists())
 
     def test_inner_reset_after_the_guest_started_does_not_retry(self) -> None:
-        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset-after-start'}):
-            reason = self.blocked(self.route())
-        self.assertIn(mac_linux.RUN_START, reason)
-        self.assertIn('Connection reset by peer', reason)
+        with (patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset-after-start'}),
+              self.assertRaises(GateResultUnknown) as result):
+            _ = self.route()
+        self.assertIn(mac_linux.RUN_START, str(result.exception))
+        self.assertIn('Connection reset by peer', str(result.exception))
         self.assert_guest_clean('probe', 'arm', 'run', 'run', 'cleanup')
 
     def test_a_different_ssh_error_does_not_retry(self) -> None:
@@ -3023,9 +3027,9 @@ fi
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_runner_failure_returns_reason_and_cleans(self) -> None:
-        reason = self.blocked(self.route('runner-failure'))
-        self.assertIn('fixture guest runner failed', reason)
-        self.assertIn('Guest cleanup: ended', reason)
+        with self.assertRaisesRegex(GateResultUnknown, 'fixture guest runner failed') as result:
+            _ = self.route('runner-failure')
+        self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_runner_failure_before_a_test_reports_an_unconfirmed_start(self) -> None:
@@ -3082,8 +3086,8 @@ fi
         send = mac_linux.BundleSend('', '', mac_linux.BundleForm.FIRST, mac_linux.BundleReason.FIRST_RUN)
         for stderr, error in ((b'fixture stderr\n', mac_linux.GuestTookNoRun),
                               (mac_linux.run_start_line(attempt).encode() + b'\nfixture stderr\n',
-                               mac_linux.GuestUnavailable)):
-            with self.subTest(started=error is mac_linux.GuestUnavailable):
+                               mac_linux.GuestResultUnavailable)):
+            with self.subTest(started=error is mac_linux.GuestResultUnavailable):
                 stream = subprocess.CompletedProcess[bytes]([], 0, b'{"reply": 1}\nno count\xff\n', stderr)
                 with self.assertRaises(mac_linux.GuestUnavailable) as refusal:
                     _ = mac_linux.stream_reply(stream, attempt, 10, send, 'Guest cleanup: ended.')

@@ -43,13 +43,14 @@ A held target admits only work that its hold rules permit.
 
 ### Gate placement
 
-A Claude gate requests placement on every eligible target in `build_targets.conf`.
-The caller reads the targets in registry order and applies the fixed placement rules.
-It omits any target whose `enabled.<target>` switch is off.
+A gate from the claude repository reads the targets in registry order.
+It omits targets with `enabled.<target>=off` and applies the fixed placement rules to the rest.
+Direct full and nightly gates use natedev or `mac-linux`.
+The prepared gate wrappers can use AWS when the queue grants an AWS assignment.
+Named module tests and promotion without tests use natedev.
 Explicit targets take precedence over `BUILDLOG_GATE_TARGETS`, which takes precedence over the default.
-Standalone named module tests and nightly suites run on natedev.
-A nested named module can use its parent reservation. Promotion without tests uses natedev.
-A Hana gate without requested targets uses its existing unassigned cloud route.
+A nested named module can use its parent reservation.
+A gate that does not request placement uses natedev.
 
 The AWS scaler is not registered yet. The current registry supplies natedev and mac-linux to Claude gates.
 The admission service requires a synced [Mac Linux state root](mac-test-offload.md#mac-linux-guest-folders) before guest placement.
