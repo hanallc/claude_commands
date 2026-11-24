@@ -1608,8 +1608,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                     return
                 scheduled = new_item_dialog.read_scheduled_request(fields)
-                if not review_submissions.is_draft_id(scheduled.request_id):
-                    raise new_item_dialog.SubmissionError("Invalid Scheduled request ID.")
                 self.scheduled_item_post(server, scheduled)
                 return
             draft = fields.get("request_id")
@@ -1682,6 +1680,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     raise
                 # Check for a saved List draft before validating a new capture.
                 key, refusal = "", error
+        except new_item_dialog.ScheduledDraftRequired as error:
+            self.json_response(409, {"code": "wrong_draft_kind", "error": str(error)})
+            return
         except (ValueError, RecursionError) as error:
             reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})

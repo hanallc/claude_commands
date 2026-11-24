@@ -1731,31 +1731,12 @@ def file_list_draft(request_id: str, payload_hash: str, *,
                     prepare: Callable[[], AbstractContextManager[tuple[ListDraftClaim, ListDraftWriter]]],
                     deliver: Callable[[ListAssignmentNotice, str, str], bool]) -> ListItemDestination:
     """Recover the first Send or file a List item under its draft lock."""
+    _ = new_item_dialog.read_scheduled_draft_id(request_id)
     with _locked_filing_draft(request_id) as folder:
-        filing = _draft_filing(folder)
-        if isinstance(filing, UnclaimedDraft):
-            with _locked_legacy_list_target(folder, None) as target:
-                if isinstance(target, LocatedSubmission):
-                    raise DraftAlreadyFiled(target.destination.id)
-            match = _find_legacy_list_draft(request_id)
-            if isinstance(match, NativeSubmissionDestination):
-                raise DraftAlreadyFiled(match.id)
         _sync_draft_parents(folder)
-        if isinstance(filing, PendingFiling):
-            raise DraftPending()
-        if isinstance(filing, NativeDraftAwaitingReceipt):
-            raise DraftAlreadyFiled(filing.destination.id)
+        filing = _draft_filing(folder)
         candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
-        if isinstance(candidate, NativeSubmissionDestination):
-            with _locked_request(candidate.address, recovered=candidate,
-                                 search_owner_stores=isinstance(filing, FiledDraft)) as lookup:
-                if isinstance(lookup.native, LocatedSubmission):
-                    saved_native = lookup.native.destination
-                    atomic_file.sync_folder(saved_native.path.parent)
-                    _write_draft_index(folder, FiledDraft(saved_native))
-                    raise DraftAlreadyFiled(saved_native.id)
-            if isinstance(filing, FiledDraft):
-                raise DraftAlreadyFiled(candidate.id)
+        if not isinstance(candidate, (ListItemDestination, UnclaimedDraft)):
             raise DraftPending()
         if isinstance(filing, FiledDraft):
             assert isinstance(candidate, ListItemDestination)
@@ -1995,65 +1976,6 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
 
 
-def _saved_legacy_image_fingerprints(details: ReviewSubmission) -> tuple[tuple[str, str], ...]:
-    digests = dict(details.image_digests)
-    fingerprints: list[tuple[str, str]] = []
-    for reference in details.images:
-        if reference == PAGE_SCREENSHOT:
-            continue
-        digest = digests.get(reference.id)
-        if digest is None:
-            path = image_folder(details) / reference.id / reference.file
-            with path.open("rb") as stream:
-                data = stream.read(MAX_IMAGE_BYTES + 1)
-            if not 0 < len(data) <= MAX_IMAGE_BYTES:
-                raise OSError(f"Cannot read the legacy Review image at {path}.")
-            digest = hashlib.sha256(data).hexdigest()
-        fingerprints.append((Path(reference.file).suffix.removeprefix("."), digest))
-    return tuple(fingerprints)
-
-
-def _find_legacy_list_draft(draft_id: str) -> NativeSubmissionDestination | NoNativeSubmission:
-    """Match the draft ID against the saved words and images in base-format List records."""
-    legacy_id = "r2-" + draft_id[3:]
-    errors: list[OSError] = []
-    for folder in sorted(_request_folder(draft_id).parent.iterdir()):
-        if not re.fullmatch(r"r4-[0-9a-f]{64}", folder.name):
-            continue
-        try:
-            markers = [path for path in sorted(folder.iterdir())
-                       if path.name == "page-list" or path.name.startswith("page-list-")]
-            if not markers:
-                continue
-            fingerprint = folder.name[3:]
-            with exclusive(folder / ".lock"):
-                for marker in markers:
-                    try:
-                        identity = marker.read_text(encoding="utf-8").rstrip("\n")
-                    except FileNotFoundError:
-                        continue
-                    try:
-                        kind = read_kind(identity.split("-", 3)[2])
-                    except (IndexError, SubmissionError) as error:
-                        raise OSError(f"Cannot read the Review request at {marker}.") from error
-                    address = _draft_binding(identity, kind, fingerprint, marker)
-                    with _locked_request(address) as lookup:
-                        item = _saved_draft(lookup)
-                        if item is None:
-                            continue
-                        intent = item.details.capture_intent
-                        if isinstance(intent, new_item_dialog.DeferredCaptureIntent) and intent.submitted_draft_id == legacy_id:
-                            return item.destination
-                        images = _saved_legacy_image_fingerprints(item.details)
-                        if _legacy_draft_fingerprint(legacy_id, kind, item.saved().words, images) == fingerprint:
-                            return item.destination
-        except (OSError, UnicodeError) as error:
-            errors.append(OSError(f"Cannot check the legacy Review draft at {folder}: {error}"))
-    if errors:
-        raise errors[0]
-    return NoNativeSubmission()
-
-
 def _recover_pre_upgrade_native_draft(draft_folder: Path, address: SubmissionAddress, words: str,
                                       uploads: tuple[_ImageUpload, ...], members: staff.StaffSnapshot | None, *,
                                       capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget
@@ -2109,6 +2031,14 @@ def submit(
     initial_delivery: InitialDelivery | NoInitialDelivery = NO_INITIAL_DELIVERY,
 ) -> SavedSubmission:
     """Save the native item or recover the first Send for this draft."""
+    if new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(request.request_id):
+        with _locked_filing_draft(request.request_id) as folder:
+            filing = _draft_filing(folder)
+            if isinstance(filing, FiledDraft) and isinstance(filing.destination, ListItemDestination):
+                raise DraftAlreadyFiled(filing.destination.id)
+            if isinstance(filing, ClaimedDraft) and isinstance(filing.destination, ListItemDestination):
+                raise DraftPending()
+            raise SubmissionConflict("This draft ID is for Scheduled. Start a new draft for this item type.")
     if isinstance(capture_intent, new_item_dialog.DeferredCaptureIntent) and (
             capture_intent.submitted_draft_id != request.request_id
             or not new_item_dialog.capture_key_matches_draft(capture_intent.capture_key, request.request_id)

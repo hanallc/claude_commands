@@ -263,9 +263,9 @@ async function sendSaved() {
    window.fetch = originalFetch;
    check(attempted.length === 4 && attempted[2].request_id === attempted[3].request_id &&
          error.textContent === 'The token expired again.', 'The dialog retries an expired token once.');
-   check(new Set(attempted.map(post => post.request_id)).size === 1 &&
+   check(attempted[0].request_id === attempted[1].request_id && attempted[1].request_id !== attempted[2].request_id &&
          attempted[0].recipient_id !== attempted[1].recipient_id && attempted[1].kind !== attempted[2].kind,
-         'Changing the recipient or type keeps the unsent draft ID.');
+         'Changing the recipient keeps the draft ID. Changing the kind creates a new ID.');
    type('');
    dialog.querySelector('[data-cancel]').click();
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
@@ -333,8 +333,8 @@ async function sendSaved() {
      observer.observe(element, {attributes:true, attributeFilter:['hidden']});
     });
    }
-   async function openOwner() {
-    await open({kind:'question'});
+   async function openOwner(kind = 'question') {
+    await open({kind});
     if (!pngAvailable) await whenShown(dialog.querySelector('[data-fallback]'));
     check(checkbox.checked && !checkbox.disabled && !checkbox.closest('label').hidden,
           'The page checkbox is checked and available on open.');
@@ -346,10 +346,11 @@ async function sendSaved() {
    }
    async function sendOwner() {
     selectType('feedback');
+    if (checkbox.checked) await whenShown(pngAvailable ? shot : dialog.querySelector('[data-fallback]'));
     type('Show the queue state.');
     return sendSaved();
    }
-   await openOwner();
+   await openOwner('bug');
    check(ownerPosts.length === 1 && ownerPosts[0].page_capture.width === innerWidth,
          'Opening the dialog starts one capture at the requested viewport.');
    const slot = dialog.querySelector('[data-capture-slot]');
@@ -362,27 +363,32 @@ async function sendSaved() {
    releasePreview();
    await whenShown(shot);
    const image = shot.href;
-   dialog.querySelector('[name="kind"][value="bug"]').click();
-   check(!shot.hidden && shot.href === image && ownerPosts.length === 1,
-         'Changing to Bug keeps the original image and capture request.');
+   selectType('question');
+   await whenShown(shot);
+   const captures = ownerPosts.filter(post => post.page_capture);
+   check(shot.href !== image && captures.length === 2 &&
+         captures[0].capture_key.slice(0, 35) !== captures[1].capture_key.slice(0, 35),
+         'Changing the kind starts a capture for the new draft ID.');
    await sendOwner();
-   check(ownerPosts.length === 2 && ownerPosts[1].capture_key === captureKey &&
-         ownerPosts[1].images.length === 0 && ownerPosts[1].evidence.kind === 'none',
-         'Send uses the same preview without the fallback rows.');
+   const capturedSend = ownerPosts.findLast(post => post.request_id);
+   check(capturedSend.capture_key === captureKey && capturedSend.images.length === 0 &&
+         capturedSend.evidence.kind === 'none',
+         'Send includes the new capture without the fallback rows.');
 
    await openOwner();
    checkbox.click();
    const skippedCapture = new Promise(resolve => { discarded = resolve; });
    await sendOwner();
    await skippedCapture;
-   check(ownerPosts.length === 5 && !ownerPosts[3].capture_key && ownerPosts[3].evidence.kind === 'none' &&
-         ownerPosts[4].discard_capture === captureKey, 'Send with the box unchecked discards the capture.');
+   const skipped = ownerPosts.findLast(post => post.request_id);
+   check(!skipped.capture_key && skipped.evidence.kind === 'none' && ownerPosts.at(-1).discard_capture === captureKey,
+         'Send with the box unchecked discards the capture.');
 
    await openOwner();
    const canceled = new Promise(resolve => { discarded = resolve; });
    dialog.querySelector('[data-cancel]').click();
    await canceled;
-   check(ownerPosts.length === 7 && ownerPosts[6].discard_capture === captureKey && !dialog.open,
+   check(ownerPosts.at(-1).discard_capture === captureKey && !dialog.open,
          'Closing the dialog discards the capture.');
 
    pngAvailable = false;
@@ -394,8 +400,9 @@ async function sendSaved() {
    main.append(paragraph);
    await openOwner();
    await sendOwner();
-   const fallback = ownerPosts[8].evidence;
-   check(ownerPosts.length === 9 && !ownerPosts[8].capture_key && fallback.kind === 'page-data' &&
+   const fallbackSend = ownerPosts.findLast(post => post.request_id);
+   const fallback = fallbackSend.evidence;
+   check(!fallbackSend.capture_key && fallback.kind === 'page-data' &&
          fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.');
    const running = fallback.sections?.find(section => section.label === 'Running');
    check(running?.columns[0] === 'Step' && running.columns[1] === 'Stage' &&
@@ -403,12 +410,13 @@ async function sendSaved() {
          'The fallback keeps the displayed build values with their column labels.');
    check(fallback.title === emoji && fallback.rows.some(row=>row.includes(emoji)),
          'The title and rows keep an emoji at the character limit.');
-   check(ownerPosts[8].page === 'builds', 'Send includes the page identity.');
+   check(fallbackSend.page === 'builds', 'Send includes the page identity.');
 
    pngAvailable = true;
    await openOwner();
    await whenShown(shot);
    const oldKey = captureKey, oldImage = shot.href, at = ownerPosts.length;
+   const previousCapture = ownerPosts.findLast(post => post.page_capture).page_capture;
    const expired = dialog.querySelector('[data-capture-expired]');
    type('Keep these Question words after a restart.');
    expireNextSend = true;
@@ -420,7 +428,7 @@ async function sendSaved() {
          ownerPosts.length === at + 2 && ownerPosts[at].kind === 'question' &&
          ownerPosts[at].capture_key === oldKey && ownerPosts[at].token !== ownerToken &&
          ownerPosts[at + 1].token === ownerToken &&
-         ownerPosts[at + 1].page_capture.place === ownerPosts[at - 1].page_capture.place,
+         ownerPosts[at + 1].page_capture.place === previousCapture.place,
          'The restart keeps the Question words and takes a screenshot with the new token.');
    releasePreview();
    await whenShown(shot);
@@ -446,6 +454,7 @@ async function sendSaved() {
    releasePreview();
    await whenShown(shot);
    dialog.querySelector('[name="kind"][value="bug"]').click();
+   await whenShown(shot);
    await sendSaved();
    const restored = ownerPosts.at(-1);
    check(restored.capture_key === captureKey && restored.capture_key !== beforeRestore &&
@@ -767,6 +776,7 @@ OWNER_OPTIONS_PROBE = r"""
   check(posted?.recipient_id === alternate.value && posted.words === words.value &&
         posted.page_recipient === 'selected' && !('capture_key' in posted),
         'Scheduled sends the selected owner and words without capture fields.');
+  check(/^s1-[0-9a-f]{32}$/.test(posted?.request_id), 'Changing the kind to Scheduled creates a Scheduled draft ID.');
   check(!hidden(dialog.querySelector('[data-saved-controls]')) && scheduledInput.checked &&
         dialog.querySelector('#new-item-saved').textContent.includes('Saved List item 12.') &&
         dialog.querySelector('#new-item-saved').textContent.includes('Repeats: Daily'),
@@ -857,6 +867,8 @@ RESTORED_SEND_PROBE = r"""
    if (deferred) await ready(() => !dialog.querySelector('[data-capture-slot]').hidden);
    send.click();
    await ready(() => posted && send.form.getAttribute('aria-busy') === 'false');
+   const namespace = kind === 'scheduled' ? /^s1-/ : /^r6-/;
+   check(namespace.test(posted.request_id), 'The first Send uses the namespace for its kind.');
    check(send.textContent === 'Retry' && !send.disabled && words.readOnly &&
          recipient('cargo-liner').matches(':disabled'), 'An uncertain Send locks the submitted fields immediately.');
    if (deferred) {
@@ -938,6 +950,7 @@ RESTORED_SEND_PROBE = r"""
     await next;
     check(posted.request_id !== original.request_id && posted.words === 'Keep my later edit.',
           'The later edits use a new draft ID.');
+    check(/^r6-/.test(posted.request_id), 'The separate Bug draft uses the native namespace.');
    }
    check(!sessionStorage.getItem('console.new-item.submitted'), 'The receipt clears the submitted draft.');
   }
@@ -1339,7 +1352,8 @@ if (scenario === 'reload') {
      firstRequest = item.request_id;
      return Promise.reject(new TypeError('Send did not reach the server.'));
     }
-    check(item.request_id === earlier.requestId, 'Send keeps the unfiled draft ID after reload.');
+    check(earlier.cleared ? item.request_id !== earlier.requestId : item.request_id === earlier.requestId,
+          'Retry keeps the ID after reload. A kind change creates a new ID.');
     if (!earlier.cleared) return Promise.resolve(Response.json({error:'The server refused this Send.'}, {status:409}));
    }
   }

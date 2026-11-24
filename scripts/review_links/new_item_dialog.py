@@ -768,6 +768,18 @@ def read_words(value: object, label: str) -> str:
 
 
 SCHEDULED_KIND = "scheduled"
+SCHEDULED_DRAFT_ID = re.compile(r"s1-[0-9a-f]{32}")
+
+
+class ScheduledDraftRequired(SubmissionConflict):
+    def __init__(self) -> None:
+        super().__init__("This draft ID is invalid for Scheduled. Start a new Scheduled draft.")
+
+
+def read_scheduled_draft_id(value: object) -> str:
+    if not isinstance(value, str) or not SCHEDULED_DRAFT_ID.fullmatch(value):
+        raise ScheduledDraftRequired()
+    return value
 
 
 @dataclass(frozen=True)
@@ -787,7 +799,7 @@ def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
         raise SubmissionError("Send the instruction, start, and repeat for a Scheduled item.")
     recipient = staff.StaffId(_text(fields.get("recipient_id"), "Recipient ID", 128))
     check_recipient_id(recipient)
-    return ScheduledSubmission(read_request_id(fields.get("request_id")), recipient,
+    return ScheduledSubmission(read_scheduled_draft_id(fields.get("request_id")), recipient,
                                read_words(fields.get("words"), "Your words"), page)
 
 
@@ -1029,7 +1041,7 @@ SCRIPT = r'''(() => {
                  dialog.querySelector('[data-cancel]')];
  const listSendKey = 'console.list.pending-send';
  const submittedKey = 'console.new-item.submitted';
- const listDraftId = /^r6-[0-9a-f]{32}$/;
+ const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
@@ -1136,10 +1148,13 @@ SCRIPT = r'''(() => {
  function editDraft(event) {
   if (sending || isRecovering()) return;
   if (event?.target.name === 'kind') {
+   discardCapture();
+   draftId = undefined;
+   ensureDraftId();
    showRecipients();
    showBugPage();
-   if (isScheduled()) discardCapture();
-   else if (!scheduledHelp.hidden) startCapture();
+   storeListDraft();
+   startCapture();
   }
   if (event?.target.name === 'recipient_id') {
    selectedRecipient = event.target.value;
@@ -1487,7 +1502,9 @@ SCRIPT = r'''(() => {
  }
 
  function ensureDraftId() {
-  return draftId ||= 'r6-' + randomNonce();
+  const prefix = isScheduled() ? 's1-' : 'r6-';
+  if (!draftId?.startsWith(prefix)) draftId = prefix + randomNonce();
+  return draftId;
  }
 
  async function renewCapture() {
@@ -1523,16 +1540,16 @@ SCRIPT = r'''(() => {
   try {
    const stored = sessionStorage.getItem(listSendKey);
    if (!stored) return null;
-   if (listDraftId.test(stored)) return {id: stored, recipient: null, awaitingSend: false};
+   if (browserDraftId.test(stored)) return {id: stored, recipient: null, awaitingSend: false};
    const draft = JSON.parse(stored);
-   if (typeof draft?.id !== 'string' || !listDraftId.test(draft.id)) return null;
+   if (typeof draft?.id !== 'string' || !browserDraftId.test(draft.id)) return null;
    const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
    return {id: draft.id, recipient, awaitingSend: draft.awaitingSend === true};
   } catch (_) { return null; }
  }
 
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId) return;
+  if (ownerPage !== 'list' || !draftId || isEditingLater() || !sendNotice.hidden) return;
   try {
    sessionStorage.setItem(listSendKey, JSON.stringify({
     id: draftId, recipient: selectedRecipient, awaitingSend: awaitingEarlierSend
@@ -1566,7 +1583,7 @@ SCRIPT = r'''(() => {
    pointer = draft.payload.request_id;
    sessionStorage.setItem(submittedKey, pointer);
   }
-  if (earlier && listDraftId.test(earlier) && earlier !== pointer) {
+  if (earlier && browserDraftId.test(earlier) && earlier !== pointer) {
    void draftTransaction('readwrite', store => store.delete(earlier)).catch(() => {});
   }
   submittedDraft = draft;
@@ -1576,9 +1593,11 @@ SCRIPT = r'''(() => {
   if (submittedDraft) return submittedDraft;
   const stored = sessionStorage.getItem(submittedKey);
   if (!stored) return;
-  const draft = listDraftId.test(stored)
+  const draft = browserDraftId.test(stored)
    ? await draftTransaction('readonly', store => store.get(stored)) : JSON.parse(stored);
-  if (listDraftId.test(draft?.payload?.request_id || '')) submittedDraft = {...draft, mode: draft.mode || 'retry'};
+  const id = draft?.payload?.request_id || '';
+  const prefix = draft?.payload?.kind === 'scheduled' ? 's1-' : 'r6-';
+  if (browserDraftId.test(id) && id.startsWith(prefix)) submittedDraft = {...draft, mode: draft.mode || 'retry'};
   else throw new Error('Could not restore the submitted New item.');
   return submittedDraft;
  }
@@ -1587,7 +1606,7 @@ SCRIPT = r'''(() => {
   const stored = sessionStorage.getItem(submittedKey);
   sessionStorage.removeItem(submittedKey);
   submittedDraft = undefined;
-  if (stored && listDraftId.test(stored)) {
+  if (stored && browserDraftId.test(stored)) {
    void draftTransaction('readwrite', store => store.delete(stored)).catch(() => {});
   }
  }
@@ -1610,7 +1629,7 @@ SCRIPT = r'''(() => {
 
  function editSnapshot() {
   return {kind: form.elements.kind.value, recipient: selectedRecipient, words: words.value,
-          include: includePage.checked, files: images.map(image => image.file), pageContext, ownerPage};
+          include: includePage.checked, files: images.map(image => image.file), pageContext, ownerPage, id: draftId};
  }
 
  function showLaterDraft() {
@@ -1620,6 +1639,7 @@ SCRIPT = r'''(() => {
   ownerPage = draft.ownerPage;
   pageContext = draft.pageContext;
   form.elements.kind.value = draft.kind;
+  draftId = draft.id;
   selectedRecipient = draft.recipient;
   words.value = draft.words;
   includePage.checked = draft.include;
@@ -1677,7 +1697,9 @@ SCRIPT = r'''(() => {
   laterBase = editSnapshot();
   submittedDraft.mode = 'edit-later';
   discardCapture();
+  draftId = undefined;
   showLaterDraft();
+  ensureDraftId();
   setError('Confirm the earlier Send before you send these edits.');
   showSentDetails();
   words.focus();

@@ -414,7 +414,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 (encoded(payload), '', {'Content-Length': str(serve.MAX_NEW_ITEM_BODY+1)}, 400),
                 (encoded({"token": token, "kind": "scheduled", "page": [], "page_recipient": "selected"}), '', {}, 400),
                 (encoded({"token": token, "kind": "scheduled", "page": "list", "page_recipient": "selected",
-                          "recipient_id": owner.id, "request_id": "r6-" + uuid4().hex,
+                          "recipient_id": owner.id, "request_id": "s1-" + uuid4().hex,
                           "words": "Check the queue. Start 2099-11-30T09:00Z.", "capture_key": "x"}), '', {}, 400),
             )
             for body, query, headers, status in cases:
@@ -3300,7 +3300,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                             if kind == new_item_dialog.SCHEDULED_KIND:
                                 notices.clear()
                                 scheduled = {"token": self.server.new_item_token, "kind": kind, "page": page,
-                                             "page_recipient": "selected", "request_id": "r6-" + uuid4().hex,
+                                             "page_recipient": "selected", "request_id": "s1-" + uuid4().hex,
                                              "recipient_id": owner,
                                              "words": "Check the Scheduled item. Start 2099-11-30T09:00Z. Repeat Daily."}
                                 encoded = json.dumps(scheduled).encode()
@@ -3341,9 +3341,21 @@ class ReviewLinksServerTests(unittest.TestCase):
             scheduled = {"token": self.server.new_item_token, "kind": "scheduled", "page": "builds",
                          "page_recipient": "selected", "recipient_id": showrunner.id,
                          "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}
+
+            def assert_wrong_scheduled_draft(draft_id: str) -> None:
+                denied = self.new_item_http(json.dumps({**scheduled, "request_id": draft_id}).encode(), finished=True)
+                conflict = cast(dict[str, object], json.loads(denied.body))
+                self.assertEqual((denied.status, conflict["code"]), (409, "wrong_draft_kind"))
+                self.assertIn("Start a new Scheduled draft.", str(conflict["error"]))
+
             draft = "r6-" + uuid4().hex
             bug = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, showrunner.id), page="builds",
                           page_recipient=new_item_dialog.PageRecipient.SELECTED, request_id=draft)
+            for prefix in ("r2-", "r6-"):
+                with self.subTest(unfiled_native_namespace=prefix):
+                    before = the_list.records(morty.id)
+                    assert_wrong_scheduled_draft(prefix + uuid4().hex)
+                    self.assertEqual(the_list.records(morty.id), before)
             for kind in (new_item_dialog.SubmissionKind.BUG, new_item_dialog.SubmissionKind.QUESTION,
                          new_item_dialog.SubmissionKind.PROPOSAL):
                 for lose_directory in (False, True):
@@ -3355,9 +3367,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                         if lose_directory:
                             shutil.rmtree(self.submission_draft_folder(draft))
                         before = {item.id for item in the_list.records(morty.id)}
-                        denied = self.new_item_http(json.dumps({**scheduled, "request_id": draft}).encode(), finished=True)
-                        self.assertEqual((denied.status, json.loads(denied.body)["id"]),
-                                         (409, json.loads(first.body)["id"]))
+                        assert_wrong_scheduled_draft(draft)
+                        retry = self.new_item_http(self.new_item_body(request), finished=True)
+                        self.assertEqual((retry.status, json.loads(retry.body)["id"]),
+                                         (200, json.loads(first.body)["id"]))
                         self.assertEqual({item.id for item in the_list.records(morty.id)}, before)
             from scripts.review_links.test_review_submissions import PNG
 
@@ -3390,7 +3403,6 @@ class ReviewLinksServerTests(unittest.TestCase):
                     draft = "r6-" + suffix
                     updated = replace(earlier, request_id=draft)
                     native_body = self.new_item_body(updated)
-                    scheduled_body = json.dumps({**scheduled, "request_id": draft}).encode()
                     folder = self.submission_draft_folder(draft)
                     list_before = {item.id for item in the_list.records(morty.id)}
                     native_before = [item.id for item in investigation.records(showrunner.id)]
@@ -3438,22 +3450,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                             self.assertEqual(interrupted.status, 503, interrupted.body)
                             if failure == "index claim write and local claim loss":
                                 (folder / "pending.json").unlink()
-                            conflict = self.new_item_http(scheduled_body, finished=True)
-                            result = cast(dict[str, object], json.loads(conflict.body))
-                            self.assertEqual((conflict.status, result.get("id")), (409, saved.id))
+                            assert_wrong_scheduled_draft(draft)
                     if recovery == "base draft key" and not failure:
-                        conflict = self.new_item_http(scheduled_body, finished=True)
-                        self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, saved.id))
-                    else:
-                        recovered = self.new_item_http(native_body, finished=True)
-                        self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
+                        assert_wrong_scheduled_draft(draft)
+                    recovered = self.new_item_http(native_body, finished=True)
+                    self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
                     if failure == "attachment write" or recovery == "base draft key" and failure == "local claim write":
                         restored, = review_submissions.image_folder(saved).glob("*/image.png")
                         self.assertEqual(restored.read_bytes(), base64.b64decode(PNG))
                     shutil.rmtree(folder)
-                    conflict = self.new_item_http(scheduled_body, finished=True)
-                    self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, saved.id))
-                    shutil.rmtree(folder)
+                    assert_wrong_scheduled_draft(draft)
                     recovered = self.new_item_http(native_body, finished=True)
                     self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (409, saved.id))
                     self.assertEqual({item.id for item in the_list.records(morty.id)}, list_before)
@@ -3461,10 +3467,10 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             for kind in ("scheduled", "bug"):
                 with self.subTest(repair_missing_index=kind):
-                    draft = "r6-" + uuid4().hex
+                    draft = ("s1-" if kind == "scheduled" else "r6-") + uuid4().hex
                     native_body = self.new_item_body(replace(bug, request_id=draft))
                     scheduled_body = json.dumps({**scheduled, "request_id": draft}).encode()
-                    body, alternate = (scheduled_body, native_body) if kind == "scheduled" else (native_body, scheduled_body)
+                    body = scheduled_body if kind == "scheduled" else native_body
                     first = self.new_item_http(body, finished=True)
                     self.assertEqual(first.status, 200, first.body)
                     filed_id = cast(dict[str, str], json.loads(first.body))["id"]
@@ -3472,16 +3478,22 @@ class ReviewLinksServerTests(unittest.TestCase):
                     recovered = self.new_item_http(body, finished=True)
                     self.assertEqual((recovered.status, json.loads(recovered.body)["id"]), (200, filed_id))
                     shutil.rmtree(self.submission_draft_folder(draft))
-                    conflict = self.new_item_http(alternate, finished=True)
-                    self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, filed_id))
+                    if kind == "scheduled":
+                        conflict = self.new_item_http(native_body, finished=True)
+                        self.assertEqual((conflict.status, json.loads(conflict.body)["id"]), (409, filed_id))
+                    else:
+                        assert_wrong_scheduled_draft(draft)
+                        retry = self.new_item_http(native_body, finished=True)
+                        self.assertEqual((retry.status, json.loads(retry.body)["id"]), (200, filed_id))
 
             unrelated = next(investigation.folder(showrunner.id).glob("I*.md"))
+            legacy = cache.create_submission(replace(bug, page="list", request_id="r2-" + uuid4().hex)).saved.path
             unrelated_list = next(the_list.folder(morty.id).glob("L*.md"))
             read_text = Path.read_text
             read_bytes = Path.read_bytes
 
             def deny_native_read(path: Path, *args: object, **kwargs: object) -> str:
-                if path == unrelated:
+                if path == unreadable_native:
                     raise PermissionError("An unrelated native record cannot be read.")
                 return cast(Callable[..., str], read_text)(path, *args, **kwargs)
 
@@ -3490,10 +3502,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                     raise PermissionError("An unrelated List item cannot be read.")
                 return read_bytes(path)
 
-            for kind in ("scheduled", "question", "proposal"):
-                with (self.subTest(unreadable_unrelated_record=kind),
+            for kind, unreadable_native in (("scheduled", unrelated), ("scheduled", legacy),
+                                            ("question", unrelated), ("proposal", unrelated)):
+                with (self.subTest(kind=kind, unreadable_native=unreadable_native),
                       patch.object(Path, "read_text", deny_native_read), patch.object(Path, "read_bytes", deny_list_read)):
-                    draft = "r6-" + uuid4().hex
+                    draft = ("s1-" if kind == "scheduled" else "r6-") + uuid4().hex
                     if kind == "scheduled":
                         body = json.dumps({**scheduled, "request_id": draft}).encode()
                     else:
@@ -3513,7 +3526,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 return add(keeper, title, owner=owner, source=source, changes=changes, number=number)
 
             with self.subTest(allocation="displaced"):
-                draft = "r6-" + uuid4().hex
+                draft = "s1-" + uuid4().hex
                 body = json.dumps({**scheduled, "request_id": draft}).encode()
                 with patch.object(the_list, "add", displace_number):
                     response = self.new_item_http(body, finished=True)
@@ -3533,7 +3546,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             for failure in ("List write", "receipt write"):
                 with self.subTest(failure=failure):
-                    draft = "r6-" + uuid4().hex
+                    draft = "s1-" + uuid4().hex
                     body = json.dumps({**scheduled, "request_id": draft}).encode()
                     before = {item.id for item in the_list.records(morty.id)}
                     notices.clear()
@@ -3570,7 +3583,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             for retry_kind in ("original", "edited", "native"):
                 with self.subTest(retry_kind=retry_kind):
-                    draft = "r6-" + uuid4().hex
+                    draft = "s1-" + uuid4().hex
                     submitted = {**scheduled, "request_id": draft}
                     before = {item.id for item in the_list.records(morty.id)}
                     with patch.object(review_submissions, "_publish_receipt", fail_receipt):
@@ -3601,7 +3614,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             for level in ("root", "draft", "index"):
                 with self.subTest(failure=f"{level} parent sync"):
-                    draft = "r6-" + uuid4().hex
+                    draft = "s1-" + uuid4().hex
                     body = json.dumps({**scheduled, "request_id": draft}).encode()
                     before = {item.id for item in the_list.records(morty.id)}
                     draft_parent = self.submission_draft_folder(draft).parent
@@ -3636,7 +3649,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             for failure in ("producer", "showrunner", "receipt progress"):
                 with self.subTest(notice_failure=failure):
-                    draft = "r6-" + uuid4().hex
+                    draft = "s1-" + uuid4().hex
                     body = json.dumps({**scheduled, "request_id": draft}).encode()
                     recipient = producer.id if failure == "producer" else showrunner.id
                     fail_notice_for = recipient if failure != "receipt progress" else staff.StaffId("")
@@ -3675,7 +3688,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                         exited if member.id == row.id else member for member in members.rows))):
                     with self.subTest(recipient=row.name, pending=bool(unavailable.pending_retire)), patch.object(
                             staff, "snapshot", return_value=unavailable):
-                        body = json.dumps({**scheduled, "request_id": "r6-" + uuid4().hex}).encode()
+                        body = json.dumps({**scheduled, "request_id": "s1-" + uuid4().hex}).encode()
                         denied = self.new_item_http(body, finished=True)
                         self.assertEqual(denied.status, 409, denied.body)
                         refusal = cast(dict[str, object], json.loads(denied.body))
