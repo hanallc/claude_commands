@@ -860,14 +860,6 @@ class VerifyRunSlot:
 
 
 @dataclass(frozen=True)
-class GuestSettlementWait:
-    """Keep the submission's deadline and the attempt that holds its slot."""
-    attempt: str
-    deadline: float
-    limit: int | None
-
-
-@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -885,7 +877,6 @@ class ServiceState:
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
     queue_pins: QueuePins = ()
     verify_run_slots: dict[str, VerifyRunSlot] = field(default_factory=dict, kw_only=True)
-    guest_settlement_waits: dict[str, GuestSettlementWait] = field(default_factory=dict, kw_only=True)
 
 
 def saved_verify_run_slots(state: ServiceState) -> dict[str, VerifyRunSlot]:
@@ -1260,6 +1251,7 @@ class DispatchEvidence:
     saved: records.SavedPlacementAssignment
     result: placement.DispatchPathState | wire.ExecutionReport
     observed_at: float
+    observed_monotonic: float
 
 
 class HostEvidenceWorker:
@@ -1293,7 +1285,11 @@ class HostEvidenceWorker:
             self.observations[evidence.key] = evidence
 
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
-        """Request a worker reading and retain ownership until the exact reading arrives."""
+        """Keep the attempt until the worker confirms settlement."""
+        return self.dispatch_settled_at(probe) is None
+
+    def dispatch_settled_at(self, probe: DispatchEvidenceProbe) -> float | None:
+        """Request a reading and return the time of exact settlement."""
         assignment = probe.saved.assignment
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         with self.lock:
@@ -1303,10 +1299,20 @@ class HostEvidenceWorker:
                 _ = self.dispatch_observations.pop(attempt, None)
                 self.due[probe.key] = float('-inf')
                 self.requested.set()
-            observed = self.dispatch_observations.get(attempt)
-            return (observed is None or observed.saved != probe.saved
-                    or time.monotonic() - observed.observed_at > self.interval
-                    or not isinstance(observed.result, placement.DispatchPathSettled))
+            return self._settlement_time(probe.saved, attempt)
+
+    def observed_settlement_time(self, saved: records.SavedPlacementAssignment, attempt: str) -> float | None:
+        with self.lock:
+            return self._settlement_time(saved, attempt)
+
+    def _settlement_time(self, saved: records.SavedPlacementAssignment, attempt: str) -> float | None:
+        observed = self.dispatch_observations.get(attempt)
+        if (observed is not None and observed.saved == saved
+                and isinstance(observed.result, placement.DispatchPathSettled)
+                and (is_mac_linux_guest(saved.assignment.destination)
+                     or time.monotonic() - observed.observed_monotonic <= self.interval)):
+            return observed.observed_at
+        return None
 
     def recovered_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
         """Read the settled report for the same saved assignment."""
@@ -1393,13 +1399,15 @@ class HostEvidenceWorker:
                 result = probe.read()
             except Exception:
                 result = placement.DispatchPathPending('The dispatch evidence is unavailable')
-            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, result, time.monotonic())))
+            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, result, self.clock.now(), time.monotonic())))
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
             self.observations[key] = evidence
             for attempt, probe, observed in dispatches_read:
-                if self.dispatch_probes.get(attempt) is probe:
+                if (self.dispatch_probes.get(attempt) is probe
+                        and (not is_mac_linux_guest(probe.saved.assignment.destination)
+                             or self._settlement_time(probe.saved, attempt) is None)):
                     self.dispatch_observations[attempt] = observed
             self.due[key] = time.monotonic() + self.interval
             if self.stopped.is_set():
@@ -1641,16 +1649,21 @@ def _placement_history_applies(saved: records.SavedPlacementAssignment, request:
                  or assignment.owner == request.owner and assignment.since == request.since))
 
 
-def _guest_wait_limit() -> int | None:
+@dataclass(frozen=True)
+class GuestWaitLimitUnavailable:
+    """The configuration has no usable Mac Linux wait limit."""
+
+
+def _guest_wait_limit() -> int | GuestWaitLimitUnavailable:
     try:
         with conf.report_key_changes():
             return target_config.unreachable_wait_seconds(_provider_configuration().read("build_targets"))
     except (OSError, conf.Unusable):
-        return None
+        return GuestWaitLimitUnavailable()
 
 
-def _guest_wait_timeout(attempt: str, limit: int | None) -> str:
-    if limit is None:
+def _guest_wait_timeout(attempt: str, limit: int | GuestWaitLimitUnavailable) -> str:
+    if isinstance(limit, GuestWaitLimitUnavailable):
         return f"The Mac Linux wait limit is unavailable for attempt {attempt}."
     return f"Mac Linux did not confirm the end of attempt {attempt} within {limit} seconds."
 
@@ -1897,7 +1910,6 @@ class AdmissionServer:
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
-        self.guest_settlement_waits: dict[str, GuestSettlementWait] = {}
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
@@ -2046,8 +2058,6 @@ class AdmissionServer:
             self.placement_requests = {
                 key: replace(request, identity=self._named_identity(self._placement_identity(request), members=members))
                 for key, request in state.placement_requests.items()}
-            self.guest_settlement_waits = {episode: wait for episode, wait in state.guest_settlement_waits.items()
-                                           if episode in self.placement_requests}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
             self.pending_cloud_groups = state.pending_cloud_groups
@@ -2163,8 +2173,7 @@ class AdmissionServer:
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
-            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots,
-            guest_settlement_waits=self.guest_settlement_waits)
+            queue_pins=self.queue_pins, verify_run_slots=self.verify_run_slots)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -4269,7 +4278,6 @@ done
             if (request := self.placement_requests.get(episode)) is not None:
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
-            _ = self.guest_settlement_waits.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -4427,9 +4435,6 @@ done
                                                self.clock.now())
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
-        from scripts.mac_test import claim_state
-
-        provider = saved.provider
         from scripts.aws_target import hana_placement
         destination = saved.assignment.destination
         if destination.provider == "scaler":
@@ -4484,14 +4489,20 @@ done
                     return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read_dispatch))
             except (OSError, ValueError):
                 return True
+        return self._pending_start_path_exists(saved, guest_state_path=marked_guest)
+
+    def _pending_start_path_exists(self, saved: records.SavedPlacementAssignment, *, guest_state_path: bool) -> bool:
+        from scripts.mac_test import claim_state
+
+        provider = saved.provider
         if not isinstance(provider, placement.ProviderClaimReference):
             return False
+        target = saved.assignment.destination.target
         identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
         with conf.report_key_changes():
             try:
-                paths = (claim_state.StatePaths(target_config.ssh_target_state_directory(destination.target),
-                                              destination.target, platform="linux") if marked_guest
-                         else claim_state.state_paths(destination.target))
+                paths = (claim_state.StatePaths(target_config.ssh_target_state_directory(target), target, platform="linux")
+                         if guest_state_path else claim_state.state_paths(target))
                 return claim_state.pending_start_exists(paths, identity)
             except (OSError, conf.Unusable):
                 return True
@@ -4521,31 +4532,41 @@ done
         state = self._assignment_state(saved) if check_lifetime else saved.state
         return wire.DispatchStatus(saved.assignment, state, saved.permission, reason, saved.retry)
 
-    def _save_guest_settlement_wait(self, request: wire.PlacementRequest) -> bool:
-        if request.episode in self.guest_settlement_waits:
-            return False
-        attempt = next((saved.assignment.attempt for saved in self.assignments.values()
-            if saved.assignment.episode == request.episode and _holds_consumed_guest_slot(saved)
-            and (saved.assignment.owner != request.owner or saved.assignment.since != request.since)), None)
-        if attempt is None:
-            return False
-        limit = _guest_wait_limit()
-        deadline = request.since + limit if limit is not None else self.clock.now()
-        self.guest_settlement_waits[request.episode] = GuestSettlementWait(attempt, deadline, limit)
-        return True
-
-    def _expired_guest_settlement_wait(self, request: wire.PlacementRequest) -> GuestSettlementWait | None:
-        wait = self.guest_settlement_waits.get(request.episode)
-        if wait is None or self.clock.now() < wait.deadline:
-            return None
+    def _reused_guest_timeout(self, request: wire.PlacementRequest) -> str | None:
         submitted = self.placement_requests.get(request.episode)
-        if submitted is not None and submitted.owner == request.owner and submitted.since == request.since:
-            return wait
+        if submitted is None or submitted.owner != request.owner or submitted.since != request.since:
+            return None
+        assigned = self.assignments.get(self.current_assignments.get(request.episode, ""))
+        if assigned is not None and assigned.assignment.owner == request.owner and assigned.assignment.since == request.since:
+            return None
+        blocking = [(key, saved) for key, saved in self.assignments.items()
+                    if saved.assignment.episode == request.episode
+                    and (saved.assignment.owner != request.owner or saved.assignment.since != request.since)
+                    and is_mac_linux_guest(saved.assignment.destination)
+                    and isinstance(saved.permission, placement.PermissionConsumed)]
+        if not blocking:
+            return None
+        limit = _guest_wait_limit()
+        deadline = submitted.since + limit if isinstance(limit, int) else submitted.since
+        for key, saved in blocking:
+            report = saved.terminal_report
+            if isinstance(saved.state, placement.CurrentAssignment):
+                evidence_key = self.settlement_host_keys.get(key)
+                reader = None if evidence_key is None else self.host_readers.get(evidence_key)
+                settled_at = None if reader is None else reader.worker.observed_settlement_time(saved, key)
+                until = self.clock.now() if settled_at is None else settled_at
+            elif (isinstance(report, placement.TerminalAttemptReport)
+                  and isinstance(report.path, placement.DispatchPathSettled) and report.received_at >= request.since):
+                until = report.received_at
+            else:
+                continue
+            if until >= deadline:
+                return _guest_wait_timeout(saved.assignment.attempt, limit)
         return None
 
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
         if (not self._placement_owner_live(request.owner) or request.episode in self.current_assignments
-                or self._expired_guest_settlement_wait(request) is not None):
+                or self._reused_guest_timeout(request) is not None):
             return False
         return not any(saved.assignment.episode == request.episode
             and (_holds_consumed_guest_slot(saved) or _holds_scaler_slot(saved)
@@ -4819,8 +4840,7 @@ done
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
-        if (wait := self._expired_guest_settlement_wait(request)) is not None:
-            reason = _guest_wait_timeout(wait.attempt, wait.limit)
+        if (reason := self._reused_guest_timeout(request)) is not None:
             return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                 placement.ClosedAssignment(reason), placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
         diagnostics = tuple(evidence.provider_diagnostic
@@ -5317,14 +5337,6 @@ done
                     self._end_placement_rank(request)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
-        wait = self.guest_settlement_waits.get(assignment.episode)
-        if wait is not None and wait.attempt == assignment.attempt:
-            remaining = next((other.assignment.attempt for other in self.assignments.values()
-                if other.assignment.episode == assignment.episode and _holds_consumed_guest_slot(other)), None)
-            if remaining is not None:
-                self.guest_settlement_waits[assignment.episode] = replace(wait, attempt=remaining)
-            elif self.clock.now() < wait.deadline:
-                del self.guest_settlement_waits[assignment.episode]
         self.manual_guest_settlement.discard(key)
         _ = self.settlement_host_keys.pop(key, None)
         destination = assignment.destination
@@ -5477,7 +5489,8 @@ done
             return scaler_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
                 holds_slot=lambda: not self.closed and self.current_assignments.get(episode) == attempt_key)
 
-        if self._dispatch_settlement_pending(saved, read_dispatch):
+        probe = self._dispatch_settlement_probe(saved, read_dispatch)
+        if probe is None or probe[0].dispatch_pending(probe[1]):
             return
         if isinstance(report, placement.TerminalAttemptReport):
             terminal = replace(report, path=placement.DispatchPathSettled())
@@ -5508,33 +5521,41 @@ done
                 holds_slot=holds_slot,
                 legacy_holder_ended=legacy_holder_ended)
 
-        pending = self._dispatch_settlement_pending(saved, read_dispatch) or self._start_pending(saved)
-        expired = self._expire_guest_replacement(saved)
-        if pending:
-            self.assignments[attempt_key] = expired
+        probe = self._dispatch_settlement_probe(saved, read_dispatch)
+        settled_at = None if probe is None else probe[0].dispatch_settled_at(probe[1])
+        if settled_at is None or self._pending_start_path_exists(saved, guest_state_path=True):
+            self.assignments[attempt_key] = self._expire_guest_replacement(saved)
             return
+        expired = self._expire_guest_replacement(saved, checked_at=settled_at)
         report = expired.terminal_report
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
-        self._close_for_report(replace(expired, terminal_report=terminal), terminal, persist_change=False)
+        # Keep the proof time for a reused submission after the worker forgets the attempt.
+        submitted = self.placement_requests.get(episode)
+        saved_terminal = (replace(terminal, received_at=settled_at) if submitted is not None
+                          and (assignment.owner != submitted.owner or assignment.since != submitted.since) else terminal)
+        self._close_for_report(replace(expired, terminal_report=saved_terminal), terminal, persist_change=False)
 
-    def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment) -> records.SavedPlacementAssignment:
+    def _expire_guest_replacement(self, saved: records.SavedPlacementAssignment, *,
+                                  checked_at: float | None = None) -> records.SavedPlacementAssignment:
         report = saved.terminal_report
         if (not isinstance(report, placement.TerminalAttemptReport)
                 or not isinstance(report.outcome, placement.AttemptDeclined | placement.PrelaunchRefused)):
             return saved
         limit = _guest_wait_limit()
-        if limit is not None and self.clock.now() < report.received_at + limit:
+        now = self.clock.now() if checked_at is None else checked_at
+        if isinstance(limit, int) and now < report.received_at + limit:
             return saved
         reason = _guest_wait_timeout(saved.assignment.attempt, limit)
         return replace(saved, terminal_report=replace(report, outcome=placement.AttemptCancelled(reason)),
                        retry=placement.DoNotRetry(reason))
 
-    def _dispatch_settlement_pending(self, saved: records.SavedPlacementAssignment,
-                                     read: Callable[[], placement.DispatchPathState]) -> bool:
+    def _dispatch_settlement_probe(self, saved: records.SavedPlacementAssignment,
+                                   read: Callable[[], placement.DispatchPathState],
+                                   ) -> tuple[HostEvidenceWorker, DispatchEvidenceProbe] | None:
         """Retain the attempt's probe until closure, even if its host evidence key changes."""
         if not isinstance(self.last_usable_configuration, records.MemoryConfig):
-            return True
+            return None
         assignment = saved.assignment
         attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         key = self.settlement_host_keys.get(attempt)
@@ -5548,7 +5569,7 @@ done
                 key = placement.HostEvidenceKey(assignment.destination, assignment.session, (), "")
             self.settlement_host_keys[attempt] = key
         reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-        return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read))
+        return reader.worker, DispatchEvidenceProbe(key, saved, read)
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport, *,
                           persist_change: bool = True) -> None:
@@ -5616,7 +5637,6 @@ done
                 elif saved is None:
                     self._end_placement_rank(submitted)
                     _ = self.placement_requests.pop(request.episode, None)
-                    _ = self.guest_settlement_waits.pop(request.episode, None)
                     self._remove_waiter(self.waiters.get(request.episode),
                                         claim_disposition=WaiterClaimDisposition.RETURN)
                 self._prune_host_evidence()
@@ -5652,8 +5672,7 @@ done
                     return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
                 request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
             self._recover_abandoned_attempt(request)
-            wait_saved = self._save_guest_settlement_wait(request)
-            if (isinstance(connection, Connection) and previous == request and not wait_saved
+            if (isinstance(connection, Connection) and previous == request
                     and not isinstance(self.system_reader, NoSystemReader)
                     and self.system_reader.latest.started_monotonic <= self.last_pass_started
                     and isinstance(self.pending_configuration, NoPass) and not self.pass_stale

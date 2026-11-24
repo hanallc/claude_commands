@@ -2295,6 +2295,29 @@ class PlacementTests(unittest.TestCase):
             assert isinstance(report, placement.TerminalAttemptReport)
             self.assertIsInstance(report.path, placement.DispatchPathPending)
 
+            claim = granted.claim
+            paths = claim_state.StatePaths(mac_linux_end_proof_journal().parent,
+                                           "mac-linux", platform="linux")
+            pending = claim_state.pending_start_path(paths,
+                claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt))
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            pending.touch()
+            _ = fixture.run_pass()
+            evidence_key = fixture.server.settlement_host_keys[key]
+            worker = fixture.server.host_readers[evidence_key].worker
+            assert isinstance(worker, ManualEvidenceWorker)
+            self.assertEqual(worker.probe_next(), evidence_key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+
+            write_guest_no_start_proof(fixture, claim)
+            self.assertEqual(worker.probe_next(), evidence_key)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+            pending.unlink()
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment(MAC_LINUX_NO_ANSWER))
+
     def test_guest_execution_outlives_holder_and_arbitrary_refusal_keeps_assignment(self) -> None:
         with PlacementFixture(private_child_starts=True) as fixture:
             request = mac_linux_and_natedev_request(fixture)
@@ -2717,12 +2740,13 @@ class PlacementTests(unittest.TestCase):
                 self.assertEqual(wait.since, new_request.since)
                 self.assertEqual(fixture.server.assignments[attempt].state, placement.CurrentAssignment())
 
-                if proof_late:
-                    fixture.clock.advance(memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS)
+                limit = memory_test_support.UNREACHABLE_WAIT_FIXTURE_SECONDS
+                fixture.clock.advance(limit if proof_late else limit - 1)
                 write_guest_no_start_proof(fixture, claim)
                 worker = fixture.server.host_readers[key].worker
                 assert isinstance(worker, ManualEvidenceWorker)
                 self.assertEqual(worker.probe_next(), key)
+                fixture.clock.advance(1)
                 _ = fixture.run_pass()
                 _ = publish_candidate(fixture, new_request)
                 self.assertEqual(fixture.server.assignments[attempt].state, placement.ClosedAssignment("cancelled"))
@@ -2731,6 +2755,8 @@ class PlacementTests(unittest.TestCase):
                     assert isinstance(reply, wire.DispatchStatus), reply
                     self.assertEqual(reply.retry, placement.DoNotRetry(reply.reason))
                     self.assertNotIn(new_request.episode, fixture.server.current_assignments)
+                    fixture.restart()
+                    self.assertEqual(fixture.server.handle_request(new_request), [reply])
                 else:
                     replacement = assignment_for(fixture, new_request)
                     self.assertEqual(replacement.owner, new_request.owner)
@@ -2747,7 +2773,9 @@ class PlacementTests(unittest.TestCase):
             fixture.clock.advance(5)
             self.assertIsInstance(fixture.server.handle_request(new_request)[0], wire.PlacementWait)
             state = service.read_state(fixture.state_dir)
-            self.assertEqual(state.guest_settlement_waits[guest.episode].deadline, new_request.since + limit)
+            snapshot = cast(dict[str, object], json.loads((fixture.state_dir / "state.json").read_text()))
+            self.assertNotIn("guest_settlement_waits", snapshot)
+            self.assertEqual(state.placement_requests[guest.episode].since, new_request.since)
             fixture.restart()
             fixture.clock.advance(limit - 6)
             self.assertIsInstance(fixture.server.handle_request(new_request)[0], wire.PlacementWait)
