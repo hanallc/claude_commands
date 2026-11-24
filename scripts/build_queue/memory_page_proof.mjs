@@ -629,6 +629,7 @@ try {
           // A fourth argument names a published page to shoot as the before view.
           // The good reading gives a live-like cap; the verify reading gives the rows and the staff names.
           const shootBefore = queueRowsProof && beforePage;
+          const guestTipShot = join(folder, 'guesttip-dark-3.png');
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
@@ -637,10 +638,9 @@ try {
           Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
-          const attempt = '82ba556d347749b08184ad3ab38ea22a_02242bdfe8464b389b20e16396f06c29';
           const guest = {...unverified, key:'shot-guest', pid:rust.pid + 1, name:'queue: gate', unit:'queue', caller:'impl3',
-            changes:'no branch',
-            machine:'mac-linux', guest_run:{target:'mac-linux',attempt},
+            changes:'report/keep-all-long-tooltip-values-inside-the-builds-page-at-desktop-and-narrow-widths',
+            machine:'mac-linux', guest_run:{target:'mac-linux',attempt:'82ba556d347749b08184ad3ab38ea22a'},
             targets:['natedev','mac-linux','hana-aws'], runs_on:'natedev or mac-linux or hana-aws', title:{unit:'queue',step:'gate'}};
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
@@ -650,6 +650,14 @@ try {
           reading.walk = [rust, guest, mac, ci];
           reading.waiters = [waiting];
           reading.queued_priority_units = [];
+          if (guestTipProof) {
+            reading.move_revision = 'fixture';
+            rust.started_at = reading.read_at - 6 * 60;
+            guest.started_at = reading.read_at - 4 * 60;
+            reading.walk[2] = {...mac, started_at:reading.read_at - 3 * 60, read_at:reading.read_at};
+            waiting.since = reading.read_at - 90;
+            await call('Emulation.setTimezoneOverride', {timezoneId:'America/Los_Angeles'});
+          }
           servedReading = reading;
           const machineGraphics = {
             'natedev':['🐧', null],
@@ -700,6 +708,7 @@ try {
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
                 waitingNameCut:waitingName.scrollWidth > waitingName.clientWidth,
+                waitingHeading:walk.querySelector('.walk-chart .queue-title').firstElementChild.textContent,
                 headingCut:(() => {
                   const label = walk.querySelector('.walk-chart .queue-title').firstElementChild;
                   return label.scrollWidth > label.clientWidth;
@@ -737,6 +746,7 @@ try {
               assert.equal(rows.machineColors.find(([name]) => name === 'mac-linux')[1], macColor,
                 'The mac-linux icon has no mac color.');
               if (width === 1440) assert.equal(rows.headingCut, false, 'The queued heading is cut.');
+              if (guestTipProof) assert.equal(rows.waitingHeading, 'Waiting, in queue order');
               if (width >= 900) {
                 const pointer = await evaluate(`(() => {
                   const icon = document.querySelector('tr[data-tip="row:shot-guest"] .machine-icon');
@@ -757,25 +767,27 @@ try {
                       rect.left < Math.max(box.left, bounds.left) - 1 || rect.right > Math.min(box.right, bounds.right) + 1
                       || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1);
                   }).map(cell => cell.textContent);
-                  const fields = Object.fromEntries([...tooltip.querySelectorAll('dt')]
-                    .map(cell => [cell.textContent, cell.nextElementSibling.textContent]));
+                  const labels = [...tooltip.querySelectorAll('dt')];
+                  const fields = Object.fromEntries(labels.map(cell => [cell.textContent, cell.nextElementSibling.textContent]));
+                  range.selectNodeContents(labels.find(cell => cell.textContent === 'Changes').nextElementSibling);
+                  const changesLines = range.getClientRects().length;
                   const card = document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   const left = Math.min(card.left, box.left), top = Math.min(card.top, box.top);
                   const right = Math.max(card.right, box.right), bottom = Math.max(card.bottom, box.bottom);
-                  return {fields, clipped,
+                  return {fields, clipped, changesLines,
                     visible:box.left >= 0 && box.right <= viewport.clientWidth
                       && box.top >= 0 && box.bottom <= viewport.clientHeight,
                     clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
                 })()`);
-                assert.equal(hover.fields['Guest attempt'], attempt);
                 assert.equal(hover.fields.Changes, guest.changes);
+                assert.ok(hover.changesLines > 1, `Changes does not wrap at ${width} px.`);
                 assert.equal(hover.fields.Showrunner, guest.showrunner);
                 assert.equal(hover.fields['Runs on'], guest.machine);
                 assert.ok(hover.visible, `The guest row tooltip is outside the viewport at ${width} px.`);
                 assert.deepEqual(hover.clipped, [], `The guest row tooltip clips text at ${width} px.`);
                 if (guestTipProof && width === 1440) {
                   const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:hover.clip});
-                  await writeFile(join(folder, 'guesttip-dark-1.png'), Buffer.from(shot.data,'base64'));
+                  await writeFile(guestTipShot, Buffer.from(shot.data,'base64'));
                 }
                 await evaluate('hideTip()');
               }
@@ -787,7 +799,7 @@ try {
             }
           }
           if (guestTipProof) {
-            console.log(JSON.stringify({pass:true,shot:join(folder, 'guesttip-dark-1.png')}));
+            console.log(JSON.stringify({pass:true,shot:guestTipShot}));
             break browserProof;
           }
           // nate, 2026-11-23: a white bar showed at the right edge of the Running/Queued card. The other checks hide
