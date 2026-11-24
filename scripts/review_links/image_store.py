@@ -7,7 +7,6 @@ import os
 import re
 import secrets
 import shutil
-import subprocess
 import tempfile
 from datetime import UTC, datetime
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 from scripts.lib import atomic_file, file_lock
+from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing
 from scripts.review_links import question_record
 
@@ -235,12 +235,12 @@ def register_output(output: Path) -> str:
             "--force-device-scale-factor=1",
             "--no-default-browser-check", "--no-first-run", f"--user-data-dir={folder / 'profile'}",
         ]
-        measured = subprocess.run([*chrome, f"--window-size={width},600", "--dump-dom", page.as_uri()],
-            capture_output=True, text=True, check=True, timeout=30)
+        measured = run_process_group([*chrome, f"--window-size={width},600", "--dump-dom", page.as_uri()], timeout=30)
+        measured.check_returncode()
         size = re.search(r"<title>output-size:(\d+)</title>", measured.stdout)
         if size is None:
             raise ValueError("Chrome did not report the output page size")
         window_height = min(4096, max(MIN_OUTPUT_IMAGE_HEIGHT, int(size[1])))
-        _ = subprocess.run([*chrome, f"--window-size={width},{window_height}", f"--screenshot={shot}", page.as_uri()],
-            capture_output=True, text=True, check=True, timeout=30)
+        run_process_group([*chrome, f"--window-size={width},{window_height}", f"--screenshot={shot}", page.as_uri()],
+                          timeout=30).check_returncode()
         return register_change(shot)

@@ -45,7 +45,8 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
         new_question = question is None
         if question is None:
             number = max((int(question.question_id[1:]) for question in questions), default=0) + 1
-            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words)
+            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words,
+                                                recipient=target.initial_recipient)
         saved = target.saved(question)
         page = saved.page()
         path = status.path(page, saved.source.row)
@@ -67,8 +68,11 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
         if not new_question and view.state is QuestionSendState.UNKNOWN:
             return change_page.question_envelope(page, record)
         if isinstance(previous, QuestionAttempt):
+            same_list_slot = (target.initial_recipient is not question_record.DefaultQuestionRecipient.PAGE
+                              and saved.source.matches_attempt(replace(previous.source, words=words)))
             unsaved_draft = (new_question and previous.state is QuestionSendState.PREPARED
-                             and not previous.earlier_unconfirmed and previous.message_id == prepared.message_id)
+                             and not previous.earlier_unconfirmed
+                             and (previous.message_id == prepared.message_id or same_list_slot))
             if new_question and not unsaved_draft and not saved.matches(previous):
                 raise question_record.AnswerRefused("The question does not match its delivery record.")
             if unsaved_draft or view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN):
@@ -101,7 +105,7 @@ def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answ
         store.set_answer(item, question_id, response)
     except question_record.AnswerRefused as error:
         return AnswerRefused(str(error))
-    return Answered(question_record.Question(question.question_id, question.asked_at, question.words, response))
+    return Answered(replace(question, answer=response))
 
 
 def question_text_html(question_id: str, words: str, *, heading_suffix: str = "", asked_time_html: str = "") -> str:

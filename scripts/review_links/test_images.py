@@ -11,6 +11,7 @@ import threading
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
@@ -119,10 +121,10 @@ class ImagesFixture(unittest.TestCase):
             try:
                 profile = self.temporary / f"{name}-profile"
                 profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / f"{name}.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=timeout)
+                run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                         "--window-size", "1200,900", "--screenshot", str(self.temporary / f"{name}.png"),
+                                         f"http://127.0.0.1:{server.server_port}/"],
+                                        timeout=timeout)
                 self.assertEqual(run.returncode, 0, run.stderr)
             finally:
                 release()
@@ -192,7 +194,7 @@ class ChangeImageTests(ImagesFixture):
             _ = Path(shot).write_bytes(PNG)
             return subprocess.CompletedProcess(arguments, 0, "", "")
 
-        with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+        with patch("scripts.review_links.image_store.run_process_group", side_effect=chrome) as run:
             identity = image_store.register_output(output)
         self.assertEqual(run.call_count, 2)
         self.assertTrue(image_store.change_image(self.root, identity))
@@ -215,7 +217,7 @@ class ChangeImageTests(ImagesFixture):
                     _ = Path(shot).write_bytes(PNG)
                     return subprocess.CompletedProcess(arguments, 0, "", "")
 
-                with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+                with patch("scripts.review_links.image_store.run_process_group", side_effect=chrome) as run:
                     identity = image_store.register_output(output)
                 self.assertEqual(run.call_count, 2)
                 self.assertTrue(image_store.change_image(self.root, identity))
@@ -310,7 +312,7 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
+        self.assertIn("status.textContent = undone ? error.message : 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -535,6 +537,67 @@ class ImagesTests(ImagesFixture):
             (["feedback"], ["Routine feedback."]),
         ])
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_undo_returns_the_card_and_says_edit_and_send_again(self) -> None:
+        _ = self.register()
+        owner = self.owner
+        assert owner is not None
+        name = "Shot owner " + "W" * 80
+        members = staff.StaffSnapshot((replace(owner, name=name),))
+        probe = r"""<script>
+(async () => {
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const realFetch = window.fetch.bind(window), host = window.top.document, posts = [];
+ const until = async (test, label) => {
+  const end = performance.now() + 8000;
+  while (!test()) {
+   if (performance.now() > end) throw new Error(label);
+   await new Promise(resolve => setTimeout(resolve, 20));
+  }
+ };
+ window.fetch = async (path, options = {}) => {
+  if (String(path).endsWith('/undo')) return Response.json({outcome: 'undone'});
+  if (options.method !== 'POST') return new Promise(() => {});
+  posts.push(new URLSearchParams(options.body));
+  return Response.json({hold: 'a'.repeat(24), seconds: 30}, {status: 202, headers: {'X-Send-Hold': 'held'}});
+ };
+ try {
+  const card = document.querySelector('[data-images] article'), form = card.querySelector('form');
+  const status = form.querySelector('[data-image-status]');
+  form.elements.feedback.value = 'Too dark.';
+  const view = host.defaultView;
+  check(view.innerWidth === 390 && view.matchMedia('(prefers-color-scheme: dark)').matches,
+        'The browser uses the phone width and dark theme.');
+  for (const action of ['feedback', 'approved']) {
+   form.requestSubmit(form.querySelector('button[value="' + action + '"]'));
+   await until(() => host.querySelector('[data-send-undo] button'), 'The Undo toast did not show.');
+   const toast = host.querySelector('[data-send-undo]'), text = toast.querySelector('span');
+   const button = toast.querySelector('button'), box = toast.getBoundingClientRect();
+   check(text.textContent === 'Sent to ' + __RECEIVER__ + '.' && button.textContent === 'Undo',
+         'The toast names the image owner and offers Undo.');
+   check(box.left >= 0 && box.right <= view.innerWidth && button.getBoundingClientRect().right < box.right,
+         'The phone viewport shows the toast and its button.');
+   const style = view.getComputedStyle(text);
+   check(text.clientHeight > parseFloat(style.lineHeight) && text.scrollWidth <= text.clientWidth,
+         'The full receiver name wraps inside the toast.');
+   check(view.getComputedStyle(toast).backgroundColor === 'rgb(20, 27, 40)' &&
+         style.color === 'rgb(228, 234, 244)', 'The toast uses its dark colors.');
+   button.click();
+   await until(() => status.textContent === 'Undone. Edit and send again.', 'The card did not say Undone.');
+   check(card.isConnected && form.elements.feedback.value === 'Too dark.', 'After Undo the card returns with its words.');
+  }
+  check(posts.map(post => post.get('action')).join(',') === 'feedback,approved', 'Undo sends nothing more.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await realFetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+})();
+</script>"""
+        with patch.object(staff, "snapshot", return_value=members):
+            page = images.render(self.status).decode()
+        page = page.replace("</body>", probe.replace("__RECEIVER__", json.dumps(name)) + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode(), window_size=(390, 860), dark=True), [[]])
+
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
@@ -544,7 +607,7 @@ class ImagesTests(ImagesFixture):
         token = images.request_token("token", record["id"])
         self.assertEqual(without_role_colors(card), (
             f'<article id="image-{record['id']}" data-image="{record['id']}"'
-            + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
+            + f' data-owner="{record['owner']}" data-owner-name="shot-owner" data-send-receiver="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
@@ -1199,6 +1262,64 @@ async (find, whenPageShows, check) => {
  check(!shown(status), 'The waiting line clears when the answer returns.');
 }'''
         _ = self.run_question_browser(self.question_probe(probe), waiting_link=True)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
+    def test_held_question_keeps_text_typed_during_undo(self) -> None:
+        _ = self.register('Question fixture')
+        probe = r'''
+async (find, whenPageShows, check) => {
+ const hold = 'a'.repeat(24);
+ const fetchFromPage = window.fetch.bind(window);
+ const host = window.top.document;
+ const card = () => find('Question fixture');
+ const sent = [];
+ window.fetch = async (path, options = {}) => {
+  if (path === location.pathname && options.method === 'POST') {
+   check(options.headers.get('X-Undo-Hold') === '1', 'The question requests an Undo hold.');
+   sent.push(options.body.get('feedback'));
+   return Response.json({hold, seconds: 30}, {status: 202, headers: {'X-Send-Hold': 'held'}});
+  }
+  if (String(path).endsWith('/' + hold)) {
+   return Response.json({state: 'review-question', waiting: false}, {headers: {'X-Image-Question': 'review'}});
+  }
+  return fetchFromPage(path, options);
+ };
+ const waitForUndo = () => new Promise((resolve, reject) => {
+  const observer = new MutationObserver(() => {
+   const toast = host.querySelector('[data-send-undo]');
+   if (!toast) return;
+   observer.disconnect();
+   clearTimeout(timeout);
+   resolve(toast);
+  });
+  const timeout = setTimeout(() => {
+   observer.disconnect();
+   reject(new Error('The Undo toast did not appear.'));
+  }, 5000);
+  observer.observe(host.body, {childList: true, subtree: true});
+ });
+ const original = 'Which check passed?';
+ const draft = 'Also check the phone layout.';
+ for (const edit of [true, false]) {
+  const form = card().querySelector('form');
+  const field = form.elements.feedback;
+  field.value = original;
+  const undo = waitForUndo();
+  form.requestSubmit(form.querySelector('button[value="question"]'));
+  const toast = await undo;
+  check(!field.disabled && !field.readOnly, 'The field stays editable during Undo.');
+  if (edit) field.value = draft;
+  const refreshed = whenPageShows('the refreshed image card', () => !form.isConnected);
+  toast.getAnimations()[0].finish();
+  await refreshed;
+  check(card().querySelector('form').elements.feedback.value === (edit ? draft : ''),
+        edit ? 'The draft survives the successful send and refresh.' : 'The submitted text clears.');
+ }
+ check(sent.length === 2 && sent.every(text => text === original), 'Only the submitted text is sent.');
+}'''
+        page = images.render(self.status).decode()
+        page = page.replace('</body>', f'<script>{self.question_probe(probe)}</script></body>')
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
     def test_browser_removes_the_card_and_recounts_until_the_owner_answers(self) -> None:
@@ -1891,9 +2012,12 @@ class ImagesServerTests(ImagesFixture):
             if release.wait(TEST_HANG_GUARD_SECS):
                 recover(status)
 
+        def list_recovered(_ledger: Path) -> None:
+            completed.set()
+
         with (patch.object(change_page, 'recover_pending', side_effect=recover_after_first_read),
               patch.object(change_page.change_review, 'lists_directory', return_value=self.temporary / 'empty'),
-              patch.object(list_page, 'recover_pending', side_effect=completed.set),
+              patch.object(list_page, 'recover_pending', side_effect=list_recovered),
               serve.ReviewLinksServer(('127.0.0.1', 0), self.root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
             thread.start()
