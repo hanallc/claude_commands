@@ -40,7 +40,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
-from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
+from scripts.build_queue import admission_client, admission_protocol as admission, kill_action, memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.production import change_routing, change_review, staff, tidy_wrapped
@@ -994,6 +994,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_token(route.query)
             return None
+        if route.path == kill_action.PATH:
+            self.build_kill_options(route.query)
+            return None
         if route.path == console_tune.PAGE_PATH:
             self.tune_token(route.query)
             return None
@@ -1300,6 +1303,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_post(route.query)
             return
+        if route.path == kill_action.PATH:
+            self.build_kill_post(route.query)
+            return
         refusal = self.tailscale_refusal()
         if refusal:
             if route.path == console_tune.PAGE_PATH:
@@ -1526,6 +1532,72 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def valid_request_token(self, token: object) -> bool:
         server = cast(ReviewLinksServer, self.server)
         return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, server.new_item_token)
+
+    def build_kill_options(self, query: str) -> None:
+        if query or self.command != "GET":
+            self.json_response(400, {"reason": "Open Kill from the Builds page."})
+            return
+        if not self.build_kill_allowed():
+            self.json_response(403, {"reason": "The Kill control requires the operator's Tailscale account."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            offers, results = server.kill_actions.options()
+        except (OSError, ValueError, admission.AdmissionUnavailable) as error:
+            print(f"review-links build kill: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The current runs are unavailable."})
+        else:
+            self.json_response(200, {"token": server.new_item_token, "offers": offers, "results": results})
+
+    def build_kill_allowed(self, *, required_origin: bool = False) -> bool:
+        if not self.same_origin(required=required_origin) or self.tailscale_refusal():
+            return False
+        server = cast(ReviewLinksServer, self.server)
+        return server.mode is ServerMode.LIVE and builds_operator(self.client_address)
+
+    def build_kill_post(self, query: str) -> None:
+        if not self.same_origin(required=True):
+            self.json_response(403, {"reason": "Open Kill from the Builds page."})
+            return
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if (query or self.headers.get_content_type() != "application/x-www-form-urlencoded"
+                    or self.headers.get_all("Transfer-Encoding") or len(lengths) != 1):
+                raise ValueError
+            limit = conf.read_or_repository("review_links").whole("kill_request_bytes")
+            length = int(lengths[0])
+            if not 0 < length <= limit:
+                raise ValueError
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError
+            fields = parse_qs(body.decode(), keep_blank_values=True, max_num_fields=4, errors="strict")
+            if (set(fields) != {"token", "reference", "handle", "words"}
+                    or any(len(values) != 1 for values in fields.values())):
+                raise ValueError
+            reference, handle = fields["reference"][0], fields["handle"][0]
+            if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in (reference, handle)):
+                raise ValueError
+            words = fields["words"][0]
+            if "\0" in words:
+                raise ValueError
+        except (OSError, ValueError):
+            self.json_response(400, {"reason": "The Kill request is invalid or too large."})
+            return
+        if not self.valid_request_token(fields["token"][0]) or not self.build_kill_allowed(required_origin=True):
+            self.json_response(403, {"reason": "The Kill request is not authorized. Confirm again."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            outcome = server.kill_actions.stop(reference, handle, words)
+        except (OSError, ValueError, admission.AdmissionUnavailable) as error:
+            print(f"review-links build kill: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The current run is unavailable."})
+            return
+        if isinstance(outcome, kill_action.NoStopRoute):
+            self.json_response(409, {"reason": "The run or its stop route changed."})
+        else:
+            self.json_response(200, {"result": outcome})
 
     def new_item_options(self) -> BinaryIO | None:
         """Return a New item token and current recipients."""
@@ -2406,6 +2478,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
             self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
             staff_scope=self.staff_read_scope)
         self.new_item_token: str = secrets.token_urlsafe()
+        self.kill_actions: kill_action.KillActions = kill_action.KillActions(self.store_folder)
         self.capture_slot: threading.BoundedSemaphore = threading.BoundedSemaphore()
         self.page_captures: PageCaptures = PageCaptures(self.root / PAGE_CAPTURE_FOLDER)
         self.next_attachment_retry: float = time.monotonic() + PAGE_ATTACHMENT_RETRY_SECONDS
@@ -2420,6 +2493,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         super().__init__(address, ReviewLinksHandler)
         if mode is ServerMode.LIST_FIXTURE:
             return
+        self.kill_actions.resume()
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         self.delivery_status.startup_recovery_pending.set()

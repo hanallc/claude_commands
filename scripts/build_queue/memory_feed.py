@@ -52,7 +52,7 @@ from scripts.build_queue import cloud_progress, limits_view, person_actions, pla
 from scripts.build_targets import targets
 from scripts.build_targets.mac_linux import TRANSFER_ALLOWANCE_SECONDS
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
-from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
+from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, kill_action, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
 from scripts.build_queue.snapshot_codec import owner_name, row_what
@@ -814,6 +814,7 @@ def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames) -
 
 
 class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
+    kill_ref: NotRequired[str]
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
@@ -3073,6 +3074,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      **(job_notes(job, names, step=step.step, verify=step.verify,
                                   ci=bool(ci_label))
                         if step is not None else job_notes(job, names, kind="between-steps"))})
+        if running is not None:
+            stop_candidate = kill_action.candidate(*running, machine, ci=bool(ci_label))
+            if isinstance(stop_candidate, kill_action.KillCandidate):
+                walk[-1]["kill_ref"] = stop_candidate.reference
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     guest_placements: set[str] = set()

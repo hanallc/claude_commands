@@ -2108,6 +2108,41 @@ After all violations, the call exits 2 with no Cargo call except `metadata`.
 `verify.sh example-test` exits 2 before any work.
 It prints `verify.sh: example-test is removed: examples carry no tests (user, 2026-10-04).`.
 
+### Stop a Builds run
+
+The Running table offers **Kill this run** for a verified natedev Cargo run with a detached run record.
+The confirmation shows the row, process tree, progress, and recorded caller.
+The server identifies the caller from the reservation's session ID and the current staff record.
+
+1. The feed publishes an opaque reference for each eligible reservation.
+2. The console supplies a handle for the verified process, recipient and detached stop route.
+3. The server checks the handle and reads the run record when the operator confirms.
+4. The server reports **Run already ended** if the record shows completion or is missing on that read.
+5. If the record shows an active run, the server saves the accepted request, notice and verified stop route.
+6. The server requests the stop through `detached_runs.stop_command` with the record path and reason.
+7. The server saves **Stopped** before it sends the keyed notice.
+
+The detached helper stages the reason and the pass cancellation before TERM.
+A detached run with a saved slice uses `builds-detached-<id>.slice`.
+The helper checks `cgroup.events` for `populated 0` to confirm that the slice is empty.
+After acceptance, a completion stamp, a status other than running, or a missing record permits the notice.
+At restart, the server requests the stop again if the record is active.
+If the server saved **Stopped**, it resumes only pending delivery.
+The server retains a verified handle for the result visibility interval.
+If the live row disappears, the retained handle can report an already ended run.
+A direct Cargo scope without a detached run record has no Kill action.
+Verify still has no Kill action because it creates only step scopes.
+The server retries pending actions every `kill_pending_check_seconds`.
+It retries an unclear delivery result with the saved key.
+A queued or kept message appears as **Message queued**.
+The server supplies the first line of the notice.
+The operator can add words in the confirmation.
+The row shows **Stopping**, **Stopped**, or **Stop unconfirmed**.
+**Message sent**, **Message queued**, and **Message failed** describe the delivery result.
+The console keeps the result visible for `kill_result_seconds` after the row leaves the table.
+Gate, merge, remote, CI, service, and unowned rows show the unavailable tip on the PID.
+The targeted gate cleanup reaps module leaders and has no confirmation for all descendants.
+
 ## Invariants
 
 - Every compiling step and every BRP launch passes the memory gate before it starts. Sweep, `cargo fmt` and `taplo` steps never wait on it, so the disk floor is never held by memory.
