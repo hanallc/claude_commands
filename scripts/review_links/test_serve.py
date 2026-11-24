@@ -3587,7 +3587,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(diagnostics.getvalue(), "")
 
             for retry_kind, lose_index_receipt in (("original", False), ("edited", False), ("native", False),
-                                                   ("original", True), ("record without draft field", True)):
+                                                   ("original", True), ("record without draft field", True),
+                                                   ("damaged body", True)):
                 with self.subTest(retry_kind=retry_kind, lose_index_receipt=lose_index_receipt):
                     draft = "s1-" + uuid4().hex
                     submitted = {**scheduled, "request_id": draft}
@@ -3602,24 +3603,29 @@ class ReviewLinksServerTests(unittest.TestCase):
                     if lose_index_receipt:
                         (index_folder(draft_folder) / "receipt.json").unlink()
                         _ = the_list.update(morty.id, existing, {"evidence": evidence}, source="morty")
-                    if retry_kind == "record without draft field":
-                        store = record_store.NumberedRecords(morty.id, "list", "L", "list item", the_list.ListError)
-                        header, record_body = store.read(existing)
-                        del header["new_item_draft_id"]
-                        store.write(existing, header, record_body)
                     damaged = the_list.folder(morty.id) / "L9999.md"
                     _ = damaged.write_bytes(b"\xff")
-                    try:
+                    attempts_before_retry = attempts.copy()
+                    with ExitStack() as restore:
+                        _ = restore.callback(damaged.unlink)
+                        if retry_kind in ("record without draft field", "damaged body"):
+                            store = record_store.NumberedRecords(morty.id, "list", "L", "list item", the_list.ListError)
+                            header, record_body = store.read(existing)
+                            if retry_kind == "record without draft field":
+                                del header["new_item_draft_id"]
+                                store.write(existing, header, record_body)
+                            else:
+                                _ = restore.callback(store.write, existing, header, record_body)
+                                store.write(existing, header, "Damaged List body.\n")
                         if retry_kind == "native":
                             retry_body = self.new_item_body(replace(bug, request_id=draft, page="list"))
                         else:
                             words = "Try different words." if retry_kind == "edited" else scheduled["words"]
                             retry_body = json.dumps({**submitted, "words": words}).encode()
                         retry = self.new_item_http(retry_body, finished=True)
-                    finally:
-                        damaged.unlink()
-                    if retry_kind == "record without draft field":
+                    if retry_kind in ("record without draft field", "damaged body"):
                         self.assertEqual(retry.status, 503, retry.body)
+                        self.assertEqual(attempts, attempts_before_retry)
                         self.assertEqual({item.id for item in the_list.records(morty.id)}, before | {existing})
                         self.assertEqual(the_list.load(morty.id, existing).evidence, evidence)
                         continue

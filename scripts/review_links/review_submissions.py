@@ -502,9 +502,6 @@ class ListItemDestination:
     def payload_hash(self) -> str:
         return self.claim.payload_hash
 
-    def store(self) -> record_store.NumberedRecords:
-        return record_store.NumberedRecords(self.claim.keeper, "list", "L", "list item", ValueError)
-
 
 class DraftAlreadyFiled(SubmissionConflict):
     def __init__(self, identity: str) -> None:
@@ -1158,8 +1155,10 @@ def locate_native_submission(address: SubmissionAddress, hint: RequestFile,
 
 
 def _publish_receipt(folder: Path, saved: FilingDestination) -> None:
+    from scripts.production import the_list
+
     # Sync the saved record directory before publishing the receipt.
-    record_folder = saved.path.parent if isinstance(saved, NativeSubmissionDestination) else saved.store().folder()
+    record_folder = saved.path.parent if isinstance(saved, NativeSubmissionDestination) else the_list.folder(saved.claim.keeper)
     atomic_file.sync_folder(record_folder)
     receipt = folder / "receipt.json"
     try:
@@ -1679,16 +1678,16 @@ class NoListRecordForClaim:
 
 
 def _indexed_list_record(draft_id: str, planned: ListItemDestination) -> FiledDraft | NoListRecordForClaim:
-    store = planned.store()
-    path = store.path(planned.id)
+    from scripts.production import the_list
+
+    path = the_list.folder(planned.claim.keeper) / f"{planned.id}.md"
     try:
         _ = path.stat()
     except FileNotFoundError:
         return NoListRecordForClaim()
     try:
-        header, _ = store.read(planned.id, path=path)
-        draft = read_list_draft(header)
-    except ValueError as error:
+        draft = the_list.load(planned.claim.keeper, planned.id).new_item_draft_id
+    except the_list.ListError as error:
         raise OSError(f"Cannot read the saved List draft at {path}.") from error
     if not isinstance(draft, NewItemDraft) or draft.id.value != draft_id or draft.claim != planned.claim:
         raise OSError(f"{planned.id}: the saved List draft differs from the filing claim.")
