@@ -21,12 +21,13 @@ import unittest
 from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import conf, scratch
+from scripts.lib import conf, removal_guard, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_hold import override_guard
 from scripts.build_hold.test_override_guard import installed_script
+from scripts.lint import tmp_sweep
 from scripts.mac_test import mac_queue_run, mac_test, mac_transport
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
@@ -943,17 +944,28 @@ else:
             self.assertEqual(placed[0], "place-step")
             self.assertEqual(len(list((root / mac_queue_run.RUNS).glob("*/run.json"))), 1)
             episode = placed[placed.index("--episode") + 1]
-            folder = root / "scratch" / f"mac-smoke-{episode}"
-            self.assertTrue((folder / "status").is_file(), "The status is missing from the scratch folder")
-            self.assertEqual((folder / "status").read_text(), "1\n")
+            scratch_root = Path(environment["SCRATCH_ROOT"])
+            folder = scratch_root / f"mac-smoke-{episode}"
+            status_file = folder / "status"
+            self.assertTrue(status_file.is_file(), "The status is missing from the scratch folder")
+            self.assertEqual(status_file.read_text(), "1\n")
+            proc = root / "proc"
+            proc.mkdir()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            environment["NOTIFIER_SESSIONS_DIR"] = str(sessions)
+            _ = Path(environment["STAFF_FILE"]).write_text(staff.StaffSnapshot(()).encode())
+            plan = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
             with mock.patch.dict(os.environ, environment, clear=True):
                 now = time.time()
                 self.assertIsInstance(scratch.record_lifetime(folder, now), scratch.Live)
                 self.assertTrue(scratch.is_throwaway(folder))
                 expiry = now + conf.read("scratch").whole("default_life_seconds")
-                result = scratch.remove_folder(folder, scratch.ExpiredFolderRemoval(expiry))
-                self.assertIsInstance(result, scratch.RemovedCopy)
-            self.assertFalse(folder.exists())
+                roots = tmp_sweep.Roots((), (), (), scratch=(str(scratch_root),))
+                sweep = tmp_sweep.sweep(False, roots, expiry, str(proc), plan=plan)
+            self.assertIn(folder, plan.rows, sweep)
+            self.assertEqual(plan.rows[folder].fingerprint, "")
+            self.assertEqual(status_file.read_text(), "1\n")
 
     def test_smoke_disconnect_after_ready_does_not_publish_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
