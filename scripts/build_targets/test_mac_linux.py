@@ -1438,7 +1438,9 @@ fi
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
         with patch.object(admission_client, 'consume_permission',
                           side_effect=wire.AdmissionUnavailable('fixture lost authorization reply')) as consume:
-            self.assertIn('fixture lost authorization reply', self.blocked(self.route()))
+            self.assertEqual(self.route(),
+                mac_linux.GuestNotStarted('the launch permission is unavailable: fixture lost authorization reply',
+                                          settlement_required=True))
         consume.assert_called_once()
         request = cast(wire.ConsumePermission, consume.call_args.args[0])
         self.assertEqual(request.assignment, self.placed)
@@ -1482,6 +1484,31 @@ fi
         lost.assert_called_once()
         query.assert_called_once()
         execution.assert_not_called()
+        self.assert_guest_clean()
+
+    def test_lost_permission_without_consumption_proof_requests_settlement_without_retry(self) -> None:
+        fixture = GatePlacementFixture(self)
+        self.placed = fixture.guest
+        args = ('--tests-only', '--full', '--module-time-limit-s', '3', '--repo', str(self.repo))
+
+        def run() -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()) as errors:
+                status = gate.main(args)
+            return subprocess.CompletedProcess(args, status, '', errors.getvalue())
+
+        with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(fixture.assignment_file)}),
+              patch.object(gate, 'current_gate_placement', return_value=wire.Assignment(fixture.guest)),
+              patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+              patch.object(admission_client, 'consume_permission', side_effect=wire.AdmissionUnavailable('queue down')),
+              patch.object(mac_linux, '_guest_queue_query', side_effect=wire.AdmissionUnavailable('queue down')),
+              patch.object(admission_client, 'request_settlement') as settle):
+            result = first_step.run_gate_with_placement(run, fixture.assignment_file, fixture.request, fixture.place_again)
+        self.assertEqual(result.returncode, 80, result.stderr)
+        self.assertIn('The queue did not confirm consumption for this launch claim', result.stderr)
+        self.assertFalse(fixture.report_file.exists())
+        settle.assert_called_once_with(wire.SettlementRequest(fixture.guest))
+        fixture.report_failure.assert_not_called()
+        fixture.place_again.assert_not_called()
         self.assert_guest_clean()
 
     def test_lost_guest_permission_reply_settles_after_the_guest_fences_the_attempt(self) -> None:
@@ -1539,7 +1566,10 @@ fi
                 if scenario == 'missing-arm-ack':
                     _ = self.unconfirmed(outcome)
                 else:
-                    self.assertIn('The queue did not confirm consumption for this launch claim', self.blocked(outcome))
+                    reason = ('the queue refused the launch permission: launch permission was already consumed'
+                              if scenario == 'already-consumed'
+                              else 'the launch permission is unavailable: fixture lost consume reply')
+                    self.assertEqual(outcome, mac_linux.GuestNotStarted(reason, settlement_required=True))
                 report.assert_not_called()
                 with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
                     mac_linux.reconcile_unproven(self.placed.episode, attempt)
@@ -4049,7 +4079,7 @@ fi
         self.assertIn(str(missing), output.getvalue())
         refusal = wire.parse_request(fixture.report_file.read_bytes())
         assert isinstance(refusal, wire.ClaimFailure), refusal
-        self.assertEqual((refusal.assignment, refusal.reason), (guest, first_step.MAC_LINUX_START_UNCONFIRMED))
+        self.assertEqual((refusal.assignment, refusal.reason), (guest, placement.MAC_LINUX_START_UNCONFIRMED))
         fixture.report_failure.assert_called_once_with(refusal)
         place.assert_called_once_with(fixture.request)
         release.assert_called_once_with(gate.LocalGateAssignment(local.grant, guest.owner, sidecar), 1)

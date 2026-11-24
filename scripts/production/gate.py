@@ -113,7 +113,7 @@ from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement  # noqa: E402
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import (  # noqa: E402
     AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation, step_identity,
@@ -3530,7 +3530,10 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            reason = first_step.MAC_LINUX_START_UNCONFIRMED if outcome.retry_before_settlement else MAC_LINUX_NO_ANSWER
+            if outcome.settlement_required and not outcome.retry_before_settlement:
+                raise GateSettlementPending(f'Mac Linux guest gate blocked. {outcome.reason}. '
+                                            + 'The queue did not confirm consumption for this launch claim.')
+            reason = MAC_LINUX_START_UNCONFIRMED if outcome.retry_before_settlement else MAC_LINUX_NO_ANSWER
             failure = admission_wire.ClaimFailure(token_hex(16), assignment, reason)
             try:
                 write_gate_claim_failure(failure)
@@ -3539,8 +3542,6 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     raise
                 raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
                                             + f'Cannot save the placement refusal. {error}') from error
-            if outcome.settlement_required and not outcome.retry_before_settlement:
-                raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         first_failures = {(job.suite, job.module): job for job in outcome.executions
                           if job.kind is GateJobKind.TEST_MODULE and job.returncode

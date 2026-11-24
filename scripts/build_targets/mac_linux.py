@@ -2388,7 +2388,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         except OSError as error:
             return GuestGateBlocked(f'{reason}. Cannot release the Mac Linux launch holder: {error}')
         if dispatch is None:
-            return GuestGateBlocked(f'{reason}. The queue did not confirm consumption for this launch claim.')
+            return GuestNotStarted(reason, settlement_required=True)
         return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
 
     try:

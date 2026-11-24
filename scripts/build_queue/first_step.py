@@ -21,15 +21,13 @@ from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import KnownPlacementStatus, read_assignment
+from scripts.build_queue.placement import MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS,
     OtherCommand, VerifyCommand, command_job, command_program, gate_job_from_process, parse_command_program,
     read_step_names, verify_command,
 )
 from scripts.mac_test import claim_state
-
-
-MAC_LINUX_START_UNCONFIRMED = "mac_linux_start_unconfirmed"
 
 
 class FirstStepRefused(RuntimeError):

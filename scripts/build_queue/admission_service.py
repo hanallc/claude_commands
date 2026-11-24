@@ -61,8 +61,7 @@ from scripts.production.gate_routes import SuiteMode
 from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
-from scripts.build_queue.first_step import MAC_LINUX_START_UNCONFIRMED
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
