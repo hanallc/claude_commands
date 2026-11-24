@@ -57,6 +57,12 @@ ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
+CONNECT_ATTEMPTS = 3
+# Give the guest port forward time to accept a new connection.
+CONNECT_RETRY_SECONDS = 1
+INNER_SSH_MARKER = 'mac-linux inner SSH'
+INNER_CONNECT_ERROR = re.compile(
+    r'ssh: connect to host [^\s]+ port [0-9]+: Connection (?:reset by peer|refused)\r?\n?')
 SSH = ('ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
        '-o', f'ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}')
 # Allow time for setup, cleanup, and result transfer.
@@ -155,12 +161,15 @@ class GuestSettings:
     def transfer_timeout_seconds(self) -> int:
         return self.guest_timeout_seconds + TRANSFER_ALLOWANCE_SECONDS
 
-    def command(self, shell: str) -> tuple[str, ...]:
+    def command(self, shell: str, *, mark_inner: bool = True) -> tuple[str, ...]:
         # Each hop waits the unreachable wait for a keepalive answer, as the Mac route does. A Mac under heavy
         # load can be slow to answer a keepalive check.
         mac, guest = self.ssh_hops
         ssh = (*SSH, *eligibility.server_alive_options(self.unreachable_wait_seconds))
-        return (*ssh, mac, shlex.join((*ssh, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell)))))
+        inner = shlex.join((*ssh, '-l', self.guest_user, guest, shlex.join(('bash', '-c', shell))))
+        if mark_inner:
+            inner = f"printf '%s\\n' {shlex.quote(INNER_SSH_MARKER)} >&2; exec env LC_ALL=C {inner}"
+        return (*ssh, mac, inner)
 
 
 def read_settings(registry: conf.ConfigRead) -> GuestSettings:
@@ -441,6 +450,47 @@ def guest_ssh_environment() -> dict[str, str]:
     return environment
 
 
+def retry_guest_connect[Output: (bytes, str)](
+    run: Callable[[float], subprocess.CompletedProcess[Output]], deadline: float, *, bundle_stream: bool = False,
+) -> subprocess.CompletedProcess[Output]:
+    """Retry only an inner SSH error that proves the guest received no command or input."""
+    marker = INNER_SSH_MARKER + '\n'
+    diagnostic = ''
+    attempts = 0
+    while (remaining := deadline - monotonic()) > 0:
+        reply = run(remaining)
+        attempts += 1
+        stderr = reply.stderr.decode(errors='replace') if isinstance(reply.stderr, bytes) else reply.stderr
+        if bundle_stream:
+            # Git can write this line when SSH closes the local bundle pipe.
+            stderr = ''.join(line for line in stderr.splitlines(keepends=True) if line != 'error: pack-objects died\n')
+        diagnostic = stderr.removeprefix(marker)
+        # The Mac shell emits the marker before it starts the inner SSH.
+        # The guest emits the lock line before it reads the bundle.
+        if (stderr == diagnostic or reply.returncode != 255 or reply.stdout
+                or not INNER_CONNECT_ERROR.fullmatch(diagnostic)):
+            if isinstance(reply.stderr, bytes):
+                reply.stderr = reply.stderr.removeprefix(marker.encode())
+            else:
+                reply.stderr = reply.stderr.removeprefix(marker)
+            return reply
+        if attempts == CONNECT_ATTEMPTS or deadline - monotonic() <= CONNECT_RETRY_SECONDS:
+            break
+        sleep(CONNECT_RETRY_SECONDS)
+    if not attempts:
+        raise GuestConnectAttemptsFailed('the guest connect deadline expired before SSH')
+    suffix = 'attempt' if attempts == 1 else 'attempts'
+    raise GuestConnectAttemptsFailed(f'{diagnostic.strip()} after {attempts} connect {suffix}')
+
+
+def run_guest_ssh(command: tuple[str, ...], timeout: float, deadline: float) -> subprocess.CompletedProcess[str]:
+    return retry_guest_connect(
+        lambda remaining: subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                         errors='replace', timeout=min(timeout, remaining), check=False,
+                                         env=guest_ssh_environment()),
+        deadline)
+
+
 def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
 if ! command -v bwrap >/dev/null 2>&1; then
@@ -450,9 +500,8 @@ fi
 if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
-    reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           errors='replace', timeout=GUEST_REF_TIMEOUT_SECONDS, check=False,
-                           env=guest_ssh_environment())
+    reply = run_guest_ssh(settings.command(shell), GUEST_REF_TIMEOUT_SECONDS,
+                          monotonic() + settings.unreachable_wait_seconds)
     if reply.returncode:
         raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
     commit = reply.stdout.strip()
@@ -497,6 +546,10 @@ class ArmedGuestAttempt:
 
 class GuestTookNoRun(GuestUnavailable):
     """The guest did not arm a run, or the run stopped before a test started, so natedev can take the gate."""
+
+
+class GuestConnectAttemptsFailed(GuestTookNoRun):
+    """The inner SSH connection failed before the guest received a command."""
 
 
 @dataclass(frozen=True)
@@ -556,17 +609,22 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
     arm = shlex.join(('python3', '-I', '-S', '-c', ARM_ATTEMPT, ARM_RECORD_PREFIX, attempt,
                       str(SSH_CONNECT_TIMEOUT_SECONDS)))
     command = settings.command(guest_shell(settings) + GUEST_CHECKOUT_SETUP + f'\nexec {arm}')
-    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
-        try:
-            output, errors = process.communicate(timeout=GUEST_REF_TIMEOUT_SECONDS)
-        except BaseException:
-            stop_ssh_process(process)
-            raise
-    if process.returncode:
-        diagnostic = errors.decode(errors='replace').strip() or 'no diagnostic'
-        raise GuestUnavailable(f'guest arm exited {process.returncode}: {diagnostic}')
-    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', output)
+
+    def send(remaining: float) -> subprocess.CompletedProcess[bytes]:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, start_new_session=True, env=guest_ssh_environment()) as process:
+            try:
+                output, errors = process.communicate(timeout=min(GUEST_REF_TIMEOUT_SECONDS, remaining))
+            except BaseException:
+                stop_ssh_process(process)
+                raise
+        return subprocess.CompletedProcess(command, process.returncode, output, errors)
+
+    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
+    if response.returncode:
+        diagnostic = response.stderr.decode(errors='replace').strip() or 'no diagnostic'
+        raise GuestUnavailable(f'guest arm exited {response.returncode}: {diagnostic}')
+    reply = re.fullmatch(rb'armed ([0-9a-f]{32}) ([0-9a-f-]{36}) ([0-9]{1,20}) (/[^\n\0]*)\n', response.stdout)
     if reply is None:
         raise GuestUnavailable('the guest did not acknowledge the armed deadline')
     return ArmedGuestAttempt(attempt, reply[1].decode('ascii'), reply[2].decode('ascii'), int(reply[3]),
@@ -814,6 +872,11 @@ class GuestEndPending:
     detail: str
 
 
+@dataclass(frozen=True)
+class GuestEndConnectFailed(GuestEndPending):
+    """Cleanup SSH used all its connect attempts or reached its deadline."""
+
+
 def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
                     proof_deadline: float = math.inf) -> GuestEndProven | GuestEndPending:
     if settings.guest_user != armed.guest_user:
@@ -821,12 +884,13 @@ def prove_guest_end(settings: GuestSettings, armed: ArmedGuestAttempt, *,
         return GuestEndPending(f'The guest account changed from {armed.guest_user} to {settings.guest_user}.')
     try:
         command = settings.command(cleanup_shell(settings, armed))
-        remaining = proof_deadline - monotonic()
-        if remaining <= 0:
+        now = monotonic()
+        if now >= proof_deadline:
             return GuestEndPending('The proof deadline expired before cleanup SSH.')
-        reply = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
-                               timeout=min(GUEST_CLEANUP_TIMEOUT_SECONDS, remaining), check=False,
-                               env=guest_ssh_environment())
+        deadline = min(proof_deadline, now + settings.unreachable_wait_seconds)
+        reply = run_guest_ssh(command, GUEST_CLEANUP_TIMEOUT_SECONDS, deadline)
+    except GuestConnectAttemptsFailed as error:
+        return GuestEndConnectFailed(str(error))
     except (OSError, subprocess.TimeoutExpired) as error:
         return GuestEndPending(str(error) or type(error).__name__)
     if reply.returncode == 0 and reply.stdout.strip() == 'ended':
@@ -857,9 +921,10 @@ class GuestEndWait:
     retry: bool = False
     proven: bool = False
     first_failure: str = ''
+    connect_failure: str = ''
 
     def run(self) -> None:
-        while not self.proven:
+        while not self.proven and not self.connect_failure:
             now = monotonic()
             if self.deadline is None:
                 self.deadline = now + self.settings.unreachable_wait_seconds
@@ -872,6 +937,9 @@ class GuestEndWait:
                     return
             self.retry = True
             proof = prove_guest_end(self.settings, self.armed, proof_deadline=self.deadline)
+            if isinstance(proof, GuestEndConnectFailed):
+                self.connect_failure = proof.detail
+                return
             if monotonic() >= self.deadline:
                 return
             if isinstance(proof, GuestEndProven):
@@ -881,6 +949,8 @@ class GuestEndWait:
 
     def unreachable(self) -> GuestEndUnproven:
         guest = self.settings.ssh_hops[-1]
+        if self.connect_failure:
+            return GuestEndUnproven(f'guest cleanup for {guest}: {self.connect_failure}', self.armed)
         return GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
                                 + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
                                 self.armed)
@@ -1291,7 +1361,7 @@ def bundle_send(repo: Path, source: CheckoutSource, bundle: FullBundle | DeltaBu
 def stream_arguments(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt,
                      prefix: str, send: BundleSend, *, count: bool, link: int) -> list[str]:
     """The local command that sends the bootstrap and the bundle to the armed guest run, then holds the link."""
-    command = settings.command(run_shell(settings, source, bootstrap_bytes, armed))
+    command = settings.command(run_shell(settings, source, bootstrap_bytes, armed), mark_inner=count)
     return ['bash', '-o', 'pipefail', '-c', STREAM_SOURCE, TARGET, prefix, send.base, send.header,
             'count' if count else '', str(link), *command]
 
@@ -1318,11 +1388,15 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
+                        armed_for_stream = armed
                         with guest_link() as link:
                             arguments = stream_arguments(settings, source, len(bootstrap), armed, prefix, send,
                                                          count=True, link=link)
-                            stream = stream_guest_bundle(repo, arguments, bootstrap,
-                                                         settings.transfer_timeout_seconds, link, armed, dispatch)
+                            stream = retry_guest_connect(
+                                lambda _remaining: stream_guest_bundle(
+                                    repo, arguments, bootstrap, settings.transfer_timeout_seconds,
+                                    link, armed_for_stream, dispatch),
+                                monotonic() + settings.unreachable_wait_seconds, bundle_stream=True)
                     if end is None:
                         end = GuestEndWait(settings, armed)
                     end.run()

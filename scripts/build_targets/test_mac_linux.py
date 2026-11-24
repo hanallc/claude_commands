@@ -66,8 +66,18 @@ cleanup = 'prove_end()' in shell
 arm = 'prefix, attempt, window = sys.argv[1:]' in shell
 probe = not cleanup and not arm and 'bundle unbundle -' not in shell
 trace_path = Path(os.environ['FIXTURE_SSH_TRACE'])
+stage = 'cleanup' if cleanup else 'arm' if arm else 'probe' if probe else 'run'
 with trace_path.open('a') as trace:
-    trace.write(('cleanup' if cleanup else 'arm' if arm else 'probe' if probe else 'run') + '\\n')
+    trace.write(stage + '\\n')
+faults = os.environ.get('FIXTURE_SSH_' + stage.upper(), '').split(',')
+index = trace_path.read_text().splitlines().count(stage) - 1
+fault = faults[index] if index < len(faults) else ''
+reset = 'ssh: connect to host 127.0.0.1 port 31022: Connection reset by peer'
+if fault in ('reset', 'refused', 'denied'):
+    errors = {'reset': reset, 'refused': reset.replace('reset by peer', 'refused'),
+              'denied': 'fixture-guest: Permission denied (publickey).'}
+    print(errors[fault], file=sys.stderr)
+    sys.exit(255)
 home = Path(os.environ['FIXTURE_GUEST_HOME'])
 if os.environ['FIXTURE_GUEST_RESULT'] == 'offline':
     print('fixture SSH refused the connection', file=sys.stderr)
@@ -132,7 +142,7 @@ before_copy = scenario in ('disconnect-before-copy', 'interrupted-before-copy')
 # A guest whose SSH server has not seen the end of the link keeps its input open.
 held = before_copy or 'FIXTURE_HELD_LINK' in os.environ
 guest = subprocess.Popen(['bash', '-c', shell], stdin=guest_input,
-                         stdout=subprocess.DEVNULL if before_copy else None,
+                         stdout=subprocess.DEVNULL if before_copy or fault == 'reset-after-start' else None,
                          stderr=subprocess.PIPE if before_copy else None,
                          env=environment, start_new_session=True, pass_fds=(link,) if held else ())
 os.close(guest_input)
@@ -152,6 +162,9 @@ if before_copy:
     os._exit(255)
 status = guest.wait()
 record_bundle()
+if status == 0 and fault == 'reset-after-start':
+    print(reset, file=sys.stderr)
+    sys.exit(255)
 sys.exit(status)
 '''
 
@@ -2000,6 +2013,47 @@ fi
         self.assertEqual(result.time_limit_report, 'time limit: limit 2 s')
         self.assertEqual([job.returncode for job in result.jobs], [124, 124])
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_retries_one_inner_connect_failure_for_each_ssh_call(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_SSH_PROBE': 'reset', 'FIXTURE_SSH_ARM': 'refused',
+                                     'FIXTURE_SSH_RUN': 'reset', 'FIXTURE_SSH_CLEANUP': 'reset'}):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assertEqual(len(self.consumed), 1)
+        self.assert_guest_clean('probe', 'probe', 'arm', 'arm', 'run', 'run', 'cleanup', 'cleanup')
+
+    def test_three_inner_connect_resets_refuse_the_run_with_the_attempt_count(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset,reset'}):
+            reason = self.not_started(self.route())
+        self.assertIn('Connection reset by peer after 3 connect attempts', reason)
+        self.assertIn('Guest cleanup: ended', reason)
+        self.assert_guest_clean('probe', 'arm', 'run', 'run', 'run', 'cleanup')
+        self.assertFalse((self.guest_home / 'build').exists())
+
+    def test_inner_reset_after_the_guest_started_does_not_retry(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset-after-start'}):
+            result = self.route()
+        self.assertIsInstance(result, str)
+        self.assertIn(mac_linux.RUN_START, str(result))
+        self.assertIn('Connection reset by peer', str(result))
+        self.assert_guest_clean('probe', 'arm', 'run', 'run', 'cleanup')
+
+    def test_a_different_ssh_error_does_not_retry(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,denied'}):
+            reason = self.not_started(self.route())
+        self.assertIn('Permission denied (publickey)', reason)
+        self.assert_guest_clean('probe', 'arm', 'run', 'run', 'cleanup')
+        self.assertFalse((self.guest_home / 'build').exists())
+
+    def test_the_guest_connect_deadline_can_stop_retries_before_three_attempts(self) -> None:
+        settings = replace(mac_linux.read_settings(conf.read(self.registry)), unreachable_wait_seconds=1)
+        with (patch.dict(os.environ, {'FIXTURE_SSH_PROBE': 'reset'}),
+              patch.object(mac_linux, 'sleep') as delay,
+              self.assertRaisesRegex(mac_linux.GuestUnavailable, 'after 1 connect attempt')):
+            _ = mac_linux.read_guest_main(settings)
+        delay.assert_not_called()
+        self.assert_guest_clean('probe')
 
     def test_sandboxed_guest_returns_module_metrics(self) -> None:
         result = self.route()

@@ -55,6 +55,12 @@ A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
 The caller must submit a new run to retry a gate that failed after a test started.
 
+The probe, arm, gate stream, and cleanup retry an inner SSH connect reset or refusal.
+The Mac marks the inner SSH call. The retry requires exit 255, empty standard output, and the exact OpenSSH connect error.
+Each call allows three attempts within the unreachable wait, with one second between attempts.
+A gate stream with guest output cannot retry.
+The hand-made command stream combines output and diagnostics, so it keeps one attempt.
+
 ## Mac queue runs
 
 `mac_queue_run.py` checks the Mac block for each kind (`shot`, `install`, `probe` and `run`) before placement, before remote preparation, and before the remote command.
