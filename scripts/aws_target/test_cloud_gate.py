@@ -1911,6 +1911,70 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(self.fake.commands, [])
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
 
+    def test_reconcile_skips_a_booking_that_changes_owner_after_selection(self) -> None:
+        read = cloud_gate.read
+        for launch_form in ('recorded', 'discovered', 'absent'):
+            with self.subTest(launch_form=launch_form):
+                attempt = 'resumed-' + launch_form
+                other = 'expired-' + launch_form
+                folder = self.root / attempt
+                folder.mkdir()
+                if launch_form == 'recorded':
+                    self.record_running_gate(attempt, 'm7a.8xlarge', 'fixture-region')
+                    launch: dict[str, object] = {'instance': 'i-' + attempt}
+                else:
+                    reservation = ledger.GateReservation(attempt, int(self.now), int(self.now) + 1200,
+                                                        Decimal('.8'), Decimal('.02'))
+                    self.assertIsInstance(self.book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+                    launch = {'arguments': {'ClientToken': attempt}} if launch_form == 'discovered' else {}
+                old_owner = ledger.GateWorkerOwner(101, 'old-start', str(folder))
+                new_owner = ledger.GateWorkerOwner(102, 'new-start', str(folder))
+                self.book.gate_owner(attempt, old_owner)
+                self.record_running_gate(other, 'm7a.8xlarge', 'fixture-region')
+                cloud_gate.save(folder / 'request.json', {'attempt': attempt})
+                journal = folder / 'launch.json'
+                cloud_gate.save(journal, launch)
+                self.advance(1200)
+                self.fake = FakeGateAws()
+                termination_locks: list[bool] = []
+
+                def read_launch(path: Path) -> dict[str, object]:
+                    record = read(path)
+                    if path == journal and launch_form != 'discovered':
+                        self.book.gate_owner(attempt, new_owner)
+                    return record
+
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if f'Name=client-token,Values={attempt}' in arguments:
+                        self.book.gate_owner(attempt, new_owner)
+                    if 'terminate-instances' in arguments:
+                        with (self.state / 'cost-ledger.lock').open('a') as lock:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                termination_locks.append(True)
+                            else:
+                                termination_locks.append(False)
+                    return self.fake(arguments, **options)
+
+                def owner_identity(pid: int) -> Gone | Started:
+                    return Started(new_owner.start) if pid == new_owner.pid else Gone()
+
+                worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
+                    self.book, self.settings, folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+                with (mock.patch.object(cloud_gate, 'read', side_effect=read_launch),
+                      mock.patch.object(cloud_gate, 'process_start', side_effect=owner_identity),
+                      redirect_stderr(StringIO()) as errors):
+                    worker.reconcile()
+
+                self.assertEqual(self.fake.terminated_instances, {'i-' + other})
+                by_attempt = {row.attempt: row for row in self.book.read_snapshot().gate_reservations}
+                self.assertEqual(by_attempt[attempt].owner, new_owner)
+                self.assertTrue(ledger.gate_is_open(by_attempt[attempt]))
+                self.assertEqual(by_attempt[other].state, ledger.GateTerminated(int(self.now), 'i-' + other))
+                self.assertIn(f'Skipped gate cleanup for {attempt}: the booking owner changed', errors.getvalue())
+                self.assertEqual(termination_locks, [True])
+
     def test_reconcile_command_ends_an_expired_gate_and_launches_no_box(self) -> None:
         self.record_running_gate('expired', 'm7a.8xlarge', 'us-east-2')
         api = AwsCli('fixture', 'us-east-2', 1, execute=self.fake)
