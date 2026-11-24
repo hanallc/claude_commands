@@ -5893,9 +5893,10 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
                                  doc=staff.WrappedDoc(local_machine(), self.fixture.temporary / 'wrapped.md'))
         snapshot = review_page.build_snapshot(self.root)
         expected = [
-            (runner.id, ' style="color:#a379fd"', runner.name),
-            (self.fixture.unit.id, ' style="color:#ffaf02"', self.fixture.unit.name),
-            (self.fixture.showrunner_id, ' style="color:#a379fd"', 'page-owner'),
+            (runner.id, f' data-send-receiver="{runner.name}" style="color:#a379fd"', runner.name),
+            (self.fixture.unit.id, f' data-send-receiver="{self.fixture.unit.name}" style="color:#ffaf02"',
+             self.fixture.unit.name),
+            (self.fixture.showrunner_id, ' data-send-receiver="page-owner" style="color:#a379fd"', 'page-owner'),
         ]
         for key in (proposal, efficiency):
             with self.subTest(key=key):
