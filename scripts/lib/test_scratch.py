@@ -1667,6 +1667,52 @@ assert scratch.removal_mark(path).is_file()
                                          capture_output=True, text=True, timeout=10)
                     self.assertEqual(run.returncode, 0, run.stderr)
 
+    def test_absent_source_retry_removes_the_tree_left_by_sigkill_after_staging(self) -> None:
+        path = scratch.new("gate:interrupted-stage", "interrupted")
+        _ = (path / "payload").write_text("scratch payload")
+        expected = path.stat()
+        program = """import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+from scripts.lib import build_folders, scratch
+
+path = Path(sys.argv[1])
+rename = build_folders._rename_without_replacing
+
+def stop_after_staging(directory, source, destination):
+    rename(directory, source, destination)
+    if source == path.name:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+with patch.object(build_folders, "_rename_without_replacing", stop_after_staging):
+    scratch.remove_folder(path)
+"""
+        run = subprocess.run([sys.executable, "-c", program, str(path)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(run.returncode, -signal.SIGKILL, run.stderr)
+        self.assertFalse(path.exists())
+        [staged] = [entry for entry in path.parent.glob(".removing-*") if entry.is_dir()]
+        self.assertTrue(os.path.samestat(staged.stat(), expected))
+        self.assertEqual((staged / "payload").read_text(), "scratch payload")
+        mark = scratch.removal_mark(path)
+        record = copy_record.read_record(mark)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["removal_stage"], staged.name)
+        self.assertEqual((record.fields["copy_device"], record.fields["copy_inode"]), (expected.st_dev, expected.st_ino))
+
+        with staged.with_suffix(".lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(scratch.ScratchError, "staged source could not be removed"):
+                _ = scratch.remove_folder(path)
+            self.assertTrue(staged.is_dir())
+            self.assertTrue(mark.is_file())
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(staged.exists())
+        self.assertFalse(staged.with_suffix(".lock").exists())
+        self.assertFalse(build_folders.lease_path(staged).exists())
+        self.assertFalse(mark.exists())
+
     def test_retry_recovers_when_interrupted_deletion_removed_internal_head(self) -> None:
         for version in ("current", "legacy"):
             with self.subTest(version=version):

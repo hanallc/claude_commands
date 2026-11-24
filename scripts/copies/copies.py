@@ -2533,17 +2533,18 @@ def remove_remote_mirror(mirror: RemoteMirror) -> None:
     unregister_remote(mirror.host, mirror.path)
 
 
+def _remove_mirror_tree(tree: Path) -> None:
+    def delete(staged: build_folders.CheckedRemovalTree) -> None:
+        staged.remove(metadata_last=floor_claims.MIRROR_METADATA)
+
+    if not build_folders.remove_build_folder(tree, wait=False, delete=delete):
+        raise CopyError(f"{tree}: guarded removal refused")
+
+
 def clear_mirror_content(tree: Path) -> None:
-    """Remove the payload before the mirror metadata."""
-    for child in tree.iterdir():
-        if child.name in floor_claims.MIRROR_METADATA:
-            continue
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
-    for name in floor_claims.MIRROR_METADATA:
-        (tree / name).unlink(missing_ok=True)
+    """Remove the mirror under its lease and make an empty mirror."""
+    _remove_mirror_tree(tree)
+    tree.mkdir()
 
 
 @contextmanager
@@ -2598,11 +2599,7 @@ def mirror_remove(args: CopyArguments) -> int:
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
                             lock.unlink(missing_ok=True)
                 else:
-                    def delete(staged: build_folders.CheckedRemovalTree) -> None:
-                        staged.remove(metadata_last=floor_claims.MIRROR_METADATA)
-
-                    if not build_folders.remove_build_folder(tree, wait=False, delete=delete):
-                        raise CopyError(f"{tree}: a child lease is held")
+                    _remove_mirror_tree(tree)
             if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
                 scratch.remove_marked(tree)
             authority.unlink(missing_ok=True)

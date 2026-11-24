@@ -246,9 +246,9 @@ def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> 
                 raise ValueError(f"{output}: the build folder lock is held. Rerun when idle") from error
         if not build_folder_lock.lock_current(output, parent, descriptor):
             raise ValueError(f"{output}: the build folder lock changed. Rerun when idle")
+        build_folder_lock.mark_lock(descriptor)
         if not build_folders.allocation_parent_current(output, parent):
             raise ValueError(f"{output}: the build folder parent changed. Rerun when idle")
-        build_folder_lock.mark_lock(descriptor)
         _mkdir_output(output, parent)
         if stat.S_ISDIR(previous.lstat().st_mode):
             # A stop between the rename and the link leaves the checkout with no target.

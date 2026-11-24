@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+from collections.abc import Callable
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
 from enum import Enum
 import fcntl
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -13,10 +15,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders
+from scripts.lib import build_folder_lock, build_folders
 from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_MOUNT, PROBE_OUTSIDE
 
@@ -28,6 +31,7 @@ class ClaimCase(Enum):
     FOREIGN_OWNER = "foreign-owner"
     HELD_LOCK = "held-lock"
     STAGED_REPLACEMENT = "staged-replacement"
+    OWNER_REPLACEMENT = "owner-replacement"
 
 
 RUN_CLAIM = """
@@ -39,6 +43,26 @@ from scripts.lib.test_build_folders_bwrap import ClaimCase, run_claim
 
 run_claim(Path(sys.argv[2]), ClaimCase(sys.argv[3]))
 """
+
+
+RUN_MOVED_PARENT = """
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from scripts.lib.test_build_folders_bwrap import remove_after_parent_moves
+
+remove_after_parent_moves(Path(sys.argv[2]))
+"""
+
+
+def remove_after_parent_moves(candidate: Path) -> None:
+    """Keep the original parent open when its path changes."""
+    parent = candidate.parent
+    with build_folder_lock.folder_parent(candidate, parent, create=False) as directory:
+        _ = parent.rename(parent.with_name("moved"))
+        parent.mkdir()
+        assert not build_folders.remove_build_folder(candidate, dir_fd=directory, repair_access=True)
 
 
 def _check_missing_pid(pid: int) -> None:
@@ -80,10 +104,37 @@ def _replace_checked_tree(stack: ExitStack, candidate: Path) -> None:
     _ = stack.enter_context(mock.patch.object(build_folders.CheckedRemovalTree, "remove", replace_then_remove))
 
 
+def _claim_after_other_owner(candidate: Path) -> None:
+    """Let the first claim return to its live owner before the second locks the name."""
+    acquire = cast(Callable[..., build_folders.FolderRemovalLease], getattr(build_folders, "_hold_free_lease"))
+    command = ["tool", "--tool", candidate.name, "--parent", str(candidate.parent), "--owner-pid", str(os.getpid())]
+    claimed = False
+
+    def acquire_after_claim(path: Path, directory: int, stack: ExitStack,
+                            **options: object) -> build_folders.FolderRemovalLease:
+        nonlocal claimed
+        if path == candidate and not claimed:
+            claimed = True
+            with redirect_stdout(StringIO()) as first:
+                assert build_folders.main(command) == 0
+            assert first.getvalue().strip() == str(candidate)
+            _ = (candidate / "live").write_text(CANARY)
+        return acquire(path, directory, stack, **options)
+
+    with mock.patch.object(build_folders, "_hold_free_lease", acquire_after_claim):
+        with redirect_stdout(StringIO()) as second:
+            assert build_folders.main(command) == 0
+    assert claimed
+    print(Path(second.getvalue().strip()).name)
+
+
 def run_claim(candidate: Path, case: ClaimCase) -> None:
     """Run the real claim with the selected fixture state."""
     lease = build_folders.lease_path(candidate)
     _ = lease.write_text(json.dumps({"pid": _lease_owner(case)}))
+    if case is ClaimCase.OWNER_REPLACEMENT:
+        _claim_after_other_owner(candidate)
+        return
     with ExitStack() as fixture:
         if case is ClaimCase.UNREADABLE_LEASE:
             lease.chmod(0)
@@ -200,6 +251,26 @@ class ToolFolderRemovalTests(unittest.TestCase):
         result = self.claim(sandbox, candidate)
         self.assert_canary(keep)
         self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
+        self.assert_claim(result, "proof-2")
+
+    def test_keeps_a_bind_mount_after_the_removal_parent_moves(self) -> None:
+        with mock.patch.object(RemovalSandbox, "build", Path("/build/removal-parent")):
+            sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
+            candidate = self.candidate(sandbox)
+            sandbox.host_path(candidate / "unit").mkdir()
+            keep = sandbox.bind_source / "output"
+            self.canary(keep)
+            result = sandbox.python("-c", RUN_MOVED_PARENT, str(LINUX_CHECKOUT), str(candidate))
+        self.assert_canary(keep)
+        moved = candidate.parent.with_name("moved") / candidate.name
+        self.assert_canary(sandbox.host_path(moved / "old" / "output"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_second_claim_keeps_the_first_claim_live_owner(self) -> None:
+        sandbox = self.sandbox()
+        candidate = self.candidate(sandbox)
+        result = self.claim(sandbox, candidate, ClaimCase.OWNER_REPLACEMENT)
+        self.assert_canary(sandbox.host_path(candidate / "live"))
         self.assert_claim(result, "proof-2")
 
     def test_keeps_a_replacement_at_the_checked_staging_name(self) -> None:

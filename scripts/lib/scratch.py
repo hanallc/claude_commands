@@ -935,7 +935,14 @@ def pending_removal(path: Path, *,
                 return current
             if cargo_removal_mark(path).exists():
                 return copy_record.UnreadableRecord(f"{path}: previous copy needs Cargo recovery before path reuse")
-            finish_removal(path, source_replaced=True)
+            try:
+                finish_removal(path, source_replaced=True)
+            except ScratchError as error:
+                return copy_record.UnreadableRecord(str(error))
+        else:
+            current = copy_record.read_record(removal_mark(path))
+            if isinstance(current, copy_record.Registered) and "removal_stage" in current.fields:
+                return copy_record.UnreadableRecord(f"{path}: previous copy needs staging recovery before path reuse")
     return copy_record.NotRegistered()
 
 
@@ -1821,13 +1828,23 @@ def check_removal_work(path: Path, request: TaskRemoval | SelectedCopyRemoval | 
 
 def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: bool = False) -> None:
     """Finish Cargo recovery before discarding the task's deletion intent."""
+    if not source_replaced and os.path.lexists(path):
+        raise ScratchError(f"{path}: source still exists; removal completion refused")
+    pending = copy_record.read_record(removal_mark(path))
+    if isinstance(pending, copy_record.UnreadableRecord):
+        raise ScratchError(pending.reason)
+    if isinstance(pending, copy_record.Registered) and "removal_stage" in pending.fields:
+        name = pending.fields.get("removal_stage")
+        device = pending.fields.get("copy_device")
+        inode = pending.fields.get("copy_inode")
+        if (not isinstance(name, str) or type(device) is not int or type(inode) is not int
+                or not build_folders.recover_staged_folder(path, name, device, inode)):
+            raise ScratchError(f"{path}: the staged source could not be removed")
     if source_replaced:
         if cargo_removal_mark(path).exists():
             raise ScratchError(f"{path}: previous copy needs Cargo recovery before path reuse")
         removal_mark(path).unlink(missing_ok=True)
         return
-    if os.path.lexists(path):
-        raise ScratchError(f"{path}: source still exists; removal completion refused")
     if not cargo_cleaned:
         saved = save_cargo_outputs(path)
         clean_cargo_outputs(path, saved)
@@ -2063,11 +2080,19 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                               removal_files=sorted(removal_regular_files(root, entries)), removal_ref_files=references,
                               removal_intent_ns=time.time_ns())
                 atomic_record(removal_mark(path), fields)
+            else:
+                fields = dict(pending.fields)
             if removal_guard.identity(path.lstat()) != source:
                 return KeptFolder(path, "source identity changed before removal")
             if held is None or not isinstance(held.lease, build_folders.FreeFolderRemovalLease):
                 return KeptFolder(path, BUSY_REASON)
             registration = git.checkout.common_dir if isinstance(git, GitDirectory) and (path / ".git").is_file() else None
+
+            def record_stage(staged: build_folders.CheckedRemovalTree) -> None:
+                if not build_folder_lock.parent_current(staged.path, staged.parent):
+                    raise ScratchError(f"{path}: the source parent changed")
+                atomic_record(removal_mark(path), {**fields, "removal_stage": staged.path.name,
+                              "copy_device": staged.info.st_dev, "copy_inode": staged.info.st_ino})
 
             def delete(staged: build_folders.CheckedRemovalTree) -> None:
                 if not build_folder_lock.parent_current(staged.path, staged.parent):
@@ -2095,7 +2120,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             expected = path.lstat()
             if removal_guard.identity(expected) != source:
                 return KeptFolder(path, "source identity changed before removal")
-            if not held.lease.remove_tree(path, expected, wait=False, repair_access=True, delete=delete):
+            if not held.lease.remove_tree(path, expected, wait=False, repair_access=True,
+                                          delete=delete, before_stage=record_stage):
                 return KeptFolder(path, BUSY_REASON)
             finish_removal(path, cargo_cleaned=True)
             if lease is not None:
