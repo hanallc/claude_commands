@@ -18,7 +18,10 @@ from typing import Literal, NamedTuple, TypedDict, cast
 from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
+from scripts.lib.build_steps import (
+    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
+    command_program, parse_command_program,
+)
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
@@ -167,6 +170,31 @@ def red_names(command: Sequence[str], output: str) -> frozenset[str]:
         return failed_tests(output)
     green = frozenset(GATE_GREEN_ALONE.findall(output))
     return frozenset(match[1] for match in GATE_RED.finditer(output) if match[2] != "0") - green
+
+
+def batch_module_command(red: RedStep, checkout: Path, probe: Path) -> list[str] | None:
+    """Select the red modules without carrying options that can change the checkout or publish."""
+    command = red.step.command
+    program = parse_command_program(command, keep_path=True)
+    if (isinstance(program, OtherCommand) or Path(program[0]).name not in {"gate.py", "merge_gate.py"}
+            or not red.names or any(word not in {"--tests-only", "--affected", "--full"} for word in program[1])):
+        return None
+    for name in red.names:
+        path = Path(name)
+        if (not re.fullmatch(r"[\w./-]+\.py", name) or name.startswith(("/", "-", "."))
+                or ".." in path.parts or len(path.parts) < 2):
+            return None
+    prefix = command[:len(command) - len(program[1])]
+    script = Path(program[0])
+    if script.is_absolute() and script.is_relative_to(checkout):
+        prefix[-1] = str(probe / script.relative_to(checkout))
+    return [*prefix, "--tests-only", *(word for name in sorted(red.names) for word in ("--module", name))]
+
+
+def batch_probe_reproduced(command: Sequence[str], output: str, modules: frozenset[str]) -> bool:
+    """Require an ordinary test failure for each selected module."""
+    return (red_names(command, output) == modules
+            and all(match[2] == "1" for match in GATE_RED.finditer(output) if match[1] in modules))
 
 
 def only_tests(command: list[str], names: frozenset[str]) -> list[str]:

@@ -187,8 +187,8 @@ Preserve each completed push receipt when a later promotion step fails.
      --session-dir "$SESSION_DIR" --phase-id "$ORDER_ID" --status completed
    ```
 
-Report partial publication precisely; a successful push does not prove promotion completed.
-Send the final `send <unit>:` result under <MergeCheckpoint/> through the authorized production route.
+Report which rows landed and which row the batch dropped. Verify promotion separately.
+Read every `send <unit>:` line, including on exit 0. Send each line through the authorized production route.
 </MergeResults>
 
 ## Recovery

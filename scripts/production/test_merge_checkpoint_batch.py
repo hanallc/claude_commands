@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import gzip
+from collections.abc import Callable
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import unittest
-from typing import final
+from typing import NamedTuple, final
 from unittest.mock import patch
 
-from scripts.production import land_runs, merge_checkpoint, staff
+from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -21,6 +23,16 @@ from scripts.production.merge_checkpoint_test_support import (
 
 def setUpModule() -> None:
     configure_test_environment()
+
+
+RED_MODULE = "production/test_row_drop.py"
+
+
+class RowDropRun(NamedTuple):
+    probe: bool
+    alpha: bool
+    beta: bool
+    main: bool
 
 
 @final
@@ -972,6 +984,174 @@ raise SystemExit(1)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
         self.assertFalse(self.batch_record().exists())
         self.assertEqual(self.receipts(), [])
+
+    def prepare_row_drop(self, *, dependent: bool = False) -> tuple[str, str, str, list[str]]:
+        self.promotions = str(self.promote)
+        self.production_doc(merge_tests_line="- **Merge tests:** "
+                            + "`python3 scripts/production/gate.py --tests-only` and `checkpoint-test`")
+        self.env.update(GATE_STATE_DIR=str(self.root / "gate-state"), BUILDLOG_DIR=str(self.root / "buildlog"))
+        start = self.git("rev-parse", "HEAD")
+        alpha = self.checkpoint("src/drop-alpha.txt", "alpha fault\n")
+        if dependent:
+            _ = self.git("merge", "--ff-only", alpha, cwd=self.other)
+        beta = self.beta_checkpoint("src/keep-beta.txt", "beta change\n")
+        return start, alpha, beta, [self.batch_line("alpha", "2", alpha), self.batch_line("beta", "2", beta)]
+
+    def row_drop_gate(self, runs: list[RowDropRun], *, both_red: bool = False, survivor_red: bool = False,
+                      move_main: bool = False) -> Callable[..., subprocess.CompletedProcess[str]]:
+        run_test_command = checkpoint_gate.run_test_command
+
+        def run(command: list[str], folder: Path, **_options: bool) -> subprocess.CompletedProcess[str]:
+            if not checkpoint_gate.runs_merge_gate(command):
+                return run_test_command(command, folder)
+            probe = "--module" in command
+            if probe:
+                self.assertNotEqual(folder, self.checkout)
+                self.assertEqual(command[command.index("--module") + 1:], [RED_MODULE])
+                self.assertIn("--tests-only", command)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin),
+                                 self.git("rev-parse", "origin/production"))
+            alpha = (folder / "src/drop-alpha.txt").exists()
+            beta = (folder / "src/keep-beta.txt").exists()
+            main = (folder / "src/main-moved.txt").exists()
+            runs.append(RowDropRun(probe, alpha, beta, main))
+            red = alpha or both_red and beta or (folder / "src/base-red.txt").exists()
+            if not probe and beta and not alpha:
+                self.assertEqual(set(land_runs.running_lands().values()), {"beta 2"})
+                if move_main and not main:
+                    _ = self.push_main_change("src/main-moved.txt", "new main change\n")
+                red = red or survivor_red
+            output = f"--- {RED_MODULE} exit=1 ---\nfixture test failure\n" if red else ""
+            return subprocess.CompletedProcess(command, int(red), output, "")
+
+        return run
+
+    def test_persistent_red_drops_only_its_owner_and_full_gates_survivors(self) -> None:
+        for resumed in (False, True):
+            with self.subTest(resumed=resumed):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                start, _, beta, rows = self.prepare_row_drop()
+                if resumed:
+                    with (patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=KeyboardInterrupt),
+                          self.assertRaises(KeyboardInterrupt)):
+                        _ = self.land_batch(rows)
+                runs: list[RowDropRun] = []
+                with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+                    result = self.land_batch(rows)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                _ = self.assert_landed(start, [beta])
+                self.assertEqual(runs[0], RowDropRun(False, True, True, False))
+                self.assertEqual(runs[1], RowDropRun(True, False, False, False))
+                self.assertCountEqual(runs[2:4], [RowDropRun(True, True, False, False), RowDropRun(True, False, True, False)])
+                self.assertEqual(runs[4:], [RowDropRun(False, False, True, False)])
+                self.assertEqual(self.events("checkpoint-test"), [[]])
+
+    def test_red_base_or_two_red_rows_keeps_todays_stop(self) -> None:
+        for red_base in (True, False):
+            with self.subTest(red_base=red_base):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                start, _, _, rows = self.prepare_row_drop()
+                if red_base:
+                    _ = self.push_main_change("src/base-red.txt", "base fault\n")
+                runs: list[RowDropRun] = []
+                with patch.object(checkpoint_gate, "run_test_command",
+                                  side_effect=self.row_drop_gate(runs, both_red=not red_base)):
+                    result = self.land_batch(rows)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assert_rolled_back(start)
+                self.assertEqual(runs[1:2], [RowDropRun(True, False, False, False)])
+                self.assertEqual(len(runs), 2 if red_base else 4)
+                self.assertIn("send alpha:", result.stdout)
+                self.assertIn("send beta:", result.stdout)
+
+    def test_survivor_with_dropped_ancestor_keeps_todays_stop(self) -> None:
+        start, alpha, beta, rows = self.prepare_row_drop(dependent=True)
+        self.assertEqual(self.git("merge-base", alpha, beta), alpha)
+        runs: list[RowDropRun] = []
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assert_rolled_back(start)
+        self.assertIn("send alpha:", result.stdout)
+        self.assertIn("send beta:", result.stdout)
+        self.assertIn("ancestor", result.stdout)
+
+    def test_survivor_gate_red_prevents_publication(self) -> None:
+        start, _, _, rows = self.prepare_row_drop()
+        runs: list[RowDropRun] = []
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs, survivor_red=True)):
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assert_rolled_back(start)
+        self.assertEqual(runs[-1], RowDropRun(False, False, True, False))
+        self.assertEqual(sum(run.probe for run in runs), 3)
+        self.assertEqual(result.stdout.count("send alpha:"), 1)
+        self.assertEqual(result.stdout.count("send beta:"), 1)
+
+    def test_restart_after_drop_does_not_restore_the_dropped_row(self) -> None:
+        for after_rollback in (False, True):
+            with self.subTest(after_rollback=after_rollback):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                start, alpha, beta, rows = self.prepare_row_drop()
+                runs: list[RowDropRun] = []
+                reset_batch = merge_checkpoint.reset_batch
+
+                def interrupt(rollback: merge_checkpoint.ResetBatchCheckout, warnings: list[str]) -> None:
+                    if after_rollback:
+                        reset_batch(rollback, warnings)
+                    raise KeyboardInterrupt
+
+                with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+                    with patch.object(merge_checkpoint, "reset_batch", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+                        _ = self.land_batch(rows)
+                    saved = self.batch_record().read_text()
+                    self.assertIn(RED_MODULE, saved)
+                    self.assertIn(alpha, saved)
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+                    if after_rollback:
+                        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                    runs.clear()
+                    result = self.land_batch(rows)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(runs, [RowDropRun(False, False, True, False)])
+                _ = self.assert_landed(start, [beta])
+                with patch.dict("os.environ", self.env):
+                    self.assertEqual(land_runs.results_path().read_text().count('"state": "dropped"'), 1)
+
+    def test_dropped_row_gets_result_send_line_and_kept_log(self) -> None:
+        _, alpha, beta, rows = self.prepare_row_drop()
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])):
+            result = self.land_batch(rows)
+        with patch.dict("os.environ", self.env):
+            results = land_runs.last_results()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(results[alpha]["landed"])
+        self.assertEqual(results[alpha]["state"], "dropped")
+        self.assertIn(RED_MODULE, results[alpha]["detail"])
+        self.assertTrue(results[beta]["landed"])
+        log, = (self.root / "buildlog").rglob("*.log.gz")
+        self.assertIn("fixture test failure", gzip.decompress(log.read_bytes()).decode())
+        notice, = (line for line in result.stdout.splitlines() if line.startswith("send alpha:"))
+        self.assertIn(str(log), notice)
+        self.assertIn(str(log), results[alpha]["detail"])
+
+    def test_main_move_requires_survivor_retest(self) -> None:
+        _, _, beta, rows = self.prepare_row_drop()
+        runs: list[RowDropRun] = []
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs, move_main=True)):
+            result = self.land_batch(rows)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(runs[-2:], [RowDropRun(False, False, True, False), RowDropRun(False, False, True, True)])
+        self.assertEqual(self.events("checkpoint-test"), [[], []])
+        main = self.git("rev-parse", "HEAD^2")
+        self.assertEqual([row["source_checkpoint"] for row in self.receipts()], [beta, main])
+        self.assertEqual(self.git("show", "HEAD:src/main-moved.txt"), "new main change")
 
     def assert_red_batch(self, result: subprocess.CompletedProcess[str], alpha: str, beta: str) -> None:
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

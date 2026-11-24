@@ -949,7 +949,8 @@ A batch can contain one item.
    Resume checkpoint merges only when the arguments and commits match the record and an unpushed checkpoint belongs to the batch.
    Identify checkpoint merges by their subjects and second parents.
    If the record is missing or differs, refuse the batch and tell the requester how to start again.
-   Remove the record after the push or when the batch ends without unpushed merges.
+   Remove the record after publication or when the batch ends without unpushed merges.
+   Keep a saved drop across an interruption, including an interruption after rollback or publication.
    If record removal fails, report a warning and continue.
    Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
@@ -959,7 +960,7 @@ A batch can contain one item.
 7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
 
 A resumed item tests an unpushed merge or resumes promotion of a pushed merge.
-A stop during test preparation, a red test, or a main conflict returns every pending item in the resumed batch.
+A stop during test preparation or a main conflict returns every pending item in the resumed batch.
 A published merge with a promotion marker keeps its completed result.
 For other stops, the existing resume rules apply.
 
@@ -971,7 +972,7 @@ Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
 Each merge retains its own review ownership and completion record.
 
-A hold, failure, or cancellation ends a fresh batch and returns each row to its requester.
+A hold, unresolved failure, or cancellation returns each pending row to its requester.
 When a row holds during its checks, each later notice names the held row and says that the later row did not run.
 Before each gate run, record the tested tip and each row's selected commands in memory.
 For attribution, compare a merged row with its merge's first parent.
@@ -979,6 +980,19 @@ Compare an unmerged row with the destination tip before preparation.
 A red report names the failed test step and says whether the row selects it.
 If command selection failed for a row, report unknown changed paths and include the error.
 The batch stops at the first failed test command.
+
+If a gate names red modules, the batch runs those modules on pinned main in a private checkout.
+It probes unpublished checkpoints separately on the same base and tests the rows with the most changed module paths first.
+The probes use the gate admission path.
+The batch drops a row only if the base passes and that row alone reproduces every red module.
+The batch keeps the stop if the base, a survivor, or the starting tip contains the dropped checkpoint.
+It keeps the test log in buildlog and saves the drop decision before rollback.
+It records the dropped row's result and removes that row from the running land.
+It rebuilds survivors in order and runs every configured merge command.
+A red survivor gate stops the batch. The existing main advance policy also applies to survivors.
+Exit 0 includes a batch that publishes its survivors. Read its `send <unit>:` lines for each row's result.
+Exit 1 reports a failed batch. Exit 77 reports a tree change.
+
 The next queued item can proceed after the batch exits.
 Before publication, the shared stop attempts to restore the starting tip.
 The batch record lists each row tip.

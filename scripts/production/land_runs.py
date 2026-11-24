@@ -117,6 +117,18 @@ def running_lands() -> dict[str, str]:
     return commits
 
 
+def update_landing(commits: Sequence[str], owners: Sequence[str]) -> None:
+    """Replace the rows in the caller's active land record."""
+    path = lands_dir() / f"{os.getpid()}.json"
+    try:
+        record = cast(LandRecord, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return
+    record["commits"] = list(commits)
+    record["owners"] = list(owners)
+    write_text_atomic(path, json.dumps(record) + "\n")
+
+
 def holds(running: Collection[str], commit: str) -> bool:
     """True when a running land names this commit; a land can name a short hash."""
     return any(commit.startswith(listed) or listed.startswith(commit) for listed in running if listed and commit)
@@ -135,6 +147,19 @@ def record_result(*, commit: str, production: str, unit: str, phase: str,
             lines = path.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
             lines = []
+        if state == "dropped":
+            for line in reversed(lines):
+                try:
+                    previous = cast(object, json.loads(line))
+                except ValueError:
+                    continue
+                if not isinstance(previous, dict):
+                    continue
+                saved = cast(dict[str, object], previous)
+                if saved.get("commit") == commit and saved.get("production") == production:
+                    if saved == {**row, "time": saved.get("time")}:
+                        return
+                    break
         lines = [*lines, json.dumps(row)][-KEPT_RESULTS:]
         write_text_atomic(path, "\n".join(lines) + "\n")
 
