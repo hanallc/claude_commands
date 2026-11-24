@@ -6526,13 +6526,22 @@ def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> Ser
     raw_state = cast(dict[str, object], json.loads(text))
     check_placement_shape(raw_state)
     state = wire.parse_record(text, ServiceState)
+    saved_current_keys = {saved.assignment.episode: key for key, saved in state.assignments.items()
+                          if isinstance(saved.state, placement.CurrentAssignment)}
     for episode, key in tuple(state.current_assignments.items()):
         saved = state.assignments.get(key)
         if saved is None or saved.assignment.episode != episode:
-            del state.current_assignments[episode]
-            print(f"memory admission: removed invalid index entry for episode {episode!r} with key {key!r}",
+            repaired_key = saved_current_keys.get(episode)
+            if repaired_key is None:
+                del state.current_assignments[episode]
+                print(f"memory admission: removed invalid index entry for episode {episode!r} with key {key!r}",
+                      file=sys.stderr)
+                continue
+            state.current_assignments[episode] = repaired_key
+            print(f"memory admission: repaired index for episode {episode!r} from {key!r} to {repaired_key!r}",
                   file=sys.stderr)
-            continue
+            key = repaired_key
+            saved = state.assignments[key]
         report = saved.terminal_report
         if (is_mac_linux_guest(saved.assignment.destination) and isinstance(saved.permission, placement.PermissionAvailable)
                 and isinstance(report, placement.TerminalAttemptReport) and report.outcome == GUEST_SETTLEMENT_REQUESTED):
