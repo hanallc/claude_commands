@@ -18,6 +18,7 @@ import threading
 import unittest
 from unittest import mock
 from collections.abc import Sequence
+from scripts.copies import copies
 from scripts.mac_test import offload, mac_test, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, config_environment, write_config_fixture
@@ -28,6 +29,72 @@ from scripts.lib import process_start as process_identity
 
 
 class PendingDispatchTests(unittest.TestCase):
+    def test_a_mirror_build_child_inherits_the_start_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = Path(offload.__file__).resolve().parents[2]
+            (root / ".claude").symlink_to(checkout, target_is_directory=True)
+            environment = {**os.environ, **config_environment(root), "HOME": str(root),
+                           "XDG_CACHE_HOME": str(root / "cache")}
+            identity = claim_state.ClaimIdentity("child-claim", "child-episode", "child-attempt")
+            mirror = copies.RemoteMirror("verify", copies.SelectedRepository("hana"), "private-host",
+                                        str(root / "mirrors/hana"), "fixture-session")
+            fence = root / offload.start_fence_relative(identity, "mac").with_suffix(".lock")
+            prepared = subprocess.run(["bash", "-c", offload.prepare_start_fence_command(identity, "mac")],
+                cwd=root, env=environment, capture_output=True, text=True, check=False,
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
+            release = root / "release"
+            finished = root / "finished"
+            os.mkfifo(release)
+            os.mkfifo(finished)
+            release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, release_fd)
+            finished_fd = os.open(finished, os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, finished_fd)
+            child = '''import os, select, sys
+assert os.path.samestat(os.fstat(8), os.stat(sys.argv[1]))
+with open(sys.argv[2], 'rb') as release:
+    assert select.select([release], [], [], float(sys.argv[4]))[0]
+    assert release.read(1) == b'x'
+os.close(8)
+with open(sys.argv[3], 'wb') as finished:
+    finished.write(b'x')
+'''
+            build = '''import os, subprocess, sys
+assert os.path.samestat(os.fstat(8), os.stat(sys.argv[2]))
+fds = tuple(map(int, os.environ["COPIES_MIRROR_LEASE_FDS"].split(",")))
+with open(sys.argv[4] + '.errors', 'wb') as errors:
+    subprocess.Popen([sys.executable, "-c", *sys.argv[1:]], pass_fds=fds, start_new_session=True,
+                     cwd=os.path.dirname(sys.argv[3]), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=errors)
+'''
+            command = shlex.join([str(root / ".claude/scripts/lib/py"), "-m", "scripts.mac_test.nextest_log",
+                "run", "4096", "4096", sys.executable, "-c", build, child, str(fence), str(release), str(finished),
+                str(test_hang_guard.TEST_HANG_GUARD_SECS)])
+            invocation = "cd " + shlex.quote(mirror.path) + " && " + command
+            launch = offload.fenced_start_command(identity, "mac", copies.remote_use_command(mirror, invocation))
+            key = offload.pending_start_key(identity)
+            try:
+                completed = subprocess.run(["bash", "-c", launch], cwd=root, env=environment,
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                child_errors = finished.with_suffix(".errors").read_text()
+                self.assertEqual(completed.stdout, f"mac_exit=0\ndispatch_start_pending={key}\n", child_errors)
+                self.assertTrue(fence.exists())
+            finally:
+                _ = os.write(release_fd, b"x")
+
+            self.assertTrue(select.select([finished_fd], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)[0])
+            self.assertEqual(os.read(finished_fd, 1), b"x")
+            settle = offload.start_fence_command(identity, "mac", settle=True)
+            settled = subprocess.run(["bash", "-c", settle], cwd=root, env=environment,
+                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            self.assertEqual(settled.returncode, 0, settled.stderr)
+            self.assertEqual(settled.stdout, f"dispatch_start_settled={key}\n")
+            self.assertFalse(fence.exists())
+
     def test_a_pending_claim_or_start_cannot_release_capacity_before_its_child_settles(self) -> None:
         for operation in ("claim", "start-acknowledged", "start-uncertain"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:

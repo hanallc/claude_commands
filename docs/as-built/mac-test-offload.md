@@ -464,6 +464,8 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   A signal during the claim lets that call answer before cleanup.
   A missing `mac_exit=<n>` becomes `LostMacRun`, unless `mirror-use` reports a busy refusal.
   A busy refusal becomes `BusyMacDecline` and writes the repository's mirror refusal time.
+  `mirror-use` forwards the start fence descriptor with its mirror lease descriptors.
+  A build child can keep the fence locked after the run wrapper exits.
   Other missing completions report the runner's exit status and exit 75 after cleanup.
   `check_leftovers` uses the two selectors from `mirror_selector_script(scope)`.
   The claim watcher's activity check uses scope `ALL_MIRRORS`.
