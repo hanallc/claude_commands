@@ -580,6 +580,14 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
         entry, sections + questions + form, today, names, unread_answers)
 
 
+def original_request_words(item: the_list.ListItem) -> str:
+    for change in item.log:
+        event = change.what
+        if isinstance(event, the_list.FieldChange) and event.action == "Added":
+            return event.fields.get("latest_status", "")
+    return ""
+
+
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, parked: bool, open_question: bool,
               visibility: the_list.WaitingForAnswer | the_list.QuestionAttention, unread_answers: frozenset[str]) -> str:
@@ -602,6 +610,9 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
+    request_words = original_request_words(item)
+    if request_words:
+        attributes["request-words"] = request_words.lower()
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
     panel = f'list-detail-{index}'
     row_id = html.escape(entry.key.replace("/", "-"), quote=True)
@@ -1257,6 +1268,7 @@ function restoreEvidenceDetails(fresh){
 }
 function matchesWords(data,search){
  if(!search) return true;
+ if(data.requestWords?.includes(search)) return true;
  const number=search.replace(/^#?l?(?=\d)/,'');
  return [data.number,data.ownerName,data.title,data.state,data.parked!=='false' ? 'Parked' : '']
   .some(value=>(value || '').toLowerCase().includes(value===data.number ? number : search));

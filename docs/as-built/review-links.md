@@ -1414,7 +1414,7 @@ Closing an item clears its unread mark.
 An older address with `show=closed`, `show=done`, or `state=Closed` opens All.
 A link to a Closed item shows “Item #N is closed.”
 An older address with `show=unread` turns on Unread only.
-The search field matches the item number, owner name, title, or state words.
+The search field matches the item number, owner name, title, state words, or original request text.
 Numbers can include `L` or `#`.
 One match function ignores case for every field.
 Parked items also match the word `Parked`.
