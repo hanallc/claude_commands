@@ -571,6 +571,7 @@ class PublishedSubmission:
     saved: review_submissions.SavedSubmission
     key: str
     version: str
+    members: staff.StaffSnapshot
 
 
 @dataclass
@@ -739,7 +740,7 @@ class ReviewSnapshotCache:
                                           replaced_key=previous_key)
             finally:
                 self.invalidate()
-            return PublishedSubmission(saved, item.key, fresh.version)
+            return PublishedSubmission(saved, item.key, fresh.version, members)
 
     def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> bool:
         """Add the screenshot to the native record and refresh its Review card."""
@@ -924,14 +925,15 @@ def waiting_change(item: ReviewItem) -> bool:
 
 def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
     shown = review_items.name(item.owner, names.members)
-    options = ''.join(f'<option value="{html.escape(member.id, quote=True)}"{names.style(member.id)}>'
+    options = ''.join(f'<option value="{html.escape(member.id, quote=True)}" '
+                      + f'data-send-receiver="{html.escape(member.name, quote=True)}"{names.style(member.id)}>'
                       +f'{html.escape(member.name)}</option>'
                       for member in review_actions.approval_assignees(names.members))
     return page_frame.action_select('assignee', 'Assign', f'<option value="">{html.escape(shown)} decides</option>'+options)
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '') -> str:
+         soon: str = "In 1 hour", owner: str = '', validator: str = '', assignment: str = '', routes: str = '') -> str:
     if item.state == ReviewState.DONE or (item.type == ReviewType.FOR_YOU and not item.actions):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
@@ -988,7 +990,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
                   +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
     else:
         groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
-    return ('<form method="post" data-review-form>'+hidden+words+groups+acknowledge
+    return (f'<form method="post" data-review-form {routes}>'+hidden+words+groups+acknowledge
             +'<span role="status" data-send-status></span></form>')
 
 
@@ -1040,7 +1042,34 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
             reason += '<p class="rebuild-secondary">The running revision is unknown.</p>'
     return ('<div class="list-panel review-panel for-you"><div data-review-body>'
             +page_frame.copy_code_block(row.command)+reason+evidence+link+'</div><div>'+metadata+'</div>'
-            +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets))+'</div>')
+            +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
+                  routes=change_browser.send_route_attributes({"done": None}))+'</div>')
+
+
+def review_toast_routes(item: ReviewItem, members: staff.StaffSnapshot) -> str:
+    """Give the form the routes for this card's actions."""
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        routed = source.assignment.owner
+        if item.state == ReviewState.VALIDATING:
+            return change_browser.send_route_attributes({
+                "question": change_browser.receiver_names(members, source.validators),
+                "read": None,
+            })
+        label = change_browser.receiver_names(members, routed.showrunner_recipients)
+        return change_browser.send_route_attributes({
+            **{action: label for action in change_page.CHANGE_HANDOFFS},
+            **change_browser.verdict_toast_labels(routed, members),
+            "read": None,
+        })
+    if isinstance(source, review_items.QuestionSource):
+        return change_browser.send_route_attributes({**change_browser.question_toast_labels(source.record, members), "read": None})
+    label = change_browser.receiver_names(members, (item.owner,))
+    labels: dict[str, str | None] = {action: label for action in item.actions}
+    labels["read"] = None
+    if isinstance(source, review_items.EfficiencySource):
+        labels["decline"] = None
+    return change_browser.send_route_attributes(labels)
 
 
 def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
@@ -1124,7 +1153,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
-                  owner=owner, validator=validator,
+                  owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members),
                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 
@@ -1758,10 +1787,15 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,recover,finished}){
+async function saveReviewAction(data,{receiver,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
  let conflict=false,confirmed=false;
  try{
-  const response=await fetch(location.pathname,{method:'POST',body:data});
+  // An answer to its owner waits on the server for Undo. Later only hides the item and Validate starts a check,
+  // so both act at once.
+  const hold=!['later','validate'].includes(data.get('outcome'));
+  if(hold) sending?.();
+  const options={method:'POST',body:data};
+  const response=await (hold ? heldFetch(location.pathname,options,receiver) : fetch(location.pathname,options));
   conflict=response.status===409;
   confirmed=response.ok;
   if(confirmed) confirmedSave?.();
@@ -1769,7 +1803,8 @@ async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,r
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
   await saved(result);
  }catch(error){
-  if(confirmed) displayFailed();
+  if(error instanceof SendUndone) undone(error.message);
+  else if(confirmed) displayFailed();
   else if(conflict) await recover(error.message);
   else failed(error.message);
  }finally{
@@ -1908,17 +1943,27 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   report('Saving…');
   let saved=false;
   await saveReviewAction(data,{
+   receiver:sendActionReceiver(form,data),
+   sending:()=>boxFrame?.dispatchEvent(new Event('review-card-sending')),
    saved:result=>{
     saved=true;
     report('Saved: '+result.answer);
     if(frame){
      frame.removeAttribute('data-saving');
-     frame.dispatchEvent(new Event('review-card-busy'));
      frame.dispatchEvent(new Event('review-card-saved'));
     }
    },
    failed:reason=>report('Not saved: '+reason),
-   displayFailed:()=>report('Saved; the item could not refresh.'),
+   undone:report,
+   displayFailed:()=>{
+    const message='Saved; the item could not refresh.';
+    saved=true;
+    report(message);
+    if(frame){
+     frame.removeAttribute('data-saving');
+     frame.dispatchEvent(new CustomEvent('review-card-saved',{detail:message}));
+    }
+   },
    recover,
    finished:()=>{if(!saved) busy(false);}
   });
@@ -2334,6 +2379,7 @@ function bindForm(row){
     view.preserveRecordRowTop(()=>showResult({kind:'failure',message:'Not saved: '+reason}));
    };
    await saveReviewAction(data,{
+   receiver:sendActionReceiver(form,data),
    confirmedSave:()=>{
     pending.saved=true;
     if(view.currentItemRequest(request) && reviewDrafts.get(key)?.stamp===draftAtSubmit?.stamp){
@@ -2388,6 +2434,10 @@ function bindForm(row){
     else applySaved();
    },
    failed:fail,
+   undone:message=>{
+    pendingSaves.delete(key);
+    showResult({kind:'undone',message});
+   },
    displayFailed:()=>{
     if(!view.currentItemRequest(request)) return;
     view.preserveRecordRowTop(()=>{
