@@ -524,7 +524,7 @@ class CargoFolderTests(unittest.TestCase):
                 client.WaitOutput()(reply.wait)
             self.assertIn("head: waits for the build in the same Cargo folder", output.getvalue())
 
-    def test_view_releases_the_folder_before_the_next_pass(self) -> None:
+    def test_view_keeps_the_cargo_folder_wait_until_the_next_pass(self) -> None:
         with PlacementFixture() as fixture:
             folder = str(fixture.root / "target")
             first = local_cargo_request(fixture)
@@ -543,7 +543,9 @@ class CargoFolderTests(unittest.TestCase):
             head = viewed.reading.explanation.head
             assert isinstance(head, records.HeadExplanation)
             self.assertEqual(head.waiter.pid, second.owner.pid)
-            self.assertNotIsInstance(head.cause, placement.CargoFolderWait)
+            self.assertIsInstance(head.cause, placement.CargoFolderWait)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.caller_reservations()), {second.episode})
 
     def test_mixed_request_uses_a_free_remote_slot_when_the_local_folder_is_busy(self) -> None:
         for another_remote_step in (False, True):
@@ -762,17 +764,20 @@ class PlacementTests(unittest.TestCase):
                     guest.destination.host, "host-generation-a", 700001, "guest-start"))
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-before-launch", assignment, claim, execution,
                     placement.PrelaunchRefused("fixture")))
+                _ = fixture.run_pass()
                 with mock.patch.object(mac_run, "claim_held", return_value=True):
                     granted, = fixture.server.handle_request(consume_permission("guest-launch", assignment, claim))
                 self.assertEqual(granted, wire.FirstAuthorization(assignment, claim))
                 wrong = replace(assignment, attempt="another-attempt")
                 _ = fixture.server.handle_request(wire.ExecutionReport("stale-guest-running", wrong, claim, execution))
+                _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
                 pending, = (row for row in reply.reading.view.running if row.assignment_target == "mac-linux")
                 self.assertEqual((pending.confirmed_guest_run, pending.mac_placement), (None, ""))
 
                 _ = fixture.server.handle_request(wire.ExecutionReport("guest-running", assignment, claim, execution))
+                _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
                 decoded = wire.parse_reply(wire.encode_reply(reply))

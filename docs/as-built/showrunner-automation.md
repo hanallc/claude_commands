@@ -606,9 +606,12 @@ The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
+They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
 Their updates use the caller's staff name as the log source.
+They can also run `park`, `close`, and `reopen` on those items.
+These commands use the `--source` words as the log source.
+The command refuses each item of another producer.
+Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
 Morty's new items default to morty.
