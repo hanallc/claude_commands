@@ -1084,6 +1084,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 if lookup == "base draft key":
                                     draft = self.submission_draft_folder(str(fields["request_id"]))
                                     shutil.rmtree(draft.parent / ".draft-index" / draft.name)
+                                    (draft / "pending.json").unlink(missing_ok=True)
                                     key = new_item_dialog.submission_key(request.kind, request.recipient_id,
                                                                          saved["id"], earlier.request_id)
                                     _ = (draft / "list-receipt-key").write_text(key + "\n")
@@ -3370,6 +3371,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                 ("base draft content", "attachment write"),
                 ("base draft content", "native directory sync"),
                 ("base draft content", "index receipt publication"),
+                ("base draft content", "index claim write"),
+                ("base draft content", "index parent sync"),
                 ("base draft key", "native directory sync"),
             ):
                 with self.subTest(native_recovery=recovery, failure=failure):
@@ -3398,22 +3401,26 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 write_bytes(path, data, mode=mode)
 
                             _ = faults.enter_context(patch.object(atomic_file, "write_bytes_atomic", fail_attachment))
-                        elif failure == "native directory sync":
-                            def fail_native_sync(path: Path) -> None:
-                                if path == saved.path.parent:
-                                    raise OSError("The native directory sync failed.")
+                        elif failure in ("native directory sync", "index parent sync"):
+                            directory = (saved.path.parent if failure == "native directory sync"
+                                         else index_folder(folder).parent)
+
+                            def fail_recovery_sync(path: Path) -> None:
+                                if path == directory:
+                                    raise OSError(f"Recovery stopped during {failure}.")
                                 sync(path)
 
-                            _ = faults.enter_context(patch.object(atomic_file, "sync_folder", fail_native_sync))
-                        elif failure == "index receipt publication":
-                            receipt = index_folder(folder) / "receipt.json"
+                            _ = faults.enter_context(patch.object(atomic_file, "sync_folder", fail_recovery_sync))
+                        elif failure in ("index receipt publication", "index claim write"):
+                            index_file = index_folder(folder) / ("receipt.json" if failure == "index receipt publication"
+                                                                else "pending.json")
 
-                            def fail_index_receipt(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
-                                if path == receipt:
-                                    raise OSError("The index receipt write failed.")
+                            def fail_index_write(path: Path, words: str, *, new_file_mode: int | None = None) -> None:
+                                if path == index_file:
+                                    raise OSError(f"Recovery stopped during {failure}.")
                                 write_text(path, words, new_file_mode=new_file_mode)
 
-                            _ = faults.enter_context(patch.object(atomic_file, "write_text_atomic", fail_index_receipt))
+                            _ = faults.enter_context(patch.object(atomic_file, "write_text_atomic", fail_index_write))
                         if failure:
                             interrupted = self.new_item_http(native_body, finished=True)
                             self.assertEqual(interrupted.status, 503, interrupted.body)

@@ -1603,19 +1603,26 @@ class ClaimedDraft:
 
 
 @dataclass(frozen=True)
+class NativeDraftAwaitingReceipt:
+    """The native record exists and the draft index receipt is pending."""
+
+    destination: NativeSubmissionDestination
+
+
+@dataclass(frozen=True)
 class FiledDraft:
     """The draft names a saved item."""
 
     destination: FilingDestination
 
 
-type DraftFiling = UnclaimedDraft | ClaimedDraft | FiledDraft | PendingFiling
+type DraftFiling = UnclaimedDraft | ClaimedDraft | NativeDraftAwaitingReceipt | FiledDraft | PendingFiling
 
 def _draft_index(folder: Path) -> Path:
     return folder.parent / ".draft-index" / folder.name
 
 
-def _write_draft_index(folder: Path, filing: ClaimedDraft | FiledDraft) -> None:
+def _write_draft_index(folder: Path, filing: ClaimedDraft | NativeDraftAwaitingReceipt | FiledDraft) -> None:
     index = _draft_index(folder)
     # Sync each parent before a record can refer to the indexed claim.
     _sync_draft_parents(index)
@@ -1664,6 +1671,8 @@ def _draft_filing(folder: Path, members: staff.StaffSnapshot | None = None, *,
                     return UnclaimedDraft()
                 record = _indexed_list_record(folder.name, pending)
                 filing = record if isinstance(record, FiledDraft) else ClaimedDraft(pending)
+            elif _is_earlier_native_draft(folder, pending):
+                return NativeDraftAwaitingReceipt(pending)
             else:
                 filing = ClaimedDraft(pending)
         if repair_index and (location == folder or isinstance(filing, FiledDraft) and filing.destination != receipt):
@@ -1679,12 +1688,18 @@ def _draft_filing(folder: Path, members: staff.StaffSnapshot | None = None, *,
     except FileNotFoundError:
         return UnclaimedDraft()
     with scoped_submission(read_submission_key(key), members=members) as item:
-        _write_draft_index(folder, ClaimedDraft(item.destination))
+        _claim_recovered_native_draft(folder, item.destination)
         return _publish_recovered_native_draft(folder, item.destination)
 
 
 def _is_earlier_native_draft(folder: Path, destination: NativeSubmissionDestination) -> bool:
     return not destination.request_id.startswith(folder.name + "-")
+
+
+def _claim_recovered_native_draft(folder: Path, saved: NativeSubmissionDestination) -> None:
+    _write_location(folder / "pending.json", saved)
+    _sync_draft_parents(folder)
+    _write_draft_index(folder, NativeDraftAwaitingReceipt(saved))
 
 
 def _publish_recovered_native_draft(folder: Path, saved: NativeSubmissionDestination) -> FiledDraft:
@@ -1707,10 +1722,10 @@ def file_list_draft(request_id: str, payload_hash: str, *,
         filing = _draft_filing(folder)
         if isinstance(filing, PendingFiling):
             raise DraftPending()
+        if isinstance(filing, NativeDraftAwaitingReceipt):
+            raise DraftAlreadyFiled(filing.destination.id)
         candidate = filing.destination if isinstance(filing, (ClaimedDraft, FiledDraft)) else filing
         if isinstance(candidate, NativeSubmissionDestination):
-            if isinstance(filing, ClaimedDraft) and _is_earlier_native_draft(folder, candidate):
-                raise DraftAlreadyFiled(candidate.id)
             with _locked_request(candidate.address, recovered=candidate,
                                  search_owner_stores=isinstance(filing, FiledDraft)) as lookup:
                 if isinstance(lookup.native, LocatedSubmission):
@@ -1805,7 +1820,7 @@ def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on
     token = _browser_draft_token.get()
     recovery = isinstance(token, BrowserDraftRecoveryToken)
     filing = _draft_filing(folder, members, repair_index=not recovery)
-    if not isinstance(filing, (ClaimedDraft, FiledDraft)):
+    if not isinstance(filing, (ClaimedDraft, NativeDraftAwaitingReceipt, FiledDraft)):
         yield NoNativeSubmission()
         return
     hint = filing.destination
@@ -1825,9 +1840,13 @@ def _locked_filed_draft(folder: Path, members: staff.StaffSnapshot | None, *, on
         if recovery and hint.browser_token_digest and not hmac.compare_digest(hint.browser_token_digest, token.digest):
             yield NoNativeSubmission()
             return
+        if isinstance(filing, NativeDraftAwaitingReceipt):
+            index = _draft_index(folder)
+            if isinstance(_read_request_file(index / "pending.json", index.name), NoRequestFile):
+                _write_draft_index(folder, filing)
         local = _read_location_hint(folder)
         relocated = isinstance(local, NativeSubmissionDestination) and local.owner != hint.owner
-        must_exist = earlier or isinstance(filing, FiledDraft)
+        must_exist = isinstance(filing, (NativeDraftAwaitingReceipt, FiledDraft))
         with _locked_request(hint.address, members, recovered=hint,
                              search_owner_stores=must_exist or relocated) as lookup:
             saved = _saved_draft(lookup)
@@ -1968,7 +1987,7 @@ def _recover_pre_upgrade_native_draft(draft_folder: Path, address: SubmissionAdd
                 if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
                     continue
                 saved = item.destination
-                _write_draft_index(draft_folder, ClaimedDraft(saved))
+                _claim_recovered_native_draft(draft_folder, saved)
                 _check_capture_target(capture_target, saved)
                 completed = _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record,
                                               edited=True, retry_uploads=uploads,
@@ -2274,7 +2293,8 @@ def committed_page_captures() -> Iterator[tuple[ScopedSubmissionKey, new_item_di
             continue
         try:
             hint = _read_location_hint(folder)
-            if not isinstance(hint, NativeSubmissionDestination) or not hint.has_capture_intent:
+            if (not isinstance(hint, NativeSubmissionDestination) or not hint.has_capture_intent
+                    or _request_folder(hint.request_id) != folder):
                 continue
             with _locked_request(hint.address) as lookup:
                 located = lookup.native
