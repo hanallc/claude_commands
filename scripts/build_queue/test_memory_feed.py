@@ -1,6 +1,7 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.review_links.browser_test_support import assert_status_states
 from scripts.build_queue import admission_records, admission_service, execution_identity, limits_view, placement, queue_evidence, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
@@ -1555,7 +1556,7 @@ process.stdout.write(JSON.stringify({
                 payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
                 # The shared browser test sets the data time for each response.
                 del payload["fresh_until"]
-                test_page_frame.assert_status_states(self, page, seconds, payload)
+                assert_status_states(self, page, seconds, payload)
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))

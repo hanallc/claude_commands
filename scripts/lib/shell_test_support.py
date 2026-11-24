@@ -1,7 +1,12 @@
-"""Read complete shell functions for isolated caller tests."""
+"""Share shell setup for isolated caller tests."""
 
 from pathlib import Path
 import re
+
+
+def fixture_zsh_environment() -> dict[str, str]:
+    """Keep the fixture PATH through NixOS zsh startup."""
+    return {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
 
 
 def refusing_bash_startup(root: Path) -> Path:
