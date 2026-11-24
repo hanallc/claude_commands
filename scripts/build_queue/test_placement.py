@@ -794,7 +794,8 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual((assignment.destination, assignment.since), (guest.destination, request.since))
 
     def test_guest_start_report_survives_restart_and_closure(self) -> None:
-        with PlacementFixture() as fixture:
+        configuration = self.enterContext(TemporaryDirectory())
+        with mock.patch.dict(os.environ, {"CONF_DIR": configuration}), PlacementFixture() as fixture:
             request = mac_linux_and_natedev_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
