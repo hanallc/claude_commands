@@ -9,9 +9,9 @@ import subprocess
 import tempfile
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import ClassVar, cast, final, override
+from typing import ClassVar, final, override
 from unittest.mock import patch
 
 from scripts.whoami import hana_runner_token
@@ -102,8 +102,10 @@ class HanaRunnerTokenTests(unittest.TestCase):
         self.assertEqual(self.stderr.getvalue(), "")
 
     def test_success_replaces_the_credential(self) -> None:
+        handlers = [signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)]
         self.assertEqual(self.reseal(), 0)
         self.assert_replaced()
+        self.assertEqual([signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)], handlers)
 
     def test_failed_sudo_creates_nothing(self) -> None:
         self.approval_status = 1
@@ -127,25 +129,23 @@ class HanaRunnerTokenTests(unittest.TestCase):
 
     def interrupt_publication(self) -> None:
         os.kill(os.getpid(), signal.SIGINT)
-        self.assertIn(signal.SIGINT, cast(set[signal.Signals], signal.sigpending()))
 
-    def test_interrupt_during_temporary_file_creation_allows_publication(self) -> None:
+    def test_interrupt_during_temporary_file_creation_keeps_the_credential(self) -> None:
         create = tempfile.NamedTemporaryFile
 
-        def interrupted_create(*, dir: Path, prefix: str, suffix: str, delete: bool):
-            output = create(dir=dir, prefix=prefix, suffix=suffix, delete=delete)
+        def interrupted_create(*, dir: Path, prefix: str, suffix: str, delete_on_close: bool):
+            output = create(dir=dir, prefix=prefix, suffix=suffix, delete_on_close=delete_on_close)
             self.interrupt_publication()
             return output
 
         with patch.object(tempfile, "NamedTemporaryFile", side_effect=interrupted_create):
-            self.assertEqual(self.reseal(), 0)
-        self.assert_replaced()
+            self.assert_failure(3, "Reseal interrupted.", 130)
 
     def patch_temporary_write(self, before_write: Callable[[], None]) -> None:
         create = tempfile.NamedTemporaryFile
 
-        def intercepted_create(*, dir: Path, prefix: str, suffix: str, delete: bool):
-            output = create(dir=dir, prefix=prefix, suffix=suffix, delete=delete)
+        def intercepted_create(*, dir: Path, prefix: str, suffix: str, delete_on_close: bool):
+            output = create(dir=dir, prefix=prefix, suffix=suffix, delete_on_close=delete_on_close)
             write = output.write
 
             def intercepted_write(sealed: bytes) -> int:
@@ -157,35 +157,39 @@ class HanaRunnerTokenTests(unittest.TestCase):
 
         _ = self.enterContext(patch.object(tempfile, "NamedTemporaryFile", side_effect=intercepted_create))
 
-    def test_interrupt_during_write_allows_publication(self) -> None:
+    def test_interrupt_during_write_keeps_the_credential(self) -> None:
         self.patch_temporary_write(self.interrupt_publication)
-        self.assertEqual(self.reseal(), 0)
-        self.assert_replaced()
+        self.assert_failure(3, "Reseal interrupted.", 130)
 
-    def test_interrupt_after_replacement_keeps_the_success_status(self) -> None:
+    def test_interrupt_after_replacement_keeps_the_complete_credential(self) -> None:
         replace = os.replace
 
-        def interrupted_replace(temporary: Path, destination: Path) -> None:
+        def interrupted_replace(temporary: str, destination: Path) -> None:
             replace(temporary, destination)
             self.interrupt_publication()
 
         with patch.object(os, "replace", side_effect=interrupted_replace):
-            self.assertEqual(self.reseal(), 0)
-        self.assert_replaced()
+            self.assertEqual(self.reseal(), 130)
+        self.assertEqual(len(self.commands), 3)
+        self.assertEqual(self.path.read_bytes(), self.SEALED)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+        self.assertEqual(self.stdout.getvalue(), "")
+        self.assertEqual(self.stderr.getvalue(), "Reseal interrupted.\n")
 
-    def test_interrupt_during_cleanup_keeps_the_write_failure_status(self) -> None:
-        unlink = Path.unlink
+    def test_interrupt_during_cleanup_keeps_the_credential(self) -> None:
+        create = tempfile.NamedTemporaryFile
 
-        def fail_write() -> None:
-            raise OSError("fixture write failure")
+        @contextmanager
+        def interrupted_cleanup(*, dir: Path, prefix: str, suffix: str, delete_on_close: bool):
+            try:
+                with create(dir=dir, prefix=prefix, suffix=suffix, delete_on_close=delete_on_close) as output:
+                    yield output
+            finally:
+                self.interrupt_publication()
 
-        def interrupted_unlink(temporary: Path, *, missing_ok: bool = False) -> None:
-            self.interrupt_publication()
-            unlink(temporary, missing_ok=missing_ok)
-
-        self.patch_temporary_write(fail_write)
-        with patch.object(Path, "unlink", new=interrupted_unlink):
-            self.assert_failure(3, "Cannot run the reseal command or write the sealed credential.")
+        with (patch.object(tempfile, "NamedTemporaryFile", side_effect=interrupted_cleanup),
+              patch.object(os, "fsync", side_effect=OSError("fixture write failure"))):
+            self.assert_failure(3, "Reseal interrupted.", 130)
 
     def test_replacement_has_owner_only_mode_under_a_restrictive_umask(self) -> None:
         previous = os.umask(0o777)

@@ -60,7 +60,11 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
                     now = began + 9.98
                     self.write(log, "OK\n")
-                    return gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
+                    job = gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
+                    recovery = gate.ACTIVE_GATE_RECOVERY.get()
+                    assert isinstance(recovery, gate.GateRecovery) and recovery.register_job is not None
+                    recovery.register_job(job)
+                    return job
 
                 def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
                     return (arguments[0] if now >= began + 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
@@ -143,6 +147,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
                                          "Traceback (most recent call last):\nAssertionError: fixture failure")
         signals: list[tuple[int, int]] = []
         def send(pid: int, signum: int) -> None:
+            if (pid, signal.SIGKILL) in signals:
+                raise ProcessLookupError(pid)
             signals.append((pid, signum))
         with mock.patch.object(time, "monotonic", return_value=11), \
                 mock.patch.object(process_group, "send_process_group", side_effect=send):

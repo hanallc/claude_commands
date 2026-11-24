@@ -16,8 +16,10 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from typing import cast, final, override
@@ -25,12 +27,14 @@ from contextlib import AbstractContextManager, contextmanager, redirect_stdout
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.buildlog import store
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -126,6 +130,78 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(excludes.count("/.scratch.json"), 1)
         with scratch.busy_path(checkout).open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_rollback_copy_wait_stops_at_its_deadline_or_on_term(self) -> None:
+        program = """
+import sys
+import time
+from pathlib import Path
+from unittest import mock
+from scripts.lib import scratch
+from scripts.production import gate
+
+repo = Path(sys.argv[1])
+sleep = time.sleep
+announced = False
+
+def announce_wait(seconds):
+    global announced
+    if not announced:
+        announced = True
+        print("waiting", flush=True)
+    sleep(seconds)
+
+with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
+    directory = gate.gate_run_directory(repo)
+    gate.recover_gate_directory(directory, own_directory=directory)
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        copies = self.root / "copies"
+        repo = copies / "show-maker" / "21-gate"
+        repo.parent.mkdir(parents=True)
+        _ = self.git(self.checkout, "clone", str(self.checkout), str(repo))
+        self.write(repo / ".scratch.json", json.dumps({"task": "gate:fixture"}))
+        _ = self.git(repo, "merge", "--no-edit", self.checkpoint)
+        merged = self.git(repo, "rev-parse", "HEAD")
+        self.assertNotEqual(merged, self.base)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "scratch.conf")
+        self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        busy = scratch.busy_path(repo)
+        busy.touch()
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            directory = gate.gate_run_directory(repo)
+            directory.mkdir(parents=True)
+            record = directory / "dead-owner.json"
+            gate.GateRecovery(record, str(repo), os.getpid(), "ended-owner",
+                                    rollback=self.base, rollback_head=merged).save()
+        for lock_path in (busy, repo):
+            for terminate in (False, True):
+                with self.subTest(lock=lock_path.name, terminate=terminate):
+                    self.configure_gate(f"program_stop_seconds={60 if terminate else 1}\n")
+                    descriptor = os.open(lock_path, os.O_RDONLY)
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        with subprocess.Popen([sys.executable, "-c", program, str(repo)], cwd=checkout,
+                                              env=self.environment, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, text=True) as child:
+                            try:
+                                assert child.stdout is not None
+                                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                                self.assertEqual(child.stdout.readline(), "waiting\n")
+                                if terminate:
+                                    child.terminate()
+                                output, errors = child.communicate(timeout=5)
+                                self.assertEqual(child.returncode, -signal.SIGTERM if terminate else 0, output + errors)
+                                if not terminate:
+                                    self.assertIn("UNRESOLVED: the scratch copy lock is still held", output)
+                            finally:
+                                if child.poll() is None:
+                                    child.kill()
+                                    _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    finally:
+                        os.close(descriptor)
+                    self.assertEqual(self.git(repo, "rev-parse", "HEAD"), merged)
+                    self.assertEqual(json.loads(record.read_text())["rollback"], self.base)
 
     def test_checkpoint_names_its_unit_before_admission_and_suites(self) -> None:
         observed: list[str] = []
@@ -820,6 +896,42 @@ class GateRecoveryTests(MergeGateFixture):
                 if process.poll() is None:
                     process.kill()
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    @gate_suites("hooks")
+    def test_tests_only_sigterm_leaves_recovery_when_the_append_lock_is_held(self) -> None:
+        self.configure_gate("program_stop_seconds=2\nprogram_sample_seconds=0.05")
+        hold = self.state / "hold-module"
+        self.write(hold, "hold")
+        ready = self.state / "module-held"
+        with mock.patch.dict(os.environ, self.environment):
+            records = gate.gate_run_directory(self.checkout)
+            log = store.host_file(store.host_name(), time.time())
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+        command = [*self.gate_command(), "--tests-only", "--full", "--repo", str(self.checkout)]
+        with subprocess.Popen(command, cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                wait_until(lambda: ready.exists() or process.poll() is not None, self.state, processes=(process,))
+                self.assertTrue(ready.is_file())
+                [record] = records.glob(f"{process.pid}-*.json")
+                with store.locked_append(log):
+                    process.send_signal(signal.SIGTERM)
+                    output, errors = process.communicate(timeout=stop_seconds + 1)
+                    self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertEqual(errors.splitlines().count(
+                    f"gate run not written: the append lock deadline passed for {log}"), 1, errors)
+                saved = cast(dict[str, object], json.loads(record.read_text()))
+                self.assertIs(saved["finished"], False)
+                self.assertEqual(self.gate_run_records(), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        hold.unlink()
+        result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(record.exists())
 
     def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment):

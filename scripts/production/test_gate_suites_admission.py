@@ -10,6 +10,7 @@ from collections.abc import Callable
 import unittest
 import io
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -494,9 +495,9 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             kinds.append(kind)
             return started(suite, path, argv, repo, environment, log, kind=kind)
         def finish(reservation: str, status: int, configuration: admission_records.MemoryConfig | wire.CleanupTiming,
-                   ending: wire.ReleaseEnding = "result") -> wire.Ok | wire.Refused:
+                   ending: wire.ReleaseEnding = "result", *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
             assert_cap()
-            return release(reservation, status, configuration, ending)
+            return release(reservation, status, configuration, ending, deadline=deadline)
         with mock.patch.object(gate, "start_gate_job", side_effect=start), \
              mock.patch.object(client, "release", side_effect=finish):
             result = self.run_gate("--tests-only")
@@ -561,13 +562,14 @@ class MergeGateAdmissionTests(unittest.TestCase):
                                  higher_pressure)),
                              ("memory pressure",))
 
-    def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
+    def test_scope_probe_timeout_or_missing_command_refuses_a_required_scope(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
             with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1", "DETACHED_RUN_SLICE": ""}), \
                     mock.patch.object(queue, "in_builds_slice", return_value=False), \
                     mock.patch("scripts.production.gate.subprocess.run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(queue.suite_scope_prefix(), [])
+                with self.assertRaisesRegex(GateRefused, "the systemd scope probe failed"):
+                    _ = gate.suite_scope_prefix()
                 self.assertEqual(probe.call_args.kwargs["timeout"], 10)
                 self.assertIn("Module scope skipped: probe failed", output.getvalue())
 

@@ -11,8 +11,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
-from typing import Self, cast, override
+from typing import Never, Self, cast, override
 import unittest
 from unittest import mock
 
@@ -177,6 +178,32 @@ subprocess.run = fail_log_put
             self.assertNotIn('rollback_signals', code)
             self.assertNotRegex(code, r'\bgate_runner\.\w*signal\w*')
             self.assertNotIn('signal.signal', code)
+
+    def test_term_during_guest_sampler_cleanup(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        stop_timeout = 2.0
+        result: dict[str, object] = {}
+
+        def stage(_name: str) -> None:
+            pass
+
+        namespace: dict[str, object] = {
+            'root': root, 'log': root / 'gate.log', 'result': result,
+            'stage': stage,
+            'links': {'module_time_limit_s': 60, 'program_stop_seconds': stop_timeout},
+        }
+
+        def cleanup(hang: Callable[[], Never]) -> int:
+            def join(*, timeout: float) -> Never:
+                self.assertEqual(timeout, stop_timeout)
+                hang()
+
+            with (mock.patch.object(gate, 'run_suites', return_value=SimpleNamespace(passed=True, jobs=())),
+                  mock.patch.object(threading.Thread, 'join', side_effect=join)):
+                exec(gate_box.CANDIDATE_GUEST, namespace)
+            return 0
+
+        trial_tests.assert_term_during_cleanup(self, cleanup, stop_timeout)
 
     def test_boot_timestamps_use_local_kernel_and_cached_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -379,7 +406,6 @@ with mock.patch.object(gate, 'process_memory_mib'):
                 library = repo / 'scripts/lib'
                 _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
                 self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
-                _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/gate.py').write_text(
                     'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nfrom typing import override\nimport os\n'
                     + inspect.getsource(gate.SuiteMode)

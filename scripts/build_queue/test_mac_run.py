@@ -1,7 +1,7 @@
 """Check mac-linux claims against the native Mac claim path."""
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import errno
 import fcntl
@@ -10,12 +10,13 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 from threading import Event
 import time
-from typing import cast, final, override
+from typing import BinaryIO, cast, final, override
 import unittest
 from unittest import mock
 
@@ -148,6 +149,19 @@ class MacRunTests(unittest.TestCase):
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getppid(), start.start))
             self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start + "-other"))
         self.assertFalse(mac_run.claim_held("mac", claim.claim_id, os.getpid(), start.start))
+
+    def test_release_uses_its_own_checkout(self) -> None:
+        foreign_scripts = self.checkout / "scripts"
+        (foreign_scripts / "lib").mkdir(parents=True)
+        _ = (foreign_scripts / "lib/py").touch()
+        (foreign_scripts / "build_queue").mkdir()
+        _ = (foreign_scripts / "build_queue/mac_run.py").write_text("raise SystemExit(0)\n")
+
+        with chdir(self.checkout):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED) as identity:
+                claim, = claim_state.read_claims(self.paths)
+                self.assertEqual(claim_state.claim_identity(claim.record), identity)
+            self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_claim_kind_reads_the_mac_linux_claim_id_prefix(self) -> None:
         with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
@@ -2071,16 +2085,87 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         self.assertEqual(claim_state.read_claims(self.paths), ())
 
     def test_release_errors_reach_the_caller_after_the_guest_run(self) -> None:
-        refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
-        with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
-            with self.assertRaisesRegex(RuntimeError, refused.reason):
-                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
-                    self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+        reason = "the exact claim changed during cleanup"
+        with self.assertRaisesRegex(RuntimeError, reason):
+            with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                self.assertEqual(len(claim_state.read_claims(self.paths)), 1)
+                self.refuse_release(reason)
 
     def test_release_error_preserves_the_guest_error(self) -> None:
-        refused = mac_test.ClaimReleaseRefused("the exact claim changed during cleanup")
-        with mock.patch.object(mac_test, "release_exact_claims", return_value=refused):
-            with self.assertRaisesRegex(ValueError, "guest failed") as failed:
-                with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
-                    raise ValueError("guest failed")
-        self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {refused.reason}"])
+        reason = "the exact claim changed during cleanup"
+        with self.assertRaisesRegex(ValueError, "guest failed") as failed:
+            with mac_run.held(self.checkout, "mac", StepJob("test-affected"), GATE_JOB_NOT_RECORDED):
+                self.refuse_release(reason)
+                raise ValueError("guest failed")
+        self.assertEqual(failed.exception.__notes__, [f"Mac claim release failed: {reason}"])
+
+    def refuse_release(self, reason: str) -> None:
+        def child(_command: Sequence[str], *, stderr: BinaryIO, **_options: object) -> mock.Mock:
+            _ = stderr.write(f"cannot release: {reason}\n".encode())
+            return mock.Mock(returncode=12, wait=mock.Mock(return_value=12))
+
+        _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=child))
+
+    def test_busy_claim_lock_refuses_before_start(self) -> None:
+        with claim_state.locked(self.paths.lock), self.assertRaisesRegex(mac_run.MacRunRefused, "claim state is busy"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                self.fail("A guest started while the state lock was held")
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+
+    def test_release_deadline_keeps_the_claim_when_the_lock_stays_held(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("# range: 5e-324..\nprogram_stop_seconds=0.5\n")
+        with ExitStack() as lock:
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "claim release deadline expired"):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    lock.enter_context(claim_state.locked(self.paths.lock))
+            self.assertLess(time.monotonic() - started, 2.0)
+            claim, = claim_state.read_claims(self.paths)
+        self.assertEqual(claim.record["pid"], os.getpid())
+
+    def test_release_deadline_bounds_the_wait_after_kill(self) -> None:
+        now = 10.0
+        waits: list[float] = []
+
+        def wait(*, timeout: float) -> int:
+            nonlocal now
+            waits.append(timeout)
+            now += timeout
+            raise subprocess.TimeoutExpired("release", timeout)
+
+        kill, exit_context = mock.Mock(), mock.MagicMock()
+        child = mock.MagicMock(spec=subprocess.Popen, returncode=None, wait=wait, kill=kill, __exit__=exit_context)
+        _ = (self.root / "build_admission.conf").write_text("# range: 5e-324..\nprogram_stop_seconds=1\n")
+        with self.assertRaisesRegex(RuntimeError, "claim release deadline expired"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                _ = self.enterContext(mock.patch.object(subprocess, "Popen", return_value=child))
+                _ = self.enterContext(mock.patch.object(time, "monotonic", lambda: now))
+        kill.assert_called_once_with()
+        self.assertEqual(len(waits), 2)
+        self.assertGreater(waits[1], 0)
+        self.assertAlmostEqual(now, 11.0)
+        exit_context.assert_not_called()
+
+    def test_release_deadline_includes_the_initial_claim_read(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("# range: 5e-324..\nprogram_stop_seconds=1\n")
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "claim release deadline expired"):
+            with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                os.mkfifo(self.paths.run)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.paths.run.unlink()
+        claim, = claim_state.read_claims(self.paths)
+        self.assertEqual(claim.record["pid"], os.getpid())
+
+    def test_interrupt_after_claim_publication_releases_the_exact_claim(self) -> None:
+        def interrupt_after_write(_args: mac_test.CliArguments, _record: claim_state.RunRecord,
+                                  path: Path) -> mac_test.ClaimFinished:
+            self.assertTrue(path.is_file())
+            os.kill(os.getpid(), signal.SIGINT)
+            self.fail("SIGINT did not interrupt claim publication")
+
+        with mock.patch.object(mac_test, "finished_claim", side_effect=interrupt_after_write):
+            with self.assertRaises(KeyboardInterrupt):
+                with mac_run.held(self.checkout, "mac", SuiteMode.GATE, GATE_JOB_NOT_RECORDED):
+                    self.fail("An interrupted claim started a guest")
+        self.assertEqual(claim_state.read_claims(self.paths), ())

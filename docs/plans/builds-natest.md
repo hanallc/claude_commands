@@ -4646,3 +4646,36 @@ True
 True
 
 ```
+
+### Phase 393 — TERM stops a gate in a known time (no cleanup signal mask)  · status: todo
+
+**Depends on:** none. Start after the red main repair and the guard repair. Keep the order of queue phase 44dg.
+
+#### Work Order
+
+**Goal:** TERM stops a merge gate and a queue place in a known time.
+
+**Why:** Gate process 101053 blocked TERM for 37 hours while it had a cleanup mask. It stopped after KILL.
+The queue place could wait for its scope members or for the admission service. The cause of the original wait is unknown.
+
+**Spec**
+
+1. Remove `defer_cleanup_signals()` and `start_masked_thread()` and their callers. Add no signal handler, mask, or disposition.
+2. Record owned resources before use. On restart, confirm that the recorded scope and process groups are empty before returning slots or removing folders.
+3. Use `time.monotonic()` and `program_stop_seconds` for cleanup deadlines. Bound both scope cleanup and admission release. Keep the lease and record on `UNRESOLVED`.
+4. Wait for an idle gate's CPU slot in `select` slices with no pool lock held. End on a token, TERM, or the gate deadline.
+5. Wait without a total time limit when the gate has no deadline. Use `program_sample_seconds` for each slice.
+6. Let `/dev/steve` reclaim slots when its owner exits. The Mac has no pool.
+7. For a test FIFO, replay only the dead owner's recorded held tokens when the device and inode match. Keep uncertain FIFO operations as `UNRESOLVED`.
+8. Accept a loss of one test token if TERM interrupts the FIFO read before the record save. Remove the pool-wide recount.
+9. Use one strict typed parser per recovery record kind. Keep a record that fails validation and report its path.
+10. Keep `CANCELLATION_SIGNALS` if detached runs need it. Unblock signals before exec only where a child can inherit the mask.
+11. Report each remaining mask on the gate path and whether its waits have a limit. Include `module_run.py`.
+12. Leave `staff.py`, `style_sync.py`, and `cli_fixture.py` as they are.
+13. Test each changed cleanup path with a real child that hangs. Send TERM and verify that the child exits within the deadline plus a margin.
+14. Use private configuration in the tests. Change the mask assertions to check that cleanup leaves cancellation signals available.
+
+**Files:** `scripts/lib/cancellation.py`, `scripts/production/gate.py`, `scripts/build_queue`, `scripts/aws_target`, and their tests.
+
+**Acceptance gate:** Run basedpyright on each changed Python file. Require zero errors and zero warnings. Run `git diff --check`.
+After the test hold lifts, run each changed test module 20 times in plain runs. Then run the full merge gate.
