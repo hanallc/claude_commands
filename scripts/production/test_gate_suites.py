@@ -678,7 +678,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
             self.assertEqual(self.pass_records(), [original])
 
     @gate_suites("hooks")
-    def test_cloud_fallback_accepts_a_staged_deletion_of_an_ignored_tracked_file(self) -> None:
+    def test_assigned_aws_gate_accepts_a_staged_deletion_of_an_ignored_tracked_file(self) -> None:
         from scripts.aws_target import cloud_gate
 
         subject = self.checkout / "subject.txt"
