@@ -21,6 +21,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.review_links.firefox_test_support import firefox_probe_results, load_firefox
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
@@ -90,21 +91,17 @@ class ImagesFixture(unittest.TestCase):
     def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
         return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
 
-    def run_firefox(self, handler: type[BaseHTTPRequestHandler], name: str, *, timeout: int = 45,
+    def run_firefox(self, handler: type[BaseHTTPRequestHandler], complete: threading.Event, *, timeout: int = 45,
                     release: Callable[[], None] = lambda: None) -> None:
-        """Serve one headless Firefox screenshot load; release frees held requests before the server stops."""
+        """Serve a Firefox probe. Release held requests before the server stops."""
         with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
             # Join the handlers before the fixture folder is deleted.
             server.daemon_threads = False
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.temporary / f"{name}-profile"
-                profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / f"{name}.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"],
-                                     capture_output=True, text=True, timeout=timeout)
+                run = load_firefox(self, f"http://127.0.0.1:{server.server_port}/",
+                                   complete, size=(1200, 900), timeout=timeout)
                 self.assertEqual(run.returncode, 0, run.stderr)
             finally:
                 release()
@@ -507,7 +504,7 @@ class ImagesTests(ImagesFixture):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        self.run_firefox(BrowserProbe, "browser", release=probe_complete.set)
+        self.run_firefox(BrowserProbe, probe_complete, release=probe_complete.set)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
         self.assertEqual(len(gets), 12, "Load, update, reload, update, one refresh per POST, and the later update.")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [
@@ -1544,7 +1541,7 @@ async (find, whenPageShows, check, controlRefresh) => {
             complete.set()
             first_delivery_released.set()
 
-        self.run_firefox(Probe, 'question-browser', timeout=60, release=release)
+        self.run_firefox(Probe, complete, timeout=60, release=release)
         self.assertEqual(results, [[]])
         return requests
 
@@ -1766,12 +1763,11 @@ class ImagePairTests(ImagesFixture):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        self.run_firefox(Probe, "pair-zoom", release=complete.set)
+        self.run_firefox(Probe, complete, release=complete.set)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_image_pair_stays_side_by_side_at_1024_pixels(self) -> None:
-        from scripts.review_links.test_accounts_page import firefox_probe_results
 
         _ = self.register_pair()
         owner = self.owner
@@ -1818,7 +1814,7 @@ class ImagePairTests(ImagesFixture):
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
-        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
+        self.assertEqual(firefox_probe_results(self, page.replace(b'</body>', probe + b'</body>')), [[]])
 
     def test_pair_feedback_names_the_before_and_after_images(self) -> None:
         record = self.register_pair()

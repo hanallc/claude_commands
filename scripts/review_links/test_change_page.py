@@ -34,6 +34,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
+from scripts.review_links.firefox_test_support import load_firefox
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1802,11 +1803,8 @@ class ChangePageTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                profile = self.temporary / 'copy-profile'
-                profile.mkdir()
-                result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--screenshot', str(self.temporary / 'copy.png'), f'http://127.0.0.1:{server.server_port}/'],
-                    capture_output=True, text=True, timeout=30)
+                result = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                      complete, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
             finally:
                 server.shutdown()
@@ -4036,11 +4034,8 @@ class ChangePageTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.temporary / "browser-profile"
-                profile.mkdir()
-                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                      "--window-size", "390,1200", "--screenshot", str(self.temporary / "browser.png"),
-                                      f"http://127.0.0.1:{server.server_port}/"], capture_output=True, text=True, timeout=45)
+                run = load_firefox(self, f'http://127.0.0.1:{server.server_port}/',
+                                   probe_complete, size=(390, 1200))
                 for kind, mode in cases:
                     with self.subTest(kind=kind, mode=mode):
                         self.assertEqual(run.returncode, 0, run.stderr)

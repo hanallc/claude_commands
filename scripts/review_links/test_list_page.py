@@ -1,7 +1,6 @@
 """Test The List page with private records and a real browser."""
 from __future__ import annotations
 
-import base64
 import html
 import io
 import json
@@ -11,7 +10,6 @@ import shlex
 import select
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
@@ -24,7 +22,6 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import BinaryIO, ClassVar, Literal, cast, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -39,6 +36,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
+from scripts.review_links.firefox_test_support import load_firefox
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
@@ -60,7 +58,6 @@ OTHER = staff.StaffRow(staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8"), "s
 DWIGHT = staff.StaffRow(staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"), "producer", "dwight", staff.StaffRoot(),
                         current_session=staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"))
 NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
-FIREFOX_MIN_SHARED_WIDTH = 500
 
 
 REVIEW_CARD_CONFLICT_CHECK = r"""
@@ -153,14 +150,6 @@ async function checkReviewCardConflict(card,layout,check,advance){
  }
 }
 """
-
-
-def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bool) -> tuple[list[str], dict[str, str]]:
-    profile.mkdir()
-    if dark:
-        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-    command = ["firefox", "--headless", "--no-remote", "--profile", str(profile), "--window-size", f"{width},{height}"]
-    return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
 
 
 def _stop_browser(process: subprocess.Popen[bytes]) -> None:
@@ -331,115 +320,16 @@ class _Chrome(_Browser):
             return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
 
 
-class _Firefox(_Browser):
-    """Keep Firefox open and control its private profile through Marionette."""
-
-    def __init__(self, root: Path) -> None:
-        profile = root / "firefox"
-        profile.mkdir()
-        _ = (profile / "user.js").write_text(
-            'user_pref("marionette.port", 0);\n'
-            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n')
-        with (root / "firefox.log").open("wb") as log:
-            process = subprocess.Popen(
-                ["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                 "--marionette", "--remote-allow-system-access", "about:blank"],
-                stdout=log, stderr=log, start_new_session=True)
-        super().__init__(process)
-        with self.stop_on_error():
-            port_file = profile / "MarionetteActivePort"
-            deadline = time.monotonic() + 30
-            while not port_file.exists():
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError((root / "firefox.log").read_text(errors="replace"))
-                time.sleep(0.02)
-            address = ("127.0.0.1", int(port_file.read_text()))
-            self.connection: socket.socket = self.resources.enter_context(socket.create_connection(address, timeout=45))
-            self.stream: BinaryIO = self.resources.enter_context(self.connection.makefile("rb"))
-            _ = self.read()
-            self.sequence: int = 0
-            _ = self.command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "none"}}})
-            initial = cast(dict[str, str], self.command("WebDriver:GetWindowHandle"))
-            self.initial: str = initial["value"]
-
-    def read(self) -> object:
-        size = bytearray()
-        while (byte := self.stream.read(1)) != b":":
-            if not byte or not byte.isdigit():
-                raise RuntimeError("Firefox closed the Marionette connection")
-            size.extend(byte)
-        return cast(object, json.loads(self.stream.read(int(size))))
-
-    def command(self, method: str, parameters: dict[str, object] | None = None) -> object:
-        self.sequence += 1
-        message = json.dumps([0, self.sequence, method, parameters or {}]).encode()
-        self.connection.sendall(str(len(message)).encode() + b":" + message)
-        kind, sequence, error, result = cast(list[object], self.read())
-        if kind != 1 or sequence != self.sequence or error is not None:
-            raise RuntimeError(f"{method}: {error}")
-        return result
-
-    def script(self, source: str, arguments: list[object]) -> object:
-        result = cast(dict[str, object], self.command("WebDriver:ExecuteScript", {"script": source, "args": arguments}))
-        return result["value"]
-
-    @contextmanager
-    def page(self, destination: str, width: int, height: int, *, dark: bool = False,
-             reduced_motion: bool = False) -> Generator[None]:
-        with self.stop_on_error():
-            _ = self.command("Marionette:SetContext", {"value": "chrome"})
-            cleared = cast(dict[str, object], self.command("WebDriver:ExecuteAsyncScript", {
-                "script": """
-Services.prefs.setIntPref("ui.systemUsesDarkTheme", arguments[0]);
-Services.prefs.setIntPref("ui.prefersReducedMotion", arguments[1]);
-const flags = Ci.nsIClearDataService;
-Services.clearData.deleteData(
-    flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | flags.CLEAR_ALL_CACHES | flags.CLEAR_HISTORY,
-    arguments[2]);
-""", "args": [int(dark), int(reduced_motion)],
-            }))
-            if cleared["value"] != 0:
-                raise RuntimeError(f"Firefox could not clear profile data: {cleared['value']}")
-            _ = self.command("Marionette:SetContext", {"value": "content"})
-            window = cast(dict[str, str], self.command("WebDriver:NewWindow", {"type": "tab", "focus": True}))
-            # If the switch fails, close the group to close the new tab.
-            _ = self.command("WebDriver:SwitchToWindow", {"handle": window["handle"]})
-            dimensions = cast(list[int], self.script("return [outerWidth - innerWidth, outerHeight - innerHeight];", []))
-            _ = self.command("WebDriver:SetWindowRect", {"width": width + dimensions[0], "height": height + dimensions[1]})
-            _ = self.command("WebDriver:Navigate", {"url": destination})
-            yield
-            _ = self.command("WebDriver:CloseWindow")
-            _ = self.command("WebDriver:SwitchToWindow", {"handle": self.initial})
-
-    def screenshot(self, path: Path) -> None:
-        result = cast(dict[str, str], self.command("WebDriver:TakeScreenshot", {"full": False}))
-        _ = path.write_bytes(base64.b64decode(result["value"]))
-
-    def wait_for_load(self, destination: str) -> None:
-        deadline = time.monotonic() + 45
-        while time.monotonic() < deadline:
-            if self.script("""
-// The console can change the query with history.replaceState.
-const navigation = performance.getEntriesByType('navigation')[0];
-return navigation?.name.split('#', 1)[0] === arguments[0] && document.readyState === 'complete';
-""", [destination.partition("#")[0]]) is True:
-                return
-            time.sleep(0.02)
-        raise TimeoutError(f"Firefox did not load {destination}")
-
-
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
     browser_root: ClassVar[Path]
     _chrome: ClassVar[_Chrome | None] = None
-    _firefox: ClassVar[_Firefox | None] = None
 
     @classmethod
     @override
     def setUpClass(cls) -> None:
         cls.browser_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="list-page-class-")))
         cls._chrome = None
-        cls._firefox = None
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
@@ -485,39 +375,11 @@ class ListPageTests(unittest.TestCase):
         cls.addClassCleanup(cls._chrome.close)
         return cls._chrome
 
-    @classmethod
-    def firefox(cls) -> _Firefox:
-        if cls._firefox is not None:
-            if not cls._firefox.closed and cls._firefox.process.poll() is None:
-                return cls._firefox
-            cls._firefox.close()
-        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="firefox-"))
-        cls._firefox = _Firefox(root)
-        cls.addClassCleanup(cls._firefox.close)
-        return cls._firefox
-
     def firefox_view(self, destination: str, path: Path | None, width: int, height: int,
-                     complete: threading.Event | None = None, *, dark: bool = False
+                     complete: threading.Event | None = None, *, dark: bool = False, timeout: float = 45
                      ) -> subprocess.CompletedProcess[str]:
-        if width < FIREFOX_MIN_SHARED_WIDTH:
-            with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
-                root = Path(temporary)
-                command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
-                screenshot = path if path is not None else root / "page.png"
-                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
-                                      capture_output=True, text=True, timeout=45, env=environment)
-        try:
-            browser = self.firefox()
-            with browser.page(destination, width, height, dark=dark):
-                if complete is None:
-                    browser.wait_for_load(destination)
-                elif not complete.wait(45):
-                    raise TimeoutError("Firefox did not report the page result")
-                if path is not None:
-                    browser.screenshot(path)
-        except (OSError, RuntimeError) as error:
-            raise RuntimeError(f"Firefox could not show {destination}") from error
-        return subprocess.CompletedProcess(destination, 0, "", "")
+        return load_firefox(self, destination, complete, size=(width, height), dark=dark,
+                            reduced_motion=False, timeout=timeout, screenshot=path)
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
@@ -1620,8 +1482,8 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                             result = self.firefox_view(url, None, width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
-                            with self.firefox().page(url, width, height, dark=True):
-                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
+                            result = self.firefox_view(url, None, width, height, complete, dark=True, timeout=35)
+                            self.assertEqual(result.returncode, 0, result.stderr)
                     finally:
                         complete.set()
                         server.shutdown()
@@ -1905,8 +1767,8 @@ frame.addEventListener('load',async()=>{
                             result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
-                            with self.firefox().page(destination, 1440, 1100, dark=True):
-                                self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
+                            result = self.firefox_view(destination, None, 1440, 1100, complete, dark=True, timeout=30)
+                            self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(results, [[]])
             finally:
                 complete.set()
@@ -4875,11 +4737,7 @@ observer.observe(original.parentElement,{childList:true});
             _ = self.add(f"List item {number}", number=number)
         with patch.object(list_page, "counts_strip", return_value=""):
             page = list_page.render(self.root / "reviews")
-        def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            return self.firefox_view(arguments[-1], None, 1366, 768)
-
-        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
-            self.assertEqual(save_notice_failures(page, 'remove'), [[]])
+        self.assertEqual(save_notice_failures(self, page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
@@ -7383,13 +7241,7 @@ window.fetch=async(_path,options={})=>{
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
         _ = self.fixture_items()
 
-        def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            path = Path(arguments[arguments.index("--screenshot") + 1])
-            width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
-            return self.firefox_view(arguments[-1], path, int(width), int(height))
-
-        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
-            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
+        assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
