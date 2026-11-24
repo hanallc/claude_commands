@@ -33,6 +33,8 @@ from scripts.lib.slot_root import slot_root as slot_root
 
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
 LEASE_SUFFIX = ".lease.json"
+# Python writes these folders beside each imported module; they hold no work.
+_TOOL_OUTPUT_FOLDERS = ("__pycache__",)
 
 
 @dataclass(frozen=True)
@@ -228,11 +230,13 @@ def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]
         _ = _git(repository, "update-ref", "-d", reference)
 
 
-def _rescue(path: Path) -> None:
+def _rescue(path: Path, output: Sequence[str] = ()) -> None:
+    """Save the source work, but not target, the use stamp or the `output` folders."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
+    generated = [path / "target", path / build_folders.COPY_USE_STAMP, *(path / folder for folder in output)]
     try:
-        _ = git_rescue.rescue(path, name, generated=[path / "target", path / build_folders.COPY_USE_STAMP],
+        _ = git_rescue.rescue(path, name, generated=generated,
                              pass_fds=build_folders.held_build_folder_descriptors())
     except git_rescue.RescueError as error:
         if "status" not in error.command or "index" not in error.stderr:
@@ -244,7 +248,7 @@ def _rescue(path: Path) -> None:
         try:
             descriptor = build_folders.build_folder_lock_fd(path)
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-            _ = git_rescue.rescue(path, name, generated=[path / "target", path / build_folders.COPY_USE_STAMP],
+            _ = git_rescue.rescue(path, name, generated=generated,
                                  pass_fds=build_folders.held_build_folder_descriptors())
         except BaseException:
             _ = saved_index.replace(index)
@@ -414,7 +418,8 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 index.with_name("index.lock").unlink(missing_ok=True)
                 if not os.path.lexists(index):
                     _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
-                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=target/")
+                scan = ("ls-files", "--others", "--directory", "--no-empty-directory", "-z", "--exclude=/target/",
+                        *(f"--exclude={folder}/" for folder in _TOOL_OUTPUT_FOLDERS))
                 rescued = False
                 try:
                     untracked = _git(path, *scan, pass_fds=(descriptor,))
@@ -433,7 +438,8 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     target.unlink()
                 _exclude_slot_target(path, descriptor)
                 if not rescued:
-                    _rescue(path)
+                    output = _git(path, *scan, "--ignored", pass_fds=(descriptor,))
+                    _rescue(path, [entry for entry in output.split("\0") if entry.endswith("/")])
                 _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1))
                 _ = _git(path, "checkout", "--force", "--detach", revision)
                 _ = _git(path, "clean", "-ffx", "--exclude=/target",
