@@ -103,9 +103,10 @@ GATE_PROGRAMS = {
     "targeted-test": ("targeted_test.py",),
 }
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
-# gate.py exits with this status when the assigned Mac Linux guest took no run.
-# It first writes the claim failure next to the placement file, so its caller can place the gate again.
+# The assigned target started no tests.
 MAC_LINUX_PRELAUNCH_REFUSED_STATUS = 79
+# The assigned target could have started tests and supplied no verdict.
+GATE_RESULT_UNKNOWN_STATUS = 80
 CLAIM_FAILURE_SUFFIX = ".claim-failure"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
@@ -148,8 +149,6 @@ def gate_natedev_only_flag(arguments: Sequence[str]) -> str | None:
     """Return the gate option that requires natedev."""
     if _count(arguments, "--module"):
         return "--module"
-    if "--nightly" in arguments:
-        return "--nightly"
     if "--promote-only" in arguments:
         return "--promote-only"
     return None

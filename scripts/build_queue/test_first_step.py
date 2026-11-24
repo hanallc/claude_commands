@@ -63,6 +63,14 @@ class FirstStepTests(unittest.TestCase):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source, requested="mac"), ("mac",))
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("mac-linux",))
 
+    def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            command = (*GATE_COMMAND[:2], "--nightly")
+            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=on\n")
+            with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
+                self.assertEqual(first_step.gate_targets(command, source), ("mac-linux", "natedev"))
+
     def test_hana_gate_has_no_default_targets(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "hana")
@@ -163,7 +171,7 @@ class FirstStepTests(unittest.TestCase):
               mock.patch.object(queue_place, "release_place", return_value=wire.Ok()) as release,
               mock.patch.object(client, "cancel_placement", return_value=wire.Ok()) as cancel):
             admitted.handoff(Path("/fixture"))
-            # The gate ends the reservation after it confirms the assignment.
+            # The gate keeps the reservation through the suites.
             release.assert_not_called()
             cancel.assert_not_called()
             self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
@@ -190,8 +198,9 @@ class FirstStepTests(unittest.TestCase):
                 targets = first_step.gate_targets(command, source=source) if use_default else expected[::-1]
                 if use_default:
                     self.assertEqual(targets, expected)
+                    nightly = (*GATE_COMMAND[:2], "--nightly", "--merge-branch", "main", "--unit", "fixture")
+                    self.assertEqual(first_step.gate_targets(nightly, source=source), expected)
                     for arguments in (("--tests-only", "--module=fixture/test_gate.py"),
-                                      ("--nightly", "--merge-branch", "main", "--unit", "fixture"),
                                       ("--promote-only", "--merge-branch", "main")):
                         local_only = (*GATE_COMMAND[:2], *arguments)
                         self.assertEqual(first_step.gate_targets(local_only, source=source), ())
