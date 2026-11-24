@@ -9,7 +9,10 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
+from textwrap import dedent
+from time import monotonic
 from typing import cast
 import unittest
 from unittest import mock
@@ -17,17 +20,31 @@ from unittest import mock
 from scripts.aws_target import cloud_gate
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, first_step, placement, queue_place
+from scripts.build_queue import admission_service as service
 from scripts.build_queue.admission_client import OuterReservation
+from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_targets import mac_linux
 from scripts.buildlog import treekey
 from scripts.copies import copies
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_folders, conf, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.production import gate
 from scripts.production.gate_routes import GateResultUnknown, ModuleCoverage
+
+
+DIRECT_GATE_ARGUMENTS = (
+    ('--affected',),
+    ('--tests-only',),
+    ('--nightly', '--merge-branch', 'main', '--unit', 'fixture'),
+    ('--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
+     '--previous-checkpoint', 'base', '--unit', 'fixture', '--phase', '1'),
+)
 
 
 def placed(target: str) -> wire.Assignment:
@@ -44,12 +61,113 @@ def inherited_admission(grant: wire.Assignment) -> first_step.FirstStepAdmission
         first_step.InheritedGatePlacement(grant), Path('/fixture/assignment.json'))
 
 
+def run_held_direct_gate(ready: Path, arguments: list[str]) -> int:
+    """Enter the direct placement and stop before the build or guest launch."""
+    def hold(*_args: object) -> int:
+        ready.touch()
+        _ = sys.stdin.read()
+        raise AssertionError("The parent did not terminate the gate")
+
+    def hold_placed(args: gate.GateArguments, target: gate.GateTarget) -> int:
+        with gate.gate_suite_target(args, Path(args.repo), target):
+            return hold()
+
+    # The tests-only route still has a legacy SIGTERM handler. Test owner exit without it.
+    with (mock.patch.object(gate, 'unwind_gate_on_sigterm', nullcontext),
+          mock.patch.object(gate, 'run_tests_only', side_effect=hold),
+          mock.patch.object(gate, 'merge_checkpoint', side_effect=hold_placed),
+          mock.patch.object(gate, 'nightly', side_effect=hold_placed),
+          mock.patch.object(gate, '_nightly_unit', return_value='fixture'),
+          mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
+          mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),
+          mock.patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+          mock.patch.object(build_folders, 'tool_folder', return_value=nullcontext(ready.parent))):
+        return gate.main(arguments)
+
+
 class GateDefaultPlacementTests(unittest.TestCase):
-    def test_sigterm_releases_each_direct_placement_before_termination(self) -> None:
-        merge = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
-                 '--previous-checkpoint', 'base', '--unit', 'fixture', '--phase', '1']
-        nightly = ['--nightly', '--merge-branch', 'main', '--unit', 'fixture']
-        for arguments in (['--affected'], ['--tests-only'], nightly, merge):
+    def test_sigterm_releases_each_direct_placement_after_owner_exit(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        # Allow eight minimum pass gaps. The idle pass interval is five seconds.
+        release_limit = 2.0
+        for arguments in DIRECT_GATE_ARGUMENTS:
+            target = 'mac-linux' if arguments == ('--affected',) else 'natedev'
+            with self.subTest(arguments=arguments, target=target), AdmissionFixture() as fixture:
+                def available(key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
+                    return placement.FreshHostEvidence(key, fixture.clock.now(),
+                        key.configuration_generation, placement.AllowedHost())
+
+                fixture.server.host_probe = available
+                ready = fixture.root / 'gate-ready'
+                source = fixture.root / 'checkout'
+                source.mkdir()
+                environment = fixture_git_environment(fixture.root)
+                environment['BUILDLOG_GATE_TARGETS'] = target
+                for name in ('BUILDLOG_PLACEMENT_FILE', 'BUILDLOG_PLACEMENT_EPISODE', 'BUILDLOG_PREPARED_COPY'):
+                    _ = environment.pop(name, None)
+                _ = subprocess.run(['git', 'init', '-q'], cwd=source, env=environment, check=True,
+                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+                _ = subprocess.run(['git', 'remote', 'add', 'origin', str(fixture.root / 'claude_commands.git')],
+                                   cwd=source, env=environment, check=True, capture_output=True,
+                                   timeout=TEST_HANG_GUARD_SECS)
+                _ = commit_repository(source, 'Fixture checkout', allow_empty=True, env=environment)
+                program = dedent('''\
+                    from pathlib import Path
+                    import sys
+                    from scripts.production.test_gate_default_placement import run_held_direct_gate
+
+                    raise SystemExit(run_held_direct_gate(Path(sys.argv[1]), sys.argv[2:]))
+                    ''')
+                command = [sys.executable, '-B', '-c', program, str(ready), *arguments, '--repo', str(source)]
+                with (mock.patch.object(fixture.server, '_prune_places',
+                                        wraps=getattr(fixture.server, '_prune_places')) as prune,
+                      fixture.serving(), subprocess.Popen(command, cwd=repository, env=environment,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child):
+                    try:
+                        wait_until(lambda: ready.exists() or child.poll() is not None, fixture.root,
+                                   processes=(child,))
+                        if not ready.exists():
+                            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                            self.fail(output + errors)
+                        assignment = wire.read_assignment(fixture.root / 'assignment.json').assignment
+                        episode = assignment.episode
+                        attempt = execution_identity.attempt_key(episode, assignment.attempt)
+                        owner = wire.Owner(child.pid, assignment.owner.start_time)
+                        watch = service.OwnerWatch(owner)
+                        self.assertEqual(assignment.owner.pid, child.pid)
+                        self.assertEqual(assignment.destination.target, target)
+                        with fixture.loop_turn():
+                            self.assertEqual(fixture.server.current_assignments[episode], attempt)
+                            self.assertIn(watch, fixture.server.watchers.values())
+                            self.assertEqual(episode in fixture.server.reservations, target == 'natedev')
+                            permission = fixture.server.assignments[attempt].permission
+                            expected = placement.PermissionAvailable if target == 'mac-linux' else placement.PermissionConsumed
+                            self.assertIsInstance(permission, expected)
+
+                        def released() -> bool:
+                            state = service.read_state(fixture.state_dir)
+                            return (episode not in state.current_assignments
+                                    and episode not in state.reservations
+                                    and isinstance(state.assignments[attempt].state, placement.ClosedAssignment))
+
+                        started = monotonic()
+                        child.send_signal(signal.SIGTERM)
+                        wait_until(released, fixture.state_dir, timeout=release_limit)
+                        elapsed = monotonic() - started
+                        self.assertLess(elapsed, release_limit)
+                        print(f'{target} {arguments[0]} SIGTERM to release: {elapsed:.3f}s', flush=True)
+                        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(child.returncode, -signal.SIGTERM, output + errors)
+                        with fixture.loop_turn():
+                            prune.assert_any_call(watch)
+                            self.assertNotIn(watch, fixture.server.watchers.values())
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_incomplete_gate_releases_each_direct_placement(self) -> None:
+        for arguments in DIRECT_GATE_ARGUMENTS:
             with self.subTest(arguments=arguments):
                 events: list[str] = []
 
@@ -62,20 +180,12 @@ class GateDefaultPlacementTests(unittest.TestCase):
                         events.append('release')
 
                 def interrupt(*_args: object) -> int:
-                    handler = signal.getsignal(signal.SIGTERM)
-                    assert callable(handler)
                     events.append('interrupt')
-                    handler(signal.SIGTERM, None)
-                    raise AssertionError('SIGTERM did not interrupt the gate')
+                    raise GateResultUnknown('The fixture gate stopped')
 
                 def interrupt_placed(args: gate.GateArguments, target: gate.GateTarget) -> int:
                     with gate.gate_suite_target(args, Path.cwd(), target):
                         return interrupt()
-
-                def terminate(number: int) -> None:
-                    self.assertEqual(number, signal.SIGTERM)
-                    self.assertEqual(signal.getsignal(number), signal.SIG_DFL)
-                    events.append('terminate')
 
                 with (mock.patch.dict(os.environ, clear=True),
                       mock.patch.object(first_step, 'gate_targets', return_value=('natedev',)),
@@ -91,11 +201,10 @@ class GateDefaultPlacementTests(unittest.TestCase):
                       mock.patch.object(gate, 'test_run_folder', return_value=nullcontext()),
                       mock.patch.object(scratch, 'copy_lock', return_value=nullcontext()),
                       mock.patch.object(gate, 'gate_recovery', return_value=nullcontext()),
-                      mock.patch.object(signal, 'raise_signal', side_effect=terminate),
-                      self.assertRaises(SystemExit) as exited):
-                    _ = gate.main(arguments)
-                self.assertEqual(exited.exception.code, 128 + signal.SIGTERM)
-                self.assertEqual(events, ['admit', 'interrupt', 'release', 'terminate'])
+                      mock.patch.object(gate, 'unwind_gate_on_sigterm', nullcontext),
+                      redirect_stderr(io.StringIO())):
+                    self.assertEqual(gate.main(arguments), GATE_UNSETTLED_LAUNCH_STATUS)
+                    self.assertEqual(events, ['admit', 'interrupt', 'release'])
 
     def test_gate_step_preserves_incomplete_child_status_when_cancellation_fails(self) -> None:
         for status in (GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS):

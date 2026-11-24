@@ -386,8 +386,7 @@ class FirstStepTests(unittest.TestCase):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("natedev",))
 
     def test_named_module_gate_keeps_the_guest_excluded_from_placement(self) -> None:
-        self.check_named_gate_candidates(MODULE_GATE_COMMAND,
-            placement.FixedExclusion("--module runs only on natedev"), "natedev")
+        self.check_named_gate_candidates(MODULE_GATE_COMMAND, include_guest=False)
 
     def test_named_module_gate_refuses_targets_without_natedev(self) -> None:
         with PlacementFixture() as fixture:
@@ -402,14 +401,14 @@ class FirstStepTests(unittest.TestCase):
                 place.assert_not_called()
 
     def test_named_plain_gate_keeps_both_targets_eligible(self) -> None:
-        self.check_named_gate_candidates(GATE_COMMAND, placement.AllowedHost(), "mac-linux")
+        self.check_named_gate_candidates(GATE_COMMAND, include_guest=True)
 
-    def check_named_gate_candidates(self, command: tuple[str, ...],
-                                    guest_eligibility: placement.AllowedHost | placement.FixedExclusion,
-                                    target: str) -> None:
+    def check_named_gate_candidates(self, command: tuple[str, ...], *, include_guest: bool) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
             owner = fixture.fixture_owner(os.getpid(), "123")
+            local = local_candidate(fixture)
+            expected = (mac_linux_candidate(), local) if include_guest else (local,)
 
             def grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted | wire.Assignment:
                 _ = publish_candidate(fixture, request)
@@ -425,9 +424,8 @@ class FirstStepTests(unittest.TestCase):
                 with first_step.admitted_run(command, source, targets=("natedev", "mac-linux")) as admitted:
                     placed = admitted.grant
                     assert isinstance(placed, first_step.OwnedGatePlacement)
-                    self.assertEqual(placed.grant.assignment.destination.target, target)
-                    guest = replace(mac_linux_candidate(), eligibility=guest_eligibility)
-                    self.assertEqual(placed.request.constraints.candidates, (guest, local_candidate(fixture)))
+                    self.assertEqual(placed.grant.assignment.destination.target, expected[0].destination.target)
+                    self.assertEqual(placed.request.constraints.candidates, expected)
 
     def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
         position = SlotQueuePosition("episode", 3)

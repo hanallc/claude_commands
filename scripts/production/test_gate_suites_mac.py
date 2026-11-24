@@ -921,7 +921,7 @@ class MacGateSuitesTests(GateSuitesFixture):
                 self.assertEqual(os.environ["BUILDLOG_PLACEMENT_EPISODE"], local_grant.assignment.episode)
             self.assert_reservation_ended(local_grant)
         self.assertEqual(result.returncode, 0)
-        released.assert_called_once_with(local_grant.grant.reservation, 0, local_grant.grant.cleanup_timing)
+        released.assert_called_once_with(local_grant.grant.reservation, 0, local_grant.grant.cleanup_timing, "result")
         guest.assert_called_once()
         local.assert_called_once()
         settled.assert_called_once()
