@@ -283,13 +283,7 @@ def run_gate_with_placement(
             else:
                 client.request_settlement(wire.SettlementRequest(previous))
                 if mac_linux:
-                    # A retry also requires a report that the guest took no run.
-                    try:
-                        refusal = read_gate_claim_failure(assignment_file, request)
-                    except FileNotFoundError:
-                        return result
-                    if refusal.reason != placement.MAC_LINUX_NO_ANSWER:
-                        return result
+                    return result
                 waiting_for_settlement = True
             if mac_linux and waiting_for_settlement:
                 print(f'waiting for Mac Linux to confirm the end of attempt {previous.attempt}', flush=True)

@@ -49,6 +49,7 @@ The count excludes type checks.
 Older guest gate code can return its result without sending progress records.
 If a guest attempt fails without a confirmed start, the gate exits with status 79 and reports the exact assignment.
 If the gate consumed permission and sent no arm command, it saves proof that the guest did not start.
+If the permission reply is lost, the gate checks for saved consumption with the exact launch claim.
 The queue checks that the holder ended and that the attempt has no recorded start.
 For a placed gate, `copies.py run` keeps the copy lease and submits the original placement request again.
 The queue keeps the original rank and assigns the next available candidate other than the guest.
@@ -56,6 +57,9 @@ The queue saves the retry decision and restores it after a restart.
 The old guest attempt holds its slot until the queue reads exact end proof and checks that no start remains pending.
 If the claim failure is missing or invalid, `copies.py run` reports `Gate placement blocked` and returns status 79.
 If a confirmed guest start has no result, the gate exits with status 80 and requests settlement.
+If the gate loses the permission reply and cannot confirm consumption, it exits with status 80.
+After consumption, a failure to release the launch holder or save the refusal also returns status 80.
+A Mac Linux gate with status 80 requests settlement without retrying.
 The queue keeps the guest slot until settlement and ends the attempt without a retry.
 A stream failure reports its status and up to 1200 characters from standard error.
 A stream timeout reports the diagnostics it received before the deadline.

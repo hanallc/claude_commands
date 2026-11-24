@@ -253,7 +253,7 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
     """Consume permission after the gate syncs its launch record.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
-    A lost consume reply leaves the permission unknown. The guest starts nothing.
+    If the reply is lost, the gate stops before it sends the arm command.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
     from scripts.buildlog import store
@@ -267,11 +267,11 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
         permission = admission_client.consume_permission(
             wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder, guest_proof_required=True))
     except wire.AdmissionUnavailable as error:
-        raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}') from error
+        raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}', reference) from error
     if isinstance(permission, wire.DispatchStatus):
         reason = f'the queue refused the launch permission: {permission.reason}'
         if isinstance(permission.permission, placement.PermissionConsumed):
-            raise GuestPermissionUnknown(reason)
+            raise GuestPermissionUnknown(reason, reference)
         raise GuestTookNoRun(reason)
     return reference
 
@@ -663,6 +663,10 @@ class GuestTookNoRun(GuestUnavailable):
 
 class GuestPermissionUnknown(GuestTookNoRun):
     """The queue may hold consumed permission without giving the gate launch authorization."""
+
+    def __init__(self, reason: str, claim: ProviderClaimReference) -> None:
+        super().__init__(reason)
+        self.claim: ProviderClaimReference = claim
 
 
 class GuestConnectAttemptsFailed(GuestTookNoRun):
@@ -1390,6 +1394,25 @@ def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: 
     if not isinstance(response, wire.DispatchStatus):
         raise wire.AdmissionUnavailable('invalid execution report answer')
     return response
+
+
+def guest_permission_consumed(assignment: PlacementAssignment, claim: ProviderClaimReference) -> bool:
+    """Check whether the queue saved consumed permission for this launch claim."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_wire, placement
+
+    query = admission_wire.PlacementStatusRequest(assignment.episode, assignment.attempt, include_permission=True,
+                                                  code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read('build_admission').number('query_timeout_seconds')
+        reply = _guest_queue_query(query, deadline=monotonic() + timeout, timeout=timeout)
+    except (wire.AdmissionUnavailable, OSError, ValueError):
+        return False
+    return (isinstance(reply, admission_wire.PlacementStatusReply)
+            and isinstance(saved := reply.status, admission_wire.KnownPlacementStatus)
+            and saved.assignment == assignment and saved.claim == claim
+            and isinstance(saved.state, placement.CurrentAssignment)
+            and isinstance(saved.permission, placement.PermissionConsumed))
 
 
 def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
@@ -2343,10 +2366,14 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         saved, launch = launch, None
         _release_guest_launch(saved)
 
-    def refused(reason: str, *, permission_unknown: bool = False,
+    def refused(reason: str, *, uncertain_claim: ProviderClaimReference | None = None,
                 lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
-        if dispatch is None and not permission_unknown:
-            return GuestNotStarted(reason)
+        nonlocal dispatch
+        if dispatch is None:
+            if uncertain_claim is None:
+                return GuestNotStarted(reason)
+            if guest_permission_consumed(assignment, uncertain_claim):
+                dispatch = GuestGateDispatch(assignment, uncertain_claim)
         if dispatch is not None:
             if dispatch.arm_requested:
                 if dispatch.started is not None:
@@ -2360,7 +2387,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
             release_launch()
         except OSError as error:
             return GuestGateBlocked(f'{reason}. Cannot release the Mac Linux launch holder: {error}')
-        return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=dispatch is not None)
+        if dispatch is None:
+            return GuestGateBlocked(f'{reason}. The queue did not confirm consumption for this launch claim.')
+        return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
 
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
@@ -2428,7 +2457,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return refused(str(error))
     except (GuestTookNoRun, GuestNotLocked) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown),
+        return refused(' '.join((str(error), *notes)),
+                       uncertain_claim=error.claim if isinstance(error, GuestPermissionUnknown) else None,
                        lock_refused=isinstance(error, GuestNotLocked))
     except GuestEndUnproven as error:
         if dispatch is not None:

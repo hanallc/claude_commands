@@ -1436,12 +1436,51 @@ fi
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
         with patch.object(admission_client, 'consume_permission',
                           side_effect=wire.AdmissionUnavailable('fixture lost authorization reply')) as consume:
-            self.assertIn('fixture lost authorization reply', self.not_started(self.route()))
+            self.assertIn('fixture lost authorization reply', self.blocked(self.route()))
         consume.assert_called_once()
         request = cast(wire.ConsumePermission, consume.call_args.args[0])
         self.assertEqual(request.assignment, self.placed)
         self.assertEqual(self.trace.read_text(), '')
         return request
+
+    def test_lost_guest_permission_reply_with_exact_consumption_exits_79(self) -> None:
+        fixture = GatePlacementFixture(self)
+        guest = self.placed = replace(fixture.guest, attempt=f'{23:032x}')
+        admission_wire.write_assignment(fixture.assignment_file, wire.Assignment(guest))
+        consume = admission_client.consume_permission
+
+        def lose_reply(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+            saved = consume(request)
+            self.assertIsInstance(saved, wire.FirstAuthorization)
+            raise wire.AdmissionUnavailable('fixture lost authorization reply')
+
+        def status(query: admission_wire.PlacementStatusRequest, *, deadline: float,
+                   timeout: float) -> admission_wire.PlacementStatusReply:
+            self.assertEqual((query.episode, query.attempt, query.include_permission), (guest.episode, guest.attempt, True))
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(timeout, 1)
+            (request, _trace, _held), = self.consumed
+            return admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+                guest, placement.CurrentAssignment(), request.claim, placement.PermissionConsumed(1.0)))
+
+        with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(fixture.assignment_file)}),
+              patch.object(gate, 'current_gate_placement', return_value=wire.Assignment(guest)),
+              patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+              patch.object(admission_client, 'consume_permission', side_effect=lose_reply) as lost,
+              patch.object(mac_linux, '_guest_queue_query', side_effect=status) as query,
+              patch.object(mac_linux, 'send_guest_execution') as execution,
+              redirect_stderr(io.StringIO()) as errors):
+            result = gate.main(('--tests-only', '--full', '--module-time-limit-s', '3', '--repo', str(self.repo)))
+        self.assertEqual(result, 79, errors.getvalue())
+        self.assertIn('fixture lost authorization reply', errors.getvalue())
+        report = wire.parse_request(fixture.report_file.read_bytes())
+        assert isinstance(report, wire.ClaimFailure), report
+        self.assertEqual((report.assignment, report.reason), (guest, 'mac_linux_start_unconfirmed'))
+        self.assertEqual(mac_linux.settlement(guest.episode, 23), placement.Settled())
+        lost.assert_called_once()
+        query.assert_called_once()
+        execution.assert_not_called()
+        self.assert_guest_clean()
 
     def test_lost_guest_permission_reply_settles_after_the_guest_fences_the_attempt(self) -> None:
         request = self.lose_guest_permission_reply(23)
@@ -1475,19 +1514,30 @@ fi
         for attempt, scenario in ((48, 'missing-arm-ack'), (49, 'lost-consume-reply'), (51, 'already-consumed')):
             with self.subTest(scenario=scenario):
                 self.placed = replace(self.placed, attempt=f'{attempt:032x}')
+                status_reply = nullcontext()
                 if scenario == 'already-consumed':
+                    permission = placement.PermissionConsumed(1.0)
                     reply = wire.DispatchStatus(self.placed, placement.CurrentAssignment(),
-                        placement.PermissionConsumed(1.0), 'launch permission was already consumed')
+                        permission, 'launch permission was already consumed')
                     consume = patch.object(admission_client, 'consume_permission', return_value=reply)
+                    destination = self.placed.destination
+                    other_claim = placement.ProviderClaimReference(destination.provider, destination.target,
+                        destination.scope, 'other-claim', self.placed.episode, self.placed.attempt)
+                    saved = admission_wire.KnownPlacementStatus(self.placed, placement.CurrentAssignment(),
+                        other_claim, permission)
+                    status_reply = patch.object(mac_linux, '_guest_queue_query',
+                        return_value=admission_wire.PlacementStatusReply(saved))
                 elif scenario == 'lost-consume-reply':
                     consume = patch.object(admission_client, 'consume_permission',
                                            side_effect=wire.AdmissionUnavailable('fixture lost consume reply'))
                 else:
                     consume = nullcontext()
-                with consume, patch.object(mac_linux, 'send_guest_execution') as report:
+                with consume, status_reply, patch.object(mac_linux, 'send_guest_execution') as report:
                     outcome = self.route(scenario)
-                assert isinstance(outcome, mac_linux.GuestNotStarted), outcome
-                self.assertTrue(outcome.settlement_required)
+                if scenario == 'missing-arm-ack':
+                    _ = self.unconfirmed(outcome)
+                else:
+                    self.assertIn('The queue did not confirm consumption for this launch claim', self.blocked(outcome))
                 report.assert_not_called()
                 with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
                     mac_linux.reconcile_unproven(self.placed.episode, attempt)
@@ -1755,6 +1805,33 @@ fi
         execution.assert_not_called()
         self.assertEqual(len(self.consumed), 1)
         self.assertEqual(mac_linux.settlement(guest.episode, 42), placement.Settled())
+        self.assert_guest_clean('probe')
+
+    def test_guest_refusal_write_failure_keeps_exit_80_with_a_legacy_report(self) -> None:
+        fixture = GatePlacementFixture(self)
+        self.placed = fixture.guest
+        _ = fixture.report_file.write_text(admission_wire.encode_request(fixture.refusal))
+        args = ('--tests-only', '--full', '--module-time-limit-s', '3', '--repo', str(self.repo))
+
+        def run() -> subprocess.CompletedProcess[str]:
+            with redirect_stderr(io.StringIO()) as errors:
+                status = gate.main(args)
+            return subprocess.CompletedProcess(args, status, '', errors.getvalue())
+
+        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'main-probe-failure',
+                                     'BUILDLOG_PLACEMENT_FILE': str(fixture.assignment_file)}),
+              patch.object(gate, 'current_gate_placement', return_value=wire.Assignment(fixture.guest)),
+              patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+              patch.object(gate, 'write_gate_claim_failure', side_effect=OSError('fixture sidecar write failed')),
+              patch.object(admission_client, 'request_settlement') as settle):
+            result = first_step.run_gate_with_placement(run, fixture.assignment_file, fixture.request, fixture.place_again)
+        self.assertEqual(result.returncode, 80, result.stderr)
+        self.assertIn('fixture sidecar write failed', result.stderr)
+        self.assertEqual(wire.parse_request(fixture.report_file.read_bytes()), fixture.refusal)
+        self.assertEqual(len(self.consumed), 1)
+        settle.assert_called_once_with(wire.SettlementRequest(fixture.guest))
+        fixture.report_failure.assert_not_called()
+        fixture.place_again.assert_not_called()
         self.assert_guest_clean('probe')
 
     def test_arm_connect_failures_save_not_started_proof(self) -> None:
