@@ -220,9 +220,9 @@ Group B (branches `style-s3-rename`, `style-s3-applied` and `style-s3-footprint`
 7. `s3-rename-applied`: `rename_applied`, the ticket-aware applied check. It builds on `s3-rename`.
 8. `s3-footprint`: `footprint`; then the S3 measure (needed blobs, cold time, the stop point).
 
-Group C:
+Group C (branch `style-s3-declarations`, checkpoint f991c6968, 2026-11-24; it merges main next):
 
-9. `s3-declarations`: `declaration` and `site_evidence`, the complete declaration reading. The request carries an approval snapshot (decision paths and answers); Python keeps the decision-file parse.
+9. `s3-declarations`: `declaration`, `site_evidence` and `approvals`, the complete declaration reading. The request carries an approval snapshot (decision paths and answers); Python keeps the decision-file parse. The phase also moved the S3 readers to the one oracle pin 1210fd999a: the ledger read accepts schemas 47 and 51 from one list, and the file rename plan follows the Python grammar.
 
 Code with no consumer cannot land, so each S3 phase extends `finding`, its consumer. The `next` request and reply types (`NextOutcome`, `SelectedTicket`) move to S5, which builds `next` (style-unit, 2026-11-18).
 
