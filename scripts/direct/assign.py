@@ -215,6 +215,22 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
     return paths
 
 
+def require_as_built_home(owner: staff.StaffRow | unit_runs.RunOwnerUnrecorded, cwd: Path) -> None:
+    """Require the launch directory to match the unit home checkout."""
+    if not isinstance(owner, staff.StaffRow) or owner.kind != "unit":
+        refuse("Run as-built requires a unit staff owner.")
+    if not isinstance(owner.worktree, staff.PresentWorktree):
+        refuse(f"{owner.name}: unit has no active home checkout.")
+    home = owner.worktree.path.resolve()
+    try:
+        phase_reservation._require_model_worktree(  # pyright: ignore[reportPrivateUsage]
+            home, owner.name, fix=phase_reservation.MOVE_UNIT_HOME)
+    except phase_reservation.StateRefused as error:
+        refuse(str(error))
+    if cwd != home:
+        refuse(f"Run as-built --cwd must resolve to the run home checkout {home}.")
+
+
 def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> tuple[Path, str]:
     director = staff.runtime_id()
     session = args.session_dir
@@ -240,9 +256,17 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
                     if args.phase else recorder_state.only_open_phase(state))
     last_finished = object_map(state.get("phase")) if not phases else {}
     phase = args.phase or text((stored_phase or last_finished).get("id")) or "1"
+    if phase == pass_recorder.AS_BUILT_PHASE and not args.phase:
+        refuse("Missing phase: --phase as-built is required for run as-built")
     if phase != "ad hoc" and (not re.fullmatch(r"[A-Za-z0-9_.-]+", phase) or phase in (".", "..")):
         refuse(f"invalid phase id: {phase}")
     try:
+        if phase == pass_recorder.AS_BUILT_PHASE:
+            membership = staff.local_snapshot()
+            if "status" in state or not unit_runs.run_is_open(run, record=membership):
+                refuse(pass_recorder.AS_BUILT_OPEN_RUN_REQUIRED)
+            require_as_built_home(unit_runs.run_owner(state, membership), cwd)
+            return run, phase
         run_open = unit_runs.run_is_open(run)
     except staff.StaffUnreadable as error:
         print(f"assign.sh: {error}", file=sys.stderr)
@@ -518,7 +542,8 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
-    if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(),
+    if role != "review" and phase != pass_recorder.AS_BUILT_PHASE and not assign_claude.claim_phase(
+            run, phase, Path(args.cwd).expanduser().resolve(),
             log, assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
         return 1
     command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),

@@ -1131,6 +1131,34 @@ def resource_wait_task(work: str, wait: phase_waits.PhaseWait, *, unit: str,
     return TaskLine(work, wait_state_text(wait, snapshot=snapshot, now=now, zone=zone), "own_wait" if own else "waiting")
 
 
+def worker_tasks(work: str, event: dict[str, object], worker: census.CensusWorker) -> tuple[TaskLine, ...]:
+    """Describe the worker's recorded work."""
+    role = role_words(str(event.get("pass_kind", "")), worker.name)
+    runs = [run for run in worker.runs if run.state == "running"]
+    if runs:
+        return tuple(TaskLine(work, f"{role} runs {run.label}", "running") for run in runs)
+    if any(run.state == "finished_queued" for run in worker.runs):
+        return (TaskLine(work, "Worker finished; director has not read the result", "result"),)
+    if worker.runs:
+        return (TaskLine(work, "Worker activity not recorded", "unexplained"),)
+    if worker.status == "busy":
+        return (TaskLine(work, f"{role} runs it", "running"),)
+    return ()
+
+
+def as_built_tasks(events: list[dict[str, object]], workers: tuple[census.CensusWorker, ...]) -> tuple[TaskLine, ...]:
+    """Show the run's open as-built passes."""
+    work = pass_recorder.AS_BUILT_TITLE
+    tasks: list[TaskLine] = []
+    for event in open_passes(events):
+        if event.get("phase_id") != pass_recorder.AS_BUILT_PHASE:
+            continue
+        worker = next((row for row in workers if row.staff_id == event.get("worker_id")), None)
+        observed = worker_tasks(work, event, worker) if worker is not None else ()
+        tasks.extend(observed or (TaskLine(work, "Worker activity not recorded", "unexplained"),))
+    return tuple(tasks)
+
+
 def phase_tasks(phase: phase_table.OpenPhase, events: list[dict[str, object]], *, unit: str,
                 workers: tuple[census.CensusWorker, ...], snapshot: staff.StaffSnapshot,
                 now: float, zone: ZoneInfo) -> tuple[TaskLine, ...]:
@@ -1159,17 +1187,7 @@ def phase_tasks(phase: phase_table.OpenPhase, events: list[dict[str, object]], *
                 tasks.append(resource_wait_task(work, wait, unit=unit, snapshot=snapshot, now=now, zone=zone))
                 used_waits.add(index)
             continue
-        role = role_words(str(event.get("pass_kind", "")), worker.name)
-        runs = [run for run in worker.runs if run.state == "running"]
-        if runs:
-            tasks.extend(TaskLine(work, f"{role} runs {run.label}", "running")
-                         for run in runs)
-        elif any(run.state == "finished_queued" for run in worker.runs):
-            tasks.append(TaskLine(work, "Worker finished; director has not read the result", "result"))
-        elif worker.runs:
-            tasks.append(TaskLine(work, "Worker activity not recorded", "unexplained"))
-        elif worker.status == "busy":
-            tasks.append(TaskLine(work, f"{role} runs it", "running"))
+        tasks.extend(worker_tasks(work, event, worker))
     for index, wait in enumerate(waits):
         if index not in used_waits:
             tasks.append(resource_wait_task(work, wait, unit=unit, snapshot=snapshot, now=now, zone=zone))
@@ -1585,6 +1603,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         status = director_status(unit)
         busy = status == "busy"
         run_events: list[dict[str, object]] = []
+        active_run = False
         phases: tuple[phase_table.OpenPhase, ...] = ()
         queue: UnitWorkQueue | UnreadableWorkQueue = UnreadableWorkQueue()
         workers: tuple[census.CensusWorker, ...] = ()
@@ -1598,6 +1617,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 open_phases: list[dict[str, object]] = []
                 if (isinstance(member.run, staff.OpenRun) and member.run.path.name == run.path.stem
                         and not run_is_finished(run_events)):
+                    active_run = True
                     try:
                         open_phases = recorder_state.read_open_phases(member.run.path)
                     except ValueError as error:
@@ -1677,6 +1697,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         tasks = tuple(task for phase in phases if isinstance(open_sent[phase.phase], NoSentWork)
                       for task in phase_tasks(phase, run_events, unit=unit.unit, workers=workers, snapshot=snapshot,
                                                now=now, zone=zone))
+        if active_run:
+            tasks += as_built_tasks(run_events, workers)
         shells = _director_shells(view, unit, owner_machine)
         shell_work_unproved = isinstance(shells, UnprovedDirectorShellWork)
         if not shell_work_unproved:

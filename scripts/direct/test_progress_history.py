@@ -48,6 +48,7 @@ from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_finding
 from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
+from scripts.herdr import worker_panes
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -8852,6 +8853,49 @@ with patch.object(fcntl, "flock", admission):
         self.assert_launch_refused(session, result, phase_id="13")
         self.assertIn("Phase 13 is not open", result.stderr)
 
+    def test_as_built_launch_does_not_authorize_a_closed_numbered_phase(self) -> None:
+        session = self.start_run("launch-after-plan", 42_500)
+        self.start_numbered_phase(session, "13", 42_510)
+        self.finish_numbered_phase(session, 42_520, "--phase-id", "13")
+
+        closed = self.launch_probe(session, "--phase-id", "13")
+        self.assert_launch_refused(session, closed, phase_id="13")
+        self.assertIn("Phase 13 is not open; open phases: none", closed.stderr)
+        as_built = self.launch_probe(session, "--phase-id", "as-built", at=42_540)
+        self.assertEqual(as_built.returncode, 0, as_built.stderr)
+
+    def test_as_built_recorder_refuses_a_finished_run(self) -> None:
+        session = self.start_run("as-built-finished", 42_500, unit_owned=True)
+        self.start_numbered_phase(session, "13", 42_510)
+        _ = self.run_command("finish-run", "--session-dir", str(session), "--status", "completed", at=42_520)
+        for command in ("check-launch", "start-pass"):
+            with self.subTest(command=command):
+                result = (self.launch_probe(session, "--phase-id", "as-built") if command == "start-pass"
+                          else self.run_failing_command("check-launch", "--session-dir", str(session),
+                                                        "--pass-kind", "impl", "--phase-id", "as-built", at=42_525))
+                self.assert_launch_refused(session, result, phase_id="as-built")
+                self.assertIn("Run as-built requires an open run.", result.stderr)
+
+    def test_start_phase_refuses_while_an_as_built_pass_is_active(self) -> None:
+        session = self.start_run("start-phase-during-as-built", 42_500, unit_owned=True)
+        self.start_numbered_phase(session, "13", 42_510)
+        self.finish_numbered_phase(session, 42_520, "--phase-id", "13")
+        launched = self.launch_probe(session, "--phase-id", "as-built")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        before = self.read_state(session)
+        events = self.read_events(session.name)
+
+        result = self.run_failing_command("start-phase", "--session-dir", str(session),
+                                          "--phase-id", "16", "--phase-title", "Next phase", at=42_540)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Finish the as-built pass first.", result.stderr)
+        self.assertEqual(self.read_state(session), before)
+        self.assertEqual(self.read_events(session.name), events)
+        _ = self.run_command("finish-pass", "--session-dir", str(session), "--status", "completed", at=42_550)
+        self.start_numbered_phase(session, "16", 42_560)
+        self.assertEqual(self.open_phase_ids(session), ["16"])
+
     def test_launch_refuses_each_stale_prompt_identity(self) -> None:
         for index, line in enumerate((
             "Phase 4 — Retry handling", "Phase 3 — Old title",
@@ -9041,6 +9085,26 @@ with patch.object(fcntl, "flock", admission):
         finished = self.phase_events("finish-run-open-phases", "phase_finished")
         self.assertEqual([event.get("phase_id") for event in finished], ["18", "6"])
         self.assertEqual(self.read_state(session_dir)["open_phases"], [])
+
+    def test_finish_run_interrupts_the_active_as_built_pass(self) -> None:
+        session = self.start_run("finish-run-as-built", 45_000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 45_010)
+        self.finish_numbered_phase(session, 45_020, "--phase-id", "6")
+        owner = unit_runs.run_owner(self.read_state(session), staff.initial_snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        worker = fixture_worker("writer", owner.id)
+        _ = self.run_command("start-pass", "--session-dir", str(session), "--pass-kind", "impl",
+                             "--activity", "Write as-built documentation", "--called-task", "direct.implementation",
+                             "--called-family", "codex", "--called-model", "fixture-model",
+                             "--phase-id", "as-built", "--worker-id", worker.id, at=45_030)
+        with patch.object(worker_panes, "close", return_value=worker_panes.Closed()) as close:
+            _ = self.run_command("finish-run", "--session-dir", str(session), "--status", "completed", at=45_040)
+
+        close.assert_called_once_with(owner.id, staff.WorkerName.parse(worker.name))
+        finished, = self.pass_events(session.name, "pass_finished")
+        self.assertEqual((finished["phase_id"], finished["status"]), ("as-built", "interrupted"))
+        self.assertEqual([event["phase_id"] for event in self.phase_events(session.name, "phase_finished")], ["6"])
+        self.assertEqual(self.read_events(session.name)[-1]["event_type"], "run_finished")
 
 
 

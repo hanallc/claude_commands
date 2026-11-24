@@ -194,6 +194,9 @@ ARMED_REVIEW_KEY = "early_review"
 # A phase closed by finish-phase takes no more passes, its plan review's included.
 CLOSED_PHASE_RULE = ("A finished phase takes no more passes: run its plan review before its finish-phase "
                      + "(docs/direct/phase_end.md, step 3 before step 5).")
+AS_BUILT_PHASE = "as-built"
+AS_BUILT_TITLE = "Run as-built"
+AS_BUILT_OPEN_RUN_REQUIRED = "Run as-built requires an open run."
 
 
 class AgentIdentity(TypedDict):
@@ -625,6 +628,10 @@ def pass_phase_instance(record: dict[str, object]) -> str:
     return string(phase.get("instance_id")) if phase is not None else ""
 
 
+def is_as_built_pass(record: dict[str, object]) -> bool:
+    return (object_dict(record.get("phase")) or {}).get("id") == AS_BUILT_PHASE
+
+
 def phase_stamp(phase: dict[str, object]) -> dict[str, object]:
     """The fields a pass carries to name the phase it was opened in."""
     return {
@@ -778,7 +785,7 @@ class LedgerRepairCause(TypedDict):
 
 
 class LaunchCheck(TypedDict):
-    """A launch checked against its open phase and prompt before any pass starts."""
+    """The phase name and prompt check for a launch."""
 
     phase_id: str
     phase_title: str
@@ -819,7 +826,9 @@ def _launch_check(
     fix_cause: str | LedgerRepairCause = optional_arg(args, "fix_cause").strip()
     if arg_string(args, "pass_kind") == "fix":
         instance = string(phase.get("instance_id"))
-        for path in (session_dir / "findings_state.json", session_dir / f"findings_state-{instance}.json"):
+        ledgers = (() if phase.get("id") == AS_BUILT_PHASE
+                   else (session_dir / "findings_state.json", session_dir / f"findings_state-{instance}.json"))
+        for path in ledgers:
             try:
                 ledger = json_object(path.read_text(encoding="utf-8"))
             except FileNotFoundError:
@@ -851,28 +860,38 @@ def _launch_check(
 
 
 def _checked_launch(
-    args: argparse.Namespace, state: dict[str, object], session_dir: Path,
+    args: argparse.Namespace, state: dict[str, object], session_dir: Path, membership: staff.StaffSnapshot,
 ) -> tuple[dict[str, object], LaunchCheck]:
-    """Validate a named open phase and its launch without changing any pass."""
+    """Check the launch without changing any pass or phase."""
     phase_id = optional_arg(args, "phase_id")
     if not phase_id:
         _ = recorder_state.only_open_phase(state)
         _launch_refused(state, args, "Missing phase: --phase-id is required for a recorded run")
-    phase = open_phase_named(state, phase_id)
-    if phase is None:
-        open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
-        _launch_refused(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
+    if phase_id == AS_BUILT_PHASE:
+        if "status" in state or not unit_runs.run_is_open(session_dir, record=membership):
+            _launch_refused(state, args, AS_BUILT_OPEN_RUN_REQUIRED)
+        if recorder_state.open_phases(state):
+            open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "unknown"
+            _launch_refused(state, args, f"Run as-built requires no open phases. Open phases: {open_ids}.")
+        phase: dict[str, object] = {"id": AS_BUILT_PHASE, "title": AS_BUILT_TITLE}
+    else:
+        opened = open_phase_named(state, phase_id)
+        if opened is None:
+            open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
+            _launch_refused(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
+        phase = opened
     return phase, _launch_check(args, state, phase, session_dir)
 
 
 def _check_launch(args: argparse.Namespace) -> None:
     session_dir = argument_session_dir(args)
     try:
-        state = read_state(session_dir)
+        membership = staff.initial_snapshot()
+        state = read_state(session_dir, record=membership)
     except staff.StaffUnreadable as error:
         print(f"staff: {arg_string(args, 'pass_kind')}: not opened: {error}", file=sys.stderr)
         raise SystemExit(3) from error
-    phase, launch_check = _checked_launch(args, state, session_dir)
+    phase, launch_check = _checked_launch(args, state, session_dir, membership)
     if optional_arg(args, "lens") == "ux":
         event = record_event(state, "launch_checked", now_epoch(), phase_record=phase)
         event.update(launch_check=launch_check, pass_kind=arg_string(args, "pass_kind"),
@@ -919,6 +938,8 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     dispatch_owned: bool,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
+        return NoMatchedDispatch()
+    if phase.get("id") == AS_BUILT_PHASE and not is_as_built_pass(active):
         return NoMatchedDispatch()
     if active.get("kind", "") != fields.get("kind", ""):
         return NoMatchedDispatch()
@@ -1005,6 +1026,7 @@ def validate_dispatch_selection(state: dict[str, object], selection: DispatchSel
                                 slot: str, phase: str) -> None:
     current_phase = open_phase_named(state, phase)
     if (slot != selection.slot or phase != selection.phase_id
+            or (phase == AS_BUILT_PHASE and ("status" in state or recorder_state.open_phases(state)))
             or string((current_phase or {}).get("instance_id")) != selection.phase_instance_id
             or dispatch_predecessor(pass_slots(state), slot) != selection.predecessor):
         raise DispatchSelectionChanged(f"Slot {slot} or phase {phase} changed during dispatch")
@@ -1043,7 +1065,7 @@ def start_pass(args: argparse.Namespace,
     if isinstance(selection, DispatchSelection):
         validate_dispatch_selection(state, selection, team_slot, optional_arg(args, "phase_id"))
     # Name the phase when more than one phase is open.
-    phase, launch_check = _checked_launch(args, state, session_dir)
+    phase, launch_check = _checked_launch(args, state, session_dir, membership)
     launcher_pid = arg_integer(args, "launcher_pid", os.getppid())
     early_id = optional_arg(args, "early_review_pass_id")
     dispatch_fields: dict[str, object] = {

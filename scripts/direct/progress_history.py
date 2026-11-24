@@ -1038,6 +1038,8 @@ def _start_phase(args: argparse.Namespace) -> None:
     session_dir = pass_recorder.argument_session_dir(args)
     record = staff.initial_snapshot()
     state = pass_recorder.read_state(session_dir, record=record)
+    if any(pass_recorder.is_as_built_pass(passed) for passed in pass_recorder.open_passes(state).values()):
+        raise SystemExit("Finish the as-built pass first.")
     now = pass_recorder.now_epoch()
     phase_id = pass_recorder.arg_string(args, "phase_id", "ad hoc")
     phase_dir = phase_reservation.phase_directory(session_dir, phase_id)
@@ -6042,6 +6044,17 @@ class InterruptedWorkerPasses:
     worker_ids: tuple[staff.StaffId, ...] = ()
 
 
+def _interrupt_passes(session_dir: Path, state: dict[str, object],
+                     passes: dict[str, dict[str, object]], now: float) -> list[staff.StaffId]:
+    interrupted: list[staff.StaffId] = []
+    for slot, record in sorted(passes.items()):
+        if pass_recorder.close_slot_pass(session_dir, state, slot, "interrupted", now):
+            identity = pass_recorder.string(record.get("worker_id"))
+            if identity:
+                interrupted.append(staff.StaffId(identity))
+    return interrupted
+
+
 class KeptWorkerPane(Protocol):
     @property
     def blocker(self) -> str: ...
@@ -6148,12 +6161,7 @@ def _finish_phase_with_wait_lock(
     for wait in external_waits:
         if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
             _end_wait({"history_file": str(_external_wait_file())}, wait, now, unclosed=True)
-    interrupted: list[staff.StaffId] = []
-    for slot, record in sorted(pass_recorder.phase_passes(state, instance_id).items()):
-        if pass_recorder.close_slot_pass(session_dir, state, slot, "interrupted", now):
-            identity = pass_recorder.string(record.get("worker_id"))
-            if identity:
-                interrupted.append(staff.StaffId(identity))
+    interrupted = _interrupt_passes(session_dir, state, pass_recorder.phase_passes(state, instance_id), now)
     _close_active_activity(session_dir, state, phase, "interrupted", "", now)
     _ = pass_recorder.clear_armed_review(session_dir, state, phase, "phase ended", now)
     status = pass_recorder.arg_string(args, "status")
@@ -6235,6 +6243,9 @@ def _finish_run(args: argparse.Namespace) -> InterruptedWorkerPasses:
         finish_args = argparse.Namespace(session_dir=str(session_dir), phase_id=phase_id, status=run_status)
         interrupted.extend(_finish_phase(finish_args).worker_ids)
     state = pass_recorder.read_state(session_dir, record=record)
+    as_built = {slot: passed for slot, passed in pass_recorder.open_passes(state).items()
+                if pass_recorder.is_as_built_pass(passed)}
+    interrupted.extend(_interrupt_passes(session_dir, state, as_built, now))
     passes = InterruptedWorkerPasses(tuple(dict.fromkeys(interrupted)))
     if not unit_runs.run_is_open(session_dir, record=record):
         _clear_run_pointer(session_dir, record=record)
