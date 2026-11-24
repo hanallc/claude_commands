@@ -8,6 +8,7 @@ from scripts.build_queue.test_queue_view import with_converted_executions
 
 import json
 import io
+from html import unescape
 import os
 import re
 from collections import Counter
@@ -37,14 +38,14 @@ from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
-from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture, FixedSystemReader, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, conf, test_hang_guard
 from scripts.lib.build_slots_test_support import write_private_slot_roots
-from scripts.review_links import console_theme, page_frame, review_link, test_serve
+from scripts.review_links import console_theme, page_frame, review_link, test_page_frame, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
 from scripts.message import unit_labels
@@ -152,6 +153,10 @@ def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProc
                             memory, pid=minutes, started_at=started_at)
 
 
+def fixture_published_view(reading: admission_records.QueueRead) -> queue_snapshot.PublishedView:
+    return queue_snapshot.PublishedView(reading.explanation.now, reading.explanation.now, reading)
+
+
 class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
@@ -173,7 +178,7 @@ class MemoryFeedTests(unittest.TestCase):
               mock.patch.object(staff, "_load", return_value=staff.StaffSnapshot(())) as load,
               mock.patch.object(unit_labels, "unit_labels_for", new=UNIT_LABELS_FOR),
               mock.patch.object(unit_labels, "newest_sessions", return_value=[]),
-              mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   reading.explanation.now, (build,)))):
             page = memory_feed.reading()
@@ -243,7 +248,7 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_local_running_rows_carry_their_tokens_only_when_counts_are_known(self) -> None:
         reading = reservation_reading()
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             unknown = memory_feed.reading()
 
         def rows(page: memory_feed.MemoryPage) -> list[dict[str, object]]:
@@ -261,19 +266,19 @@ class MemoryFeedTests(unittest.TestCase):
                                              "paused": unknown["available"] < 12})
         pid = pids[0]
         assert isinstance(pid, int)
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             known = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 6}))
         self.assertEqual(known["token_counts"], "")
         self.assertEqual({row["pid"]: row["tokens"] for row in rows(known) if local(row) and "tokens" in row}, {pid: 6})
         self.assertTrue(all("tokens" not in row for row in rows(known) if local(row) and row["pid"] != pid))
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             idle = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 0}))
         self.assertEqual({row["pid"]: row["tokens"] for row in rows(idle) if "tokens" in row}, {pid: 0})
         self.assertTrue(all("tokens" not in row for row in rows(known) if not local(row)))
 
     def test_the_feed_shows_why_token_counts_are_unknown_when_steve_refuses_a_dump(self) -> None:
         reading = reservation_reading()
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             self.assertEqual(memory_feed.main(["--once"]), 0)
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
         self.assertEqual(page["token_counts"], "Job type reload is not applicable for unit steve.service.")
@@ -335,20 +340,22 @@ class MemoryFeedTests(unittest.TestCase):
                                            "cargo nextest run", "hana")
                 mac = queue_view.MacBuildReading(reading.explanation.now, (build,) if machine == "mac" else (),
                                                 home="" if configured == "unknown-home" else str(mac_home))
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "host_name", return_value="natedev"),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=mac)):
                     page = memory_feed.reading()
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(staff_names.parts_text(rows[0].get("name_parts", [])), rows[0]["name"])
-                self.assertEqual(rows[0].get("slot"), expected)
+                # The feed sends no slot number; the slot folder ends with it.
+                self.assertNotIn("slot", rows[0])
+                self.assertEqual(rows[0].get("slot_folder", "—").rsplit("/", 1)[-1], str(expected))
                 # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
                 self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
                                  ("/".join(folder.parts[-3:]), mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
-                self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
+                self.assertTrue(all("slot" not in row for row in shown_rows))
                 self.assertTrue(all("slot" not in row for row in page["waiters"]))
                 for waiting in page["waiters"]:
                     self.assertEqual(staff_names.parts_text(waiting.get("name_parts", [])), waiting["name"])
@@ -390,12 +397,13 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.gate=merge gate\n"
+            + "names.gate=gate\n"
             + "owned.default={unit} {step}\n"
             + "owned.test-affected={unit} {step}\n"
             + "owned.ci-default=CI {step}\n"
             + "owned.showrunner-default=showrunner {step}\n")
         self.configure()
+        self.configure_console()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
         proc.mkdir()
@@ -412,8 +420,6 @@ class MemoryFeedTests(unittest.TestCase):
             "MACHINE_FACTS_FILE": str(self.root / "machine-facts.json"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
         })))
-        _ = self.enterContext(mock.patch.object(admission_client, "view",
-            side_effect=AssertionError("The test must supply a private queue reading")))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
@@ -444,7 +450,7 @@ class MemoryFeedTests(unittest.TestCase):
                 notified: set[tuple[int, float]] = set()
                 with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as send,
                       mock.patch.object(queue_view, "read_mac_builds", return_value=reading),
-                      mock.patch.object(admission_client, "view", return_value=baseline),
+                      mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(baseline)),
                       mock.patch.object(memory_feed, "mac_build_units", return_value={})):
                     page = memory_feed.reading()
                     memory_feed.notify_unplaced_mac_runs(reading, notified)
@@ -479,17 +485,20 @@ class MemoryFeedTests(unittest.TestCase):
                                  + "history_days=7\nswap_rows=6\nreport_refresh_seconds=300\n"
                                  + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
 
+    def configure_console(self, age_limit: int = 15) -> None:
+        settings = {"round_trip_limit": 1, "render_limit": 1, "reading_delay": 1, "builds.age_limit": age_limit}
+        _ = (self.root / "console.conf").write_text("".join(
+            f"# range: 0.001..86400\nstatus.{key}_seconds={value}\n" for key, value in settings.items()))
+
     def expected_page(self, seconds: float = 0.125) -> str:
-        page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
+        page = memory_feed.page_html(seconds)
         self.assertIn(console_theme.TOKENS, page)
-        return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-                .replace("__BUILD_LIMIT_ICONS__", json.dumps(memory_feed.build_limit_icons()))
-                .replace('</head>', staff_names.script({}) + '</head>', 1))
+        return page
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
         reading = with_converted_executions(baseline)
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             page = memory_feed.reading()
         remote = [row for row in page["walk"] if "used" in row and "counted" in row and "reserved" in row and row.get("machine") in
                   ("fixture-mac", "fixture-ssh", "uncertain-mac")]
@@ -511,7 +520,7 @@ class MemoryFeedTests(unittest.TestCase):
         waiter = GatePlacementWaiter(8100, "gate-session", "fixture gate", "gate", folder,
             base.explanation.now - 30, admission_records.GIB, admission_records.NeedsMemory(),
             job=StepJob("gate"), placement_candidates=candidates)
-        with mock.patch.object(admission_client, "view", return_value=replace(base, view=replace(base.view, waiting=(waiter,)))):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(base, view=replace(base.view, waiting=(waiter,))))):
             return memory_feed.reading()
 
     def test_a_fixed_guest_exclusion_is_not_a_target_and_the_route_fit_names_the_targets(self) -> None:
@@ -539,7 +548,8 @@ class MemoryFeedTests(unittest.TestCase):
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         _tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="wait:{row.get("key")}" tabindex="0"'), 1)
-        self.assertIn('data-machine="natedev or mac-linux or hana-aws"', table)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="wait:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("dim", "natedev"), ("dim", "mac-linux"), ("dim", "hana-aws")])
 
     def test_gate_wait_row_shows_the_recorded_mac_linux_exclusion(self) -> None:
         for guest in (placement.TemporaryExclusion("backoff until 15:30 EST"),
@@ -569,11 +579,11 @@ class MemoryFeedTests(unittest.TestCase):
             pid=8200, started_at=now - 30, assignment_host="mac", mac_placement="episode/native-attempt",
             job=StepJob("gate"), placement_candidates=(native, *gate_candidates(placement.TemporaryExclusion("not answering"))))
         reading = replace(base, view=replace(base.view, running=(step,)))
-        build = queue_view.MacBuild(8202, step.folder, step.started_at, "merge gate", "claude_commands",
+        build = queue_view.MacBuild(8202, step.folder, step.started_at, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=step.mac_placement)
         other = replace(build, pid=8203, gate_placement="episode/other-attempt")
         mac = queue_view.MacBuildReading(now, (build, other))
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
             page = memory_feed.reading()
@@ -584,9 +594,90 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertNotIn("targets", unrelated)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
-        self.assertIn("mac-linux: not answering", "\n".join(tips["walk"][page["walk"].index(row)]))
-        self.assertIn('<td class="machine" data-machine="mac or natedev or mac-linux or hana-aws">'
-            + '<strong class="machine" data-machine="mac">mac (running)</strong>', table)
+        text = "\n".join(tips["walk"][page["walk"].index(row)])
+        self.assertIn("mac-linux: not answering", text)
+        self.assertIn("Named targets  Mac or natedev or mac-linux or hana-aws", text)
+        rows = dict(cast(list[tuple[str, str]], re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(rows[str(row.get("key"))]), [("run", "mac")])
+
+    def test_consumed_guest_gate_uses_the_recorded_job_and_owner(self) -> None:
+        now = 200_000.0
+        step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, unit="phases",
+            assignment_host="guest", assignment_target="mac-linux", job=StepJob("test-affected"),
+            placement_candidates=gate_candidates(placement.AllowedHost()))
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading(running=(step,)))):
+            page = memory_feed.reading()
+        (row,) = (cast(memory_feed.RunRow, row) for row in page["walk"] if row.get("guest_unconfirmed"))
+        self.assertEqual(row["title"], {"unit": "phases", "step": "test affected"})
+        self.assertEqual((row.get("caller"), row.get("machine"), row["state"]),
+                         ("phases", "mac-linux", "running"))
+
+    def test_guest_gate_progress_comes_from_the_placement_sidecar(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, consume_guest_permission, guest_gate, mac_linux_and_natedev_request,
+            publish_candidate,
+        )
+
+        for sidecar_state in ("empty", "missing file", "written counter"):
+            with self.subTest(sidecar=sidecar_state):
+                readings: list[queue_snapshot.PublishedView] = []
+                with PlacementFixture() as fixture:
+                    request = mac_linux_and_natedev_request(fixture, natedev=False)
+                    assert isinstance(request.local, wire.LocalAdmissionContext)
+                    sidecar = fixture.root / "gate.cgroup"
+                    request = replace(request, identity=replace(request.identity, step="gate",
+                        unit="phases", job=StepJob("test-affected")), local=replace(request.local,
+                        sidecar="" if sidecar_state == "empty" else str(sidecar)))
+                    if sidecar_state == "written counter":
+                        progress_profile.publish_counter(sidecar, progress_profile.ProgressCounter("modules", 7, 12))
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    granted, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                    assert isinstance(granted, wire.FirstAuthorization), granted
+                    execution = execution_identity.ObservedExecution(execution_identity.ProcessExecution(
+                        assignment.destination.host, "host-generation-a", 700001, "guest-start"))
+                    for confirmed in (False, True):
+                        if confirmed:
+                            _ = fixture.server.handle_request(
+                                wire.ExecutionReport("guest-running", assignment, granted.claim, execution))
+                        _ = fixture.run_pass()
+                        readings.append(queue_snapshot.read_view_snapshot(fixture.state_dir))
+
+                for confirmed, reading in zip((False, True), readings, strict=True):
+                    with self.subTest(confirmed=confirmed):
+                        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=reading):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("machine") == "mac-linux"]
+                        self.assertEqual(bool(row.get("guest_run")), confirmed)
+                        self.assertEqual(bool(row.get("guest_unconfirmed")), not confirmed)
+                        payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
+                        tips, table = self.render_assignment_table(payload)
+                        if sidecar_state == "written counter":
+                            self.assertIn('<td class="place">testing</td><td class="done">58.3%</td>', table)
+                            self.assertIn("Testing  7 of 12 modules", "\n".join(tips["walk"][page["walk"].index(row)]))
+                        else:
+                            self.assertIn('<td class="place">—</td><td class="done">—</td>', table)
+
+    def test_queue_timeout_keeps_the_last_guest_row_in_running(self) -> None:
+        now = 200_000.0
+        step = GatePlacementStep("gate-session", "phases", "gate", "/fixture/claude_commands", 0,
+            admission_records.RemoteMemoryUnavailable("remote memory is unavailable"),
+            pid=admission_records.PidNotRecorded(), started_at=now - 30, unit="phases",
+            assignment_host="guest", assignment_target="mac-linux", job=StepJob("test-affected"))
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", side_effect=[
+                  fixture_published_view(captured_reading(running=(step,))), wire.AdmissionUnavailable("queue read timed out")]),
+              mock.patch.object(time, "sleep", side_effect=[None, FeedStopped]),
+              self.assertRaises(FeedStopped)):
+            _ = memory_feed.main([])
+        payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(payload["read_error"], "queue read timed out")
+        rows = cast(list[dict[str, object]], payload["walk"])
+        row, = [row for row in rows if row.get("guest_unconfirmed")]
+        _tips, table = self.render_assignment_table(payload)
+        self.assertEqual(table.count(f'data-tip="row:{row["key"]}" tabindex="0"'), 1)
 
     def guest_gate_page(self) -> memory_feed.MemoryPage:
         base = captured_reading()
@@ -605,10 +696,10 @@ class MemoryFeedTests(unittest.TestCase):
             0, 0, 0, owner=str(step.pid)) for step in running)
         reading = replace(base, view=replace(base.view, running=running),
                           explanation=replace(base.explanation, running=explained))
-        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "merge gate", "claude_commands",
+        native = queue_view.MacBuild(8202, "/Mac/claude_commands", now - 30, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=guest.mac_placement)
         mac = queue_view.MacBuildReading(now, (native,))
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
             return memory_feed.reading()
@@ -622,7 +713,7 @@ class MemoryFeedTests(unittest.TestCase):
         unconfirmed = next(row for row in page["walk"] if row["pid"] == 8201)
         self.assertNotIn("guest_run", unconfirmed)
         self.assertEqual((unconfirmed.get("machine"), unconfirmed.get("guest_unconfirmed"), unconfirmed.get("state")),
-                         ("mac-linux", True, "uncertain"))
+                         ("mac-linux", True, "running"))
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, table = self.render_assignment_table(payload)
         self.assertEqual(table.count(f'data-tip="row:{row.get("key")}" tabindex="0"'), 1)
@@ -631,14 +722,16 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIn("Guest attempt  guest-attempt", text)
         self.assertIn("Named targets  natedev or mac-linux or hana-aws", text)
 
-    def test_running_gate_table_lists_named_targets_and_marks_the_selected_target(self) -> None:
+    def test_running_gate_target_cell_shows_only_the_running_machine(self) -> None:
+        # The user, 11-23: a running row shows one icon where it runs; the named targets go in the tooltip.
         page = self.guest_gate_page()
+        row = next(row for row in page["walk"] if row["pid"] == 8200)
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
-        _tips, table = self.render_assignment_table(payload)
-        self.assertIn('<td class="machine" data-machine="natedev or mac-linux or hana-aws">'
-            + '<span class="machine" data-machine="natedev">natedev</span> or '
-            + '<strong class="machine" data-machine="mac-linux">mac-linux (running)</strong> or '
-            + '<span class="machine" data-machine="hana-aws">hana-aws</span></td>', table)
+        tips, table = self.render_assignment_table(payload)
+        cells = dict(cast(list[tuple[str, str]],
+            re.findall(r'<tr[^>]*data-tip="row:([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S)))
+        self.assertEqual(machine_icons(cells[str(row.get("key"))]), [("run", "mac-linux")])
+        self.assertIn("Named targets  natedev or mac-linux or hana-aws", "\n".join(tips["walk"][page["walk"].index(row)]))
 
     def test_consumed_unconfirmed_guest_gate_shows_one_mac_linux_row(self) -> None:
         base = captured_reading()
@@ -660,9 +753,9 @@ class MemoryFeedTests(unittest.TestCase):
             0, 0, 0, owner=str(index)) for index, step in enumerate(running))
         reading = replace(base, view=replace(base.view, running=running),
                           explanation=replace(base.explanation, running=explained))
-        build = queue_view.MacBuild(8302, native.folder, native.started_at, "merge gate", "claude_commands",
+        build = queue_view.MacBuild(8302, native.folder, native.started_at, "gate", "claude_commands",
             gate_label=queue_view.MacGateLabel.PLACEMENT, gate_placement=native.mac_placement)
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (build,))),
               mock.patch.object(memory_feed, "mac_build_units", return_value={})):
             page = memory_feed.reading()
@@ -681,7 +774,8 @@ class MemoryFeedTests(unittest.TestCase):
                   for name, row in (("guest", guest), ("waiting", waiting), ("host", host_row), ("mac", mac_row))}
         # The Mac host run shows once, as its Mac build row; the guest run shows once, as its queue row.
         self.assertEqual(counts, {"guest": 1, "waiting": 0, "host": 0, "mac": 1})
-        self.assertIn('<strong class="machine" data-machine="mac-linux">mac-linux (not confirmed)</strong>', table)
+        # The guest row shows the bright mac-linux icon; its hover says the attempt is not confirmed.
+        self.assertIn('class="machine machine-icon run" data-machine="mac-linux"', table)
         text = "\n".join(tips["walk"][page["walk"].index(guest)])
         self.assertIn("Runs on  mac-linux", text)
         self.assertIn("Guest attempt  not confirmed", text)
@@ -722,7 +816,7 @@ process.stdout.write(JSON.stringify({
 
     def test_step_table_keeps_assignment_fields_with_report_tooltips(self) -> None:
         reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(os, "cpu_count", return_value=4)):
             page = memory_feed.reading()
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
@@ -762,22 +856,23 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
                     if kind == "wait":
-                        # A queued row names the machines that can take it, in a span that wraps in the column.
+                        # A queued row shows a dim icon for each machine that can take it.
                         self.assertEqual(machine, "")
-                        targets = " or ".join(cast(list[str], row["targets"]))
+                        targets = cast(list[str], row["targets"])
                         self.assertTrue(targets)
-                        shown = " or ".join(f'<span class="machine" data-machine="{target}">{target}</span>'
-                                            for target in cast(list[str], row["targets"]))
-                        self.assertIn(f'<td class="machine" data-machine="{targets}"><span class="wait-target">{shown}</span></td>',
-                                      cell)
+                        self.assertEqual(machine_icons(cell), [("dim", target) for target in targets])
                     else:
                         self.assertTrue(machine)
-                        self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
+                        self.assertEqual([name for _, name in machine_icons(cell)], [machine])
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
-                    unit = str(row["unit"])
-                    self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
+                    title = cast(memory_feed.QueueRowTitle, row["title"])
+                    # A row with no unit shows the step after ": " in its name.
+                    name = str(row["name"])
+                    step = (title["step"] if row["unit"] not in ("", "—") else
+                            name.partition(": ")[2])
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{step}</span></th>', cell)
                     self.assertIn(str(row["name"]), text)
                     if row.get("kind") == "cloud":
                         self.assertNotIn("Uses  ", text)
@@ -799,7 +894,7 @@ process.stdout.write(JSON.stringify({
                         cgroup=str(cgroup), owner="hana-ci.slice", pid=701,
                         job_state=RunningServiceJob(199_000) if busy else IdleService()), pid=701)
                 reading = captured_reading(running=(step,))
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "read_ci_runner", return_value=runner)):
                     page = memory_feed.reading()
                 row, = [row for row in page["walk"] if row.get("ci")]
@@ -821,7 +916,7 @@ process.stdout.write(JSON.stringify({
                 with self.subTest(theme=theme, key=key):
                     _ = self.configuration.write_text(text)
                     configuration = memory_feed.read_configuration()
-                    with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+                    with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())):
                         page = memory_feed.reading(configuration)
                     palette = page["colors"]["light"] if theme == "light" else page["colors"]["dark"]
                     actual = palette["remote_memory"] if key == "remote_memory" else palette["machines"].get(key.removeprefix("machine_"))
@@ -837,7 +932,7 @@ process.stdout.write(JSON.stringify({
                         anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
                         job_state=RunningServiceJob(199_000), service_job_state=state, pid=701), pid=701)
                 reading = with_wait_reason(captured_reading(running=(step,)), admission_records.StartSpacingWait(110))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 ci, = [row for row in page["walk"] if row.get("ci")]
                 self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
@@ -855,7 +950,7 @@ process.stdout.write(JSON.stringify({
         reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         labels = {step.session_id: unit_labels.UnitLabels("solo")
                   for step in (*reading.view.running, *reading.view.waiting)}
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             page = memory_feed.reading()
         running, = [row for row in page["walk"] if row.get("queued")]
@@ -938,7 +1033,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(names.about(StepJob("test-all")), "Runs every test module")
         reading = reservation_reading()
         integrate = StepJob("integrate", unit="handler", branch="sdlc")
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(memory_feed, "step_job", return_value=integrate)):
             page = memory_feed.reading()
         running, = [row for row in page["walk"] if row.get("queued")]
@@ -986,7 +1081,7 @@ process.stdout.write(JSON.stringify({
                     running, = [row for row in reading.view.running if row.pid == owner.pid]
                     self.assertEqual(queue_view.step_counter(running), counter)
                     fixture.release(grant)
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 row, = [row for row in page["walk"] if row["pid"] == owner.pid]
                 self.assertEqual(row.get("progress"), {"kind": "RowProgress", "phase": "testing",
@@ -1004,7 +1099,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(condition=pressure.condition):
                 inputs = replace(baseline.explanation.decided_from, pressure=pressure)
                 reading = gate.queue_read_from(inputs, admission_policy_fixture())
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 self.assertIn(expected, page["pressure"])
                 self.assertNotIn("96.0%", page["pressure"])
@@ -1017,9 +1112,9 @@ process.stdout.write(JSON.stringify({
             "cargo nextest run --test-threads 12", "hana", queue_view.MacTesting(710002),
             3 * admission_records.GIB, 8, progress_profile.ProgressCounter("test:1", 7, 10), "trunk")
         native = queue_view.MacBuildReading(now, (build,))
-        with mock.patch.object(admission_client, "view", return_value=baseline):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(baseline)):
             before = memory_feed.reading()
-        with (mock.patch.object(admission_client, "view", return_value=baseline),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(baseline)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=native),
               mock.patch.object(memory_feed, "mac_build_units", return_value={710001: unit_labels.UnitLabels("", unit="trunk")})):
             page = memory_feed.reading()
@@ -1060,7 +1155,7 @@ process.stdout.write(JSON.stringify({
         reading = replace(reading, view=replace(reading.view, waiting=(waiting,)))
         reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
         assert isinstance(reply, wire.ViewReply)
-        with mock.patch.object(admission_client, "view", return_value=reply.reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
             page = memory_feed.reading()
         run, = page["walk"]
         wait, = page["waiters"]
@@ -1079,7 +1174,7 @@ process.stdout.write(JSON.stringify({
         reading = replace(base, view=replace(base.view, waiting=(waiting,)))
         reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
         assert isinstance(reply, wire.ViewReply)
-        with mock.patch.object(admission_client, "view", return_value=reply.reading), \
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)), \
              mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}):
             page = memory_feed.reading()
         wait, = page["waiters"]
@@ -1147,7 +1242,7 @@ process.stdout.write(JSON.stringify({
                     del proc
                     return {"unit": path.name, "name": path.name.removeprefix("github-runner-").removesuffix(".service"),
                             "state": "idle", "used": 0.0625, "pid": 701}
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "read_ci_runner", side_effect=runner_record)):
                     page = memory_feed.reading()
                 run = next(row for row in page["walk"] if row.get("queued"))
@@ -1162,7 +1257,13 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(ci.get("ci_label"))
                 for row in (run, page["waiters"][0], ci):
                     self.assertFalse(row.get("mac_text"))
+                for row in (run, ci):
                     self.assertFalse(row.get("runs_on"))
+                # bob, 2026-11-23: a waiting CI step can run only on the host, where the running CI row shows it.
+                host = FIXTURE_MACHINE
+                self.assertEqual(ci.get("machine"), host)
+                self.assertEqual(page["waiters"][0].get("targets"), [host])
+                self.assertEqual(page["waiters"][0].get("runs_on"), f"{host} only")
         impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
         self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
 
@@ -1210,7 +1311,7 @@ process.stdout.write(JSON.stringify({
         for read_at, error in ((now - 90, ""), (now - 30, "Mac unreachable"), (0, "Mac reading missing")):
             with self.subTest(read_at=read_at, error=error):
                 native = queue_view.MacBuildReading(read_at, (build,), error)
-                with (mock.patch.object(admission_client, "view", return_value=baseline),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(baseline)),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=native)):
                     page = memory_feed.reading()
                 self.assertFalse(any(row["pid"] == 710001 for row in page["walk"]))
@@ -1365,13 +1466,13 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(response.read().decode(), self.expected_page())
 
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
-        def view() -> admission_records.QueueRead:
+        def view(_folder: Path) -> queue_snapshot.PublishedView:
             self.assertEqual((self.output / "memory_live.html").read_text(), self.expected_page())
-            return captured_reading()
+            return fixture_published_view(captured_reading())
 
-        with mock.patch.object(admission_client, "view", side_effect=view) as read:
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", side_effect=view) as read:
             self.assertEqual(memory_feed.main(["--once"]), 0)
-        read.assert_called_once_with()
+        read.assert_called_once_with(self.root / "buildlog" / "admission")
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
         self.assertIs(page["ok"], True)
         self.assertEqual(page["read_at"], 200_000)
@@ -1385,7 +1486,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
 
     def test_a_one_time_run_reads_the_mac_but_sends_no_alert(self) -> None:
-        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())),
               mock.patch.object(memory_feed, "notify_unplaced_mac_runs") as notify):
             self.assertEqual(memory_feed.main(["--once"]), 0)
             notify.assert_not_called()
@@ -1400,9 +1501,9 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
+                self.configure_console(stale)
                 _ = (self.output / "memory_live.html").write_text("previous page")
-                with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())):
                     self.assertEqual(memory_feed.main(["--once"]), 0)
                 page = (self.output / "memory_live.html").read_text()
                 self.assertEqual(page, self.expected_page(seconds))
@@ -1421,12 +1522,15 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
+                self.configure_console(stale)
                 _ = (self.output / "memory_live.html").write_text("previous page")
-                with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())):
                     _ = memory_feed.main(["--once"])
                 page = (self.output / "memory_live.html").read_text()
-                assert_status_states(self, page, seconds, cast(dict[str, object], json.loads((self.output / "memory.json").read_text())))
+                payload = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+                # The shared browser test sets the data time for each response.
+                del payload["fresh_until"]
+                assert_status_states(self, page, seconds, payload)
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
@@ -1502,8 +1606,69 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(target.read_text(), "previous page")
         self.assertEqual(list(self.output.iterdir()), [target])
 
+    def write_view_file(self, written_at: float, pass_interval: float = 30) -> None:
+        folder = self.root / "buildlog" / "admission"
+        folder.mkdir(parents=True, exist_ok=True)
+        reply = wire.encode_reply(wire.ViewReply(captured_reading())).encode()
+        queue_snapshot.write_view_snapshot(folder, written_at, written_at + pass_interval, reply)
+
+    def test_feed_uses_published_view_when_the_socket_does_not_answer(self) -> None:
+        written_at = 200_001.0
+        self.write_view_file(written_at)
+        with mock.patch.object(admission_client, "view", side_effect=wire.AdmissionUnavailable("no answer in 0.5 s")) as query:
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertIs(page["ok"], True)
+        self.assertNotIn("read_error", page)
+        self.assertEqual(page["read_at"], written_at)
+        query.assert_not_called()
+
+    def test_view_is_late_only_after_the_pass_interval_and_page_limit(self) -> None:
+        written_at = 200_000.0
+        self.write_view_file(written_at)
+        self.assertEqual(memory_feed.main(["--once"]), 0)
+        page = (self.output / "memory_live.html").read_text()
+        options = re.search(r'data-status-options="([^"]+)"', page)
+        assert options is not None
+        source = Path(memory_feed.__file__).with_name("memory_live.html").read_text(encoding="utf-8")
+        loader = source[source.index("async function tick("):source.index("let reportVersion =")]
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        payload = (self.output / "memory.json").read_text()
+        script = test_page_frame.PageStatusTests.environment(unescape(options[1])) + page_frame.REFRESH_SCRIPT + loader + f"""
+const data = {payload};
+const fetch = async () => ({{ok:true, json:async()=>data}});
+const consoleHidden = () => false, paused = false;
+const render = () => {{}}, level = () => "ok", latest = data, $ = () => node();
+const reportVersion = data.report_version;
+const refresh = createPageRefresh(tick);
+(async () => {{
+    for (const age of [20, 45, 46]) {{
+        now = ({written_at} + age) * 1000;
+        await refresh.refresh();
+        console.log(line.dataset.state, parts.age.textContent);
+    }}
+}})();
+"""
+        result = subprocess.run([executable, "-e", script], text=True, capture_output=True, check=False,
+                                timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual((result.returncode, result.stdout.splitlines()),
+                         (0, ["Live 20 s ago", "Live 45 s ago", "Late 46 s ago"]), result.stderr)
+        self.assertIn(loader, page)
+
+    def test_missing_or_unreadable_view_file_keeps_the_queue_error(self) -> None:
+        folder = self.root / "buildlog" / "admission"
+        folder.mkdir(parents=True)
+        for contents in (None, b"\xff", b"{}", b"[]"):
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    _ = (folder / "view.json").write_bytes(contents)
+                self.assertEqual(memory_feed.main(["--once"]), 0)
+                page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+                self.assertIs(page["ok"], False)
+                self.assertEqual(page["error"], "The queue did not answer.")
+
     def test_the_first_failed_reading_publishes_an_error(self) -> None:
-        with mock.patch.object(admission_client, "view",
+        with mock.patch.object(queue_snapshot, "read_view_snapshot",
                                side_effect=wire.AdmissionUnavailable("private socket unavailable")):
             self.assertEqual(memory_feed.main(["--once"]), 0)
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
@@ -1511,8 +1676,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(page["error"], "private socket unavailable")
 
     def test_a_failed_cycle_retains_the_last_successful_reading(self) -> None:
-        with (mock.patch.object(admission_client, "view",
-                                side_effect=[captured_reading(), RuntimeError("queue unavailable")]),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot",
+                                side_effect=[fixture_published_view(captured_reading()), RuntimeError("queue unavailable")]),
               mock.patch.object(time, "sleep", side_effect=[None, FeedStopped]) as sleep):
             with self.assertRaises(FeedStopped):
                 _ = memory_feed.main([])
@@ -1538,7 +1703,7 @@ process.stdout.write(JSON.stringify({
 
     def test_report_reads_follow_the_configured_refresh_window(self) -> None:
         report_calls_per_cycle: list[int] = []
-        with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               # Each cycle reads the clock for the loop, token dump, Mac source, and limits source.
               mock.patch.object(time, "monotonic", side_effect=(
@@ -1548,9 +1713,9 @@ process.stdout.write(JSON.stringify({
               )) as clock,
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
               mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
-            def view() -> admission_records.QueueRead:
+            def view(_folder: Path) -> queue_snapshot.PublishedView:
                 report_calls_per_cycle.append(provider.call_count)
-                return captured_reading()
+                return fixture_published_view(captured_reading())
 
             queue.side_effect = view
             with self.assertRaises(FeedStopped):
@@ -1591,7 +1756,7 @@ process.stdout.write(JSON.stringify({
                     if len(published) == 3:
                         raise FeedStopped
 
-                with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
                       mock.patch.object(time, "monotonic", side_effect=(
                           0.0, 0.0, 0.0, 0.0,
@@ -1624,7 +1789,7 @@ process.stdout.write(JSON.stringify({
             if clock[0] > 30:
                 raise FeedStopped
 
-        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())),
               mock.patch.object(memory_feed, "newest_token_holders", side_effect=slow_journal),
               mock.patch.object(memory_feed, "request_token_dump", side_effect=request),
               mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
@@ -1778,7 +1943,7 @@ process.stdout.write(JSON.stringify({
         write_process(proc, 45)
         _ = (proc / "45" / "cmdline").write_bytes(b"python3\0-u\0/fixture/check_rows.py\0")
         owner = unit_labels.UnitLabels("helper", "hana", "builder")
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value={"fixture": owner})):
             page = memory_feed.reading()
         grouped, = [cast(memory_feed.RunRow, row) for row in page["walk"] if row.get("group")]
@@ -1907,7 +2072,7 @@ process.stdout.write(JSON.stringify({
                 host = admission_records.HostMemory(30 * gib, 60 * gib, 4 * gib, gib, build_and_ci_swap=0,
                                                     swap_in_window_bytes=returned)
                 reading = captured_reading(host=host)
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(gate.SwapInHistory, "read", side_effect=AssertionError("the feed must use the service reading"))):
                     page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
                 self.assertEqual((page["swap"]["used_bytes"], page["swap"]["capacity_bytes"]), (3 * gib, 4 * gib))
@@ -1944,7 +2109,7 @@ process.stdout.write(JSON.stringify({
         reading = gate.queue_read_from(inputs, policy)
         self.assertEqual(reading.view.running, ())
         self.assertEqual(reading.view.waiting, ())
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,)))):
             page = memory_feed.reading()
         row, = page["walk"]
@@ -1966,6 +2131,7 @@ process.stdout.write(JSON.stringify({
                     fixture.free(0)
                     _ = fixture.server.handle_request(fixture.request(run=run, need=8 * admission_records.GIB))
                 fixture.release(grant)
+                _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
                 slot, = reply.reading.explanation.decided_from.slots
@@ -1974,7 +2140,7 @@ process.stdout.write(JSON.stringify({
                 for stage, current in (("released", reply), ("snapshot", wire.parse_reply(wire.encode_reply(reply)))):
                     with self.subTest(stage=stage):
                         assert isinstance(current, wire.ViewReply)
-                        with mock.patch.object(admission_client, "view", return_value=current.reading):
+                        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(current.reading)):
                             page = memory_feed.reading()
                         row, = [row for row in page["walk"] if row.get("between_steps")]
                         self.assertEqual(row["name"], first.identity.name)
@@ -2027,16 +2193,16 @@ process.stdout.write(JSON.stringify({
                             identity["caller_name"] = caller
                         encoded["identity"] = identity
 
-                        def view() -> admission_records.QueueRead:
+                        def view(_folder: Path) -> queue_snapshot.PublishedView:
                             decoded = cast(admission_records.QueueRead, codec.parse_snapshot_value(raw, admission_records.QueueRead))
                             decoded_slot, = decoded.explanation.decided_from.slots
                             restored = decoded_slot.slot if isinstance(decoded_slot, admission_records.ContinuationSlot) else decoded_slot
                             self.assertEqual(restored.identity, replace(facts, caller_name=expected))
                             self.assertEqual(restored.bytes, held.bytes)
-                            return decoded
+                            return fixture_published_view(decoded)
 
                         with (mock.patch.object(staff, "snapshot", return_value=members),
-                              mock.patch.object(admission_client, "view", side_effect=view)):
+                              mock.patch.object(queue_snapshot, "read_view_snapshot", side_effect=view)):
                             page = memory_feed.reading()
                         row, = [row for row in page["walk"] if row.get("between_steps")]
                         self.assertEqual(row["name"], expected)
@@ -2056,7 +2222,7 @@ process.stdout.write(JSON.stringify({
             assert isinstance(ended, admission_records.BetweenStepsSlot)
             slots.append(ended if pid != 103 else admission_records.ContinuationSlot(ended, "successor"))
         reading = gate.queue_read_from(replace(inputs, slots=tuple(slots)), policy)
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             page = memory_feed.reading()
         self.assertEqual(len(page["walk"]), 4)
         self.assertEqual({row["pid"]: row["name"] for row in page["walk"]},
@@ -2077,7 +2243,7 @@ process.stdout.write(JSON.stringify({
         decided = cast(dict[str, object], explanation["decided_from"])
         del cast(list[dict[str, object]], decided["slots"])[0]["identity"]
         legacy = cast(admission_records.QueueRead, codec.parse_snapshot_value(raw, admission_records.QueueRead))
-        with mock.patch.object(admission_client, "view", return_value=legacy):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(legacy)):
             page = memory_feed.reading()
         self.assertEqual(page["walk"], [])
         self.assertEqual(page["reserved"], 1.0)
@@ -2095,7 +2261,7 @@ process.stdout.write(JSON.stringify({
     def test_history_shorter_than_the_recent_window_names_the_configuration_error(self) -> None:
         _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=8\n")
         with (mock.patch.object(charts, "page_data") as provider,
-              mock.patch.object(admission_client, "view", return_value=reservation_reading())):
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reservation_reading()))):
             page = memory_feed.reading()
             text = memory_feed.report_file(memory_feed.report_reading(memory_feed.read_configuration().history_days)).text
         provider.assert_not_called()
@@ -2145,17 +2311,17 @@ process.stdout.write(JSON.stringify({
             _ = source.write_text("schema = 'after'\n")
             self.assertNotEqual(memory_feed.installed_feed_code_version(installed), before)
 
-        with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as view,
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())) as view,
               mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", before),
               mock.patch.object(time, "sleep", side_effect=install_schema)):
             self.assertEqual(memory_feed.main(["--code-root", str(installed)]), 1)
-        view.assert_called_once_with()
+        view.assert_called_once_with(self.root / "buildlog" / "admission")
         self.assertNotEqual(memory_feed.installed_feed_code_version(installed), before)
         changed = replace(captured_reading(), explanation=replace(captured_reading().explanation, now=200_001))
-        with (mock.patch.object(admission_client, "view", return_value=changed) as restarted,
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(changed)) as restarted,
               mock.patch.object(memory_feed, "LOADED_FEED_CODE_VERSION", memory_feed.installed_feed_code_version(installed))):
             self.assertEqual(memory_feed.main(["--once", "--code-root", str(installed)]), 0)
-        restarted.assert_called_once_with()
+        restarted.assert_called_once_with(self.root / "buildlog" / "admission")
         page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
         self.assertEqual(page["read_at"], 200_001)
 
@@ -2177,7 +2343,7 @@ process.stdout.write(JSON.stringify({
                         step="nextest", since=2, reason=admission_records.NeedsMemory(), unit="compiler")
                     reading = replace(reading, view=replace(reading.view,
                         waiting=(first, second, *reading.view.waiting)))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 row = page["waiters"][-1 if has_blocker else 0]
                 self.assertIn(expected, row["reason"])
@@ -2261,7 +2427,7 @@ process.stdout.write(JSON.stringify({
             wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
             base.explanation.now - 60, "natedev",
             wire.RepositorySlotWaiting("widget", (1, 2), 2, "slots.natedev.widget.max"))
-        with mock.patch.object(admission_client, "view", return_value=base):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base)):
             before = memory_feed.reading()
         for identity in (
             slot.identity,
@@ -2270,7 +2436,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(step=identity.step):
                 reading = wire.CloudQueueRead(base.view, base.explanation, base.ordered, base.diagnostics,
                     cloud_gate_stale_pushes=3, repository_slots=(replace(slot, identity=identity),))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     after = memory_feed.reading()
                 self.assertEqual(after["waiters"], before["waiters"])
                 self.assertEqual(after["reserved"], before["reserved"])
@@ -2359,7 +2525,7 @@ process.stdout.write(JSON.stringify({
                 slot = gate.ended_step_slot(reservation, inputs.now, policy)
                 assert isinstance(slot, admission_records.BetweenStepsSlot)
                 reading = gate.queue_read_from(replace(inputs, slots=(slot,)), policy)
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 self.assertEqual([row["name"] for row in page["walk"]], names)
                 self.assertEqual(page["reserved"], 1.0)
@@ -2375,7 +2541,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(step=step, folder=folder):
                 missing = replace(known, pid=known.pid + 1, step=step, project="", folder=folder)
                 reading = cloud_reading(replace(base, view=replace(base.view, waiting=(missing, known))))
-                with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(slot,))):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(reading, repository_slots=(slot,)))):
                     page = memory_feed.reading()
                 self.assertEqual([row["name"] for row in page["waiters"]],
                                  [*names, "fixture: check", "route-two"])
@@ -2419,7 +2585,7 @@ process.stdout.write(JSON.stringify({
                 cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(row.identity, step=step))
                     for row in cloud.cloud))
                 build = queue_view.MacBuild(90082, folder, inputs.now - 30, f"cargo {step}", repository)
-                with (mock.patch.object(admission_client, "view", return_value=cloud),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(cloud)),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(inputs.now, (build,)))):
                     page = memory_feed.reading()
                 # Each row shows `<owner>: <what>`; this test checks the "what" part.
@@ -2456,7 +2622,7 @@ process.stdout.write(JSON.stringify({
                  (two, "queue priority: research (the user's bump), cables (urgent)"), (base, ""))
         for reading, expected in cases:
             with self.subTest(expected=expected):
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     payload = memory_feed.reading()
                 self.assertEqual(payload["priority_text"], expected)
                 entries = reading.explanation.priority
@@ -2473,7 +2639,7 @@ process.stdout.write(JSON.stringify({
                 reading = queued_reading(base, units)
                 labels = {step.session_id: unit_labels.UnitLabels(step.unit, "fixture-runner", step.unit)
                           for step in reading.view.waiting}
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
                     payload = memory_feed.reading()
                 self.assertEqual(payload["queued_priority_units"], expected)
@@ -2491,7 +2657,7 @@ process.stdout.write(JSON.stringify({
                           for step in (*reading.view.running, *reading.view.waiting)}
                 current = reading if priority else replace(reading, explanation=replace(
                     reading.explanation, priority=admission_records.NoQueuePriority()))
-                with (mock.patch.object(admission_client, "view", return_value=current),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(current)),
                       mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
                     page = memory_feed.reading()
                 for row in (*page["walk"], *page["waiters"]):
@@ -2547,7 +2713,7 @@ process.stdout.write(JSON.stringify({
                     waiting=tuple(replace(step, route=route) for step in view.waiting)),
                     explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=route))
                                                                   for entry in explanation.running)))
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(target_availability, "read_snapshots", return_value=(
                           snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free()))),
                       mock.patch.object(target_availability.MacRoutes, "holds", return_value="build hold by research (hana) until released")):
@@ -2600,7 +2766,7 @@ process.stdout.write(JSON.stringify({
         claim = claim_state.HeldClaim(RepositoryScope("hana_catalyst"), self.root / "claim.json", record)
         snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"),
                      (targets.Running((targets.running_job(claim),)),), (claim,), eligibility.NO_BACKOFF),)
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(mac_test, "run_is_live", return_value=True),
               mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
               mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r"))):
@@ -2624,7 +2790,7 @@ process.stdout.write(JSON.stringify({
                     reply, = fixture.server.handle_request(wire.ViewRequest())
                     assert isinstance(reply, wire.ViewReply)
                     reading = reply.reading
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 row, = page["waiters"]
                 self.assertEqual(row.get("runs_on"), "natedev only")
@@ -2655,7 +2821,7 @@ process.stdout.write(JSON.stringify({
             assert isinstance(view, wire.ViewReply)
             job = targets.RunningJob("nextest fixture", datetime.now(UTC), targets.NotSeenIdle())
             snapshots = (snapshot(MAC, targets.Running((job,))), snapshot(NATEDEV, targets.Free()))
-            with (mock.patch.object(admission_client, "view", return_value=view.reading),
+            with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(view.reading)),
                   mock.patch.object(target_availability, "read_snapshots", return_value=snapshots),
                   mock.patch.object(build_targets, "step_policy",
                                     return_value=eligibility.KnownRepository("fixture", str(fixture.root)))):
@@ -2706,7 +2872,7 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(state.reservations[first.episode].queue_waiter.get("verify"), replace(facts, position=2))
             reply, = fixture.connect(wire.ViewRequest()).replies()
             assert isinstance(reply, wire.ViewReply)
-            with mock.patch.object(admission_client, "view", return_value=reply.reading):
+            with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                 return memory_feed.reading()
 
     def mac_verify_call_page(self) -> memory_feed.MemoryPage:
@@ -2728,7 +2894,7 @@ process.stdout.write(JSON.stringify({
                 gate_placement=f"{assignment.episode}/{assignment.attempt}")
             other = replace(build, pid=710002, gate_placement=f"{assignment.episode}/other-attempt")
             mac = queue_view.MacBuildReading(now, (build, other))
-            with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+            with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)),
                   mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
                   mock.patch.object(memory_feed, "mac_build_units", return_value={})):
                 return memory_feed.reading()
@@ -2818,7 +2984,7 @@ process.stdout.write(JSON.stringify({
         _ = (proc / str(child) / "cmdline").write_text(
             "\0".join(("python3", "queue_place.py", "admit", "--pid", str(waiter.pid), "--",
                         "cargo", "nextest", "run", "-p", "hana")) + "\0")
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             waiting, = memory_feed.reading()["waiters"]
         self.assertEqual(waiting.get("call"), "cargo nextest run -p hana")
         self.assertNotIn("verify", waiting)
@@ -2907,7 +3073,7 @@ process.stdout.write(JSON.stringify({
                     admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False,
                     cause=cause)
                 current = replace(reading, explanation=replace(reading.explanation, head=head))
-                with mock.patch.object(admission_client, "view", return_value=current):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(current)):
                     page = memory_feed.reading()
                 shown = [[(row["label"], row["gib"]) for row in waiter["head_room"]["rows"]]
                          for waiter in page["waiters"] if "head_room" in waiter]
@@ -2923,7 +3089,7 @@ process.stdout.write(JSON.stringify({
         head = admission_records.HeadExplanation(last, admission_records.NeedSourceNotRecorded(),
             admission_records.AdmissionDecision("hold", 0, 0, 0, 0), room,
             admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False, cause=admission_records.NeedsMemory())
-        with mock.patch.object(admission_client, "view", return_value=replace(reading, explanation=replace(reading.explanation, head=head))):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(reading, explanation=replace(reading.explanation, head=head)))):
             page = memory_feed.reading()
         last_pid = last.run.pid if isinstance(last.run, LiveBuildRun) else last.pid
         self.assertEqual([row.get("first_in_line", False) for row in page["waiters"]],
@@ -2953,7 +3119,7 @@ process.stdout.write(JSON.stringify({
     def test_builds_page_shows_the_repository_run_limit(self) -> None:
         wait = admission_records.RunLimitWait(2, 2, "claude_commands", "natedev")
         reading = with_wait_reason(reservation_reading(), wait)
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             page = memory_feed.reading()
         row = cast(memory_feed.MemoryWaitRow, page["waiters"][0])
         self.assertEqual(row["why"], "2 of 2 claude_commands runs on natedev")
@@ -2983,7 +3149,7 @@ process.stdout.write(JSON.stringify({
                     _ = path.write_text(json.dumps(saved))
                 live = write_live_mac_state(self.root / "mac-state", block=state == "idle",
                                             unreachable_until=now + 300 if state == "unreachable" else 0)
-                with mock.patch.object(admission_client, "view", return_value=reading), \
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)), \
                      mock.patch.object(time, "time", return_value=now), \
                      mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(live)}):
                     page = memory_feed.reading()
@@ -3014,7 +3180,7 @@ process.stdout.write(JSON.stringify({
                 saved = cast(dict[str, object], json.loads(path.read_text()))
                 saved.update(admission_error=admission_error)
                 _ = path.write_text(json.dumps(saved))
-                with mock.patch.object(admission_client, "view", return_value=reading), \
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)), \
                      mock.patch.object(time, "time", return_value=now), \
                      mock.patch.object(target_availability, "read_snapshots", return_value=snapshots), \
                      mock.patch.object(unit_labels, "unit_labels_for", return_value=labels), \
@@ -3042,7 +3208,7 @@ process.stdout.write(JSON.stringify({
             "aws": machine_facts.facts("no_box")}}
 
         def limits() -> limits_view.BuildLimits:
-            with mock.patch.object(admission_client, "view", return_value=reading), \
+            with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)), \
                  mock.patch.object(time, "time", return_value=now):
                 page = memory_feed.reading(limit_source=lambda _: background, mac_source=lambda _: None)
             shown = page.get("build_limits")
@@ -3069,8 +3235,8 @@ process.stdout.write(JSON.stringify({
         ):
             with self.subTest(stage=stage, region=region, zone=zone):
                 current = replace(first, progress=replace(first.progress, stage=stage, region=region, zone=zone))
-                with mock.patch.object(admission_client, "view", return_value=replace(
-                        reading, cloud=(current, *reading.cloud[1:]))):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(
+                        reading, cloud=(current, *reading.cloud[1:])))):
                     page = memory_feed.reading()
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 rows = cast(list[dict[str, object]], payload["walk"])
@@ -3084,7 +3250,7 @@ process.stdout.write(JSON.stringify({
         reading = cloud_reading(reservation_reading())
         rows = tuple(replace(row, identity=identity or replace(row.identity, step=step)) for row in reading.cloud)
         labels = {row.identity.session_id: owner for row in rows}
-        with mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(reading, cloud=rows))):
             if owner is not None:
                 with mock.patch.object(unit_labels, "unit_labels_for", return_value=labels):
                     return memory_feed.reading()
@@ -3118,7 +3284,7 @@ process.stdout.write(JSON.stringify({
                                                             unit_labels.UnderDirector("devtools", "devtools", "")))
         labels = {session: owner for session in
                   (running.session_id, waiting.session_id, *(row.identity.session_id for row in rows))} if unit_known else {}
-        with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(reading, cloud=rows))),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             return memory_feed.reading()
 
@@ -3199,7 +3365,7 @@ process.stdout.write(JSON.stringify({
                 hold = gate.ended_step_slot(reservation, inputs.now, policy)
                 assert isinstance(hold, admission_records.BetweenStepsSlot)
                 reading = gate.queue_read_from(replace(inputs, slots=(hold,)), policy)
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,)))):
                     held, = memory_feed.reading()["walk"]
                 self.assertEqual(held["name"], expected)
@@ -3244,7 +3410,7 @@ process.stdout.write(JSON.stringify({
             "cargo nextest run --jobs=8", "hana", queue_view.MacTesting(90083), admission_records.GIB,
             origin=queue_view.MacBuildOrigin.CI if ci else queue_view.MacBuildOrigin.NON_CI,
             ci_runner="hana-mac-1" if ci else "", ci_job="test-hana" if ci else "")
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   reading.explanation.now, (build,))),
@@ -3347,14 +3513,14 @@ process.stdout.write(JSON.stringify({
         mac = queue_view.MacBuild(304, "/private/hana", now - 45, "cargo nextest run --jobs=8", "hana",
                                    queue_view.MacTesting(305), admission_records.GIB)
 
-        def view() -> wire.CloudQueueRead:
+        def view(_folder: Path) -> queue_snapshot.PublishedView:
             reply = wire.parse_reply(message)
             assert isinstance(reply, wire.ViewReply) and isinstance(reply.reading, wire.CloudQueueRead)
-            return reply.reading
+            return fixture_published_view(reply.reading)
 
         unknown = unit_labels.UnitLabels("$OWNER")
         labels = {session: unknown for session in (local.session_id, *(row.identity.session_id for row in cloud.cloud))}
-        with (mock.patch.object(admission_client, "view", side_effect=view),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", side_effect=view),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
               mock.patch.object(staff, "snapshot", return_value=members),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (mac,))),
@@ -3380,6 +3546,39 @@ process.stdout.write(JSON.stringify({
                                               slot_roots={}, slot_machine="private-mac-host")
                 self.assertEqual(row["name"], "hana CI: nextest")
                 self.assertEqual(row.get("ci_label"), label)
+
+    def test_a_mac_build_with_no_unit_starts_with_its_launcher(self) -> None:
+        # bob, 2026-11-23: a Mac build with no owner names who started it; a row with a unit does not change.
+        worker = staff.StaffRow(staff.StaffId("impl2"), "worker", "impl2", staff.StaffRoot(),
+                                current_session=staff.StaffId("session-a"))
+        members = memory_feed.FeedStaff(staff.StaffSnapshot((worker,)))
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo build -p hana", "hana")
+        owned = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                        unit_labels.UnderDirector("research", "research", ""))
+        for case, launched, identity, expected in (
+            ("known session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-a"),
+             unit_labels.UnitLabels(""), "impl2"),
+            ("unknown session", replace(build, launcher=queue_view.MacLauncher.CLAUDE, launcher_session="session-x"),
+             unit_labels.UnitLabels(""), "Claude session"),
+            ("CI", replace(build, launcher=queue_view.MacLauncher.CI, origin=queue_view.MacBuildOrigin.CI),
+             unit_labels.UnitLabels(""), "hana CI"),
+            ("rust-analyzer", replace(build, launcher=queue_view.MacLauncher.RUST_ANALYZER),
+             unit_labels.UnitLabels(""), "rust-analyzer"),
+            ("terminal", replace(build, launcher=queue_view.MacLauncher.TERMINAL), unit_labels.UnitLabels(""), "terminal"),
+            ("old reading", build, unit_labels.UnitLabels(""), ""),
+            ("unit", replace(build, launcher=queue_view.MacLauncher.TERMINAL), owned, ""),
+        ):
+            with self.subTest(case=case):
+                row = memory_feed.mac_work_row(launched, queue_view.MacBuildReading(1, (launched,)), identity,
+                    names=read_step_names(), slot_roots={}, slot_machine="private-mac-host",
+                    launcher=memory_feed.mac_launcher_name(launched, members))
+                if expected:
+                    self.assertEqual(row.get("started_by"), {"name": expected, "step": "build"})
+                    self.assertEqual(row["name"], f"{expected}: build")
+                    self.assertEqual(row["repository"], "hana")
+                else:
+                    self.assertNotIn("started_by", row)
+                    self.assertEqual(row["name"], "research: build" if case == "unit" else "hana: build")
 
     def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
@@ -3418,7 +3617,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(tty=tty, unit=unit):
                 fields = ["S", "1", str(pid), str(pid), str(tty), *(["0"] * 14), str(pid)]
                 _ = stat.write_text(f"{pid} (cargo) {' '.join(fields)}\n")
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(members))):
                     row, = memory_feed.reading()["waiters"]
                 self.assertEqual(row["name"], name)
@@ -3436,7 +3635,7 @@ process.stdout.write(JSON.stringify({
         waiting = replace(base.view.waiting[0], session_id=organon.current_session, unit="organon-unit")
         reading = replace(base, view=replace(base.view, waiting=(waiting,)))
         labels = unit_labels.recorded_owner_labels({organon.current_session}, record)
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
               mock.patch.object(staff, "snapshot", return_value=record)):
             row, = memory_feed.reading()["waiters"]
@@ -3569,7 +3768,7 @@ process.stdout.write(JSON.stringify({
         reading = replace(base, view=replace(base.view, waiting=(waiter,)))
         labels = {session: unit_labels.UnitLabels("") for session in (
             waiter.session_id, *(row.identity.session_id for row in base.cloud))}
-        with (mock.patch.object(admission_client, "view", return_value=reading),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
               mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             page = memory_feed.reading()
@@ -3586,7 +3785,7 @@ process.stdout.write(JSON.stringify({
         owners = ("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", "$UNIT")
         reading = replace(base, cloud=tuple(replace(row, identity=replace(row.identity, unit=unit))
             for row, unit in zip(base.cloud, owners, strict=True)))
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             page = memory_feed.reading()
         self.assertEqual([row["unit"] for row in (*page["walk"], *page["waiters"]) if row.get("kind") == "cloud"],
                          ["", ""])
@@ -3619,7 +3818,7 @@ process.stdout.write(JSON.stringify({
         for cloud, state, late_age in cases:
             with self.subTest(state=state, progress=cloud.progress, counter=cloud.counter):
                 current = replace(reading, cloud=(cloud, *reading.cloud[1:]))
-                with (mock.patch.object(admission_client, "view", return_value=current),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(current)),
                       mock.patch.object(os, "cpu_count", return_value=17)):
                     page = memory_feed.reading()
                 text = memory_feed.page_json(page)
@@ -3684,7 +3883,7 @@ process.stdout.write(JSON.stringify({
                 decoded = wire.parse_reply(wire.encode_reply(reply))
                 self.assertEqual(decoded, reply)
                 assert isinstance(decoded, wire.ViewReply)
-                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(decoded.reading)),
                       mock.patch.object(memory_feed, "host_name", return_value="fixture")):
                     page = memory_feed.reading()
                 self.assertEqual(page["cloud_slots_used"], 1)
@@ -3717,10 +3916,10 @@ process.stdout.write(JSON.stringify({
                 waiter = replace(reading.view.waiting[0], step=raw_step, project=project, folder=folder,
                                  session_name="")
                 reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
-                with (mock.patch.object(admission_client, "view", return_value=reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                       mock.patch.object(memory_feed, "read_step_names", wraps=read_step_names) as names_read):
                     page = memory_feed.reading()
-                names_read.assert_called_once_with()
+                names_read.assert_called_once_with(self.root / "buildlog" / "admission")
                 self.assertEqual(page["walk"][0]["name"],
                     queue_lines.step_text(reading.view.running[0], read_step_names()))
                 self.assertEqual(page["waiters"][0]["name"],
@@ -3734,7 +3933,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(grouped=small):
                 reading = captured_reading(running=tuple(leftover_step(minutes, small=small)
                     for minutes in (45, 19 * 60, 2 * 24 * 60)))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 text = memory_feed.page_json(page)
                 for minutes in (45, 19 * 60, 2 * 24 * 60):
@@ -3780,7 +3979,7 @@ process.stdout.write(JSON.stringify({
                 policy = admission_records.read_memory_config(report=False).policy
                 reading = captured_reading()
                 reading = replace(reading, explanation=replace(reading.explanation, policy=policy))
-                with mock.patch.object(admission_client, "view", return_value=reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 self.assertEqual(page["swap"]["reserve_share_percent"], share)
 
@@ -4099,7 +4298,7 @@ process.stdout.write(JSON.stringify({
                         "since": inputs.now, "need": 60 * gib, "step": "nextest", "folder": "/fixture"}
                     reading = gate.queue_read_from(replace(inputs, ordered=[(Path("waiter"), waiter)]),
                                                    admission_policy_fixture())
-                    with (mock.patch.object(admission_client, "view", return_value=reading),
+                    with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
                           mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
                           mock.patch.object(memory_feed, "PROC", proc)):
                         page = memory_feed.reading()
@@ -4150,7 +4349,7 @@ process.stdout.write(JSON.stringify({
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 decoded = wire.parse_reply(wire.encode_reply(reply))
                 assert isinstance(decoded, wire.ViewReply)
-                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(decoded.reading)),
                       mock.patch.object(memory_feed, "PROC", proc)):
                     return memory_feed.reading(), decoded.reading
 
@@ -4277,7 +4476,6 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(memory.anonymous_source, admission_records.ScopeSource(child, frozenset({cargo_owner.pid})))
 
     def test_ci_scan_deducts_a_process_that_enters_a_reserved_scope_between_samples(self) -> None:
-        from scripts.build_queue.test_admission_service import FixedSystemReader
 
         gib = admission_records.GIB
         with AdmissionFixture() as fixture:
@@ -4319,7 +4517,7 @@ process.stdout.write(JSON.stringify({
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
-                with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+                with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)),
                       mock.patch.object(memory_feed, "PROC", fixture.proc.path)):
                     page = memory_feed.reading()
                 self.assertEqual(page["ci_ram"], 1.0)
@@ -4348,7 +4546,7 @@ process.stdout.write(JSON.stringify({
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
-                with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reply.reading)):
                     page = memory_feed.reading()
                 self.assertEqual(page["used"], registered_use)
                 self.assertEqual(page["ci_ram"], unregistered_use)
@@ -4378,7 +4576,7 @@ process.stdout.write(JSON.stringify({
         service = replace(ended, pid=80, measured=replace(memory, job_state=IdleService()))
         reading = captured_reading(running=(ended, live, compiler, service))
         with (mock.patch.object(queue_view, "leftover_processes", wraps=queue_view.leftover_processes) as shared_rule,
-              mock.patch.object(admission_client, "view", return_value=reading)):
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading))):
             page = memory_feed.reading()
         shared_rule.assert_called_once_with(reading.view.running)
         self.assertEqual(len(page["leftovers"]), 1)
@@ -4396,7 +4594,7 @@ process.stdout.write(JSON.stringify({
         for cap in (admission_records.CapUnavailable(()), admission_records.CapUnavailable((missing_run,))):
             with self.subTest(cap=cap):
                 changed = replace(reading, explanation=replace(reading.explanation, room=replace(room, cap=cap)))
-                with mock.patch.object(admission_client, "view", return_value=changed):
+                with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(changed)):
                     page = memory_feed.reading()
                 self.assertIsInstance(page["cap"], admission_records.CapUnavailable)
                 self.assertEqual(page["room"], room.room / admission_records.GIB)
@@ -4413,7 +4611,7 @@ process.stdout.write(JSON.stringify({
         run = replace(room.runs[0], memory=replace(room.runs[0].memory, use=missing))
         room = replace(room, runs=(run,), cap=admission_records.CapUnavailable((run.memory,)))
         reading = replace(reading, explanation=replace(reading.explanation, room=room))
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             page = memory_feed.reading()
         run_row = page["walk"][0]
         assert "used" in run_row
@@ -4422,7 +4620,7 @@ process.stdout.write(JSON.stringify({
 
     def test_one_report_call_supplies_top_costs(self) -> None:
         with (mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              mock.patch.object(admission_client, "view", return_value=captured_reading())):
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading()))):
             report = memory_feed.report_reading(7)
         provider.assert_called_once_with(7, n=3)
         assert isinstance(report, memory_feed.ReportSections)
@@ -4450,7 +4648,7 @@ process.stdout.write(JSON.stringify({
                             if isinstance(failure, Exception) else
                             mock.patch.object(charts, "page_data", return_value=failure))
                 with (provider,
-                      mock.patch.object(admission_client, "view", return_value=reservation_reading())):
+                      mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reservation_reading()))):
                     page = memory_feed.reading()
                     text = memory_feed.report_file(memory_feed.report_reading(7)).text
                 self.assertTrue(page["walk"])
@@ -4472,7 +4670,7 @@ process.stdout.write(JSON.stringify({
                                "need": step.need, "move_id": member.row_id}, admission_records.NormalOrder())
         reading = replace(base, view=replace(base.view, waiting=(step,), move_line=line),
                           ordered=[(self.root / "fixture", row)])
-        with mock.patch.object(admission_client, "view", return_value=reading):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
             payload = memory_feed.reading()
         rows = cast(list[dict[str, object]], payload["waiters"])
         self.assertEqual(payload.get("move_revision"), line.revision)
@@ -4484,9 +4682,9 @@ process.stdout.write(JSON.stringify({
         unnamed_row = gate.rank_waiter({"pid": 201, "since": unnamed.since, "start_time": "unnamed-start",
             "need": unnamed.need, "move_id": unnamed_member.row_id}, admission_records.NormalOrder())
         complete = replace(line, members=(unnamed_member, *line.members))
-        with mock.patch.object(admission_client, "view", return_value=replace(reading,
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(replace(reading,
                                view=replace(reading.view, waiting=(unnamed, step), move_line=complete),
-                               ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered])):
+                               ordered=[(self.root / "unnamed", unnamed_row), *reading.ordered]))):
             named = memory_feed.reading()
         self.assertEqual(named.get("move_revision"), line.revision)
         shown, = named["waiters"]
@@ -4494,18 +4692,29 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(shown.get("move"), member)
 
         incomplete = replace(line, members=(*line.members, admission_records.QueueMoveMember("new-wait")))
-        with mock.patch.object(admission_client, "view",
-                               return_value=replace(reading, view=replace(reading.view, move_line=incomplete))):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot",
+                               return_value=fixture_published_view(replace(reading, view=replace(reading.view, move_line=incomplete)))):
             stale = memory_feed.reading()
         self.assertNotIn("move_revision", stale)
 
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
-        with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(captured_reading())):
             payload = memory_feed.reading()
         payload["cap"] = admission_records.CapUnavailable(())
         page = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
         self.assertEqual(page["cap"], {"kind": "CapUnavailable", "runs": []})
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
+
+
+class PageTextTests(unittest.TestCase):
+    def test_the_page_and_its_fixtures_use_only_configured_job_names(self) -> None:
+        # bob, 2026-11-23 12:59: job names come from config/build_steps.conf (names.gate=gate), so no file shows the retired name.
+        retired = " ".join(("merge", "gate"))
+        folder = Path(__file__).resolve().parent
+        for name in ("memory_live.html", "builds_page_real_rows.json", "memory_page_proof.mjs",
+                     "test_memory_feed.py", "test_memory_hover.py", "test_queue_view.py"):
+            with self.subTest(file=name):
+                self.assertNotIn(retired, (folder / name).read_text(encoding="utf-8").lower())
 
 
 class BuildsPageProofTests(unittest.TestCase):
@@ -4541,6 +4750,20 @@ class BuildsPageProofTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).glob("*.png")), [])
             for report in ("proof.json", "steady-refresh.json"):
                 self.assertFalse((Path(directory) / report).exists())
+
+
+def machine_icons(row: str) -> list[tuple[str, str]]:
+    """Return the state and name of each machine in the Machine cell of one rendered table row.
+
+    An icon has the state "run" or "dim" and its name as its accessible name. An unknown machine is text, with no state.
+    """
+    cell = re.search(r'<td class="machine">(.*?)</td>', row, flags=re.S)
+    assert cell is not None
+    machines = cast(list[tuple[str, str, str]], re.findall(
+        r'<span class="machine(?: machine-icon (run|dim))?" data-machine="([^"]+)"(?:[^>]* role="img" aria-label="([^"]+)")?>',
+        cell.group(1)))
+    assert all(label == (name if state else "") for state, name, label in machines), machines
+    return [(state, name) for state, name, _ in machines]
 
 
 def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:
@@ -4669,7 +4892,12 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page = fixture.verify_call_page()
         builder = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
                                  current_session=staff.StaffId("builder"))
-        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder,))).registry()
+        builds = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("builds"))
+        units = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.ReportsTo(builds.id),
+                                     current_session=staff.StaffId(name))
+                      for name in ("queue", "natest", "admin-console"))
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder, builds, *units))).registry()
         verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
         builder_unit = memory_feed.StaffUnitName(builder.name)
         verified_waiter["unit"] = builder_unit
@@ -4682,23 +4910,23 @@ def write_browser_fixture(folder: Path) -> None:
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))
         for name, reading in readings.items():
-            with mock.patch.object(admission_client, "view", return_value=reading):
+            with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         for name, units in (("queued_none", ()), ("queued_one", ("research",)),
                             ("queued_two", ("research", "cables"))):
-            with mock.patch.object(admission_client, "view", return_value=queued_reading(base, units)):
+            with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(queued_reading(base, units))):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         readings["priority"] = with_queue_priority(base)
-        with mock.patch.object(admission_client, "view", return_value=readings["priority"]):
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(readings["priority"])):
             pages["priority_unmatched"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         labels = {base.view.running[0].session_id: unit_labels.UnitLabels("fixture", "fixture-production", "research")}
-        with (mock.patch.object(admission_client, "view", return_value=readings["priority"]),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(readings["priority"])),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             pages["priority"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         _ = write_idle_config(fixture.root)
         _ = write_idle_alert(fixture.root / "mac-idle", base.explanation.now)
         live = write_live_mac_state(fixture.root / "mac-state", block=True)
-        with mock.patch.object(admission_client, "view", return_value=base), \
+        with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base)), \
              mock.patch.object(time, "time", return_value=base.explanation.now), \
              mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(live)}):
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
@@ -4706,16 +4934,21 @@ def write_browser_fixture(folder: Path) -> None:
         for name, report in (("empty_report", report_fixture(empty=True)),
                              ("missing_report", charts.IndexUnavailable("private index is missing"))):
             with (mock.patch.object(charts, "page_data", return_value=report),
-                  mock.patch.object(admission_client, "view", return_value=base)):
+                  mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base))):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
                 reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        # The first build has no unit: a terminal started it. The last one is from a reading with no launcher.
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
-            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
-            for index, (pid, path, command, repository, used, done, unit) in enumerate((
-                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk"),
-                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify"),
-                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler"))))
+            queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit,
+            launcher=launcher)
+            for index, (pid, path, command, repository, used, done, unit, launcher) in enumerate((
+                (30081, "/private/tmp/trunk-p172-assembly-rows", "cargo build --release -p hana", "hana", 0.6, 604, "trunk",
+                 queue_view.MacLauncher.TERMINAL),
+                (34606, "/Users/nate/.local/state/mac-test/mirror/hana", "cargo nextest run --test-threads 12", "hana", 0.3, 647, "verify",
+                 queue_view.MacLauncher.CLAUDE),
+                (42846, "/Users/nate/.local/state/mac-test/mirror/cargo-liner", "cargo nextest run --jobs=6", "cargo-liner", 0.3, 983, "handler",
+                 queue_view.MacLauncher.UNKNOWN))))
         mac_reading = queue_view.MacBuildReading(base.explanation.now - 5, mac_builds)
         from scripts.mac_test import claim_state
         from scripts.copies import copies
@@ -4723,13 +4956,13 @@ def write_browser_fixture(folder: Path) -> None:
             "submitting_session": "claim-owner", "pid": 900, "proc_start": "start", "what": "nextest hana",
             "worktree": mac_builds[1].folder, "since": "2026-11-12T18:00:00+00:00", "remote_host": "mac", "repo_name": "hana"}
         claim = claim_state.HeldClaim(claim_state.RepositoryScope("hana"), fixture.root / "claim.json", mac_claim)
-        with (mock.patch.object(admission_client, "view", return_value=base),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=mac_reading),
               mock.patch.object(target_availability, "mac_claims", return_value=(claim,)),
               mock.patch.object(copies, "held_remote_mirrors", return_value=()),
               mock.patch.object(unit_labels, "unit_labels_for", return_value={"claim-owner": unit_labels.UnitLabels("worker", "hana", "trunk")})):
             pages["mac_three"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
-        with (mock.patch.object(admission_client, "view", return_value=base),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now - 540, mac_builds, "awk: private raw error"))):
             pages["mac_failed"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
@@ -4737,7 +4970,7 @@ def write_browser_fixture(folder: Path) -> None:
             "cargo nextest run -p fps", "hana", queue_view.MacTesting(710002),
             int(2.1 * admission_records.GIB), gate_label=queue_view.MacGateLabel.PLACEMENT,
             gate_placement="v20261115T234230-2719419-21122-step-1/24e0cf9c4113402abff80a3dfa0edcdb2")
-        with (mock.patch.object(admission_client, "view", return_value=base),
+        with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(base)),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now, (placed,)))):
             pages["macroute_running"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))

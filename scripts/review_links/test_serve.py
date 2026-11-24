@@ -1720,6 +1720,40 @@ class ReviewLinksServerTests(unittest.TestCase):
                               new_item_dialog.PageViewport(1280, 800, True), 1.5, (), (), "Owner builds", screenshot))
         return case.root / "page-states", cache, request
 
+    def test_published_builds_page_versions_each_write_in_one_second(self) -> None:
+        from scripts.build_queue import memory_files
+
+        output = self.root / "builds"
+        output.mkdir()
+        _ = conf.path("memory_feed").write_text(f"output_folder={output}\n", encoding="utf-8")
+        page = output / memory_files.PAGE_NAME
+        route = f"/builds/{memory_files.PAGE_NAME}"
+        source = memory_files.PAGE_SOURCE.read_bytes()
+        versions: list[str] = []
+        for offset in (100_000_000, 200_000_000):
+            with self.subTest(offset=offset):
+                _ = page.write_bytes(source)
+                mark = 1_700_000_000_000_000_000 + offset
+                os.utime(page, ns=(mark, mark))
+                reply = self.request(route)
+                self.assertEqual(reply.status, 200)
+                version = reply.headers.get("x-builds-page-version", "")
+                self.assertTrue(version)
+                self.assertIn(f'<meta name="builds-page-version" content="{version}">'.encode(), reply.body)
+                versions.append(version)
+                with (socket.create_connection(("127.0.0.1", self.port), TEST_HANG_GUARD_SECS) as client,
+                      client.makefile("rb") as head_reply):
+                    client.sendall((f"HEAD {route} HTTP/1.0\r\n"
+                                    "Host: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+                    raw = head_reply.read()
+                head, delimiter, body = raw.partition(b"\r\n\r\n")
+                self.assertTrue(delimiter)
+                status_line, _, raw_headers = head.partition(b"\r\n")
+                self.assertEqual(status_line.split()[1:2], [b"200"])
+                self.assertEqual(parse_headers(BytesIO(raw_headers))["X-Builds-Page-Version"], version)
+                self.assertEqual(len(body), 0, "HEAD sent a response body")
+        self.assertEqual(len(set(versions)), 2)
+
     def test_only_the_published_aws_machines_path_matches_the_console_page(self) -> None:
         output = self.root / "AWS reports"
         output.mkdir()
@@ -3371,10 +3405,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                 card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': key}))
             self.assertEqual(card.status, 200)
 
-    def request(self, path: str) -> HttpReply:
+    def request(self, path: str, *, method: str = "GET") -> HttpReply:
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request("GET", path)
+            connection.request(method, path)
             response = connection.getresponse()
             headers = {name.lower(): value for name, value in response.getheaders()}
             return HttpReply(response.status, headers.get("content-type", ""), response.read(), headers)
