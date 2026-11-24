@@ -2183,9 +2183,14 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
     path = settled if isinstance(settled, placement.DispatchPathPending) else placement.DispatchPathSettled()
     evidence = (execution_identity.ExecutionNotStarted() if settled == 'no launch'
                 else execution_identity.ExecutionEvidenceUnavailable('AWS gate dispatch', time.time()))
-    disposition = (placement.AttemptCompleted(int(not outcome.run.passed)) if isinstance(outcome, CloudCompleted)
-                   else placement.PrelaunchRefused(f'AWS gate took no run. {outcome.reason}') if settled == 'no launch'
-                   else placement.AttemptCancelled(outcome.reason))
+    if isinstance(outcome, CloudCompleted):
+        disposition = placement.AttemptCompleted(int(not outcome.run.passed))
+    elif settled == 'no launch':
+        disposition = placement.PrelaunchRefused(f'AWS gate took no run. {outcome.reason}')
+    elif isinstance(path, placement.DispatchPathPending):
+        disposition = placement.AttemptDeclined(outcome.reason)
+    else:
+        disposition = placement.AttemptCancelled(outcome.reason)
     try:
         _ = admission_client.report_execution(wire.ExecutionReport(
             admission_client.request_id(), assignment, claim, evidence, disposition, path))
