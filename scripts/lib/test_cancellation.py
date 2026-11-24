@@ -1,4 +1,4 @@
-"""Check that TERM stops cleanup when an operation hangs."""
+"""Check cancellation masks and interruption of hung cleanup."""
 from __future__ import annotations
 
 from contextlib import ExitStack
@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import TextIO, cast
 import unittest
 from unittest import mock
@@ -161,3 +162,29 @@ with AdmissionFixture(root=root) as fixture:
     with mock.patch.object(threading.Thread, "start", side_effect=hang), fixture.serving():
         pass
 """)
+
+    def test_masked_thread_blocks_cancellation_and_preserves_the_creators_mask(self) -> None:
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        masks: list[frozenset[int]] = []
+
+        def read_mask() -> None:
+            masks.append(frozenset(signal.pthread_sigmask(signal.SIG_BLOCK, set())))
+
+        worker = threading.Thread(target=read_mask, daemon=True)
+        cancellation.start_masked_thread(worker)
+        worker.join(TEST_HANG_GUARD_SECS)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(worker.daemon)
+        self.assertEqual(masks, [before | {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}])
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), before)
+
+    def test_masked_thread_keeps_the_callers_non_daemon_setting(self) -> None:
+        masks: list[frozenset[int]] = []
+        worker = threading.Thread(
+            target=lambda: masks.append(frozenset(signal.pthread_sigmask(signal.SIG_BLOCK, set()))),
+            daemon=False)
+        cancellation.start_masked_thread(worker)
+        worker.join(TEST_HANG_GUARD_SECS)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(worker.daemon)
+        self.assertTrue(set(cancellation.CANCELLATION_SIGNALS).issubset(masks[0]))

@@ -19,7 +19,7 @@ import sys
 
 from scripts.lib import build_folder_lock, build_folders, cargo_target_config, git_files
 from scripts.lib.atomic_file import write_bytes_atomic
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 # The build-hold cargo wrapper. It holds the cargo word lists, each on one line, and this module reads them there.
@@ -119,7 +119,7 @@ def _workspace(argv: list[str], cwd: Path, environment: Mapping[str, str]) -> Ca
 def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
     """The build output folder that the build folder model gives for the checkout."""
     layout = worktrees.worktree_output(checkout)
-    if isinstance(layout, worktrees.RecordedWorktreeOutput):
+    if isinstance(layout, worktree_records.RecordedWorktreeOutput):
         return LinkedOutput(worktrees.checked_output(layout))
     form = build_folders.parse_form(checkout)
     if isinstance(form, build_folders.UnverifiedFolderPath):
@@ -130,7 +130,7 @@ def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWo
         return LocalOutput(checkout)
     try:
         word = build_folders.repo_word(checkout)
-        if worktrees.main_checkout_for_word(word) == checkout:
+        if worktree_records.main_checkout_for_word(word) == checkout:
             return LinkedOutput(build_folders.main_output_path(word))
     except ValueError:
         pass
@@ -236,7 +236,7 @@ def check_step(argv: list[str], cwd: Path, locks: ExitStack, environment: Mappin
 
 
 # The errors that end a checked step with no Cargo run.
-STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused)
+STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktree_records.Refused)
 
 
 def checked_step(argv: list[str], cwd: Path, locks: ExitStack,

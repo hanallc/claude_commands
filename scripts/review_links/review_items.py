@@ -1602,9 +1602,8 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
     zone = user_zone()
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
     now = datetime.now(zone)
-    afters = [item.times.later for item in items if not isinstance(item.times.later,NoLaterTime) and item.times.later > now]
     return (sum(item.for_you(now) and (not source or item.source_unit == source) for item in items),
-            '' if not afters else str(int(min(afters).timestamp())))
+            question_path.next_later_deadline((item.times.later for item in items), now))
 
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:

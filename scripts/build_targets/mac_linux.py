@@ -2893,9 +2893,13 @@ def run_copy(request_path: Path, reply: int) -> None:
             def send_progress(line: str) -> None:
                 print(GUEST_PROGRESS + json.dumps(line), file=output, flush=True)
 
-            # Older gate code can omit the progress callback.
-            machine = (gate.WholeMachine(module_progress=send_progress)
-                       if hasattr(gate.WholeMachine, 'module_progress') else gate.WholeMachine())
+            # Older gate code can omit these fields.
+            if hasattr(gate.WholeMachine, 'rerun_failed_modules'):
+                machine = gate.WholeMachine(module_progress=send_progress, rerun_failed_modules=True)
+            elif hasattr(gate.WholeMachine, 'module_progress'):
+                machine = gate.WholeMachine(module_progress=send_progress)
+            else:
+                machine = gate.WholeMachine()
             run = gate.run_suites(repo, type_dirs=tuple(map(str, type_dirs)), full=request['full'],
                                   mode=SuiteMode(request['mode']), machine=machine,
                                   selected=ALL_MODULES if selection == 'all' else SelectedModules(tuple(selection)),

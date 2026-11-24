@@ -301,6 +301,23 @@ exit {manager_exit}
         self.assertEqual(self.module_events(), [])
         self.assertFalse((self.state / "types-ran").exists())
 
+    @gate_suites("lib", "hooks")
+    def test_whole_machine_can_rerun_a_failed_module_alone(self) -> None:
+        self.write(self.state / "fail-first-hooks", "once")
+        machine = gate.WholeMachine(rerun_failed_modules=True)
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()) as output:
+            run = gate.run_suites(self.checkout, full=True, machine=machine, selected=gate.ALL_MODULES)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertIn("--- hooks/test_first.py passed on rerun alone; first run exit=1 ---", output.getvalue())
+        first, second = (job for job in run.executions if job.suite == "hooks")
+        self.assertEqual((first.returncode, second.returncode), (1, 0))
+        self.assertIn("fixture first run in hooks/test_first.py", first.output)
+        self.assertEqual([job for job in run.jobs if job.suite == "hooks"], [second])
+        events = self.module_events()
+        self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])
+        self.assertTrue(all(event["suite"] == "hooks" for event in events[-2:]))
+        self.assertEqual(sum(event["event"] == "start" for event in events), self.module_count + 1)
+
     @gate_suites(*FIXTURE_FOLDERS[:gate.RERUN_LIMIT])
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:
         failed_suites = self.suites[:gate.RERUN_LIMIT]
