@@ -5407,6 +5407,8 @@ def write_browser_fixture(folder: Path) -> None:
         verify_page["walk"].extend(row for row in fixture.mac_verify_call_page()["walk"]
                                    if row.get("kind") == "mac-build" and "verify" in row)
         pages["verify_calls"] = json.loads(memory_feed.page_json(verify_page))
+        pages["three_target_gate_wait"] = json.loads(memory_feed.page_json(
+            fixture.gate_wait_page(placement.AllowedHost())))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))

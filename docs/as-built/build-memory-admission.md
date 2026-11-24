@@ -2430,9 +2430,13 @@ A waiting CI step has one target: the host machine, where the CI runners run (`m
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.
 An icon keeps the 20 px text line, so it does not make a row taller, and a row of icons never wraps.
-Waiting rows size the `Step` column, so each step shows on one line; a new waiting row can move the columns to its right.
-In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
-Each word of a waiting step with more than one word is in its own `.word` span with `white-space: nowrap`, so a word such as `cargo-style` never breaks at its hyphen.
+`fitWalkDetails` measures the Step header and the running step names.
+The widest measurement sets the minimum `--step` width, including cell padding.
+The chart keeps its minimum width before Step uses spare space, up to 10 rem.
+The Step width calculation excludes waiting names.
+Waiting step names wrap inside that width.
+A hyphenated word stays together and ends in an ellipsis if it exceeds the available width.
+The row tooltip shows the full name.
 A legend under the table shows `Legend:`, then each of the six icons with its name.
 The machine colors apply to SVG symbols and machine names throughout the page.
 Emoji use their own colors.
@@ -2469,7 +2473,11 @@ The label column is as wide as the widest row title or small line, running or wa
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
 A small line under a title (the showrunner or repository line, or a waiting note with the job start of a CI row) never wraps either. It ends in an ellipsis in the same way.
-The 12rem cap (9rem in a narrow pane) on the label column stays.
+The layout starts with compact gaps and a label width of up to 9 rem.
+It evaluates normal gaps and a label width of up to 12 rem.
+Each larger layout must fit the minimum chart width and preserve the Step width.
+The Machine column reserves one icon per machine family and space for the last badge.
+This fits a gate wait with natedev, mac-linux, and hana-aws.
 The chart, the top bar and the axis start one even gap after the label column.
 The table room row is empty and only keeps the rows aligned.
 `memory_page_proof.mjs` fails when the table leaves the chart's side, a Stage or Step cell is cut, or the label column is wider than its labels.
