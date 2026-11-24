@@ -37,7 +37,7 @@ from scripts.mac_test import claim_state, mac_gate
 from scripts.production import mac_gate_process, gate, targeted_test
 from scripts.copies import copies
 from scripts.production.gate_modules import GateRefused
-from scripts.production.gate_routes import MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import GateTookNoRun, MacGateCancellation, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.production.gate_test_support import gate_suites
 
@@ -183,6 +183,24 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.write(self.checkout / mac_gate.MODULE_LIST,
                    mac_gate.MODULE_LIST_HEADER + "".join(path + "\n" for path in paths))
 
+    def commit_one_affected_module(self, path: str) -> None:
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf",
+                                 "landing_branches=fixture-landing\nscan_roots=\n")
+        baseline = gate.run_suites(self.checkout)
+        self.assertTrue(baseline.passed, self.output.getvalue())
+        record, = self.pass_records()
+        self.assertEqual(record["kind"], "full")
+        self.assertEqual(record["commit"], self.git(self.checkout, "rev-parse", "HEAD"))
+        self.clear_gate_events()
+        module = self.checkout / path
+        self.write(module, module.read_text() + "\n# Change one test module.\n")
+        _ = self.commit(self.checkout, "Change one test module")
+
+    def assert_modules_started(self, *paths: str) -> None:
+        starts = [f"scripts/{row['suite']}/{row['module']}" for row in self.module_events()
+                  if row["event"] == "start"]
+        self.assertCountEqual(starts, paths)
+
     def assert_targeted_cloud_selection(
         self, *paths: str, gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
     ) -> None:
@@ -190,7 +208,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.cloud_route.assert_called_once_with(
             self.checkout, mode=SuiteMode.TARGETED, full=False,
             module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=TreeSelection(paths, tree),
-            gate_job=gate_job)
+            assignment=self.gate_assignment("aws", provider="scaler"), gate_job=gate_job)
         self.assertFalse((self.state / "mac-call.json").exists())
 
     def start_fixture_mac(self) -> AbstractContextManager[mac_gate_process.MacGateProcess]:
@@ -218,6 +236,13 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.placement_status.side_effect = None
         self.placement_status.return_value = admission_wire.PlacementStatusReply(
             admission_wire.KnownPlacementStatus(assignment, state, placement.NoProviderClaim()))
+
+    def checked_aws_target(self) -> gate.GateTarget:
+        assignment = self.gate_assignment("aws", provider="scaler")
+        path = self.write_gate_assignment(assignment)
+        self.set_placement_status(assignment, placement.CurrentAssignment())
+        with mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}):
+            return checked_target(SuiteMode.TARGETED, StepJob("test-affected"))
 
     def assert_gate_refuses_placement(self, path: Path | str, reason: str) -> None:
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path)}),
@@ -617,14 +642,15 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.cloud_route.assert_not_called()
         local.assert_not_called()
 
-    def test_mac_linux_enabled_without_a_placement_file_uses_the_cloud(self) -> None:
+    @gate_suites("lib")
+    def test_mac_linux_enabled_without_a_placement_file_runs_locally(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=on\n")
-        result = gate.GateRun((), 1, 0, selection_certified=True)
-        self.cloud_route.return_value = result
         with mock.patch.object(mac_linux, "route") as guest:
-            self.assertIs(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT), result)
+            run = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+        self.assertTrue(run.passed, self.output.getvalue())
+        self.assert_all_modules_started()
         guest.assert_not_called()
-        self.cloud_route.assert_called_once()
+        self.cloud_route.assert_not_called()
 
     def test_mac_linux_off_refuses_the_current_assignment(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_targets.conf", "enabled.mac-linux=off\n")
@@ -687,6 +713,7 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     def test_aws_placement_reports_a_cloud_refusal(self) -> None:
         assignment = self.gate_assignment("aws", provider="scaler")
+        self.cloud_route.side_effect = GateTookNoRun("fixture cloud unavailable")
         path = self.write_gate_assignment(assignment)
         self.set_placement_status(assignment, placement.CurrentAssignment())
         with (mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": str(path),
@@ -694,8 +721,8 @@ class MacGateSuitesTests(GateSuitesFixture):
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_linux, "route") as guest,
               mock.patch.object(gate, "run_suites") as local, redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), 1)
-        self.assertIn("AWS gate failed: fixture cloud unavailable", errors.getvalue())
+            self.assertEqual(gate.main(["--tests-only", "--repo", str(self.checkout)]), MAC_LINUX_PRELAUNCH_REFUSED_STATUS)
+        self.assertIn("fixture cloud unavailable", errors.getvalue())
         self.cloud_route.assert_called_once()
         guest.assert_not_called()
         local.assert_not_called()
@@ -872,35 +899,35 @@ class MacGateSuitesTests(GateSuitesFixture):
         local.assert_not_called()
 
     @gate_suites("lib")
-    def test_merge_gate_cli_uses_the_cloud_route_before_natedev_fallback(self) -> None:
+    def test_unassigned_merge_gate_cli_runs_all_modules_locally(self) -> None:
         self.exclude_modules(LIB_FIRST)
+        self.commit_one_affected_module(LIB_FIRST)
         script = str(gate.__file__)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(mac_gate_process, "load_mac_gate_route") as load_mac,
+              mock.patch.object(mac_linux, "route") as guest,
               mock.patch.object(sys, "argv", [script, "--tests-only", "--repo", str(self.checkout)]),
               self.assertRaises(SystemExit) as exited):
             _ = runpy.run_path(script, run_name="__main__")
         self.assertEqual(exited.exception.code, 0, self.output.getvalue())
-        self.assert_all_modules_started()
+        self.assert_modules_started(LIB_FIRST, LIB_SECOND)
         load_mac.assert_not_called()
-        self.cloud_route.assert_called_once()
-        self.assertIs(cast(object, self.cloud_route.call_args.kwargs["selected"]), gate.ALL_MODULES)
-        self.assertIs(cast(object, self.cloud_route.call_args.kwargs["mode"]), SuiteMode.GATE)
+        guest.assert_not_called()
+        self.cloud_route.assert_not_called()
 
     @gate_suites("lib")
-    def test_targeted_test_cli_sends_the_whole_selection_to_the_cloud(self) -> None:
+    def test_unassigned_targeted_test_cli_runs_the_whole_selection_locally(self) -> None:
         self.exclude_modules(LIB_FIRST)
-        jobs = (gate.GateJobResult("lib", "test_first.py", 0, 1, ""),
-                gate.GateJobResult("lib", "test_second.py", 0, 1, ""))
-        self.cloud_route.return_value = gate.GateRun(jobs, 1, 0)
+        self.commit_one_affected_module(LIB_FIRST)
         with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(self.checkout)}),
               mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
-              mock.patch.object(gate, "run_suites") as local):
+              mock.patch.object(mac_linux, "route") as guest):
             status = targeted_test.main(["--repo", str(self.checkout)])
         self.assertEqual(status, 0, self.output.getvalue())
-        self.assert_targeted_cloud_selection(LIB_FIRST, LIB_SECOND, gate_job=StepJob("test-affected"))
-        local.assert_not_called()
+        self.assert_modules_started(LIB_FIRST)
+        guest.assert_not_called()
+        self.cloud_route.assert_not_called()
 
     @gate_suites("lib")
     def test_mac_child_returns_large_output(self) -> None:
@@ -939,30 +966,30 @@ class MacGateSuitesTests(GateSuitesFixture):
                 self.assertCountEqual([f"scripts/{job.suite}/{job.module}" for job in run.jobs], paths)
 
     @gate_suites("hooks", "lib")
-    def test_full_targeted_gate_uses_the_cloud_before_natedev(self) -> None:
+    def test_unassigned_full_targeted_gate_runs_all_modules_locally(self) -> None:
         self.exclude_modules(HOOKS)
-        run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, full=True, target=gate.NO_GATE_ASSIGNMENT)
+        self.commit_one_affected_module(LIB_FIRST)
+        with mock.patch.object(mac_linux, "route") as guest:
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, full=True, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(run.passed, self.output.getvalue())
-        self.cloud_route.assert_called_once_with(
-            self.checkout, mode=SuiteMode.TARGETED, full=True,
-            module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=gate.ALL_MODULES,
-            gate_job=GATE_JOB_NOT_RECORDED)
-        self.assert_all_modules_started()
-        self.assertIn("Cloud gate uses natedev: fixture cloud unavailable", self.output.getvalue())
+        self.assert_modules_started(HOOKS, LIB_FIRST, LIB_SECOND)
+        guest.assert_not_called()
+        self.cloud_route.assert_not_called()
 
     @gate_suites("lib")
     def test_cloud_stop_report_reaches_the_result_without_running_local_types(self) -> None:
         self.exclude_modules(LIB_SECOND)
         stopped = gate.GateRun((), 3, 0, time_limit_report="Cloud time limit")
         self.cloud_route.return_value = stopped
-        with mock.patch.object(gate, "run_suites") as local:
-            run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED,
-                                       target=gate.NO_GATE_ASSIGNMENT)
+        with (mock.patch.object(gate, "run_suites") as local,
+              mock.patch.object(mac_linux, "route") as guest):
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=self.checked_aws_target())
         self.assertIs(run, stopped)
         self.assertFalse(run.passed)
         self.assertEqual(run.time_limit_report, "Cloud time limit")
         self.assert_targeted_cloud_selection(LIB_FIRST, LIB_SECOND)
         local.assert_not_called()
+        guest.assert_not_called()
 
     @gate_suites("lib")
     def test_mac_process_context_kills_and_reaps_on_exception_and_sigint(self) -> None:
@@ -1100,11 +1127,13 @@ class MacGateSuitesTests(GateSuitesFixture):
             self.assertNotEqual(path, excluded, "Read the exclude file without checking it first")
             return is_file(path, follow_symlinks=follow_symlinks)
 
-        with mock.patch.object(Path, "is_file", avoid_probe):
-            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+        with (mock.patch.object(Path, "is_file", avoid_probe),
+              mock.patch.object(mac_linux, "route") as guest):
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=self.checked_aws_target())
         self.assertEqual(run.jobs, (hooks,))
-        self.cloud_route.assert_called_once()
-        self.assertFalse((self.state / "mac-call.json").exists())
+        self.assert_targeted_cloud_selection(HOOKS)
+        self.assertEqual(self.module_events(), [])
+        guest.assert_not_called()
 
     @gate_suites("lib")
     def test_natedev_records_and_reuses_its_full_pass(self) -> None:
@@ -1165,13 +1194,16 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assertEqual(self.pass_records(), [record])
 
     @gate_suites("direct", "hooks", "message")
-    def test_targeted_gate_sends_all_affected_modules_to_the_cloud_and_runs_types_once(self) -> None:
+    def test_targeted_gate_sends_all_affected_modules_to_aws_and_checks_types_once_locally(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "gate.conf", "scan_roots=\n")
         self.exclude_modules("scripts/direct/test_first.py", MESSAGE)
-        baseline = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+        with mock.patch.object(mac_linux, "route") as guest:
+            baseline = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(baseline.passed, self.output.getvalue())
+        self.assert_all_modules_started()
+        guest.assert_not_called()
+        self.cloud_route.assert_not_called()
         passes = self.pass_records()
-        self.cloud_route.reset_mock()
         self.clear_gate_events()
         for path in (HOOKS, MESSAGE):
             module = self.checkout / path
@@ -1181,37 +1213,52 @@ class MacGateSuitesTests(GateSuitesFixture):
         jobs = (gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),
                 gate.GateJobResult("message", "test_first.py", 0, 1, ""))
         self.cloud_route.return_value = gate.GateRun(jobs, 1, 0)
-        with mock.patch.object(gate, "read_time_limit", wraps=gate.read_time_limit) as limit:
-            run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED,
-                                       target=gate.NO_GATE_ASSIGNMENT)
+        with mock.patch.object(mac_linux, "route") as guest:
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=self.checked_aws_target())
         self.assertTrue(run.passed, self.output.getvalue())
         self.assertIn("affected: 2 of 3 modules", self.output.getvalue())
         self.assert_targeted_cloud_selection(HOOKS, MESSAGE)
         self.assertEqual(self.module_events(), [])
-        self.assertEqual(run.jobs[:2], jobs)
+        self.assertEqual(run.jobs, jobs)
+        self.assertEqual(self.calls(), [])
+        guest.assert_not_called()
+        self.assertEqual(self.pass_records(), passes)
+        self.cloud_route.reset_mock()
+        with (mock.patch.object(mac_linux, "route") as guest,
+              mock.patch.object(gate, "read_time_limit", wraps=gate.read_time_limit) as limit):
+            local = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED,
+                                         target=gate.NO_GATE_ASSIGNMENT)
+        self.assertTrue(local.passed, self.output.getvalue())
+        self.assertCountEqual([f"scripts/{row['suite']}/{row['module']}" for row in self.module_events()
+                               if row["event"] == "start"], [HOOKS, MESSAGE])
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
         limit.assert_called_once()
         self.assertTrue(limit.call_args.args[3])
-        self.assertEqual(self.pass_records(), passes)
+        guest.assert_not_called()
+        self.cloud_route.assert_not_called()
         self.clear_gate_events()
-        self.cloud_route.return_value = "fixture cloud unavailable"
-        later = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+        with mock.patch.object(mac_linux, "route") as guest:
+            later = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
         self.assertTrue(later.passed, self.output.getvalue())
         self.assertFalse(later.tests_reused)
         self.assert_all_modules_started()
         self.assertEqual(self.pass_records()[-1]["tree"], tree)
+        guest.assert_not_called()
+        self.cloud_route.assert_not_called()
 
     @gate_suites("lib")
     def test_empty_exclude_list_sends_all_modules_to_the_cloud(self) -> None:
         jobs = (gate.GateJobResult("lib", "test_first.py", 0, 1, ""),
                 gate.GateJobResult("lib", "test_second.py", 0, 1, ""))
         self.cloud_route.return_value = gate.GateRun(jobs, 1, 0)
-        run = gate.run_gate_suites(self.checkout, ("scripts",), mode=SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+        with mock.patch.object(mac_linux, "route") as guest:
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=self.checked_aws_target())
         self.assertTrue(run.passed, self.output.getvalue())
         self.assert_targeted_cloud_selection(LIB_FIRST, LIB_SECOND)
         self.assertEqual(self.module_events(), [])
-        self.assertEqual([job.kind for job in run.jobs],
-                         [gate.GateJobKind.TEST_MODULE, gate.GateJobKind.TEST_MODULE, gate.GateJobKind.TYPE_CHECK])
+        self.assertEqual(run.jobs, jobs)
+        self.assertEqual(self.calls(), [])
+        guest.assert_not_called()
 
     @gate_suites("hooks", "message")
     def test_cloud_receives_affected_modules_when_all_are_excluded_from_the_mac(self) -> None:
@@ -1226,7 +1273,9 @@ class MacGateSuitesTests(GateSuitesFixture):
         job = gate.GateJobResult("hooks", "test_first.py", 0, 1, "")
         completed = gate.GateRun((job,), 1, 0)
         self.cloud_route.return_value = completed
-        run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+        with mock.patch.object(mac_linux, "route") as guest:
+            run = gate.run_gate_suites(self.checkout, mode=SuiteMode.TARGETED, target=self.checked_aws_target())
         self.assertIs(run, completed)
         self.assert_targeted_cloud_selection(HOOKS)
         self.assertEqual(self.module_events(), [])
+        guest.assert_not_called()

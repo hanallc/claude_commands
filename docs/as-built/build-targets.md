@@ -636,6 +636,16 @@ From a `claude_commands` checkout, run the affected tests through the queue with
 
 Add `--module <module>` after `--affected` to select a module.
 
+`copies.py run` passes a one-use pipe to the copy's own `scripts/production/gate.py`.
+The pipe contains the launched process ID.
+The gate accepts the handoff only when the process ID and checkout both match.
+The handoff lets the gate skip a second placement request.
+The gate uses AWS only after it confirms an AWS assignment with the queue.
+Only the copy's canonical `scripts/production/gate.py` command can request AWS.
+Aliases, wrapper scripts, and module commands can request natedev or Mac Linux.
+A prepared gate without an assignment runs its suites on natedev.
+A gate started by hand in a copy shell uses direct placement, which allows natedev or Mac Linux.
+
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
 For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
 No configuration maps repositories to unit gates.

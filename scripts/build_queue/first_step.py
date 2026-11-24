@@ -257,6 +257,17 @@ def read_gate_claim_failure(assignment_file: Path, request: wire.PlacementReques
     return refusal
 
 
+def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
+    """Check for a direct call to the checkout's gate script."""
+    program = parse_command_program(command, keep_path=True)
+    if isinstance(program, OtherCommand) or Path(command[0]).name in {"bash", "sh"}:
+        return False
+    root = source.resolve()
+    path = root / program[0]
+    canonical = root / "scripts/production/gate.py"
+    return path == canonical and path.resolve() == canonical
+
+
 def _gate_targets_for_command(command: Sequence[str], source: Path, targets: tuple[str, ...],
                               scalers: set[str]) -> tuple[str, ...]:
     from scripts.build_targets.gate_targets import aws_gate_command
@@ -282,7 +293,13 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "", *, d
             targets = tuple(name for name in targets if name in ("natedev", "mac-linux") or name in scalers)
             if not targets:
                 raise FirstStepRefused("Direct gates require natedev, mac-linux, or a registered scaler")
-        return _gate_targets_for_command(command, source, targets, scalers)
+        targets = _gate_targets_for_command(command, source, targets, scalers)
+        if not canonical_gate_command(command, source):
+            local = tuple(name for name in targets if name in ("natedev", "mac-linux"))
+            if targets and not local:
+                raise FirstStepRefused("Direct gates require natedev or mac-linux")
+            return local
+        return targets
     from scripts.build_targets.gate_targets import NoEnabledTarget, eligible_gate_targets
 
     selected = eligible_gate_targets(source, tuple(command))

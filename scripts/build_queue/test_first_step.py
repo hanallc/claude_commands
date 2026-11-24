@@ -84,11 +84,19 @@ class FirstStepTests(unittest.TestCase):
             source = gate_source(fixture, "claude_commands")
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev"))
+                canonical = source / "scripts/production/gate.py"
+                # Aliases never receive a scaler assignment.
+                canonical.parent.mkdir(parents=True)
+                canonical.touch()
+                (source / "gate.py").symlink_to(canonical)
+                (source / "gate-alias.py").symlink_to(canonical)
                 register_scaler(fixture.root, enabled="off")
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev"))
                 register_scaler(fixture.root)
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("mac-linux", "natedev", "claude-aws"))
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source, requested="claude-aws"), ("claude-aws",))
+                self.assertEqual(first_step.gate_targets(("python3", "gate-alias.py"), source,
+                                                         requested="claude-aws,natedev"), ())
                 for command in (("python3", "scripts/production/merge_gate.py", "--tests-only"),
                                 ("python3", "scripts/production/targeted_test.py"),
                                 ("python3", "-m", "scripts.production.gate", "--tests-only"),

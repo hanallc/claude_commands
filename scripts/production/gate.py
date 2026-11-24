@@ -3454,6 +3454,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         finally:
             ACTIVE_ROUTED_GATE_TREE.reset(token)
 
+    run_selected: Callable[[AllModules | TreeSelection], GateRun]
     match gate_target_kind(target) if isinstance(target, str) else target:
         case LocalGateAssignment() as local_assignment:
             status = 1
@@ -3643,13 +3644,18 @@ def _sweep_nightly_build_folders() -> None:
 def _gate_invocation(arguments: Sequence[str], argv: Sequence[str] | None) -> tuple[str, ...]:
     """Keep the script or module that invoked the gate."""
     original = tuple(sys.orig_argv)
+    program = parse_command_program(original, keep_path=True)
+    if isinstance(program, OtherCommand) and "-c" in original:
+        root_at = original.index("-c") + 2
+        root = str(Path(__file__).resolve().parents[2])
+        if original[root_at:root_at + 3] == (root, "file", sys.argv[0]):
+            return (str(Path(sys.argv[0]).absolute()), *arguments)
     if argv is not None and command_program(original) not in GATE_SCRIPTS:
         return ("scripts/production/gate.py", *arguments)
-    program = parse_command_program(original, keep_path=True)
     if isinstance(program, OtherCommand):
         return original
     prefix = original[:len(original) - len(program[1]) - 1]
-    return (*prefix, str(Path(program[0]).resolve()), *arguments)
+    return (*prefix, str(Path(program[0]).absolute()), *arguments)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

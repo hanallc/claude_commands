@@ -22,8 +22,12 @@ class NoEnabledTarget:
 def aws_gate_command(repo: Path, command: tuple[str, ...]) -> bool:
     """Allow AWS for the canonical gate script in the checkout."""
     program = parse_command_program(command, keep_path=True)
-    return (not isinstance(program, OtherCommand) and Path(command[0]).name not in {"bash", "sh"}
-            and (repo / program[0]).resolve() == repo.resolve() / "scripts/production/gate.py"
+    if isinstance(program, OtherCommand) or Path(command[0]).name in {"bash", "sh"}:
+        return False
+    root = repo.resolve()
+    path = root / program[0]
+    canonical = root / "scripts/production/gate.py"
+    return (path == canonical and path.resolve() == canonical
             and "--nightly" not in program[1] and gate_natedev_only_flag(program[1]) is None)
 
 
