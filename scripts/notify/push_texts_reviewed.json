@@ -31,59 +31,75 @@
     "file_change_no_waits": {
       "objections": [
         {
-          "quote": "hana: demo command refused",
+          "quote": "demo: 1 command refused",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "write phases/34h/delegated_phase_reservation_state.json",
+          "quote": "Go: run the refused command",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Auto mode refused a file change in the demo session.",
+          "quote": "On natedev, in the demo pane, type: Go: run the refused command",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "demo: 1 command refused",
           "rule": "what-happened-why-what-you-do"
         },
         {
-          "quote": "Allow rule: auto mode lets this command run from then on.",
+          "quote": "Go: run the refused command",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
-      "time": "2026-11-06T06:23:26.488387-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 07:37 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2164e19306982a2a955b8a59521d7c0330fcaec96da59078e00781e360479203",
+      "time": "2026-11-24T10:44:42.577252-05:00"
     },
     "one_with_rule": {
       "objections": [
         {
-          "quote": "build-followups: messaging command refused",
+          "quote": "messaging: 1 command refused; its work waits",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Go: the session runs this command now, and auto mode can refuse this command again.",
-          "rule": "every-choice-says-what-it-does"
+          "quote": "the refused command",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Go: run the refused command",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "On natedev, in the messaging pane, type: Go: run the refused command",
+          "rule": "first-150-stand-alone"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
-      "time": "2026-11-06T06:23:15.528138-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 07:37 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2164e19306982a2a955b8a59521d7c0330fcaec96da59078e00781e360479203",
+      "time": "2026-11-24T10:44:34.809793-05:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style: modules commands refused",
+          "quote": "modules: 2 commands refused; its build waits",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "implement.sh --to modules-impl",
+          "quote": "modules: 2 commands refused; its build waits",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Go: the session runs these commands now, and auto mode can refuse these commands again.",
+          "quote": "modules: 2 commands refused; its build waits",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Go: run the refused commands",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
-      "time": "2026-11-06T06:23:02.002895-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 07:37 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "2164e19306982a2a955b8a59521d7c0330fcaec96da59078e00781e360479203",
+      "time": "2026-11-24T10:44:26.572994-05:00"
     }
   },
   "aws.snapshot_failed": {
@@ -419,14 +435,21 @@
   },
   "nixos.ups_battery": {
     "shutdown_threshold": {
-      "reviewer": "opus",
-      "sha256": "0846956765230afe65d57d025036b245af20453c59348864ba08b614e449cc8d",
-      "time": "2026-10-14T04:26:53.467045-04:00"
+      "objections": [],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 09:49 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "bb706de143161d801fefef8882c395c072f84012a24c7111e123a977164712da",
+      "time": "2026-11-24T12:52:31.374651-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "0846956765230afe65d57d025036b245af20453c59348864ba08b614e449cc8d",
-      "time": "2026-10-14T04:26:42.406180-04:00"
+      "objections": [
+        {
+          "quote": "Save your open work on natedev now.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 09:49 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "bb706de143161d801fefef8882c395c072f84012a24c7111e123a977164712da",
+      "time": "2026-11-24T12:52:23.660634-05:00"
     }
   },
   "nixos.ups_no_contact": {
@@ -1171,30 +1194,6 @@
       "time": "2026-10-21T08:04:49.559420-04:00"
     }
   },
-  "shutdown.manual_restart": {
-    "one_session": {
-      "reviewer": "opus",
-      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
-      "time": "2026-11-01T22:43:40.334596-05:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
-      "time": "2026-11-01T22:43:31.298215-05:00"
-    }
-  },
-  "shutdown.move_failed": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
-      "time": "2026-10-22T08:41:21.232661-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
-      "time": "2026-10-22T08:41:13.031634-04:00"
-    }
-  },
   "shutdown.move_untrusted": {
     "mac": {
       "reviewer": "opus",
@@ -1217,37 +1216,6 @@
       "reviewer": "opus",
       "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
       "time": "2026-11-07T12:59:38.245148-05:00"
-    }
-  },
-  "shutdown.restart_incomplete": {
-    "long_account": {
-      "reviewer": "opus",
-      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
-      "time": "2026-11-07T13:00:09.523293-05:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "ada7c3fe1a713afffff6864d57d1a225c87f399b9477d555bbf57ee3c70a67d4",
-      "time": "2026-11-07T13:00:02.062164-05:00"
-    }
-  },
-  "shutdown.restart_untrusted": {
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "ac22944a6753615e074a27bffe4dbba0c64c654aebf4f560a00a2ad57e560c95",
-      "time": "2026-11-07T12:59:55.219819-05:00"
-    }
-  },
-  "shutdown.restart_untrusted_unlisted": {
-    "one_session": {
-      "reviewer": "opus",
-      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
-      "time": "2026-11-01T23:41:12.323161-05:00"
-    },
-    "several_sessions": {
-      "reviewer": "opus",
-      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
-      "time": "2026-11-01T23:41:18.957713-05:00"
     }
   },
   "silence.auto_off": {
