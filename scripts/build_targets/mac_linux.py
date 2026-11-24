@@ -491,22 +491,33 @@ physical_home=$(CDPATH= cd -P -- "${checkout%/*}" >/dev/null && pwd -P)
 physical_checkout="${physical_home%/}/.claude"'''
 
 
+def _checkout_probe_output(stdout: str, stderr: str) -> str:
+    return f'stdout={repr(stdout[:300])[:300]} stderr={repr(stderr[:300])[:300]}'
+
+
 def read_guest_checkout(settings: GuestSettings, repo: Path) -> GuestCheckoutIdentity:
     shell = guest_shell(settings) + GUEST_CHECKOUT_IDENTITY + '''
 printf 'checkout %s %s\\n' "$machine_id" "$physical_checkout"'''
     diagnostics: list[str] = []
     reason = 'the guest checkout probe returned an invalid identity'
     for _ in range(2):
-        reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True,
-                               timeout=GUEST_REF_TIMEOUT_SECONDS, check=False, env=guest_ssh_environment())
+        try:
+            reply = subprocess.run(settings.command(shell), stdin=subprocess.DEVNULL, capture_output=True,
+                                   timeout=GUEST_REF_TIMEOUT_SECONDS, check=False, env=guest_ssh_environment())
+        except subprocess.TimeoutExpired as error:
+            if not diagnostics:
+                raise
+            partial = _checkout_probe_output((error.stdout or b'').decode(errors='replace'),
+                                             (error.stderr or b'').decode(errors='replace'))
+            raise GuestUnavailable(f'{reason} in natedev checkout {str(repo)!r}. '
+                                   + f'{diagnostics[0]} | retry timed out {partial}') from error
         stdout = reply.stdout.decode(errors='replace')
         identity = re.fullmatch(r'checkout ([0-9a-f]{32}) (/[^\r\n\0]*)\r?\n', stdout)
         if not reply.returncode and identity is not None:
             return GuestCheckoutIdentity(identity[1], identity[2])
 
         stderr = reply.stderr.decode(errors='replace')
-        diagnostics.append(f'exit {reply.returncode} stdout={repr(stdout[:300])[:300]} '
-                           + f'stderr={repr(stderr[:300])[:300]}')
+        diagnostics.append(f'exit {reply.returncode} ' + _checkout_probe_output(stdout, stderr))
         if reply.returncode:
             reason = 'the guest checkout probe exited with an error'
             break

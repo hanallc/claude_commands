@@ -508,6 +508,21 @@ class GuestCheckoutTests(unittest.TestCase):
         probe.assert_called_once()
         run.assert_called_once()
 
+    def test_read_guest_checkout_reports_partial_output_when_retry_times_out(self) -> None:
+        first_stdout, first_stderr = 'first invalid\n' * 100, 'first warning\r' * 100
+        retry_stdout, retry_stderr = 'retry output\n' * 100, 'retry warning\r' * 100
+        first = subprocess.CompletedProcess(('fixture',), 0, first_stdout.encode(), first_stderr.encode())
+        timeout = subprocess.TimeoutExpired('fixture', 1, output=retry_stdout.encode(), stderr=retry_stderr.encode())
+        with (patch.object(subprocess, 'run', side_effect=[first, timeout]) as run,
+              self.assertRaises(mac_linux.GuestUnavailable) as caught):
+            _ = mac_linux.read_guest_checkout(self.settings, self.repo)
+        self.assertEqual(run.call_count, 2)
+        message = str(caught.exception)
+        self.assertIn(f'natedev checkout {str(self.repo)!r}', message)
+        self.assertTrue(message.endswith(
+            f'exit 0 stdout={repr(first_stdout)[:300]} stderr={repr(first_stderr)[:300]} | '
+            + f'retry timed out stdout={repr(retry_stdout)[:300]} stderr={repr(retry_stderr)[:300]}'), message)
+
     def test_guest_checkout_ignores_cd_output_in_the_probe_and_guard(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         home = root / 'physical home'
