@@ -71,6 +71,27 @@ class MacBuildOrigin(Enum):
     UNKNOWN = "unknown"
 
 
+class MacLauncher(Enum):
+    """Who started a Mac build: the first launcher program above it, or else a terminal."""
+
+    CLAUDE = "claude"
+    CI = "hana-ci"
+    RUST_ANALYZER = "rust-analyzer"
+    TERMINAL = "terminal"
+    UNKNOWN = "unknown"
+
+
+# The one table of launcher programs. The Mac reader matches a process by its program name,
+# with or without a version suffix such as rust-analyzer-2026-11-02.
+MAC_LAUNCHER_PROGRAMS: Mapping[str, MacLauncher] = {
+    "claude": MacLauncher.CLAUDE, "Runner.Worker": MacLauncher.CI, "Runner.Listener": MacLauncher.CI,
+    "rust-analyzer": MacLauncher.RUST_ANALYZER}
+
+
+def parse_mac_launcher(wire: str) -> MacLauncher:
+    return next((launcher for launcher in MacLauncher if launcher.value == wire), MacLauncher.UNKNOWN)
+
+
 class MacGateLabel(Enum):
     USER = "user"
     PLACEMENT = "placement"
@@ -103,6 +124,8 @@ class MacBuild:
     ci_job: str = ""
     gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
     gate_placement: str = ""
+    launcher: MacLauncher = MacLauncher.UNKNOWN
+    launcher_session: str = ""
 
 
 @dataclass(frozen=True)
@@ -194,7 +217,8 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
             "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
             "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
-            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build)}
+            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build),
+            "launcher": build.launcher.value, "launcher_session": build.launcher_session}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
@@ -215,7 +239,8 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
                     str(row.get("ci_runner", "")), str(row.get("ci_job", "")),
                     parse_gate_label(str(row.get("gate_label", ""))),
                     str(row.get("gate_label", "")).removeprefix("placement ")
-                    if str(row.get("gate_label", "")).startswith("placement ") else "")
+                    if str(row.get("gate_label", "")).startswith("placement ") else "",
+                    parse_mac_launcher(str(row.get("launcher", ""))), str(row.get("launcher_session", "")))
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -257,7 +282,7 @@ import time
 import tomllib
 
 CAPTURE_ROOT = Path("/tmp/cargo-tile")
-
+''' + mac_launcher_source() + r'''
 
 def output(arguments):
     return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL,
@@ -428,7 +453,7 @@ def cargo_environment(data):
             break
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT", b"CLAUDE_CODE_SESSION_ID"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
@@ -476,20 +501,44 @@ def running_test_pid(pid, folder, command, members, processes):
     return 0
 
 
-def build_origin(pid, processes):
-    """Identify a build with a GitHub Actions runner ancestor."""
+def program_launcher(process):
+    """Name the launcher of one process from LAUNCHERS by its first argument or its program, or give ""."""
+    try:
+        words = shlex.split(process["command"])
+    except ValueError:
+        words = []
+    for name in (Path(words[0]).name if words else "", Path(process["executable"]).name):
+        launcher = LAUNCHERS.get(re.sub(r"-[0-9][0-9.-]*$", "", name))
+        if launcher:
+            return launcher
+    return ""
+
+
+def first_launcher(pid, processes):
+    """Find the nearest launcher program in the parent process chain of a build, or give ""."""
     cursor = pid
     seen = set()
     while cursor in processes and cursor not in seen:
         seen.add(cursor)
-        try:
-            words = shlex.split(processes[cursor]["command"])
-        except ValueError:
-            return "unknown"
-        if words and Path(words[0]).name in ("Runner.Worker", "Runner.Listener"):
-            return "ci"
+        launcher = program_launcher(processes[cursor])
+        if launcher:
+            return launcher
         cursor = processes[cursor]["parent"]
-    return "non-ci"
+    return ""
+
+
+def build_origin(pid, processes):
+    """Identify a build with a GitHub Actions runner ancestor."""
+    return "ci" if first_launcher(pid, processes) == CI_LAUNCHER else "non-ci"
+
+
+def build_launcher(pid, processes, marker_session):
+    """Name who started a build: the nearest launcher program, a Claude session marker, or else a terminal."""
+    launcher = first_launcher(pid, processes) or (CLAUDE_LAUNCHER if marker_session else TERMINAL_LAUNCHER)
+    session = ""
+    if launcher == CLAUDE_LAUNCHER:
+        session = process_environment(pid).get("CLAUDE_CODE_SESSION_ID", "") or marker_session
+    return dict(launcher=launcher, launcher_session=session)
 
 
 def read_gate_records():
@@ -618,6 +667,10 @@ def read_builds(processes=None, records=None, captures=None):
             origin = "unknown"
         ci_environment = process_environment(pid) if origin == "ci" else {}
         try:
+            launcher = build_launcher(pid, processes, record["session"])
+        except Exception:
+            launcher = dict(launcher="unknown", launcher_session="")
+        try:
             folder = str(Path(folder).resolve())
         except OSError:
             pass
@@ -631,7 +684,7 @@ def read_builds(processes=None, records=None, captures=None):
                            recorded_unit=record["recorded_unit"], session=record["session"],
                            origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
                            ci_job=ci_environment.get("GITHUB_JOB", ""),
-                           gate_label=gate_label(pid, processes, records, ci_uid)))
+                           gate_label=gate_label(pid, processes, records, ci_uid), **launcher))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 
@@ -646,6 +699,13 @@ def read_reading():
 print(json.dumps(read_reading()))
 print("rc=0")
 ''' + "MAC_READING\n"
+
+
+def mac_launcher_source() -> str:
+    """Give the Mac reader the launcher table and the launcher names it returns."""
+    programs = {name: launcher.value for name, launcher in MAC_LAUNCHER_PROGRAMS.items()}
+    return (f"LAUNCHERS = {programs!r}\nCLAUDE_LAUNCHER = {MacLauncher.CLAUDE.value!r}\n"
+            f"CI_LAUNCHER = {MacLauncher.CI.value!r}\nTERMINAL_LAUNCHER = {MacLauncher.TERMINAL.value!r}\n")
 
 
 def refresh_mac_builds() -> None:

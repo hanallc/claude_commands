@@ -457,6 +457,8 @@ class WaiterPlace:
     move_id: str = field(default="", kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
     run: wire.RunIdentity | wire.NoRun = field(default=wire.NO_RUN, kw_only=True)
+    # The saved job start keeps the place of a CI step through a service restart.
+    ci_job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
 
 
 def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -465,7 +467,7 @@ def waiter_place(row: records.Waiter, episode: str, *, run: wire.RunIdentity | w
     return WaiterPlace(wire.Owner(row["pid"], row["start_time"]), row["since"], episode,
         row.get("priority_since", OrderNotStarted()), row.get("token_left_at", TokenNotLeft()),
         queue_identity=gate.queue_life_identity(row), move_id=row.get("move_id", ""),
-        ci_runner=row.get("ci_runner", ""), run=run)
+        ci_runner=row.get("ci_runner", ""), run=run, ci_job_start=records.waiter_job_start(row))
 
 
 @dataclass(frozen=True)
@@ -1688,6 +1690,7 @@ class StateIntents:
 class ServiceEstimatedAdmission(wire.AdmitRequest):
     """Keep the runner separate from the unit used for priority."""
     runner: str = field(kw_only=True)
+    job_start: records.CiJobStart = field(default=records.NO_JOB_START, kw_only=True)
 
 
 def wait_line_name(waiting: WaitingAdmission) -> str:
@@ -2150,13 +2153,13 @@ class AdmissionServer:
                 continue
             row = gate.rank_waiter(waiting.row, records.NormalOrder())
             run = waiting.request.run if isinstance(waiting.request, wire.AdmitRequest) else wire.NO_RUN
-            row["order_since"] = self._run_order_since(row["since"], run)
+            row["order_since"] = self._order_since(row["since"], run, records.waiter_job_start(row))
             rows.append((self.state_dir / records.waiter_owner(row), row))
         for request in self.placement_requests.values():
             if request.episode in self.waiters or not self._placement_waiting(request):
                 continue
             row = gate.rank_waiter(self._placement_row(request), records.NormalOrder())
-            row["order_since"] = self._run_order_since(row["since"], request.run)
+            row["order_since"] = self._order_since(row["since"], request.run, records.waiter_job_start(row))
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return rows
 
@@ -2175,8 +2178,10 @@ class AdmissionServer:
                 grant = self.reservations.get(place.episode)
                 row: records.Waiter = (grant.queue_waiter if grant is not None else
                     {**place.queue_identity, "need": 0, "ci_runner": place.ci_runner})
+                if isinstance(place.ci_job_start, records.JobStart):
+                    row = {**row, "ci_job_start": place.ci_job_start}
                 ranked = gate.rank_waiter({**row, "move_id": place.move_id,
-                    "order_since": self._run_order_since(place.since, place.run)}, records.NormalOrder())
+                    "order_since": self._order_since(place.since, place.run, place.ci_job_start)}, records.NormalOrder())
                 key = records.waiter_owner(row) if grant is not None else place.move_id
                 rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
@@ -2402,7 +2407,9 @@ class AdmissionServer:
         if key not in self.run_places and self._run_alive(run):
             self.run_places[key] = wire.RunPlace(run, place.since, request.owner, request.identity.unit)
 
-    def _run_order_since(self, since: float, run: wire.RunIdentity | wire.NoRun) -> float:
+    def _order_since(self, since: float, run: wire.RunIdentity | wire.NoRun, job_start: records.CiJobStart) -> float:
+        """Rank a step at the earliest of its arrival, the first step of its run, and the start of its CI job."""
+        since = records.job_order_since(since, job_start)
         if isinstance(run, wire.RunIdentity):
             place = self.run_places.get(records.run_owner(run.pid, run.start_time))
             if place is not None:
@@ -2494,6 +2501,8 @@ class AdmissionServer:
             row["job"] = identity.job
         if isinstance(request, ServiceEstimatedAdmission):
             row["ci_runner"] = request.runner
+            if isinstance(request.job_start, records.JobStart):
+                row["ci_job_start"] = request.job_start
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -3195,7 +3204,7 @@ class AdmissionServer:
             represented.add(owner)
             waiting.append(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
-                records.ReadingUnavailable("waiting for placement"), row.get("unit", ""),
+                records.MachineChoiceWait(), row.get("unit", ""),
                 project=gate.step_project(row.get("repository_name", "")), run=row.get("build_run", NoLiveBuildRun()),
                 route=records.waiter_route(row), verify=row.get("verify", records.NotVerifyCall()),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), placement_candidates=candidates[owner],
@@ -3332,6 +3341,7 @@ class AdmissionServer:
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"],
                 reason, row.get("unit", ""), route=records.waiter_route(row),
                 job=row.get("job", GATE_JOB_NOT_RECORDED), ci_runner=row.get("ci_runner", ""),
+                ci_job_start=records.waiter_job_start(row),
                 verify=row.get("verify", records.NotVerifyCall()), placement_targets=targets,
                 speculative_copy=request is not None and isinstance(request.purpose, placement.SpeculativeCopy),
                 what=row.get("what", "")))
@@ -4111,7 +4121,11 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
+        # Only copies.py knows if the guest gate took a run.
+        # While it lives, its claim failure or its end closes the guest attempt.
+        guest_owner_live = (assignment.destination.target == "mac-linux"
+                            and self._placement_owner_live(assignment.owner))
+        return ((self._ended_claim_holder(saved) and not guest_owner_live or self._unconfirmed_holder_owner_ended(saved))
             and isinstance(saved.permission, placement.PermissionConsumed)
             and evidence.observed_at > saved.permission.consumed_at
             and not self._start_pending(saved))
@@ -4901,6 +4915,8 @@ done
         if not isinstance(request.holder, placement.ClaimHolderIdentity) or not self._holder_matches(assignment.owner, request.holder):
             return self._placement_status(assignment, "claim holder is not a live coordinator descendant")
         from scripts.aws_target import hana_placement
+        from scripts.build_queue import mac_run
+        from scripts.build_targets import mac_linux
         from scripts.mac_test.claim_state import RepositoryScope
         if isinstance(destination.scope, RepositoryScope) and destination.scope.slot != destination.slot and destination.provider == "ssh":
             return self._placement_status(assignment, "assigned scope and slot disagree")
@@ -4926,6 +4942,15 @@ done
                 return self._placement_status(assignment, adopted.reason)
             if adopted.reference != reference:
                 return self._placement_status(assignment, "the exact claim is not adopted")
+        elif destination.target == mac_linux.TARGET:
+            # The guest probe reads no claims. The gate holds the Mac claim of its guest run on this host.
+            try:
+                held = mac_run.claim_held(mac_linux.GUEST_CLAIM_TARGET, reference.claim_id,
+                                          request.holder.pid, request.holder.start_time)
+            except (OSError, ValueError) as error:
+                return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
+            if not held:
+                return self._placement_status(assignment, "the exact claim is not adopted")
         else:
             evidence = self._request_host_evidence(submitted, destination)
             if not isinstance(evidence, placement.FreshHostEvidence):
@@ -4947,13 +4972,35 @@ done
         self.persist()
         return wire.FirstAuthorization(assignment, reference)
 
+    def _guest_took_no_run(self, saved: records.SavedPlacementAssignment, request: wire.ClaimFailure) -> bool:
+        """A guest gate that consumed its launch permission took no run and ended.
+
+        The gate reports no claim, so the reply settles the attempt as for an available permission.
+        A new process read confirms the end, because the last system reading can still show the gate.
+        """
+        holder = saved.holder
+        return (saved.assignment.destination.target == "mac-linux"
+                and isinstance(saved.permission, placement.PermissionConsumed)
+                and isinstance(request.claim, placement.NoProviderClaim) and request.reason == MAC_LINUX_NO_ANSWER
+                and isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host
+                and not owner_may_be_live(self.proc.owner_start(holder.pid), holder.start_time))
+
     def _holder_matches(self, owner: placement.SubmittingOwner, holder: placement.ClaimHolderIdentity) -> bool:
-        if holder.host != self.host or not self._live(wire.Owner(holder.pid, holder.start_time)):
+        if holder.host != self.host:
+            return False
+        processes = (dict(self.system_reader.latest.processes) if not isinstance(self.system_reader, NoSystemReader)
+                     else self.proc.processes())
+        listed = processes.get(holder.pid)
+        if listed is None or listed.start != holder.start_time:
+            # A holder that started after the last system reading is not in it, or its pid then named
+            # another process. So read the processes now.
+            processes = self.proc.processes()
+            if self.proc.owner_start(holder.pid) != LiveOwnerIdentity(holder.start_time):
+                return False
+        elif not self._live(wire.Owner(holder.pid, holder.start_time)):
             return False
         if holder.pid == owner.pid and holder.start_time == owner.start_time:
             return True
-        processes = (dict(self.system_reader.latest.processes) if not isinstance(self.system_reader, NoSystemReader)
-                     else self.proc.processes())
         return holder.pid in gate.process_tree({owner.pid: owner.start_time}, processes)
 
     def _close_placement(self, saved: records.SavedPlacementAssignment, reason: str,
@@ -5181,7 +5228,8 @@ done
             return [self._placement_status(assignment, check_lifetime=False)]
         if isinstance(request, wire.ClaimFailure):
             if (self.current_assignments.get(assignment.episode) == key
-                    and isinstance(saved.permission, placement.PermissionAvailable)
+                    and (isinstance(saved.permission, placement.PermissionAvailable)
+                         or self._guest_took_no_run(saved, request))
                     and isinstance(saved.state, placement.CurrentAssignment)):
                 if isinstance(saved.terminal_report, placement.TerminalAttemptReport):
                     return [self._placement_status(assignment, 'the attempt already has a terminal report', check_lifetime=False)]
@@ -5315,7 +5363,7 @@ done
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
             isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version,
-            runner=request.runner)
+            runner=request.runner, job_start=request.job_start)
 
     @staticmethod
     def _stored_caller(session: str, name: str, unit: str, *,

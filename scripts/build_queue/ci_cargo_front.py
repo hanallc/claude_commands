@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 
 from scripts.build_queue import admission_client as client
@@ -28,12 +29,13 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation
+from scripts.lib import cancellation, process_stat
 from scripts.lib.descendants import adopt_descendants
 
 
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
+PROC_ROOT = process_stat.PROC_ROOT
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,34 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
+def job_start(pid: int, proc_root: Path) -> float | None:
+    """Return the CLOCK_BOOTTIME seconds when the GitHub job of pid started, or None without a readable Runner.Worker ancestor.
+
+    A self-hosted runner starts one Runner.Worker process for each job, so its start is the job start.
+    """
+    seen: set[int] = set()
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        try:
+            name, fields = process_stat.name_and_fields(pid, proc_root)
+            if name == "Runner.Worker":
+                return int(fields[19]) / os.sysconf("SC_CLK_TCK")
+            pid = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            return None
+    return None
+
+
+def queue_job_start(boot_start: float | None, *, now: float, boot_now: float) -> records.CiJobStart:
+    """Convert a CLOCK_BOOTTIME job start to the queue clock.
+
+    now and boot_now are readings of the queue clock and of CLOCK_BOOTTIME at the same moment.
+    """
+    if boot_start is None:
+        return records.NO_JOB_START
+    return records.JobStart(now - (boot_now - boot_start))
+
+
 def remove_abandoned_folders(shared_folder: Path) -> None:
     """Remove this user's shared admission folders when their owners are not live."""
     uid = os.getuid()
@@ -128,6 +158,9 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("cargo admission owner has no process identity")
+    boot_start = job_start(pid, PROC_ROOT)
+    if os.environ.get("GITHUB_ACTIONS") == "true" and boot_start is None:
+        print("::warning::build queue: no readable Runner.Worker ancestor, so this step has no job start", file=sys.stderr)
     argv = [command, *arguments]
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)
@@ -143,10 +176,12 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         sidecar = directory / "cargo.cgroup"
         _ = sidecar.write_text("")
         sidecar.chmod(0o644)
+        now = client.CLOCK.now()
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
-            client.CLOCK.now(), str(sidecar), repository, worktree,
+            now, str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
-            route=records.direct_cargo_route())
+            route=records.direct_cargo_route(),
+            job_start=queue_job_start(boot_start, now=now, boot_now=time.clock_gettime(time.CLOCK_BOOTTIME)))
         with ExitStack() as reservation:
             try:
                 held = reservation.enter_context(queue_place.held_reservation(request))
