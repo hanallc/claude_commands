@@ -162,6 +162,25 @@ class QuestionLibraryTests(unittest.TestCase):
                 self.assertIn("unavailable", errors.getvalue())
                 self.assertIn("missing-owner", errors.getvalue())
 
+    def test_deferred_time_skips_expired_deadlines_in_the_repeated_dst_hour(self) -> None:
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "Choose the compiler", "question": "Which compiler?",
+             "after": "2026-11-01T02:05"},
+            {"since": AT, "text": "Choose the layout", "question": "Which layout?",
+             "after": "2026-11-01T01:45"},
+        ]
+        zone = ZoneInfo("America/Los_Angeles")
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
+            for fold, hour, minute in ((0, 1, 45), (1, 2, 5)):
+                now = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=fold)
+                clock = mock.Mock(now=mock.Mock(return_value=now))
+                with self.subTest(fold=fold), mock.patch.object(showrunner_footer, "datetime", clock):
+                    deadline = showrunner_footer.deferred_until([path.stem], zone.key)
+                    assert deadline is not None
+                    expected = datetime(2026, 11, 1, hour, minute, tzinfo=zone)
+                    self.assertEqual(deadline.timestamp(), expected.timestamp())
+
     def test_row_reports_missing_owner_and_keeps_readable_efficiency_count(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

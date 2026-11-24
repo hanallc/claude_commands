@@ -485,7 +485,12 @@ Sync refuses incoming paths that overlap the live document, LOG, or notes.
   A directory lock protects every write without a separate lock file.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
-  A failed commit prints `written but not committed`; the next write commits the complete list.
+  Commits share the vault's main push lock with the other Git writers.
+  The readiness scan also runs after a merge. It tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
+  Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+  Other list writes report a commit failure immediately.
+  The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
   Every new or edited visible row requires a registered image.
