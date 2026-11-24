@@ -62,7 +62,7 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import console_tune, go_check, go_ledger, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_submissions
+from scripts.review_links import console_tune, go_check, go_ledger, new_item_dialog, page_frame, page_question, question_record, reply_tokens, review_link, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item, placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
@@ -5987,7 +5987,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         The test client is a loopback address. Without natedev, the fixture accepts it as another device.
         With waiting, the item waits for nate. With a producer, that row produces the item; else morty does.
         """
-        _ = write_config_fixture(conf.path("review_links"), "go_refused_addresses=192.0.2.1\ndelivery_pause_seconds=0\n")
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=3\ndelivery_pause_seconds=0\n")
+        _ = self.enterContext(patch.object(review_link, "tailscale_ip",
+                                          side_effect={4: "192.0.2.1", 6: "2001:db8::1"}.__getitem__))
         if not natedev:
             _ = self.enterContext(patch.object(go_ledger, "natedev_address", return_value=False))
         morty, item = self.list_keeper_item("Merge the needsme unit")
@@ -6011,16 +6013,24 @@ class ReviewLinksServerTests(unittest.TestCase):
     def go_ledger_records(self) -> list[Path]:
         return sorted((self.root / go_ledger.LEDGER_FOLDER).glob("*.json"))
 
-    def post_go(self, body: str, *, send_error: Exception | Callable[..., None] | None = None) -> tuple[int, bytes, Mock]:
+    def post_go(self, body: str, *, client: str = "127.0.0.1",
+                send_error: Exception | Callable[..., None] | None = None) -> tuple[int, bytes, Mock]:
         """Post one Go and wait until its delivery ends."""
         delivered = threading.Event()
         deliver = list_page.deliver_go
+        go_post = serve.ReviewLinksHandler.go_post
+
+        def post_from_client(handler: serve.ReviewLinksHandler) -> None:
+            handler.client_address = (client, handler.client_address[1])
+            go_post(handler)
+
         def deliver_and_finish(ledger: Path, go_id: str) -> None:
             try:
                 deliver(ledger, go_id)
             finally:
                 delivered.set()
         with (patch.object(change_page, "send_to_staff", side_effect=send_error) as delivery,
+              patch.object(serve.ReviewLinksHandler, "go_post", new=post_from_client),
               patch.object(list_page, "deliver_go", side_effect=deliver_and_finish)):
             code, reply = self.post(go_ledger.GO_PATH, body)
             if code == 200:
@@ -6151,26 +6161,11 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_go_from_natedev_is_refused_and_writes_nothing(self) -> None:
         morty, _unit, item, _ask, body = self.go_fixture(natedev=True)
-        self.assertTrue(go_ledger.refused_address("127.0.0.2"))
         self.assertTrue(go_ledger.host_owns(ipaddress.ip_address("127.0.0.1")))
-        self.assertFalse(go_ledger.host_owns(ipaddress.ip_address("192.0.2.7")))
-        self.assertFalse(go_ledger.refused_address("192.0.2.7"))
-        self.assertTrue(go_ledger.refused_address("192.0.2.1"))
-        with patch.object(go_ledger, "host_owns", return_value=True):
-            self.assertTrue(go_ledger.refused_address("192.0.2.7"))
         for client, owned in (("127.0.0.2", False), ("192.0.2.7", True)):
-            with (self.subTest(client=client), patch.object(change_page, "send_to_staff") as delivery,
-                  patch.object(go_ledger, "host_owns", return_value=owned) as owner_check,
-                  patch.object(go_ledger, "_address", return_value=ipaddress.ip_address(client))):
-                connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS,
-                                            source_address=("127.0.0.2", 0))
-                try:
-                    connection.request("POST", go_ledger.GO_PATH, body,
-                                       {"Content-Type": "application/x-www-form-urlencoded"})
-                    response = connection.getresponse()
-                    code, reply = response.status, response.read()
-                finally:
-                    connection.close()
+            with (self.subTest(client=client),
+                  patch.object(go_ledger, "host_owns", return_value=owned) as owner_check):
+                code, reply, delivery = self.post_go(body, client=client)
                 self.assertEqual(code, 403)
                 self.assertIn("A Go from natedev is refused.", cast(dict[str, str], json.loads(reply))["reason"])
                 self.assertEqual(owner_check.called, owned)
@@ -6178,8 +6173,50 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertFalse((self.root / go_ledger.LEDGER_FOLDER).exists())
                 self.assertEqual(the_list.load(morty.id, item.id), item)
 
+    def test_list_go_refuses_both_local_tailscale_addresses(self) -> None:
+        morty, _unit, item, _ask, body = self.go_fixture(natedev=True)
+        for client in ("192.0.2.1", "::ffff:192.0.2.1", "2001:db8::1"):
+            with (self.subTest(client=client), patch.object(go_ledger, "host_owns", return_value=False),
+                  patch.object(review_link, "tailscale_ip", side_effect=["192.0.2.1", "2001:db8::1"]) as read):
+                status, reply, delivery = self.post_go(body, client=client)
+                self.assertEqual(status, 403, reply)
+                self.assertEqual(read.call_args_list, [call(4), call(6)])
+                delivery.assert_not_called()
+                self.assertFalse((self.root / go_ledger.LEDGER_FOLDER).exists())
+                self.assertEqual(the_list.load(morty.id, item.id), item)
+
+    def test_list_go_refuses_a_failed_address_read_without_writing(self) -> None:
+        morty, _unit, item, _ask, body = self.go_fixture(natedev=True)
+        command = ["tailscale", "ip", "-6"]
+        for error in (OSError("Tailscale is unavailable."), subprocess.CalledProcessError(1, command),
+                      subprocess.TimeoutExpired(command, 0.1), ValueError("Tailscale gave no address.")):
+            with (self.subTest(error=error),
+                  patch.object(review_link, "tailscale_ip", side_effect=["192.0.2.1", error]) as read,
+                  patch.object(go_ledger, "host_owns", return_value=False) as probe):
+                status, reply, delivery = self.post_go(body, client="192.0.2.7")
+                self.assertEqual((status, json.loads(reply)["reason"]),
+                                 (503, "Could not check natedev's addresses. Try again."))
+                self.assertEqual(read.call_args_list, [call(4), call(6)])
+                probe.assert_not_called()
+                delivery.assert_not_called()
+                self.assertFalse((self.root / go_ledger.LEDGER_FOLDER).exists())
+                self.assertEqual(the_list.load(morty.id, item.id), item)
+
+    def test_list_go_accepts_a_remote_address_after_both_reads(self) -> None:
+        morty, _unit, item, _ask, body = self.go_fixture(natedev=True)
+        client = "192.0.2.7"
+        with (patch.object(go_ledger, "host_owns", return_value=False) as probe,
+              patch.object(review_link, "tailscale_ip", side_effect=["192.0.2.1", "2001:db8::1"]) as read):
+            status, reply, _delivery = self.post_go(body, client=client)
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(read.call_args_list, [call(4), call(6)])
+        probe.assert_called_once_with(ipaddress.ip_address(client))
+        entry, = self.go_ledger_records()
+        self.assertEqual(go_ledger.read(self.root, entry.stem)["client"], client)
+        self.assertFalse(the_list.load(morty.id, item.id).asks[0].is_open)
+
     def test_go_refusal_fails_closed_on_a_bind_error_other_than_address_not_available(self) -> None:
-        _ = self.go_fixture(natedev=True)
+        morty, _unit, item, _ask, body = self.go_fixture(natedev=True)
         self.assertTrue(go_ledger.refused_address("not an address"))
         binds: list[tuple[str, int]] = []
 
@@ -6199,13 +6236,24 @@ class ReviewLinksServerTests(unittest.TestCase):
                 binds.append(address)
                 raise OSError(FailingSocket.error, os.strerror(FailingSocket.error))
 
-        for error, owned in ((errno.EACCES, True), (errno.EADDRINUSE, True), (errno.EADDRNOTAVAIL, False)):
+        for error in (errno.EACCES, errno.EADDRINUSE, errno.EADDRNOTAVAIL):
             FailingSocket.error = error
             binds.clear()
             with self.subTest(error=errno.errorcode[error]), patch.object(socket, "socket", FailingSocket):
-                self.assertEqual(go_ledger.host_owns(ipaddress.ip_address("192.0.2.7")), owned)
-                self.assertEqual(go_ledger.refused_address("192.0.2.7"), owned)
-            self.assertEqual(binds, [("192.0.2.7", 0)] * 2)
+                if error == errno.EADDRNOTAVAIL:
+                    self.assertFalse(go_ledger.refused_address("192.0.2.7"))
+                else:
+                    with self.assertRaises(OSError) as raised:
+                        _ = go_ledger.refused_address("192.0.2.7")
+                    self.assertEqual(raised.exception.errno, error)
+            self.assertEqual(binds, [("192.0.2.7", 0)])
+        with patch.object(go_ledger, "host_owns", side_effect=OSError(errno.EACCES, "Bind refused.")):
+            status, reply, delivery = self.post_go(body, client="192.0.2.7")
+        self.assertEqual((status, json.loads(reply)["reason"]),
+                         (503, "Could not check natedev's addresses. Try again."))
+        delivery.assert_not_called()
+        self.assertFalse((self.root / go_ledger.LEDGER_FOLDER).exists())
+        self.assertEqual(the_list.load(morty.id, item.id), item)
 
     def test_list_go_removes_the_ledger_record_when_the_list_save_fails(self) -> None:
         morty, _unit, item, _ask, body = self.go_fixture()
