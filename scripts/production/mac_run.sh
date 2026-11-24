@@ -226,7 +226,7 @@ if ref := env["MAC_RUN_BUNDLE_REF"]:
     )
 command = [
     "/bin/zsh", "-c",
-    prepare + f"exec{py}{copies}run --repo {source} --owner " + quote(env["MAC_RUN_COPY_OWNER"])
+    prepare + f"exec{py}{runner}smoke-copy{py}{copies}run --repo {source} --owner " + quote(env["MAC_RUN_COPY_OWNER"])
     + " --commit " + env["MAC_RUN_SHA"] + f" --{py}{runner}smoke-work " + quote(work) + " " + quote(cleanup)
 ]
 Path(sys.argv[1]).write_text(json.dumps(command))

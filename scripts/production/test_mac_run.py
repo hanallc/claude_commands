@@ -154,7 +154,8 @@ else:
     (state / "cleanup-called").touch()
     episode = os.environ["MAC_PLACEMENT"].split("/")[0]
     print("mac_smoke_ready=" + episode, flush=True)
-    _ = sys.stdin.read()
+    if sys.stdin.read(1) != chr(10):
+        sys.exit(1)
     (state / "input-closed").touch()
     status_file = Path.home() / ".local/state/mac-queue/smoke" / episode / "status"
     status_file.parent.mkdir(parents=True)
@@ -724,9 +725,10 @@ class MacRunTests(unittest.TestCase):
             event["args"][-1] for event in events if event["command"] == "ssh"
         ]
         self.assertFalse(any("fetch" in command for command in remote_commands), events)
-        lease = shlex.split((self.stub_state / "lease-command").read_text())
-        self.assertIn("copies.py", Path(lease[2]).name)
-        self.assertEqual(lease[3], "run")
+        words = shlex.split((self.stub_state / "lease-command").read_text())
+        lease = words[words.index("smoke-copy") + 1:]
+        self.assertEqual(Path(lease[1]).name, "copies.py")
+        self.assertEqual(lease[2], "run")
         self.assertEqual(lease[lease.index("--commit") + 1], SHA)
         self.assertEqual(lease[lease.index("--repo") + 1], "$HOME/rust/hana")
         self.assertTrue(any(
@@ -814,8 +816,8 @@ class MacRunTests(unittest.TestCase):
                 remote = [event for event in self.events() if event["command"] == "ssh"]
                 command = (self.stub_state / "lease-command").read_text()
                 words = shlex.split(command)
-                lease = words[words.index("exec"):]
-                self.assertEqual(lease[3], "run")
+                lease = words[words.index("smoke-copy") + 1:]
+                self.assertEqual(lease[2], "run")
                 self.assertEqual(lease[lease.index("--owner") + 1], "verify")
                 launch = next(event["input"] for event in remote if event["input"])
                 line = next(line for line in launch.splitlines() if line.startswith("HANA_TEST_PURPOSE="))

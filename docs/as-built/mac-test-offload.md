@@ -820,14 +820,17 @@ The Mac retains its single slot per repository.
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
 The copy stays kept if `stop-checkout` cannot confirm it is clear.
-The smoke worker removes any old `status` file from its run folder on the Mac.
+The Mac wrapper removes any old `status` file before it starts `copies.py run`.
 The file path is `~/.local/state/mac-queue/smoke/<episode>/status`.
 The test and cleanup read stdin from `/dev/null`.
-After cleanup, the worker reports readiness and keeps the copy until SSH input closes.
-The worker writes the exit code to a temporary sibling and renames it to `status`.
+After remote cleanup, the worker reports readiness and holds the copy until it receives a newline after local cleanup.
+SSH EOF before the newline stops active work and prevents a zero exit code.
+After `copies.py run` returns, the wrapper writes its exit code to a temporary file and renames it to `status`.
+The exit code includes any copy lease close failure.
 After the first SSH call ends, the queue reads and removes the file through a separate SSH call.
-The queue uses the file only if the worker reported readiness.
-The queue returns 255 and keeps the run record if the status is missing or invalid.
+The queue reads the file only after readiness and requires the first SSH call to finish without a connection error.
+The second SSH call uses `probe_timeout_s` from `config/mac_test.conf`.
+The queue returns 255 and keeps the run record if the connection fails or the read cannot return a valid status.
 For an old scratch run, the callback confirms checkout clearance before it ends the task and removes both registry rows.
 The queue removes the old run record and receipt after successful cleanup.
 
