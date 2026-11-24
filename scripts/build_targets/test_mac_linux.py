@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import ExitStack, contextmanager, redirect_stderr, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, suppress
 from dataclasses import replace
 from datetime import timedelta
 import errno
@@ -28,12 +28,13 @@ import unittest
 from unittest.mock import call, patch
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, mac_run, placement, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, execution_identity, first_step, mac_run, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
-from scripts.buildlog import store
+from scripts.buildlog import store, treekey
 from scripts.lib import conf, process_group, process_start
+from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
@@ -914,6 +915,7 @@ fi
                 proof = cast(dict[str, object], json.loads(line))
                 self.assertEqual(proof['claim'], self.consumed[0][0].claim.claim_id)
                 self.assertEqual(proof['result'], 'proven')
+                self.assertIsInstance(mac_linux.settlement(self.placed.episode, 16), placement.Pending)
                 return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
             with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
                 mac_linux.reconcile_unproven(self.placed.episode, 16)
@@ -938,14 +940,21 @@ fi
         assert isinstance(identity, execution_identity.CloudExecution)
         self.assertEqual((identity.target, identity.attempt), (mac_linux.TARGET, self.placed.attempt))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+        self.assertIsInstance(mac_linux.settlement(self.placed.episode, 16), placement.Pending)
+        with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            self.assertEqual(mac_linux.settlement(self.placed.episode, 16), placement.Settled())
 
     def test_guest_without_a_start_line_saves_end_proof_and_reports_no_execution(self) -> None:
         attempt = 16
         self.placed = replace(self.placed, attempt=f'{attempt:032x}')
-        with patch.object(mac_linux, 'send_guest_execution') as report:
+        pending = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+        with patch.object(mac_linux, 'send_guest_execution', return_value=pending) as report:
             reason = self.not_started(self.route('disconnect-before-copy'))
         self.assertIn('Guest cleanup: ended', reason)
-        report.assert_not_called()
+        report.assert_called_once()
+        request = cast(wire.ExecutionReport, report.call_args.args[0])
+        self.assertIsInstance(request.evidence, execution_identity.ExecutionNotStarted)
+        self.assertEqual(request.outcome, placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER))
         self.assertEqual(mac_linux.settlement(self.placed.episode, attempt), placement.Settled())
 
     def lose_guest_permission_reply(self, attempt: int) -> wire.ConsumePermission:
@@ -988,8 +997,8 @@ fi
         self.assertEqual(record['result'], 'not started')
 
     def test_guest_fence_refuses_a_gate_that_arms_after_reconciliation(self) -> None:
-        self.placed = replace(self.placed, attempt=f'{29:032x}')
-        episode = self.placed.episode
+        request = self.lose_guest_permission_reply(29)
+        episode = request.assignment.episode
         attempts: list[str] = []
         arm_guest = mac_linux.arm_guest
 
@@ -1108,6 +1117,60 @@ fi
         self.assert_guest_clean('probe')
         self.assertFalse(self.run_lock().exists())
 
+    def test_direct_affected_retries_after_a_consumed_guest_takes_no_run(self) -> None:
+        key = treekey.tree_key(str(self.repo))
+        assert key is not None
+        guest = replace(self.placed, attempt=f'{46:032x}', source_key=execution_identity.SourceKeyKnown(key))
+        local = replace(guest, attempt=f'{47:032x}', destination=replace(
+            guest.destination, provider='local', target='natedev', host='natedev'))
+        args = ('--affected', '--full', '--repo', str(self.repo))
+        command = ('gate.py', *args)
+        constraints = placement.PlacementConstraints(guest.source_key, command, str(self.repo), '', guest.session,
+            (placement.PlacementCandidate(guest.destination), placement.PlacementCandidate(local.destination)))
+        profile = admission_records.ProgramProfile('gate', str(self.repo), str(self.repo),
+            admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
+        submitted = wire.PlacementRequest(guest.episode, guest.owner, guest.since, profile, constraints)
+        path = self.root / 'assignment.json'
+        grant = wire.Assignment(guest)
+        admission_client.write_assignment(path, grant)
+        admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest.episode, guest.since),
+            first_step.OwnedGatePlacement(grant, submitted), path)
+        pending = wire.DispatchStatus(guest, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+        events: list[str] = []
+
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertEqual(request.assignment, guest)
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(timeout, 1)
+            self.assertEqual(request.claim, self.consumed[0][0].claim)
+            self.assertIsInstance(request.evidence, execution_identity.ExecutionNotStarted)
+            self.assertEqual(request.outcome, placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER))
+            self.assertIsInstance(mac_linux.settlement(guest.episode, 46), placement.Pending)
+            events.append('report')
+            return replace(pending, retry=placement.RetryAt(1.0))
+
+        def settle(request: wire.SettlementRequest) -> None:
+            self.assertEqual(request.assignment, guest)
+            self.assertEqual(mac_linux.settlement(guest.episode, 46), placement.Settled())
+            events.append('settle')
+
+        with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'main-probe-failure'}),
+              patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)),
+              patch.object(gate, 'test_run_folder', return_value=nullcontext()),
+              patch.object(mac_linux, 'send_guest_execution', side_effect=report),
+              patch.object(admission_client, 'claim_failure', return_value=pending) as decline,
+              patch.object(admission_client, 'request_settlement', side_effect=settle),
+              patch.object(queue_place, 'wait_for_placement', return_value=wire.Assignment(local)) as again,
+              patch.object(gate, 'run_suites', return_value=GateRun((), 0, 0, selection_certified=True)) as run,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(gate.main(args), 0, errors.getvalue())
+        self.assertEqual(events, ['report', 'settle'])
+        again.assert_called_once()
+        self.assertEqual(again.call_args.args[0], submitted)
+        run.assert_called_once()
+        decline.assert_not_called()
+        self.assert_guest_clean('probe')
+
     def test_bundle_preparation_failure_after_consumption_saves_proof_without_arming(self) -> None:
         self.placed = replace(self.placed, attempt=f'{39:032x}')
         with patch.object(mac_linux, 'runner_bootstrap', side_effect=OSError('fixture bootstrap failed')):
@@ -1148,19 +1211,16 @@ fi
         self.assertEqual(mac_linux.settlement(episode, 43), placement.Settled())
         self.assert_guest_clean('fence')
 
-    def test_recovery_leaves_an_old_address_only_record_pending(self) -> None:
-        request = self.lose_guest_permission_reply(44)
-        episode = request.assignment.episode
-        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
-        launch = cast(dict[str, object], json.loads(path.read_bytes().splitlines()[0]))
-        _ = launch.pop('guest_checkout')
-        _ = launch.pop('holder')
-        _ = path.write_text(json.dumps(launch) + '\n')
-        with patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit:
+    def test_unrecorded_attempt_uses_holder_exit_without_guest_recovery(self) -> None:
+        episode = self.placed.episode
+        with (patch('scripts.aws_target.cloud_gate.start_reconcile_service') as submit,
+              patch.object(mac_linux, 'recover_guest_launch') as fence):
             mac_linux.reconcile_unproven(episode, 44)
+            mac_linux.reconcile_guest_end(episode, 44)
         submit.assert_not_called()
-        mac_linux.reconcile_guest_end(episode, 44)
+        fence.assert_not_called()
         self.assertIsInstance(mac_linux.settlement(episode, 44), placement.Pending)
+        self.assertEqual(mac_linux.settlement(episode, 44, legacy_holder_ended=True), placement.Settled())
         self.assert_guest_clean()
 
     def test_reconcile_unproven_checks_for_proof_after_preparing_submission(self) -> None:

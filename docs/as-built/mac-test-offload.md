@@ -100,29 +100,30 @@ When the proof wait expires, the gate returns status 80 to its placement retry l
 The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
 The arm checks the saved guest identity before it writes any guest records.
 It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
-It records `proven` when cleanup confirms the end, even when the stream gives no start marker.
-It records `not started` locally if the gate consumed permission and sent no arm request.
+It records `proven` when cleanup confirms the end of a run.
+It records `not started` if the gate consumed permission and can prove that no run started.
 It records `unproven` and saves the armed guest identity when the proof wait expires.
-The route sends the end report only if the stream gave the start marker.
+The route sends a completion report for a run with a start marker.
+For a proven no-run, it sends a refusal for the consumed claim and releases the holder in the journal.
+The gate requests settlement and keeps the same placement episode for the retry.
 The queue can acknowledge the end report while it waits to read the proof.
 Each record contains the queue attempt key, the result, the detail, and the wall time.
-The record includes the Mac claim ID when it is known.
+Each record includes the Mac claim ID.
 The writer locks the file during the append and syncs the record to disk.
 A failed report send leaves the proof available on disk.
 `mac_linux.settlement()` reads the file without a lock and skips damaged rows.
 The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
-Only a `proven` or `not started` row for that key settles the attempt.
+A matching `proven` or `not started` row settles the attempt after the holder exits or gives up the attempt.
 The queue can call `reconcile_unproven()` while it holds the slot.
 If a launch remains unproven, recovery waits for the gate process to exit or give up the attempt.
 The adapter reads the journal again before it submits the service.
 When the route saved an armed guest identity, the service uses it to confirm the run ended.
 For a launch with an unknown arm result, the service requires the saved guest identity.
-If the journal has no record for the attempt, the service uses the current guest settings.
+An attempt without a journal record requires the queue to confirm that its legacy holder exited.
 A guest with a held run lock leaves the attempt pending.
 With the lock free, the guest checks both arm names and records refusal under the run lock.
 The refusal prevents later arms and runs for that queue attempt.
 The service records `proven` if the guest found an arm and `not started` if it found none.
-Older launch records without a saved guest identity remain pending.
 The recovery path records at most one warning per attempt under `mac-linux/end-proof-warnings`.
 
 natedev holds the SSH input open for the whole run.
