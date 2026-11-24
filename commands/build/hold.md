@@ -7,10 +7,11 @@ The shared `config/build_targets.conf` sets `default_target=natedev`.
 Only natedev supports `clear`, `drain`, and `release` in this delivery.
 Mac, AWS, and `all` return exit 2 without changing any target.
 Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
+Clear and drain require Nate's explicit request. Pass his exact words with `--user-words`.
 
 ## Clear existing work
 
-1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py clear [target] --for '<why>' --release-eta HH:MM --zone <IANA zone>`.
+1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py clear [target] --for '<why>' --user-words '<exact request>' --release-eta HH:MM --zone <IANA zone>`.
 2. Add `--keep <pid>` for each run that must continue.
 3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 4. Send the printed notice with `/notify_top_level --here`.
@@ -28,7 +29,7 @@ Other CI requests stay queued until release.
 
 ## Drain existing work
 
-1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py drain [target] --for '<why>' --release-eta HH:MM --zone <IANA zone>`.
+1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py drain [target] --for '<why>' --user-words '<exact request>' --release-eta HH:MM --zone <IANA zone>`.
 2. Add `--keep <pid>` for an additional run that must continue.
 3. Use `YYYY-MM-DDTHH:MM` instead of `HH:MM` for a later date.
 
@@ -83,7 +84,7 @@ The existing Bash guard uses the same hold and caller check.
 Eligible `verify.sh` test steps can use the Mac while natedev remains held.
 
 Inspect any path named by `state unreadable`.
-Repair your natedev holder record with `clear --for '<why>' --release-eta HH:MM --zone <IANA zone>`, or remove it with `release`.
+Repair your natedev holder record with the clear command above, or remove it with `release`.
 `/build:hold release` sets a damaged release record aside.
 For a damaged Mac claim, check its holder and running job before repairing the file.
 Use `/build:mac block` or `/build:mac unblock` for a Mac block.

@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import IO, Literal, cast, override
 from unittest import mock
 
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
@@ -453,7 +454,8 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(set(holder.keep), {build_hold.ProcessIdentity(pid, "11000") for pid in (20, 30, 40, 60, 80)})
             self.assertIsInstance(holder.release, build_hold.KnownReleaseEta)
             record = cast(dict[str, object], json.loads((self.holders / member.id).read_text()))
-            self.assertEqual(set(record), {"holder", "since", "for", "release_eta", "keep"})
+            self.assertEqual(set(record), {"holder", "since", "for", "release_eta", "keep", "user_words"})
+            self.assertEqual(record["user_words"], TEST_HOLD_USER_WORDS)
             for pid, expected in ((10, build_hold.Holder), (11, build_hold.Holder),
                                   *((pid, build_targets.NoBlockingHold) for pid in (20, 21, 30, 60, 61, 80, 81))):
                 lineage = build_targets.read_caller_lineage(self.proc, pid, "11000")
@@ -469,7 +471,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(os, "kill") as kill, \
              mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(build_hold, "print_hold_audit"), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain", "--user-words", TEST_HOLD_USER_WORDS,
                 "--keep", "40", "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
         stop.assert_not_called()
@@ -506,12 +508,15 @@ class HoldEnforcerTests(unittest.TestCase):
         def publish(directory: Path, identity: build_hold.HolderIdentity, purpose: str,
                     request: build_hold.ReleaseRequest, now: datetime,
                     keep: tuple[build_hold.ProcessIdentity, ...] | list[build_hold.ProcessIdentity], *,
-                    before_publish: Callable[[], None] | None = None) -> str:
+                    user_words: str,
+                    before_publish: Callable[[], None] | None = None,
+                    after_publish: Callable[[Path], None] | None = None) -> str:
             self.assertEqual(discoveries, [()])
             self.assertFalse(build_hold.has_holder_file(directory))
             _ = self.process(55, "bash", argv=("bash", "verify.sh", "check"))
             _ = self.process(57, "cargo", parent=55, argv=("cargo", "build"))
-            return original_start(directory, identity, purpose, request, now, keep, before_publish=before_publish)
+            return original_start(directory, identity, purpose, request, now, keep, user_words=user_words,
+                                  before_publish=before_publish, after_publish=after_publish)
 
         def start_enforcer() -> None:
             self.assertEqual(discoveries, [(), (build_hold.ProcessIdentity(55, "11000"),)])
@@ -532,7 +537,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain", "--user-words", TEST_HOLD_USER_WORDS,
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
 
@@ -677,7 +682,7 @@ class HoldEnforcerTests(unittest.TestCase):
         for target in ("mac", "aws", "all"):
             with self.subTest(target=target), \
                  mock.patch.object(build_hold, "start_hold") as start, redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(build_hold.main(["drain", target, "--for", "private drain"]), 2)
+                self.assertEqual(build_hold.main(["drain", target, "--for", "private drain", "--user-words", TEST_HOLD_USER_WORDS]), 2)
                 self.assertEqual(output.getvalue(), f"drain {target} is not supported yet\n")
                 start.assert_not_called()
 
@@ -712,7 +717,7 @@ class HoldEnforcerTests(unittest.TestCase):
         with mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop), \
              mock.patch.object(hold_enforcer, "start") as start, \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear", "--user-words", TEST_HOLD_USER_WORDS,
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "30", "--proc-root", str(self.proc)]), 0)
         start.assert_called_once_with()
@@ -731,7 +736,7 @@ class HoldEnforcerTests(unittest.TestCase):
         with mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear", "--user-words", TEST_HOLD_USER_WORDS,
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "11", "--proc-root", str(self.proc)]), 0)
         stop.assert_not_called()
@@ -870,7 +875,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain", "--user-words", TEST_HOLD_USER_WORDS,
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "45", "--proc-root", str(self.proc)]), 0)
         clock.assert_called_once_with(time.CLOCK_BOOTTIME)
@@ -894,16 +899,46 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start") as start, \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs") as wait, \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain", "--user-words", TEST_HOLD_USER_WORDS,
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
         self.assertFalse((self.holders / member.id).exists())
-        self.assertIn("the hold was released", output.getvalue())
+        self.assertIn("The hold was released", output.getvalue())
+        start.assert_not_called()
+        wait.assert_not_called()
+
+    def test_drain_refresh_leaves_a_newer_hold_for_the_same_holder(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        member = fixture_member("producer", name="holder")
+        (self.holders / "holder").unlink()
+        path = self.holders / member.id
+        newer = b""
+
+        def discover(_proc_root: Path, identity: build_hold.HolderIdentity) -> tuple[build_hold.ProcessIdentity, ...]:
+            nonlocal newer
+            if path.is_file():
+                since = build_hold.read_holder(path).since
+                request = build_hold.DatedReleaseEta(since + timedelta(hours=4))
+                _ = build_hold.start_hold(self.holders, identity, "new purpose", request, since,
+                                          user_words=TEST_HOLD_USER_WORDS + " New request.")
+                newer = path.read_bytes()
+            return ()
+
+        with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
+             mock.patch.object(hold_enforcer, "start") as start, \
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0) as wait, \
+             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--user-words", TEST_HOLD_USER_WORDS, "--release-eta", "23:59", "--zone", "Etc/GMT+12",
+                "--proc-root", str(self.proc)]), 0)
+        self.assertTrue(newer)
+        self.assertEqual(path.read_bytes(), newer)
+        self.assertIn("The holder has a newer hold", output.getvalue())
         start.assert_not_called()
         wait.assert_not_called()
 
     def test_parser_rejects_removed_hold_command_and_drain_option(self) -> None:
-        for arguments in (["hold", "--for", "test"], ["clear", "--for", "test", "--drain"]):
+        for arguments in (["hold", "--for", "test"], ["clear", "--for", "test", "--user-words", TEST_HOLD_USER_WORDS, "--drain"]):
             with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as errors:
                 with self.assertRaises(SystemExit) as exit_code:
                     _ = build_hold.main(arguments)

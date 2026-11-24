@@ -120,6 +120,7 @@ class DeploymentPaths:
     roots: rename.RecordRoots
     settings: DeploymentSettings
     lock_fd: int
+    user_words: str
     discovery_arguments: tuple[str, ...] = ()
 
     @property
@@ -133,6 +134,10 @@ class DeploymentFailed(Exception):
     def __init__(self, message: str, status: int = 1) -> None:
         super().__init__(message)
         self.status: int = status
+
+
+class DrainWordsRequired(DeploymentFailed):
+    """The deployment needs the user's words to create a hold."""
 
 
 def say(message: str) -> None:
@@ -271,12 +276,12 @@ def service(paths: DeploymentPaths, action: str, unit: str, *, user: bool = Fals
     _ = run(paths.settings, command, f"{action} {unit}", lock_fd=paths.lock_fd)
 
 
-def hold_command(paths: DeploymentPaths, action: str) -> None:
+def hold_command(paths: DeploymentPaths, action: Literal["drain", "release"]) -> None:
     arguments = [action, "natedev", "--holder", HOLDER]
     if action == "drain":
         eta = datetime.now(paths.settings.zone) + timedelta(hours=paths.settings.hold_eta_hours)
         arguments += ["--for", "gate folder and step-name deployment", "--release-eta", eta.strftime("%H:%M"),
-                      "--zone", paths.settings.zone.key]
+                      "--zone", paths.settings.zone.key, f"--user-words={paths.user_words}"]
     _ = run_python(paths, paths.tree / "scripts/build_hold/build_hold.py", arguments, f"{action} natedev", writes=True)
 
 
@@ -463,6 +468,10 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
     elif number == 2:
         holds = build_hold.natedev_holds(build_hold.holder_directory())
         if not holds.in_force:
+            try:
+                _ = build_hold.require_user_words(paths.user_words)
+            except ValueError as error:
+                raise DrainWordsRequired(str(error), 2) from error
             state.owns_hold = True
             save(paths, state)
             hold_command(paths, "drain")
@@ -534,9 +543,11 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
 
 
 def print_resume_command(paths: DeploymentPaths) -> None:
-    arguments = shlex.join((*paths.roots.direction.arguments(), *paths.discovery_arguments))
+    words = (f"--user-words={paths.user_words}",) if paths.user_words.strip() else ()
+    arguments = shlex.join((*paths.roots.direction.arguments(), *paths.discovery_arguments,
+                            *words))
     command = "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh"
-    say(f"After correcting the cause, continue with: {command}" + (f" {arguments}" if arguments else ""))
+    say(f"After correcting the cause, continue with: {command} {arguments}")
 
 
 def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryRequired) -> int:
@@ -611,6 +622,8 @@ def deploy(paths: DeploymentPaths, state: DeploymentState, *,
             save(paths, state)
             say(f"Done: {NAMES[number]} at {datetime.now(paths.settings.zone):%Y-%m-%d %H:%M:%S %Z}")
             after_step(number)
+    except DrainWordsRequired:
+        raise
     except (DeploymentFailed, rename.Refused, OSError, ValueError) as error:
         status = error.status if isinstance(error, DeploymentFailed) else 1
         failure = RecoveryRequired(number, status, str(error))
@@ -640,13 +653,16 @@ def checked_home() -> Path:
     return home
 
 
-def main() -> int:
+def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--wait-root", type=Path, action="append")
     _ = parser.add_argument("--cloud-root", type=Path, action="append")
     _ = parser.add_argument("--reverse", action="store_true", help="undo the deployment with the old gate code installed")
+    _ = parser.add_argument("--user-words", help="Nate's exact request (required to create a hold)")
     _ = parser.add_argument("--discover", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(arguments)
+    discover = cast(bool, args.discover)
+    user_words = cast(str | None, args.user_words) or ""
     tree = HERE.parents[2]
     try:
         home = checked_home()
@@ -659,7 +675,7 @@ def main() -> int:
         reverse = cast(bool, args.reverse)
         wait = cast(list[Path] | None, args.wait_root)
         cloud = cast(list[Path] | None, args.cloud_root)
-        if cast(bool, args.discover):
+        if discover:
             require_installed_code(tree, Direction.REVERSE if reverse else Direction.FORWARD)
             with tempfile.TemporaryFile(mode="w+t") as details, redirect_stdout(details):
                 wait_roots = tuple(wait) if wait is not None else rename.default_wait_roots()
@@ -681,7 +697,7 @@ def main() -> int:
             roots = rename.configured_roots(state.direction)
             discovery = tuple(word for flag, folders in (("--wait-root", wait), ("--cloud-root", cloud))
                               for folder in folders or () for word in (flag, str(folder)))
-            paths = DeploymentPaths(tree, home, journal, roots, settings, lock.fileno(), discovery)
+            paths = DeploymentPaths(tree, home, journal, roots, settings, lock.fileno(), user_words, discovery)
             return deploy(paths, state)
     except (DeploymentFailed, rename.Refused, OSError, ValueError, SyntaxError) as error:
         say(f"Refused: {error}")

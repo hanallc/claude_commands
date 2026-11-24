@@ -20,6 +20,7 @@ from scripts.build_queue.test_placement import (
     placement_request, publish_candidate,
 )
 from scripts.build_hold import build_hold
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.build_targets import build_targets
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
@@ -1745,7 +1746,8 @@ class QueueMoveTests(unittest.TestCase):
             with land_runs.landing([commit]):
                 self.assertIn(commit, land_runs.running_lands())
                 _ = build_hold.write_hold(directory, holder, reason.purpose, build_hold.NoReleaseEta(),
-                                          datetime.fromtimestamp(fixture.clock.now(), UTC))
+                                          datetime.fromtimestamp(fixture.clock.now(), UTC),
+                                          user_words=TEST_HOLD_USER_WORDS)
                 for request in (first, second):
                     reply, = fixture.server.handle_request(request)
                     assert isinstance(reply, wire.Wait)

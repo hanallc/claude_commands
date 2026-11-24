@@ -9,6 +9,7 @@ from typing import override
 from unittest import mock
 import unittest
 
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.mac_test.test_target_state import IsolatedTargetState, SCRIPTS, TARGET_NAMES, build_hold
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
@@ -51,7 +52,7 @@ class TargetHoldTests(IsolatedTargetState):
                 with self.subTest(action=action, target=name):
                     arguments = [action, name]
                     if action != "release":
-                        arguments.extend(["--for", "private test"])
+                        arguments.extend(["--for", "private test", "--user-words", TEST_HOLD_USER_WORDS])
                     result = self.invoke_hold(arguments)
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertEqual(result.stdout, f"{action} {name} is not supported yet\n")
@@ -69,6 +70,7 @@ class TargetHoldTests(IsolatedTargetState):
                      mock.patch.object(build_hold, "print_hold_audit"), \
                      mock.patch.object(build_hold, "record_hold_event"):
                     result = self.invoke_hold([action, *selection, "--holder", "alice", "--for", "inspect local",
+                                               "--user-words", TEST_HOLD_USER_WORDS,
                                                "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                                "--proc-root", str(self.root / "proc")])
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

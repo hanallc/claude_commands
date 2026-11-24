@@ -42,6 +42,7 @@ from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.lib.release_waiter import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
@@ -1561,7 +1562,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                  "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets" / "build_targets.py")})
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
-            _ = build_hold.start_hold(holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            _ = build_hold.start_hold(holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone(),
+                                      user_words=TEST_HOLD_USER_WORDS)
             cycle = build_hold.read_cycle()
             assert not isinstance(cycle, build_hold.NoCycle)
             return self.root / "release" / cycle["id"] / "cycle.json"
@@ -1850,7 +1852,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             with self.hold_environment():
                 _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
                     build_hold.HolderIdentity("hana", "hana"), "render checks",
-                    build_hold.NoReleaseEta(), datetime.now().astimezone())
+                    build_hold.NoReleaseEta(), datetime.now().astimezone(), user_words=TEST_HOLD_USER_WORDS)
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         episode = self.runner_episode()
         if wait_kind in ("hold", "first_hold"):

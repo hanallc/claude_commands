@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.direct.verify_mac_offload_test_support import CARGO_STUB
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
@@ -31,6 +32,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         build_hold.start_hold(
             Path(os.environ["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
             "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone(),
+            user_words={TEST_HOLD_USER_WORDS!r},
         )
         print("natedev builds and tests are held by hana for render checks; this run was stopped. "
               "You get a notice at the release; run it again then.", file=sys.stderr)

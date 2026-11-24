@@ -27,6 +27,7 @@ from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
 from scripts.build_hold import build_hold, override_guard
+from scripts.build_hold.build_hold_test_support import TEST_HOLD_USER_WORDS
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
@@ -1157,7 +1158,8 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         _ = self.enterContext(mock.patch.object(build_targets, "wait_clock", return_value=NOW))
 
     def begin_hold(self) -> None:
-        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), NOW)
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("hana", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW, user_words=TEST_HOLD_USER_WORDS)
 
     def release_hold(self, _seconds: float) -> None:
         self.sleeps += 1
@@ -1483,7 +1485,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
     def test_holder_session_launch_is_admitted_without_changing_hold_or_release(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
-                                  "render checks", build_hold.NoReleaseEta(), NOW)
+                                  "render checks", build_hold.NoReleaseEta(), NOW, user_words=TEST_HOLD_USER_WORDS)
         cycle = build_hold.read_cycle()
         assert not isinstance(cycle, build_hold.NoCycle)
         cycle_file = self.root / "release" / cycle["id"] / "cycle.json"
@@ -1507,7 +1509,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
     def test_another_session_launch_is_refused_by_the_session_hold(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
-                                  "render checks", build_hold.NoReleaseEta(), NOW)
+                                  "render checks", build_hold.NoReleaseEta(), NOW, user_words=TEST_HOLD_USER_WORDS)
         self.assertEqual(self.check_launch("other-session"), (
             10, "natedev is held by hana for render checks; launch after the release.\n", "",
         ))
@@ -1519,10 +1521,12 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             _ = (directory / "stat").write_text(f"{pid} (gate) " + " ".join(fields))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
                                   "render checks", build_hold.NoReleaseEta(), NOW,
+                                  user_words=TEST_HOLD_USER_WORDS,
                                   keep=(build_hold.ProcessIdentity(10, "1000"),
                                         build_hold.ProcessIdentity(50, "4999")))
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("kept-session", "peer"),
                                   "peer checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
+                                  user_words=TEST_HOLD_USER_WORDS,
                                   keep=(build_hold.ProcessIdentity(10, "1000"),
                                         build_hold.ProcessIdentity(40, "4000"),
                                         build_hold.ProcessIdentity(50, "4999")))
@@ -1537,7 +1541,8 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         ):
             if owns_hold:
                 _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity(session, "caller"),
-                                          "caller checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+                                          "caller checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
+                                          user_words=TEST_HOLD_USER_WORDS)
             with self.subTest(caller_pid=pid, session=session, owns_hold=owns_hold), \
                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}), \
                  mock.patch.object(build_hold, "PROC_ROOT", proc), \
@@ -1558,9 +1563,10 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
     def test_holder_session_launch_is_refused_when_another_hold_is_in_force(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
-                                  "render checks", build_hold.NoReleaseEta(), NOW)
+                                  "render checks", build_hold.NoReleaseEta(), NOW, user_words=TEST_HOLD_USER_WORDS)
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
-                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
+                                  user_words=TEST_HOLD_USER_WORDS)
         self.assertEqual(self.check_launch("holder-session"), (
             10, "natedev is held by research for timing; launch after the release.\n", "",
         ))
@@ -1573,7 +1579,8 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                 for offset, session in enumerate(sessions):
                     _ = build_hold.start_hold(
                         self.holders, build_hold.HolderIdentity(session, session),
-                        f"{session} checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=offset))
+                        f"{session} checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=offset),
+                        user_words=TEST_HOLD_USER_WORDS)
                 others = tuple(session for session in sessions if session != owner)
                 try:
                     with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner}):
@@ -1636,7 +1643,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
     def test_holder_session_verify_passes_its_own_hold_without_queueing(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
-                                  "render checks", build_hold.NoReleaseEta(), NOW)
+                                  "render checks", build_hold.NoReleaseEta(), NOW, user_words=TEST_HOLD_USER_WORDS)
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("The holder must not wait")), \
              mock.patch.object(build_hold, "register_wait", wraps=build_hold.register_wait) as register:
             self.assertEqual(self.verify_calls("holder-session"), (0, 0, 0))
@@ -1646,9 +1653,10 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
     def test_holder_session_verify_waits_while_another_hold_is_in_force(self) -> None:
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
-                                  "render checks", build_hold.NoReleaseEta(), NOW)
+                                  "render checks", build_hold.NoReleaseEta(), NOW, user_words=TEST_HOLD_USER_WORDS)
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
-                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1),
+                                  user_words=TEST_HOLD_USER_WORDS)
 
         def other_releases(_seconds: float) -> None:
             self.sleeps += 1
