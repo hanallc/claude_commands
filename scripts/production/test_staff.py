@@ -796,6 +796,26 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_resume_transaction_saves_the_pause_and_checks_the_key_on_completion(self) -> None:
+        _, unit, _ = self.tree()
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True,
+                             unknown_fields={"future": "hold data"})
+        paused = staff.set_hold(unit.id, pause)
+        started = self.cli("begin-resume", unit.id, "--record", json.dumps(pause.to_json()), "--json")
+        pending = staff.StaffRow.from_json(cast(object, json.loads(started.stdout)))
+        key = f"agents-resume:{unit.id}:{pause.since}"
+        self.assertEqual(pending.paused, staff.Active())
+        self.assertEqual(pending.resume_pending, staff.ResumePending(key, pause))
+        self.assertEqual(staff.by_id(unit.id), pending)
+        self.assertEqual(staff.finish_resume(unit.id, "another-key"), pending)
+        self.assertEqual(staff.finish_resume(unit.id, key, restore_pause=True), paused)
+
+        _ = staff.begin_resume(unit.id, pause)
+        newer_pause = replace(pause, since="2026-11-24T08:45:00-08:00")
+        _ = staff.set_hold(unit.id, newer_pause)
+        finished = self.cli("finish-resume", unit.id, "--resume-key", key, "--restore-pause", "--json")
+        self.assertEqual(staff.StaffRow.from_json(cast(object, json.loads(finished.stdout))), replace(paused, paused=newer_pause))
+
     def test_pause_keeps_the_worker_mode_in_the_staff_record(self) -> None:
         _, unit, _ = self.tree()
         hold = staff.Paused("2026-11-24", "caller", "maintenance", keep_workers=True,

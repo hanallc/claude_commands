@@ -1396,12 +1396,16 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
         except (staff.StaffUnreadable, staff.StaffNotFound) as error:
             print(f"anomaly: {row.id}: pane home is unavailable: {error}", file=sys.stderr)
     try:
+        if codex_prompt and row is not None and isinstance(row.paused, staff.Paused):
+            _ = staff.resume(str(row.id))
         os.execvpe(program, command, staff.child_environment(environment))
     except OSError:
         if row is not None and row.home != selected_home and isinstance(row.home, staff.SessionHome):
             _ = staff.set_home(row.id, row.home)
         if row is not None and isinstance(row.exited, staff.Exited):
             _ = staff.set_hold(str(row.id), row.exited)
+        if codex_prompt and row is not None and isinstance(row.paused, staff.Paused):
+            _ = staff.set_hold(str(row.id), row.paused)
         raise
 
 

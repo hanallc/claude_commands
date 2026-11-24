@@ -47,9 +47,10 @@ JSON status lists the names under `kept_workers`.
 It reports each held row and its holder when known.
 It resumes the available rows and returns exit 2 if a row lock blocks a resume.
 Resume sends a running director one continuation per pause.
-An open message review keeps the continuation and leaves the director paused.
-The review release clears the matching pause before it presents the continuation.
-The send record prevents another copy after confirmed delivery.
+Resume saves the pending message and clears the pause in one staff write before calling the sender.
+A retry recovers the pending continuation even when the director is active.
+A durable send, queue entry, or review entry completes the pending resume.
+Review release publishes the continuation once and can retry the notice.
 Resume skips worker restoration for a director paused with `--keep-workers`.
 A worker message to a paused director waits in the director's transcript until resume.
 A paused director on the other machine gets the continuation message without a local liveness read.
@@ -57,7 +58,8 @@ The machine comes from its worktree or its showrunner document.
 A stopped paused director starts through the shared resume path, including its requested `--to` account.
 With `--keep-workers`, resume requires a live staff recipient for its continuation.
 If its socket is unavailable, the send fails and leaves no queued continuation.
-Queued or failed delivery restores the same pause record and returns failure.
+Definite delivery failure restores the same pause record.
+Uncertain delivery keeps the pending resume for a retry.
 A failed start or a start exception also restores the pause record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
 The Claude and Codex prompt hooks read the same director hold for every prompt source.

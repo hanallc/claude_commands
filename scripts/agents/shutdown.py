@@ -49,7 +49,7 @@ import subprocess
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from functools import partial
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -458,16 +458,32 @@ def _message(row: staff.StaffRow, text: str, *, require_live: bool = False,
                                               once_per_key=bool(key))
     except (OSError, ValueError, RuntimeError) as error:
         result = restart_support.MessageUnconfirmed(kind="unconfirmed", reason=str(error))
-    if not restart_support.message_was_delivered(result):
+    accepted = (restart_support.message_was_accepted(result) if key else restart_support.message_was_delivered(result))
+    if not accepted:
         print(f"anomaly: {row.name}: continuation delivery: {result}", file=sys.stderr)
     return result
 
 
-def _complete_paused_resume(row: staff.StaffRow) -> None:
-    if isinstance(row.paused, staff.Paused):
-        with suppress(staff.StaffRefused):
-            _ = staff.set_hold(str(row.id), staff.Active(), expected_pause=row.paused)
-    shutdown_record.remove_started([str(row.id)])
+def _deliver_pending_resume(row: staff.StaffRow) -> tuple[staff.StaffRow, int]:
+    pending = row.resume_pending
+    assert pending is not None
+    text = stop_resume.PAUSED_CONTINUATION
+    keep_workers = pending.original_pause.keep_workers
+    if not keep_workers:
+        workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
+                   else "Resume your existing workers. Do not open new workers.")
+        text = f"{text} {workers}"
+    delivery = (_message(row, text, require_live=True, key=pending.key) if keep_workers
+                else _message(row, text, key=pending.key))
+    if restart_support.message_was_accepted(delivery):
+        current = staff.finish_resume(row.id, pending.key)
+        if isinstance(current.paused, staff.Active) and isinstance(current.exited, staff.Active):
+            shutdown_record.remove_started([str(row.id)])
+            print(f"{row.name}: active")
+        return current, 0
+    if delivery["kind"] == "rejected":
+        row = staff.finish_resume(row.id, pending.key, restore_pause=True)
+    return row, 1
 
 
 def _finish_tasks(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
@@ -578,44 +594,34 @@ def _lifecycle(options: CommandLine) -> int:
                     print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                     code = 2
                     continue
-                started = False
-                keep_workers = isinstance(row.paused, staff.Paused) and row.paused.keep_workers
-                key = f"agents-resume:{row.id}:{row.paused.since}" if isinstance(row.paused, staff.Paused) else ""
-                if _paused_resume_needs_message(row):
-                    text = stop_resume.PAUSED_CONTINUATION
-                    if keep_workers:
-                        delivery = _message(row, text, require_live=True, key=key)
-                    else:
-                        workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
-                                   else "Resume your existing workers. Do not open new workers.")
-                        delivery = _message(row, f"{text} {workers}", key=key)
-                    if restart_support.message_was_delivered(delivery):
-                        _complete_paused_resume(row)
-                        print(f"{row.name}: active")
-                    else:
-                        code = max(code, 1)
+                if row.resume_pending is not None:
+                    row, status = _deliver_pending_resume(row)
+                    code = max(code, status)
+                    if status or (isinstance(row.paused, staff.Active) and isinstance(row.exited, staff.Active)):
+                        continue
+                pause = row.paused
+                if isinstance(pause, staff.Paused) and _paused_resume_needs_message(row):
+                    _, status = _deliver_pending_resume(staff.begin_resume(row.id, pause))
+                    code = max(code, status)
+                elif isinstance(pause, staff.Paused) and pause.keep_workers:
+                    result = stop_resume.resume(str(row.id), why=why, to=options.to, keep_workers=True)
+                    code = max(code, _result_code(result))
+                    if isinstance(result, stop_resume.ClaudeUp):
+                        _, status = _deliver_pending_resume(staff.begin_resume(row.id, pause))
+                        code = max(code, status)
                 else:
+                    started = False
                     try:
-                        if isinstance(row.paused, staff.Paused):
+                        if isinstance(pause, staff.Paused):
                             _ = staff.resume(str(row.id))
-                        if keep_workers:
-                            result = stop_resume.resume(str(row.id), why=why, to=options.to, keep_workers=True)
-                        else:
-                            result = stop_resume.resume(str(row.id), why=why, to=options.to)
+                        result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
-                        if started and keep_workers:
-                            _ = staff.set_hold(str(row.id), row.paused, expected_pause=staff.Active())
-                            delivery = _message(row, stop_resume.PAUSED_CONTINUATION, require_live=True, key=key)
-                            if not restart_support.message_was_delivered(delivery):
-                                code = max(code, 1)
-                                continue
-                            _complete_paused_resume(row)
                         if started and row.kind != "producer" and isinstance(row.exited, staff.Exited):
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))
                     finally:
-                        if not started and isinstance(row.paused, staff.Paused):
-                            _ = staff.set_hold(str(row.id), row.paused)
+                        if not started and isinstance(pause, staff.Paused):
+                            _ = staff.set_hold(str(row.id), pause)
             continue
         if options.command == "exit" and row.kind == "producer":
             if _worktree_is_remote(row):

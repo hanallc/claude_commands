@@ -29,6 +29,12 @@ from scripts.whoami import quota_state
 NATIVE_PROCESS = herdr.native_process
 
 
+def pending_resume_row(row: staff.StaffRow) -> staff.StaffRow:
+    assert isinstance(row.paused, staff.Paused)
+    pending = staff.ResumePending(f"agents-resume:{row.id}:{row.paused.since}", row.paused)
+    return replace(row, paused=staff.Active(), resume_pending=pending)
+
+
 class PauseWorkersTests(StaffTestCase):
     def test_named_pause_keeps_the_worker_and_resume_sends_one_continuation(self) -> None:
         owner = fixture_member("showrunner", name="production")
@@ -59,7 +65,7 @@ class PauseWorkersTests(StaffTestCase):
                 "Finish your current turn. Hold at the prompt. Do not start new work. Wait for agents resume.")
             send.reset_mock()
             self.assertEqual(shutdown.main(["resume", director.name]), 0)
-            send.assert_called_once_with(paused, "Continue where you stopped.", require_live=True,
+            send.assert_called_once_with(pending_resume_row(paused), "Continue where you stopped.", require_live=True,
                                          key=f"agents-resume:{director.id}:{paused.paused.since}")
         self.assertEqual(staff.by_id(director.id), director)
         self.assertEqual(staff.by_id(child.id), child)
@@ -176,16 +182,16 @@ class PauseWorkersTests(StaffTestCase):
         self.assertEqual(world.stops, [child.current_session])
         self.assertEqual(set(world.foreground), {"w1:p0"})
 
-    def test_stopped_kept_worker_pause_clears_only_after_the_continuation(self) -> None:
+    def test_stopped_kept_worker_resume_restores_the_pause_after_rejection(self) -> None:
         owner = fixture_member("showrunner", name="production")
         director = fixture_member("unit", name="selected", parent=owner.id)
         paused = staff.pause(str(director.id), "maintenance", keep_workers=True)
         for delivered in (False, True):
             def send_continuation(*_args: object, **_kwargs: object) -> restart_support.MessageSendOutcome:
-                self.assertEqual(staff.by_id(director.id), paused)
+                self.assertEqual(staff.by_id(director.id), pending_resume_row(paused))
                 if delivered:
                     return {"kind": "sent"}
-                return {"kind": "queued", "reason": "fixture"}
+                return {"kind": "rejected", "reason": "fixture socket miss"}
 
             with (self.subTest(delivered=delivered),
                   patch.object(herdr, "reboot_lock", side_effect=ExitStack),
@@ -198,7 +204,7 @@ class PauseWorkersTests(StaffTestCase):
                 self.assertEqual(shutdown.main(["resume", director.name]), 0 if delivered else 1)
             start.assert_called_once_with(str(director.id), why="resumed by name", to=None, keep_workers=True)
             assert isinstance(paused.paused, staff.Paused)
-            send.assert_called_once_with(paused, "Continue where you stopped.", require_live=True,
+            send.assert_called_once_with(pending_resume_row(paused), "Continue where you stopped.", require_live=True,
                                          key=f"agents-resume:{director.id}:{paused.paused.since}")
             if delivered:
                 remove.assert_called_once_with([str(director.id)])
@@ -213,7 +219,7 @@ class PauseWorkersTests(StaffTestCase):
         live = stop_resume.ClaudeUp(director.current_session, "w1:p0", "claude2")
 
         with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
-              patch.object(stop_resume, "running_on_account", side_effect=[sessions.SessionNotLive(), live]),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()) as probe,
               patch.object(stop_resume, "resume", return_value=live) as start,
               patch.object(restart_support, "_send_command", return_value=["send.py"]),
               patch.object(restart_support, "_deliver_message",
@@ -221,10 +227,11 @@ class PauseWorkersTests(StaffTestCase):
               patch.object(shutdown_record, "remove_started") as remove,
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertEqual(shutdown.main(["resume", director.name]), 1)
-            self.assertEqual(staff.by_id(director.id), paused)
+            self.assertEqual(staff.by_id(director.id), pending_resume_row(paused))
             remove.assert_not_called()
             self.assertEqual(shutdown.main(["resume", director.name]), 0)
         start.assert_called_once()
+        probe.assert_called_once()
         remove.assert_called_once_with([str(director.id)])
         assert isinstance(paused.paused, staff.Paused)
         argv = ["send.py", "--to", str(director.id), "--from", "shutdown", "--summary", "agents lifecycle",
@@ -234,6 +241,28 @@ class PauseWorkersTests(StaffTestCase):
 
 
 class ProductionResumeTests(StaffTestCase):
+    def test_resume_recovers_a_saved_continuation_before_the_active_path(self) -> None:
+        director = fixture_member("unit", name="selected", parent=fixture_member("showrunner", name="production").id)
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "director", "review")
+        _ = staff.set_hold(str(director.id), pause)
+        pending = staff.begin_resume(director.id, pause)
+        assert pending.resume_pending is not None
+
+        with (patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+              patch.object(stop_resume, "resume") as start,
+              patch.object(quota_state, "no_worker_mode", return_value=False),
+              patch.object(shutdown, "_message", return_value={"kind": "accepted"}) as send,
+              patch.object(shutdown_record, "remove_started") as remove,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["resume", director.name]), 0)
+
+        start.assert_not_called()
+        send.assert_called_once_with(pending, "Continue where you stopped. Resume your existing workers. Do not open new workers.",
+                                     key=pending.resume_pending.key)
+        remove.assert_called_once_with([str(director.id)])
+        self.assertEqual(output.getvalue(), "selected: active\n")
+        self.assertEqual(staff.by_id(director.id), director)
+
     def test_production_resume_reads_the_pause_mode_after_the_previous_resume(self) -> None:
         owner = fixture_member("showrunner", name="production")
         units = [fixture_member("unit", name=name, parent=owner.id) for name in ("alpha", "beta")]
@@ -255,9 +284,9 @@ class ProductionResumeTests(StaffTestCase):
               patch.object(shutdown_record, "remove_started"), redirect_stdout(io.StringIO())):
             self.assertEqual(shutdown.main(["resume", "--production", owner.name]), 0)
 
-        self.assertEqual(messages.call_args_list, [call(first, "Continue where you stopped.", require_live=True,
+        self.assertEqual(messages.call_args_list, [call(pending_resume_row(first), "Continue where you stopped.", require_live=True,
                                                      key=f"agents-resume:{first.id}:{pause.since}"),
-            call(replace(second, paused=plain_pause),
+            call(pending_resume_row(replace(second, paused=plain_pause)),
                  "Continue where you stopped. Resume your existing workers. Do not open new workers.",
                  key=f"agents-resume:{second.id}:{pause.since}")])
 
@@ -285,7 +314,7 @@ class ProductionResumeTests(StaffTestCase):
         self.assertEqual(errors.getvalue().splitlines(),
                          [f"shutdown: StaffRefused: {held.name}: another operation holds this row (pid {os.getpid()}: {holder})"])
         message = "Continue where you stopped. Resume your existing workers. Do not open new workers."
-        self.assertEqual(send.call_args_list, [call(row, message, key=f"agents-resume:{row.id}:{pause.since}")
+        self.assertEqual(send.call_args_list, [call(pending_resume_row(row), message, key=f"agents-resume:{row.id}:{pause.since}")
                                                for row in (first, last)])
         self.assertEqual(staff.by_id(first.id), replace(first, paused=staff.Active()))
         self.assertEqual(staff.by_id(held.id), held)

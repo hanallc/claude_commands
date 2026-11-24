@@ -21,7 +21,7 @@ from scripts.production import session_pane
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr
-from scripts.message import review_hold
+from scripts.message import review_hold, send
 from scripts.message.relay_identity import relay_session_name
 from scripts.production.unit_lookup import Place
 from scripts.hooks import hook_dispatch, review_hold_delivery
@@ -75,6 +75,36 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_review_release_reads_one_active_director_state(self) -> None:
+        director = fixture_member("showrunner", name="director")
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=True)
+        _ = staff.set_hold(director.id, pause)
+        row = staff.begin_resume(director.id, pause)
+        assert row.resume_pending is not None
+        session = str(director.current_session)
+        key = row.resume_pending.key
+        self.write_review_config("on")
+        with (patch.dict(os.environ, self.environment),
+              patch.object(send, "STATE", self.root / "message-state")):
+            review_hold.set_count(session, 2, 100, self.fail, record_keys=review_hold_delivery.record_keys)
+            message = review_hold.ReviewMessage("shutdown", 101, "Continue where you stopped.",
+                                                key=key, once_per_key=True)
+            with review_hold.route(session, message, urgent=False, record_keys=review_hold_delivery.record_keys) as route:
+                assert isinstance(route, review_hold.OpenReview)
+                route.keep(message)
+            reply = self.run_prompt("Continue review.", now=161, extra={"session_id": session})
+            held_file = review_hold.held_file(session)
+            contents = held_file.read_text()
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        self.assertNotIn("review hold:", reply.stderr)
+        expected_header = contents.splitlines()[0]
+        self.assertEqual(json.loads(reply.stdout), {"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": review_hold.held_notice(1, held_file, expected_header),
+        }})
+        self.assertEqual(contents.count("Continue where you stopped."), 1)
+        self.assertEqual(staff.by_id(director.id), row)
+
     def test_codex_prompt_reads_the_same_director_hold_as_claude(self) -> None:
         owner = fixture_member("showrunner", name="production")
         director = fixture_member("unit", name="selected", parent=owner.id)

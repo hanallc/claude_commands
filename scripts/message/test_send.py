@@ -74,7 +74,7 @@ from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, r
 from scripts.message import roster
 from scripts.message import sessions, session_records
 from scripts.accounts import accounts
-from scripts.agents.test_support import ShutdownSendLeaf, ShutdownTestCase, write_machine_config
+from scripts.agents.test_support import ShutdownTestCase, write_machine_config
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -2205,136 +2205,95 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.held_text().count("Same update."), 1)
         self.assertEqual(self.relayed, [])
 
-    def test_two_resumes_keep_one_continuation_during_a_review(self) -> None:
-        from contextlib import ExitStack
-        from types import SimpleNamespace
-
-        from scripts.agents import restart_support, shutdown, stop_resume
-        from scripts.herdr import herdr
-        from scripts.whoami import quota_state
-
-        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+    def test_interrupted_review_release_keeps_one_continuation(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
+        self.session("recipient", "Recipient")
+        at = send.now().timestamp()
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        review_hold.set_count("recipient", 2, at, self.fail, record_keys=send.record_released_acceptances)
+        self.assertEqual(send.send(options).outcome, "kept")
 
-        def store_hold(reference: str, hold: staff.Paused | staff.Active, *,
-                       expected_pause: staff.Paused | staff.Active | None = None) -> staff.StaffRow:
-            current = self.staff_rows[reference]
-            if expected_pause is not None and current.paused != expected_pause:
-                raise staff.StaffRefused("the pause changed")
-            row = replace(current, paused=hold)
-            self.staff_rows[reference] = row
-            return row
+        # Leave the reservation that a stopped review process would leave before it files the messages.
+        path = review_hold.held_file("recipient").with_name("recipient.json")
+        reservation = cast(dict[str, object], json.loads(path.read_text()))
+        reservation["reserved"] = reservation["messages"]
+        reservation["messages"] = []
+        _ = path.write_text(json.dumps(reservation))
+        with send.key_states() as states:
+            del states[key]
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
 
-        def run_send(command: list[str], *, input: str, capture_output: bool, text: bool,
-                     check: bool, timeout: float) -> subprocess.CompletedProcess[str]:
-            del capture_output, text, check, timeout
-            result = send.send(local_options([*command[1:], "--text", input]))
-            outcomes.append(result.outcome)
-            return subprocess.CompletedProcess(command, send.EXIT[result.outcome],
-                                              f"{result.outcome.upper()}: {result.detail}\n", "")
+        def interrupted(_notice: str) -> None:
+            self.assertTrue(send.once_accepted(key))
+            self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+            raise OSError("fixture notice interruption")
 
-        for keep_workers in (False, True):
-            with self.subTest(keep_workers=keep_workers):
-                identity = f"director-{keep_workers}"
-                self.session(identity, identity)
-                pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=keep_workers)
-                paused = store_hold(identity, pause)
-                at = send.now().timestamp()
-                key = f"agents-resume:{paused.id}:{pause.since}"
-                review_hold.set_count(identity, 2, at, self.fail, record_keys=send.record_released_acceptances)
-                outcomes: list[str] = []
-                released: list[str] = []
-
-                def release(notice: str) -> None:
-                    self.assertEqual(self.staff_rows[identity].paused, staff.Active())
-                    self.assertFalse(send.once_confirmed(key))
-                    released.append(notice)
-
-                def fail_release(_notice: str) -> None:
-                    self.assertEqual(self.staff_rows[identity].paused, staff.Active())
-                    raise OSError("fixture delivery failure")
-
-                with (mock.patch.object(staff, "row_operation", return_value=ExitStack()),
-                      mock.patch.object(staff, "set_hold", side_effect=store_hold),
-                      mock.patch.object(herdr, "reboot_lock", side_effect=ExitStack),
-                      mock.patch.object(stop_resume, "running_on_account",
-                                        return_value=stop_resume.ClaudeUp(identity, "w1:p1", "claude2")),
-                      mock.patch.object(stop_resume, "resume",
-                                        return_value=stop_resume.ClaudeUp(identity, "w1:p1", "claude2")),
-                      mock.patch.object(quota_state, "no_worker_mode", return_value=False),
-                      mock.patch.object(restart_support, "_send_command", return_value=["send.py"]),
-                      mock.patch.object(restart_support, "subprocess", SimpleNamespace(run=run_send))):
-                    for _ in range(2):
-                        self.assertEqual(shutdown.main(["resume", identity]), 1)
-                        self.assertEqual(self.staff_rows[identity], paused)
-                        self.assertFalse(send.once_confirmed(key))
-                    with self.assertRaisesRegex(OSError, "fixture delivery failure"):
-                        review_hold.set_count(identity, 0, at, fail_release,
-                                              record_keys=send.record_released_acceptances)
-                    self.assertEqual(self.staff_rows[identity], paused)
-                    self.assertFalse(send.once_confirmed(key))
-                    review_hold.set_count(identity, 0, at, release, record_keys=send.record_released_acceptances)
-                    self.assertTrue(send.once_confirmed(key))
-                    self.assertEqual(shutdown.main(["resume", identity]), 0)
-                    self.assertEqual(self.staff_rows[identity].paused, staff.Active())
-                    sent = restart_support.send_message(f"session:{identity}", "agents lifecycle",
-                                                        "Continue where you stopped.", key=key, once_per_key=True)
-                    self.assertTrue(restart_support.message_was_delivered(sent))
-                self.assertEqual(outcomes, ["kept", "skipped", "skipped"])
-                self.assertEqual(released, [held_notice(1, identity)
-                                           + "\nThe director pause ended. Follow the continuation in the held messages."])
-                self.assertEqual(self.held_text(identity).count("Continue where you stopped."), 1)
+        with self.assertRaisesRegex(OSError, "fixture notice interruption"):
+            review_hold.set_count("recipient", 0, at, interrupted, record_keys=send.record_released_acceptances)
+        released: list[str] = []
+        review_hold.set_count("recipient", 0, at + 30, released.append, record_keys=send.record_released_acceptances)
+        review_hold.set_count("recipient", 0, at + 60, released.append, record_keys=send.record_released_acceptances)
+        self.assertEqual(released, [held_notice(1, "recipient")])
+        self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
         self.assertEqual(self.relayed, [])
 
-    def test_once_per_pause_key_distinguishes_pending_and_confirmed_delivery(self) -> None:
-        for route in ("direct", "queue", "review"):
-            with self.subTest(route=route):
-                identity = f"director-{route}"
-                if route == "queue":
-                    self.staff_member(identity, identity)
-                else:
-                    self.session(identity, identity)
-                pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review")
-                paused = replace(self.staff_rows[identity], paused=pause)
-                self.staff_rows[identity] = paused
-                key = f"agents-resume:{identity}:{pause.since}"
-                args = ["--to", f"session:{identity}", "--key", key, "--once-per-key",
-                        "--text", "Continue where you stopped."]
+    def test_normal_mail_queues_when_an_offline_review_holds_a_continuation(self) -> None:
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
+        self.session("recipient", "Recipient")
+        at = send.now()
+        review_hold.set_count("recipient", 2, at.timestamp(), self.fail, record_keys=send.record_released_acceptances)
+        args = ["--to", "session:recipient"]
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        continuation = local_options([*args, "--key", key, "--once-per-key",
+                                      "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(continuation).outcome, "kept")
+        (self.root / "sessions/recipient.json").unlink()
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=2)):
+            normal = send.send(local_options([*args, "--text", "An ordinary update."]))
+        self.assertEqual(normal.outcome, "queued")
+        self.session("recipient", "Recipient")
+        queued = send.pending("session:recipient")
+        self.assertIn("An ordinary update.", queued)
+        self.assertIn(held_notice(1, "recipient"), queued)
+        self.assertEqual(self.held_text().count("Continue where you stopped."), 1)
 
-                def set_hold(reference: str, hold: staff.Paused | staff.Active, *,
-                             expected_pause: staff.Paused | staff.Active) -> staff.StaffRow:
-                    row = self.staff_rows[reference]
-                    self.assertEqual(row.paused, expected_pause)
-                    self.staff_rows[reference] = replace(row, paused=hold)
-                    return self.staff_rows[reference]
+    def test_once_queue_drain_records_acceptance_without_staff_calls_under_the_lock(self) -> None:
+        key = "agents-resume:recipient:2026-11-24T08:31:00-08:00"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        self.assertEqual(send.send(options).outcome, "queued")
+        with send.key_states() as states:
+            del states[key]
+        self.session("recipient", "Recipient")
+        membership = staff.snapshot()
 
-                with mock.patch.object(staff, "set_hold", side_effect=set_hold):
-                    if route == "queue":
-                        self.assertEqual(send.send(local_options(args)).outcome, "queued")
-                        self.assertEqual(self.staff_rows[identity], paused)
-                        self.assertFalse(send.once_confirmed(key))
-                        self.session(identity, identity)
-                        self.staff_rows[identity] = paused
-                        self.assertEqual(send.pending(f"session:{identity}").count("Continue where you stopped."), 1)
-                        self.assertEqual(send.pending(f"session:{identity}"), "")
-                    else:
-                        if route == "review":
-                            path = self.root / "config/send.conf"
-                            _ = write_config_fixture(path, "review_hold=on")
-                            review_hold.set_count(identity, 2, send.now().timestamp(), self.fail,
-                                                  record_keys=send.record_released_acceptances)
-                            self.assertEqual(send.send(local_options(args)).outcome, "kept")
-                            _ = write_config_fixture(path, "review_hold=off")
-                        self.outcome = send.Result("failed", "fixture delivery failure")
-                        self.assertEqual(send.send(local_options(args)).outcome, "failed")
-                        self.assertEqual(self.staff_rows[identity], paused)
-                        self.assertFalse(send.once_confirmed(key))
-                        self.outcome = send.Result("sent", "fixture delivery confirmed")
-                        self.assertEqual(send.send(local_options(args)).outcome, "sent")
-                        if route == "review":
-                            self.assertEqual(self.held_text(identity).count("Continue where you stopped."), 1)
-                    self.assertEqual(self.staff_rows[identity].paused, staff.Active())
-                    self.assertEqual(send.send(local_options(args)), send.Result("skipped", send.ONCE_CONFIRMED))
+        def read_staff() -> staff.StaffSnapshot:
+            with (self.root / ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return membership
+
+        with (mock.patch.object(staff, "snapshot", side_effect=read_staff) as read,
+              mock.patch.object(staff, "initial_snapshot", side_effect=AssertionError("unexpected staff read")),
+              mock.patch.object(staff, "set_hold", side_effect=AssertionError("unexpected staff write"))):
+            self.assertEqual(send.pending("session:recipient").count("Continue where you stopped."), 1)
+        read.assert_called_once_with()
+        self.assertEqual(send.pending("session:recipient"), "")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
+
+    def test_once_send_retries_definite_failure_and_stops_after_acceptance(self) -> None:
+        self.session("recipient", "Recipient")
+        key = "test-continuation"
+        options = local_options(["--to", "session:recipient", "--key", key, "--once-per-key",
+                                 "--text", "Continue where you stopped."])
+        self.outcome = send.Result("failed", "fixture delivery failure")
+        self.assertEqual(send.send(options), send.Result("failed", send.BEFORE_ACCEPTANCE + "fixture delivery failure"))
+        self.assertFalse(send.once_accepted(key))
+        self.outcome = send.Result("sent", "fixture delivery confirmed")
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options), send.Result("skipped", send.ONCE_ACCEPTED))
 
     def test_urgent_send_goes_through_an_open_review(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")

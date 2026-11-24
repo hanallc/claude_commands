@@ -27,6 +27,15 @@ class MessagePreviouslySent(TypedDict):
     kind: Literal["previously sent"]
 
 
+class MessageAccepted(TypedDict):
+    kind: Literal["accepted"]
+
+
+class MessageRejected(TypedDict):
+    kind: Literal["rejected"]
+    reason: str
+
+
 class MessageWindowSkipped(TypedDict):
     kind: Literal["window skipped"]
     reason: str
@@ -48,12 +57,16 @@ class MessageUnconfirmed(TypedDict):
 
 MessageDelivery = MessageSent | MessageQueued
 MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessagePreviouslySent | MessageWindowSkipped
-                      | MessageKept | MessageReplaced | MessageUnconfirmed)
+                      | MessageKept | MessageReplaced | MessageUnconfirmed | MessageAccepted | MessageRejected)
 
 
 def message_was_delivered(outcome: Mapping[str, object]) -> bool:
     """Accept only a delivered send or the recipient's acknowledgement."""
     return outcome["kind"] in {"sent", "acknowledged", "previously sent"}
+
+
+def message_was_accepted(outcome: MessageSendOutcome) -> bool:
+    return outcome["kind"] in {"sent", "accepted", "previously sent"}
 
 
 def _send_command() -> list[str]:
@@ -78,15 +91,27 @@ def _deliver_message(
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"send to {recipient} timed out after {timeout:g} seconds") from error
+    except OSError as error:
+        if "--once-per-key" in command:
+            return MessageRejected(kind="rejected", reason=str(error))
+        raise
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         parsed = outcome.header
         detail = parsed.detail
+        if "--once-per-key" in command:
+            if parsed.outcome in ("kept", "queued") and detail.startswith(message_send.DURABLE_ACCEPTANCE):
+                return MessageAccepted(kind="accepted")
+            if parsed.outcome == "skipped" and message_send.is_once_accepted_skip(detail):
+                return MessageAccepted(kind="accepted")
+            if parsed.outcome in ("failed", "refused", "held", "closed", "absent") and detail.startswith(
+                    message_send.BEFORE_ACCEPTANCE):
+                return MessageRejected(kind="rejected", reason=detail.removeprefix(message_send.BEFORE_ACCEPTANCE))
         match parsed.outcome:
             case "sent":
                 return MessageSent(kind="sent")
             case "skipped":
-                if message_send.is_once_confirmed_skip(detail):
+                if detail == "the earlier copy has confirmed delivery":
                     return MessagePreviouslySent(kind="previously sent")
                 if message_send.is_acknowledged_skip(detail):
                     return MessageAcknowledged(kind="acknowledged", reason=detail)
