@@ -711,6 +711,8 @@ class MacLinuxRouteTests(unittest.TestCase):
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
         _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            'GATE_STATE_DIR': str(self.root / 'gate-state'),
+            'GATE_PASSED_DIR': str(self.root / 'gate-passes'),
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
             'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
@@ -1223,6 +1225,7 @@ fi
                     submit.assert_called_once()
 
     def test_direct_affected_retries_after_a_consumed_guest_takes_no_run(self) -> None:
+        self.assertEqual(gate.gate_state_dir(), self.root / 'gate-state')
         key = treekey.tree_key(str(self.repo))
         assert key is not None
         guest = replace(self.placed, attempt=f'{46:032x}', source_key=execution_identity.SourceKeyKnown(key))
