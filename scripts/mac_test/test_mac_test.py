@@ -3193,6 +3193,118 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                 sleep.assert_called_once_with(60)
         return output.getvalue()
 
+    def saved_mirror_claim(self, **changes: object) -> tuple[Path, Path]:
+        from scripts.mac_test import offload
+
+        saved = claim_state.CleanupOnlyMacRepository("hana-key", "hana", "hana.json", "hana",
+                                                     fence_generation="a" * 32)
+        record = self.write_claim(mac_repository=saved.record(), repo_name=saved.mirror_name,
+                                  repo_key=saved.key, **changes)
+        self.paths.claims.mkdir()
+        path = self.paths.run.rename(self.paths.claims / saved.claim_file)
+        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                             cast(str, record["attempt"]))
+        fence = offload.start_fence_relative(identity, "mac", scope_key=saved.fence_scope_key())
+        return path, self.root / fence.with_suffix(".lock")
+
+    @contextmanager
+    def watch_mirror(self, activity: mac_test.MacActivity,
+                     remote: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+                     ) -> Generator[mock.Mock]:
+        from scripts.copies import copies
+        from scripts.mac_test.offload_test_commands import write_shell
+
+        write_shell(self.root / "pgrep", '[[ $* == *"/hana("* ]] || exit 2\nexit 1\n')
+        write_shell(self.root / "lsof", r'''
+if [[ $* == *"-d cwd"* ]]; then
+    printf 'p2345\nn%s/.local/state/mac-test/mirror/cargo-liner\n' "$HOME"
+elif [[ ${WATCH_FENCE_OPEN:-} == yes ]]; then
+    printf 'p2346\0ccargo helper\0\n'
+else
+    exit 1
+fi
+''')
+
+        def shell(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+            _, script, limit = arguments[-1].rsplit(" ", 2)
+            self.assertNotIn("kill ", bytes.fromhex(script).decode())
+            self.assertEqual(float(limit), options["timeout"])
+            return self.run_private_shell(arguments[-1], self.root)
+
+        with mock.patch.object(copies, "remote_registry", return_value=self.root / "mirror-registry"), \
+             mock.patch.dict(os.environ, {"PATH": f"{self.root}:{os.environ['PATH']}"}), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=activity), \
+             mock.patch.object(mac_test, "send_message") as send, \
+             mock.patch.object(subprocess, "run", side_effect=remote or shell) as check:
+            yield check
+        if not any(self.paths.claims.iterdir()):
+            send.assert_called_once()
+        else:
+            send.assert_not_called()
+
+    def test_kept_mirror_claim_releases_while_another_repository_runs(self) -> None:
+        path, fence = self.saved_mirror_claim()
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        with self.watch_mirror(mac_test.MacActive(2, 2)) as check:
+            output = self.watch_once()
+        self.assertFalse(path.exists())
+        self.assertFalse(fence.exists())
+        self.assertIn("the run left its mirror", output)
+        check.assert_called_once()
+
+    def test_kept_mirror_claim_stays_while_the_start_fence_is_held(self) -> None:
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        path, fence = self.saved_mirror_claim(idle_since=expired, work_idle_since=expired)
+        fence.parent.mkdir(parents=True)
+        with fence.open("w") as holder, self.watch_mirror(mac_test.MacIdle()) as check:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _ = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+        with mock.patch.dict(os.environ, {"WATCH_FENCE_OPEN": "yes"}), \
+             self.watch_mirror(mac_test.MacIdle()) as check:
+            _ = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+
+    def test_a_missing_fence_uses_the_mac_idle_rule(self) -> None:
+        path, fence = self.saved_mirror_claim()
+        fence.parent.mkdir(parents=True)
+        other = fence.with_name(f"{fence.stem[:-32]}{'b' * 32}.lock")
+        other.touch()
+        with self.watch_mirror(mac_test.MacActive(2, 2)) as check:
+            _ = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertFalse(fence.exists())
+        check.assert_called_once()
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        _ = path.write_text(json.dumps({**record, "idle_since": expired}))
+        with self.watch_mirror(mac_test.MacIdle()) as check:
+            output = self.watch_once()
+        self.assertFalse(path.exists())
+        self.assertTrue(other.exists())
+        self.assertIn("nothing ran on the Mac for 15 minutes", output)
+        check.assert_called_once()
+
+    def test_kept_mirror_claim_stays_when_the_check_gives_no_answer(self) -> None:
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        path, fence = self.saved_mirror_claim(idle_since=expired, work_idle_since=expired)
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        for status, output in ((255, ""), (0, "leftovers=0\nrc=0\n")):
+            with self.subTest(status=status), self.watch_mirror(mac_test.MacIdle(), remote=lambda *args, **kwargs:
+                    subprocess.CompletedProcess(args, status, output, "")) as check:
+                _ = self.watch_once()
+            self.assertTrue(path.exists())
+            self.assertTrue(fence.exists())
+            check.assert_called_once()
+
     def test_active_pass_clears_idle_since_with_state_lock_released(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
 

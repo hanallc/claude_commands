@@ -635,7 +635,8 @@ base.with_suffix(".lock").touch()
 
 
 def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
-                        scope_key: str = "run", report_holders: bool = False) -> str:
+                        scope_key: str = "run", report_holders: bool = False,
+                        leftover_observation: tuple[str, float] | None = None) -> str:
     """Use the prepared identity without permitting recreation after release."""
     key = pending_start_key(identity)
     relative = str(start_fence_relative(identity, target, scope_key=scope_key))
@@ -651,13 +652,42 @@ def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, set
         except OSError:
             pass
 ''' if check_holders else ""
-        program = (FENCE_HOLDER_PROGRAM if check_holders else "") + '''import fcntl, pathlib, sys
+        observation = '''import os, subprocess
+
+def check_leftovers():
+    observation = bytes.fromhex(sys.argv[4]).decode()
+    try:
+        result = subprocess.run(["sh", "-c", observation], capture_output=True,
+                                check=False, timeout=float(sys.argv[5]))
+    except subprocess.TimeoutExpired:
+        sys.exit("the mirror check timed out")
+    sys.stdout.buffer.write(result.stdout)
+    sys.stdout.flush()
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(1)
+    if result.returncode != 0 or result.stdout != b"leftovers=0\\nrc=0\\n":
+        sys.exit(1)
+''' if leftover_observation else ""
+        missing = ('''    check_leftovers()
+    if os.path.lexists(path):
+        sys.exit(1)
+    print("dispatch_start_missing=" + sys.argv[2], flush=True)
+''' if leftover_observation else '''    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+''')
+        remove = ('''    check_leftovers()
+    if not os.path.samestat(path.lstat(), os.fstat(lock.fileno())):
+        sys.exit(1)
+    path.unlink()
+''' if leftover_observation else '''    path.unlink(missing_ok=True)
+''')
+        program = (FENCE_HOLDER_PROGRAM if check_holders else "") + observation + '''import fcntl, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 path = base.with_suffix(".lock")
 try:
     lock = path.open("r")
 except FileNotFoundError:
-    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+''' + missing + '''\
     sys.exit(0)
 with lock:
     try:
@@ -666,10 +696,14 @@ with lock:
         print(sys.argv[3] + sys.argv[2], flush=True)
 ''' + holders + '''\
         sys.exit(0)
-    path.unlink(missing_ok=True)
+''' + remove + '''\
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
 '''
-        return shlex.join(["python3", "-c", program, encoded, key, pending_marker])
+        arguments = ["python3", "-c", program, encoded, key, pending_marker]
+        if leftover_observation is not None:
+            script, timeout = leftover_observation
+            arguments.extend((script.encode().hex(), str(timeout)))
+        return shlex.join(arguments)
     program = '''import fcntl, os, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 fcntl.flock(8, fcntl.LOCK_EX)
@@ -2702,9 +2736,9 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
 
 
 def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1, *,
-                          fence: Path | None = None) -> str:
+                          fence: Path | None = None, observe: bool = False) -> str:
     script = mirror_selector_script(repository, target, slot)
-    if isinstance(repository, KnownRepository):
+    if isinstance(repository, KnownRepository) and not observe:
         script += r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
