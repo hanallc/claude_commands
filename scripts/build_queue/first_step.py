@@ -337,6 +337,13 @@ def canonical_gate_command(command: Sequence[str], source: Path) -> bool:
     return path == canonical and path.resolve() == canonical
 
 
+def gate_module_mode_error(*, has_modules: bool, tests_only: bool, affected: bool) -> str:
+    """Return the error for named modules in an incompatible gate mode."""
+    if has_modules and not (tests_only or affected):
+        return "--module needs --tests-only or --affected"
+    return ""
+
+
 def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> tuple[str, ...]:
     """Read the caller's gate targets or the source repository's default."""
     if command_program(command) not in GATE_SCRIPTS:
