@@ -661,11 +661,21 @@ try {
             machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
           reading.walk = [rust, guest, mac, ci];
           reading.waiters = [waiting];
+          const runAgeMinutes = 3;
+          const pacificTime = new Intl.DateTimeFormat('en-US', {
+            timeZone:'America/Los_Angeles', hourCycle:'h23', hour:'2-digit', minute:'2-digit', timeZoneName:'short',
+          });
+          const clock = seconds => pacificTime.format(seconds * 1000);
+          const runStart = reading.read_at - runAgeMinutes * 60;
+          const bumpTime = clock(runStart - 3 * 60);
+          const keptUntil = clock(reading.read_at + 12 * 60);
           if (!shootBefore) {
-            rust.last_move = {kind:'bump', who:'nate', from_place:31, to_place:1, at:'12:22 PST'};
+            reading.move_revision = 'shot-queue';
+            rust.started_at = runStart;
+            rust.last_move = {kind:'bump', who:'nate', from_place:31, to_place:1, at:bumpTime};
             waiting.place = 2;
             reading.held_places = [{kind:'held', key:'proof-kept', unit:'admin-console',
-              position:1, failed_step:'test affected', kept_until:'23:37 EST', targets:['natedev','hana-aws']}];
+              position:1, failed_step:'test affected', kept_until:keptUntil, targets:['natedev','hana-aws']}];
           }
           reading.queued_priority_units = [];
           servedReading = reading;
@@ -710,6 +720,8 @@ try {
                   .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
                 keptDeadline:keptDeadline?.textContent,
                 keptDeadlineLines:deadlineRange.getClientRects().length,
+                runAge:table(keys[0]).querySelector('.duration').textContent,
+                heading:walk.querySelector('.walk-chart .queue-title').firstElementChild.textContent,
                 walkOverflow:scroll.scrollWidth - scroll.clientWidth,
                 trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
@@ -747,7 +759,9 @@ try {
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
-              assert.equal(rows.keptDeadline, 'until 23:37');
+              assert.equal(rows.heading, 'Waiting, in queue order');
+              assert.equal(rows.runAge, `${runAgeMinutes} min`);
+              assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
               if (width === 1440) assert.equal(rows.keptDeadlineLines, 1, 'The kept place deadline wraps at 1440 px.');
               if (width === 900) {
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
@@ -784,9 +798,10 @@ try {
                     clip:{x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1}};
                 })()`);
                 assert.match(bump.text, /Moved by\s+nate/);
+                assert.ok(bump.text.includes(bumpTime), 'The bump tooltip shows the wrong time.');
                 assert.ok(bump.fits, 'The bump tooltip extends outside the card.');
                 const withBump = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:bump.clip});
-                await writeFile(join(folder, 'moved-dark-3.png'), Buffer.from(withBump.data,'base64'));
+                await writeFile(join(folder, 'moved-dark-4.png'), Buffer.from(withBump.data,'base64'));
               }
             }
           }
