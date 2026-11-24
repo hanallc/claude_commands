@@ -289,6 +289,56 @@ send._bound_relay(message, 2, [], {}, attempt)
         self.assertEqual(result.receiver, "session:recipient")
         relay.assert_called_once_with(message, 2)
 
+    def test_routing_refuses_two_live_generations_when_one_environment_is_unreadable(self) -> None:
+        from scripts.herdr import herdr
+
+        conversation = fixture_runtime_id("routing-recipient")
+        mailbox = send.ConversationRecipient("fixture", conversation)
+        message = send.Message(mailbox.address, "fixture", "Preview", "body", None)
+        place = HerdrPlace("agents", "w1:p1")
+        readable_pid, denied_pid = 998070, 998071
+        pids = (readable_pid, denied_pid)
+        info = {"process_info": {"foreground_processes": [{"pid": pid, "argv": ["claude"]} for pid in pids]}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry_dir = root / "sessions"
+            registry_dir.mkdir()
+            environment = {**fake_unit_host.environment(root), "NOTIFIER_SESSIONS_DIR": str(registry_dir)}
+            for pid in pids:
+                fake_unit_host.process(environment, pid, 1, ["claude"], {})
+            denied_path = root / "proc" / str(denied_pid) / "environ"
+            read_bytes = Path.read_bytes
+
+            def read_process_file(path: Path) -> bytes:
+                if path == denied_path:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return read_bytes(path)
+
+            first = sessions.SessionRecord(pid=readable_pid, sessionId=conversation, procStart="1",
+                name="recipient", updatedAt=1, formerNames=[], tmux="", messagingSocketPath=str(root / "recipient.sock"))
+            second: sessions.SessionRecord = {**first, "pid": denied_pid, "messagingSocketPath": ""}
+            _ = (registry_dir / f"{readable_pid}.json").write_text(json.dumps(first))
+            with (mock.patch.dict(os.environ, environment), fake_unit_host.private_process_registry(),
+                  mock.patch.object(Path, "read_bytes", read_process_file),
+                  mock.patch.object(staff, "runtime_id", return_value=conversation),
+                  mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+                  mock.patch.object(herdr, "herdr_processes", return_value=[
+                      herdr.HerdrProcess(pid, place, {}, "claude", directory) for pid in pids]),
+                  mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+                  mock.patch.object(herdr.Herdr, "result", return_value=info)):
+                for second_start, expected in (("2", send.RelayAttempt), ("1", send.ClaudeRoutingFailed)):
+                    with self.subTest(second_start=second_start):
+                        second["procStart"] = second_start
+                        _ = (registry_dir / f"{denied_pid}.json").write_text(json.dumps(second))
+                        registry = sessions.read_registry()
+                        running = sessions.running_records(registry)
+                        self.assertEqual({row["pid"] for row in running},
+                                         set(pids) if second_start == "1" else {readable_pid})
+                        plan = send.relay_plan(message, registry, running, staff.StaffSnapshot(()), mailbox)
+                        self.assertIsInstance(plan, expected)
+                        if isinstance(plan, send.ClaudeRoutingFailed):
+                            self.assertIn("Permission denied", plan.failure.reason)
+
     def test_delivery_refuses_an_unbound_socket_and_sends_over_the_checked_connection(self) -> None:
         from scripts.herdr import herdr
 

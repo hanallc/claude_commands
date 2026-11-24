@@ -967,7 +967,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 with server.staff_read_scope():
                     if route.query == "view=count":
                         try:
-                            snapshot = for_you.read(include_comparison_reason=False)
+                            snapshot = for_you.read(include_running_revision=False)
                         except RecursionError as error:
                             rebuild = rebuild_row.read()
                             snapshot = for_you.ForYouSnapshot(

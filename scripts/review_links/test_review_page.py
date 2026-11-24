@@ -28,7 +28,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -5703,6 +5703,56 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         self.assertFalse(current.unread_answer)
         self.assertTrue(current.hidden_until(now))
         self.assertEqual(review_later.times()[key], until)
+
+    def test_later_deadlines_during_the_first_dst_hour(self) -> None:
+        zone = ZoneInfo('America/Los_Angeles')
+        now = datetime(2026, 11, 1, 1, 15, tzinfo=zone)
+        first = now.replace(minute=45)
+        second = now.replace(minute=30, fold=1)
+        self.check_later_deadlines(now, ((first, True), (second, True), (second.replace(minute=0), True)), first)
+
+    def test_later_deadlines_during_the_second_dst_hour(self) -> None:
+        zone = ZoneInfo('America/Los_Angeles')
+        now = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+        first = now.replace(minute=45, fold=0)
+        self.check_later_deadlines(now, ((first, False), (now, False)), None)
+
+    def check_later_deadlines(self, now: datetime, cases: tuple[tuple[datetime, bool], ...],
+                              earliest: datetime | None) -> None:
+        key = self.question()
+        snapshot = review_page.build_snapshot(self.root)
+        item = snapshot.records[key]
+        owner = next(member for member in snapshot.members.rows if member.id == item.owner)
+        identities = update_registration.QuestionStaff.for_record(snapshot.members)
+        items = [replace(item, times=replace(item.times, later=deadline)) for deadline, _ in cases]
+        for candidate, (deadline, active) in zip(items, cases, strict=True):
+            with self.subTest(deadline=deadline.isoformat()):
+                self.assertEqual(candidate.hidden_until(now), active)
+        expected = '' if earliest is None else str(int(earliest.timestamp()))
+        stored = {str(i): deadline for i, (deadline, _) in enumerate(cases)}
+        clock = Mock(now=Mock(return_value=now))
+        with (patch.object(review_items, 'read_kind', return_value=items),
+              patch.object(review_items, 'datetime', clock),
+              self.subTest(reader='Question counts')):
+            self.assertEqual(review_items.question_counts(owner, snapshot.zone, identities, None),
+                             (sum(not active for _, active in cases), expected))
+        with (patch.object(review_later, 'times', return_value=stored),
+              patch.object(review_later, 'datetime', clock),
+              self.subTest(reader='Status deadline')):
+            self.assertEqual(review_later.deadline(), expected)
+
+    def test_later_preserves_both_instants_of_a_repeated_wall_time(self) -> None:
+        key = self.question()
+        zone = ZoneInfo('America/Los_Angeles')
+        with patch.dict(os.environ, {'USER_ZONE': zone.key}):
+            for hour, offset in ((8, '-07:00'), (9, '-08:00')):
+                with self.subTest(hour=hour):
+                    item = review_page.build_snapshot(self.root).records[key]
+                    selected = datetime(2026, 11, 1, hour, 45, tzinfo=ZoneInfo('UTC'))
+                    _ = review_actions.later(item, selected.isoformat(), '')
+                    saved = review_later.times()[key]
+                    self.assertEqual(saved.isoformat(), '2026-11-01T01:45:00' + offset)
+                    self.assertEqual(saved.timestamp(), selected.timestamp())
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,

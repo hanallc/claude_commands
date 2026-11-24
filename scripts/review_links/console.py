@@ -241,6 +241,8 @@ def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
     payload: dict[str, object] = {**for_you_count(snapshot), "rebuild_machines": status.rebuild_machines}
     if isinstance(status.other_count, int):
         payload["other_count"] = status.other_count
+    if status.partial:
+        payload["partial"] = True
     return payload
 
 
