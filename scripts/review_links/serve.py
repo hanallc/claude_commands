@@ -2406,13 +2406,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(400, str(error), error)
             return
         except images.AnswerNotSent as error:
-            self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
+            self.browser_failure(503, str(error), error)
             return
         except ValueError as error:
             self.browser_failure(400, "Use the form on this page.", error)
             return
         except OSError as error:
-            self.browser_failure(503, "The image could not be changed. Try again.", error)
+            self.browser_failure(503, "Could not save the picture change. Try again.", error)
+            return
+        if isinstance(delivery, images.ImageAnswerSent):
+            result: dict[str, object] = {"state": "done"}
+            if delivery.notice:
+                result["notice"] = delivery.notice
+            if delivery.draft_confirmed:
+                result["draft_confirmed"] = True
+            self.json_response(200, result)
             return
         if self.headers.get(send_hold.REPLAY_HEADER) == "1" and isinstance(delivery, change_page.MessageDelivery):
             outcome = self.deliver_review(server, delivery, report_outcome=True)

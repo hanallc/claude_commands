@@ -22,10 +22,13 @@ Check the light mode and phone width yourself when the change needs them.
    `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py get <your worktree path>` prints the row.
 3. Register each image or pair:
    ```sh
-   ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image <path> | --before <path> --after <path>) --caption "<caption>" --owner <your staff id> (--change <id> | --phase <id>)
+   ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image <path> | --before <path> --after <path>) --caption "<caption>" --owner <your staff id> (--change <id> | --phase <id>) [--list-item L<n>]
    ```
    - A pair shows its two images side by side on one card, with one caption, one Feedback field and one set of answer buttons. On a narrow window the before image is on top.
    - Use `--change` for a change review row, such as `sdlc/C12`. Use `--phase` for phase work.
+   - Use `--list-item L<n>` to link the picture to a List item. Registration also searches old List folders.
+   - A linked answer updates the item and goes to its producer and the picture owner.
+   - An answer from an open card still goes to the recipients after the owner deletes the picture.
    - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
    - It copies the images, so you can delete the source files after it prints `registered`.
 4. Give the user the `Image link:` that the command prints for each image or pair. Write it as the full URL in plain text, never as a Markdown link or a wikilink.
@@ -36,6 +39,7 @@ The page shows the oldest image first, and a new image goes to the end.
 The user answers on an image or pair with **Approved** or **Send Feedback**, and both can carry feedback.
 **Send Feedback** means the image is not approved; the first line of its message ends with `your image is not approved. The feedback follows.`
 The answer arrives as a message that starts `From the user (via the Images page):`.
+For a linked item, the server saves the answer in the List log and sends it to the producer too.
 Act on it as on the user's words. Then delete the image with the command in the message.
 Answer **Ask question** with `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer --id <image> --question Q<n> --text "<answer>"`; keep the image for the user.
 To remove your own image, run `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id <id>`.

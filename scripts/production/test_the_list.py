@@ -89,6 +89,77 @@ class TheListTests(unittest.TestCase):
         return the_list.add(MORTY.id, title, owner=RUNNER.id, source="nate", number=number,
                             changes=changes if changes is not None else {})
 
+    def test_image_answer_retry_keeps_the_original_producer_and_a_later_state(self) -> None:
+        item = self.add(changes={"producer": BOB.id, "state": the_list.ItemState.WAITING_FOR_NATE,
+                                 "eta": the_list.EtaStatus.WAITING_FOR_NATE, "next_step": "Check the results."})
+        key = "review:" + "a" * 64
+        words = "Image 000000000001 approved.\nKeep the first row."
+        self.assertEqual(the_list.save_image_answer(
+            MORTY.id, item.id, key, words, image_id="000000000001", approved=True), BOB.id)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.state, the_list.ItemState.WORKING)
+        self.assertIs(saved.eta, the_list.EtaStatus.NO_TIME_YET)
+        self.assertEqual(saved.next_step, "bob: act on nate's answer to picture 000000000001")
+        self.assertIs(the_list.unread_update(saved), the_list.NoUnreadUpdate.ABSENT)
+        self.assertEqual(saved.log[-1].what, words)
+        later = the_list.update(MORTY.id, item.id, {"producer": MORTY.id,
+                                "state": the_list.ItemState.WAITING_FOR_NATE}, source="morty")
+        self.assertEqual(the_list.save_image_answer(
+            MORTY.id, item.id, key, words, image_id="000000000001", approved=True), BOB.id)
+        self.assertEqual(the_list.load(MORTY.id, item.id), later)
+
+    def test_image_answer_replaces_the_next_step(self) -> None:
+        image = "000000000001"
+        item = self.add(changes={"producer": BOB.id, "next_step": f"nate reviews picture {image}."})
+        _ = the_list.save_image_answer(MORTY.id, item.id, "review:next", f"Image {image}: Approved.",
+                                       image_id=image, approved=True)
+        self.assertEqual(the_list.load(MORTY.id, item.id).next_step,
+                         f"bob: act on nate's answer to picture {image}")
+
+    def test_image_answer_marks_read_and_keeps_open_questions(self) -> None:
+        image = "000000000001"
+        item = self.add()
+        question = question_record.Question("Q1", START.isoformat(), "Which check passed?")
+        self.write_legacy_question(item, question)
+        self.assertIsInstance(the_list.unread_update(the_list.load(MORTY.id, item.id)), the_list.UnreadUpdate)
+        _ = the_list.save_image_answer(MORTY.id, item.id, "review:read", f"Image {image}: Feedback.",
+                                       image_id=image, approved=False)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.questions, (question,))
+        self.assertTrue(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
+
+    def test_image_answer_marks_read_and_closes_only_the_matching_ask(self) -> None:
+        image = "000000000001"
+        item = self.add()
+        picture_ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.APPROVAL, target=OWNER.id,
+            what=f"Review picture {image}.", why="The layout changed.", config=False, requester=MORTY.id, source="morty")
+        other_ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id,
+            what=f"Check picture f{image}.", why="Another layout changed.", config=False, requester=MORTY.id, source="morty")
+        _ = the_list.save_image_answer(MORTY.id, item.id, "review:read", f"Image {image}: Feedback.",
+                                       image_id=image, approved=False)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(the_list.open_asks(saved), (other_ask,))
+        self.assertEqual(saved.asks[0].ask_id, picture_ask.ask_id)
+        self.assertTrue(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
+
+    def test_image_answer_uses_the_state_and_verdict_for_the_eta(self) -> None:
+        image = "000000000001"
+        for state in (the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.DELIVERED, the_list.ItemState.WORKING):
+            for approved in (True, False):
+                with self.subTest(state=state, approved=approved):
+                    item = self.add(changes={"state": state, "eta": the_list.EtaStatus.WAITING_FOR_NATE})
+                    words = f"Image {image}: " + ("Approved." if approved else "Feedback.")
+                    _ = the_list.save_image_answer(MORTY.id, item.id, "review:state", words,
+                                                   image_id=image, approved=approved)
+                    saved = the_list.load(MORTY.id, item.id)
+                    keeps_delivery = state is the_list.ItemState.DELIVERED and approved
+                    self.assertEqual(saved.state, state if keeps_delivery else the_list.ItemState.WORKING)
+                    self.assertEqual(saved.eta, the_list.EtaStatus.WAITING_FOR_NATE if keeps_delivery
+                                     else the_list.EtaStatus.NO_TIME_YET)
+                    self.assertEqual(saved.log[-1].what, words)
+
     def test_log_field_changes_replays_linked_delivery(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
         delivered = the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered("sdlc/C1"))

@@ -135,6 +135,13 @@ class ItemChange:
 
 
 @dataclass(frozen=True)
+class _ImageAnswerChange(ItemChange):
+    what: str
+    key: str
+    producer: staff.StaffId
+
+
+@dataclass(frozen=True)
 class UnreadUpdate:
     """Identify the unread update that a feedback request can mark read."""
 
@@ -247,6 +254,7 @@ class Ask:
 
 
 PAGE_SOURCE = "nate via List"
+_IMAGE_ANSWER_SOURCE = "nate via Images"
 _LEGACY_RECEIPT = "List request receipt: "
 _LEGACY_FEEDBACK = "Feedback to morty: "
 feedback_claims: set[tuple[Path, str]] = set()
@@ -814,7 +822,10 @@ def _validate(item: ListItem) -> None:
                         ("evidence", item.evidence), ("done_when", item.done_when)):
         _ = _field_text(value, name)
     for change in item.log:
-        if isinstance(change.what, str):
+        if isinstance(change, _ImageAnswerChange):
+            if not change.what.strip() or change.source != _IMAGE_ANSWER_SOURCE:
+                raise ListError("invalid image answer log")
+        elif isinstance(change.what, str):
             _log_line(change.what, "log text")
         if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt)):
             _validate_page_source(change.source)
@@ -1114,6 +1125,9 @@ def _read_log_line(line: str, number: int) -> ItemChange:
         match fields:
             case {"note": str(note)} if len(fields) == 1:
                 content = _read_legacy_note(note, source, number)
+            case {"note": str(note), "image_answer": {"key": str(key), "producer": str(producer)}} if len(fields) == 2:
+                return _ImageAnswerChange(_required_time(time), note, source, _request_id(key),
+                                          staff_id(producer, "image answer producer"))
             case {"action": "Parked", "fields": values, "request": request} if len(fields) == 3:
                 parking = _read_field_change("Parked", values, number)
                 content = PageParkingChange("Parked", parking.fields, _request_id(request))
@@ -1230,6 +1244,14 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
             raise RetiredListProducer(f"{producer.name}: retired producer. Choose an active producer.")
 
 
+def _stored_log_line(entry: ItemChange) -> str:
+    fields = _log_content(entry.what)
+    if isinstance(entry, _ImageAnswerChange):
+        fields["image_answer"] = {"key": entry.key, "producer": entry.producer}
+    return "- " + json.dumps({"time": entry.time.isoformat(), "source": entry.source, **fields},
+                              ensure_ascii=False)
+
+
 def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
@@ -1248,8 +1270,7 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     if item.asks:
         fields["asks"] = json.dumps([_stored_ask(ask) for ask in item.asks], ensure_ascii=False)
     body = "## Next step\n\n" + item.next_step
-    log = "\n".join("- " + json.dumps({"time": entry.time.isoformat(), "source": entry.source,
-                                         **_log_content(entry.what)}, ensure_ascii=False) for entry in item.log)
+    log = "\n".join(_stored_log_line(entry) for entry in item.log)
     for key, text, heading, following in (("next_step", item.next_step, "Latest status", item.latest_status),
                                           ("latest_status", item.latest_status, "Evidence", item.evidence),
                                           ("evidence", item.evidence, "Done when", item.done_when),
@@ -1870,7 +1891,9 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
 
 
 def _own_page_entry(entry: ItemChange) -> bool:
-    """Find nate's own List page entries: a read, his words and the request receipts. They are not unread content."""
+    """Find nate's own page entries. They do not change the unread update."""
+    if entry.source == _IMAGE_ANSWER_SOURCE:
+        return True
     return entry.source == PAGE_SOURCE and (isinstance(entry.what, MarkedRead) or entry.what == "Marked read"
                                             or _is_feedback(entry) or is_page_request_receipt(entry))
 
@@ -1910,6 +1933,10 @@ def unread_answer_ids(item: ListItem) -> frozenset[str]:
     return frozenset(answers)
 
 
+def _clear_unread(item: ListItem) -> ListItem:
+    return replace(item, unread_since=NoTimestamp.UNSET)
+
+
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
               update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
@@ -1927,7 +1954,7 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
-        read = replace(item, unread_since=NoTimestamp.UNSET)
+        read = _clear_unread(item)
         if not isinstance(page_request, PageRequest) or not _waits_for_nate(item, moment):
             return read
         return _start_working(read, moment, source)
@@ -1950,6 +1977,11 @@ def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staf
     return _change(keeper, identity, edit, lambda changed: AskOpened(changed.asks[-1]), source).item.asks[-1]
 
 
+def _close_asks(item: ListItem, ask_ids: set[str], moment: datetime, reference: str) -> ListItem:
+    return replace(item, asks=tuple(replace(ask, closed=moment, go_id=reference) if ask.ask_id in ask_ids else ask
+                                    for ask in item.asks))
+
+
 def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, source: str) -> ListEdit:
     """Close the ask with the go id; mark the item read when no answerable ask stays open.
 
@@ -1960,8 +1992,7 @@ def give_go(keeper: staff.StaffId, identity: str, ask_id: str, go_id: str, *, so
         _open(item)
         if not any(ask.ask_id == ask_id for ask in open_asks(item)):
             raise ListError("This ask is no longer open.")
-        closed = replace(item, asks=tuple(replace(ask, closed=moment, go_id=go_id) if ask.ask_id == ask_id else ask
-                                          for ask in item.asks))
+        closed = _close_asks(item, {ask_id}, moment, go_id)
         return replace(closed, state=ItemState.WORKING) if _waits_for_nate(closed, moment) else closed
 
     def event(changed: ListItem) -> GoGiven:
@@ -2330,6 +2361,52 @@ def list_question_target(keeper: staff.StaffId, item: ListItem,
     owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
     return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
                                            recipient, keeper=keeper, alert_owner=owner)
+
+
+def image_list_keeper(identity: str) -> staff.StaffId:
+    """Find the List folder that holds this item, including old folders."""
+    if re.fullmatch(r"L[1-9][0-9]*", identity) is None:
+        raise ListError("Use a List item id such as L324.")
+    candidates = tuple(record_store.owner_state_paths(
+        record_store.state_root(), f"list/{identity}.md", strict=True))
+    if not candidates:
+        raise ListError(f"No List item {identity}.")
+    if len(candidates) != 1:
+        raise ListError(f"More than one List folder holds {identity}.")
+    keeper = staff.StaffId(candidates[0].parent.parent.name)
+    _ = load(keeper, identity)
+    return keeper
+
+
+def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str, *,
+                      image_id: str, approved: bool) -> staff.StaffId:
+    """Save the answer before delivery. Return the producer for this answer."""
+    _ = _request_id(key)
+    store = _store(keeper)
+    with store.locked():
+        item = load(keeper, identity)
+        for entry in reversed(item.log):
+            if isinstance(entry, _ImageAnswerChange) and entry.key == key:
+                sync_folder(store.folder())
+                return entry.producer
+        moment = now()
+        producer = staff.snapshot().by_id(item.producer)
+        producer_name = producer.name if producer is not None else item.producer
+        changes: ItemChanges = {"next_step": f"{producer_name}: act on nate's answer to picture {image_id}"}
+        keeps_delivery = item.state is ItemState.DELIVERED and approved
+        if item.state in (ItemState.WAITING_FOR_NATE, ItemState.DELIVERED) and not keeps_delivery:
+            changes["state"] = ItemState.WORKING
+        if item.eta is EtaStatus.WAITING_FOR_NATE and not keeps_delivery:
+            changes["eta"] = EtaStatus.NO_TIME_YET
+        picture = re.compile(r"(?<![a-z0-9])" + re.escape(image_id) + r"(?![a-z0-9])", re.IGNORECASE)
+        asks = {ask.ask_id for ask in open_asks(item) if picture.search(ask.what) or picture.search(ask.why)}
+        changed = _close_asks(_clear_unread(item), asks, moment, key)
+        log = (*item.log, ItemChange(moment, FieldChange("Updated", {**changes}), _IMAGE_ANSWER_SOURCE))
+        if item.unread_since is not NoTimestamp.UNSET:
+            log = (*log, ItemChange(moment, MarkedRead(), _IMAGE_ANSWER_SOURCE))
+        answer = _ImageAnswerChange(moment, words, _IMAGE_ANSWER_SOURCE, key, item.producer)
+        _save(store, replace(changed, **changes, updated=moment, log=(*log, answer)))
+        return answer.producer
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
