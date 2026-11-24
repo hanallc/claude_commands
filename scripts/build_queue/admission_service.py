@@ -1192,6 +1192,20 @@ class DispatchEvidence:
     observed_at: float
 
 
+@dataclass(frozen=True)
+class NoHostObservation:
+    """The worker has no observation for this key."""
+
+
+@dataclass(frozen=True)
+class HoldReadingNotSupplied:
+    """The hold must read the worker's observation."""
+
+
+HostObservation = placement.HostEvidence | NoHostObservation
+HOLD_READING_NOT_SUPPLIED = HoldReadingNotSupplied()
+
+
 class HostEvidenceWorker:
     """One target reader publishes evidence without blocking the service loop."""
 
@@ -1214,12 +1228,15 @@ class HostEvidenceWorker:
         self.thread: threading.Thread = threading.Thread(target=self._read, name="placement-evidence-" + key.destination.target, daemon=True)
         self.thread.start()
 
-    def observation(self, key: placement.HostEvidenceKey) -> placement.HostEvidence | None:
+    def observation(self, key: placement.HostEvidenceKey) -> HostObservation:
         with self.lock:
-            return self.observations.get(key)
+            observed = self.observations.get(key)
+        return observed if observed is not None else NoHostObservation()
 
     def evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
-        return self.observation(key) or placement.HostEvidenceUnavailable(key, self.clock.now(), "not read")
+        observed = self.observation(key)
+        return (placement.HostEvidenceUnavailable(key, self.clock.now(), "not read")
+                if isinstance(observed, NoHostObservation) else observed)
 
     def publish(self, evidence: placement.HostEvidence) -> None:
         with self.lock:
@@ -1360,14 +1377,14 @@ class PlacementHold:
     destination: placement.PlacementDestination
     key: placement.HostEvidenceKey
     observed_at: float
-    reading: placement.HostEvidence | None
+    reading: HostObservation
     answered: bool
 
 
 @dataclass(frozen=True)
 class PlacementHoldStart:
     started_at: float
-    reading: placement.HostEvidence | None
+    reading: HostObservation
 
 
 @dataclass(frozen=True)
@@ -1837,7 +1854,6 @@ class AdmissionServer:
         self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
         self.placement_request_digests: dict[str, bytes] = {}
-        self.mac_only_refusals: dict[str, wire.DispatchStatus] = {}
         self.input_event_count: int = 0
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
@@ -2075,12 +2091,9 @@ class AdmissionServer:
             if not self.bumps.moves.keys() <= active:
                 self.bumps = replace(self.bumps, moves={episode: move for episode, move in self.bumps.moves.items()
                                                        if episode in active})
-        pending_placements = ({episode: request for episode, request in self.placement_requests.items()
-                               if episode not in self.mac_only_refusals}
-                              if self.mac_only_refusals else self.placement_requests)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            pending_placements, self.assignments, self.current_assignments, self.pending_cloud_groups,
+            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
             queue_pins=self.queue_pins, bumps=self.bumps, verify_run_slots=self.verify_run_slots,
             held_places=self.held_places)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
@@ -2571,7 +2584,6 @@ class AdmissionServer:
             submitted = self.placement_requests.pop(episode, None)
             if submitted is not None:
                 _ = self.placement_request_digests.pop(episode, None)
-                _ = self.mac_only_refusals.pop(episode, None)
                 self._end_placement_rank(submitted)
             waiting = self.waiters.get(episode)
             if waiting is not None:
@@ -3186,10 +3198,18 @@ class AdmissionServer:
 
     def _answer_parked_placements(self) -> None:
         parked, self.parked_placements = self.parked_placements, []
+        # Duplicate submissions in this pass receive the same refusal.
+        refused: dict[str, wire.DispatchStatus] = {}
         for item in parked:
             if not item.connection.finished and item.connection.socket.fileno() >= 0:
-                self._send(item.connection, self._placement_reply(item.request,
-                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
+                episode = item.request.episode
+                reply = refused.get(episode)
+                if reply is None:
+                    reply = self._placement_reply(item.request,
+                        self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()))
+                    if isinstance(reply, wire.DispatchStatus) and episode not in self.placement_requests:
+                        refused[episode] = reply
+                self._send(item.connection, reply)
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
@@ -3690,7 +3710,7 @@ class AdmissionServer:
             if digest is None or not self._placement_waiting(request):
                 continue
             reply = self._placement_reply(request,
-                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys, record_refusal=False)
+                self.local_hold_holders.get(episode, placement.ResourceHolderUnknown()), keys, discard_on_refusal=False)
             if isinstance(reply, wire.PlacementWait):
                 waits[episode] = PublishedPlacementWait(self.input_event_count, digest, reply)
         return waits
@@ -4422,7 +4442,6 @@ done
                 self._end_placement_rank(request)
             _ = self.placement_requests.pop(episode, None)
             _ = self.placement_request_digests.pop(episode, None)
-            _ = self.mac_only_refusals.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
             self._remove_waiter(self.waiters.get(episode))
@@ -4664,8 +4683,7 @@ done
         return wire.DispatchStatus(saved.assignment, state, saved.permission, reason, saved.retry)
 
     def _placement_waiting(self, request: wire.PlacementRequest) -> bool:
-        if (request.episode in self.mac_only_refusals or request.episode in self.current_assignments
-                or not self._placement_owner_live(request.owner)):
+        if request.episode in self.current_assignments or not self._placement_owner_live(request.owner):
             return False
         return not any(saved.assignment.episode == request.episode
             and isinstance(saved.state, placement.ClosedAssignment)
@@ -4931,11 +4949,23 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
+    def _discard_placement_request(self, request: wire.PlacementRequest) -> None:
+        episode = request.episode
+        self._end_placement_rank(request)
+        _ = self.placement_requests.pop(episode, None)
+        _ = self.placement_request_digests.pop(episode, None)
+        _ = self.prerequisites.pop(episode, None)
+        _ = self.placement_eligibility.pop(episode, None)
+        _ = self.local_hold_holders.pop(episode, None)
+        for candidate in request.constraints.candidates:
+            pair = (episode, candidate.destination)
+            _ = self.placement_holds.pop(pair, None)
+            _ = self.placement_hold_answers.pop(pair, None)
+        self._remove_waiter(self.waiters.get(episode), claim_disposition=WaiterClaimDisposition.RETURN)
+
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder,
-                         keys: PlacementEvidenceKeys | None = None, *, record_refusal: bool = True
+                         keys: PlacementEvidenceKeys | None = None, *, discard_on_refusal: bool = True
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
-        if (refused := self.mac_only_refusals.get(request.episode)) is not None:
-            return refused
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
             if candidate.destination.provider != "local" and isinstance(candidate.eligibility, placement.TemporaryExclusion)
@@ -5023,13 +5053,12 @@ done
                 refused = wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
                     refusal, placement.DoNotRetry(refusal))
-                if record_refusal:
-                    self._end_placement_rank(request)
-                    self.mac_only_refusals[request.episode] = refused
-                    self._remove_waiter(self.waiters.get(request.episode),
-                                        claim_disposition=WaiterClaimDisposition.RETURN)
+                if discard_on_refusal:
+                    self._discard_placement_request(request)
+                    self._prune_host_evidence()
                     self._schedule_pass()
                     self.persist()
+                    self._publish_replies(self._project_replies(self._queue_order()))
                 return refused
         if isinstance(selection, placement.PinnedHost):
             selected = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
@@ -5228,19 +5257,20 @@ done
             pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named)
 
     def _mac_hold_reading(self, request: wire.PlacementRequest,
-                          candidate: placement.CandidateEligibility) -> placement.HostEvidence | None:
+                          candidate: placement.CandidateEligibility) -> HostObservation | HoldReadingNotSupplied:
         """Read the Mac evidence once for eligibility and the hold."""
         if (candidate.destination.provider != "mac" or not isinstance(request.purpose, placement.NormalStep)
                 or not (isinstance(candidate.eligibility, placement.EvidenceNeeded)
                         or candidate.eligibility == placement.TemporaryExclusion("busy"))):
-            return None
+            return HOLD_READING_NOT_SUPPLIED
         key = self.placement_host_keys.get((request.episode, candidate.destination))
         reader = self.host_readers.get(key) if key is not None else None
-        return reader.worker.observation(reader.key) if reader is not None else None
+        return reader.worker.observation(reader.key) if reader is not None else NoHostObservation()
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], placement.HostEvidence], *,
-                        reading: placement.HostEvidence | None = None) -> PlacementHold | None:
+                        reading: HostObservation | HoldReadingNotSupplied = HOLD_READING_NOT_SUPPLIED
+                        ) -> PlacementHold | None:
         """Keep a remote destination for one probe of an older request."""
         destination = candidate.destination
         eligibility = candidate.eligibility
@@ -5252,13 +5282,13 @@ done
         reader = self.host_readers.get(key)
         if reader is None:
             return None
-        latest = reading if reading is not None else reader.worker.observation(key)
-        observed_at = latest.observed_at if latest is not None else self.clock.now()
+        latest = reader.worker.observation(key) if isinstance(reading, HoldReadingNotSupplied) else reading
+        observed_at = self.clock.now() if isinstance(latest, NoHostObservation) else latest.observed_at
         start = self.placement_holds.get(pair)
         answer = self.placement_hold_answers.get(pair)
         mac = destination.provider == "mac"
         # A Mac probe can publish after the hold starts with an earlier observation time.
-        if (start is not None and latest is not None
+        if (start is not None and not isinstance(latest, NoHostObservation)
                 and (latest is not start.reading if mac else observed_at >= start.started_at)):
             answer = latest
         answered = (answer is not None and
@@ -5597,12 +5627,7 @@ done
                     else:
                         self._close_placement(saved, "cancelled", placement.DoNotRetry(request.reason))
                 elif saved is None:
-                    self._end_placement_rank(submitted)
-                    _ = self.placement_requests.pop(request.episode, None)
-                    _ = self.placement_request_digests.pop(request.episode, None)
-                    _ = self.mac_only_refusals.pop(request.episode, None)
-                    self._remove_waiter(self.waiters.get(request.episode),
-                                        claim_disposition=WaiterClaimDisposition.RETURN)
+                    self._discard_placement_request(submitted)
                 self._prune_host_evidence()
             self._schedule_pass()
             self.persist()
@@ -5644,11 +5669,6 @@ done
                     or previous.run != request.run or previous.purpose != request.purpose):
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
-                if (refused := self.mac_only_refusals.get(request.episode)) is not None:
-                    if refused.reason != "backoff":
-                        return [refused]
-                    # Verify can ask again after it probes the Mac during backoff.
-                    del self.mac_only_refusals[request.episode]
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
                 self._close_abandoned_attempt(request.episode)
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
