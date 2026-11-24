@@ -1725,32 +1725,11 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted 
         _start_guest_queue_report(send, math.inf, reports, warn)
 
 
-def send_guest_end_report(request: ExecutionReport) -> None:
-    from scripts.build_queue import admission_protocol as wire, placement
-
-    with conf.diagnostics(report=False):
-        timeout = conf.read('build_admission').number('query_timeout_seconds')
-    reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
-    settlement_pending = (isinstance(reply.state, placement.CurrentAssignment)
-                          and isinstance(reply.permission, placement.PermissionConsumed))
-    if (reply.assignment != request.assignment or reply.reason
-            or not (settlement_pending or isinstance(reply.state, placement.ClosedAssignment))):
-        raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
-
-
-def settle_guest_no_run(dispatch: GuestGateDispatch, *, retry_before_settlement: bool) -> None:
-    """Save no-start proof and report settlement for the old no-answer path."""
-    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
-
+def save_guest_no_start(dispatch: GuestGateDispatch) -> None:
+    """Save proof that the guest received no arm command."""
     try:
         _append_guest_end(dispatch, GuestNotStartedProven(), 'The guest received no arm command')
-        if retry_before_settlement:
-            return
-        request = wire.ExecutionReport(admission_client.request_id(), dispatch.assignment, dispatch.claim,
-            execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER),
-            placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
-        send_guest_end_report(request)
-    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
+    except (OSError, ValueError) as error:
         print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
 
 
@@ -2023,8 +2002,6 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             armed = arm_guest(settings, request['attempt'])
                         except (GuestArmNotSent, GuestConnectAttemptsFailed) as error:
                             dispatch.arm_requested, dispatch.settled = prior_arm, prior_settlement
-                            if isinstance(error, GuestConnectAttemptsFailed):
-                                raise GuestConnectAttemptsFailed(f'the gate could not send the arm request: {error}') from error
                             raise GuestTookNoRun(f'the gate could not send the arm request: {error}') from error
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
@@ -2366,25 +2343,24 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         saved, launch = launch, None
         _release_guest_launch(saved)
 
-    def refused(reason: str, *, permission_unknown: bool = False, lock_refused: bool = False,
-                retry_before_settlement: bool = False) -> GuestNotStarted | GuestGateBlocked:
+    def refused(reason: str, *, permission_unknown: bool = False,
+                lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
         if dispatch is None and not permission_unknown:
             return GuestNotStarted(reason)
         if dispatch is not None:
             if dispatch.arm_requested:
                 if dispatch.started is not None:
                     return GuestGateBlocked(reason)
-                retry_before_settlement = True
                 if dispatch.settled and not lock_refused:
                     reason += '. The guest did not confirm whether the run started.'
                     return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
             else:
-                settle_guest_no_run(dispatch, retry_before_settlement=retry_before_settlement)
+                save_guest_no_start(dispatch)
         try:
             release_launch()
         except OSError as error:
             return GuestGateBlocked(f'{reason}. Cannot release the Mac Linux launch holder: {error}')
-        return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=retry_before_settlement)
+        return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=dispatch is not None)
 
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
@@ -2453,8 +2429,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except (GuestTookNoRun, GuestNotLocked) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown),
-                       lock_refused=isinstance(error, GuestNotLocked),
-                       retry_before_settlement=isinstance(error, GuestConnectAttemptsFailed))
+                       lock_refused=isinstance(error, GuestNotLocked))
     except GuestEndUnproven as error:
         if dispatch is not None:
             try:

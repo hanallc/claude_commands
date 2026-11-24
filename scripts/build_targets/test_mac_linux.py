@@ -1611,7 +1611,7 @@ fi
 
     def test_failed_main_probe_after_consumption_saves_proof_without_arming(self) -> None:
         self.placed = replace(self.placed, attempt=f'{38:032x}')
-        self.assertIn('the guest main probe failed', self.not_started(self.route('main-probe-failure')))
+        self.assertIn('the guest main probe failed', self.unconfirmed(self.route('main-probe-failure')))
         self.assertEqual(len(self.consumed), 1)
         self.assertEqual(mac_linux.settlement(self.placed.episode, 38), placement.Settled())
         self.assert_guest_clean('probe')
@@ -1667,23 +1667,13 @@ fi
         admitted = first_step.FirstStepAdmission(SlotQueuePosition(guest.episode, guest.since),
             first_step.OwnedGatePlacement(grant, submitted), path)
         pending = wire.DispatchStatus(guest, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
-        events: list[str] = []
 
-        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+        def report(request: wire.ClaimFailure) -> wire.DispatchStatus:
             self.assertEqual(request.assignment, guest)
-            self.assertGreater(deadline, time.monotonic())
-            self.assertEqual(timeout, 1)
-            self.assertEqual(request.claim, self.consumed[0][0].claim)
-            self.assertIsInstance(request.evidence, execution_identity.ExecutionNotStarted)
-            self.assertEqual(request.outcome, placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER))
-            self.assertIsInstance(mac_linux.settlement(guest.episode, 46), placement.Pending)
-            events.append('report')
-            return replace(pending, retry=placement.RetryAt(1.0))
-
-        def settle(request: wire.SettlementRequest) -> None:
-            self.assertEqual(request.assignment, guest)
+            self.assertEqual(request.reason, 'mac_linux_start_unconfirmed')
+            self.assertIsInstance(request.claim, placement.NoProviderClaim)
             self.assertEqual(mac_linux.settlement(guest.episode, 46), placement.Settled())
-            events.append('settle')
+            return replace(pending, retry=placement.RetryAt(1.0))
 
         def status(_episode: str, attempt: str) -> admission_wire.PlacementStatusReply:
             assignment = guest if attempt == guest.attempt else local
@@ -1699,25 +1689,26 @@ fi
         with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'main-probe-failure'}),
               patch.object(admission_client, 'placement_status', side_effect=status),
               patch.object(gate, 'test_run_folder', return_value=nullcontext()),
-              patch.object(mac_linux, 'send_guest_execution', side_effect=report),
-              patch.object(admission_client, 'claim_failure', return_value=pending) as decline,
-              patch.object(admission_client, 'request_settlement', side_effect=settle),
+              patch.object(mac_linux, 'send_guest_execution') as execution,
+              patch.object(admission_client, 'claim_failure', side_effect=report) as decline,
+              patch.object(admission_client, 'request_settlement') as settle,
               patch.object(queue_place, 'wait_for_placement', return_value=wire.Assignment(local)) as again,
               patch.object(gate, 'run_suites', return_value=GateRun((), 0, 0, selection_certified=True)) as run):
             admitted.handoff(self.repo)
             result = admitted.run_gate(run_gate)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(events, ['report', 'settle'])
         again.assert_called_once()
         self.assertEqual(again.call_args.args[0], submitted)
         run.assert_called_once()
-        decline.assert_not_called()
+        decline.assert_called_once()
+        execution.assert_not_called()
+        settle.assert_not_called()
         self.assert_guest_clean('probe')
 
     def test_bundle_preparation_failure_after_consumption_saves_proof_without_arming(self) -> None:
         self.placed = replace(self.placed, attempt=f'{39:032x}')
         with patch.object(mac_linux, 'runner_bootstrap', side_effect=OSError('fixture bootstrap failed')):
-            self.assertIn('fixture bootstrap failed', self.not_started(self.route()))
+            self.assertIn('fixture bootstrap failed', self.unconfirmed(self.route()))
         self.assertEqual(len(self.consumed), 1)
         self.assertEqual(mac_linux.settlement(self.placed.episode, 39), placement.Settled())
         self.assert_guest_clean('probe')
@@ -1733,9 +1724,37 @@ fi
             return start(argv, **kwargs)
 
         with patch.object(subprocess, 'Popen', start_other_commands):
-            self.assertIn('fixture arm SSH could not start', self.not_started(self.route()))
+            self.assertIn('fixture arm SSH could not start', self.unconfirmed(self.route()))
         self.assertEqual(len(self.consumed), 1)
         self.assertEqual(mac_linux.settlement(self.placed.episode, 42), placement.Settled())
+        self.assert_guest_clean('probe')
+
+    def test_arm_ssh_popen_eagain_reports_unconfirmed_start(self) -> None:
+        fixture = GatePlacementFixture(self)
+        guest = self.placed = replace(fixture.guest, attempt=f'{42:032x}')
+        admission_wire.write_assignment(fixture.assignment_file, wire.Assignment(guest))
+        start = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+
+        def start_other_commands(argv: Sequence[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            if argv[0] == 'ssh' and ' arm mac-linux-armed mac-linux-cancel ' in argv[-1]:
+                raise BlockingIOError(errno.EAGAIN, 'fixture arm SSH could not start')
+            return start(argv, **kwargs)
+
+        with (patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(fixture.assignment_file)}),
+              patch.object(gate, 'current_gate_placement', return_value=wire.Assignment(guest)),
+              patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+              patch.object(subprocess, 'Popen', start_other_commands),
+              patch.object(mac_linux, 'send_guest_execution') as execution,
+              redirect_stderr(io.StringIO()) as errors):
+            status = gate.main(('--tests-only', '--full', '--module-time-limit-s', '3', '--repo', str(self.repo)))
+        self.assertEqual(status, 79, errors.getvalue())
+        self.assertIn('fixture arm SSH could not start', errors.getvalue())
+        report = wire.parse_request(fixture.report_file.read_bytes())
+        assert isinstance(report, wire.ClaimFailure), report
+        self.assertEqual((report.assignment, report.reason), (guest, 'mac_linux_start_unconfirmed'))
+        execution.assert_not_called()
+        self.assertEqual(len(self.consumed), 1)
+        self.assertEqual(mac_linux.settlement(guest.episode, 42), placement.Settled())
         self.assert_guest_clean('probe')
 
     def test_arm_connect_failures_save_not_started_proof(self) -> None:
@@ -1743,7 +1762,7 @@ fi
         with (patch.dict(os.environ, {'FIXTURE_SSH_ARM': 'reset,refused,reset'}),
               patch.object(mac_linux, 'sleep')):
             outcome = self.route()
-        self.assertIn('Connection reset by peer after 3 connect attempts', self.not_started(outcome))
+        self.assertIn('Connection reset by peer after 3 connect attempts', self.unconfirmed(outcome))
         self.assertEqual(len(self.consumed), 1)
         self.assertEqual(mac_linux.settlement(self.placed.episode, 42), placement.Settled())
         self.assert_guest_clean('probe', 'arm', 'arm', 'arm')

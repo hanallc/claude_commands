@@ -3127,9 +3127,12 @@ class PlacementTests(unittest.TestCase):
             self.assertNotIn(attempt, fixture.server.manual_guest_settlement)
             self.assertEqual(fixture.server.places[place_key].move_id, original_rank)
             self.assertEqual(fixture.server.handle_request(failure), [accepted])
+            _ = publish_candidate(fixture, request)
             replacement, = fixture.server.handle_request(request)
             assert isinstance(replacement, wire.LocalPlacementGranted), replacement
             self.assertEqual(replacement.assignment.destination.target, "natedev")
+            self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
+                placement.CandidateEligibility(guest.destination, placement.FixedExclusion(failure.reason)))
             self.assertEqual((replacement.assignment.episode, replacement.assignment.since), (guest.episode, guest.since))
             replacement_key = execution_identity.attempt_key(request.episode, replacement.assignment.attempt)
             self.assertNotEqual(replacement_key, attempt)

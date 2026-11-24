@@ -48,6 +48,7 @@ The route publishes each change to the module count.
 The count excludes type checks.
 Older guest gate code can return its result without sending progress records.
 If a guest attempt fails without a confirmed start, the gate exits with status 79 and reports the exact assignment.
+If the gate consumed permission and sent no arm command, it saves proof that the guest did not start.
 The queue checks that the holder ended and that the attempt has no recorded start.
 For a placed gate, `copies.py run` keeps the copy lease and submits the original placement request again.
 The queue keeps the original rank and assigns the next available candidate other than the guest.
