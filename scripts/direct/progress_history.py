@@ -5309,17 +5309,59 @@ def _finish_wait(args: argparse.Namespace) -> None:
     _end_wait(state, wait, now, unclosed=False)
 
 
+@dataclass(frozen=True)
+class _FinishedPhase:
+    id: str
+    instance_id: str
+    title: str
+    started_at: float
+    status: str
+
+    def phase_record(self) -> dict[str, object]:
+        return {"id": self.id, "instance_id": self.instance_id, "title": self.title, "started_at": self.started_at}
+
+
+@dataclass(frozen=True)
+class _NoFinishedPhase:
+    pass
+
+
+def _finished_phase(events: list[dict[str, object]], phase_id: str) -> _FinishedPhase | _NoFinishedPhase:
+    """Read the newest finished instance of the named phase."""
+    finished = next((event for event in reversed(events)
+                     if event.get("event_type") == "phase_finished" and event.get("phase_id") == phase_id), None)
+    if finished is None:
+        return _NoFinishedPhase()
+    return _FinishedPhase(phase_id, pass_recorder.string(finished.get("phase_instance_id")),
+                          pass_recorder.string(finished.get("phase_title")),
+                          pass_recorder.number(finished.get("phase_started_at")),
+                          pass_recorder.string(finished.get("status")))
+
+
 def _checkpoint(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
-    state = pass_recorder.read_state(pass_recorder.argument_session_dir(args))
+    session_dir = pass_recorder.argument_session_dir(args)
+    state = pass_recorder.read_state(session_dir)
     commit = pass_recorder.arg_string(args, "commit")
     if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None:
         raise SystemExit("checkpoint requires a full commit hash")
-    phase = _selected_phase(state, args)
-    if phase is None:
-        raise SystemExit("checkpoint requires the named open phase")
-    events = _run_events(state)
+    if cast(bool, args.closed):
+        phase_id = pass_recorder.optional_arg(args, "phase_id")
+        if not phase_id:
+            raise SystemExit("checkpoint --closed requires --phase-id")
+        if pass_recorder.open_phase_named(state, phase_id) is not None:
+            raise SystemExit(f"Phase {phase_id} is open. Use checkpoint without --closed.")
+        events = _run_events(state)
+        finished = _finished_phase(events, phase_id)
+        if isinstance(finished, _NoFinishedPhase):
+            raise SystemExit(f"Phase {phase_id} has no finished instance")
+        phase = finished.phase_record()
+    else:
+        phase = _selected_phase(state, args)
+        if phase is None:
+            raise SystemExit("checkpoint requires the named open phase")
+        events = _run_events(state)
     folders = _phase_working_dirs(state, events, phase)
     if not any(_is_commit(folder, commit) for folder in folders):
         raise SystemExit(f"checkpoint refused: {commit} is not a commit in {' or '.join(map(str, folders))}")
@@ -5329,7 +5371,7 @@ def _checkpoint(args: argparse.Namespace) -> None:
             print(pass_recorder.string(event.get("event_id")))
             return
     event = pass_recorder.record_event(state, "checkpoint", pass_recorder.now_epoch(), phase_record=phase)
-    event.update(checkpoint_commit=commit, session_dir=str(pass_recorder.argument_session_dir(args)))
+    event.update(checkpoint_commit=commit, session_dir=str(session_dir))
     pass_recorder.append_event(state, event)
     print(event["event_id"])
 
@@ -5390,22 +5432,29 @@ def resolve_checkpoint(commit: str, working_dir: Path, phase_id: str) -> (
 ):
     """Match a full checkpoint, including finished instances, across durable runs."""
     events, ignored = load_events()
-    phases = [event for event in events if event.get("event_type") == "phase_started"
-              and pass_recorder.string(event.get("working_dir"))
-              and Path(pass_recorder.string(event.get("working_dir"))).resolve() == working_dir.resolve()
-              and event.get("phase_id") == phase_id]
+    directory = working_dir.resolve()
+    phases = [event for event in events if event.get("event_type") == "phase_started" and event.get("phase_id") == phase_id]
     matches = [event for event in events if event.get("event_type") == "checkpoint"
                and event.get("checkpoint_commit") == commit]
-    valid = [event for event in matches if any(
-        (event.get("run_id"), event.get("phase_instance_id"), event.get("working_dir")) ==
-        (phase.get("run_id"), phase.get("phase_instance_id"), phase.get("working_dir")) for phase in phases)]
+
+    def phase_key(event: dict[str, object]) -> tuple[str, str]:
+        return pass_recorder.string(event.get("run_id")), pass_recorder.string(event.get("phase_instance_id"))
+
+    def in_worktree(event: dict[str, object]) -> bool:
+        path = pass_recorder.string(event.get("working_dir"))
+        try:
+            return bool(path) and Path(path).resolve() == directory
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    instances = {key for phase in phases if all(key := phase_key(phase))}
+    valid = [event for event in matches if phase_key(event) in instances and in_worktree(event)]
     if len(matches) == len(valid) == 1 and not ignored:
         return ResolvedCheckpointPhase(valid[0])
-    candidates = list({(pass_recorder.string(event.get("run_id")), pass_recorder.string(event.get("phase_instance_id"))): event
-                       for event in [*phases, *matches]}.values())
+    candidates = {phase_key(event): event for event in [*filter(in_worktree, phases), *matches]}
     identities = tuple({key: event[key] for key in
                         ("run_id", "phase_id", "phase_instance_id", "session_dir", "working_dir", "checkpoint_commit")
-                        if key in event} for event in candidates)
+                        if key in event} for event in candidates.values())
     reason = (f"checkpoint {commit} has {len(matches)} records and {len(valid)} valid phase matches"
               + (f"; {ignored} unreadable history rows" if ignored else ""))
     return UnresolvedWaitAttribution(reason, identities)
@@ -6222,20 +6271,17 @@ def _drop_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
         args.interrupted_worker_passes = passes
         state = pass_recorder.read_state(session_dir)
     events = _run_events(state)
-    finished = next((event for event in reversed(events)
-                     if event.get("event_type") == "phase_finished" and event.get("phase_id") == phase_id), None)
-    if finished is None:
+    phase = _finished_phase(events, phase_id)
+    if isinstance(phase, _NoFinishedPhase):
         raise SystemExit(f"Cannot drop Phase {phase_id}: no open or finished instance")
-    if finished.get("status") == "completed":
+    if phase.status == "completed":
         raise SystemExit(f"Cannot drop Phase {phase_id}: the newest instance completed")
-    instance = pass_recorder.string(finished.get("phase_instance_id"))
     previous = next((event for event in reversed(events)
-                     if event.get("event_type") == "phase_dropped" and event.get("phase_instance_id") == instance), None)
+                     if event.get("event_type") == "phase_dropped" and event.get("phase_instance_id") == phase.instance_id),
+                    None)
     if previous is not None and previous.get("reason") == reason:
         return passes
-    phase = {"id": phase_id, "instance_id": instance, "title": finished.get("phase_title", ""),
-             "started_at": finished.get("phase_started_at", 0)}
-    event = pass_recorder.record_event(state, "phase_dropped", pass_recorder.now_epoch(), phase_record=phase)
+    event = pass_recorder.record_event(state, "phase_dropped", pass_recorder.now_epoch(), phase_record=phase.phase_record())
     event["reason"] = reason
     pass_recorder.append_event(state, event)
     _refresh_phase_table(session_dir)
@@ -6524,6 +6570,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = checkpoint.add_argument("--session-dir", required=True)
     _ = checkpoint.add_argument("--phase", "--phase-id", dest="phase_id", default="")
     _ = checkpoint.add_argument("--commit", required=True)
+    _ = checkpoint.add_argument("--closed", action="store_true", help="record a checkpoint for a finished phase")
     checkpoint.set_defaults(handler=_checkpoint)
 
     void_checkpoint = subparsers.add_parser("void-checkpoint")

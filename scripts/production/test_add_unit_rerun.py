@@ -24,7 +24,7 @@ from scripts.lib import atomic_file, build_folders
 from scripts.production.production_doc import Refusal, read_production
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import unit_membership
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 def setUpModule() -> None:
@@ -158,17 +158,17 @@ class AddUnitRerunTests(AddUnitTestCase):
         tree = self.unit_tree("alpha")
         inode = tree.stat().st_ino
         with patch.dict(os.environ, self.env):
-            record_path = worktrees.record_file(tree)
-            pending = worktrees.read_record(record_path)
-        self.assertIs(pending.stage, worktrees.MakeStage.MAKING)
+            record_path = worktree_records.record_file(tree)
+            pending = worktree_records.read_record(record_path)
+        self.assertIs(pending.stage, worktree_records.MakeStage.MAKING)
         self.assertFalse((tree / "target").is_symlink())
 
         _ = self.successful(*arguments)
 
-        self.assertEqual(worktrees.read_record(record_path), replace(pending, stage=worktrees.MakeStage.DONE))
+        self.assertEqual(worktree_records.read_record(record_path), replace(pending, stage=worktree_records.MakeStage.DONE))
         self.assertEqual(tree.stat().st_ino, inode)
-        self.assertIsInstance(pending.layout, worktrees.RecordedWorktreeOutput)
-        assert isinstance(pending.layout, worktrees.RecordedWorktreeOutput)
+        self.assertIsInstance(pending.layout, worktree_records.RecordedWorktreeOutput)
+        assert isinstance(pending.layout, worktree_records.RecordedWorktreeOutput)
         self.assertEqual((tree / "target").readlink(), pending.layout.output)
 
     def test_retry_finishes_an_empty_pending_unit_checkout(self) -> None:
@@ -186,14 +186,14 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertIn("checkout stopped before Git", stopped.stderr)
         inode = tree.stat().st_ino
         with patch.dict(os.environ, self.env):
-            record_path = worktrees.record_file(tree)
-        self.assertIs(worktrees.read_record(record_path).stage, worktrees.MakeStage.MAKING)
+            record_path = worktree_records.record_file(tree)
+        self.assertIs(worktree_records.read_record(record_path).stage, worktree_records.MakeStage.MAKING)
         self.assertEqual(list(tree.iterdir()), [])
 
         _ = self.successful(*arguments)
 
         self.assertEqual(tree.stat().st_ino, inode)
-        self.assertIs(worktrees.read_record(record_path).stage, worktrees.MakeStage.DONE)
+        self.assertIs(worktree_records.read_record(record_path).stage, worktree_records.MakeStage.DONE)
         self.assertIn("/unit:direct", self.opening_prompt())
 
     def test_launch_refreshes_the_record_of_an_existing_unit_checkout(self) -> None:
@@ -204,12 +204,12 @@ class AddUnitRerunTests(AddUnitTestCase):
         legacy = worktrees.new_record(tree, branch, self.checkout, base, "old-owner", "")
         with patch.dict(os.environ, self.env):
             worktrees.write_record(legacy)
-            record_path = worktrees.record_file(tree)
+            record_path = worktree_records.record_file(tree)
             expected = worktrees.output_record("origin", "alpha", "worktree")
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
-        self.assertEqual(worktrees.read_record(record_path),
+        self.assertEqual(worktree_records.read_record(record_path),
                          replace(legacy, owner="alpha", merge_branch="build-followups", layout=expected))
         self.assertEqual((tree / "target").readlink(), expected.output)
         self.assertIn("/unit:direct", self.opening_prompt())

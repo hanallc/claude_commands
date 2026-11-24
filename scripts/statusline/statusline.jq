@@ -164,7 +164,7 @@ def usage($config; $label; $window; $fmt):
 | ($ARGS.named.for_you // "") as $actions
 | ([($ARGS.named.rebuild // ""),
     (if $actions == "unavailable" then "Unavailable"
-     elif ($actions | test("^[1-9][0-9]*$")) then
+     elif ($actions | test("^([1-9][0-9]*|[0-9]+\\+)$")) then
        "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
      else "" end)]
    | map(select(. != ""))
