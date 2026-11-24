@@ -38,7 +38,7 @@ from scripts.buildlog import treekey
 from scripts.production.gate_modules import discover_test_modules
 from scripts.production.gate import (
     SUITE_BOOTSTRAP, RunningGateJob, kill_job_group, stop_gate_jobs, test_module_environment,
-    unwind_tests_only_on_sigterm,
+    unwind_gate_on_sigterm,
 )
 from scripts.test_times.measurement_gate import MeasurementBlocked, measurement_child, measurement_place
 from scripts.test_times.module_run import (
@@ -342,7 +342,7 @@ def main(argv: list[str]) -> int:
             run_with_descendant_cleanup(runner_folder_owner(), cleanup, run)
         return 0
     try:
-        with (unwind_tests_only_on_sigterm(),
+        with (unwind_gate_on_sigterm(),
               build_folders.tool_folder("natest-coverage") as root,
               measurement_place(REPOSITORY, root) as place):
             environment = test_module_environment(root, dict(os.environ))
