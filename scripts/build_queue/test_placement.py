@@ -206,7 +206,8 @@ def scaler_gate_request(fixture: PlacementFixture) -> wire.PlacementRequest:
     request = mac_linux_and_natedev_request(fixture)
     install_aws_fixture_settings(fixture.root)
     cloud = register_scaler(fixture)
-    _ = fixture.enter_context(mock.patch.dict(os.environ, {"AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")}))
+    _ = cast(object, fixture.enter_context(mock.patch.dict(os.environ,
+        {"AWS_TARGET_CONFIG": str(fixture.root / "aws_target.conf")})))
     book = aws_ledger.CostLedger(target_config.ssh_target_state_directory("aws"))
     book.record_inventory(aws_ledger.ResourceInventory(int(fixture.clock.now()), (), "fixture", builder_removed=True))
     local = request.local
@@ -1399,11 +1400,12 @@ class PlacementTests(unittest.TestCase):
             request = mac_linux_and_natedev_request(fixture) if guest else scaler_gate_request(fixture)
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
+            scaler: tuple[aws_ledger.GateDispatchBinding, Path] | None = None
             if guest:
                 authorization, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
             else:
-                binding, folder = scaler_launch(fixture, request, assignment)
-                consume = consume_permission("launch", assignment, binding.claim)
+                scaler = scaler_launch(fixture, request, assignment)
+                consume = consume_permission("launch", assignment, scaler[0].claim)
                 authorization, = fixture.server.handle_request(consume)
             assert isinstance(authorization, wire.FirstAuthorization), authorization
             outbound, inbound = socket.socketpair()
@@ -1417,8 +1419,8 @@ class PlacementTests(unittest.TestCase):
 
                 outcome = placement.AttemptCompleted(0) if guest else placement.AttemptDeclined("ended")
                 for path in (placement.DispatchPathPending("pending"), placement.DispatchPathSettled()):
-                    if not guest and isinstance(path, placement.DispatchPathSettled):
-                        confirm_scaler_absent(binding, folder, fixture.clock.now())
+                    if scaler is not None and isinstance(path, placement.DispatchPathSettled):
+                        confirm_scaler_absent(*scaler, fixture.clock.now())
                     report = wire.ExecutionReport("execution", assignment, authorization.claim,
                         execution_identity.ExecutionNotStarted(), outcome, path, code_version="fixture-version")
                     with (mock.patch.object(server, "_record_caller_version", side_effect=record_version),
