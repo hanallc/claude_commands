@@ -25,11 +25,12 @@ from unittest import mock
 from scripts.build_queue import execution_identity
 from scripts.build_targets import build_targets
 from scripts.direct import verify_mac_offload_test_support
+from scripts.lint import prebuild
 from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHABLE_WAIT_FIXTURE_SECONDS, config_environment,
                                               write_config_fixture,
                                               write_config_fault, commit_config_fixture)
 
-from scripts.mac_test import eligibility, fix_return, nextest_log, offload, claim_state
+from scripts.mac_test import eligibility, fix_return, floor_claims, nextest_log, offload, claim_state
 from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_hold.owning_session import NoOwningSession
@@ -102,6 +103,25 @@ class GeneratedSourceTests(unittest.TestCase):
 
 
 class LintVerbTests(unittest.TestCase):
+    def test_prebuild_refuses_the_mirror_descriptor_environment_variable(self) -> None:
+        name = floor_claims.MIRROR_LEASE_FDS
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "Cargo.toml"
+            _ = manifest.write_text(f'''[workspace.metadata.dev.prebuild.fixture-artifact]
+target = "wasm32-unknown-unknown"
+env = "{name}"
+for = ["fixture"]
+''')
+            stderr = io.StringIO()
+            with mock.patch.object(prebuild, "build", return_value=1) as build, \
+                 mock.patch.object(os, "execvp") as nextest, redirect_stderr(stderr):
+                status = prebuild.main(["--manifest", str(manifest), "--", "cargo", "nextest", "run", "-p", "fixture"])
+            self.assertEqual(status, 2, stderr.getvalue())
+            self.assertEqual(stderr.getvalue(), f"prebuild: {manifest}: workspace.metadata.dev.prebuild.fixture-artifact"
+                             + f".env: the runner sets {name}.\n")
+            build.assert_not_called()
+            nextest.assert_not_called()
+
     def test_build_reports_the_cargo_target_directory_after_success(self) -> None:
         lint = Path(__file__).resolve().parents[1] / "lint" / "lint"
         with tempfile.TemporaryDirectory() as directory:

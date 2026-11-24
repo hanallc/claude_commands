@@ -130,6 +130,8 @@ def read_prebuilds(manifest: Path) -> tuple[Prebuild, ...]:
         env = text(fields.get("env"), f"{where}.env")
         if ENV_NAME.fullmatch(env) is None:
             raise DeclarationError(f"{where}.env must be a variable name")
+        if env == floor_claims.MIRROR_LEASE_FDS:
+            raise DeclarationError(f"{where}.env: the runner sets {env}.")
         names = fields.get("for")
         if not isinstance(names, list) or not names:
             raise DeclarationError(f"{where}.for must be a non-empty list of package names")
