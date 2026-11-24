@@ -107,8 +107,6 @@ OWNED_FOLDERS = (Path('/etc'), Path('/bin'), Path('/usr'), Path('/sbin'))
 STORE = Path('/nix/store')
 # The run sees its attempt temp folder at this path, and TMPDIR names it.
 TEMP = Path('/tmp')
-# The socket of the private sccache server of the run, in the attempt temp folder.
-SCCACHE_SOCKET = TEMP / 'sccache.sock'
 # The lock files of the cargo registry and git folders, at the top of CARGO_HOME.
 CARGO_LOCKS = ('.package-cache', '.package-cache-mutate', '.global-cache')
 # The key of the bwrap status line that gives the exit status of the program.
@@ -2060,12 +2058,10 @@ def read_paths(environment: Mapping[str, str], kept: Sequence[Path]) -> list[Pat
 
 
 def written_paths(checkout: Path, environment: Mapping[str, str]) -> list[Path]:
-    """The paths of the program environment that the run reads and writes, the checkout first: the cargo registry
-    and git folders, the cargo lock files, and the sccache folder."""
+    """Return the checkout, the Cargo registry and git folders, and the Cargo lock files."""
     home = home_folder(environment)
     cargo_home = Path(environment.get('CARGO_HOME') or home / '.cargo')
-    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS),
-            Path(environment.get('SCCACHE_DIR') or home / '.cache' / 'sccache')]
+    return [checkout, cargo_home / 'registry', cargo_home / 'git', *(cargo_home / name for name in CARGO_LOCKS)]
 
 
 def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Path, read: Iterable[Path],
@@ -2087,8 +2083,11 @@ def limit_words(bwrap: str, status_fd: int, temp: Path, checkout: Path, home: Pa
             if bindable(item, home, read=option == '--ro-bind'):
                 words += [option, str(item), str(item)]
     # The root of the limit is not writable, so a write to a folder that is not bound fails at once.
-    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'SCCACHE_SERVER_UDS',
-            str(SCCACHE_SOCKET), '--setenv', 'CARGO_NET_OFFLINE', 'true', '--chdir', str(checkout), '--']
+    # Empty wrapper values turn off the Cargo config wrapper.
+    return [*words, '--remount-ro', '/', '--setenv', 'TMPDIR', str(TEMP), '--setenv', 'CARGO_NET_OFFLINE', 'true',
+            '--setenv', 'RUSTC_WRAPPER', '', '--setenv', 'CARGO_BUILD_RUSTC_WRAPPER', '',
+            '--unsetenv', 'SCCACHE_DIR', '--unsetenv', 'SCCACHE_CACHE_SIZE', '--unsetenv', 'SCCACHE_SERVER_UDS',
+            '--chdir', str(checkout), '--']
 
 
 def setup_failed(status: int, status_fd: int) -> bool:
@@ -2112,9 +2111,9 @@ def limited_command(bwrap: str, status_fd: int, tmp: Path, copy: Path, environme
                     attempt: str, argv: Sequence[str]) -> list[str]:
     """The bwrap words that start the argv of a hand made run in the numbered copy under the read limit.
 
-    The program reads and writes the copy, which holds the run home and the build output, the cargo folders and
-    the sccache folder of its environment, and the attempt temp folder, which it sees as /tmp. home is the account
-    home of the guest: the limit binds no path that holds it. START_SHELL prints the start line in the limit.
+    The program writes the copy and its Cargo folders. The copy holds the run home and the build output.
+    The program sees the attempt temp folder as /tmp.
+    The limit binds no path that holds the guest account home. START_SHELL prints the start line in the limit.
     """
     write = [*written_paths(copy, environment), output_folder(copy, environment)]
     words = limit_words(bwrap, status_fd, tmp, copy, home, read_paths(environment, [tmp, copy]), write)

@@ -76,8 +76,8 @@ done
 # A builds.slice scope came from the build queue: a queued step or an editor.
 # Its Cargo calls start at once. A detached run lives under builds-detached.slice
 # and has no queue place, so its Cargo calls go to the queue.
-# A queued step of a detached run is different: invoke.sh exports its scope folder
-# as BUILDLOG_STEP_SCOPE. When that folder is this cgroup, Cargo starts at once.
+# A queued step of a detached run is different: invoke.sh, and each reserved
+# queue_place program scope, exports its scope folder as BUILDLOG_STEP_SCOPE. When that folder is this cgroup, Cargo starts at once.
 # The override selects a saved cgroup record instead of the host's process state.
 cgroup_file=${CARGO_WRAPPER_CGROUP_FILE:-/proc/self/cgroup}
 in_build_scope=0
@@ -270,7 +270,7 @@ if [[ "$OSTYPE" == linux* ]]; then
     fi
 fi
 
-if [[ "$subcommand" != install && "${CARGO_FOLDER_CHECKED:-}" != 1 && -z "${BUILDLOG_STEP_SCOPE:-}" ]]; then
+if [[ "$subcommand" != install && "${CARGO_FOLDER_CHECKED:-}" != 1 ]]; then
     if ! cargo_output_fast_path "$@"; then
         exec "$wrapper_dir/../lib/py" "$wrapper_dir/cargo_folder.py" --exec-checked "$route" "$real_cargo" "$@"
     fi

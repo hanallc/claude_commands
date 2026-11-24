@@ -568,6 +568,9 @@ if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$VERIFY_REPO_ROOT" ]] &&
 fi
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
+    if [[ -f "$VERIFY_REPO_ROOT/scripts/copies/copies.py" ]]; then
+        printf '%s\n' 'claude_commands: run tests with copies.py --affected or --module' >&2
+    fi
     exit 2
 fi
 # Create the inherited temporary parent before environment commands use it.
