@@ -94,6 +94,10 @@ The question form for every question to the user is defined by this import:
 
 @~/.claude/docs/question_template.md
 
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
+
 ---
 
 <Throughout>
@@ -206,8 +210,15 @@ The question form for every question to the user is defined by this import:
     - the order of promotions to a shared destination: the parent of the
       productions promoting;
     - disk room and quota: the root, always.
-  - **Give the Mac to one unit with a Mac hold, never with words.** Run
-    `/build:mac block <why> [hours N]`, or direct the unit to run it.
+  - **Hold the Mac only on nate's explicit request; never reserve it with words.**
+    Quote his words with the place and the time.
+    A go from nate for a Mac run means a normal queued run, not a Mac hold.
+    Source: nate, bob session, 2026-11-23 about 12:14 PST: "yes a hold has
+    to be explicitly requested by me - but i don't know how you are making
+    that be invariant". This replaces the part of the 2026-10-18 rule that
+    let a showrunner give the Mac to a unit with a hold.
+    On his request, run `/build:mac block <why> [hours N]` with his quoted
+    words in `<why>`, or direct the unit to run it.
     Tests skip a held Mac by themselves,
     `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records
@@ -272,9 +283,9 @@ The question form for every question to the user is defined by this import:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up, in the question form imported above <Throughout/>. Set it
+  where it first comes up (in idle update mode, the short form of <IdleUpdate/>), in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
-  restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
+  restates the question or its choices; the full item after his yes in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
   production's items only; the showrunners below count theirs
   (**Nested showrunners** above).

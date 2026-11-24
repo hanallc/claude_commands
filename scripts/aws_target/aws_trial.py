@@ -509,8 +509,7 @@ def cleanup_trial(folder: Path, worker: cloud_gate.GateWorker) -> bool:
 
 def sweep_trial_resources(folder: Path, worker: cloud_gate.GateWorker) -> None:
     """Clean expired trials before a new trial reserves boxes."""
-    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations
-                  if not isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated)) and worker.cleanup_due(row)}
+    unresolved = {row.attempt for row in worker.book.read_snapshot().gate_reservations if worker.cleanup_due(row)}
     for previous in sorted(folder.parent.iterdir()):
         if previous == folder or not previous.is_dir():
             continue

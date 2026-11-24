@@ -244,6 +244,8 @@ def _run(launch: ClaudeLaunch) -> int:
             worker_state.publish_worker_claim(claim, name)
     if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
         return 1
+    if launch.phase:
+        launch = replace(launch, cwd=phase_reservation.claimed_launch_directory(directory, launch.cwd))
     env["UNIT_RUN_DIR"] = str(launch.run)
     env["UNIT_PASS_OWNER"] = "launcher"
     build_folders = str(SCRIPTS / "../lib/build_folders.py")

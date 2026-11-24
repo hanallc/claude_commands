@@ -293,6 +293,8 @@ Each local Promote checkout must exist before the command pushes.
 - **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
+     For a shrink or as-built checkpoint, the test merge uses the pending commit's first parent as its base.
+     Ancestry skips the commit if a clean test merge leaves the fetched `origin/main` tree unchanged.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
      `_unit_paths` excludes unchanged paths that an origin merge base contains.
      A path absent from that base remains in scope, including a deleted plan.
@@ -542,12 +544,12 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
 The CLI requires a producer staff row for the current session.
-Morty's fixed staff ID selects the folder for every caller.
+Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
 Old records without the field default to morty.
-`record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
+`record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
 Investigations retain their existing format and command behavior.
@@ -585,7 +587,7 @@ Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
-2. Preserve an existing item number with `add --number <n>`.
+2. Use `add --number <n>` as morty to advance the sequence to a specified number.
 3. Change fields with `update --id L<n> --source <source>` and the corresponding field options.
 4. Park or unpark an item with `park --id L<n> --until <condition> --source <source>`.
    Use a time or `delivered` to park. Use an empty condition to unpark.
@@ -601,15 +603,20 @@ They include the date for updates from another day.
 The page shows the time of each log entry beside its source.
 The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
+Other producers can add items assigned to themselves.
+The command uses the caller's staff name as the source for those items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
+They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
 Their updates use the caller's staff name as the log source.
+They can also run `park`, `close`, and `reopen` on those items.
+These commands use the `--source` words as the log source.
+The command refuses each item of another producer.
+Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-New items default to morty.
+Morty's new items default to morty.
 Changing the producer to someone other than morty sends two notices after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
@@ -627,15 +634,21 @@ They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in the same producer folder.
+References use numbers in morty's List folder.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
 Closing a prerequisite preserves its dependents' conditions.
 
-Closed records remain on disk with their time and closing words.
-Automatic numbering includes invalid records and Closed records.
-An explicit number must name an unused path.
+Closed and removed records remain on disk with their time, closing words, and log.
+The `.next-number` record in morty's List folder stores the next number.
+The sequence is per machine, and the List's machine is the one source.
+If the counter is missing, the allocator reads the record names and the migration log in all existing List folders.
+This scan includes invalid and Closed records and the migration entries for removed records.
+The first number is one more than the highest recorded number.
+The allocator advances the counter under the List store lock before it publishes the item.
+An explicit number must be at or above the next available number.
+A failed write after reservation leaves a gap in the sequence.
 Exact repeated operations change nothing.
 An update appends a log line and marks the item unread if it is not Closed.
 Closing clears the unread time.
@@ -650,7 +663,8 @@ Items with active parks and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
-`create_records` validates a complete typed batch before writing into an empty list folder.
+`create_records` validates a complete typed batch before writing into morty's empty List folder without a counter.
+It reserves the highest number in the batch before it writes any records.
 It checks forward references and cycles under the same lock as other writes.
 The one-off converter lives outside the repository and uses this API.
 It preserves item numbers, source sections, and each item's JSON data in Evidence.

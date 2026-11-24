@@ -18,7 +18,7 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
                                                   │                                         | ssh send.py --here
                                                   ├─► broadcast.py        groups ──► send.py --to <address> --here per row
                                                   │                                  + ssh broadcast.py --here
-                                                  └─► top_level.py        ThisMachine ──► /notify_top_level SendMessage
+                                                  └─► top_level.py        ThisMachine ──► /notify_top_level send.py
 ```
 
 ### Record sources
@@ -127,6 +127,7 @@ Codex rows:
 - `Roster(entries, problems, warnings)`; `RosterScope = ThisMachine | AllMachines`; `roster(environment, scope) -> Roster` (scope required). Unreadable durable-role records are warnings: they preserve the readable rows and do not make recipient discovery incomplete. Other source failures remain problems. `diagnostics` combines problems and labelled warnings for display.
 - `SenderIdentity = CodexThread | ClaudeSession | NoSession` from `sender_identity(environment)`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`. `is_sender(entry, identity)` matches a Codex row's `thread` or any row's `session`; `NoSession` matches nothing.
 - `is_top_level(entry)`: a Claude row that is not a worker and not a unit director `UnderShowrunner`.
+- `is_closed_worker(entry)` identifies worker rows whose pane observation confirmed closure.
 - `cannot_receive_message_text(entry)`: the one refusal text for `send.py` and `broadcast.py`, `<name> cannot take messages (<reason>)` plus a tail: a worker `UnderDirector` gets `; contact its unit director <name> or wait`, a worker with `NoDirector` none, a socketless Claude session `; wait for it to open its messaging socket, then read the roster again and send again`.
 
 ### Unit labels (`roster.py`)
@@ -152,6 +153,23 @@ Codex rows:
 - `UnitLabels.folder_name() -> str` names the copies folder `<copies root>/<showrunner>-<unit>/<phase>-<purpose>`: showrunner `hana`, unit `lfo` gives `hana-lfo`. A unit name equal to the showrunner name, or one that starts with the showrunner name and `-`, is the folder name alone (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`). The prefix rule needs the hyphen: `hana` + `hanami` gives `hana-hanami`. A `—` part is left out with its hyphen (`builds`, `lfo`); with both parts `—` the session name is the folder name. A caller looks up labels with `unit_labels_for([<session id from owning_session.owning_session()>], environment)`, so a Codex worker resolves to its unit director. No caller uses `folder_name` yet.
 - `roster.py` and `inventory.py` use package imports for repository modules.
   Account helpers load lazily, so label-only callers do not load account discovery.
+
+### `agents status` command
+
+`shutdown.py` sends `status` to `status_entry.py` before it loads the lifecycle commands.
+`agents status` starts the SSH request before it reads local inventory and prints the local report first.
+The command uses the 120 s peer timeout and reports an unreachable peer separately from an unavailable report.
+`--here` reports only this machine's sessions.
+
+The production staff owner sends its staff snapshot and account role map on the peer command's stdin.
+If the data is absent or invalid, the peer can read staff over SSH even with `--here`.
+It also reads roles from their authority when needed.
+The supplied data applies to this command only.
+
+Inventory skips unit and pane discovery if the account has no selected sessions.
+The report still includes unattributed sessions.
+Inventory reads the first record of each run log and preserves the plan ranking.
+It reads Git state for distinct checkout folders with at most four workers and preserves session order.
 
 ### `roster.py` command
 
@@ -282,10 +300,16 @@ The relay checks the current registry, connected peer PID, and process start bef
 
 The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMessage` tool.
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
+The relay prompt gives the target, the summary and the short `RELAY_MESSAGE_STAND_IN` text.
+The prompt does not carry the message, so a long message takes no longer to relay than a short one.
+The PreToolUse hook approves the first `SendMessage` call and sets its `to`, `message`, and `summary` to the approved values.
+The hook refuses later calls and calls without a tool ID.
 The proxy checks the request and writes it to the recipient's verified socket.
 The relay requires a completed proxy write of the approved text and one explicit success result for the forwarded tool ID.
-The relay logs changed calls locally in `STATE/relay_mismatches.jsonl`, with a bounded target and short excerpts at the first text difference.
-The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
+The relay logs model input that differs from the prompt (target, summary or stand-in) in `STATE/relay_mismatches.jsonl`.
+The log limits the target length, shows short excerpts at the first difference from the stand-in, and marks summary changes.
+The `SENT` line reports when the guard set the approved input for a changed call.
+If the model makes several calls, the `SENT` line gives the call count and reports one proxy forward.
 It saves the tool stream in `STATE/relay/<to>.jsonl`.
 `--timeout` defaults to 40 s for every transport.
 If `~/.config/claude/oauth-token.gpg` exists, the relay decrypts it for authentication.
@@ -535,10 +559,12 @@ broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--producti
 
 `BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
 The group type stays separate from the roster's `Role` because flags overlap.
+Every group excludes closed workers before delivery and empty-group checks.
+The roster keeps these rows for direct sends and other readers.
 
 | Flag | Members |
 |---|---|
-| `--all` | every row |
+| `--all` | every eligible row |
 | `--showrunners` | role `showrunner` |
 | `--units` | every unit director; after `--production <showrunner name or session: address>`, unit directors whose `UnderShowrunner.address` matches that showrunner |
 | `--agents` | every worker and freestanding session, Claude and Codex |
@@ -549,7 +575,11 @@ The group type stays separate from the roster's `Role` because flags overlap.
 - `RunsProduction`, `DirectsUnit`, `ProductionWithoutRunningShowrunner` and `NoDirector` rows join no unit worker group.
 - A row several flags select gets one delivery, carrying the last selecting flag's text, so a role flag after `--all` keeps its own text.
 - Each message is `<text>`, a blank line, and the closing line `Sent directly to <groups> on <machine> and <other machine>; do not pass it on.` (`on this machine` under `--here`).
-- Delivery is `send.py --to <address> --from <sender> --here --text ...` per `Messageable` row, 24 at once (`AT_ONCE`), never with action flags. A recipient gone since the roster read is a failed delivery here. A `CannotReceiveMessages` row prints `send.py`'s refusal line and is neither sent nor a failure.
+- Broadcast runs `send.py --to <address> --from <sender> --here --text ...` for each selected `Messageable` row.
+  It runs up to 24 sends at a time (`AT_ONCE`) without action flags.
+  If a recipient disappears after the roster read, the delivery fails on that machine.
+  Each selected `CannotReceiveMessages` row prints the refusal from `send.py`.
+  These refusals do not affect the sent count or the exit status.
 - Without `--here`, `ssh <other machine> env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID [BROADCAST_SEND=...] BROADCAST_CLOSING_MACHINES=... broadcast.py --here --from <sender> <same groups>` runs in parallel (120 s timeout); its lines print under `<host>: `. The replay spells an all-workers group `--all-workers` (accepted by `main`, absent from `USAGE`) so it does not inherit an earlier `--of`. ssh exit 255, a timeout, or a nonzero exit with no `NOT sent` line yields `<host>: NOT sent: <why>`.
 - `--of` is resolved once across both machines before any delivery: one director gives its machine and address; several give exit 2 with `<target> matches more than one unit director:` and their addresses; none gives `unknown unit <target>; known units:`. If the other machine is not reached, `--of` sends nothing: one `NOT sent` line, exit 1. `--of` without a following `--workers` is a usage error.
 - `--production` resolves a showrunner's staff name or session address across both machines before delivery.
@@ -569,7 +599,13 @@ Callers: `/announce` (`--all`), `/unit:announce` (`--units`), `/showrunner:annou
 
 ### `top_level.py`
 
-Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket path>` for each `is_top_level` Claude row other than the sender, from the newest running record per session id, so same-name sessions are two lines and one conversation in two processes is one. A row without a socket prints `not reachable: <name> [<session id>] has no messaging socket` on stderr. Each recipient is recorded with `build_hold.py record-recipient --session-id --name` (a failure exits 1). Roster problems print as `top_level: roster: <problem>`; any argument is a usage error (exit 2). `/notify_top_level` sends to each line with SendMessage, adds ListAgents peers on the other machine unless `--here`, and asks showrunners to pass the message to their unit directors.
+Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket path>` for each `is_top_level` Claude row except the sender.
+It uses the newest running record for each session ID. Sessions with the same name get separate lines.
+A row without a socket prints `not reachable: <name> [<session id>] has no messaging socket` on stderr.
+It records each recipient with `build_hold.py record-recipient --session-id --name`. A failure exits with code 1.
+Roster problems print as `top_level: roster: <problem>`. An argument causes a usage error and exit code 2.
+`/notify_top_level` sends with `send.py`. It adds ListAgents peers on the other machine unless the caller uses `--here`.
+It asks showrunners to give the message to their unit directors.
 
 ### `sessions.py`
 
@@ -643,7 +679,11 @@ Release recalculates the priority of a kept decision.
 
 ### Instructions: which tool each session uses
 
-- **Claude sessions** (`commands/message.md`, "Finding sessions"): ListAgents and SendMessage for Claude sessions on this machine; `roster.py` for Codex workers, unit-director and showrunner relationships, and the other machine; `send.py --to <address>` for anything the roster lists; `broadcast.py` for groups. Scripts always send with `send.py`.
+- **Claude sessions** (see `commands/message.md`). Use ListAgents to list local Claude sessions.
+  Use `roster.py` for Codex workers, unit-director and showrunner relationships, and sessions on the other machine.
+  Use `send.py --to <address>` for one session and `broadcast.py` for groups.
+  The sender hook refuses native `SendMessage` to another session, including urgent messages.
+  Use `send.py --urgent` for urgent messages.
 - **Codex sessions** read `~/.codex/AGENTS.md`, workers included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, and the sandbox rerun.
 - Both texts carry the same outcome and recovery words.
 - `scripts/message/install_codex_agents.py [--machine HOST] [--agents-file PATH]` writes that text into `~/.codex/AGENTS.md` between `<!-- claude-messaging: begin -->` and `<!-- claude-messaging: end -->`:
@@ -743,7 +783,8 @@ Release recalculates the priority of a kept decision.
 - `--plugin-dir` reloads the folder when its files change. A pull on main replaces the worker 19–23 s after `register.ts` changes. The shutdown pane record retains each plugin directory as an absolute path. Account moves and pane restores pass those directories to Claude again. Old records without those directories need a manual launch with the plugin flag. A stopped postmaster needs a manual start.
 - The cloud gate provides Node.js without the Claude mod runner. The Python gate runs the receipt fixture from `outbox.test.ts` with Node.js. The fixture calls the real mod and writes its receipt to a temporary file. Python checks the receipt with `is_outbox_result` and `receipt_matches_recipient`. The Python fakes use the same receipt as their template.
 - After about 32 quick sends to one session the engine answers `isDelivered: false` (then about one per 2 s); the mod does not pace, so these surface as `failed` and the client relays them.
-- A reply only counts when the recipient answers the postmaster session with SendMessage. A recipient that answers through `send.py --to postmaster` sends through the relay, whose socket holds no route, so the postmaster takes an ordinary turn.
+- The postmaster identifies a reply by the sender's socket. The relay socket from `send.py --to postmaster` has no reply route.
+  The postmaster takes an ordinary turn for that message.
 - `quota_alert.py` reads `quota_relay_timeout_seconds` from `config/accounts.conf` for session sends. The default is 40 seconds, with 10 seconds reserved before `send_budget.seconds()` adds the delivery allowances. Phone sends use `review.user_send_seconds()` and `send_budget.user_seconds()`.
 - Unmeasured: whether a `$` taken in `session.receive` keeps the outbox poll timer alive after a receive-first start. The live check could not reach receive-first; a hook reload starts the new worker through `session.start`.
 - The test kit skips a throwing `fs.list` hook, so a test that makes the listing throw sees the kit's own implementation failure instead.
@@ -802,7 +843,8 @@ Release recalculates the priority of a kept decision.
 
 - **One lister, the existing senders.** `roster.py` lists and never sends; `send.py` reaches one session and `broadcast.py` a group, both from the roster. One way to list, one way to send to one, one way to send to a group, and no second sender to keep in step.
 
-- **Native for your own kind, the roster for the other.** Claude lists Claude with ListAgents and messages it with SendMessage on this machine. A peer on the other machine goes through `send.py`, because Remote Control gives no delivery report. Codex has no scriptable list (`codex agents` is interactive and does not show workers), so Codex sessions use the roster and `send.py`. The roster lists every kind anyway: a Codex caller needs Claude rows, and a Claude caller needs a worker's unit director and showrunner.
+- **Session discovery.** ListAgents lists local Claude sessions. `roster.py` lists Claude and Codex sessions on both machines.
+  It includes each worker's unit director and showrunner. Claude and Codex sessions both send with `send.py`.
 
 - **The user's Codex windows are sessions of interest.** They list as freestanding Codex sessions from every account daemon. `send.py` reaches a loaded thread through its owning daemon's control socket; an unloaded thread fails, and `--agents` counts the loaded sessions.
 

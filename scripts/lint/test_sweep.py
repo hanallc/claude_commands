@@ -40,6 +40,7 @@ from scripts.lib import build_folders, conf, copy_record, removal_guard
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
+from scripts.lib.sizes import MIB, gib
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -1847,7 +1848,7 @@ class FloorTests(SweepCase):
         roots, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
         self.assertEqual(set(roots), {str(path) for pair in pairs for path in pair})
         for pair in pairs:
-            self.assertEqual(set(outputs.roots_for(str(pair[0]))), set(map(str, pair)))
+            self.assertEqual(set(outputs.pair_roots_for(str(pair[0]))), set(map(str, pair)))
         status, text = self.hold(base, 10 * GIB, [0], dry_run=True, recorded=False)
         self.assertEqual(status, 0)
         self.assertEqual(reported_floor_targets(text), set(roots))
@@ -2168,6 +2169,74 @@ class FloorTests(SweepCase):
         self.assertCountEqual(outcome.held_targets, (protected, busy))
         self.assertIn(protected, dict(outcome.protected))
 
+    def chained_targets(self, base: Path) -> tuple[str, str, str, str]:
+        """Four targets that three saved mappings chain: one and shared, two and shared, two and three.
+
+        The names sort in chain order, so the floor pass meets two, held by its pair, before three.
+        """
+        one, shared, two, three = (str(cargo_target(base, name, digest, time.time() - DAY)[0].parent)
+                                   for name, digest in (("chain-1", APP), ("chain-2", DEMO),
+                                                        ("chain-3", TOOL), ("chain-4", MY_TOOL)))
+        self.root_row(base / "ws-one", one, shared)
+        self.root_row(base / "ws-two", two, shared)
+        self.root_row(base / "ws-three", two, three)
+        return one, shared, two, three
+
+    def test_one_process_holds_its_pairs_and_their_targets_but_not_the_whole_chain(self) -> None:
+        base = self.base()
+        one, shared, two, three = self.chained_targets(base)
+        use = sweep.TargetUse(62002, "maps build output")
+        with (mock.patch.object(sweep, "process_uses", return_value={one: use}),
+              mock.patch.object(sweep, "shrink_floor", wraps=sweep.shrink_floor) as shrink):
+            status, printed = self.hold(base, 10 * GIB, [0], dry_run=True, recorded=False)
+        self.assertEqual(status, 0)
+        busy = cast(dict[str, sweep.FloorProtection], shrink.call_args.args[6])
+        self.assertEqual(busy, {one: use, shared: use, two: sweep.PairHeld(use)})
+        self.assertIn(f"lint sweep: pid {use.pid} {use.how}; {shared} left alone", printed)
+        self.assertIn(f"the floor lists {three}", printed)
+
+    def test_held_paths_spread_from_uses_and_from_a_lock_found_on_a_pair_held_target(self) -> None:
+        for late_lock in (False, True):
+            with self.subTest(late_lock=late_lock):
+                base = self.base()
+                one, shared, two, three = self.chained_targets(base)
+                use = sweep.TargetUse(62003, "maps build output")
+                judgment_lock = scratch.judgment_lock
+                checked: list[str] = []
+
+                @contextmanager
+                def lock_two_after_the_first_check(path: Path) -> Generator[bool]:
+                    if late_lock and str(path) == two and two in checked:
+                        yield False
+                        return
+                    checked.append(str(path))
+                    with judgment_lock(path) as idle:
+                        yield idle
+
+                with (mock.patch.object(sweep, "process_uses", return_value={one: use}),
+                      mock.patch.object(scratch, "judgment_lock", side_effect=lock_two_after_the_first_check),
+                      mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT),
+                      mock.patch.object(sweep, "send_holder_message", return_value=DELIVERED_NATEDEV_ALERT),
+                      mock.patch.object(sweep, "notify_floor_problem", wraps=sweep.notify_floor_problem) as notify):
+                    status, _ = self.hold(base, 10 * GIB, [0], dry_run=False, recorded=False)
+                self.assertEqual(status, 0)
+                outcome = cast(sweep.FloorOutcome, notify.call_args.args[0])
+                self.assertEqual(set(outcome.held_targets),
+                                 {one, shared, two, three} if late_lock else {one, shared, two})
+
+    def test_scan_clusters_keep_the_whole_mapping_chain(self) -> None:
+        base = self.base()
+        roots = self.chained_targets(base)
+        _, outputs = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
+        self.assertEqual(len(outputs.workspaces), 3)
+        token = sweep.OUTPUT_ROOTS.set(outputs)
+        self.addCleanup(sweep.OUTPUT_ROOTS.reset, token)
+        trees = {root: sweep.build_trees(root) for root in roots}
+        with mock.patch.object(sweep, "scan_roots", wraps=sweep.scan_roots) as scans:
+            _ = sweep.scan_floor_roots(list(roots), trees, lint_settings=conf.read("lint"))
+        self.assertEqual([sorted(cast(sweep.DiscoveredTargetRoots, call.args[0])) for call in scans.call_args_list],
+                         [sorted(roots)])
+
     def test_unavailable_index_uses_saved_roots_after_the_checkout_is_gone(self) -> None:
         base = self.base()
         tree, payload = cargo_target(base, "cached", APP, time.time() - DAY)
@@ -2222,11 +2291,27 @@ class FloorTests(SweepCase):
             CargoOutputRoots(base / "two", shared, other),
             CargoOutputRoots(base / "bridge", build, shared),
         ))
-        self.assertEqual(index.roots_for(str(target)), tuple(sorted(map(str, roots))))
+        self.assertEqual(index.connected_roots_for(str(target)), tuple(sorted(map(str, roots))))
         shared.rmdir()
-        self.assertEqual(index.roots_for(str(other)), tuple(sorted(map(str, (target, build, other)))))
+        self.assertEqual(index.connected_roots_for(str(other)), tuple(sorted(map(str, (target, build, other)))))
         shared.mkdir()
-        self.assertEqual(index.roots_for(str(build)), tuple(sorted(map(str, roots))))
+        self.assertEqual(index.connected_roots_for(str(build)), tuple(sorted(map(str, roots))))
+
+    def test_pair_roots_stop_at_the_roots_own_mappings(self) -> None:
+        base = self.base()
+        roots = [base / name for name in ("one", "shared", "two", "three")]
+        for root in roots:
+            root.mkdir()
+        one, shared, two, three = roots
+        index = sweep.CargoOutputIndex((
+            CargoOutputRoots(base / "ws-one", one, shared),
+            CargoOutputRoots(base / "ws-two", two, shared),
+            CargoOutputRoots(base / "ws-three", two, three),
+        ))
+        self.assertEqual(index.pair_roots_for(str(one)), tuple(sorted(map(str, (one, shared)))))
+        self.assertEqual(index.pair_roots_for(str(shared)), tuple(sorted(map(str, (one, shared, two)))))
+        self.assertEqual(index.pair_roots_for(str(three)), tuple(sorted(map(str, (two, three)))))
+        self.assertEqual(index.connected_roots_for(str(one)), tuple(sorted(map(str, roots))))
 
     def test_recorded_pairs_precede_saved_pairs_and_dry_discovery_keeps_the_cache(self) -> None:
         base = self.base()
@@ -2246,7 +2331,7 @@ class FloorTests(SweepCase):
         self.assertEqual(set(roots), {str(root) for pair in pairs
                                      for root in (pair.target_directory, pair.build_directory)})
         for pair in (first, second):
-            self.assertEqual(set(index.roots_for(str(pair.target_directory))),
+            self.assertEqual(set(index.pair_roots_for(str(pair.target_directory))),
                              {str(pair.target_directory), str(pair.build_directory)})
         self.assertEqual(sweep.cargo_output_cache_path().read_bytes(), before)
 
@@ -2265,7 +2350,7 @@ class FloorTests(SweepCase):
         self.assertEqual(set(roots), {str(root) for pair in pairs
                                      for root in (pair.target_directory, pair.build_directory)})
         for pair in pairs:
-            self.assertEqual(set(index.roots_for(str(pair.target_directory))),
+            self.assertEqual(set(index.pair_roots_for(str(pair.target_directory))),
                              {str(pair.target_directory), str(pair.build_directory)})
 
     def test_floor_fixture_supports_repeated_capacity_reads_during_the_scan(self) -> None:
@@ -4378,9 +4463,9 @@ class FloorTests(SweepCase):
         self.assertIn("The sweep keeps their output.", message)
         self.assertNotIn("Free ", message)
         lock_path = busy_tree / sweep.LOCK_NAMES[0]
-        self.assertIn(f"- {busy_tree.parent} ({sweep.gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
+        self.assertIn(f"- {busy_tree.parent} ({gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
                       + " no session found", message)
-        self.assertIn(f"Not swept: CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertIn(f"Not swept: CI's targets ({gib(ci_bytes)})", message)
         self.assertIn("No phone alert was attempted for this event.", message)
         self.assertNotIn("phone", send.call_args.kwargs)
         self.assertNotIn("Could not remove", message)
@@ -5003,7 +5088,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                     else:
                         self.finalize_crossing(140, removed=2 * GIB)
                 choices.assert_called_once()
-                shortfall = sweep.gib(150 * GIB - free)
+                shortfall = gib(150 * GIB - free)
                 if links == "held-only":
                     recommendation = ("Every measured folder holds output a build is using. "
                                       "The sweep frees it when the build ends.")
@@ -5042,7 +5127,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                 held_effect = "A build is using output inside it; deleting it can break that build."
                 other_effect = "Deleting it removes its contents; their use is unknown."
                 lines = [
-                    f"Free disk space fell below the 150.0 GiB alert line. {sweep.gib(free)} remains."
+                    f"Free disk space fell below the 150.0 GiB alert line. {gib(free)} remains."
                     + (" This is the Mac disk." if machine == "Mac" else ""),
                     "Cleanup removed 2.0 GiB.",
                     *([f"{large}: holds {large_size}. " + (held_effect if held_targets else other_effect)]
@@ -7901,7 +7986,7 @@ class BudgetTests(unittest.TestCase):
         target = root / "target"
         target.mkdir()
         repository = Path(__file__).resolve().parents[2] / "config" / "lint.conf"
-        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * sweep.MIB)
+        doc_budget = int(conf.read(repository).number("sweep_doc_index_mib") * MIB)
         environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
         environment.update({sweep.BUDGET_ENV: "", sweep.DOC_INDEX_ENV: ""})
         with (mock.patch.dict(os.environ, environment, clear=True),

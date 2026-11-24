@@ -177,38 +177,86 @@ A layout scan retains a pane without a notice when a new Claude process in its f
 If the arguments stay unreadable after that period, the next scan reports unknown evidence once per scan run.
 
 The notes timer delegates account moves to this detached batch before any stop.
-An automatic move (cause `auto`, `refusal` or `credits off`) reads the admission queue and verify records before any stop.
-A session with a running, waiting or cloud build step keeps its process and queue place.
-A live verify call also prevents a move while it waits for the cargo token or enters the queue.
-The reader checks each verify PID and saved start time.
-Unreadable queue, verify record or process evidence defers the move without a stop.
-Free sessions move first.
-The detached batch waits for build owners.
-The batch checks ownership every `MOVE_BUILD_POLL_SECONDS` and moves an owner after its steps end.
-At `MOVE_BUILD_WAIT_MINUTES`, remaining owners receive a deferred result and keep their processes.
+A move does not wait for build steps, queued runs, verify calls or Bash tool shells.
+It stops each session at once.
+The resumed session must do its interrupted work again.
 A later group account selection applies to the next stop attempt.
-A later `refusal_watch` check retries the move after the build ends.
-A move by hand does not read build ownership.
-The batch writes its wait lines to its move log.
+The batch writes its output to its move log.
 The supervisor needs a restart request; an exited child alone does not cause a restart.
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
 
 Each move and unit attachment acquires the native session lock first.
 If the session has a staff row, the operation also acquires that row lock.
-The move holds both locks through its build wait, stop, and resume.
-If the native session changes during a build wait, the move releases the old locks.
-It acquires the new native lock before it acquires the row lock again.
+The move holds both locks through its stop and resume.
 Attachment refuses while a move holds either lock.
 Retired unit recovery holds both locks in the same order before it starts `add_unit --resume`.
 The child verifies both inherited lock descriptors in native-first order.
 The batch verifies each reference and reads the current conversation while it holds the locks.
 References to the same member share one move and receive the same result.
-Each build check uses the current conversation.
-The batch reports a move to the same account as in progress.
-Other busy rows remain pending while the batch moves available members.
-The pending result is final for the batch and gives the user a retry command.
-The batch omits busy members from both the self-move and build handoffs.
+Only a user command sets the user-command flag:
+
+- `accounts.py move <session>`
+- `accounts.py move <group> <claudeN>`
+- `accounts.py move workers <label>` without `--follow-role`
+- `accounts.py swap`
+- `stop_resume.py retry`, the retry command of a pending move
+- the batch command that a user command gives at its limit; it carries `--user-command`
+
+A detached `move workers --follow-role` run gets the cause and the flag of the swap that started it.
+The move cause is only a label for the move journal; it does not set the flag.
+A user command takes a row that another operation holds:
+
+1. The command moves the free rows at once, and keeps no lock on a held row.
+2. A row is held when another process holds its row lock, or when it is in the restart record while a restart is active.
+3. At its first try on a held row, the command writes its own request without the row lock.
+   The request records the pid and process start of the command.
+4. A move that holds the row reads the request before its stop and drops the row as `not moved: a newer move ran`.
+5. If that move is already past its check, it finishes first.
+6. The command tries the held rows again after each poll and moves each row when it is free.
+7. If its claim is missing or has another request ID, a newer move ran.
+   The command then stops its wait for that row as `not moved: a newer move ran`.
+   This is the placeholder (x) default: a newer move by hand wins over an older one.
+
+A user claim is live while the process that wrote it lives, or while that process cannot be read.
+A command that cannot read its own process start after two reads records no start.
+Such a claim is live while its pid exists.
+An automatic move never takes a row while a live user claim is current.
+It drops that row as `not moved: a newer move ran` at once and does not wait.
+The claim of a killed command does not stop an automatic move.
+Each check and write of a request file holds the `latest-requests.lock` file beside the request folder.
+Plain reads, such as the ownership check of the detached child and the list of pending moves, do not take the lock.
+So an automatic move cannot write over a live user claim, and only a newer move removes or replaces it.
+`accounts.py move <session> <account>` on a session already on that account removes the claim, so an older waiting command stops its wait.
+
+The restart record check keeps the move out of the gap between the stop and the start of a restart.
+The restart record is the shared list of rows to restart, and it can keep rows that an earlier stop saved.
+While any restart is active, a user command waits for each row in the record, and an automatic move reports it as busy.
+A limit stops the wait for a holder that is hung.
+The limit counts from the start of the command, so the move of the free rows uses part of it.
+The detached child counts the limit from the start of its parent, from the `--waited-seconds` handoff value.
+The limit is the sum of `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, `MOVE_STOP_MARGIN_SECONDS`, `UPKEEP_ROW_WAIT_SECONDS`, `RESTART_RECORD_LOCK_SECONDS`, `HOLDER_EXIT_SECONDS`, `OWN_PANE_SHELL_SECONDS`, `START_SECONDS`, `OPENING_PROMPT_SECONDS` and `STAY_SECONDS`.
+At the limit, the command tries the held rows one last time.
+For each row that is still held, it removes its request and gives the batch command with `--user-command`.
+The result names the holder pid and command when the row lock names them.
+Otherwise it gives the reason of the last try, for example `a restart holds this row`.
+A retry keeps the pending request and gives the retry command.
+When the command ends, it ends each of its claims, also after an interrupt in the first pass:
+
+- It removes the claim of each row that it never took.
+- A successful move removes its request.
+- It keeps any other request as a plain request for a retry, for example after a stop failure or a refused destination.
+  A plain request does not stop an automatic move.
+- After a failed handoff, it keeps each request as a plain request for a retry.
+
+When the caller is in the batch, the detached child takes the held rows with the same rules.
+The parent waits up to 15 seconds for the child to confirm its start.
+Before the child confirms, it writes its own pid and process start into each claim of its parent.
+So each claim stays live through the handoff.
+An automatic move never waits for a busy row and never writes a request for it, also when its cause is "by hand".
+It reports a move to the same account as in progress.
+Other busy rows remain pending while the batch moves available members, and the pending result gives a retry command.
+The batch omits busy members from the self-move handoff.
 Each attempt reads the member's live account while it holds the row lock.
 If the read fails, the batch leaves the request file and writes no journal request.
 For a live source, the stop must prove the same PID and start time before it records the request.
@@ -216,10 +264,11 @@ If the request append fails, the batch refuses that member before sending a stop
 The batch reads the current role map for a group move.
 A single-session move uses the explicit account.
 The batch keeps a member running when its live account matches the target.
-The batch validates the Claude destination again after build waits and before launch preparation.
+The batch validates the Claude destination again after the warning and before launch preparation.
 A Claude destination needs a real account directory and a matching local sign-in.
 The sign-in needs an unexpired refresh token or an unexpired access token if only that token is present.
 A refused destination leaves the members running and keeps their request files.
+A user command keeps them as plain requests.
 The handoff carries the request ID, target, and native session references.
 Before a stop or handoff, the parent writes the new request ID and target under the session locks.
 It writes one file per native session in `latest-requests` beside the move journal.
@@ -231,17 +280,20 @@ Success removes the move's own file under the locks.
 Failure leaves the file for retry.
 Each explicit group request checks all members, including members that appear to be on the target.
 If the live account matches the target, the request clears the earlier file under the native lock.
-A busy lock refuses a new request and prints a fresh `batch --target` command for an explicit target.
+A busy lock makes an automatic move report the row as pending.
+A user command waits for the row, and at its limit it prints a fresh `batch --target` command for an explicit target.
 For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
 The batch creates the default `move.log` directory and its parents before it opens the log.
 `retry` can run only a saved request.
 `result` and `retry` check live accounts under the session locks.
+When another operation holds the row, `result` reports the busy row, and `retry` waits for the row like any user command.
 They remove requests for members already on their target, including after `shutdown resume --to`.
 They remove a missing session's request only when a fresh read proves absence.
 Unknown liveness keeps the request and reports the cause.
 Both commands name each file with a decode error and continue with valid files.
 Legacy reports supply display data only.
 Both commands show a fresh batch command for an off-target legacy member.
+The command uses `--group` when the legacy report names a group.
 `retry` starts a new move for each saved request that still needs a move.
 The journal writer rolls back an incomplete append before it releases the journal lock.
 The refusal watcher reads the row lock, and the unit watchdog holds it through recovery.
@@ -510,6 +562,16 @@ A shell with another session's retained launch stays unchanged; recovery opens a
 A registry error during pending admission returns `ResumeFailed` and preserves the record.
 Without pending admission, a registry error permits the generic resume lookup.
 The [upkeep service](herdr-restore.md#restore-services) recovers admitted producers after server loss or reboot.
+`agents stop NAME`, `agents stop --all`, and local producer exit save an exit hold before the stop.
+If the stop fails, the command restores the previous hold.
+A remote producer exit saves a pause before the stop and changes it to an exit hold after confirmation.
+If the exit hold write fails, the pause keeps the producer stopped.
+The staff row stores the hold. The restart record keeps the producer's fixed ID for `agents restart`.
+Upkeep checks the hold under the producer's row lock. It reports the skipped producer once per run.
+`agents resume` and `agents restart` clear the hold after the producer starts or a live process confirms it already runs.
+Resume in the producer's own pane clears the hold before `execvpe`, so upkeep can retry if the new agent exits.
+A saved restart ID alone does not block upkeep. A crash without an exit hold remains eligible for recovery.
+Accepted limit: a storage fault after the hold write (a failed directory sync, or an unreadable staff record during rollback) can leave a running producer with a hold. Upkeep then does not recover it after a crash; `agents resume NAME` clears the hold.
 
 ## Worker resume results
 
@@ -935,3 +997,57 @@ A surviving run keeps its memory queue place and its age.
 A new process does not take over the place of a dead waiter.
 
 A session restart is not a machine restart. A reboot or power-off can end local supervisors and waiting processes.
+
+## Reboot
+
+Run `agents reboot` from a terminal outside Herdr. The command refuses inside a Herdr pane.
+The shared Herdr session must have the name `agents`.
+
+1. Save and stop the local sessions through `agents stop --all`.
+2. Stop Herdr only when a fresh read finds no live or unidentified agent.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/session_move.py`.
+4. Restore the server and the saved sessions through `agents restart`.
+
+The server stop uses `herdr --session agents server stop`.
+
+Before the first step, the command runs `session_move.py --dry-run` through the same Python shim.
+The plan gives the size of idle folders and counts live folders to size after the stop.
+Use `agents reboot --dry-run` to see the plan without running the four steps.
+If session move returns an error, the plan reports that it is incomplete and omits the totals. The dry run returns status 1.
+
+The reboot holds the Herdr upkeep job lock across the four steps and releases it on failure.
+The reboot also holds `reboot.lock` exclusively beside the shared Herdr server socket across the four steps.
+The common Herdr launcher takes a shared lock before it creates a pane.
+The direct Herdr start for a producer reservation takes the same lock.
+A lock refusal reports that a reboot is running.
+Nested starts in one process use the same open lock file, including starts in the reboot's restart step.
+The Herdr server start functions take the same shared lock before they can start a server.
+Manual starts through a pane command, `accounts.py exec`, `cli_agent.sh`, or native Herdr can bypass the lock.
+A shell wrapper can start an agent after a resume times out, and a fork without exec can retain the lock.
+All staff tooling shares one `XDG_CONFIG_HOME`, because a process with a different config home locks a different file.
+A slow Ghostty window or pending Linux service can start the server after its shared lock closes and reboot takes the exclusive lock.
+A remote attach started during a reboot can start the server through the Herdr SSH bridge without the lock. Attach after the reboot prints its Attach line.
+The `agents resume` command holds the lock while it changes staff or recovery records.
+The direct resume API also holds the lock for starts in an existing pane.
+The `agents restart` and `agents move` commands hold the lock while they save restart or move records.
+The `agents add-producer` and `agents transfer` commands hold the lock while they change producer state.
+Dry runs can read state during a reboot.
+The Nix healer takes the shared lock before it saves a launch reservation.
+If reboot holds the lock, the healer keeps the stop record and resumes the session on its next available sweep.
+A failed stop, server stop, or restart leaves the next step in `agents/reboot/reboot.json` under the user state folder.
+Run `agents reboot` again to continue at that step.
+A retry at the server stop checks for resumed sessions. Step 1 saves and stops those sessions and keeps the earlier restart entries.
+If an interrupt ends the reboot, the report lists the saved sessions that still need a restart.
+A folder move failure permits restart to proceed.
+The final report names the failed copy folder if available and assigns the move failure to the verify owner.
+
+The first output line gives the log path in the folder set by `REBOOT_LOG_FOLDER`.
+The default log folder is `~/.local/state/agents/reboot/`.
+The command adds the time to each log line. It keeps older logs and sets `latest.log` to the most recent run.
+A terminal shows each step on one line with an elapsed time and a spinner.
+Stop and restart progress includes the current session name.
+The report counts completed sessions and reads the current total under one lock.
+Output to a pipe uses one line for each name and omits the spinner.
+The move step shows the `session_move` summary. The per-folder refusal details go to the log.
+The report names sessions or workers that need a step and says whether Nate must act.
+The last line gives the command `herdr session attach agents`.

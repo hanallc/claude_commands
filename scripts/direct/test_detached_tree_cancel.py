@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, cast
 from unittest.mock import patch
 
+from scripts.lib.fixture_test_support import register_fixture_class_cleanup, set_up_fixture
 from scripts.agents import detached_runs
 from scripts.production import session_staff, staff
 from scripts.production.staff_test_support import (
@@ -133,11 +134,8 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         return cast(dict[str, object], json.loads(self.inbox_path(fixture, identity).read_text()))
 
     def test_two_simultaneous_callers_receive_only_their_own_cancellation_or_pass(self) -> None:
-        VerifyTreeCancelFixture.setUpClass()
-        self.addCleanup(VerifyTreeCancelFixture.doClassCleanups)
-        other = VerifyTreeCancelFixture()
-        other.setUp()
-        self.addCleanup(other.doCleanups)
+        register_fixture_class_cleanup(self.addCleanup, VerifyTreeCancelFixture).setUpClass()
+        other = set_up_fixture(self.addCleanup, VerifyTreeCancelFixture())
         self.addCleanup(other.tearDown)
         first_identity, second_identity = "edited-worker", "stable-worker"
         first_path = self.start_detached(self, first_identity, done_message=True)

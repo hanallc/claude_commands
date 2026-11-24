@@ -8,9 +8,11 @@ import json
 import math
 import os
 from pathlib import Path
+from stat import S_ISREG
 from scripts.build_queue import execution_identity
+from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
@@ -42,10 +44,15 @@ else:
     placement = _DeferredPlacement()
 
 VERSION = 3
+ASSIGNMENT_MAX_BYTES = 1024 * 1024
 
 
 def _no_test_width() -> records.NoTestWidth:
     return records.NoTestWidth()
+
+
+def _no_job_start() -> records.NoJobStart:
+    return records.NO_JOB_START
 
 
 class AdmissionUnavailable(RuntimeError):
@@ -135,7 +142,7 @@ class RunPlace:
 
 @dataclass(frozen=True)
 class Identity:
-    """The caller identity holds its session, step, folder, and unit."""
+    """The caller identity holds its session, step, folder, and unit, and the caller's own text for the work."""
     session_id: str
     name: str
     step: str
@@ -143,6 +150,7 @@ class Identity:
     unit: str = ""
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    what: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -152,6 +160,11 @@ class CallerCode:
 
 
 NO_RUN = NoRun()
+
+
+@dataclass(frozen=True)
+class SessionNotSent:
+    """A client from before the session field sent no owning session."""
 
 
 @dataclass(frozen=True)
@@ -172,6 +185,8 @@ class AdmitRequest(CallerCode):
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    # The session that owns the run; a natedev hold of this session does not hold the step.
+    session: OwningSession | NoOwningSession | SessionNotSent = field(default=SessionNotSent(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -250,6 +265,8 @@ class ServiceEstimateRequest(CallerCode):
     job: str
     test_width: records.TestWidth = field(default_factory=_no_test_width)
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    # An older client sends no job start, and the service reads that as NoJobStart.
+    job_start: records.CiJobStart = field(default_factory=_no_job_start, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -314,6 +331,47 @@ class PriorityClearRequest(CallerCode):
     request_id: str
     actor: str
     unit: str = ""
+
+
+@dataclass(frozen=True)
+class QueueDrop:
+    neighbor: str
+    side: Literal["before", "after"]
+
+
+@dataclass(frozen=True)
+class QueueHeadDrop:
+    """Place the step at the head of the full wait order."""
+
+
+@dataclass(frozen=True)
+class QueueMoveRequest(CallerCode):
+    request_id: str
+    row_id: str
+    revision: str
+    destination: QueueDrop | QueueHeadDrop
+
+
+@dataclass(frozen=True)
+class QueueUndoRequest(CallerCode):
+    request_id: str
+    row_id: str
+    revision: str
+    move_request_id: str
+
+
+@dataclass(frozen=True)
+class QueueMoved:
+    row_id: str
+    line: records.QueueMoveLine
+    old_place: int
+    new_place: int
+
+
+@dataclass(frozen=True)
+class QueueMoveConflict:
+    line: records.QueueMoveLine
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -476,14 +534,28 @@ class PlacementStatusRequest(CallerCode):
     """The request asks for the status of an episode and attempt."""
     episode: str
     attempt: str
+    include_permission: bool = False
+
+
+@dataclass(frozen=True)
+class LaunchPermissionNotReported:
+    """The status reply does not identify the launch permission."""
+
+
+LAUNCH_PERMISSION_NOT_REPORTED = LaunchPermissionNotReported()
 
 
 @dataclass(frozen=True)
 class KnownPlacementStatus:
-    """The status holds a known assignment, its state, and provider claim."""
+    """The status holds a known assignment, its state, and provider claim.
+
+    A permission request also gets the final report. A reply from an older service has no report.
+    """
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
+    permission: placement.LaunchPermission | LaunchPermissionNotReported = LAUNCH_PERMISSION_NOT_REPORTED
+    report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
 
 
 @dataclass(frozen=True)
@@ -649,12 +721,16 @@ class DispatchStatus:
     retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
+Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
+           | ReleaseRequest | WidthRequest | ViewRequest
+           | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
+           | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
-         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | VerifyRunSlotWaiting
+         | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply
+         | QueueMoved | QueueMoveConflict)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
 _REQUESTS: dict[str, type] = {
@@ -663,6 +739,7 @@ _REQUESTS: dict[str, type] = {
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest,
+    "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
@@ -674,6 +751,7 @@ REPLY_TYPES: dict[str, type] = {
     "repository_slot_expired": RepositorySlotExpired,
     "verify_run_slot_waiting": VerifyRunSlotWaiting,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
+    "queue_moved": QueueMoved, "queue_move_conflict": QueueMoveConflict,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
@@ -724,6 +802,9 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    # An older reader has no session field; a request with no session leaves it out.
+    if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
+        del record["session"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
@@ -743,6 +824,13 @@ def parse_record(text: str, schema: type[T]) -> T:
 
 
 def _parse_value(value: object, schema: type[T]) -> T:
+    if schema in (QueueMoveRequest, QueueUndoRequest):
+        if not isinstance(value, dict):
+            raise ValueError("Invalid queue move request.")
+        value = cast(dict[str, object], value)
+        allowed = set(codec.record_field_names(schema)) | {"kind"}
+        if value.keys() - allowed:
+            raise ValueError("Unexpected queue move request field.")
     return cast(T, codec.parse_snapshot_value(value, schema))
 
 
@@ -772,7 +860,7 @@ def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, o
         if version < 3 and variants[name] in _PLACEMENT_TYPES:
             raise ValueError("placement requires version 3")
         return version, cast(object, _parse_value(data, variants[name]))
-    except (ArithmeticError, KeyError, TypeError, UnicodeError) as error:
+    except (ArithmeticError, KeyError, RecursionError, TypeError, UnicodeError) as error:
         raise ValueError("invalid admission message") from error
 
 
@@ -843,11 +931,37 @@ def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
     return encode_envelope(reply, REPLY_TYPES, version)
 
 
+def read_assignment_text(path: Path) -> str:
+    def open_assignment(name: str, flags: int) -> int:
+        return os.open(name, flags | os.O_NONBLOCK)
+
+    with open(path, "rb", opener=open_assignment) as stream:
+        if not S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise AdmissionUnavailable("the assignment file must be a regular file")
+        data = stream.read(ASSIGNMENT_MAX_BYTES + 1)
+    if len(data) > ASSIGNMENT_MAX_BYTES:
+        raise AdmissionUnavailable("the assignment file exceeds its size limit")
+    return data.decode("utf-8")
+
+
 def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
-    reply = parse_reply(path.read_text())
+    reply = parse_reply(read_assignment_text(path))
     if isinstance(reply, (Assignment, LocalPlacementGranted)):
         return reply
     raise AdmissionUnavailable("file contains no assigned attempt")
+
+
+def assignment_what(path: Path) -> str:
+    """The `what` text that a caller writes in the assignment file before placement; empty when it gave none.
+
+    mac_queue_run writes `episode`, `pid` and `what`. A placement replaces the file only after its request
+    carries the text to the queue, and the queue record keeps the text."""
+    try:
+        value = cast(object, json.loads(read_assignment_text(path)))
+    except (OSError, ValueError, AdmissionUnavailable):
+        return ""
+    what = cast(dict[str, object], value).get("what") if isinstance(value, dict) else ""
+    return what if isinstance(what, str) else ""
 
 
 def write_assignment(path: Path, reply: Assignment | LocalPlacementGranted) -> None:

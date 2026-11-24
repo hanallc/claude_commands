@@ -20,6 +20,7 @@ from unittest import mock
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.aws_target.ledger_test_support import write_gate_config
+from scripts.lib.python_startup import sitecustomize as python_startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import gate
 from scripts.test_times import gate_record
@@ -163,7 +164,10 @@ subprocess.run = fail_log_put
         self.assertIs(aws_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
         self.assertNotIn('basedpyright', gate_box.GUEST)
-        self.assertNotIn('merge_gate', gate_box.GUEST)
+        # The embedded startup hook names merge_gate.py to recognize a gate parent; the guest itself never runs it.
+        startup = repr(inspect.getsource(python_startup))
+        self.assertIn(startup, gate_box.GUEST)
+        self.assertNotIn('merge_gate', gate_box.GUEST.replace(startup, ''))
         self.assertIn('gate_runner.SelectedModules', gate_box.CANDIDATE_GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
@@ -356,12 +360,16 @@ subprocess.run = fail_log_put
         self.production_boot_stubs(('',), candidate_change='missing')
 
     def test_bootstrap_renders_with_mock_process_memory_mib(self) -> None:
-        code = '''from unittest import mock
+        code = '''import inspect
+from unittest import mock
+from scripts.lib.python_startup import sitecustomize as python_startup
 from scripts.production import gate
 with mock.patch.object(gate, 'process_memory_mib'):
     from scripts.aws_target import gate_box
     compile(gate_box.GUEST, '<bootstrap>', 'exec')
-    assert 'merge_gate' not in gate_box.GUEST
+    startup = repr(inspect.getsource(python_startup))
+    assert startup in gate_box.GUEST
+    assert 'merge_gate' not in gate_box.GUEST.replace(startup, '')
     assert 'inspect.getsource' not in gate_box.GUEST
 '''
         reply = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True,

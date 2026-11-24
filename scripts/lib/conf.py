@@ -78,6 +78,14 @@ class UnstampedConfiguration(Enum):
     UNSTAMPED = "no file stamp"
 
 
+def file_stamp(source: Path) -> ConfigurationStamp | UnstampedConfiguration:
+    """Stamp the file without a read, so a cache keyed by the stamp sees each edit."""
+    try:
+        return ConfigurationStamp.from_stat(source.stat())
+    except OSError:
+        return UnstampedConfiguration.UNSTAMPED
+
+
 _report_changes: ContextVar[bool] = ContextVar("report_configuration_changes", default=False)
 _reported_bad_edits: set[tuple[Path, str, str, ConfigurationStamp | UnstampedConfiguration]] = set()
 _bad_edits_lock = Lock()
@@ -155,6 +163,16 @@ class UseConfiguredValue(Enum):
     CURRENT = "current configuration"
 
 
+class HostOverride(Enum):
+    """Tell whether a `<key>.<host>` key for the reading host replaces the key.
+
+    IGNORED fits a key whose last part names something other than the reading host, such as a watched machine.
+    """
+
+    APPLIES = "the reading host key replaces the key"
+    IGNORED = "the key is read as written"
+
+
 @dataclass(frozen=True)
 class ConfigRead:
     """Keep one live file read for the settings used in one pass."""
@@ -167,14 +185,15 @@ class ConfigRead:
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-                 recover_invalid: bool = True, use_file_limits: bool = True
+                 recover_invalid: bool = True, use_file_limits: bool = True,
+                 host_override: HostOverride = HostOverride.APPLIES
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
             try:
-                setting = _setting(settings, key)
+                setting = _setting(settings, key, host_override)
             except _MissingKey:
                 if isinstance(default, UseConfiguredValue):
                     raise
@@ -210,7 +229,7 @@ class ConfigRead:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
         if use_file_limits and isinstance(self.settings, dict):
-            current = self.settings.get(self.effective_key(key))
+            current = self.settings.get(self.effective_key(key) if host_override is HostOverride.APPLIES else key)
             if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
@@ -239,10 +258,10 @@ class ConfigRead:
 
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-              recover_invalid: bool = True) -> Result:
+              recover_invalid: bool = True, host_override: HostOverride = HostOverride.APPLIES) -> Result:
         """Read one key with a domain conversion and an optional default."""
         result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
-                               recover_invalid=recover_invalid)
+                               recover_invalid=recover_invalid, host_override=host_override)
         if isinstance(result, UnavailableValue):
             raise Unusable(f"{result.reason}; no usable committed value" if recover_invalid else result.reason)
         return result.value
@@ -405,8 +424,10 @@ def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> 
     return candidate if candidate in settings else key
 
 
-def _setting(settings: dict[str, Setting], key: str) -> Setting:
+def _setting(settings: dict[str, Setting], key: str, host_override: HostOverride = HostOverride.APPLIES) -> Setting:
     try:
+        if host_override is HostOverride.IGNORED:
+            return settings[key]
         return settings[effective_key(settings, key, host_name=_local_host_name())]
     except KeyError:
         raise _MissingKey("key is missing") from None

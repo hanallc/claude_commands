@@ -12,7 +12,7 @@ from scripts.disks import measure
 from scripts.disks.measure import DisksData
 from scripts.lib import build_folders, conf
 from scripts.lib.build_steps import StepNames, read_step_names
-from scripts.message.unit_labels import OwnerRole
+from scripts.build_queue.snapshot_codec import row_text
 from scripts.review_links import staff_names as name_rendering
 
 State = Callable[[Path], Literal["held", "free"]]
@@ -88,12 +88,9 @@ def slot_use(record: Mapping[str, object], steps: StepNames, owners: OwnerNames)
     text = {key: value for key in ("work", "purpose", "unit", "showrunner") if isinstance(value := record.get(key), str)}
     unit = owners(text.get("unit", ""))
     step = text.get("work", "")
-    current = " ".join(part for part in (unit, text.get("purpose", "")) if part)
-    name = steps.for_owner(step, unit, OwnerRole.UNIT, current_name=current) if step else current
-    current_parts = name_rendering.text_parts(name_rendering.StaffReference(unit),
-        " " if unit and text.get("purpose") else "", text.get("purpose", ""))
-    parts = name_rendering.owned_step_parts(steps, step, unit, OwnerRole.UNIT, current=current_parts) if step else current_parts
-    return {"name": name, "showrunner": text.get("showrunner", ""), "name_parts": parts}
+    what = steps.shown(step) if step else text.get("purpose", "")
+    return {"name": row_text(unit, what), "showrunner": text.get("showrunner", ""),
+            "name_parts": name_rendering.row_parts(unit, what, unit)}
 
 
 def slot_row(path: Path, form: build_folders.BuildCopy, days: int, data: DisksData | None, now: float,

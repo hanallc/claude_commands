@@ -38,8 +38,8 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress, program_start, queue_place
 from scripts.build_queue.admission_wire import CloudGroup, Owner
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import gate
-from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.boot_identity import boot_identity
@@ -47,6 +47,7 @@ from scripts.lib.process_start import Gone, Started, process_start
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 FIXTURE_BOOT = '01234567-89ab-cdef-0123-456789abcdef'
@@ -359,7 +360,7 @@ class GuestTests(unittest.TestCase):
                 call = ledger.mapping(cast(object, json.loads((root / path.name).read_text())))
                 self.assertEqual(call['args'], [str(suite), path.name])
                 environment = ledger.mapping(call['env'])
-                self.assertEqual(environment['HERDR_BIN'], '/nonexistent/herdr')
+                self.assertEqual(environment['HERDR_BIN'], MISSING_HERDR_BIN)
                 for key in ('TEST_TIMES_OUT', 'TMPDIR', 'STAFF_FILE', 'BUILDLOG_DIR', 'BUILDLOG_LIVE_MEMORY_TRIPWIRE'):
                     self.assertIn(key, environment)
                 self.assertNotIn('GATE_BOX_DIR', environment)
@@ -404,22 +405,25 @@ class PairedTrialTests(CostFixture):
         self.install_scope_fixture()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
-        for name in tuple(os.environ):
-            if name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')):
-                del os.environ[name]
-        os.environ['GIT_CONFIG_GLOBAL'] = str(write_fixture_git_config(self.root))
+        # clear=True drops the caller's GIT_* variables, such as GIT_DIR or GIT_INDEX_FILE.
+        self.enterContext(mock.patch.dict(os.environ, fixture_git_environment(self.root), clear=True))
         shipped = Path(__file__).resolve().parents[2]
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
             _ = trial.checked_git(self.repo, *args)
         copy_test_runner(self.repo)
-        for relative in ('scripts/lib/process_group.py', 'scripts/aws_target/gate_box.py',
-                         'scripts/aws_target/__init__.py', 'scripts/build_queue/admission_jobs.py',
-                         'scripts/production/gate_routes.py', 'scripts/test_times/gate_record.py'):
+        for relative in ('scripts/aws_target/__init__.py', 'scripts/aws_target/gate_box.py',
+                         'scripts/build_queue/admission_jobs.py', 'scripts/build_queue/snapshot_codec.py',
+                         'scripts/buildlog/parse.py', 'scripts/lib/build_steps.py',
+                         'scripts/lib/proc_text.py', 'scripts/lib/process_group.py',
+                         'scripts/production/gate_modules.py', 'scripts/production/gate_routes.py',
+                         'scripts/test_times/gate_record.py'):
             path = self.repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_bytes((shipped / relative).read_bytes())
+        _ = (self.repo / 'scripts/buildlog/store.py').write_text(
+            '"""The paired guest uploads its result without using the build log."""\n')
         (self.repo / 'scripts/production').mkdir(exist_ok=True)
         _ = (self.repo / 'scripts/production/gate.py').write_text(
             "def test_module_environment(root, environment):\n"
@@ -459,8 +463,9 @@ class Sample(unittest.TestCase):
         scopes.mkdir()
         startup = self.root / 'startup'
         startup.mkdir()
-        _ = (startup / 'sitecustomize.py').write_text(fr'''import io, os, signal
+        _ = (startup / 'sitecustomize.py').write_text(fr'''import io, os, shutil, signal
 from pathlib import Path
+# Initialize shutil before the fixture replaces os.open.
 prefix = Path('/sys/fs/cgroup/fixture/builds.slice')
 root = Path({str(scopes)!r})
 old_open, old_iterdir, old_realpath = Path.open, Path.iterdir, os.path.realpath
@@ -535,6 +540,20 @@ os.execvp(command[0], command)
             'PYTHONPATH': pythonpath,
             'FIXTURE_SCOPE_ROOT': str(scopes),
         })))
+
+    def test_a_caller_git_variable_does_not_reach_the_fixture_commands(self) -> None:
+        folder = self.root / 'caller'
+        folder.mkdir()
+        caller = {'GIT_INDEX_FILE': str(folder / 'index'), 'GIT_DIR': str(folder / 'repository.git')}
+        probe = PairedTrialTests('test_expired_sweep_preserves_a_racing_coordinator_termination')
+        with mock.patch.dict(os.environ, caller):
+            try:
+                probe.setUp()
+                self.assertFalse(set(caller) & set(os.environ))
+                _ = trial.checked_git(probe.repo, 'add', 'change')
+            finally:
+                probe.doCleanups()
+        self.assertEqual(list(folder.iterdir()), [])
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000
@@ -1371,7 +1390,8 @@ print('200', end='')
         curl.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)
         trace = self.root / 'trace.jsonl'
-        result = subprocess.run([sys.executable, str(box / 'guest.py')], capture_output=True, text=True,
+        # The guest selects the candidate checkout after it clones the source.
+        result = subprocess.run([sys.executable, '-E', str(box / 'guest.py')], capture_output=True, text=True,
             timeout=guest_deadline_s + guest_delivery_margin_s,
             env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'HOME': str(box)})

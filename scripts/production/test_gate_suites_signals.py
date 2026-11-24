@@ -23,7 +23,9 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.build_queue.queue_place import QueuePlace
+from scripts.copies import copies
 from scripts.lib import build_folder_lock, build_folders, process_group
+from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Started, Unreadable, Zombie, process_start
@@ -38,6 +40,52 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class GateProcessStateTests(unittest.TestCase):
+    def test_gate_jobs_only_name_descriptors_passed_to_them(self) -> None:
+        request = build_folders.UniqueBuildFolder("gate-job-fds-", build_folders.InheritedTemporaryParent())
+        with ExitStack() as stack:
+            root = stack.enter_context(build_folders.temporary_build_folder(request))
+            lease = stack.enter_context(Path(os.devnull).open("rb"))
+            second_lease = stack.enter_context(Path(os.devnull).open("rb"))
+            omitted = stack.enter_context(Path(os.devnull).open("rb"))
+            source = stack.enter_context(Path(gate.__file__).open("rb"))
+            leases = (lease.fileno(), second_lease.fileno())
+            token = copies.COMMAND_LOCKS.set(leases)
+            _ = stack.callback(copies.COMMAND_LOCKS.reset, token)
+            _ = stack.enter_context(mock.patch.object(gate, "_gate_program_source", return_value=source))
+            _ = stack.enter_context(mock.patch.object(gate, "python_shim", return_value=Path(sys.executable)))
+            environment = {
+                "BUILDLOG_CALLER": "gate",
+                build_folders.NUMBERED_COPY_LOCK_ENV: str(lease.fileno()),
+                "BUILD_FOLDER_LOCK_FD": str(omitted.fileno()),
+                "EXAMPLE_LOCK_FD": str(omitted.fileno()),
+                "EXAMPLE_LEASE_FDS": f"{second_lease.fileno()},{omitted.fileno()},{lease.fileno()}",
+                "LISTEN_FDS": str(lease.fileno()),
+                "COPIES_COMMAND_LEASE_FDS": f"{lease.fileno()},{omitted.fileno()}",
+                "COPIES_MIRROR_LEASE_FDS": str(omitted.fileno()),
+                "COPIES_STEP_SOURCE_LOCK_FD": str(source.fileno()),
+                "STAFF_ROW_FD_fixture": str(omitted.fileno()),
+                GATE_PARENT_SOURCE_FD: str(omitted.fileno()),
+            }
+
+            for kind in (gate.GateJobKind.TEST_MODULE, gate.GateJobKind.TYPE_CHECK):
+                with self.subTest(kind=kind), mock.patch.object(subprocess, "Popen") as launch:
+                    job = gate.start_gate_job("hooks", root / "test_fixture.py", [], root, environment,
+                                              root / "output.log", kind=kind)
+                    job.output.close()
+                    expected = {
+                        "BUILDLOG_CALLER": "gate", "GATE_PARENT_PID": str(os.getpid()),
+                        build_folders.NUMBERED_COPY_LOCK_ENV: str(lease.fileno()),
+                        "COPIES_COMMAND_LEASE_FDS": str(lease.fileno()),
+                        "EXAMPLE_LEASE_FDS": f"{second_lease.fileno()},{lease.fileno()}",
+                    }
+                    passed = leases
+                    if kind is gate.GateJobKind.TEST_MODULE and sys.platform == "linux":
+                        passed += (source.fileno(),)
+                        expected[GATE_PARENT_SOURCE_FD] = str(source.fileno())
+                    launch.assert_called_once()
+                    self.assertEqual(cast(tuple[int, ...], launch.call_args.kwargs["pass_fds"]), passed)
+                    self.assertEqual(cast(dict[str, str], launch.call_args.kwargs["env"]), expected)
+
     def test_recovery_keeps_canaries_and_saved_gate_folders(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="gate-recovery-test-")).resolve()
         self.addCleanup(shutil.rmtree, root)

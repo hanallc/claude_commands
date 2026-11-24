@@ -383,6 +383,22 @@ class SnapshotCodecTests(unittest.TestCase):
                             self.assertEqual(cast(str, getattr(older_cause, "head_name")),
                                              "2 of 2 claude_commands runs on natedev")
 
+    def test_each_pinned_client_reads_a_machine_choice_row_and_the_current_client_keeps_it(self) -> None:
+        reading = head_reading()
+        row = replace(reading.view.waiting[0], reason=records.MachineChoiceWait())
+        reading = replace(reading, view=replace(reading.view, waiting=(row, *reading.view.waiting[1:])))
+        reply = wire.ViewReply(reading)
+        line = wire.encode_reply(reply)
+        self.assertEqual(wire.parse_reply(line), reply)
+        for revision in (*OLDER_CLIENTS, CI_CLIENT):
+            with self.subTest(revision=revision), pinned_snapshot_reader(revision) as (_parse, _schema, pinned):
+                older = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
+                view = cast(object, getattr(cast(object, getattr(older, "reading")), "view"))
+                waiting = cast(tuple[object, ...], getattr(view, "waiting"))
+                reason = cast(object, getattr(waiting[0], "reason"))
+                self.assertEqual(type(reason).__name__, "BehindHead")
+                self.assertEqual(cast(str, getattr(reason, "head_name")), "a machine choice")
+
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
         held = records.NatedevHeld("fps", "Phase 3 timing")
         snapshot = wait_reply(records.NeedsMemory()).snapshot

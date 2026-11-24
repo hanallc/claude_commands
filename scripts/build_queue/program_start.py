@@ -9,6 +9,7 @@ if not __package__:
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum, auto
 import os
 from pathlib import Path
 import select
@@ -19,6 +20,24 @@ from scripts.lib import atomic_file
 from scripts.lib.process_start import Started, process_start
 from scripts.build_queue.admission_wire import Owner, encode_record
 from scripts.build_queue.snapshot_codec import SnapshotParseError
+
+
+STEP_SCOPE_ENV = "BUILDLOG_STEP_SCOPE"
+# The --scope-start word of a program scope that a reservation pays for.
+RESERVED_WORD = "--reserved"
+
+
+class ScopeReservation(Enum):
+    """Whether a reservation pays for the memory of the program scope."""
+    # The program names its scope as a queued step does: the cargo wrapper starts cargo at once in that scope,
+    # and memory_admit charges the compilers that sccache runs for the scope to the reservation.
+    HELD = auto()
+    # No reservation pays for the scope, so its cargo calls take the queue path and its compilers stay global.
+    UNRESERVED = auto()
+
+    def arguments(self) -> list[str]:
+        """The --scope-start words that select this value."""
+        return [RESERVED_WORD] if self is ScopeReservation.HELD else []
 
 
 class ProgramStartRefused(Exception):
@@ -82,31 +101,39 @@ def program_scope() -> Path | None:
 
 
 
-def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str], *, record: Path) -> None:
+def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str], *, record: Path,
+                reservation: ScopeReservation = ScopeReservation.UNRESERVED) -> None:
     """Publish the scope before the program starts."""
     if process_start(holder_pid) != Started(holder_start):
         raise ProgramStartRefused("the queue place holder exited before scope startup")
     scope = program_scope()
     if scope is None:
         raise ProgramStartRefused("the program did not enter its memory scope")
+    if reservation is ScopeReservation.HELD:
+        os.environ[STEP_SCOPE_ENV] = str(scope)
     program_start(record, Owner(holder_pid, holder_start), argv, sidecar=sidecar, scope=str(scope))
 
 
 def main(argv: list[str] | None = None) -> int:
     """Start the program after publishing its ownership or memory scope."""
     argv = sys.argv[1:] if argv is None else argv
-    if argv[1:2] == ["--authorized"]:
-        if len(argv) < 9 or argv[0] not in ("--scope-start", "--program-start"):
+    action = argv[0] if argv else ""
+    reservation = (ScopeReservation.HELD if action == "--scope-start" and argv[1:2] == [RESERVED_WORD]
+                   else ScopeReservation.UNRESERVED)
+    words = argv[1 + len(reservation.arguments()):]
+    if words[:1] == ["--authorized"]:
+        if len(words) < 8 or action not in ("--scope-start", "--program-start"):
             raise ProgramStartRefused("invalid authorized startup arguments")
-        sidecar, holder, record = Path(argv[2]), Owner(int(argv[3]), argv[4]), Path(argv[5])
-        wait_for_start(int(argv[6]), float(argv[7]))
-        if argv[0] == "--scope-start":
-            scope_start(sidecar, holder.pid, holder.start_time, argv[8:], record=record)
+        sidecar, holder, record = Path(words[1]), Owner(int(words[2]), words[3]), Path(words[4])
+        wait_for_start(int(words[5]), float(words[6]))
+        if action == "--scope-start":
+            scope_start(sidecar, holder.pid, holder.start_time, words[7:], record=record, reservation=reservation)
         else:
-            program_start(record, holder, argv[8:], sidecar=sidecar)
+            program_start(record, holder, words[7:], sidecar=sidecar)
         return 0
-    if len(argv) >= 6 and argv[0] == "--scope-start":
-        scope_start(Path(argv[1]), int(argv[2]), argv[3], argv[5:], record=Path(argv[4]))
+    if action == "--scope-start" and len(words) >= 5:
+        scope_start(Path(words[0]), int(words[1]), words[2], words[4:], record=Path(words[3]),
+                    reservation=reservation)
         return 0
     if len(argv) >= 5 and argv[0] == "--program-start":
         program_start(Path(argv[1]), Owner(int(argv[2]), argv[3]), argv[4:])

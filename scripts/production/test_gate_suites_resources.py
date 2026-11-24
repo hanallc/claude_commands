@@ -301,10 +301,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
             measured = float((self.state / "cpu-measured" / key).read_text())
             self.assertGreaterEqual(measured, work["leader"] + work["child"])
             self.assertGreaterEqual(results[key].cpu_seconds, measured - 0.02, key)
-            self.assertLess(results[key].cpu_seconds, measured + 0.5, key)
-        sleeper = results["lib/test_second.py"]
-        self.assertLess(sleeper.cpu_seconds, 0.25)
-        self.assertGreaterEqual(sleeper.seconds, workloads["lib/test_second.py"]["sleep"])
+            # Only one process of a job uses CPU at a time, so its CPU is at most its wall time less its sleep.
+            # Load adds only wall time to this bound.
+            self.assertLessEqual(results[key].cpu_seconds, results[key].seconds - work["sleep"], key)
         self.assertGreater(results["types/basedpyright"].cpu_seconds, 0.0)
         ranked = sorted(results, key=lambda key: (-results[key].cpu_seconds, key))
         self.assertEqual(ranked[0], "lib/test_first.py")

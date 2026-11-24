@@ -28,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import BinaryIO, TypedDict, cast
 
-from scripts.lib import scratch
+from scripts.lib import file_lock
 
 
 UNKNOWN_IDENTITY = "unknown"
@@ -258,8 +258,8 @@ def locked_append(path: Path, *, deadline: float | None = None) -> Generator[Bin
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     with os.fdopen(fd, "r+b", buffering=0) as handle:
         try:
-            scratch.lock_copy_descriptor(fd, fcntl.LOCK_EX, deadline=deadline)
-        except scratch.CopyLockTimeout as error:
+            file_lock.flock(fd, fcntl.LOCK_EX, deadline=deadline)
+        except file_lock.LockDeadlineExceeded as error:
             raise AppendLockTimeout(f"the append lock deadline passed for {path}") from error
         end = last_whole_row_end(handle)
         if end != os.fstat(fd).st_size:

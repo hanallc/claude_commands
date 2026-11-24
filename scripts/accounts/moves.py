@@ -7,16 +7,19 @@ import os
 import re
 import shlex
 import sys
-from dataclasses import dataclass, field
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from importlib import import_module
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
+from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
 from scripts.agents.stop_results import MoveHandedOff, StopFailed
+from scripts.lib import process_start
 from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
@@ -56,10 +59,15 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 MoveCause = Literal["refusal", "credits off", "by hand", "auto"]
 
 
-class RequestedMove(MoveCommon, RequestedFields):
+class RecordedMoveRequest(MoveCommon, RequestedFields):
     terminal: NotRequired[str]
     kind: Literal["requested"]
     cause: NotRequired[MoveCause]
+    scope: NotRequired[ReadOnly[Literal["group", "session"]]]
+
+
+class RequestedMove(RecordedMoveRequest):
+    scope: Literal["group", "session"]
 
 
 class ConfirmedMove(MoveCommon):
@@ -95,7 +103,9 @@ class RoomAgainMove(MoveCommon):
     label: HistoricalAccountLabel
 
 
-MoveEntry = RequestedMove | ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveOutcomeEntry = ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
+MoveEntry = RecordedMoveRequest | MoveOutcomeEntry
+MoveWriteEntry = RequestedMove | MoveOutcomeEntry
 
 
 @dataclass(frozen=True)
@@ -166,6 +176,7 @@ class MoveSuperseded(StopFailed):
 
 class ExplicitMoveTarget(Enum):
     REQUESTED_ACCOUNT = "use the requested account"
+    GROUP_ACCOUNT = "use the account requested by a group operation"
 
 
 @dataclass(frozen=True)
@@ -190,9 +201,20 @@ def native_row_key(reference: str) -> str:
 
 
 @dataclass(frozen=True)
+class ClaimOwner:
+    """The process of a user command; its claim is live while this process lives."""
+
+    pid: int
+    start: str
+
+
+@dataclass(frozen=True)
 class LatestMoveRequest:
     request_id: str
     target: str
+    explicit_group_scope: bool = False
+    # The user command that wrote the claim; None for an automatic move or a plain request.
+    owner: ClaimOwner | None = field(default=None, compare=False)
 
 
 class NoLatestMoveRequest:
@@ -209,12 +231,55 @@ def latest_request_path(native_session: str) -> Path:
     return store_file().parent / "latest-requests" / native_row_key(native_session)
 
 
+@contextmanager
+def claim_lock() -> Generator[None]:
+    """Make each read, check and write of the latest-request files one atomic step."""
+    path = latest_request_path("").parent.with_name("latest-requests.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def own_claim_owner() -> ClaimOwner:
+    """Read the own process start, with one more read after a failure; no start is recorded after two failures."""
+    for _ in range(2):
+        started = process_start.process_start(os.getpid())
+        if isinstance(started, process_start.Started):
+            return ClaimOwner(os.getpid(), started.start)
+    return ClaimOwner(os.getpid(), "")
+
+
+def claim_is_live(request: LatestMoveRequest) -> bool:
+    """A user claim is live while its process lives or cannot be read; a claim with no start, while its pid exists."""
+    if request.owner is None:
+        return False
+    state = process_start.process_start(request.owner.pid)
+    return (isinstance(state, process_start.Unreadable)
+            or isinstance(state, process_start.Started) and request.owner.start in ("", state.start))
+
+
 def write_latest_request(native_session: str, request: LatestMoveRequest, *, name: str = "") -> None:
-    """Replace the request while the caller holds the session locks."""
+    """Replace the request of a native session; a caller that reads and checks first holds `claim_lock`.
+
+    A move writes its request while it holds the session locks.
+    One exception: a user command writes its claim without the row lock while another operation holds the row.
+    The holder reads the request again before its stop and drops the row when the claim replaced its own.
+    An automatic move never takes a row while a live user claim is current.
+    A user command stops its wait for a row when its claim is missing or replaced, because a newer move ran.
+    """
     path = latest_request_path(native_session)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps({"request_id": request.request_id, "target": request.target,
-        "name": name or "unnamed session", "native_session": native_session}), new_file_mode=0o600)
+    fields: dict[str, str | bool | int] = {"request_id": request.request_id, "target": request.target,
+        "name": name or "unnamed session", "native_session": native_session}
+    if request.explicit_group_scope:
+        fields["explicit_group_scope"] = True
+    if request.owner is not None:
+        fields["pid"], fields["start"] = request.owner.pid, request.owner.start
+    write_text_atomic(path, json.dumps(fields), new_file_mode=0o600)
 
 
 def _read_move_request(path: Path) -> PendingMoveRequest | NoLatestMoveRequest:
@@ -227,12 +292,17 @@ def _read_move_request(path: Path) -> PendingMoveRequest | NoLatestMoveRequest:
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
         request_id, target = fields.get("request_id"), fields.get("target")
+        explicit_group_scope = fields.get("explicit_group_scope", False)
+        pid, start = fields.get("pid"), fields.get("start")
+        owner = ClaimOwner(pid, start) if isinstance(pid, int) and isinstance(start, str) else None
         native_session, name = fields.get("native_session"), fields.get("name")
         if (isinstance(request_id, str) and request_id and isinstance(target, str) and target
                 and (not target.startswith("group:") or target[6:] in role_map.CLAUDE_GROUPS)
                 and isinstance(native_session, str) and native_session and latest_request_path(native_session) == path
-                and isinstance(name, str) and name):
-            return PendingMoveRequest(MoveMember(native_session, name), LatestMoveRequest(request_id, target))
+                and isinstance(name, str) and name and isinstance(explicit_group_scope, bool)
+                and (owner is not None or pid is None and start is None)):
+            return PendingMoveRequest(MoveMember(native_session, name),
+                                      LatestMoveRequest(request_id, target, explicit_group_scope, owner))
     raise ValueError("invalid latest move request")
 
 
@@ -258,17 +328,39 @@ MOVE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/agents/stop_resume.py
 RETRY_COMMAND = f"{MOVE_COMMAND} retry"
 
 
-def batch_move_command(reference: str, destination: str | FollowGroupAccount) -> str:
+def batch_move_command(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> str:
     options = (["--group", destination.group] if isinstance(destination, FollowGroupAccount)
                else ["--target", destination])
+    if user_command:
+        options.append("--user-command")
     return f"{MOVE_COMMAND} batch {shlex.join([*options, '--', reference])}"
 
 
 def remove_latest_request(native_session: str, request_id: str) -> None:
-    """Remove only this request while the caller holds the session locks."""
-    current = read_latest_request(native_session)
-    if isinstance(current, LatestMoveRequest) and current.request_id == request_id:
-        latest_request_path(native_session).unlink(missing_ok=True)
+    """Remove only this request.
+
+    A move removes its request while it holds the session locks.
+    A user command that stops its wait for a held row removes its claim without the row lock.
+    The request id check under `claim_lock` keeps a newer request in place.
+    """
+    with claim_lock():
+        current = read_latest_request(native_session)
+        if isinstance(current, LatestMoveRequest) and current.request_id == request_id:
+            latest_request_path(native_session).unlink(missing_ok=True)
+
+
+def set_claim_owner(native_session: str, request_id: str, owner: ClaimOwner | None) -> bool:
+    """Give this request a new owner and keep its other fields; False when another request replaced it.
+
+    The detached child takes the claim of its parent. A user command at its end keeps a plain request for a retry.
+    """
+    with claim_lock():
+        saved = _read_move_request(latest_request_path(native_session))
+        if not isinstance(saved, PendingMoveRequest) or saved.request.request_id != request_id:
+            return False
+        if saved.request.owner != owner:
+            write_latest_request(native_session, replace(saved.request, owner=owner), name=saved.member.name)
+        return True
 
 
 def _batch_path(batch_id: str) -> Path:
@@ -365,6 +457,8 @@ def _valid(value: object) -> bool:
     kind = fields.get("kind")
     if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand", "auto")):
         return False
+    if "scope" in fields and (kind != "requested" or fields["scope"] not in ("group", "session")):
+        return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:
             return False
@@ -376,7 +470,7 @@ def _valid(value: object) -> bool:
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
-def _canonical_entry(entry: MoveEntry) -> MoveEntry:
+def _canonical_entry[Entry: MoveEntry](entry: Entry) -> Entry:
     from scripts.whoami.note_file import canonical_label
 
     fields: dict[str, object] = dict(entry)
@@ -384,7 +478,7 @@ def _canonical_entry(entry: MoveEntry) -> MoveEntry:
         value = fields.get(field)
         if isinstance(value, str):
             fields[field] = canonical_label(value)
-    return cast(MoveEntry, cast(object, fields))
+    return cast(Entry, cast(object, fields))
 
 
 
@@ -478,7 +572,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     return evidence.history if isinstance(evidence, MoveReplayEvidence) else evidence
 
 
-def append_move(entry: MoveEntry) -> None:
+def append_move(entry: MoveWriteEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     entry = _canonical_entry(entry)
     if entry["kind"] == "requested":

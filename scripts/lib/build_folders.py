@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -36,6 +37,8 @@ from scripts.lib.conf import UseConfiguredValue
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
+
+TEST_RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
 
 # Python's mkdtemp allocator uses this suffix.
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
@@ -550,6 +553,30 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
         return InvalidFolderComponents(str(error))
 
 
+def test_runs_parent(checkout: Path) -> Path:
+    """Use the selected checkout's build output or its temporary parent."""
+    target = checkout / "target"
+    output = None
+    if isinstance(parse_form(checkout), BuildCopy):
+        if not target.is_symlink():
+            output = target
+    elif target.is_symlink():
+        with suppress(OSError, RuntimeError):
+            linked_output = target.resolve(strict=True)
+            if linked_output.is_dir() and isinstance(parse_form(linked_output), (WorktreeOutput, MainOutput)):
+                output = linked_output
+    if output is not None:
+        parent = output / "test-runs"
+        if parent.is_symlink():
+            raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
+        return parent
+
+    inherited = inherited_temporary_parent().resolve()
+    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV):
+        return inherited.parent
+    return inherited / "test-runs"
+
+
 def repository_git_timeout() -> float:
     """Keep the copies Git deadline when the maker creates a slot."""
     from scripts.lib import conf
@@ -625,6 +652,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_inherited_build_locks: ContextVar[tuple[int, ...]] = ContextVar('inherited_build_locks', default=())
 
 def _probe_timing(*, wait: bool = True, settings: ConfigRead | None = None) -> build_folder_lock.ProbeTiming:
     settings = _settings() if settings is None else settings
@@ -647,8 +675,18 @@ def build_folder_lock_fd(path: Path) -> int:
 
 
 def held_build_folder_descriptors() -> tuple[int, ...]:
-    """Retain all maker leases in source and command subprocesses."""
-    return tuple(_locks)
+    """Retain all build locks in source and command subprocesses."""
+    return (*_inherited_build_locks.get(), *_locks)
+
+
+@contextmanager
+def inherit_build_lock(descriptor: int) -> Generator[None]:
+    """Pass an inherited build lock to child processes."""
+    token = _inherited_build_locks.set((*_inherited_build_locks.get(), descriptor))
+    try:
+        yield
+    finally:
+        _inherited_build_locks.reset(token)
 
 
 def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
@@ -716,15 +754,33 @@ def _mac_mount_points() -> tuple[Path, ...]:
         _ = cast(None, free(mounts))
 
 
-def _linux_mount_points() -> tuple[Path, ...]:
-    points: list[Path] = []
+@dataclass(frozen=True)
+class LinuxMount:
+    mount_id: int
+    device: bytes
+    root: Path
+    point: Path
+
+
+def _decode_mount_path(value: bytes) -> Path:
+    return Path(os.fsdecode(re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), value)))
+
+
+def linux_mounts() -> tuple[LinuxMount, ...]:
+    mounts: list[LinuxMount] = []
     for line in Path("/proc/self/mountinfo").read_bytes().splitlines():
         fields = line.split()
         if len(fields) < 10 or b"-" not in fields[6:]:
             raise ValueError("invalid Linux mount table entry")
-        decoded = re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), fields[4])
-        points.append(Path(os.fsdecode(decoded)))
-    return tuple(points)
+        root, point = map(_decode_mount_path, fields[3:5])
+        if not root.is_absolute() or not point.is_absolute():
+            raise ValueError("invalid Linux mount path")
+        mounts.append(LinuxMount(int(fields[0]), fields[2], root, point))
+    return tuple(mounts)
+
+
+def _linux_mount_points() -> tuple[Path, ...]:
+    return tuple(mount.point for mount in linux_mounts())
 
 
 def may_remove_build_path(path: Path) -> bool:
@@ -1470,7 +1526,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 new_folder = False
                 try:
                     if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind not in ("copy", "slot") and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind not in ("copy", "slot")):
+                                      wait=spec.kind not in ("copy", "slot") and not isinstance(original, UniqueBuildFolder)):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -1628,19 +1684,23 @@ def _empty_editable_destination(path: Path, parent: int, expected: os.stat_resul
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        _remove_folder(path, directory, allocated)
+        remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
-                   preserve_recovery: bool = False) -> None:
+def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None, *,
+                  preserve_recovery: bool = False) -> None:
+    """Remove an owned folder and repair permissions when removal needs it."""
+    removal_path = path if directory is None else Path(path.name)
+    name = os.fspath(removal_path)
+
     def repair(function: object, name: str, error: BaseException) -> None:
         if not isinstance(error, PermissionError):
             raise error
         entry = Path(name)
         for candidate in (entry.parent, entry):
-            if not candidate.is_relative_to(path.name):
+            if not candidate.is_relative_to(removal_path):
                 continue
             inode = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
             if inode.st_uid == os.geteuid() and not stat.S_ISLNK(inode.st_mode):
@@ -1651,33 +1711,34 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
             _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
     try:
-        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if os.path.samestat(current, allocated):
-        if not may_remove_build_path(path):
-            raise PermissionError(f"{path}: retain the protected build folder")
-        if not preserve_recovery:
-            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
-            return
-        marker = str(Path(path.name) / RECOVERY_MARKER)
-        retained_marker = recovery_marker_sidecar(path).name
-        try:
-            os.link(marker, retained_marker, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
-            return
-        # Keep the recovery link outside the tree until recursive removal succeeds.
-        try:
-            shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
-        except BaseException:
-            if _folder_exists(path, directory):
-                with suppress(FileExistsError):
-                    os.link(retained_marker, marker, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
-            raise
-        finally:
-            if not _folder_exists(path, directory):
-                os.unlink(retained_marker, dir_fd=directory)
+    if allocated is not None and not os.path.samestat(current, allocated):
+        return
+    if not may_remove_build_path(path):
+        raise PermissionError(f"{path}: retain the protected build folder")
+    if not preserve_recovery or directory is None:
+        shutil.rmtree(name, dir_fd=directory, onexc=repair)
+        return
+    marker = str(Path(path.name) / RECOVERY_MARKER)
+    retained_marker = recovery_marker_sidecar(path).name
+    try:
+        os.link(marker, retained_marker, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+        return
+    # Keep the recovery link outside the tree until recursive removal succeeds.
+    try:
+        shutil.rmtree(path.name, dir_fd=directory, onexc=repair)
+    except BaseException:
+        if _folder_exists(path, directory):
+            with suppress(FileExistsError):
+                os.link(retained_marker, marker, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+        raise
+    finally:
+        if not _folder_exists(path, directory):
+            os.unlink(retained_marker, dir_fd=directory)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -2006,36 +2067,51 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             _release_build_folder(path)
 
 
+class _FolderRemoval(Enum):
+    REMOVED = "removed the folder"
+    PROTECTED = "the folder is protected"
+    LOCK_HELD = "the folder lock is held"
+    LOCK_CHANGED = "the folder lock file changed"
+    CLEANUP_KEPT = "the cleanup kept the folder"
+    FOLDER_PRESENT = "the folder still exists after cleanup"
+
+
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
                         dir_fd: int | None = None, wait: bool = True) -> bool:
     """Run cleanup under the free folder's lock, then remove temporary metadata."""
+    return _remove_build_folder(path, cleanup, temporary=temporary, dir_fd=dir_fd,
+                                wait=wait) is _FolderRemoval.REMOVED
+
+
+def _remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
+                         dir_fd: int | None = None, wait: bool = True) -> _FolderRemoval:
     if not may_remove_build_path(path):
-        return False
+        return _FolderRemoval.PROTECTED
     with ExitStack() as parents:
         try:
             directory = dir_fd if dir_fd is not None else parents.enter_context(
                 build_folder_lock.folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
             # An absent parent has no folder or metadata to lock.
-            return cleanup() is not False
+            return _FolderRemoval.CLEANUP_KEPT if cleanup() is False else _FolderRemoval.REMOVED
         descriptor = build_folder_lock.open_lock(path, directory, create=True)
         try:
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return False
+                return _FolderRemoval.LOCK_HELD
             if not build_folder_lock.lock_current(path, directory, descriptor):
-                return False
+                return _FolderRemoval.LOCK_CHANGED
             try:
                 if cleanup() is False:
-                    return False
+                    return _FolderRemoval.CLEANUP_KEPT
             except FileNotFoundError:
                 if temporary and not _folder_exists(path, directory):
                     _unlink_metadata(path, directory)
                 raise
             if _folder_exists(path, directory):
-                return False
+                return _FolderRemoval.FOLDER_PRESENT
             if temporary:
                 _unlink_metadata(path, directory)
-            return True
+            return _FolderRemoval.REMOVED
         finally:
             os.close(descriptor)
 
@@ -2135,12 +2211,12 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
 
     def cleanup() -> bool:
         if not children:
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
             return True
         with ExitStack() as leases:
             if _hold_child_leases(path, leases, wait=False) is not None:
                 return False
-            _remove_folder(path, directory, allocated, preserve_recovery=True)
+            remove_folder(path, directory, allocated, preserve_recovery=True)
         return True
 
     try:
@@ -2167,7 +2243,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
                     return False
             except OSError:
                 return False
-            _remove_folder(path, directory, allocated)
+            remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
@@ -2343,6 +2419,19 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
 
 
 def main(argv: Sequence[str]) -> int:
+    # verify_helper.py runs main in its long-lived process. A lock kept past the call loses its
+    # owner when the helper reloads this module, and a later remove cannot take that lock.
+    # Thus each call releases the locks it took, as a process that exits does.
+    held = set(_locks.items())
+    try:
+        return _command(argv)
+    finally:
+        for descriptor, path in list(_locks.items()):
+            if (descriptor, path) not in held:
+                _release_build_folder(path, descriptor=descriptor)
+
+
+def _command(argv: Sequence[str]) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2441,7 +2530,11 @@ def main(argv: Sequence[str]) -> int:
                     shutil.rmtree(path)
                 except FileNotFoundError:
                     pass
-            return 0 if remove_build_folder(path, cleanup) else 1
+            removal = _remove_build_folder(path, cleanup)
+            if removal is not _FolderRemoval.REMOVED:
+                print(f"build folders: {path}: {removal.value}", file=sys.stderr)
+                return 1
+            return 0
         if command == "run-temp-path":
             from scripts.lib import unit_runs
 

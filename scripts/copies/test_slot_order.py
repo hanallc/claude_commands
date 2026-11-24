@@ -24,7 +24,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import execution_identity
-from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
@@ -44,6 +44,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, staff, waiting
 from scripts.production.production_doc import Production
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -91,6 +92,16 @@ finally:
 """
 
 
+def memory_pressure_wait(reply: wire.Reply) -> bool:
+    """Accept only a wait caused by memory pressure, as the queue head or behind it."""
+    wait = reply.wait if isinstance(reply, wire.PlacementWait) else reply
+    if not isinstance(wait, wire.Wait):
+        return False
+    reason = wait.reason
+    cause = reason.cause if isinstance(reason, admission_records.HeadAdmissionStatus) else reason
+    return isinstance(cause, admission_records.MemoryPressure)
+
+
 class StartedStep(TypedDict):
     phase: int
     cwd: str
@@ -131,7 +142,7 @@ class SlotOrderTests(unittest.TestCase):
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
             "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
-            "HERDR_BIN": "/nonexistent/herdr", "BUILDLOG_RUN": ""})))
+            "HERDR_BIN": MISSING_HERDR_BIN, "BUILDLOG_RUN": ""})))
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -160,6 +171,9 @@ class SlotOrderTests(unittest.TestCase):
             self.replies.append(reply)
             if isinstance(reply, (wire.Wait, wire.PlacementWait)):
                 self.waiting.set()
+            if isinstance(reply, (wire.Wait, wire.PlacementWait, wire.LocalPlacementGranted)):
+                # Wake a file waiter that also ends when its process exits.
+                (self.root / "queue-wait").touch()
             return reply
 
         _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
@@ -272,7 +286,7 @@ class SlotOrderTests(unittest.TestCase):
         checkout = self.slot_root / "origin/slot-order/1"
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
         self.assertFalse((checkout / "target/debug/app").exists())
-        write_pressure_reading(self.queue.root / "pressure")
+        write_pressure_reading(self.queue.readings.pressure_path)
         self.queue.server.wake_loop()
         self.assertEqual(Path(self.next_step(process)["cwd"]), checkout)
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
@@ -350,7 +364,6 @@ class SlotOrderTests(unittest.TestCase):
         path = self.root / "bump.json"
         checkpoint_gate.save_record(path, record)
         self.queue.hold_starts()
-        write_pressure_reading(Path(environment["BUILDLOG_MEMORY_PRESSURE"]), full_avg10=99)
         with (mock.patch.dict(os.environ, {**environment, "MERGE_CHECKPOINT_VERIFY": str(CHECKOUT / "scripts/direct/verify.sh")}),
               mock.patch.object(bump_gate, "run_checkpoint_test_steps",
                   side_effect=AssertionError("the bump command started before admission")),
@@ -498,7 +511,7 @@ placement_once
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
         self.assertFalse(self.slot_root.exists())
         with self.queue.loop_turn():
-            write_pressure_reading(self.queue.root / "pressure")
+            write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
         self.assertTrue(select.select([ready_fd], [], [], TEST_HANG_GUARD_SECS)[0],
             "the copy run did not reach preparation")
@@ -627,15 +640,22 @@ placement_once
             gate_copy = Path(self.next_step(gate_process)["cwd"])
             self.assertEqual(gate_copy, self.slot_root / "verify/slot-order/1")
             self.queue.hold_starts()
-            self.waiting.clear()
+            first_reply = len(self.replies)
             step = self.start(("bash", verify, "check", "sample", "--local", "fixture"))
-            self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+            wait_until(lambda: step.poll() is not None or any(memory_pressure_wait(reply)
+                       or isinstance(reply, wire.LocalPlacementGranted) for reply in self.replies[first_reply:]),
+                       self.root, processes=(step,))
+            if not any(memory_pressure_wait(reply) for reply in self.replies[first_reply:]):
+                step.kill()
+                replies = ", ".join(type(reply).__name__ for reply in self.replies[first_reply:])
+                self.fail(f"verify did not wait for memory pressure; replies: {replies}; output: "
+                          + "".join(step.communicate(timeout=TEST_HANG_GUARD_SECS)))
             request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
-            self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_slots.lease_path(gate_copy)])
+            self.assertEqual(list(gate_copy.parent.glob("*.lease.json")), [build_folders.lease_path(gate_copy)])
             self.assertEqual(build_folders.build_folder_state(gate_copy), "held")
             with self.queue.loop_turn():
                 self.assertNotIn(request.episode, self.queue.caller_reservations())
-            write_pressure_reading(self.queue.root / "pressure")
+            write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
             cargo = wait_for_pid(started, processes=(step,))
             checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
@@ -963,7 +983,7 @@ placement_once
                 wait_for_callers(memory_waiters, 1)
                 env_folders = held_folders()
                 self.assertEqual(len(env_folders), 1, "the env wrapper needs its copy before its memory wait")
-                write_pressure_reading(self.queue.root / "pressure")
+                write_pressure_reading(self.queue.readings.pressure_path)
                 self.queue.server.wake_loop()
                 wait_until(lambda: any(first_waiters.iterdir()), first_waiters, processes=(env_caller,))
                 with self.subTest(wait="Cargo token"):
@@ -1008,7 +1028,7 @@ placement_once
                     capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 local_hold.unlink(missing_ok=True)
 
-            write_pressure_reading(self.queue.root / "pressure")
+            write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
             self.assertEqual(len(self.processes), caller_count)
             running = dict(next_running_step() for _ in range(caller_count))
@@ -1097,7 +1117,7 @@ placement_once
                                 "hold", "--repo", request.constraints.repository, "--tree", tree,
                                 "--step", "test", "--",
                             ])
-                            lease = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+                            lease = cast(dict[str, object], json.loads(build_folders.lease_path(checkout).read_text()))
                             self.assertEqual(lease["pid"], pid)
                             os.kill(pid, signal.SIGKILL)
                             self.assertTrue(select.select([launcher_exit], [], [], 30)[0])
@@ -1146,7 +1166,7 @@ placement_once
         self.assertEqual(build_folders.build_folder_state(snapshot.parent), "held")
         self.assertFalse(self.slot_root.exists())
 
-        write_pressure_reading(self.queue.root / "pressure")
+        write_pressure_reading(self.queue.readings.pressure_path)
         self.queue.server.wake_loop()
         cargo = wait_for_pid(started, processes=(process,))
         checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
@@ -1189,7 +1209,7 @@ placement_once
         checkout = self.slot_root / "verify/slot-order/1"
         self.assertEqual(Path(published[0]).read_text(), f"doc from {checkout}\n")
         self.assertEqual((checkout / asset).read_bytes(), Path(published[0]).read_bytes())
-        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_slots.lease_path(checkout)])
+        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_shell_wrapped_verify_doc_refuses_edits_outside_the_index(self) -> None:
@@ -1226,7 +1246,7 @@ placement_once
         self.assertEqual(copies.git(checkout, "show", ":src/lib.rs").decode(), applied)
         self.assertTrue((checkout / "target/ignored").is_file())
         self.assertEqual(sum(event["args"][:1] == ["doc"] for event in tools.cargo_events()), 1)
-        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_slots.lease_path(checkout)])
+        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
 
     def test_shell_wrapped_verify_doc_refuses_an_assume_unchanged_edit(self) -> None:
         tools = self.verify_source()
@@ -1543,7 +1563,10 @@ placement_once
                                    timeout=45, processes=(process,))
                         self.assertTrue(observed.exists(), process.communicate(timeout=5) if process.poll() is not None else "")
                     else:
-                        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
+                        wait_until(lambda: self.waiting.is_set() or process.poll() is not None, self.root,
+                                   processes=(process,))
+                        self.assertTrue(self.waiting.is_set(),
+                                        process.communicate(timeout=5) if process.poll() is not None else "")
                     request = next(request for request in self.requests[first_request:]
                                    if isinstance(request, wire.PlacementRequest))
                     snapshot = Path(request.constraints.repository)
@@ -1631,7 +1654,7 @@ placement_once
             with self.subTest(arguments=arguments):
                 request_file = tools.root / f"first-step-{number}.json"
                 episode, since = f"verify-first-{number}", time.time()
-                environment = {**tools.environment, "HERDR_BIN": "/nonexistent/herdr", "UNIT_RUN_DIR": "",
+                environment = {**tools.environment, "HERDR_BIN": MISSING_HERDR_BIN, "UNIT_RUN_DIR": "",
                     "UNIT_SESSION_DIR": "", "UNIT_DETACHED_RUN": "1", "BUILDLOG_FIRST_STEP_REQUEST": str(request_file),
                     "BUILDLOG_FIRST_STEP_PID": str(os.getpid()), "BUILDLOG_FIRST_STEP_EPISODE": episode,
                     "BUILDLOG_FIRST_STEP_SINCE": str(since), "ADMISSION_SOCKET": str(self.queue.socket_path)}

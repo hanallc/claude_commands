@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from scripts.agents.test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase, write_machine_config
 from scripts.agents import remote
+from scripts.accounts import role_map
+from scripts.production import staff
 
 
 class SshInvocation(TypedDict):
@@ -134,6 +136,13 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         self.assertIn('"$HOME/.claude/scripts/agents/shutdown.py"', command)
         self.assertIn("status claude2 --json", command)
         self.assertTrue(command.endswith('; printf "rc=%s\\n" $?'))
+
+        authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))
+        result = remote.run_remote(["status", "claude2", "--json", "--here"], stdin=authority.encode())
+        self.assertEqual(result, (status, output))
+        called = self.invocation()
+        self.assertTrue(called["arguments"][3].startswith("AGENTS_STATUS_STAFF_STDIN=1 "))
+        self.assertEqual(staff.decode_peer_status_authority(called["stdin"]), authority)
 
     def test_missing_remote_status_line_is_unreachable(self) -> None:
         _ = os.environ.pop("SHUTDOWN_TEST_REMOTE_STATUS", None)

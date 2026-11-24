@@ -34,7 +34,7 @@ from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue import admission_records as records, program_start, snapshot_codec, step_estimator
 from scripts.lint import memory_admit as gate
 
-from scripts.buildlog import store
+from scripts.buildlog import sample, store
 
 from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.build_queue.queue_fixture import write_memory_config
@@ -190,6 +190,12 @@ class HelperLifelineTests(unittest.TestCase):
             for stream in (owner.stdin, owner.stdout):
                 if stream is not None:
                     stream.close()
+
+
+def exported_step_scopes(pid: int) -> list[str]:
+    """Each BUILDLOG_STEP_SCOPE value in the environment of the live process pid."""
+    return [entry.removeprefix(gate.STEP_SCOPE_ENTRY).decode()
+            for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if entry.startswith(gate.STEP_SCOPE_ENTRY)]
 
 
 def private_slice_name() -> str:
@@ -394,6 +400,35 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_detached_module_scope_stays_in_builds_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            builds = Path(directory) / "builds.slice"
+            parent = "builds-detached-r1.slice"
+            step = builds / "builds-detached.slice" / parent / "run-step.scope"
+            step.mkdir(parents=True)
+            _ = (step / "memory.stat").write_text("anon 4096\nfile 16384\n")
+            _ = (builds / "memory.stat").write_text("anon 12288\nfile 32768\n")
+            read = Path.read_text
+
+            def read_membership(path: Path) -> str:
+                if path == Path("/proc/self/cgroup"):
+                    return f"0::/{step.relative_to(builds.parent)}\n"
+                return read(path)
+
+            with (mock.patch.dict(os.environ, {"DETACHED_RUN_SLICE": parent, "BUILDLOG_SCOPE": "1"}),
+                  mock.patch.object(Path, "read_text", autospec=True, side_effect=read_membership),
+                  mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(["true"], 0)) as probe):
+                self.assertTrue(queue.in_builds_slice())
+                prefix = queue.suite_scope_prefix()
+                self.assertIn(f"--slice={parent}", prefix)
+                self.assertIn("--scope", prefix)
+                self.assertEqual(probe.call_args.args[0], [*prefix, "true"])
+
+            step_anon = sample.anon_bytes(step)
+            assert isinstance(step_anon, int)
+            self.assertEqual(step_anon, 4096)
+            self.assertEqual(sample.anon_bytes(builds), 8192 + step_anon)
+
     def test_fixture_removes_child_folders_after_exit_term_int_and_kill(self) -> None:
         source = """
 from pathlib import Path
@@ -478,7 +513,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 assert "queue_waiter" in row
                 waiter = row["queue_waiter"]
                 self.assertEqual(waiter.get("unit"), "queue-unit")
-                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "")["session_id"])
+                self.assertEqual(waiter.get("session_id"), records.waiter_identity("", "", records.request_owner(""))["session_id"])
 
     def analyzer(self, fixture: QueuePlaceFixture, source: str) -> Path:
         executable = fixture.root / "rust-analyzer"
@@ -553,6 +588,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(child.stdout.readline(), b"ready\n")
                     scope = Path(place.sidecar.read_text().strip())
                     self.assertIn(child.pid, gate.scope_members(scope))
+                    # No reservation pays for the editor scope, so the editor does not name it to its cargo calls.
+                    self.assertNotIn(str(scope), exported_step_scopes(child.pid))
                     self.assertFalse(fixture.admission.server.reservations)
                     place.observe(2 * GIB, 2 * GIB)
                     self.assertEqual(place.peak_bytes, 2 * GIB)
@@ -1957,6 +1994,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     directory = Path(Path(row["sidecar"]).read_text().strip())
                     self.assertTrue(directory.is_relative_to("/sys/fs/cgroup"))
                     self.assertIn(fixture.private_slice, directory.parts)
+                    # The program names its own scope, in the form the cargo wrapper compares with its cgroup.
+                    cgroup = next(line[3:] for line in Path(f"/proc/{child.pid}/cgroup").read_text().splitlines()
+                                  if line.startswith("0::"))
+                    named = exported_step_scopes(child.pid)
+                    self.assertEqual(named, [f"/sys/fs/cgroup{cgroup}"])
+                    self.assertEqual(Path(named[0]), directory)
                     self.assertIsInstance(gate.reservation_lifetime(row, True), gate.PopulatedStepScope)
                     self.assertEqual(int(place.path.with_suffix(".max").read_text()), 3 * GIB)
                     self.assertIsNone(child.poll())
@@ -1987,6 +2030,15 @@ class HeldReservationTests(unittest.TestCase):
                 except RuntimeError:
                     self.assertTrue(failure)
                 release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing)
+
+    def test_release_runs_when_the_wait_message_fails(self) -> None:
+        with (mock.patch.object(client, "admit", return_value=self.grant),
+              mock.patch.object(client.WaitOutput, "finished", side_effect=BrokenPipeError("closed pipe")),
+              mock.patch.object(client, "release", return_value=wire.Ok()) as release,
+              self.assertRaisesRegex(BrokenPipeError, "closed pipe")):
+            with queue.held_reservation(self.step_request()):
+                self.fail("the holder ran after the wait message failed")
+        release.assert_called_once_with("reservation-1", 1, self.grant.cleanup_timing)
 
     def test_refusal_and_queue_exit_raise_before_any_release(self) -> None:
         replies: tuple[tuple[wire.Refused | client.LeftQueue, str], ...] = (
