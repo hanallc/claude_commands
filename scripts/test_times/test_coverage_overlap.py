@@ -253,6 +253,16 @@ class CoverageOverlapTests(unittest.TestCase):
             report = cast("CoverageReport", json.loads(output.read_text(encoding="utf-8")))
             return FixtureCoverage(report, result.stdout)
 
+    def assert_slower_candidate(self, first: CoverageRow, second: CoverageRow) -> None:
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertGreater(first["seconds"], 0.0, first["id"])
+        self.assertGreater(second["seconds"], 0.0, second["id"])
+        candidate, kept = sorted((first, second), key=lambda row: (-row["seconds"], row["id"]))
+        self.assertTrue(candidate["candidate"], candidate["id"])
+        self.assertEqual(candidate["covered_by"], [kept["id"]])
+        self.assertFalse(kept["candidate"], kept["id"])
+        self.assertEqual(kept["covered_by"], [])
+
     def test_module_import_failure_reports_one_line_without_running_tests(self) -> None:
         with self.fixture_command({
             "scripts/fixture/test_broken.py": 'raise RuntimeError("fixture import refused")\n',
@@ -319,11 +329,8 @@ class Equal(unittest.TestCase):
 '''})
         fast = fixture.row("test_fast")
         slow = fixture.row("test_slow")
-        self.assertGreater(slow["seconds"], fast["seconds"])
-        self.assertTrue(slow["candidate"])
-        self.assertEqual(slow["covered_by"], [fast["id"]])
-        self.assertFalse(fast["candidate"])
         self.assertEqual((fast["line_count"], slow["line_count"]), (1, 1))
+        self.assert_slower_candidate(fast, slow)
 
     def test_kept_tests_can_cover_a_candidate_together(self) -> None:
         fixture = self.run_fixture({"scripts/fixture/test_union.py": PRELUDE + '''
@@ -444,10 +451,7 @@ class Git(unittest.TestCase):
         self.assertEqual(git["child"], "none")
         self.assertEqual(parent["child"], "none")
         self.assertEqual((git["line_count"], parent["line_count"]), (1, 1))
-        slower, faster = sorted((git, parent), key=lambda row: (-row["seconds"], row["id"]))
-        self.assertTrue(slower["candidate"])
-        self.assertEqual(slower["covered_by"], [faster["id"]])
-        self.assertFalse(faster["candidate"])
+        self.assert_slower_candidate(git, parent)
 
     def test_known_git_and_parent_coverage_selects_the_slower_test_in_both_orders(self) -> None:
         lines = frozenset({("scripts/fixture/product.py", 2)})
@@ -786,15 +790,13 @@ class Repeat(unittest.TestCase):
         self.assertEqual(right(), "right")
 ''',
                 })
-                kept = fixture.row("test_b_known")
+                known = fixture.row("test_b_known")
                 repeat = fixture.row("test_c_repeat")
-                for row in (kept, repeat):
+                for row in (known, repeat):
                     self.assertEqual(row["status"], "pass")
                     self.assertEqual(row["child"], "none")
                     self.assertEqual(row["line_count"], 1)
-                self.assertFalse(kept["candidate"])
-                self.assertTrue(repeat["candidate"])
-                self.assertEqual(repeat["covered_by"], [kept["id"]])
+                self.assert_slower_candidate(known, repeat)
                 owner = fixture.row("test_a_origin")
                 self.assertIn("python children,", owner["child"])
                 self.assertNotIn("child outlived its test", owner["child"])
@@ -832,10 +834,7 @@ class After(unittest.TestCase):
         clock = fixture.row("test_b_clock")
         self.assertEqual(clock["child"], "unknown: 1 python children, 0 reported")
         self.assertFalse(clock["candidate"])
-        slower, faster = sorted((before, after), key=lambda row: (-row["seconds"], row["id"]))
-        self.assertTrue(slower["candidate"])
-        self.assertEqual(slower["covered_by"], [faster["id"]])
-        self.assertFalse(faster["candidate"])
+        self.assert_slower_candidate(before, after)
 
     def test_live_unreported_child_marks_only_overlapping_modules_unknown(self) -> None:
         fixture = self.run_fixture({
@@ -1311,9 +1310,8 @@ class Filter(unittest.TestCase):
         })
         plain = fixture.row("test_a_plain")
         filtered = fixture.row("test_z_filtered")
-        self.assertTrue(filtered["candidate"])
-        self.assertEqual(filtered["line_count"], 1)
-        self.assertEqual(filtered["covered_by"], [plain["id"]])
+        self.assertEqual((plain["line_count"], filtered["line_count"]), (1, 1))
+        self.assert_slower_candidate(plain, filtered)
 
     def test_named_modules_share_one_coverage_run(self) -> None:
         fixture = self.run_fixture({
@@ -1331,9 +1329,8 @@ class Second(unittest.TestCase):
         })
         first = fixture.row("test_first")
         second = fixture.row("test_second")
-        self.assertTrue(second["candidate"])
-        self.assertEqual(second["covered_by"], [first["id"]])
-        self.assertFalse(first["candidate"])
+        self.assertEqual((first["line_count"], second["line_count"]), (1, 1))
+        self.assert_slower_candidate(first, second)
 
     @unittest.skipUnless(hasattr(os, "fork"), "The fixture needs os.fork")
     def test_fork_marks_coverage_unknown(self) -> None:
