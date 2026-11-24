@@ -2543,34 +2543,38 @@ class _GoalArguments(argparse.Namespace):
     keeper: staff.StaffId | None = None
 
 
-def _change_goal(args: _GoalArguments, producer: staff.StaffId, *, keeper: staff.StaffId | None = None) -> str:
+def _set_goal(producer: staff.StaffId, identity: str, *, keeper: staff.StaffId) -> str:
+    with _store(keeper).locked(), goal.locked(producer):
+        saved = goal.load(producer)
+        item = load(keeper, identity)
+        if item.producer != producer:
+            raise ListError(f"{item.id} is assigned to another producer.")
+        if saved is goal.NoGoal.UNSET or (saved["keeper"], saved["item"]) != (keeper, item.id):
+            saved = goal.GoalRecord(keeper=keeper, item=item.id, blocked="", faster="", noted_at="")
+        goal.write_goal(producer, saved)
+        return goal.save(producer, saved, _goal_status(item))
+
+
+def _refresh_goal(producer: staff.StaffId, *, note: tuple[str, str] | None = None) -> str:
     with goal.locked(producer):
         saved = goal.load(producer)
-        if args.action == "set":
-            assert keeper is not None
-            item = load(keeper, args.item)
-            if item.producer != producer:
-                raise ListError(f"{item.id} is assigned to another producer.")
-            if saved is goal.NoGoal.UNSET or (saved["keeper"], saved["item"]) != (keeper, item.id):
-                saved = goal.GoalRecord(keeper=keeper, item=item.id, blocked="", faster="", noted_at="")
-        elif saved is goal.NoGoal.UNSET:
-            if args.action == "note":
+        if saved is goal.NoGoal.UNSET:
+            if note is not None:
                 raise ListError(saved.value)
             goal.clear_card(producer)
             return saved.value
-        else:
-            item = load(saved["keeper"], saved["item"])
-            if item.producer != producer:
-                if args.action == "note":
-                    raise ListError(f"{item.id} is assigned to another producer.")
-                return goal.save(producer, saved, goal.ItemAvailability.UNAVAILABLE)
-        if args.action == "note":
-            _line(args.blocked, "Blocked by")
-            _line(args.faster, "Faster if")
-            saved["blocked"] = args.blocked.strip()
-            saved["faster"] = args.faster.strip()
+        item = load(saved["keeper"], saved["item"])
+        if item.producer != producer:
+            if note is not None:
+                raise ListError(f"{item.id} is assigned to another producer.")
+            return goal.save(producer, saved, goal.ItemAvailability.UNAVAILABLE)
+        if note is not None:
+            blocked, faster = note
+            _line(blocked, "Blocked by")
+            _line(faster, "Faster if")
+            saved["blocked"] = blocked.strip()
+            saved["faster"] = faster.strip()
             saved["noted_at"] = now().isoformat(timespec="seconds")
-        if args.action != "card":
             goal.write_goal(producer, saved)
         return goal.save(producer, saved, _goal_status(item))
 
@@ -2595,10 +2599,11 @@ def goal_main(argv: list[str] | None = None) -> int:
         if args.action == "set":
             keeper = _record_keeper(_active_morty(members), producer.id, args.item, args.keeper,
                                     policy=_KeeperRouting.CALLER_FIRST)
-            with _store(keeper).locked():
-                card = _change_goal(args, producer.id, keeper=keeper)
+            card = _set_goal(producer.id, args.item, keeper=keeper)
+        elif args.action == "note":
+            card = _refresh_goal(producer.id, note=(args.blocked, args.faster))
         else:
-            card = _change_goal(args, producer.id)
+            card = _refresh_goal(producer.id)
         print(card)
     except (OSError, ValueError, staff.StaffRefused) as error:
         print(f"goal: {error}", file=sys.stderr)

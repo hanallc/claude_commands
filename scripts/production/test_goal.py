@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from datetime import UTC, date, datetime
@@ -14,6 +13,7 @@ from unittest.mock import patch
 
 from scripts.production import goal, record_store, staff, the_list
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
+from scripts.production.test_the_list import copy_list_item
 
 
 @final
@@ -34,11 +34,6 @@ class GoalTests(StaffTestCase):
     def add(self, title: str, producer: staff.StaffId) -> the_list.ListItem:
         return the_list.add(self.keeper.id, title, owner=the_list.UnassignedOwner.NATE, source="nate",
                             changes={"producer": producer})
-
-    def copy_to_keeper(self, item: the_list.ListItem, keeper: staff.StaffId) -> None:
-        folder = the_list.folder(keeper)
-        folder.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(the_list.folder(self.keeper.id) / f"{item.id}.md", folder / f"{item.id}.md")
 
     def run_goal(self, *args: str, caller: staff.StaffRow | None = None) -> tuple[int, str, str]:
         stdout, stderr = StringIO(), StringIO()
@@ -106,7 +101,7 @@ class GoalTests(StaffTestCase):
 
     def test_goal_defaults_to_the_callers_store_and_refreshes_for_that_keeper(self) -> None:
         item = self.add("Morty's copy", self.producer.id)
-        self.copy_to_keeper(item, self.producer.id)
+        copy_list_item(item.id, source_keeper=self.keeper.id, destination_keeper=self.producer.id)
         _ = the_list.update(self.producer.id, item.id, {"title": "Producer's copy"}, source=self.producer.name)
 
         with staff.supplied_snapshot(staff.StaffSnapshot((self.producer,))):
@@ -128,9 +123,9 @@ class GoalTests(StaffTestCase):
         legacy = fixture_member("producer", name="legacy-keeper")
         item = self.add("Morty's copy", self.producer.id)
         other = self.add("Another producer's item", legacy.id)
-        self.copy_to_keeper(item, legacy.id)
-        self.copy_to_keeper(other, legacy.id)
-        self.copy_to_keeper(item, self.producer.id)
+        copy_list_item(item.id, source_keeper=self.keeper.id, destination_keeper=legacy.id)
+        copy_list_item(other.id, source_keeper=self.keeper.id, destination_keeper=legacy.id)
+        copy_list_item(item.id, source_keeper=self.keeper.id, destination_keeper=self.producer.id)
         _ = the_list.update(legacy.id, item.id, {"title": "Legacy copy"}, source="morty")
 
         self.assertEqual(self.run_goal("set", other.id, "--keeper", legacy.id),
