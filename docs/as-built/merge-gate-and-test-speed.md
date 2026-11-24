@@ -65,7 +65,8 @@ The nightly gate asks after it prepares the fetched checkout.
 The gate keeps merge writes, validation, push, promotion and nightly publication on natedev.
 The natedev handoff keeps its memory reservation until the suites end.
 The suites publish progress to the sidecar from the granted request.
-A `--module` run uses natedev. A nested run keeps its parent reservation.
+A `--module` run can use natedev or `mac-linux`.
+A nested named run keeps its parent reservation on natedev by default.
 `--promote-only` runs on natedev.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
@@ -468,16 +469,18 @@ This record changes no selection and refuses no run.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
 Use one `--module <suite>/<module>` for each module with `--tests-only` or `--affected`.
 Use the module names that the gate prints.
-A standalone named run waits for the build hold to clear and takes one local admission reservation.
-The named run of the unit in `max_runs.exempt_unit` does not wait for the build hold.
-A named run uses the reservation of a live ancestor when they share the admission queue or CPU pool.
+A standalone named run on natedev waits for the build hold to clear and takes one local admission reservation.
+A named run on natedev uses the build hold exemption for the unit in `max_runs.exempt_unit`.
+A named run on natedev uses a live ancestor's reservation when they share the admission queue or CPU pool.
 It reads the reservation from the state folder in the grant and checks that release has not started.
 The child runs one module at a time and takes no additional CPU slot.
 The Builds page shows the run while it holds the reservation.
 The reservation counts as one run under `max_runs.natedev.claude_commands`.
 Modules share the CPU slots and use the memory governor.
 A failed module can run once more alone.
-The named run has no time limit and creates no gate record or passed-tree entry.
+A named run on natedev has no time limit.
+On `mac-linux`, `run.time_limit_seconds` limits each module and the full run.
+Named runs create no gate record or passed-tree entry.
 The merge checkpoint uses this form to verify a failed module on its base. See [showrunner automation](showrunner-automation.md).
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.

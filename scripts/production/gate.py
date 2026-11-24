@@ -3177,7 +3177,9 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
-                            help="stop a module after this many seconds (default: 1800). Runs with --module have no time limit.")
+                            help="stop a module after this many seconds (default: 1800). "
+                                 + "Named modules on natedev have no time limit. "
+                                 + "Named modules on mac-linux use run.time_limit_seconds.")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
                             help="run only this suite/module with shared admission or the parent's reservation")
@@ -3418,11 +3420,11 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return run_local(type_dirs)
         return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
 
-    def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
+    def run_guest(assignment: placement.PlacementAssignment, limit: float,
+                  selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
         local_types = nightly_types and bool(type_dirs) and not guest_has_type_tools(guest)
-        outcome = guest.route(repo, mode=mode, full=full,
-                              module_time_limit_s=sys.float_info.max if named else module_time_limit_s,
+        outcome = guest.route(repo, mode=mode, full=full, module_time_limit_s=limit,
                               selected=selection, gate_job=gate_job, type_dirs=() if local_types else type_dirs,
                               assignment=assignment)
         if isinstance(outcome, str):
@@ -3479,12 +3481,22 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         case MacLinuxAssignment(assignment=guest_assignment):
             key = "enabled.mac-linux"
             try:
-                enabled = conf.read("build_targets").value(key, conf.on_off, default=False, recover_invalid=False)
+                registry = conf.read("build_targets")
+                enabled = registry.value(key, conf.on_off, default=False, recover_invalid=False)
             except conf.Unusable as error:
                 raise MacLinuxGateRefused(f"Mac Linux guest gate cannot read build_targets.conf {key}: {error}") from error
             if not enabled:
                 raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
-            run_selected = partial(run_guest, guest_assignment)
+            limit = module_time_limit_s
+            if named:
+                from scripts.mac_test.eligibility import mac_linux_target
+
+                try:
+                    settings = conf.read(mac_linux_target(registry).settings)
+                    limit = settings.value("run.time_limit_seconds", int, recover_invalid=False)
+                except conf.Unusable as error:
+                    raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {error}") from error
+            run_selected = partial(run_guest, guest_assignment, limit)
         case "aws":
             if type_dirs:
                 raise GateRefused("The AWS gate route does not support type checks")
