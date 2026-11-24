@@ -23,7 +23,6 @@ SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "t
 class QueueKind(Enum):
     """A fixed name for queue work without a verify or script name."""
 
-    MERGE_GATE = "merge gate"
     CI = "hana CI"
     COMPILER_CACHE = "compiler cache"
     MAC = "Mac builds"
