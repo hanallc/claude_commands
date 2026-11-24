@@ -2141,7 +2141,8 @@ function bindFeedbackForm(form){
    };
    const post=async()=>{
     const options={method:'POST',body:data,signal:parks ? listRequestSignal() : undefined};
-    const response=await (usesWords ? heldFetch(location.pathname,options,current.dataset.sendReceiver)
+    const receiver=action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
+    const response=await (usesWords ? heldFetch(location.pathname,options,receiver)
                                    : fetch(location.pathname,options));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     if(!parks) saved=response.ok;

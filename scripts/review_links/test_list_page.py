@@ -7072,6 +7072,32 @@ window.fetch=async(_url,options)=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_tell_undo_toast_names_the_signed_producer(self) -> None:
+        item = self.add("Check the assigned item", number=1)
+        _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        self.browser_action_sequence(r"""
+ const listFetch=window.fetch;
+ window.fetch=(path,options={})=>{
+  if(options.method==='POST' && new Headers(options.headers).get('X-Undo-Hold')==='1'){
+   requests.push(new URLSearchParams(options.body));
+   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return listFetch(path,options);
+ };
+ const toast=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   const text=document.querySelector('[data-send-undo] span');
+   if(text){observer.disconnect();resolve(text.textContent);}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ const words=form.elements.words;
+ words.value='Check the result.';words.dispatchEvent(new Event('input'));
+ submit('tell');
+ check(await toast==='Sent to dwight.','The Undo toast names the signed producer.');
+""", add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
         steps = r'''
  const view=document.querySelector('[data-record-inline-view]');
@@ -8707,6 +8733,11 @@ window.fetch=async(_path,options={})=>{
  const template=document.createElement('template');
  template.innerHTML=saved.detail_html;
  const signed=template.content.querySelector('[data-feedback-form]').elements;
+ const listFetch=window.fetch,holds=[];
+ window.fetch=(path,options={})=>{
+  if(options.method==='POST') holds.push(new Headers(options.headers).get('X-Undo-Hold'));
+  return listFetch(path,options);
+ };
  check(form.querySelector('[value="tell"]').textContent==='Tell morty',
   'The original form names morty.');
  submit('read');finishPost(saved);await flush();
@@ -8719,6 +8750,8 @@ window.fetch=async(_path,options={})=>{
   'The text box names dwight.');
  words.value='Check this result.';words.dispatchEvent(new Event('input'));
  const tell=submit('tell',current);
+ check(holds.length===2 && holds[0]===null && holds[1]==='1',
+  'Tell requests a hold. Mark read sends immediately.');
  check(tell.id===signed.request.value && tell.id.endsWith('~'+RECIPIENT_ID) && tell.token===signed.token.value,
   'Tell uses the request and token for dwight.');
  finishPost({unread:'false'});await flush();

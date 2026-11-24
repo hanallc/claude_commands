@@ -2526,7 +2526,7 @@ A send waits a short time before it leaves, so the user can undo it, as in an em
 These sends wait:
 
 1. Review items: each answer except Later and Validate.
-2. The List: Tell and Ask.
+2. The List uses the hold for **Tell** and **Ask question**. **Mark read** runs immediately.
 3. Images: Approved, Send Feedback and Ask question.
 4. The New item dialog on each console page.
 5. The change browser: each answer except Skip.
@@ -2542,6 +2542,7 @@ The toast says `Sent to <name>.` and shows an **Undo** button and a bar.
 If the page has no receiver name, the toast says "Sending."
 For an action that saves without a message, the toast says "Saved."
 The toast uses the recipient name shown when the user presses **Send**.
+For **Tell**, the toast uses the signed producer.
 If a draft can recover an earlier filing, the toast says "Sending."
 The toast appears at the bottom right of the top window.
 It sits 24 px from the bottom and right edges. At phone widths, the right gutter is 16 px.
