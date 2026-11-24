@@ -322,13 +322,6 @@ ENTRIES = (
         (PushExample("typical", {"version": "1.100.0", "pin": "1.99.0"}),
          PushExample("long_versions", {"version": "100.100.100", "pin": "99.99.99"})),
         purpose="A new Rust compiler breaks the build repair tool. Upgrade or wait."),
-    PushText("codex.reset_ready", "codex-winddown", "decision", "Codex is ready for your reset",
-        ActionTemplate("At chatgpt.com/codex/settings/usage, redeem your limit reset."),
-        "All Codex coding agents on {machine}, your computer, have stopped. Redeeming your usage reset now will not interrupt any work. "
-        + "New Codex work stays paused until you give the all clear: in a Claude session on {machine}, run /codex_winddown clear.",
-        (PushExample("typical", {"machine": "natedev"}),
-         PushExample("long_machine", {"machine": "macbook-workstation"})),
-        purpose="All Codex agents stopped. You can redeem your usage reset now."),
     PushText("sweep.disk_floor", "disk_floor", "decision", "{machine} disk is low; {machine} tests can fail",
         ActionTemplate("{folder_action}"),
         "{machine} has {free} free, below the {floor} alert line, so {machine} test builds can fail. {recommendation}",

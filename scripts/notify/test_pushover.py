@@ -37,6 +37,13 @@ PARENT = "python test_pushover.py"
 from scripts.notify.push_test_support import registered_send
 
 
+KEPT_NOTE = push_texts.PushText(
+    "fixture.admitted", PARENT, "note", "{title}", push_texts.NoActionNeeded(), "{body}",
+    (push_texts.PushExample("fixture", {"title": "Build done", "body": "The build passed."}),),
+    purpose="Test kept notes.",
+)
+
+
 def footed(message: str, sender: str = PARENT, template: str = "fixture.admitted") -> str:
     return with_footer(message, sender, template)
 
@@ -721,7 +728,8 @@ class PushoverTests(unittest.TestCase):
             posted.append(urllib.parse.parse_qs(data.decode())["message"][0])
             return 200, b'{"status":1}'
 
-        with redirect_stdout(io.StringIO()):
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              redirect_stdout(io.StringIO())):
             self.assertEqual(silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post)), 0)
         self.assertEqual(posted, [footed("No action needed.\nThe build passed.", "build-followups", "test.kept")])
 
@@ -1276,7 +1284,8 @@ class PushoverTests(unittest.TestCase):
             posted.append(urllib.parse.parse_qs(data.decode()))
             return 200, b'{"status":1}'
 
-        with redirect_stdout(io.StringIO()) as output:
+        with (mock.patch.object(push_texts, "catalog", return_value=(*push_texts.catalog(), KEPT_NOTE)),
+              redirect_stdout(io.StringIO()) as output):
             code = silence.off(lambda _argv: 0, lambda push: pushover.post_kept(push, self.keys, post))
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue(), "pushover: sent\n" * 2 + "silence off; 2 kept pushes delivered\n")
@@ -1304,7 +1313,8 @@ class PushoverTests(unittest.TestCase):
             posted.append(urllib.parse.parse_qs(data.decode())["title"][0])
             return 200, b'{"status":1}'
 
-        with redirect_stdout(io.StringIO()):
+        with (mock.patch.object(push_texts, "catalog", return_value=(*push_texts.catalog(), KEPT_NOTE)),
+              redirect_stdout(io.StringIO())):
             self.assertEqual(silence.off(lambda _argv: 0,
                 lambda push: pushover.post_kept(push, self.keys, post)), 0)
         self.assertEqual(posted, ["Build done"])
@@ -1312,6 +1322,23 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual([line["outcome"] for line in self.log_lines()
                           if line["source"] == "send-repeat-guard"],
                          ["dropped: retired template message.repeat_flood"])
+
+    def test_silence_release_drops_a_kept_codex_reset_push(self) -> None:
+        self.silence_on()
+        push: silence.KeptPush = {
+            "source": "codex", "priority": "0", "title": "Codex is ready for your reset",
+            "message": "Action: Redeem your reset.", "detail": "", "key": "reset",
+            "text_id": "codex.reset_ready",
+        }
+        self.assertIsInstance(silence.keep_here(push), silence.Kept)
+        post = mock.Mock(side_effect=AssertionError("Retired push posted"))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(silence.off(lambda _argv: 0,
+                lambda kept: pushover.post_kept(kept, self.keys, post)), 0)
+        post.assert_not_called()
+        self.assertEqual(silence.read_kept(), [])
+        self.assertIn("0 kept pushes delivered; 1 dropped", output.getvalue())
+        self.assertEqual(self.log_lines()[-1]["outcome"], f"dropped: retired template {push['text_id']}")
 
     def test_a_push_after_a_missed_end_posts_the_kept_pushes_first(self) -> None:
         self.silence_on()

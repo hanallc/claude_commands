@@ -108,18 +108,6 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
-  "codex.reset_ready": {
-    "long_machine": {
-      "reviewer": "opus",
-      "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
-      "time": "2026-10-14T04:26:14.156449-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
-      "time": "2026-10-14T04:25:55.369515-04:00"
-    }
-  },
   "decision.choices": {
     "hana": {
       "objections": [

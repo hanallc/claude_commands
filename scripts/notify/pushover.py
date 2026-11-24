@@ -601,25 +601,29 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
-    reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
-    if push["text_id"] in TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
-        reason = TOKEN_APPROVAL_REQUIRED
-    if reference["kind"] == "question":
-        try:
-            opening = push_reference.read_question(Path(reference["path"]))
-        except (OSError, ValueError) as error:
-            log(push["source"], push["priority"], push["title"], push["message"],
-                f"anomaly: question record {reference['path']}: {error}",
-                key=push["key"], template=push["text_id"], reference=reference)
-        else:
-            if opening.status == "closed":
-                reason = "question closed"
-            elif opening.since != reference["since"]:
-                reason = "question reopened"
-    elif reference["kind"] == "review_watch":
-        from scripts.production import review_regime
-        if review_regime.acknowledged():
-            reason = "report acknowledged"
+    text_id = push["text_id"]
+    reason = ""
+    if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
+        reason = f"retired template {text_id}"
+    else:
+        if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
+            reason = TOKEN_APPROVAL_REQUIRED
+        if reference["kind"] == "question":
+            try:
+                opening = push_reference.read_question(Path(reference["path"]))
+            except (OSError, ValueError) as error:
+                log(push["source"], push["priority"], push["title"], push["message"],
+                    f"anomaly: question record {reference['path']}: {error}",
+                    key=push["key"], template=push["text_id"], reference=reference)
+            else:
+                if opening.status == "closed":
+                    reason = "question closed"
+                elif opening.since != reference["since"]:
+                    reason = "question reopened"
+        elif reference["kind"] == "review_watch":
+            from scripts.production import review_regime
+            if review_regime.acknowledged():
+                reason = "report acknowledged"
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
