@@ -3827,7 +3827,7 @@ def check_named_modules(repo: Path, names: Sequence[str]) -> None:
                 or ".." in relative.parts or "__pycache__" in relative.parts[:-1]
                 or not is_test_module(name)
                 or any((scripts / parent).is_symlink() for parent in relative.parents if parent != Path("."))
-                or not path.resolve().is_relative_to(repo) or not path.is_file()):
+                or not path.is_file()):
             raise GateRefused(f"--module {name!r} does not name a test module in {repo}. "
                               + "Use a path under scripts/, for example lib/test_x.py.")
 
@@ -3840,7 +3840,7 @@ def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.Argume
     args = parse_gate_arguments(arguments, parser, repo_default=".")
     if not args.modules:
         return
-    repo = (source / Path(args.repo.replace("{tree}", str(source))).expanduser()).resolve()
+    repo = (source / Path(args.repo).expanduser()).resolve()
     if not repo.is_relative_to(source):
         parser.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
     try:

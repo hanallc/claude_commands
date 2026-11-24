@@ -374,6 +374,36 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--targets", "natedev", "--", *command]), 0)
             admit.assert_called_once_with([*command[:-1], str(source)], source, targets=("natedev",))
 
+    def test_gate_step_expands_the_checkout_path_once(self) -> None:
+        with TemporaryDirectory() as folder:
+            source = Path(folder).resolve() / "{tree}"
+            script = "scripts/production/gate.py"
+            module = "fixture/test_ok.py"
+            test = source / "scripts" / module
+            test.parent.mkdir(parents=True)
+            test.touch()
+            package = source / "scripts/__init__.py"
+            _ = package.write_text(f"__path__.append({str(REPOSITORY / 'scripts')!r})\n")
+            (source / script).parent.mkdir()
+            _ = (source / script).write_bytes((REPOSITORY / script).read_bytes())
+            command = [sys.executable, "-B", script, "--affected", "--module", module, "--repo"]
+            expanded = [*command, str(source)]
+            grant = placed("natedev")
+            admitted = inherited_admission(grant)
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit,
+                  mock.patch.object(copies, "run_prepared_gate",
+                                    return_value=subprocess.CompletedProcess(expanded, 0)) as launch):
+                result = copies.main(["gate-step", "--repo", str(source), "--targets", "natedev",
+                                      "--", *command, "{tree}"])
+            self.assertEqual(result, 0)
+            admit.assert_called_once_with(expanded, source, targets=("natedev",))
+            launch.assert_called_once_with(expanded, cwd=source, descriptors=(), environment={
+                "BUILDLOG_PREPARED_COPY": str(source),
+                "BUILDLOG_PLACEMENT_FILE": str(admitted.assignment_file),
+                "BUILDLOG_PLACEMENT_EPISODE": grant.assignment.episode,
+            })
+
     def test_default_modes_enter_one_admission_for_the_whole_command(self) -> None:
         checkpoint = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
                       '--previous-checkpoint', 'base', '--unit', 'fixture', '--phase', '1']

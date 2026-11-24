@@ -1484,8 +1484,11 @@ class Parser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         parsed = super().parse_args(args, namespace)
         repo = getattr(parsed, "repo", ".")
-        if copy_run and repo != "{tree}" and Path(repo) != Path("."):
-            self.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
+        if copy_run:
+            if repo == "{tree}":
+                parsed.repo = "."
+            elif Path(repo) != Path("."):
+                self.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
         return parsed
 
 sys.path.insert(0, str(root))
@@ -1525,9 +1528,8 @@ def gate_command_source_check(command: Sequence[str], *,
                    for node in syntax.body):
             return
         mode = "run" if numbered_copy else "gate-step"
-        checked_arguments = arguments if numbered_copy else [part.replace("{tree}", str(source)) for part in arguments]
         result = subprocess.run(
-            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), mode, *checked_arguments],
+            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), mode, *arguments],
             cwd=source, capture_output=True, text=True,
         )
         if result.returncode == GATE_CHECK_HELP:
@@ -2803,9 +2805,10 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
 
     if command_program(command) not in GATE_SCRIPTS:
         raise CopyError("gate-step requires a gate command")
-    if check := gate_command_source_check(command):
+    expanded = [part.replace("{tree}", str(source)) for part in command]
+    if check := gate_command_source_check(expanded):
         check(source)
-        command = [part.replace("{tree}", str(source)) for part in command]
+        command = expanded
     targets = first_step.gate_targets(command, source, args.targets)
 
     def run() -> subprocess.CompletedProcess[str]:
