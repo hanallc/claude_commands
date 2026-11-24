@@ -4,7 +4,7 @@ from functools import partial
 
 from scripts.notify.gpu_xid import XID_MEANINGS
 from scripts.notify.push_texts import (ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate,
-                                       TemplateValues, decision_values)
+                                       TemplateValues, decision_values, display_values)
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -42,6 +42,18 @@ def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> Tem
         raise ValueError(f"missing values {missing}")
     displayed = {field: value for field, value in given.items() if field not in hidden}
     return TemplateValues(displayed, dict(given))
+
+
+def nightly_not_run_values(given: dict[str, str]) -> TemplateValues:
+    """Accept the legacy values that the installed timer sends."""
+    if given.keys() != {"branch", "time", "reason", "action"}:
+        return display_values(given)
+    from scripts.production.gate import nightly_next_run
+
+    action = given["action"]
+    if action == "None. The next nightly run tries again.":
+        action = ""
+    return TemplateValues({"reason": given["reason"], "action": action, "next_run": nightly_next_run()}, dict(given))
 
 
 def silence_auto_off_values(given: dict[str, str]) -> TemplateValues:
@@ -86,15 +98,15 @@ ENTRIES = (
             "failures": "AWS refused the us-east-2 price read.\nAWS refused the us-west-2 Standard quota read."})),
         purpose="AWS denied a regional read that the gate deployment can repair."),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
-        "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
-        + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
+        "Fix assigned to: {unit}.",
         (PushExample("tests_failed", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
             "types": "passed", "tests": "failed in production/test_staff.py", "received": "03:00 EST",
             "unit": "staff", "assigned": "03:05 EST"}),
          PushExample("types_failed", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
             "types": "failed with 3 errors, 0 warnings, 0 notes", "tests": "passed", "received": "03:00 EST",
             "unit": "types", "assigned": "03:05 EST"})),
-        purpose="sdlc assigned the failed nightly check to a unit director."),
+        purpose="sdlc assigned the failed nightly check to a unit director.", header=False,
+        expand_values=partial(hide_sender_values, hidden=("branch", "time", "types", "tests", "received", "assigned"))),
     PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
         "",
         (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
@@ -111,15 +123,16 @@ ENTRIES = (
                                        "types": "did not run", "tests": "did not finish"})),
         purpose="The nightly check finished. The title gives the result.",
         header=False, expand_values=nightly_result_values),
-    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}"),
-        "The nightly check of {branch} did not run at {time}.\nWhy: {reason}.",
-        (PushExample("fetch_failed", {"branch": "main", "time": "03:53 EST",
+    PushText("nightly.not_run", "nightly", "note", "Nightly check did not run", ActionTemplate("{action}", omit_when_empty=True),
+        "Why: {reason}.\nNext run: {next_run}.",
+        (PushExample("fetch_failed", {"next_run": "Tue 11-24 00:53 PST",
              "reason": "git fetch of main failed: ssh connection timed out",
-             "action": "None. The next nightly run tries again."}),
-         PushExample("cold_credentials", {"branch": "main", "time": "03:53 EST",
+             "action": ""}),
+         PushExample("cold_credentials", {"next_run": "Tue 11-24 00:53 PST",
              "reason": "GitHub credentials are cold",
              "action": "In a terminal on natedev, run github-warmup"})),
-        purpose="The nightly check did not run. It says why."),
+        purpose="The nightly check did not run. The push gives the reason and next run.",
+        expand_values=nightly_not_run_values),
     PushText("decision.choices", "{sender}", "decision", "{title}",
         ActionTemplate("On {machine}, reply in the {session} terminal: {choice_labels}."),
         "Situation: {situation}\n\nChoices:\n{choices}\n\n"

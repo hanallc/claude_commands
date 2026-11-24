@@ -189,6 +189,20 @@ class PushTextTests(unittest.TestCase):
                     # A one-line text posts no title; its line is the message.
                     self.assertLess(len(push.posted_title), 45)
 
+    def test_nightly_not_run_accepts_the_installed_timer_values(self) -> None:
+        from scripts.production import gate
+
+        for reason, action, expected_action in (
+                ("GitHub credentials are cold", "In a terminal on natedev, run github-warmup",
+                 "Action: In a terminal on natedev, run github-warmup\n"),
+                ("fetch failed", "None. The next nightly run tries again.", "")):
+            values = {"branch": "main", "time": "03:00 EST", "reason": reason, "action": action}
+            with (self.subTest(reason=reason), mock.patch.object(gate, "nightly_next_run", return_value="Wed 11-25 00:00 PST")):
+                rendered = push_texts.render("nightly.not_run", **values)
+            self.assertEqual(rendered.values, values)
+            self.assertEqual(rendered.posted_title, "Nightly check did not run")
+            self.assertEqual(rendered.message, f"{expected_action}Why: {reason}.\nNext run: Wed 11-25 00:00 PST.")
+
     def test_decision_argv_carries_the_question_record_path(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         push = push_texts.render_entry(entry, entry.examples[0].values)

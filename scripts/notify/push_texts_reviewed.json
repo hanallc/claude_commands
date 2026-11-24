@@ -226,42 +226,86 @@
   },
   "nightly.assigned": {
     "tests_failed": {
-      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
-      "sha256": "ddc96d9ad493780308322ed36edf62ae4d396e4a9b147a94e61a0a733c822b2d",
-      "time": "2026-11-11T13:40:09.429004-05:00"
+      "objections": [
+        {
+          "quote": "Fix assigned to: staff.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "staff",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Fix assigned to: staff.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Nightly check failed",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 10:33 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "50d9148731f23d31ac68e5ad573b89fcd34667ecd3705251041d782e8bba11ff",
+      "time": "2026-11-24T13:37:59.539005-05:00"
     },
     "types_failed": {
-      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
-      "sha256": "ddc96d9ad493780308322ed36edf62ae4d396e4a9b147a94e61a0a733c822b2d",
-      "time": "2026-11-11T13:40:09.429060-05:00"
+      "objections": [
+        {
+          "quote": "Fix assigned to: types.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "types",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Fix assigned to: types.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 10:33 PST Nov 24; reviewer: claude-opus-5-5",
+      "sha256": "50d9148731f23d31ac68e5ad573b89fcd34667ecd3705251041d782e8bba11ff",
+      "time": "2026-11-24T13:38:04.770218-05:00"
     }
   },
   "nightly.not_run": {
     "cold_credentials": {
       "objections": [
         {
-          "quote": "run github-warmup",
+          "quote": "Nightly check did not run",
           "rule": "reader-starts-cold"
         },
         {
           "quote": "Why: GitHub credentials are cold.",
           "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Nightly check did not run",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Next run: Tue 11-24 00:53 PST.",
+          "rule": "times-carry-zone"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
-      "sha256": "2061c49a150d75ef62b00b77ee7e06dbe7886c64e48e8d3c5146217e5bfc053d",
-      "time": "2026-11-06T10:46:38.779135-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 2a140ed53d37), 11:21 PST Nov 24: title Nightly check did not run; Why line; Next run line; reviewer: claude-opus-5-5",
+      "sha256": "280e15d5fce03c98937641739cd8d233331ccb8b727f143490afc192cf251665",
+      "time": "2026-11-24T14:33:40.182817-05:00"
     },
     "fetch_failed": {
       "objections": [
         {
-          "quote": "The next nightly run tries again.",
+          "quote": "Why: git fetch of main failed: ssh connection timed out.",
           "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "Why: git fetch of main failed: ssh connection timed out.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
-      "sha256": "2061c49a150d75ef62b00b77ee7e06dbe7886c64e48e8d3c5146217e5bfc053d",
-      "time": "2026-11-06T10:46:25.461944-05:00"
+      "reviewer": "user-spec: nate: Approved on the Images page (image 2a140ed53d37), 11:21 PST Nov 24: title Nightly check did not run; Why line; Next run line; reviewer: claude-opus-5-5",
+      "sha256": "280e15d5fce03c98937641739cd8d233331ccb8b727f143490afc192cf251665",
+      "time": "2026-11-24T14:33:28.403495-05:00"
     }
   },
   "nightly.result": {
