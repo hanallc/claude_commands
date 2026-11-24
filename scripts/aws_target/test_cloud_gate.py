@@ -52,7 +52,7 @@ from scripts.production import affected_modules
 from scripts.production import change_review, gate
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 from scripts.lib.git_test_support import commit_repository
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -2031,6 +2031,51 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                          ledger.GateTerminated(int(self.now), 'i-' + attempt))
         calls = [command[command.index('--instance-ids') - 1] for command in self.fake.commands]
         self.assertEqual(calls, ['terminate-instances', 'describe-instances'])
+
+    def test_cleanup_retry_syncs_pending_ledger_before_termination(self) -> None:
+        for retry_in_batch in (False, True):
+            with self.subTest(retry_in_batch=retry_in_batch):
+                self.fake = FakeGateAws()
+                attempt = 'batch' if retry_in_batch else 'direct'
+                instance = 'i-' + attempt
+                region = 'fixture-region'
+                owner = ledger.GateWorkerOwner(101, 'fixture-start', str(self.folder))
+                self.record_running_gate(attempt, 'm7a.8xlarge', region)
+                self.book.gate_owner(attempt, owner)
+                synced: list[int] = []
+                fsync = os.fsync
+                file_inode = 0
+
+                def record_sync(fd: int) -> None:
+                    fsync(fd)
+                    synced.append(os.fstat(fd).st_ino)
+
+                def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if 'terminate-instances' in arguments:
+                        self.assertEqual(self.book.path.stat().st_ino, file_inode)
+                        self.assertEqual(synced, [file_inode, self.book.path.parent.stat().st_ino])
+                    return self.fake(arguments, **options)
+
+                worker = cloud_gate.GateWorker(AwsCli('fixture', region, 1, execute=transport),
+                    self.book, self.settings, self.folder / 'sidecar', clock=lambda: self.now, pause=self.advance)
+                with (mock.patch.object(atomic_file, 'sync_folder', side_effect=OSError('fixture sync failed')),
+                      self.assertRaises(atomic_file.AtomicDurabilityUnconfirmed)):
+                    worker.terminate(attempt, instance, owner)
+                self.assertEqual(self.fake.commands, [])
+                saved = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt)
+                self.assertIsInstance(saved.cleanup, ledger.GateCleanupPending)
+                file_inode = self.book.path.stat().st_ino
+
+                with mock.patch.object(os, 'fsync', side_effect=record_sync):
+                    if retry_in_batch:
+                        box = cloud_gate.GateTermination(attempt, ledger.GateCleanupTargets(region, (instance,)), owner)
+                        deadline = self.now + 60
+                        progress = worker.request_terminations((box,), deadline)
+                        self.assertEqual(progress, cloud_gate.GateTerminationProgress([box], False))
+                        self.assertTrue(worker.confirm_terminations(progress.pending, deadline))
+                    else:
+                        worker.terminate(attempt, instance, owner)
+                self.assertEqual(self.fake.terminated_instances, {instance})
 
     def test_cleanup_confirmation_requires_the_same_region_and_instance_set(self) -> None:
         self.record_running_gate('group', 'm7a.8xlarge', 'fixture-region')

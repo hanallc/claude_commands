@@ -31,7 +31,7 @@ from unittest.mock import Mock, call, patch
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, execution_identity, first_step, mac_run, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_targets import mac_linux, target_config
+from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
 from scripts.buildlog import store, treekey
 from scripts.lib import atomic_file, conf, process_group, process_start, scratch
@@ -683,6 +683,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.guest_home = self.root / 'guest'
         self.guest_home.mkdir()
+        (self.root / 'target-state').mkdir()
         self.trace = self.root / 'ssh.log'
         self.trace.touch()
         self.repo = self.root / 'repository'
@@ -1696,7 +1697,7 @@ fi
 
     def test_first_guest_launch_syncs_the_journal_directory_before_consume(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
-        self.assertFalse(path.parent.parent.exists())
+        self.assertFalse(path.parent.exists())
         consume = admission_client.consume_permission
         fsync = os.fsync
         sync_folder = atomic_file.sync_folder
@@ -1704,7 +1705,7 @@ fi
         folders: list[Path] = []
 
         def sync_journal_folder(folder: Path) -> None:
-            self.assertIn(folder, (self.root, path.parent.parent, path.parent))
+            self.assertIn(folder, (path.parent.parent, path.parent))
             sync_folder(folder)
             folders.append(folder)
 
@@ -1719,7 +1720,7 @@ fi
             self.assertIn(path.stat().st_ino, synced)
             self.assertIn(path.parent.stat().st_ino, synced)
             self.assertGreater(synced.index(path.parent.stat().st_ino), synced.index(path.stat().st_ino))
-            self.assertCountEqual(folders, [self.root, path.parent.parent, path.parent])
+            self.assertEqual(folders, [path.parent, path.parent.parent])
             return consume(request)
 
         with (patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
@@ -1731,35 +1732,32 @@ fi
         self.assertTrue(result.passed)
         send.assert_called_once()
 
-    def test_a_failed_state_root_parent_sync_does_not_consume_permission(self) -> None:
-        state_root = self.root / 'target-state'
-        sync_folder = atomic_file.sync_folder
-        consume = admission_client.consume_permission
-        parent_syncs: list[Path] = []
-        self.assertFalse(state_root.exists())
+    def test_a_missing_state_root_refuses_launch_before_consume(self) -> None:
+        root = self.root / 'target-state'
+        root.rmdir()
+        with patch.object(process_start, 'process_start', return_value=process_start.Started('123')):
+            result = self.route()
+        self.assertEqual(self.consumed, ())
+        self.assertFalse(root.exists())
+        reason = self.not_started(result)
+        self.assertEqual(reason, f'The Mac Linux state root {root} must be a directory. '
+                         + 'The admission service creates it at startup. '
+                         + 'To repair it, run build_targets.py setup-mac-linux on natedev.')
+        self.assert_guest_clean()
 
-        def sync_journal_folder(folder: Path) -> None:
-            self.assertIn(folder, (self.root, state_root, state_root / 'mac-linux'))
-            if folder == self.root:
-                self.assertTrue(state_root.is_dir())
-                parent_syncs.append(folder)
-                if len(parent_syncs) == 1:
-                    raise OSError('fixture state root parent sync failed')
+    def test_setup_mac_linux_creates_the_state_root_and_syncs_its_parent(self) -> None:
+        root = self.root / 'target-state'
+        root.rmdir()
+        sync_folder = atomic_file.sync_folder
+
+        def sync_parent(folder: Path) -> None:
+            self.assertTrue(root.is_dir())
             sync_folder(folder)
 
-        def check_launch(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
-            self.assertEqual(parent_syncs, [self.root, self.root])
-            return consume(request)
-
-        with (patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
-              patch.object(atomic_file, 'sync_folder', side_effect=sync_journal_folder),
-              patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
-            self.assertEqual(self.route(), 'mac-linux: fixture state root parent sync failed')
-            send.assert_not_called()
-            result = self.route()
-        assert isinstance(result, GateRun), result
-        self.assertTrue(result.passed)
-        send.assert_called_once()
+        with (patch.object(sys, 'argv', ['build_targets.py', 'setup-mac-linux']),
+              patch.object(atomic_file, 'sync_folder', side_effect=sync_parent) as sync):
+            self.assertEqual(build_targets.main(), 0)
+        sync.assert_called_once_with(root.parent)
 
     def test_a_failed_journal_directory_sync_does_not_consume_permission(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
@@ -1907,11 +1905,11 @@ fi
         self.assert_guest_clean('probe')
 
     def test_backoff_write_error_keeps_the_probe_failure(self) -> None:
-        _ = (self.root / 'target-state').write_text('This file blocks creation of the state directory.\n')
+        _ = (self.root / 'target-state/mac-linux').write_text('This file blocks the backoff directory.\n')
         reason = self.not_started(self.route('offline'))
         self.assertIn('fixture SSH refused the connection', reason)
         self.assertIn(f'Cannot record the {mac_linux.TARGET} backoff:', reason)
-        self.assertIn('Not a directory', reason)
+        self.assertIn('File exists', reason)
         self.assert_guest_clean('probe')
 
     def test_unreachable_wait_refuses_a_missing_key_without_a_committed_value(self) -> None:

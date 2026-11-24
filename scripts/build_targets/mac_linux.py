@@ -1282,14 +1282,6 @@ def _append_guest_end_row(row: dict[str, object]) -> None:
     path = target_config.mac_linux_end_proof_journal()
     directory = path.parent
     state_root = directory.parent
-    pending_root_sync = state_root.parent / f'.{state_root.name}.mac-linux-root-sync-pending'
-    if not state_root.is_dir() or pending_root_sync.is_dir():
-        # Create the marker first so another writer can finish an interrupted sync.
-        pending_root_sync.mkdir(parents=True, exist_ok=True)
-        state_root.mkdir(exist_ok=True)
-        atomic_file.sync_folder(state_root.parent)
-        with suppress(FileNotFoundError):
-            pending_root_sync.rmdir()
     directory.mkdir(exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, 'a+b') as journal:
@@ -2140,6 +2132,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         settings = new_run_settings()
         if not isinstance(settings, GuestSettings):
             return settings
+        root = target_config.build_targets_state_root()
+        if not root.is_dir():
+            return GuestNotStarted(f'The Mac Linux state root {root} must be a directory. '
+                                   + 'The admission service creates it at startup. '
+                                   + 'To repair it, run build_targets.py setup-mac-linux on natedev.')
         if not math.isfinite(module_time_limit_s) or module_time_limit_s <= 0:
             raise GuestUnavailable('the module time limit must be positive and finite')
         repo = repo.resolve()

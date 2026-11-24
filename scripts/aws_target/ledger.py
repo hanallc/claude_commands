@@ -12,6 +12,7 @@ import fcntl
 from hashlib import sha256
 import json
 from math import ceil, inf
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -21,7 +22,7 @@ from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.lib import conf
 from scripts.aws_target import hana_result, remote
 from scripts.message import send_result, session_send
@@ -863,25 +864,34 @@ def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
     return booking
 
 
-def mark_gate_cleanup(
-    state: LedgerEvidence, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
-    targets: GateCleanupTargets, *, result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED,
-) -> GateCleanupPending | GateTerminated:
-    """Return a matching confirmed end or save cleanup before the AWS call."""
-    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
-    if (booking is not None and isinstance(booking.state, GateTerminated)
-            and booking.region == targets.region and booking.state.confirms(targets.instances)):
-        return booking.state
-    booking = require_gate_cleanup_owner(state, attempt, owner)
-    if isinstance(booking.cleanup, GateCleanupPending):
-        if booking.cleanup.targets != targets:
+@dataclass
+class GateCleanupTransaction:
+    """Stage cleanup for the selected bookings under the ledger lock."""
+
+    _state: LedgerEvidence
+    has_pending_cleanup: bool = field(default=False, init=False)
+
+    def mark(
+        self, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
+        targets: GateCleanupTargets, *, result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED,
+    ) -> GateCleanupPending | GateTerminated:
+        """Stage pending cleanup or return an exact confirmed end."""
+        state = self._state
+        booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+        if (booking is not None and isinstance(booking.state, GateTerminated)
+                and booking.region == targets.region and booking.state.confirms(targets.instances)):
+            return booking.state
+        booking = require_gate_cleanup_owner(state, attempt, owner)
+        if isinstance(booking.cleanup, GateCleanupPending) and booking.cleanup.targets != targets:
             raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
-        if isinstance(booking.cleanup.result_seen_at, int) or isinstance(result_seen_at, GateResultNotReceived):
-            return booking.cleanup
-    pending = GateCleanupPending(targets, result_seen_at)
-    state.gate_reservations[state.gate_reservations.index(booking)] = replace(
-        booking, region=targets.region, cleanup=pending)
-    return pending
+        self.has_pending_cleanup = True
+        if isinstance(booking.cleanup, GateCleanupPending):
+            if isinstance(booking.cleanup.result_seen_at, int) or isinstance(result_seen_at, GateResultNotReceived):
+                return booking.cleanup
+        pending = GateCleanupPending(targets, result_seen_at)
+        state.gate_reservations[state.gate_reservations.index(booking)] = replace(
+            booking, region=targets.region, cleanup=pending)
+        return pending
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -2557,13 +2567,19 @@ class CostLedger:
             self._save(state)
 
     @contextmanager
-    def gate_cleanup_transaction(self) -> Generator[LedgerEvidence]:
-        """Save a cleanup update only if it changes the gate reservations."""
+    def gate_cleanup_transaction(self) -> Generator[GateCleanupTransaction]:
+        """Sync pending cleanup before the caller can request termination."""
         with self._locked() as state:
             previous = state.gate_reservations.copy()
-            yield state
+            cleanup = GateCleanupTransaction(state)
+            yield cleanup
             if state.gate_reservations != previous:
                 self._save(state)
+            elif cleanup.has_pending_cleanup:
+                # A failed directory sync can leave the pending record visible.
+                with self.path.open('rb') as stream:
+                    os.fsync(stream.fileno())
+                sync_folder(self.path.parent)
 
     def spending_decision(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
         """Validate account evidence and apply the shared bill cap to a proposed reservation."""

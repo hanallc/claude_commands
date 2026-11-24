@@ -6352,6 +6352,15 @@ done
         listener.setblocking(False)
         self.listener = listener
         self.epoll.register(listener.fileno(), select.EPOLLIN)
+        try:
+            root = target_config.build_targets_state_root()
+            self.writes.require(root)
+            target_config.provision_mac_linux_state_root(root)
+        except (OSError, RuntimeError) as error:
+            detail = " ".join(str(error).splitlines())
+            print(f"memory admission: Cannot prepare the Mac Linux state root. {detail}", file=sys.stderr)
+        else:
+            print(f"memory admission: Mac Linux state root ready at {root}", file=sys.stderr)
         self.listener_started_at = self.clock.monotonic()
         if self.next_source_check == float("inf"):
             first_check = "after the first usable configuration"
