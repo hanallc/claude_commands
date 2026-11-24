@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
@@ -553,6 +554,72 @@ def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, sc
     return state / "dispatch-fences" / scope / claim_state.start_fence_name(identity, scope_key)
 
 
+MAC_MACHINE_ID_PROGRAM = r'''import re, subprocess
+
+def mac_machine_id(timeout):
+    try:
+        result = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                                capture_output=True, check=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    matches = re.findall(rb'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]+)"', result.stdout)
+    return matches[0].decode().lower() if len(matches) == 1 else ""
+'''
+
+
+FENCE_HOLDER_PROGRAM = '''import os, subprocess
+
+def fence_holders(path, timeout=None):
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return {}
+    arguments = ["lsof", "-n", "-P", "-a", "-u", str(os.getuid()), "-d", "8", "-F0pc", str(path)]
+    with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as probe:
+        try:
+            output, errors = probe.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            raise OSError("the start fence holder check timed out")
+        if probe.returncode == 1 and not output and not errors:
+            return {}
+        if probe.returncode != 0 or errors:
+            raise OSError("lsof could not inspect the start fence")
+        excluded = {str(pid).encode() for pid in (0, os.getpid(), os.getppid(), probe.pid)}
+    holders = {}
+    pid = b""
+    for field in output.split(b"\\0"):
+        field = field.lstrip(b"\\n")
+        if field.startswith(b"p"):
+            pid = field[1:]
+            if pid.isdigit() and pid not in excluded:
+                holders[pid] = "(unknown command)"
+        elif field.startswith(b"c") and pid in holders:
+            command = field[1:].decode(errors="replace")
+            command = "".join(char if char.isprintable() else " " for char in command).strip()
+            if command:
+                holders[pid] = command
+    return holders
+'''
+
+
+def start_fence_reason(identity: claim_state.ClaimIdentity, output: str) -> str | None:
+    key = pending_start_key(identity)
+    lines = output.splitlines()
+    if f"dispatch_start_settled={key}" in lines:
+        return None
+    mac_pending = f"dispatch_start_pending_mac={key}" in lines
+    if not mac_pending and f"dispatch_start_pending={key}" not in lines:
+        return "the remote start fence gave no answer"
+    prefix = f"dispatch_start_holder={key} "
+    holders = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    if holders:
+        return "the remote start fence is held by " + ", ".join(holders)
+    if mac_pending:
+        return "the remote start fence is held; the holder check gave no answer"
+    return "the remote start fence is held"
+
+
 def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
     """Remove inactive fences from older claims in this exact provider scope."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
@@ -574,7 +641,8 @@ for path in base.parent.glob("*.lock"):
     return shlex.join(["python3", "-c", program, encoded])
 
 
-def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
+def prepare_start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run",
+                                machine_id_timeout: float | None = None) -> str:
     """Create the start identity before the probe acknowledges preparation."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
     program = '''import pathlib, sys
@@ -582,34 +650,95 @@ base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 base.parent.mkdir(parents=True, exist_ok=True)
 base.with_suffix(".lock").touch()
 '''
-    return shlex.join(["python3", "-c", program, encoded])
+    arguments = [encoded]
+    if machine_id_timeout is not None:
+        program = MAC_MACHINE_ID_PROGRAM + program + '''machine_id = mac_machine_id(float(sys.argv[2]))
+if machine_id:
+    print("dispatch_mac_id=" + machine_id)
+'''
+        arguments.append(str(machine_id_timeout))
+    return shlex.join(["python3", "-c", program, *arguments])
 
 
 def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, settle: bool = False,
-                        scope_key: str = "run") -> str:
+                        scope_key: str = "run", report_holders: bool = False,
+                        leftover_observation: tuple[str, float, str] | None = None) -> str:
     """Use the prepared identity without permitting recreation after release."""
     key = pending_start_key(identity)
     relative = str(start_fence_relative(identity, target, scope_key=scope_key))
     encoded = relative.encode().hex()
     if settle:
-        program = '''import fcntl, pathlib, sys
+        pending = '        print("dispatch_start_pending=" + sys.argv[2], flush=True)\n'
+        if report_holders:
+            holder_timeout = ", remaining()" if leftover_observation is not None else ""
+            pending = '''        print("dispatch_start_pending_mac=" + sys.argv[2], flush=True)
+        try:
+            for pid, command in fence_holders(path''' + holder_timeout + ''').items():
+                print("dispatch_start_holder=" + sys.argv[2] + " " + pid.decode() + " " + command, flush=True)
+        except OSError:
+            pass
+'''
+        observation = MAC_MACHINE_ID_PROGRAM + '''import os, sys, time
+
+deadline = time.monotonic() + float(sys.argv[4])
+
+def remaining():
+    return max(0.0, deadline - time.monotonic())
+
+machine_id = mac_machine_id(remaining())
+print("dispatch_mac_id=" + machine_id, flush=True)
+if machine_id != sys.argv[5]:
+    sys.exit(0)
+
+def check_leftovers():
+    observation = bytes.fromhex(sys.argv[3]).decode()
+    try:
+        result = subprocess.run(["sh", "-c", observation], capture_output=True,
+                                check=False, timeout=remaining())
+    except subprocess.TimeoutExpired:
+        sys.exit("the mirror check timed out")
+    sys.stdout.buffer.write(result.stdout)
+    sys.stdout.flush()
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(1)
+    if result.returncode != 0 or result.stdout != b"leftovers=0\\nrc=0\\n":
+        sys.exit(1)
+''' if leftover_observation is not None else ""
+        missing = ('''    check_leftovers()
+    if os.path.lexists(path):
+        sys.exit(1)
+    print("dispatch_start_missing=" + sys.argv[2], flush=True)
+''' if leftover_observation is not None else '''    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+''')
+        remove = ('''    check_leftovers()
+    if not os.path.samestat(path.lstat(), os.fstat(lock.fileno())):
+        sys.exit(1)
+    path.unlink()
+''' if leftover_observation is not None else '''    path.unlink(missing_ok=True)
+''')
+        program = (FENCE_HOLDER_PROGRAM if report_holders else "") + observation + '''import fcntl, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 path = base.with_suffix(".lock")
 try:
     lock = path.open("r")
 except FileNotFoundError:
-    print("dispatch_start_settled=" + sys.argv[2], flush=True)
+''' + missing + '''\
     sys.exit(0)
 with lock:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("dispatch_start_pending=" + sys.argv[2], flush=True)
+''' + pending + '''\
         sys.exit(0)
-    path.unlink(missing_ok=True)
+''' + remove + '''\
     print("dispatch_start_settled=" + sys.argv[2], flush=True)
 '''
-        return shlex.join(["python3", "-c", program, encoded, key])
+        arguments = ["python3", "-c", program, encoded, key]
+        if leftover_observation is not None:
+            script, timeout, machine_id = leftover_observation
+            arguments.extend((script.encode().hex(), str(timeout), machine_id))
+        return shlex.join(arguments)
     program = '''import fcntl, os, pathlib, sys
 base = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
 fcntl.flock(8, fcntl.LOCK_EX)
@@ -1625,9 +1754,13 @@ def linux_mirror_root() -> Path:
     return Path('.local/state/build-target/mirror')
 
 
+offload_mirror_root: ContextVar[MacMirrorRoot | None] = ContextVar("offload_mirror_root", default=None)
+
+
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
-    return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
+    root = offload_mirror_root.get()
+    return root if root is not None else conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1989,6 +2122,34 @@ def record_reachable(target: str, *, probe_started_ns: int) -> None:
         print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
 
 
+def save_mac_watch_origin(controller: ProcessController, host: str, root: MacMirrorRoot, output: str) -> None:
+    """Save the origin of this claim's prepared fence."""
+    identity = controller.claim_identity
+    repository = controller.mac_repository
+    if not isinstance(identity, claim_state.ClaimIdentity) or not isinstance(repository, claim_state.MacMirrorIdentity):
+        return
+    replies = [line.removeprefix("dispatch_mac_id=") for line in output.splitlines()
+               if line.startswith("dispatch_mac_id=")]
+    machine_id = claim_state.mac_machine_id(replies[0]) if len(replies) == 1 else None
+    origin: claim_state.MacWatchOrigin | None = (
+        {"mirror_root": root.relative, "machine_id": machine_id} if machine_id is not None else None)
+    paths = claim_state.state_paths(controller.claim_target)
+    path = paths.claims / repository.claim_file
+    with claim_state.locked(paths.lock):
+        record = claim_state.read_run(path)
+        if (isinstance(record, claim_state.NoRun) or "remote_host" not in record
+                or record["remote_host"] != host or record["pid"] != os.getpid()
+                or claim_state.claim_identity(record) != identity
+                or record.get("mac_repository") != repository.record()
+                or record.get("mac_watch_origin") == origin):
+            return
+        if origin is None:
+            _ = record.pop("mac_watch_origin", None)
+        else:
+            record["mac_watch_origin"] = origin
+        write_text_atomic(path, json.dumps(record, separators=(",", ":")) + "\n")
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig | eligibility.SshProbeSettings,
@@ -2030,13 +2191,16 @@ def probe_mac(
         script = probe_script(repository, target, slot)
         timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
+    watch_root = offload_mirror_root.get() if not linux else None
     if isinstance(identity, claim_state.ClaimIdentity):
         path = pending_start_path(target, identity, scope_key=controller.claim_scope_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, pending_start_key(identity))
+        prepare = prepare_start_fence_command(identity, target, scope_key=controller.claim_scope_key,
+                                              machine_id_timeout=timeout_s if watch_root is not None else None)
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
                   + "if [ \"$probe_status\" -eq 0 ]; then\n"
-                  + prepare_start_fence_command(identity, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"
+                  + prepare + " || exit 1\nfi\n"
                   + 'exit "$probe_status"')
     result = controller.capture(
         [*ssh_prefix(config), script],
@@ -2055,6 +2219,9 @@ def probe_mac(
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
+            if watch_root is not None:
+                with suppress(OSError, claim_state.StateReadError):
+                    save_mac_watch_origin(controller, config.host, watch_root, result.stdout)
             if not linux or not isinstance(config, OffloadConfig):
                 return succeeded(probe)
             expected = expected_linux_parity(controller, config)
@@ -2588,7 +2755,8 @@ def extended_regex_literal(text: str) -> str:
     )
 
 
-def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1) -> str:
+def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1, *,
+                           mirror_root: MacMirrorRoot | None = None) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
     A repository's scope stops at its own mirror. Brackets around the first character prevent the pattern from matching its assignment.
@@ -2599,7 +2767,7 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
         from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=False)
-    root = mac_mirror_root().relative
+    root = (mirror_root if mirror_root is not None else mac_mirror_root()).relative
     mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
         mirror += "/" + extended_regex_literal(scope.name)
@@ -2626,15 +2794,12 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     )
 
 
-def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1) -> str:
-    if isinstance(repository, AllMirrors):
-        return mirror_selector_script(repository, target, slot) + r'''
-leftover_pids=$(select_leftovers) || exit "$?"
-leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
-printf 'leftovers=%s\nrc=0\n' "$leftover_count"
-'''
-    return mirror_selector_script(repository, target, slot) + r'''
-leftover_pids=$(select_leftovers) || exit "$?"
+def leftover_check_script(repository: MirrorScope, target: str = "mac", slot: int = 1, *,
+                          fence: Path | None = None, observe: bool = False,
+                          mirror_root: MacMirrorRoot | None = None) -> str:
+    script = mirror_selector_script(repository, target, slot, mirror_root=mirror_root) + "\n"
+    if isinstance(repository, KnownRepository) and not observe:
+        script += r'''leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
 done
@@ -2643,8 +2808,22 @@ leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
 done
-leftover_pids=$(select_leftovers) || exit "$?"
-leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+'''
+    script += 'leftover_pids=$(select_leftovers) || exit "$?"\n'
+    if fence is not None:
+        program = FENCE_HOLDER_PROGRAM + '''import pathlib, sys
+path = pathlib.Path.home() / bytes.fromhex(sys.argv[1]).decode()
+try:
+    for pid in fence_holders(path):
+        print(pid.decode())
+except OSError as error:
+    sys.exit(str(error))
+'''
+        command = shlex.join(["python3", "-c", program, str(fence).encode().hex()])
+        script += f"fence_pids=$({command}) || exit 1\n"
+        script += r'''leftover_pids=$(printf '%s\n%s\n' "$leftover_pids" "$fence_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }') || exit 1
+'''
+    return script + r'''leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
 printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
 
@@ -2789,14 +2968,16 @@ def mac_cleanup_scope(saved: claim_state.SavedMacRepository) -> MirrorScope:
 
 @contextmanager
 def mac_cleanup_lease(saved: claim_state.SavedMacRepository,
-                      host: str, target: str) -> Generator[None, None, None]:
+                      host: str, target: str, *, mirror_root: MacMirrorRoot | None = None) -> Generator[None, None, None]:
     """Protect the saved mirror or all mirrors on the recorded host during cleanup."""
     from scripts.copies import copies
 
     scope = mac_cleanup_scope(saved)
+    path = (f"{mirror_root.relative}/{scope.legacy_mirror_name}"
+            if mirror_root is not None and isinstance(scope, KnownRepository) else None)
     lease = (copies.remote_host_lease(host, exclusive=True) if isinstance(scope, AllMirrors) else
              copies.remote_lease(copies.RemoteMirror("", copies.SelectedRepository(scope.name), host,
-                                                      remote_mirror(scope, target), "")))
+                                                      path if path is not None else remote_mirror(scope, target), "")))
     with lease:
         yield
 
@@ -3592,6 +3773,9 @@ def run_offload(
 
     try:
         with ExitStack() as admission_leases:
+            if not linux:
+                root_token = offload_mirror_root.set(mac_mirror_root())
+                _ = admission_leases.callback(offload_mirror_root.reset, root_token)
             slots = (target_config.slot_capacity(config.values, repository.name,
                      missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
             leases: dict[int, ExitStack] = {}
