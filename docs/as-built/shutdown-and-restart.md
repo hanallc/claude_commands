@@ -76,6 +76,18 @@ If its socket is unavailable, the send fails and leaves no queued continuation.
 Definite delivery failure restores the same pause record.
 Uncertain delivery keeps the pending resume for a retry.
 A failed start or a start exception also restores the pause record.
+
+#### Continuation crash limits
+
+The rule is visible pending over double send.
+Claude Code has no atomic keyed input write, so a sender cannot prove whether a killed attempt was accepted.
+Three windows remain, and each needs a kill at one exact line:
+
+1. A `send.py pending` drain killed after it flushes a queued continuation and before it rewrites the queue sends it again on the next drain. Every queued message has this window.
+2. A sender killed after it saves `relay-unconfirmed` and before the socket write leaves the resume pending. A retry does not send.
+3. A sender stopped after it saves the Mac destination and before SSH, followed by a director move, leaves the resume pending. A retry does not send.
+
+A pending resume exits non-zero and keeps its record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
 The Claude and Codex prompt hooks read the same director hold for every prompt source.
 Each hook adds the hold instruction and preserves the message in the transcript.
