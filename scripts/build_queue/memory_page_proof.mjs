@@ -664,6 +664,17 @@ try {
           }
           reading.queued_priority_units = [];
           servedReading = reading;
+          const machineGraphics = {
+            'natedev':['🐧', null],
+            'mac':['#machine-apple', null],
+            'mac-linux':['#machine-apple', '🐧'],
+            'aws':['#machine-cloud', '🐧'],
+            'hana-aws':['#machine-cloud', '🌸'],
+            'hana-gpu':['#machine-cloud', '⚡'],
+          };
+          const expectedIcon = name => [name, name, ...machineGraphics[name]];
+          const runningIcon = name => [...expectedIcon(name), 'img', 'run'];
+          const waitingIcons = ['natedev','hana-aws'].map(name => [...expectedIcon(name), 'img', 'dim']);
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           // At 800 px the walk uses compact gaps. At 900 px the font metrics determine the gaps.
           let rows;
@@ -682,6 +693,9 @@ try {
               const keptChart = chart('held:proof-kept'), keptTable = table('held:proof-kept');
               const scroll = walk.closest('.walk-scroll');
               const waitingName = chart(keys[4]).querySelector('.name');
+              const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
+                icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
+                icon?.getAttribute('data-badge')];
               return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
                 keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
@@ -691,12 +705,12 @@ try {
                 names:keys.map(key => [name(chart(key)),owner(chart(key)),table(key).querySelector('.verify').textContent,
                   table(key).querySelector('.step').textContent]),
                 icons:keys.map(key => [...table(key).querySelectorAll('td.machine .machine-icon')].map(icon =>
-                  [icon.getAttribute('aria-label'), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
+                  [...iconDetails(icon), icon.getAttribute('role'), ['run', 'dim'].find(state => icon.classList.contains(state))])),
                 wrappedIcons:[...walk.querySelectorAll('tbody td.machine')].filter(cell =>
                   new Set([...cell.querySelectorAll('.machine-icon')].map(icon => Math.round(icon.getBoundingClientRect().top))).size > 1)
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
-                  [key.lastChild.textContent, key.querySelector('.machine-icon')?.getAttribute('aria-label')]),
+                  [key.lastChild.textContent, ...iconDetails(key.querySelector('.machine-icon'))]),
                 colors:[chart(keys[0]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
@@ -718,10 +732,10 @@ try {
               assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
                 ['queue','builds','','gate'],['terminal','hana','','build'],['hana CI','','',''],
                 ['admin-console','builds','','test affected']]);
-              assert.deepEqual(rows.icons, [[['natedev','img','run']],[['mac-linux','img','run']],[['mac','img','run']],
-                [['natedev','img','run']],[['natedev','img','dim'],['hana-aws','img','dim']]]);
+              assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
+                [runningIcon('natedev')],waitingIcons]);
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
-              assert.deepEqual(rows.legend, ['natedev','mac','mac-linux','aws','hana-aws','hana-gpu'].map(name => [name, name]));
+              assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
               assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
               if (width === 900) {
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
