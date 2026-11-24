@@ -8450,9 +8450,8 @@ class PaneWorkerMoveTests(unittest.TestCase):
         config.mkdir()
         _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
                                      config / "accounts.conf")
-        source = Path(__file__).resolve().parents[2] / "config"
         for name in ("detached_runs.conf", "postmaster.conf"):
-            _ = shutil.copyfile(source / name, config / name)
+            _ = write_config_fixture(config / name)
         _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nworker_split_ratio=0.667\n"
                                                + "# whole: 1..\nunit_compact_above_tokens=43000\n"
                                                + "# range: 1..1800\nworker_compact_seconds=300\n"

@@ -151,9 +151,8 @@ class PaneWorld(herdr.Herdr):
         _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
-        source = Path(__file__).resolve().parents[2] / "config"
         for name in ("detached_runs.conf", "postmaster.conf"):
-            write_text_atomic(config / name, (source / name).read_text())
+            _ = write_config_fixture(config / name)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),

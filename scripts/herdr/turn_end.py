@@ -1135,6 +1135,24 @@ def recover_stopped_in_run(run: Path, identity: staff.StaffId, *,
         return recovery
 
 
+def close_interrupted_worker(run: Path, identity: staff.StaffId) -> None:
+    """Recover a stopped pass or close its idle pane when no notice is pending."""
+    if recover_stopped_in_run(run, identity) is not worker.CompletionRecovery.NO_PENDING_NOTICE:
+        return
+    record = staff.snapshot()
+    row = record.by_id(identity)
+    if row is None or row.kind != "worker":
+        return
+    parent = record.parent_of(row)
+    if parent is None:
+        return
+    name = staff.WorkerName.parse(row.name)
+    with worker_panes.worker_lock(parent.id, name, blocking=True) as hold:
+        if isinstance(hold, worker_panes.Kept) or not hold.owns(row) or worker_panes.worker_run(row) != run:
+            return
+        _ = worker_panes.close(parent.id, name, lock=hold)
+
+
 def _defer_stopped_diagnostics(hold: worker_panes.WorkerLockHold, run: Path, worker_id: staff.StaffId) -> None:
     def deliver() -> None:
         _ = retry_stopped_diagnostics(run, worker_id)

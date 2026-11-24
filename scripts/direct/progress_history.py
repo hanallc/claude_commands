@@ -6987,11 +6987,11 @@ def _close_interrupted_workers(passes: InterruptedWorkerPasses) -> None:
         return
     from scripts.herdr import herdr_types
 
-    recover = cast(Callable[[Path, staff.StaffId], object], import_module("scripts.herdr.turn_end").recover_stopped_in_run)
+    close = cast(Callable[[Path, staff.StaffId], None], import_module("scripts.herdr.turn_end").close_interrupted_worker)
     for identity in passes.worker_ids:
         try:
             with redirect_stderr(io.StringIO()):
-                _ = recover(passes.run, identity)
+                close(passes.run, identity)
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                 staff.StaffRefused, staff.StaffUnreadable) as error:
             print(f"anomaly: finish-phase: worker {identity}: {' '.join(str(error).splitlines())}", file=sys.stderr)
