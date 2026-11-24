@@ -243,10 +243,15 @@ class OwnerGone:
 
 
 @dataclass(frozen=True)
+class HandedOff:
+    """The grant only held the place until the command sent its own first step; no step ended."""
+
+
+@dataclass(frozen=True)
 class OutcomeNotRecorded:
     pass
 
-FinalOutcome = Completed | Failed | Killed | OwnerGone
+FinalOutcome = Completed | Failed | Killed | OwnerGone | HandedOff
 
 HistoryOutcome = FinalOutcome | OutcomeNotRecorded
 
