@@ -187,11 +187,12 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertIn(investigation.folder(OWNER), sources)
         self.assertIn(investigation.folder(OWNER) / "I2.md", sources)
 
-    def test_producer_uses_its_questions_and_requires_a_proposal_folder(self) -> None:
+    def test_producer_uses_its_default_and_configured_stores(self) -> None:
         question = submissions.submit(request(submissions.SubmissionKind.QUESTION, recipient=PRODUCER))
         payload = request(submissions.SubmissionKind.PROPOSAL, "proposal", recipient=PRODUCER)
-        with self.assertRaisesRegex(submissions.SubmissionError, "native proposal folder"):
-            _ = submissions.submit(payload)
+        default_proposal = submissions.submit(payload)
+        self.assertEqual((default_proposal.id, default_proposal.path.parent),
+                         ("P1", self.root / "state" / PRODUCER / "proposals"))
         self.assertEqual(question.id, "Q1")
         row = self.identities.record.by_id(PRODUCER)
         assert row is not None
@@ -205,16 +206,17 @@ class ReviewSubmissionTests(unittest.TestCase):
         producer = replace(row, doc=staff.LiveDoc(local_machine(), producer_doc))
         producer_staff = staff.StaffSnapshot((producer,))
         with patch.object(staff, 'snapshot', return_value=producer_staff):
-            proposal = submissions.submit(payload, members=producer_staff)
-        self.assertEqual(proposal.id, "P1")
-        self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P1")), Issue)
+            configured = request(submissions.SubmissionKind.PROPOSAL, "configured-proposal", recipient=PRODUCER)
+            proposal = submissions.submit(configured, members=producer_staff)
+        self.assertEqual((proposal.id, proposal.path.parent), ("P2", vault))
+        self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P2")), Issue)
 
-    def test_proposal_folder_is_absent_for_a_producer_directory(self) -> None:
+    def test_proposal_folder_defaults_to_local_state_for_a_producer_directory(self) -> None:
         directory = self.root / "brain"
         directory.mkdir()
         producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
         self.assertEqual(submissions.proposal_folder(producer, self.members),
-                         submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
+                         self.root / "state" / PRODUCER / "proposals")
 
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -384,9 +386,10 @@ class ReviewSubmissionTests(unittest.TestCase):
         image, = (folder / "images").glob("*/image.png")
         before = image.stat()
         self.assertEqual(image.read_bytes(), base64.b64decode(PNG))
+        delivery = submissions.InitialDelivery()
         with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
-            _ = submissions.submit(replace(payload, words="Different words"))
-        saved = submissions.submit(payload)
+            _ = submissions.submit(replace(payload, words="Different words"), initial_delivery=delivery)
+        saved = submissions.submit(payload, initial_delivery=delivery)
         self.assertEqual(saved.id, "I2")
         self.assertEqual(len(saved.details.images), 1)
         self.assertEqual(image.stat().st_ino, before.st_ino)
