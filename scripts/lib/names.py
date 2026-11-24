@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import cache
+from functools import lru_cache
 from pathlib import Path
 import sys
 import tomllib
 from typing import Literal, cast, get_args
+
+from scripts.lib import conf
+from scripts.lib.conf import ConfigurationStamp, UnstampedConfiguration
 
 JobKey = Literal["showrunner", "unit_director", "worker", "implementer", "tester", "repair_worker", "code_reviewer",
                  "ui_reviewer", "designer", "design_reviewer"]
@@ -121,7 +125,9 @@ def load_names(path: Path = CONFIG_PATH) -> Names | NamesError:
                  cast(Mapping[AudienceKey, tuple[str, ...]], groups["audiences"]))
 
 
-_reported_errors: set[NamesError] = set()
+# The errors this command reported. A CLI process runs one command in one context, and
+# verify_helper.py runs each call in a copy of its context, so the set lives for one command.
+_reported_errors: ContextVar[frozenset[NamesError]] = ContextVar("reported_names_errors", default=frozenset())
 
 
 def error_text(error: NamesError, path: Path = CONFIG_PATH) -> str:
@@ -141,16 +147,22 @@ def error_text(error: NamesError, path: Path = CONFIG_PATH) -> str:
 
 
 def report_error(error: NamesError) -> None:
-    """Report each config problem once in this process."""
-    if error not in _reported_errors:
-        _reported_errors.add(error)
+    """Report each config problem once in this command."""
+    reported = _reported_errors.get()
+    if error not in reported:
+        _ = _reported_errors.set(reported | {error})
         print(error_text(error), file=sys.stderr)
 
 
-@cache
 def runtime_names() -> Names | NamesError:
-    """Load the command's configuration once; explicit path loads remain uncached."""
-    loaded = load_names()
+    """Load the configuration again only after its file changes; explicit path loads remain uncached."""
+    loaded = _runtime_names(conf.file_stamp(CONFIG_PATH))
     if not isinstance(loaded, Names):
         report_error(loaded)
     return loaded
+
+
+# The stamp is the cache key, so a long-lived process (verify_helper.py) sees an edit to the file.
+@lru_cache(maxsize=1)
+def _runtime_names(_stamp: ConfigurationStamp | UnstampedConfiguration) -> Names | NamesError:
+    return load_names()

@@ -391,6 +391,16 @@ def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str
     return _start_deadline_refusal(row, now, settings) or _claim_owner_refusal(row)
 
 
+def _at_rest(row: BoxRecord, replacement: hana_replacement_record.NoReplacement | hana_replacement_record.ReplacementStopDuty,
+             spending: hana_spend.HanaSpending[hana_spend.PermitSettings]) -> bool:
+    """Show that no box can run: stopped, no claim, no stop duty, no open compute, and no operation other than observe."""
+    return (row.state in (Lifecycle.IDLE_STOPPED, Lifecycle.UNPROVISIONED) and not row.claims
+            and isinstance(replacement, hana_replacement_record.NoReplacement)
+            and (isinstance(row.operation, NoOperation) or row.operation.action == Action.OBSERVE)
+            and not any(isinstance(exposure.state, ledger.HanaExposureOpen)
+                        for exposure in spending.book.read_snapshot().hana_compute))
+
+
 def _decode(document: dict[str, object]) -> BoxRecord:
     if document.get('version') != 1:
         raise ValueError('The Hana lifecycle journal version is unknown')
@@ -750,6 +760,8 @@ class HanaController:
             settings = read_settings(conf.read(self.workload_path))
             spending = self._spending()
             replacement = hana_replacement_record.read_stop_duty(self.directory)
+            if not spending.settings.enabled and _at_rest(row, replacement, spending):
+                return row.state
             if isinstance(replacement, hana_replacement_record.ReplacementStopDuty):
                 if any(exposure.generation == replacement.generation and exposure.expires > now
                        and isinstance(exposure.state, ledger.HanaExposureOpen)

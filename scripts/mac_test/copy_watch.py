@@ -37,7 +37,7 @@ from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
-from scripts.direct import step_record
+from scripts.direct import runner_result, step_record
 from scripts.build_queue import placement, admission_protocol as wire
 
 
@@ -256,7 +256,7 @@ def read_mac_words(path: Path) -> MacWords | None:
     except (OSError, UnicodeDecodeError):
         return None
     macs = [line.removeprefix("mac=") for line in lines if line.startswith("mac=")]
-    if len(macs) != 1 or macs[0] not in ("passed", "failed", "lost", "declined"):
+    if len(macs) != 1 or macs[0] not in ("passed", "failed", "lost", "declined", "prelaunch_failed"):
         return None
     reason = seconds = ""
     for line in lines:
@@ -278,6 +278,8 @@ def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
         return CopyWin(words, status)
     if words.mac == "declined":
         return CopyEnded("declined", final=words.reason in FINAL_DECLINE_REASONS)
+    if words.mac == "prelaunch_failed" and runner_result.is_mac_history_refusal(status, words.reason):
+        return CopyEnded("declined", final=True)
     return CopyEnded("lost", final=False)
 
 
@@ -596,7 +598,8 @@ class Watch:
 
     def run(self, wakeup: Wakeup) -> WatchReport:
         from scripts.buildlog import store
-        from scripts.direct.local_release_wait import LocalReleaseEvents, episode_is_assigned, local_release_waiter
+        from scripts.direct.local_release_wait import episode_is_assigned
+        from scripts.lib.release_waiter import LocalReleaseEvents, local_release_waiter
 
         tick = min(1.0, self.poll_s)
         state_file = store.root() / "admission/state.json"

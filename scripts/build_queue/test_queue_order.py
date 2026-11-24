@@ -1,11 +1,13 @@
 """Check durable queue moves with a private admission service."""
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +21,7 @@ from scripts.build_queue.test_placement import (
 )
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
+from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_pressure_reading
 from scripts.production import land_runs
@@ -32,11 +35,33 @@ def move_line(fixture: AdmissionFixture) -> records.QueueMoveLine:
     return line
 
 
+@contextmanager
+def hold_only(holder: build_hold.Holder, *owners: wire.Owner) -> Generator[None]:
+    """Put a natedev hold in force that holds only the named callers and keeps every other caller."""
+    pids = {owner.pid for owner in owners}
+
+    def blocking(_holds: build_hold.NatedevHolds, _own_key: str,
+                 lineage: build_targets.CallerLineage) -> build_hold.Holder | build_targets.NoBlockingHold:
+        if isinstance(lineage, build_targets.ConfirmedCallerLineage) and any(
+                process.pid in pids for process in lineage.processes):
+            return holder
+        return build_targets.NoBlockingHold()
+
+    with patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds((holder,))), \
+            patch.object(build_targets, "blocking_hold", side_effect=blocking):
+        yield
+
+
 def ids(line: records.QueueMoveLine) -> list[str]:
     return [member.row_id for member in line.members if member.movable]
 
 
 class QueueMoveTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        # The service applies natedev holds only on natedev; the guest has another host name.
+        _ = self.enterContext(patch.object(store, "host_name", return_value="natedev"))
+
     def test_release_skips_remote_waiters_with_local_admission_context(self) -> None:
         for mac_only in (False, True):
             with self.subTest(mac_only=mac_only), PlacementFixture() as fixture:
@@ -295,7 +320,7 @@ class QueueMoveTests(unittest.TestCase):
             holder = build_hold.Holder("fixture", datetime.fromtimestamp(fixture.clock.now(), UTC),
                                        "fixture hold", build_hold.UnknownReleaseEta(), "fixture")
             ordinary = [fixture.request(since=fixture.clock.now() + index) for index in (1, 2, 3)]
-            with patch.object(build_targets, "hold_waited_on", return_value=holder):
+            with hold_only(holder, ci.owner):
                 for request in (ci, *ordinary):
                     self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
                 line = move_line(fixture)
@@ -343,7 +368,7 @@ class QueueMoveTests(unittest.TestCase):
             _ = publish_candidate(fixture, remote, placement.TemporaryExclusion("busy"))
             first, second = [fixture.request(run=run, since=running.since + index,
                              owner=fixture.fixture_owner(700000 + index, "4000")) for index in (1, 2)]
-            with patch.object(build_targets, "hold_waited_on", return_value=holder):
+            with hold_only(holder, ci.owner):
                 for request in (second, ci, first, remote):
                     _ = fixture.server.handle_request(request)
                 result = fixture.run_pass()
@@ -897,7 +922,7 @@ class QueueMoveTests(unittest.TestCase):
             fixture.allow_next_start()
             holder = build_hold.Holder("fixture", datetime.fromtimestamp(fixture.clock.now(), UTC),
                                        "fixture hold", build_hold.UnknownReleaseEta(), "fixture")
-            with patch.object(build_targets, "hold_waited_on", return_value=holder):
+            with hold_only(holder, second_pin.owner):
                 _ = fixture.run_pass()
             self.assertIn(first.episode, fixture.server.reservations)
             fixture.free(0)

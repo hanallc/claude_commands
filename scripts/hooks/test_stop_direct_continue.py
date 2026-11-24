@@ -21,6 +21,7 @@ from unittest import mock
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
@@ -149,7 +150,7 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
         write_text_atomic(root / "staff.json", json.dumps({"schema": 2, "rows": [row.to_json()]}))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root),
-            "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": "/nonexistent/herdr",
+            "PYTHONDONTWRITEBYTECODE": "1", "HERDR_BIN": MISSING_HERDR_BIN,
             "XDG_STATE_HOME": str(root / "state"), 
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
             "SCRATCH_ROOT": str(root / "scratch"),

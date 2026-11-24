@@ -325,7 +325,8 @@ The file holds the request ID and the account or group.
 The move checks each selected member under the native lock.
 This check includes group members that appear to be on the target.
 A member on the target clears its pending file.
-A busy lock refuses a new request and prints a fresh `batch --target` command for an explicit target.
+A busy lock makes an automatic move report the row as pending.
+A user command waits for the row, and at its limit it prints a fresh `batch --target` command for an explicit target.
 For a group request, it prints `batch --group` so the batch reads the current group target under the session lock.
 `retry` can run only a saved request.
 The detached child checks its request ID before it reports a member outcome.
@@ -339,9 +340,11 @@ If the registry cannot prove liveness because the process start is unreadable, b
 Both commands name each file with a decode error and continue with valid files.
 Legacy reports supply display data only.
 Both commands show a fresh batch command for an off-target legacy member.
+The command uses `--group` when the legacy report names a group.
 `retry` starts a new move for each saved request that still needs a move.
 It uses the current selection for a saved group.
 A workers swap also selects eligible Codex producers.
+Their move requests record group scope and retain the selected account for retry.
 A producers group move selects only eligible Claude producers.
 `eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
 `producer_settings` returns `LaunchSettings` or `InvalidProducerSettings`.
@@ -358,10 +361,34 @@ The group command prints moved, pending, and failed members by staff name.
 A retry of the selected destination reuses the group transition ID.
 The refusal watcher skips members whose staff rows are busy.
 The watcher uses one read of the move journal for all members.
-It skips a member when the latest request was by hand, names a different account, and is newer than the group selection.
-A selection without a time is older than any move by hand.
+The watcher keeps a member on a different account when its latest individual move was by hand and newer than the group selection.
+Each new move request records a `scope` of `group` or `session`.
+Worker group requests and requests for their worker panes use `group`.
+The watcher treats legacy requests without `scope` as individual moves.
+A group request keeps the member eligible for completion.
+A selection without a time is older than any individual move by hand.
 A later group selection lets the watcher complete the move for that member.
 A pending refusal stays eligible until its move completes or a detached batch accepts it.
+Each machine completes only the group members in its own session registry.
+On natedev, the refusal pass of the notes timer completes them.
+On the Mac, the `usage-only` job runs `refusal_watch.complete_local_groups` after its usage read.
+The Mac pass runs at most once in each `parts.refusals.interval_seconds`, less half a poll, also after a failed move.
+Its schedule history is `~/.local/state/agent-notes/group-completion/completed.json`.
+Natedev is the only authority on which groups a machine may complete.
+Each natedev refusal pass that is not a dry run or a proof writes `~/.local/state/accounts/completion_plan.json`.
+The plan holds the pass time `at` and, for each permitted group, `target`, `cause`, `why` and `selected_at`.
+The plan leaves out a skipped group, a legacy selection and a target with an unresolved refusal.
+Legacy selections stay natedev's job, because natedev upgrades them in the role map.
+`accounts completion-plan-read` prints the plan on natedev, and the Mac reads it through the role map ssh transport.
+The Mac pass first reads its local group members and stops before ssh when no member is live.
+It then reads the plan fresh and does nothing when the plan is unreadable.
+It also does nothing when the plan is older than three `parts.refusals` intervals.
+Natedev runs its refusal part one interval after the last run ends, so two plans can be almost two intervals apart.
+The Mac completes only the planned groups, with the plan's target, cause and why.
+It applies the Mac journal check for moves by hand made after `selected_at`.
+It never writes the role map and never calls `set_group_account`.
+The move batch reads the group's current target again under the session row lock, so a later selection wins.
+The Mac pass uses the watch lock, the journal checks and detached moves, but no refusal placement or quota alerts.
 An in-progress result from another move keeps the refusal pending.
 The watcher saves the decision ID before it requests the move.
 A retry uses that decision ID when only some members still need to move.
@@ -412,12 +439,11 @@ An owned workers refusal checks `codex_can_work` before it selects another accou
 Remaining allowance or a positive balance with credits on keeps the current account working.
 Login faults and refusals from other homes never route workers to Claude or start no-worker mode.
 The existing login fault notice stays unchanged.
-No-worker mode requires exhaustion on the workers account and no alternate account from `accounts.pick`.
+No-worker mode requires exhaustion on the workers account and no alternate account from `accounts.pick`, except at weekly zero with credits off, where a failed move counts as no room.
 Unknown capacity cannot confirm exhaustion.
 The flag starts only on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
-The credits-off path uses the same capacity rule.
-A failed move does not start no-worker mode while another account has allowance or permitted credits.
+On the refusal path, a failed move does not start no-worker mode while another account has allowance or permitted credits. On the credits-off zero path, a failed move counts as no room and can start the mode.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.
@@ -623,8 +649,15 @@ The page shows forecast times in the user's time zone.
 
 The Roles table has one row per role.
 It shows the selected account for each role.
-Each role has a color swatch.
-Each count column shows the total for the role across all accounts.
+Each role has a color swatch and a line of its busy sessions over the last 24 hours.
+`scripts/accounts/role_activity.py` keeps those samples: the time and the busy count of each role.
+`role_activity.sample_now()` records one sample from the stored-usage status read, and the file keeps 24 hours.
+A gap longer than `role_activity.SAMPLE_GAP` (10 minutes) breaks the line. The notes job samples about every 2 minutes.
+The count columns are busy, idle and total. Each shows the total for the role across all accounts.
+A warning icon after the total names the paused and exited sessions of the role.
+`StatusRow.named_sessions_by_role` gives the staff name and state of each local session of a role.
+It is filled only for local sessions, and only when the read uses `include_models=True`.
+A peer count has no names, so the icon gives the count and `names unknown` for those sessions.
 The count tooltip lists counts by account when any observed sessions run outside the selected account.
 The tooltip also lists accounts outside the selected account when their counts are unknown.
 If the role has no selected account, the tooltip lists the count for each observed account.
@@ -644,6 +677,7 @@ The role column sorts by role name without regard to letter case.
 The next column sorts by its text without regard to letter case.
 `auto`, `none` and `unavailable` sort as words. Rows with no next move stay last.
 Role counts sort by the sum for the role, largest first.
+The busy line column has no sort.
 Missing values stay last in both directions.
 Select the active header again to reverse the order.
 Press Enter or Space to sort by a focused header.
@@ -681,6 +715,8 @@ The Accounts table shows each next move beside its role.
 Sorting keeps each next move with its role.
 A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
 A selected Codex workers line shows its first target, or `auto`, without a button.
+While it shows `auto`, each spare Codex line also shows `auto`; together these lines are the codex pair.
+`background.codex-pair` in `config/statusline.conf` tints the pair rows on the Accounts page.
 Other assignments show a minus icon.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
 One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
@@ -796,9 +832,9 @@ Explicit folders have no repository fallback.
 The [shared configuration contract](showrunner-automation.md#shared-runtime-configuration) defines reads, limits, and publication.
 
 `note_file.notes_dir()` gives `AGENT_NOTES_DIR` and an explicit `AGENTS_DIR` override precedence.
-Its private cached helper reads `notes_directory` at most once per process.
+Its private cached helper reads `notes_directory` again only when the accounts configuration file stamp changes.
 Account creation, identity resolution, and missing-note instructions use that same helper.
-A new process sees a changed notes-folder setting.
+A later call in the same process sees a changed notes-folder setting.
 
 The default usage age is ten minutes.
 Codex alert readings use the same `usage_stale_minutes` setting.
@@ -827,6 +863,8 @@ Account and role changes preserve these boundaries:
 The Tokens table appears below Models on the Accounts page.
 It shows each token's purpose, end date, days left, and state.
 The page uses the user's time zone and shows the renewal steps below the table.
+Each token's steps are closed by default under a **Renew `<name>`** or **Replace the token on the Mac** summary.
+A click on the summary opens the steps.
 Set a GitHub token's end date with `/tune showrunners token_expiry.<name>.ends <YYYY-MM-DD>`.
 The page warns during a reminder window and marks expired tokens as errors.
 The table includes the token that registers the Hana Linux CI runners.
@@ -845,7 +883,7 @@ The `mac_token.account` key in `config/showrunners.conf` sets the Claude account
 A blank or invalid label prompts the user to set the account.
 The relay and timer use no account probe.
 The note stores the token file's modification time and the times of relay results.
-The timer records a fresh observation at most once an hour for the same file.
+The timer records a fresh observation at most once in 12 hours for the same file: half the 24-hour stale limit (`OBSERVATION_INTERVAL = OBSERVATION_MAX_AGE / 2`).
 The page marks data stale when the observation is more than one day old, missing, or in the future.
 Replacing the file starts a new record.
 The page estimates expiry as 365 days after the modification time.

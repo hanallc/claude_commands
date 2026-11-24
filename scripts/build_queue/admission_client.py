@@ -31,8 +31,10 @@ import uuid
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
+from scripts.build_queue.admission_wire import assignment_what
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
 from scripts.build_queue.admission_wire import write_assignment as write_assignment
+from scripts.build_hold import owning_session
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET
 from scripts.build_targets import target_config
 from scripts.direct import step_selection
@@ -64,6 +66,12 @@ class PlacementConstraintBuilder(Protocol):
                  command: tuple[str, ...], session: placement.SubmittingSession,
                  source_key: execution_identity.SourceIdentity, routing: target_config.Routing,
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
+
+
+def placement_constraint_builder() -> PlacementConstraintBuilder:
+    """Load the fixed placement policy when a caller needs it."""
+    return cast(PlacementConstraintBuilder, getattr(
+        import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
 
 
 CLOCK: ClientClock = SystemClock()
@@ -385,15 +393,16 @@ def _is_placement_control(request: wire.Request) -> bool:
 
 def _waits_for_live_service(request: wire.Request) -> bool:
     """A placement call waits while a live service is slow, and fails at once when it is down."""
-    return _is_placement_control(request) or isinstance(request, status_wire.PlacementStatusRequest)
+    return _is_placement_control(request) or (
+        isinstance(request, status_wire.PlacementStatusRequest) and not request.include_permission)
 
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
+           | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    if wait_for_service and _waits_for_live_service(request):
-        reply = _call(request, lambda _wait: None)
+    if _waits_for_live_service(request):
+        reply = _call(request, lambda _wait: None, report_refusal=False)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
         if isinstance(reply, wire.Refused):
@@ -422,12 +431,37 @@ def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | 
         raise wire.AdmissionUnavailable(str(error) or "invalid answer") from error
 
 
-def placement_status(episode: str, attempt: str, *, wait_for_service: bool = True) -> status_wire.PlacementStatusReply:
+def placement_status(episode: str, attempt: str) -> status_wire.PlacementStatusReply:
     """Read a saved attempt without requesting authorization."""
-    reply = _query(status_wire.PlacementStatusRequest(episode, attempt), wait_for_service=wait_for_service)
+    reply = _query(status_wire.PlacementStatusRequest(episode, attempt))
     if isinstance(reply, status_wire.PlacementStatusReply):
         return reply
     raise wire.AdmissionUnavailable("invalid placement status answer")
+
+
+def _print_placement_permission(episode: str, attempt: str) -> int:
+    """Read launch permission once within the query time limit.
+
+    The service accepts a settled refusal after consumption only with proof that nothing started,
+    so `not_started` leaves no Mac cleanup to confirm.
+    """
+    reply = _query(status_wire.PlacementStatusRequest(episode, attempt, include_permission=True))
+    if isinstance(reply, status_wire.PlacementStatusReply) and isinstance(reply.status, status_wire.KnownPlacementStatus):
+        permission, report = reply.status.permission, reply.status.report
+        if isinstance(permission, placement.PermissionAvailable):
+            print("available")
+            return 0
+        if (isinstance(permission, placement.PermissionConsumed)
+                and isinstance(report, placement.TerminalAttemptReport)
+                and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                and isinstance(report.path, placement.DispatchPathSettled)):
+            print("not_started")
+            return 0
+        if isinstance(permission, placement.PermissionConsumed):
+            print("consumed")
+            return 0
+    print("unknown")
+    return 1
 
 
 def _print_placement_status(episode: str, attempt: str) -> int:
@@ -509,11 +543,18 @@ def token_prerequisite(choice: str) -> placement.TokenRequired | placement.Token
 def finish_step(path: Path, status: int, reason: str = "", *,
                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
                 ) -> wire.DispatchStatus:
-    from scripts.build_queue import placement
-
     reply = read_assignment(path)
     if not isinstance(reply, wire.LocalPlacementGranted):
         raise wire.AdmissionUnavailable("finish-step requires a local grant")
+    return finish_local(reply, status, reason, prerequisite=prerequisite)
+
+
+def finish_local(reply: wire.LocalPlacementGranted, status: int, reason: str = "", *,
+                 prerequisite: placement.LocalExecutionPrerequisite | KeepPlacementPrerequisite = KEEP_PLACEMENT_PREREQUISITE
+                 ) -> wire.DispatchStatus:
+    """Release a local grant with its status, and close its attempt; a reason closes it as refused before launch."""
+    from scripts.build_queue import placement
+
     if not isinstance(prerequisite, KeepPlacementPrerequisite):
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
@@ -907,9 +948,9 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         _ACQUISITION_RETRY.reset(token)
 
 
-def _unreachable(configuration: records.MemoryConfig | wire.AcquisitionTiming) -> _QueueUnreachable:
-    duration = _unreachable_duration(configuration.unreachable_limit_seconds)
-    return _QueueUnreachable(f"build queue unreachable for {duration}; step stopped; cargo token given back")
+def _unreachable(configuration: records.MemoryConfig | wire.AcquisitionTiming, *, holds_step: bool) -> _QueueUnreachable:
+    reason = f"build queue unreachable for {_unreachable_duration(configuration.unreachable_limit_seconds)}"
+    return _QueueUnreachable(f"{reason}; step stopped; cargo token given back" if holds_step else reason)
 
 
 def _begin_unreachable(retry: AcquisitionRetry, configuration: records.MemoryConfig | wire.AcquisitionTiming) -> None:
@@ -917,6 +958,38 @@ def _begin_unreachable(retry: AcquisitionRetry, configuration: records.MemoryCon
         retry.unreachable_deadline = CLOCK.monotonic() + configuration.unreachable_limit_seconds
         duration = _unreachable_duration(configuration.unreachable_limit_seconds)
         print(f"build queue not reachable; trying for {duration}", file=sys.stderr)
+
+
+@dataclass
+class ReconnectNotice:
+    pending: bool = False
+    restart_reported: bool = False
+
+    def disconnected(self, *, restarted: bool = False) -> None:
+        self.pending = True
+        if restarted and not self.restart_reported:
+            print("admission service restarted; waiting again", file=sys.stderr)
+            self.restart_reported = True
+
+    def reached(self, reply: wire.Reply) -> bool:
+        """Print the reconnect line once after a loss of contact; return whether it printed."""
+        if not self.pending:
+            return False
+        self.pending = False
+        reason = " ".join(_reconnect_wait_reason(reply).splitlines())
+        print("queue reached again" + (f": {reason}" if reason else ""), file=sys.stderr, flush=True)
+        return True
+
+
+def _reconnect_wait_reason(reply: wire.Reply) -> str:
+    wait = reply.wait if isinstance(reply, wire.PlacementWait) else reply
+    if isinstance(wait, (wire.Wait, wire.RepositorySlotWaiting)):
+        return wait.text
+    if isinstance(wait, wire.PlacementResourceWait):
+        return f"waiting for {wait.resource}: {wait.reason}"
+    if isinstance(wait, wire.PlacementEvidenceWait):
+        return "waiting for host evidence"
+    return ""
 
 
 def _transport_failure(error: OSError, retry: AcquisitionRetry,
@@ -959,13 +1032,13 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
     def deadline_reply(expired: DeadlineStop = AcquisitionDeadline.LAUNCH) -> wire.Refused | wire.RepositorySlotExpired:
         if expired is AcquisitionDeadline.UNREACHABLE:
             assert not isinstance(configuration, wire.CleanupTiming)
-            raise _unreachable(configuration)
+            raise _unreachable(configuration, holds_step=not placement_control)
         if slot_waiting is not None:
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
     last_valid = last_notice = CLOCK.monotonic()
-    restarted = False
+    reconnect = ReconnectNotice()
     showed_slot = False
     while True:
         if retry.left_queue():
@@ -1004,11 +1077,13 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                         if retry.launch_without_wait:
                             return deadline_reply()
                         _silence_notice(last_valid)
+                        reconnect.disconnected()
                         last_notice = CLOCK.monotonic()
                         continue
                     reply = _parse_acquisition_reply(line, request)
                     if CLOCK.monotonic() > retry.deadline:
                         return deadline_reply()
+                    rejoined = reconnect.reached(reply)
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
@@ -1020,7 +1095,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                             return reply
                         if not isinstance(reply, wire.RepositorySlotWaiting):
                             raise CheckerFailure("invalid repository slot answer")
-                        if reply != slot_waiting or not showed_slot:
+                        if (reply != slot_waiting or not showed_slot) and not rejoined:
                             print(reply.text, file=sys.stderr)
                         slot_waiting = reply
                         showed_slot = True
@@ -1060,10 +1135,10 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                 return deadline_reply()
             if (expired := retry.expired()) is not None:
                 return deadline_reply(expired)
-            if _transport_failure(error, retry, configuration, bound_outage=bound_outage):
-                if not restarted:
-                    print("admission service restarted; waiting again", file=sys.stderr)
-                    restarted = True
+            restarted = _transport_failure(error, retry, configuration, bound_outage=bound_outage)
+            if restarted or bound_outage:
+                reconnect.disconnected(restarted=restarted)
+            if restarted:
                 continue
             CLOCK.sleep(retry.bound(configuration.reconnect_seconds))
 
@@ -1172,7 +1247,7 @@ def _acquire(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
     if cause is AcquisitionDeadline.LAUNCH:
         return refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
     if cause is AcquisitionDeadline.UNREACHABLE:
-        raise _unreachable(configuration)
+        raise _unreachable(configuration, holds_step=True)
     if isinstance(cause, _QueueUnreachable):
         raise cause
     assert isinstance(cause, CheckerFailure)
@@ -1195,7 +1270,8 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
     last_valid = last_notice = reconnect_at = CLOCK.monotonic()
     if isinstance(configuration, wire.AcquisitionTiming) and retry.unreachable_deadline == math.inf:
         retry.unreachable_deadline = last_valid + configuration.unreachable_limit_seconds
-    had_wait = restarted = estimate_pending = False
+    had_wait = estimate_pending = False
+    reconnect = ReconnectNotice()
     waiting_callback: tuple[socket.socket, wire.Wait] | None = None
     refreshing: EstimateRefresh | None = None
     refreshed_write: tuple[socket.socket, AdmissionRequest] | None = None
@@ -1210,11 +1286,9 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         checker.fail(error, interval, failure_limit)
 
     def transport_failed(error: OSError) -> None:
-        nonlocal restarted
         _begin_unreachable(retry, configuration)
-        if _transport_failure(error, retry, configuration, bound_outage=False) and not restarted:
-            print("admission service restarted; waiting again", file=sys.stderr)
-            restarted = True
+        restarted = _transport_failure(error, retry, configuration, bound_outage=False)
+        reconnect.disconnected(restarted=restarted)
 
     if (expired := retry.expired()) is not None:
         return request, expired
@@ -1257,7 +1331,11 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                 refreshing = None
                 refreshed_write = None
 
-        if sockets.terminal() is not None:
+        if (answer := sockets.terminal()) is not None:
+            # A wait that arrived in the same read as the answer is the first answer after a reconnect.
+            owner_stream = sockets.streams.get(sockets.owner) if sockets.owner is not None else None
+            replies = owner_stream.replies if owner_stream is not None else ()
+            _ = reconnect.reached(next((reply for reply in replies if isinstance(reply, wire.Wait)), answer))
             return request, None
         if retry.launch_without_wait and any(stream.error is not None for stream in sockets.streams.values()):
             return request, AcquisitionDeadline.LAUNCH
@@ -1274,6 +1352,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
         message = sockets.next_reply()
         if message is not None and message[0] is sockets.owner and isinstance(message[1], wire.Wait):
             wait = message[1]
+            _ = reconnect.reached(wait)
             last_valid = last_notice = now
             if refreshing is None or sockets.streams[message[0]].history_lookup is None:
                 reconnect_at = math.inf
@@ -1297,6 +1376,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
                 and (message is None or message[0] is not history.connection or isinstance(message[1], wire.Wait))):
             fail_history(CheckerFailure("no build history generation answer"))
             _begin_unreachable(retry, configuration)
+            reconnect.disconnected()
             if len(sockets.streams) == 1:
                 reconnect_at = min(reconnect_at, now)
             continue
@@ -1308,6 +1388,7 @@ def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: Admi
             _silence_notice(last_valid)
             last_notice = now
             _begin_unreachable(retry, configuration)
+            reconnect.disconnected()
             if len(sockets.streams) == 1 and reconnect_at == math.inf:
                 reconnect_at = now
 
@@ -1735,8 +1816,9 @@ class WaitOutput:
         order = snapshot.decision.order_hold
         if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead):
             blocker = order.waiter
+            what = snapshot_codec.row_what(blocker.get("what", ""), blocker.get("step", ""))
             label = snapshot_codec.wait_line_name(blocker.get("unit", ""), blocker.get("session_name", ""),
-                blocker.get("folder", ""), blocker.get("step", ""), fallback_name=cause.head_name)
+                blocker.get("folder", ""), what, fallback_name=cause.head_name)
             reasons = (blocking_waiter_text(reply.text, label, blocker["need"] / records.GIB),)
         else:
             reasons = wait_reasons(snapshot)
@@ -1816,9 +1898,28 @@ INFER_PROFILE_AT_USE = InferProfileAtUse()
 def step_identity(step: str, worktree: str) -> wire.Identity:
     from scripts.build_queue import admission_records as records
 
-    identity = records.waiter_identity(step, worktree)
+    return owned_identity(step, worktree, records.request_owner(worktree or os.getcwd()))
+
+
+def owned_identity(step: str, worktree: str, owner: records.QueueCaller | records.OwnerNotGiven) -> wire.Identity:
+    from scripts.build_queue import admission_records as records
+
+    identity = records.waiter_identity(step, worktree, owner)
     return wire.Identity(identity["session_id"], identity["session_name"], identity["step"],
                          identity["folder"], identity.get("unit", ""))
+
+
+OWNER_REFUSAL = ("build queue refused the step: it does not say who started it ({program}). "
+                 "Set BUILDLOG_OWNER_STAFF_ID to the owner's staff id, or CLAUDE_SESSION_NAME to a name "
+                 "when no staff member owns the work.")
+
+
+def refuse_unowned(owner: records.QueueCaller | records.OwnerNotGiven) -> None:
+    """Refuse a request that does not say who started it, before it enters the queue."""
+    from scripts.build_queue import admission_records as records
+
+    if isinstance(owner, records.OwnerNotGiven):
+        raise CheckerFailure(OWNER_REFUSAL.format(program=owner.program))
 
 
 def verify_call() -> records.VerifyStep:
@@ -1859,14 +1960,16 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
         records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = replace(step_identity(estimate.profile.step, estimate.profile.worktree), verify=verify_call())
+    caller = records.request_owner(estimate.profile.worktree or os.getcwd())
+    refuse_unowned(caller)
+    identity = replace(owned_identity(estimate.profile.step, estimate.profile.worktree, caller), verify=verify_call())
     if isinstance(estimate.profile, records.ProgramProfile):
         identity = replace(identity, folder=estimate.profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
         identity,
         records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
         isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run,
-        route=records.direct_cargo_route())
+        route=records.direct_cargo_route(), session=owning_session.owning_session())
 
 
 def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, elapsed: int) -> None:
@@ -1965,6 +2068,7 @@ class ClientArguments(argparse.Namespace):
     sidecar: str = ""
     shell_state: Path | None = None
     wait_events: bool = False
+    launch_only: bool = False
     argv: list[str] = []
     episode: str = ""
     attempt: str = ""
@@ -2077,6 +2181,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             cargo_folder = placement.CargoFolder(args.cargo_folder.resolve())
 
         local = refresh_local()
+        # Read the caller's own text before a placement replaces the assignment file.
+        identity = replace(local.identity, what=assignment_what(args.assignment_file))
         session = OwningSession(args.session_id) if args.session_id else NoOwningSession()
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
         selection = (step_selection.Pinned(args.target) if args.target else
@@ -2088,8 +2194,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             kind = "test"
         elif kind in ("clippy", "mend-check"):
             kind = "lint"
-        builder = cast(PlacementConstraintBuilder, getattr(
-            import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
+        builder = placement_constraint_builder()
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
             cast(placement.CommandKind, kind), tuple(step_argv), session,
             execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),
@@ -2103,7 +2208,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                         token_prerequisite(args.token) if args.token in TOKEN_REQUIRED_CHOICES else
                         placement.TokenHeld() if args.token == "held" else placement.TokenNotRequired())
         request = wire.PlacementRequest(episode, owner, args.since, local.profile, constraints,
-            identity=local.identity, run=local.run,
+            identity=identity, run=local.run,
             local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
@@ -2208,6 +2313,7 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
+    _ = status_parser.add_argument("--launch-only", action="store_true")
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
@@ -2272,6 +2378,8 @@ def main(argv: list[str] | None = None) -> int:
     retry_token = _ACQUISITION_RETRY.set(AcquisitionRetry(float("inf")))
     try:
         if args.command == "placement-status":
+            if args.launch_only:
+                return _print_placement_permission(args.episode, args.attempt)
             return _print_placement_status(args.episode, args.attempt)
         if args.command == "down-alert":
             return down_alert()

@@ -70,10 +70,10 @@ An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Wi
 Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
-Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-A producer other than morty asks morty to add, close, park, or assign its items.
-It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
+Add your own items with `the_list.py add`. Park or close your own item only on nate's word, and quote his words in `--source`. Ask morty only to assign an item to a different producer.
+Ask morty to record updates and decisions that you cannot write with `the_list.py`.
 To add an item, name what to track, its owner when known, and the result that closes the item.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.
@@ -105,7 +105,11 @@ Write no present time; the tools add it. Write each past or future time, such as
 Ask the showrunner before you alert nate to a stall. A quiet log during a build queue wait is normal.
 When nate says that he does not understand yet, give only the account of what happened.
 Give no recommendation and no request until he says that it is clear.
-When a peer request or a pause stops a discussion with nate, show him again where the discussion stood.
+When a peer request or a pause stops a discussion with nate, name in a few words where it stood and ask whether he is willing to look at it.
+Show it in full only after he says yes.
+Your text to nate while he is away follows this import:
+
+@~/.claude/docs/idle_update.md
 
 ## Transfer
 

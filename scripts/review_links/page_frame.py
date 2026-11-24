@@ -18,7 +18,8 @@ from scripts.review_links import setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
-OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "rebuilds", "review"))
+OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
+                         "rebuilds", "review"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
 
@@ -34,15 +35,11 @@ class NoShownOwner:
     """There is no staff name to show in the page heading."""
 
 
-def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
-               dialog: Callable[[], str], *,
-               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
-    """Add the shared owner control to one served console document."""
+def owner_control(page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot, *,
+                  recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> str:
+    """Render the owner name and its New item button."""
     from scripts.review_links import staff_names
 
-    main = re.search(rb"<main(?=[\s>])[^>]*>", content)
-    if main is None or b'data-page-owner="' in content:
-        return content
     name = ""
     if isinstance(owner, staff.StaffRow):
         rendered = staff_names.StaffNames(members).html(owner.id, owner.name)
@@ -57,7 +54,17 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
         label = html.escape(label, quote=True)
         button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
                   + icon_svg("message-circle-question") + '</button>')
-    control = (f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>').encode()
+    return f'<div class="page-owner" data-page-owner="{page}">' + name + button + '</div>'
+
+
+def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, members: staff.StaffSnapshot,
+               dialog: Callable[[], str], *,
+               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
+    """Add the shared owner control to one served console document."""
+    main = re.search(rb"<main(?=[\s>])[^>]*>", content)
+    if main is None or b'data-page-owner="' in content:
+        return content
+    control = owner_control(page, owner, members, recipient=recipient).encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
     if heading is not None:
@@ -69,13 +76,13 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow | NoShownOwner, 
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
     row_style = HEADING_STYLE.encode()
-    style = OWNER_STYLE.encode()
+    style = (OWNER_STYLE + HEADING_POSITION).encode()
     if BUTTON_STATES.encode() not in content:
         style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
     if row_style not in content:
         style = b'<style>' + row_style + b'</style>' + style
     content = content.replace(b'</head>', style + b'</head>', 1)
-    if button:
+    if recipient is not OwnerNewItem.UNAVAILABLE:
         markup = dialog()
         if CONSOLE_DIALOG_ASSETS.encode() in content:
             markup = markup.replace(CONSOLE_DIALOG_ASSETS, '', 1)
@@ -89,13 +96,62 @@ HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;g
                  + 'max-width:100%;margin-inline-start:auto}')
 
 
+# The stacking order, lowest to highest: page content with its own sticky bars (z-index 3 or lower),
+# the heading row (4), overlays such as tooltips, menus and the Builds paused badge (5 to 10),
+# and the sticky status line (20).
 OWNER_STYLE = """<style>
 .page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
 .page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
-margin:0;padding:7px;background:var(--card);color:var(--ink-2);border:1px solid var(--line);border-radius:8px;cursor:pointer}
+margin:0;padding:7px;background:var(--card,#1a1a19);color:var(--ink-2,#c3c2b7);border:1px solid var(--line,#34332f);border-radius:8px;cursor:pointer}
 .page-owner svg{width:18px;height:18px}
+:root{--page-heading-space:8px;--page-heading-top:var(--page-heading-space)}
+:is(.page-heading,main>.page-heading-actions){position:sticky;top:var(--page-heading-space);z-index:4;
+background:var(--bg,Canvas)}
+:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]{box-shadow:0 1px 0 var(--line)}
+:is(.page-heading,main>.page-heading-actions)[data-page-heading-stuck]::before{content:'';position:absolute;
+inset:auto 0 100%;height:var(--page-heading-space);background:inherit}
 </style>"""
+
+
+# The heading row sticks with a space above it. At scroll zero it stays in its normal place.
+# A stuck row shows an opaque band in the space and a line under it. Neither takes layout space.
+# A Late or Failed status line sticks directly below the stuck row, so the page order never changes.
+HEADING_POSITION = """<script>
+function stickyPageStatusHeight(){
+ const banner=document.querySelector('[data-page-status]');
+ return banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
+}
+function pageHeadingSpace(){
+ return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--page-heading-space'));
+}
+function stuckPageHeadingBottom(){
+ const row=document.querySelector('.page-heading,main>.page-heading-actions');
+ return pageHeadingSpace()+row.getBoundingClientRect().height+stickyPageStatusHeight();
+}
+document.addEventListener('DOMContentLoaded',()=>{
+ const root=document.documentElement.style;
+ const row=document.querySelector('.page-heading,main>.page-heading-actions');
+ const banner=document.querySelector('[data-page-status]');
+ const set=(name,pixels)=>{if(root.getPropertyValue(name)!==pixels+'px') root.setProperty(name,pixels+'px');};
+ // The row is stuck when its sticky top clips it.
+ new IntersectionObserver(entries=>row.toggleAttribute('data-page-heading-stuck',entries.at(-1).intersectionRatio<1),
+  {root:document,rootMargin:-(pageHeadingSpace()+1)+'px 0px 0px 0px',threshold:1}).observe(row);
+ const place=()=>{
+  set('--page-status-height',stickyPageStatusHeight());
+  set('--page-heading-height',row.getBoundingClientRect().height);
+ };
+ const resize=new ResizeObserver(place);
+ resize.observe(row);
+ if(banner){
+  resize.observe(banner);
+  // The clock writes the same state each second; only a new state can change the position.
+  new MutationObserver(records=>{if(records.some(record=>record.oldValue!==banner.dataset.state)) place();})
+   .observe(banner,{attributeFilter:['data-state'],attributeOldValue:true});
+ }
+ place();
+},{once:true});
+</script>"""
 
 
 PAGE_SCRIPT_ERRORS = r"""<script>(() => {
@@ -341,7 +397,8 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 .page-status[data-state=Late] .page-status-state,.page-status-slow{color:var(--warning)}
 .page-status[data-state=Failed] .page-status-state{color:var(--error)}
 .page-status[data-state=Paused] .page-status-state{color:var(--ink-3)}
-.page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;top:0;z-index:20;padding:4px 0}
+.page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;z-index:20;padding:4px 0;
+top:calc(var(--page-heading-space,0px) + var(--page-heading-height,0px))}
 .page-status-announcement{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}
@@ -513,34 +570,106 @@ document.addEventListener('click',async event=>{
 });
 })();'''
 
-# A plain click on a data-image-zoom link shows its image over the page; Escape returns.
+# A plain click on a data-image-zoom link shows its image over the page; Escape returns focus to that link.
 # A click with a modifier key, or any other button, keeps the browser's link action.
+# In a data-image-zoom-group, the left and right arrow keys and the arrow buttons show the previous
+# and next image, and a badge names the shown image (Before or After for a pair).
+# A button's hover tip names its key (the ◀ and ▶ keys on a Mac) and the image it shows.
+# A touch screen has no hover, so a tap only moves and never shows a tip that names a key.
+# The zoom keeps hrefs, not link nodes, so a page refresh while it is open changes nothing.
 ZOOM_STYLE = '''
 :root:has([data-image-zoom-dialog][open]){overflow:hidden;scrollbar-gutter:stable}
 [data-image-zoom]{cursor:zoom-in}
 [data-image-zoom-dialog]{position:fixed;inset:0;box-sizing:border-box;width:100vw;height:100dvh;
 max-width:none;max-height:none;margin:0;padding:16px;border:0;background:#000d;outline:none;overflow:hidden}
-[data-image-zoom-dialog][open]{display:grid;place-items:center}
+[data-image-zoom-dialog][open]{display:grid;place-items:center;align-content:center;gap:8px}
+[data-image-zoom-dialog] [data-image-zoom-badge]{padding:4px 12px;border-radius:8px;background:#000c;color:#fff;
+font:600 14px/20px system-ui,sans-serif}
+[data-image-zoom-dialog]:has([data-image-zoom-badge]:not([hidden])) img{max-height:calc(100dvh - 68px)}
 [data-image-zoom-dialog]::backdrop{background:transparent}
+[data-image-zoom-step]{position:fixed;top:50%;transform:translateY(-50%);width:48px;height:48px;padding:0;
+display:grid;place-items:center;border:1px solid #fff4;border-radius:24px;background:#000c;color:#fff;cursor:pointer}
+[data-image-zoom-step]:not([disabled]):is(:hover,:focus-visible){background:#222;border-color:#fff8}
+[data-image-zoom-step][disabled]{opacity:.3;cursor:default}
+[data-image-zoom-step][hidden]{display:none}
+[data-image-zoom-step] svg{width:24px;height:24px}
+[data-image-zoom-step="-1"]{left:24px}
+[data-image-zoom-step="1"]{right:24px}
+[data-image-zoom-tip]{position:absolute;top:calc(100% + 10px);padding:7px 11px;border-radius:6px;background:#e8e8e8;
+color:#111;font:500 13px/18px system-ui,sans-serif;white-space:nowrap;box-shadow:0 3px 12px #0006;pointer-events:none;
+visibility:hidden}
+[data-image-zoom-step="-1"] [data-image-zoom-tip]{left:0}
+[data-image-zoom-step="1"] [data-image-zoom-tip]{right:0}
+[data-image-zoom-step]:not([disabled]):focus-visible [data-image-zoom-tip]{visibility:visible}
+@media (hover:hover){[data-image-zoom-step]:not([disabled]):hover [data-image-zoom-tip]{visibility:visible}}
+[data-image-zoom-tip] kbd{display:inline-block;min-width:18px;margin:0 2px;padding:0 4px;border:1px solid #999;
+border-bottom-width:2px;border-radius:4px;background:#fff;font:700 16px/18px system-ui,sans-serif;text-align:center}
 [data-image-zoom-dialog] img{display:block;width:auto;height:auto;max-width:100%;max-height:calc(100dvh - 32px);
 border:0;border-radius:0;cursor:zoom-out}
 '''
 
 ZOOM_SCRIPT = r'''(() => {
-const dialog=document.createElement('dialog'), image=document.createElement('img');
+const dialog=document.createElement('dialog'), image=document.createElement('img'), badge=document.createElement('div');
 dialog.dataset.imageZoomDialog='';dialog.setAttribute('role','dialog');
 dialog.setAttribute('aria-modal','true');dialog.tabIndex=-1;
-dialog.append(image);document.body.append(dialog);
-let source=null, position=[0,0];
+badge.dataset.imageZoomBadge='';badge.setAttribute('aria-live','polite');badge.hidden=true;
+const mac=/Mac/.test(navigator.userAgentData?.platform || navigator.platform);
+const arrow=paths=>'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+ +'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+ +paths.map(path=>'<path d="'+path+'"/>').join('')+'</svg>';
+const steps=[[-1,mac ? '◀' : '←','ArrowLeft',['m12 19-7-7 7-7','M19 12H5'],'previous'],
+ [1,mac ? '▶' : '→','ArrowRight',['M5 12h14','m12 5 7 7-7 7'],'next']].map(([step,key,shortcut,paths,place])=>{
+ const button=document.createElement('button'), tip=document.createElement('span'), kbd=document.createElement('kbd');
+ const name=document.createTextNode('');
+ button.type='button';button.dataset.imageZoomStep=String(step);button.hidden=true;
+ button.setAttribute('aria-keyshortcuts',shortcut);button.innerHTML=arrow(paths);
+ kbd.textContent=key;tip.dataset.imageZoomTip='';tip.setAttribute('aria-hidden','true');
+ tip.append('Press ',kbd,' to show ',name);button.append(tip);return {step,place,button,name};
+});
+dialog.append(badge,image,...steps.map(item=>item.button));document.body.append(dialog);
+let opener='', shown='', position=[0,0];
+const live=href=>[...document.querySelectorAll('a[data-image-zoom]')].find(link=>link.getAttribute('href')===href);
+function neighbor(step){
+ const current=live(shown), group=current?.closest('[data-image-zoom-group]');
+ const links=group ? [...group.querySelectorAll('a[data-image-zoom]')].filter(item=>item.querySelector('img')) : [];
+ return {grouped:links.length>1, next:links[links.indexOf(current)+step]};
+}
+// A page refresh can change the group while the zoom is open, so each move checks the buttons again.
+function syncSteps(){
+ for(const {step,place,button,name} of steps){
+  const {grouped,next}=neighbor(step), text=next?.dataset.imageZoomLabel || 'the '+place+' image';
+  button.hidden=!grouped;button.disabled=!next;button.setAttribute('aria-label','Show '+text);name.data=text;
+ }
+}
+function show(link){
+ const thumbnail=link.querySelector('img');
+ shown=link.getAttribute('href');image.alt=thumbnail.alt;image.src=link.href;
+ badge.textContent=link.dataset.imageZoomLabel || '';badge.hidden=!badge.textContent;
+ dialog.setAttribute('aria-label',thumbnail.alt || 'Image');
+ syncSteps();
+}
+function move(step){
+ const {next}=neighbor(step);
+ if(next) show(next);else syncSteps();
+ return Boolean(next);
+}
 function close(){
  if(!dialog.open) return;
  dialog.close();image.removeAttribute('src');
- if(source?.isConnected) source.focus({preventScroll:true});
- window.scrollTo(...position);source=null;
+ live(opener)?.focus({preventScroll:true});
+ window.scrollTo(...position);opener=shown='';
 }
 dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
 dialog.addEventListener('keydown',event=>{
- if(event.key==='Escape'){event.preventDefault();close();}
+ if(event.key==='Escape'){event.preventDefault();close();return;}
+ const step={ArrowLeft:-1,ArrowRight:1}[event.key];
+ if(!step || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+ if(move(step)) event.preventDefault();
+});
+// A button that turns off at the end of the group hands focus back to the large view, so the keys keep working.
+for(const {step,button} of steps) button.addEventListener('click',()=>{
+ move(step);
+ if(button.disabled) dialog.focus({preventScroll:true});
 });
 document.addEventListener('click',event=>{
  if(dialog.open && (event.target===dialog || event.target===image)){close();return;}
@@ -548,9 +677,8 @@ document.addEventListener('click',event=>{
  const link=event.target instanceof Element ? event.target.closest('a[data-image-zoom]') : null;
  const thumbnail=link?.querySelector('img');
  if(!thumbnail) return;
- event.preventDefault();source=link;position=[window.scrollX,window.scrollY];
- image.alt=thumbnail.alt;image.src=link.href;
- dialog.setAttribute('aria-label',thumbnail.alt || 'Image');
+ event.preventDefault();position=[window.scrollX,window.scrollY];
+ opener=link.getAttribute('href');show(link);
  dialog.showModal();dialog.focus({preventScroll:true});
 });
 })();'''

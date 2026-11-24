@@ -38,6 +38,8 @@ from scripts.lib.conf import UseConfiguredValue
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
 
+TEST_RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
+
 # Python's mkdtemp allocator uses this suffix.
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
@@ -540,6 +542,30 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
                 return InvalidFolderComponents("the path has the wrong number of components")
     except ValueError as error:
         return InvalidFolderComponents(str(error))
+
+
+def test_runs_parent(checkout: Path) -> Path:
+    """Use the selected checkout's build output or its temporary parent."""
+    target = checkout / "target"
+    output = None
+    if isinstance(parse_form(checkout), BuildCopy):
+        if not target.is_symlink():
+            output = target
+    elif target.is_symlink():
+        with suppress(OSError, RuntimeError):
+            linked_output = target.resolve(strict=True)
+            if linked_output.is_dir() and isinstance(parse_form(linked_output), (WorktreeOutput, MainOutput)):
+                output = linked_output
+    if output is not None:
+        parent = output / "test-runs"
+        if parent.is_symlink():
+            raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
+        return parent
+
+    inherited = inherited_temporary_parent().resolve()
+    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV):
+        return inherited.parent
+    return inherited / "test-runs"
 
 
 def repository_git_timeout() -> float:
@@ -1489,7 +1515,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 new_folder = False
                 try:
                     if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind not in ("copy", "slot") and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind not in ("copy", "slot")):
+                                      wait=spec.kind not in ("copy", "slot") and not isinstance(original, UniqueBuildFolder)):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -1913,36 +1939,51 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             _release_build_folder(path)
 
 
+class _FolderRemoval(Enum):
+    REMOVED = "removed the folder"
+    PROTECTED = "the folder is protected"
+    LOCK_HELD = "the folder lock is held"
+    LOCK_CHANGED = "the folder lock file changed"
+    CLEANUP_KEPT = "the cleanup kept the folder"
+    FOLDER_PRESENT = "the folder still exists after cleanup"
+
+
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
                         dir_fd: int | None = None, wait: bool = True) -> bool:
     """Run cleanup under the free folder's lock, then remove temporary metadata."""
+    return _remove_build_folder(path, cleanup, temporary=temporary, dir_fd=dir_fd,
+                                wait=wait) is _FolderRemoval.REMOVED
+
+
+def _remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
+                         dir_fd: int | None = None, wait: bool = True) -> _FolderRemoval:
     if not may_remove_build_path(path):
-        return False
+        return _FolderRemoval.PROTECTED
     with ExitStack() as parents:
         try:
             directory = dir_fd if dir_fd is not None else parents.enter_context(
                 build_folder_lock.folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
             # An absent parent has no folder or metadata to lock.
-            return cleanup() is not False
+            return _FolderRemoval.CLEANUP_KEPT if cleanup() is False else _FolderRemoval.REMOVED
         descriptor = build_folder_lock.open_lock(path, directory, create=True)
         try:
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return False
+                return _FolderRemoval.LOCK_HELD
             if not build_folder_lock.lock_current(path, directory, descriptor):
-                return False
+                return _FolderRemoval.LOCK_CHANGED
             try:
                 if cleanup() is False:
-                    return False
+                    return _FolderRemoval.CLEANUP_KEPT
             except FileNotFoundError:
                 if temporary and not _folder_exists(path, directory):
                     _unlink_metadata(path, directory)
                 raise
             if _folder_exists(path, directory):
-                return False
+                return _FolderRemoval.FOLDER_PRESENT
             if temporary:
                 _unlink_metadata(path, directory)
-            return True
+            return _FolderRemoval.REMOVED
         finally:
             os.close(descriptor)
 
@@ -2216,6 +2257,19 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
 
 
 def main(argv: Sequence[str]) -> int:
+    # verify_helper.py runs main in its long-lived process. A lock kept past the call loses its
+    # owner when the helper reloads this module, and a later remove cannot take that lock.
+    # Thus each call releases the locks it took, as a process that exits does.
+    held = set(_locks.items())
+    try:
+        return _command(argv)
+    finally:
+        for descriptor, path in list(_locks.items()):
+            if (descriptor, path) not in held:
+                _release_build_folder(path, descriptor=descriptor)
+
+
+def _command(argv: Sequence[str]) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2314,7 +2368,11 @@ def main(argv: Sequence[str]) -> int:
                     shutil.rmtree(path)
                 except FileNotFoundError:
                     pass
-            return 0 if remove_build_folder(path, cleanup) else 1
+            removal = _remove_build_folder(path, cleanup)
+            if removal is not _FolderRemoval.REMOVED:
+                print(f"build folders: {path}: {removal.value}", file=sys.stderr)
+                return 1
+            return 0
         if command == "run-temp-path":
             from scripts.lib import unit_runs
 
