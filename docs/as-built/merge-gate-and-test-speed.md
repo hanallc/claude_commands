@@ -52,6 +52,22 @@ Order the latest run's module attempts with this query:
 buildlog query "SELECT module, module_started_at, module_ended_at FROM gate_modules WHERE run_id = (SELECT id FROM gate_runs ORDER BY started_at DESC LIMIT 1) ORDER BY module_started_at"
 ```
 
+## Module rankings
+
+`show.py top` ranks live gate modules by median CPU time.
+It keeps passed, unrestarted attempts from the selected host, checkout and time window.
+Each module uses one attempt per run, up to `TOP_RUNS`.
+The commit time of the merge base with `origin/main` orders the runs.
+The newest start time breaks ties.
+Runs with unknown commit times fill any remaining places.
+`last s` uses the latest start among the counted runs.
+`code date` shows that run's merge-base date as MM-DD in the user zone.
+If the commit time is unavailable, the column shows `unknown`.
+`unmeasured` lists modules without eligible records.
+
+The report caches merge-base times by the main commit and run commit.
+It checks commit availability in one Git batch, so a later fetch can change a run's order.
+
 ## Whole gate route
 
 The gate reads the target from the bounded assignment file at `BUILDLOG_PLACEMENT_FILE`.

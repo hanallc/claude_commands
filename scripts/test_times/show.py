@@ -13,12 +13,15 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 import json
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import statistics
+import subprocess
 import sys
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -33,7 +36,7 @@ else:
     from scripts.buildlog.mac_outcome import DURATION_NOT_RECORDED, DurationNotRecorded
 
 TOOL_REPOSITORY = Path(__file__).resolve().parents[2]
-from scripts.lib import conf, file_lock
+from scripts.lib import conf, file_lock, git_files
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
@@ -140,11 +143,185 @@ def mebibytes(value: float) -> str:
     return f"{value:.3f}"
 
 
+def ranking_git(repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+    """Read Git history without fetching missing objects."""
+    result = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(repo), *arguments],
+        input=input_text, capture_output=True, text=True, check=False, timeout=treekey.GIT_TIMEOUT_S,
+        env={**os.environ, **treekey.NO_FETCH_ENVIRONMENT},
+    )
+    if result.returncode == 1 and missing_ok:
+        return ""
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or f"git {arguments[0]} failed")
+    return result.stdout
+
+
+def resolve_run_commits(repo: Path, revisions: set[str]) -> dict[str, str]:
+    """Resolve recorded commit IDs in one Git batch."""
+    names = sorted(revision for revision in revisions if re.fullmatch(r"[0-9a-fA-F]{4,64}", revision))
+    if not names:
+        return {}
+    replies = ranking_git(repo, "cat-file", "--batch-check", input_text="\n".join(names) + "\n")
+    resolved: dict[str, str] = {}
+    for name, reply in zip(names, replies.splitlines(), strict=True):
+        commit, kind, *_ = reply.split()
+        if kind == "commit":
+            resolved[name] = commit
+    return resolved
+
+
+def merge_base_times(repo: Path, main: str, commits: set[str]) -> dict[str, int | None]:
+    """Find the merge-base times for unmeasured commits with one graph walk."""
+    tips = sorted(commits)
+    graph = ranking_git(repo, "rev-list", "--topo-order", "--timestamp", "--parents", "--stdin",
+                        input_text="\n".join([main, *tips]) + "\n")
+    main_ancestors = {main}
+    pending = {tip: 1 << number for number, tip in enumerate(tips)}
+    covered: dict[str, int] = {}
+    ages: dict[str, int | None] = dict.fromkeys(tips)
+    ambiguous: set[str] = set()
+    for line in graph.splitlines():
+        stamp, commit, *parents = line.split()
+        bits = pending.pop(commit, 0)
+        blocked = covered.pop(commit, 0)
+        if commit in main_ancestors:
+            main_ancestors.update(parents)
+            # Each bit names a run. An earlier base masks its ancestors for that run.
+            while bits:
+                bit = bits & -bits
+                tip = tips[bit.bit_length() - 1]
+                if ages[tip] is not None:
+                    ambiguous.add(tip)
+                ages[tip] = int(stamp)
+                bits ^= bit
+                blocked |= bit
+        for parent in parents:
+            if blocked:
+                covered[parent] = covered.get(parent, 0) | blocked
+            if bits or blocked:
+                pending[parent] = (pending.get(parent, 0) | bits) & ~covered.get(parent, 0)
+
+    # Git chooses the base when a run has several equally good common ancestors.
+    for tip in ambiguous:
+        base = ranking_git(repo, "merge-base", tip, main).strip()
+        ages[tip] = int(ranking_git(repo, "show", "-s", "--format=%ct", base).strip())
+    return ages
+
+
+def top_cache_root() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "claude" / "test-times"
+
+
+def run_code_ages(repo: Path, revisions: set[str]) -> dict[str, int | None]:
+    """Cache known merge-base times for the main commit and shallow boundary."""
+    if not revisions:
+        return {}
+    main = ranking_git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}",
+                       missing_ok=True).strip()
+    if not main:
+        return {}
+    resolved = resolve_run_commits(repo, revisions)
+    shallow_file = git_files.locate(repo).common_dir / "shallow"
+    try:
+        shallow = sha256(shallow_file.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        shallow = ""
+    path = top_cache_root() / "gate-top-code-age.json"
+    ages: dict[str, int] = {}
+    try:
+        payload = cast(object, json.loads(path.read_text()))
+        if isinstance(payload, dict):
+            document = cast(dict[str, object], payload)
+            saved = document.get("times")
+            if document.get("main") == main and document.get("shallow") == shallow and isinstance(saved, dict):
+                ages = {commit: age for commit, age in cast(dict[str, object], saved).items()
+                        if type(age) is int}
+    except (OSError, ValueError):
+        pass
+    missing = set(resolved.values()) - ages.keys()
+    found = merge_base_times(repo, main, missing) if missing else {}
+    known = {commit: age for commit, age in found.items() if age is not None}
+    if known:
+        ages.update(known)
+        try:
+            write_text_atomic(path, json.dumps({"main": main, "shallow": shallow, "times": ages}) + "\n")
+        except OSError:
+            pass
+    return {name: ages.get(commit) for name, commit in resolved.items()}
+
+
+TOP_ATTEMPTS_QUERY = """
+    SELECT m.run_id, m.started_at, m.suite, m.module, m.attempt, m.restart, m.times_missing,
+           m.wall_s, m.cpu_s, m.peak_mib, m.status, m.tests_run, m.tests_s, r.aborted,
+           r.slow_test_s
+    FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+"""
+
+
+def top_histories(connection: sqlite3.Connection, repo: Path, modules: set[tuple[str, str]], count: int,
+                  host_test: str, host_value: str, checkouts: list[str], oldest: str
+                  ) -> tuple[dict[tuple[str, str], list[ModuleAttempt]], dict[str, int | None]]:
+    """Read the newest code first and return module histories with the run code times."""
+    placeholders = ", ".join("?" for _ in checkouts)
+    runs = query(connection, f"""
+        SELECT id, sha, started_at FROM gate_runs
+        WHERE host {host_test} ? AND checkout IN ({placeholders}) AND aborted = 0 AND started_at >= ?
+    """, (host_value, *checkouts, oldest))
+    if not runs:
+        return {}, {}
+    ages = run_code_ages(repo, {str(row["sha"]) for row in runs})
+    code_times = {str(row["id"]): ages.get(str(row["sha"])) for row in runs}
+
+    def order(row: dict[str, object]) -> tuple[bool, int, str, str]:
+        age = code_times[str(row["id"])]
+        return age is not None, age or 0, str(row["started_at"]), str(row["id"])
+
+    run_ids = [str(row["id"]) for row in sorted(runs, key=order, reverse=True)]
+    positions = {run_id: position for position, run_id in enumerate(run_ids)}
+    histories: dict[tuple[str, str], list[ModuleAttempt]] = defaultdict(list)
+    # A full run usually fills one slot for nearly every module.
+    for run_id in run_ids[:count]:
+        seen: set[tuple[str, str]] = set()
+        for row in query_rows(connection, TOP_ATTEMPTS_QUERY + f"""
+            WHERE m.run_id = ? AND m.host {host_test} ? AND m.started_at >= ?
+              AND m.restart = '' AND m.status = 0
+            ORDER BY m.suite, m.module, m.attempt
+        """, (run_id, host_value, oldest)):
+            key = str(row["suite"]), str(row["module"])
+            if key in modules and key not in seen:
+                seen.add(key)
+                histories[key].append(ModuleAttempt.from_row(row))
+
+    if len(run_ids) > count:
+        starts = [str(row["started_at"]) for row in runs]
+        time_bounds = min(starts), max(starts)
+        for folder, filename in modules:
+            key = folder, filename
+            history = histories.get(key, [])
+            if len(history) == count:
+                continue
+            candidates: dict[int, dict[str, object]] = {}
+            for row in query_rows(connection, TOP_ATTEMPTS_QUERY + f"""
+                WHERE m.suite = ? AND m.module = ? AND m.host {host_test} ?
+                  AND m.started_at BETWEEN ? AND ? AND m.restart = '' AND m.status = 0
+                ORDER BY m.attempt
+            """, (folder, filename, host_value, *time_bounds)):
+                position = positions.get(str(row["run_id"]))
+                if position is not None and position >= count and position not in candidates:
+                    candidates[position] = row
+            for position in sorted(candidates)[:count - len(history)]:
+                histories[key].append(ModuleAttempt.from_row(candidates[position]))
+    return histories, code_times
+
+
 def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> None:
-    from scripts.production.gate_modules import discover_test_modules, test_module_name
+    from scripts.production.gate_modules import discover_test_modules
     from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
-    modules = {(suite, test_module_name(repo, suite, path))
+    scripts = repo / "scripts"
+    modules = {(suite, path.relative_to(scripts).as_posix().split("/", 1)[1])
                for suite, path in discover_test_modules(repo)}
     config = conf.read("test_times")
     count = config.whole("TOP_RUNS")
@@ -156,35 +333,21 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                  if Path(str(row["checkout"])).expanduser().resolve() == checkout]
     checkout_parameters = ", ".join(["?"] * len(checkouts))
     oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
-    histories: list[list[ModuleAttempt]] = []
-    type_history: list[ModuleAttempt] = []
-    for folder, filename in sorted(modules | {TYPE_CHECK_JOB}):
-        history: list[ModuleAttempt] = []
-        seen: set[str] = set()
-        for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + f"""
-            WHERE m.suite = ? AND m.module = ? AND m.host {host_test} ? AND m.restart = ''
-              AND m.status = 0 AND r.aborted = 0 AND r.checkout IN ({checkout_parameters})
-              AND m.started_at >= ?
-            ORDER BY m.started_at DESC, m.run_id DESC, m.attempt ASC
-        """, (folder, filename, host_value, *checkouts, oldest)):
-            attempt = ModuleAttempt.from_row(row)
-            if attempt.run_id in seen:
-                continue
-            seen.add(attempt.run_id)
-            history.append(attempt)
-            if len(history) == count:
-                break
-        if (folder, filename) == TYPE_CHECK_JOB:
-            type_history = history
-        elif history:
-            histories.append(history)
-    unmeasured = [f"{folder}/{filename}"
-                  for folder, filename in sorted(modules - {history[0].key for history in histories})]
+    histories, code_times = top_histories(connection, repo, modules, count, host_test, host_value, checkouts, oldest)
+    type_rows = query(connection, TOP_ATTEMPTS_QUERY + f"""
+        WHERE m.suite = ? AND m.module = ? AND m.host {host_test} ? AND m.restart = ''
+          AND m.status = 0 AND m.started_at >= ? AND r.aborted = 0
+          AND r.checkout IN ({checkout_parameters})
+        ORDER BY m.started_at DESC, m.run_id DESC, m.attempt
+        LIMIT 1
+    """, (*TYPE_CHECK_JOB, host_value, oldest, *checkouts))
+    unmeasured = [f"{folder}/{filename}" for folder, filename in sorted(modules - histories.keys())]
     ranked = sorted(((statistics.median(attempt.cpu_s for attempt in history), history)
-                     for history in histories), key=lambda item: (-item[0], item[1][0].name))[:limit]
+                     for history in histories.values()), key=lambda item: (-item[0], item[1][0].name))[:limit]
     output: list[list[str]] = []
+    zone = user_zone()
     for rank, (median, history) in enumerate(ranked, 1):
-        last = history[0]
+        last = max(history, key=lambda attempt: (attempt.started_at, attempt.run_id))
         tests_run = str(last.tests_run)
         slowest = ""
         if last.times_missing:
@@ -193,15 +356,17 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
             tests = kept_tests(connection, last)
             if tests:
                 slowest = f"{tests[0].test} {seconds(tests[0].duration_s)} s"
+        code_time = code_times[last.run_id]
+        code_date = "unknown" if code_time is None else datetime.fromtimestamp(code_time, zone).strftime("%m-%d")
         output.append([str(rank), last.name, seconds(median),
                        seconds(statistics.median(attempt.wall_s for attempt in history)), seconds(last.wall_s),
-                       tests_run, slowest, str(len(history))])
+                       tests_run, slowest, str(len(history)), code_date])
     print_table(["rank", "suite/module", "median CPU s", "median s", "last s", "tests run",
-                 "slowest kept test", "runs counted"], output, "no modules recorded yet")
+                 "slowest kept test", "runs counted", "code date"], output, "no modules recorded yet")
     if output:
         print(f"{len(output)} modules; sum of median CPU {seconds(sum(item[0] for item in ranked))} s")
-    if type_history:
-        last_type = type_history[0]
+    if type_rows:
+        last_type = ModuleAttempt.from_row(type_rows[0])
         print(f"{last_type.name} runs nightly, so it is not ranked: "
               + f"last run {seconds(last_type.cpu_s)} CPU s, {seconds(last_type.wall_s)} s")
     if unmeasured:
@@ -673,7 +838,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"repository identity unavailable for {repo}", file=sys.stderr)
                     return 1
                 if identity == repository.repository_key(str(TOOL_REPOSITORY)):
-                    top(connection, request.host, request.limit, repo)
+                    try:
+                        top(connection, request.host, request.limit, repo)
+                    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                        print(f"module ranks unavailable: {error}", file=sys.stderr)
+                        return 1
                 else:
                     nextest_top(connection, request.host, request.limit, repo, identity)
             case "trend":
