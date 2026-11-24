@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from scripts.direct.test_verify_lint_judgment import VerifyLintJudgmentFixture
+from scripts.direct.test_verify_lint_scope import assert_clippy_calls
 
 
 class VerifyLintScopeTests(VerifyLintJudgmentFixture):
@@ -15,7 +16,7 @@ class VerifyLintScopeTests(VerifyLintJudgmentFixture):
                 self.environment["TEST_CLIPPY_STATUSES"] = f"[101, {judgment_status}]"
                 result = self.invoke_verify("lint", "sample", cwd=self.root)
                 self.assertEqual(result.returncode, judgment_status, result.stdout + result.stderr)
-                self.assert_fix_and_judgment_calls()
+                assert_clippy_calls(self)
                 stages = self.lint_stages()
                 self.assertEqual(stages, [
                     ["+nightly", "fmt", "-p", "sample"],
