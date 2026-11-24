@@ -5101,7 +5101,10 @@ done
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
                             for reference, execution in host_evidence.executions)):
-                self._end_placement_rank(request)
+                # A Mac mend runner can still report busy. Keep its rank until the step ends.
+                if not (saved.assignment.destination.provider == "mac" and request.profile.step == "mend"
+                        and isinstance(request.run, wire.RunIdentity)):
+                    self._end_placement_rank(request)
                 self.assignments[key] = self._end_remote_start_hold(request, saved)
                 return False
             if _holds_consumed_guest_slot(saved):

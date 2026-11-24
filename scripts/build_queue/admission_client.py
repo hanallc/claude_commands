@@ -2308,8 +2308,11 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 print(wire.encode_reply(answer), end="")
             return 2
         write_assignment(args.assignment_file, answer)
+        elapsed = output.elapsed_seconds()
         if isinstance(answer, wire.LocalPlacementGranted) and args.shell_state is not None:
-            write_shell_grant(args.shell_state, answer.grant, output.elapsed_seconds())
+            write_shell_grant(args.shell_state, answer.grant, elapsed)
+        if elapsed and args.wait_events:
+            output.on_event(f"memory-seconds {elapsed}")
         output.finished(left=isinstance(answer, wire.Assignment), placement_events=args.wait_events)
         if output.held:
             output.on_event("done")

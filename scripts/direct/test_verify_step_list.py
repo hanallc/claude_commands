@@ -10,10 +10,11 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_service as service
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import target_config
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -73,7 +74,7 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.assertIsInstance(run, wire.RunIdentity)
         assert isinstance(run, wire.RunIdentity)
         self.assertEqual([row["run_id"] for row in rows], [f"{run.pid}:{run.start_time}"] * 5)
-        self.assertEqual([request.run for request in placements], [run] * 5 + [wire.NO_RUN])
+        self.assertEqual([request.run for request in placements], [run] * 6)
         routes = list(dict.fromkeys((request.identity.step, request.route) for request in placements))
         self.assertEqual(routes, [
             ("check", target_config.LocalRequired("requires Linux kernel")),
@@ -117,8 +118,41 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
         self.assertIsInstance(run, wire.RunIdentity)
         assert isinstance(run, wire.RunIdentity)
         self.assertEqual([row["run_id"] for row in rows], [f"{run.pid}:{run.start_time}"] * 3)
-        self.assertEqual([request.run for request in placements], [run, run, run, wire.NO_RUN])
+        self.assertEqual([request.run for request in placements], [run] * 4)
         self.assert_removed()
+
+    def test_each_call_records_its_admission_wait_under_the_outer_run(self) -> None:
+        self.prepare_repository()
+        root = self.fixture.root
+        self.fixture.environment["BUILDLOG_OFF"] = "0"
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        previous = admission.server.handle_request
+        observed: dict[str, wire.PlacementRequest] = {}
+        waits = {"mend": 4200, "clippy": 720, "nextest": 1290}
+
+        def handle(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                   ) -> list[wire.Reply]:
+            if (isinstance(request, wire.PlacementRequest) and request.episode not in observed
+                    and request.identity.step in waits):
+                observed[request.episode] = request
+                folder, = tool_folders(root / "tmp", "verify", pid=request.owner.pid)
+                path = folder / f"placement-{request.episode}.json.wait"
+                notice = admission_client.PlacementWaitNotice(0, (), 1,
+                    wire.PlacementResourceWait("mac", "busy"), waits[request.identity.step])
+                _ = path.write_text(wire.encode_record(notice))
+                return [wire.PlacementWait(request.episode, request.since, 0, ())]
+            return previous(request, connection)
+
+        with mock.patch.object(admission.server, "handle_request", side_effect=handle):
+            result = self.run_verify("lint,test", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([request.identity.step for request in observed.values()], ["mend", "clippy", "nextest"])
+        rows = cast(list[dict[str, object]], self.fixture.call_records())
+        run = next(iter(observed.values())).run
+        assert isinstance(run, wire.RunIdentity)
+        self.assertEqual([(row["verb"], row["wait_s"], row["run_id"]) for row in rows],
+                         [("lint", 4920, f"{run.pid}:{run.start_time}"), ("test", 1290, f"{run.pid}:{run.start_time}")])
 
     def test_quoted_plus_is_a_routing_reason(self) -> None:
         self.prepare_repository()

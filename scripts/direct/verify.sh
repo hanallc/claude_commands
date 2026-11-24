@@ -882,7 +882,7 @@ finish_verify_verb_list() {
 }
 
 run_verify_verbs() {
-    local verb length offset=0 status list_run step_list=0
+    local verb length offset=0 status step_list=0
     if (( ${#VERIFY_STEP_LENGTHS[@]} )); then
         step_list=1
     fi
@@ -897,10 +897,7 @@ run_verify_verbs() {
     VERIFY_VERB_PREVIOUS_JOB=${!:-}
     trap 'finish_verify_verb_list "$?" "$BASH_COMMAND"' EXIT
     for length in "${VERIFY_STEP_LENGTHS[@]}"; do
-        # Doc can leave its grant without a memory handoff when it takes its own slot.
-        list_run=""
-        if [[ "${VERIFY_STEP_WORDS[offset]}" != doc ]]; then list_run=${BUILDLOG_RUN:-}; fi
-        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="$list_run" bash "$VERIFY_START_DIR/verify.sh" \
+        env -u UNIT_DETACHED_RECORD UNIT_DETACHED_RUN=1 VERIFY_STEP_LIST_RUN="${BUILDLOG_RUN:-}" bash "$VERIFY_START_DIR/verify.sh" \
             "${VERIFY_STEP_WORDS[@]:offset:length}" <&0 &
         status=0
         wait "$!" || status=$?
@@ -2016,6 +2013,11 @@ buildlog_memory_event() {
                 STEP_MAC_DISK_EXCLUSIONS=$exclusions
             fi
             ;;
+        memory-seconds\ *)
+            if [[ -n "$HOLD_WAIT_DIR" ]]; then
+                printf '%s\n' "${1#memory-seconds }" >> "$HOLD_WAIT_DIR/memory-seconds"
+            fi
+            ;;
         retry\ *)
             if [[ "$PLACEMENT_RETRY_NOTICE_SHOWN" == 0 ]]; then
                 printf '%s\n' "${1#retry }" >&2
@@ -2305,7 +2307,7 @@ cancel_tree_run() {
     local changed_path=""
     if [[ -s "$TREE_WATCH_DIR/fired.path" ]]; then changed_path=" ($(< "$TREE_WATCH_DIR/fired.path"))"; fi
     printf 'verify.sh: cancelled — the tree changed while %s ran%s, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$changed_path" "$CMD" >&2
-    note_event cancelled "${RUN_STARTED}" "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
+    note_event cancelled "$(( SECONDS - RUN_STARTED ))" "" 0 "$TREE_CHANGED_STATUS"
     exit "$TREE_CHANGED_STATUS"
 }
 
@@ -2434,7 +2436,7 @@ doc_record() {
     doc_staged_helper record "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID"
 }
 
-# note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
+# note_event OUTCOME WALL BUILD SAVED STATUS: this call's one record in
 # the build log (see the header), the first time it is called. OUTCOME is ran,
 # failed, interrupted, cancelled, reused or replayed; an empty STATUS or BUILD is unknown.
 # record.py adds the repo, worktree, branch and commit. A record that cannot be
@@ -2445,7 +2447,7 @@ note_event() {
     CALL_NOTED=1
     collect_hold_wait
     [[ -f "${BUILDLOG_RECORD:-}" ]] || return 0
-    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0
+    local outcome=$1 wall=$2 build=$3 saved=$4 status=$5 cached=0
     if [[ -n "${CACHE_DIR}" ]]; then
         cached=1
     fi
@@ -2459,6 +2461,12 @@ note_event() {
             token_wait_s=$(( token_wait_s + step_wait ))
         done < "$TOKEN_WAIT_FILE"
     fi
+    local memory_wait_s=0 wait
+    if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/memory-seconds" ]]; then
+        memory_wait_s=$(awk '{ total += $1 } END { print total + 0 }' "$HOLD_WAIT_DIR/memory-seconds")
+    fi
+    wait=$(awk -v memory="$memory_wait_s" -v token="$token_wait_s" -v hold="$BUILDLOG_HOLD_WAIT_S" \
+        'BEGIN { printf "%d", memory + token + hold }')
     local mem_kill_stopped=0
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
@@ -2528,7 +2536,7 @@ forward_mac_runner_signal() {
         exec 9>&-
         rm -f "$MAC_LOG_FILE"
     fi
-    note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
+    note_event interrupted 0 "" 0 "$exit_status"
     exit "$exit_status"
 }
 
@@ -2761,7 +2769,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then return "$runner_status"; fi
-            note_event failed "${SECONDS}" 0 "" 0 "$runner_status"
+            note_event failed 0 "" 0 "$runner_status"
             exit "$runner_status"
             ;;
         passed)
@@ -2771,7 +2779,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 exec 9>&-
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
-                note_event failed "$SECONDS" 0 "" 0 2
+                note_event failed 0 "" 0 2
                 exit 2
             fi
             MAC_PASSED=1
@@ -2784,7 +2792,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$selected_is_mac" == 0 ]]; then
                 record_mac_pass "$MAC_LOG_FILE" "$result_seconds"
                 echo "verify.sh: PASS on $selected_target (Linux)."
-                note_event ran "${SECONDS}" 0 "" 0 0
+                note_event ran 0 "" 0 0
                 exit 0
             fi
             finish_mac_pass "$MAC_LOG_FILE" "$result_seconds"
@@ -2802,7 +2810,7 @@ finish_mac_pass() {
     fi
     record_mac_pass "$1" "$2"
     echo "verify.sh: PASS on the Mac (macOS), so nothing ran on natedev."
-    note_event ran "${SECONDS}" 0 "" 0 0
+    note_event ran 0 "" 0 0
     exit 0
 }
 
@@ -3051,7 +3059,7 @@ pinned_target_refuse() {
     local reason=$1
     [[ "$reason" != command ]] || reason="the target cannot run this command"
     printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$reason" >&2
-    note_event failed "$SECONDS" 0 "" 0 2
+    note_event failed 0 "" 0 2
     exit 2
 }
 
@@ -3081,7 +3089,7 @@ mac_only_refuse() {
     else
         printf 'verify.sh: %s --mac refused: %s; nothing ran on natedev.\n' "$CMD" "$text" >&2
     fi
-    note_event failed "$SECONDS" 0 "" 0 2
+    note_event failed 0 "" 0 2
     exit 2
 }
 
@@ -3221,7 +3229,7 @@ placement_once() {
     reply=$(< "$HOLD_WAIT_DIR/placement-reply")
     while IFS= read -r line; do
         case "$line" in
-            first|holder\ *|resource\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
+            first|holder\ *|resource\ *|memory-seconds\ *|provider\ *|retry\ *|disk\ *|done|left) buildlog_memory_event "$line" ;;
             left\ *)
                 printf '%s\n' "${line#left }"
                 buildlog_memory_event left ;;
@@ -3593,7 +3601,7 @@ finish_copy_win() {
     RUN_LOG=""
     if [[ "$COPY_MAC" == failed ]]; then
         [[ -z "$log" ]] || rm -f "$log"
-        note_event failed "${SECONDS}" 0 "" 0 "$COPY_RUNNER_STATUS"
+        note_event failed 0 "" 0 "$COPY_RUNNER_STATUS"
         exit "$COPY_RUNNER_STATUS"
     fi
     if [[ -z "$log" ]]; then
@@ -3675,7 +3683,7 @@ cache_lookup() {
     fi
     LOOKUP_STATUS="${status_line#status=}"
     first_line="${record_text%%$'\n'*}"
-    note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
+    note_event "${outcome}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
     if [[ "${FILTER_RUN}" -eq 1 ]]; then
         echo "verify.sh: ${word} (recorded), skipped — ${first_line}; the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
         return 0
@@ -3812,7 +3820,7 @@ finish_run() {
         cancelled) outcome=cancelled ;;
         error) lint_failure_is_the_tree && kind=fail ;;
     esac
-    note_event "${outcome}" "${RUN_STARTED}" "${wall}" "${build:-0}" 0 "${code}"
+    note_event "${outcome}" "${wall}" "${build:-0}" 0 "${code}"
     if [[ -z "${kind}" || -z "${CACHE_DIR}" ]] || ! cache_record "${kind}" "${repeat}"; then
         rm -f "${RUN_LOG}"
     fi
@@ -3860,7 +3868,7 @@ hold_interrupted() {
         collect_child "$HOLD_WAITER_PID" "$signal_name"
     fi
     interrupt_hold_wait
-    note_event interrupted "$SECONDS" 0 "" 0 "$code"
+    note_event interrupted 0 "" 0 "$code"
     exit "$code"
 }
 trap 'hold_interrupted INT 130' INT
@@ -4081,7 +4089,7 @@ token_wait_superseded() {
     trap - INT TERM HUP
     TOKEN_WAIT_S=$TOKEN_WAITED
     printf 'verify.sh: superseded by a newer %s call; this call ran nothing. Read the newer call'"'"'s result: nothing failed and nothing needs a repair.\n' "$CMD"
-    note_event superseded "$SECONDS" 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
+    note_event superseded 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
     exit "$VERIFY_SUPERSEDED_STATUS"
 }
 # A release stays visible to every shell until an acquisition succeeds.
@@ -4444,6 +4452,9 @@ buildlog_wait_for_memory() {
     sync_token_state
     release_token || return $?
     buildlog_wait_for_memory_only "$@" || status=$?
+    if (( BUILDLOG_MEM_WAIT_S > 0 )); then
+        buildlog_memory_event "memory-seconds $BUILDLOG_MEM_WAIT_S"
+    fi
     if (( status != 0 )) || [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
         return "$status"
     fi
@@ -4630,7 +4641,7 @@ verify_cleanup() {
         cancelled) outcome=cancelled ;;
         interrupted) outcome=interrupted ;;
     esac
-    note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    note_event "${outcome}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
     apply_placement_outcome
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
