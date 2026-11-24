@@ -1738,22 +1738,26 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = page.write_bytes(source)
                 mark = 1_700_000_000_000_000_000 + offset
                 os.utime(page, ns=(mark, mark))
-                reply = self.request(route)
+                reply = self.request(route, headers={"Accept-Encoding": "gzip"})
                 self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.headers.get("content-encoding"), "gzip")
                 version = reply.headers.get("x-builds-page-version", "")
                 self.assertTrue(version)
-                self.assertIn(f'<meta name="builds-page-version" content="{version}">'.encode(), reply.body)
+                self.assertIn(f'<meta name="builds-page-version" content="{version}">'.encode(),
+                              gzip.decompress(reply.body))
                 versions.append(version)
                 with (socket.create_connection(("127.0.0.1", self.port), TEST_HANG_GUARD_SECS) as client,
                       client.makefile("rb") as head_reply):
                     client.sendall((f"HEAD {route} HTTP/1.0\r\n"
-                                    "Host: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+                                    + "Host: 127.0.0.1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n").encode())
                     raw = head_reply.read()
                 head, delimiter, body = raw.partition(b"\r\n\r\n")
                 self.assertTrue(delimiter)
                 status_line, _, raw_headers = head.partition(b"\r\n")
                 self.assertEqual(status_line.split()[1:2], [b"200"])
-                self.assertEqual(parse_headers(BytesIO(raw_headers))["X-Builds-Page-Version"], version)
+                received = parse_headers(BytesIO(raw_headers))
+                for name in ("X-Builds-Page-Version", "Content-Encoding", "Content-Length", "Vary"):
+                    self.assertEqual(received[name], reply.headers[name.lower()])
                 self.assertEqual(len(body), 0, "HEAD sent a response body")
         self.assertEqual(len(set(versions)), 2)
 
@@ -3408,15 +3412,116 @@ class ReviewLinksServerTests(unittest.TestCase):
                 card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': key}))
             self.assertEqual(card.status, 200)
 
-    def request(self, path: str, *, method: str = "GET") -> HttpReply:
+    def request(self, path: str, *, method: str = "GET", headers: Mapping[str, str] | None = None) -> HttpReply:
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
-            connection.request(method, path)
+            connection.putrequest(method, path, skip_accept_encoding=True)
+            for name, value in (headers or {}).items():
+                connection.putheader(name, value)
+            connection.endheaders()
             response = connection.getresponse()
-            headers = {name.lower(): value for name, value in response.getheaders()}
-            return HttpReply(response.status, headers.get("content-type", ""), response.read(), headers)
+            received = {name.lower(): value for name, value in response.getheaders()}
+            return HttpReply(response.status, received.get("content-type", ""), response.read(), received)
         finally:
             connection.close()
+
+    def test_console_page_gzip_matches_identity(self) -> None:
+        page = b"<main><h1>The List</h1></main>"
+        with patch.object(list_page, "render", return_value=page):
+            identity = self.request(list_page.PAGE_PATH)
+            for encoding in ("gzip, br", "gzip;q=0.5"):
+                with self.subTest(encoding=encoding):
+                    reply = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": encoding})
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+                    self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
+                    self.assertEqual(reply.headers.get("content-length"), str(len(reply.body)))
+                    self.assertEqual(gzip.decompress(reply.body), identity.body)
+
+    def test_console_page_stays_identity_without_gzip(self) -> None:
+        page = b"<main><h1>The List</h1></main>"
+        with patch.object(list_page, "render", return_value=page):
+            for headers in (None, {"Accept-Encoding": "br, gzip;q=0"}):
+                with self.subTest(headers=headers):
+                    reply = self.request(list_page.PAGE_PATH, headers=headers)
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(reply.body, page)
+                    self.assertNotIn("content-encoding", reply.headers)
+                    self.assertEqual(reply.headers.get("content-length"), str(len(page)))
+                    self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
+
+    def test_static_css_has_separate_gzip_and_identity_etags(self) -> None:
+        path = "/fixture.css"
+        content = b".row { padding: 0; }\n"
+        _ = (self.root / path[1:]).write_bytes(content)
+        identity = self.request(path)
+        gzip_headers = {"Accept-Encoding": "*;q=0.5"}
+        reply = self.request(path, headers={**gzip_headers, "If-None-Match": identity.headers["etag"]})
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+        self.assertEqual(reply.headers.get("content-length"), str(len(reply.body)))
+        self.assertEqual(reply.headers["etag"], identity.headers["etag"].removesuffix('"') + '-gzip"')
+        self.assertEqual(gzip.decompress(reply.body), content)
+        cached = self.request(path, headers={**gzip_headers, "If-None-Match": reply.headers["etag"]})
+        self.assertEqual((cached.status, cached.body), (304, b""))
+        self.assertEqual(cached.headers.get("vary"), "Accept-Encoding")
+        self.assertEqual(cached.headers.get("etag"), reply.headers["etag"])
+
+    def test_console_html_accepts_wildcard_unless_gzip_is_excluded(self) -> None:
+        page = b"<main><h1>The List</h1></main>"
+        with patch.object(list_page, "render", return_value=page):
+            reply = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": "identity;q=0, *;q=1"})
+            refused = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": "*;q=1, gzip;q=0"})
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+        self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
+        self.assertEqual(gzip.decompress(reply.body), page)
+        self.assertNotIn("content-encoding", refused.headers)
+        self.assertEqual(refused.body, page)
+
+    def test_review_attachment_errors_use_gzip(self) -> None:
+        path = review_page.ATTACHMENT_PATH
+        missing = path + "?key=missing&id=missing"
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            for route, status, headers in (
+                (path, 404, {}),
+                (missing, 404, {}),
+                (missing, 403, {"Origin": "http://other.test"}),
+            ):
+                with self.subTest(route=route, status=status):
+                    identity = self.request(route, headers=headers)
+                    reply = self.request(route, headers={**headers, "Accept-Encoding": "gzip"})
+                    self.assertEqual((identity.status, reply.status), (status, status))
+                    self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+                    self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
+                    self.assertEqual(reply.content_type, "text/html; charset=utf-8")
+                    self.assertEqual(gzip.decompress(reply.body), identity.body)
+
+    def test_review_attachment_post_returns_gzip_405(self) -> None:
+        path = review_page.ATTACHMENT_PATH
+        with patch.object(serve, "tailscale_ip", return_value="127.0.0.1"):
+            identity = self.request(path, method="POST")
+            reply = self.request(path, method="POST", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual((identity.status, reply.status), (405, 405))
+        self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+        self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
+        self.assertEqual(reply.content_type, "text/html; charset=utf-8")
+        self.assertEqual(gzip.decompress(reply.body), identity.body)
+
+    def test_review_version_response_uses_gzip(self) -> None:
+        snapshot = review_page.build_snapshot(self.review_fixture().root)
+        path = review_page.PAGE_PATH + "?version=1"
+        with (patch.object(self.server.review_cache, "get", return_value=snapshot),
+              patch.object(review_page.ReviewSnapshot, "facts", return_value=snapshot.facts())):
+            identity = self.request(path)
+            reply = self.request(path, headers={"Accept-Encoding": "gzip"})
+        self.assertEqual((identity.status, reply.status), (200, 200))
+        self.assertEqual(reply.content_type, "application/json; charset=utf-8")
+        self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+        self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
+        self.assertEqual(reply.headers.get("content-length"), str(len(reply.body)))
+        self.assertEqual(gzip.decompress(reply.body), identity.body)
+        self.assertEqual(json.loads(identity.body)["version"], snapshot.version)
 
     def test_files_are_served_with_the_required_utf8_content_types(self) -> None:
         text = "review café — ready\n"
@@ -3704,8 +3809,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                     (answer, 'answer', 'Use the compact layout.', ''),
                     (later, 'later', '', '&later=2030-12-02T18%3A30')):
                 with self.subTest(outcome=outcome):
-                    status, body = self.post(review_page.PAGE_PATH, case.card_body(cache.get(), key, outcome, words)+extra)
+                    status, body = self.post(review_page.PAGE_PATH,
+                                             case.card_body(cache.get(), key, outcome, words) + extra,
+                                             headers={"Accept-Encoding": "gzip"})
                     self.assertEqual(status, 200, body)
+                    self.assertIsInstance(cast(object, json.loads(body)), dict)
         self.assertNotIn(answer, cache.get().records)
         self.assertIsInstance(cache.get().records[later].times.later, datetime)
 
@@ -5071,16 +5179,22 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(self.server, "root", case.root), patch.object(self.server, "review_cache", cache),
               patch.object(list_page, "counts_strip", return_value=footer) as counts,
               patch.object(list_page, "read_linked_reviews", side_effect=AssertionError("The List read all reviews."))):
-            page = self.request(list_page.PAGE_PATH)
+            encoding = {"Accept-Encoding": "gzip, br"}
+            page = self.request(list_page.PAGE_PATH, headers=encoding)
             self.assertEqual(page.status, 200)
-            self.assertIn(b"Read the published review", page.body)
-            self.assertIn(b"1 change for you", page.body)
-            self.assertIn(b'data-list-counts-url="/console/list.html?counts=1"', page.body)
-            self.assertNotIn(footer.encode(), page.body)
+            self.assertEqual(page.headers.get("content-encoding"), "gzip")
+            markup = gzip.decompress(page.body)
+            self.assertIn(b"Read the published review", markup)
+            self.assertIn(b"1 change for you", markup)
+            self.assertIn(b'data-list-counts-url="/console/list.html?counts=1"', markup)
+            self.assertNotIn(footer.encode(), markup)
             counts.assert_not_called()
             with patch.object(list_page, "records", side_effect=AssertionError("The counts request read the List.")):
-                response = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_QUERY}")
-            self.assertEqual((response.status, response.body), (200, footer.encode()))
+                response = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_QUERY}",
+                                        headers=encoding)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers.get("content-encoding"), "gzip")
+            self.assertEqual(gzip.decompress(response.body), footer.encode())
             counts.assert_called_once()
 
     def test_list_reads_a_change_missing_from_a_partial_review_snapshot(self) -> None:
@@ -6271,6 +6385,23 @@ class ReviewLinksServerTests(unittest.TestCase):
                     clear.assert_not_called()
         with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new color", .5, 101)):
             self.assertEqual(self.request(accounts_page.PAGE_PATH).body, b"new color")
+
+    def test_accounts_reuses_gzip_for_the_same_final_page(self) -> None:
+        body = b"<p>Cached Accounts page</p>"
+        first = body + b"<p>Owner One</p>"
+        changed = body + b"<p>Owner Two</p>"
+        encoding = {"Accept-Encoding": "gzip"}
+        with (patch.object(self.server.accounts_cache, "get", return_value=body),
+              patch.object(serve, "owned_document", side_effect=(first, first, first, changed)),
+              patch.object(gzip, "compress", wraps=gzip.compress) as compress):
+            self.assertEqual(self.request(accounts_page.PAGE_PATH).body, first)
+            compress.assert_not_called()
+            for expected in (first, first, changed):
+                reply = self.request(accounts_page.PAGE_PATH, headers=encoding)
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.headers.get("content-encoding"), "gzip")
+                self.assertEqual(gzip.decompress(reply.body), expected)
+            self.assertEqual(compress.call_count, 2)
 
     def test_accounts_cache_keeps_the_page_during_one_render_and_after_a_failure(self) -> None:
         cache = serve.AccountsPageCache()

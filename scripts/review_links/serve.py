@@ -60,6 +60,7 @@ QUEUE_MOVE_PATH = "/console/builds/queue-move"
 SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
 STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
+GZIP_FILE_SUFFIXES = frozenset({".html", ".htm", ".css", ".js", ".json", ".svg", ".txt"})
 
 
 def published_console_page(root: Path, path: str) -> str:
@@ -133,9 +134,11 @@ def owned_document(content: bytes, page: str) -> bytes:
     return content
 
 
-@lru_cache(maxsize=8)
-def _compressed_review_shell(content: bytes) -> bytes:
+def gzip_content(content: bytes) -> bytes:
     return gzip.compress(content, compresslevel=1, mtime=0)
+
+
+_cached_gzip_content = lru_cache(maxsize=8)(gzip_content)
 
 
 def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCaptureRequest) -> bytes:
@@ -870,13 +873,13 @@ def old_console_link(root: Path, path: str) -> str:
     return f"/{change_page.CONSOLE_FOLDER}/{page}" + (f"?{parts.query}" if parts.query else "")
 
 
-def accepts_gzip(header: str, *, allow_wildcard: bool = False) -> bool:
-    """Accept gzip when its encoding token has a positive quality."""
+def accepts_gzip(header: str) -> bool:
+    """Use the gzip quality if present. Otherwise, use the wildcard quality."""
     wildcard = False
     for part in header.split(','):
         encoding, *parameters = part.split(';')
         encoding = encoding.strip().lower()
-        if encoding != 'gzip' and not (allow_wildcard and encoding == '*'):
+        if encoding not in ('gzip', '*'):
             continue
         accepted = True
         for parameter in parameters:
@@ -942,15 +945,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links console: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The console is not available.</p>"))
                 return None
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
-                             + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
-            self.end_headers()
-            return BytesIO(content)
+            self.html_response(200, content, content_security_policy="default-src 'self'; script-src 'unsafe-inline'; "
+                               + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
+            return None
         if route.path == "/console/for-you.json":
             extra: dict[str, object] = {}
             if route.query == "view=console":
@@ -986,7 +983,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links accounts: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Accounts page is not available.</p>"))
                 return None
-            self.html_response(200, owned_document(content, "accounts"))
+            self.html_response(200, owned_document(content, "accounts"), cache_gzip=True)
             return None
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
@@ -1022,24 +1019,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
                     return None
                 elif 'version' in fields and 'index' not in fields:
-                    self.json_response(200, {'version':snapshot.version, 'facts':snapshot.facts(),
-                                             'delivery_pending':delivery})
+                    payload = {'version': snapshot.version, 'facts': snapshot.facts(), 'delivery_pending': delivery}
+                    self.review_response(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8")
                     return None
                 elif 'index' in fields:
                     response = snapshot.full_index if fields.get('for-you') == ['1'] else snapshot.legacy_index
                     self.review_response(response.body, 'application/json; charset=utf-8', response.gzip_body)
                     return None
                 else:
-                    content = snapshot.render(show=fields.get('show',['open'])[0])
+                    show = fields.get("show", ["open"])[0]
+                    content = snapshot.render(show=show)
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
-            prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
             owned = owned_document(content, "review")
-            if owned is not content or not prepared:
-                prepared = _compressed_review_shell(owned) if accepts_gzip(self.headers.get("Accept-Encoding", "")) else b""
-            self.review_response(owned, 'text/html; charset=utf-8', prepared)
+            prepared = snapshot.page_gzip if show == "open" and owned is content else b""
+            self.encoded_response(200, owned, "text/html; charset=utf-8", {}, prepared, cache_gzip=True)
             return None
         if route.path == list_page.PAGE_PATH:
             if route.query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
@@ -1159,13 +1155,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links render: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
                 return None
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            return BytesIO(content)
+            self.html_response(200, content)
+            return None
         try:
             decoded = unquote(urlsplit(self.path).path)
             if ".." in decoded.split("/"):
@@ -1196,9 +1187,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         try:
             stat = os.fstat(stream.fileno())
-            json_file = file.suffix.lower() == ".json"
-            accepts = ",".join(self.headers.get_all("Accept-Encoding", []))
-            compressed = json_file and accepts_gzip(accepts, allow_wildcard=True)
+            headers = self.gzip_headers() if file.suffix.lower() in GZIP_FILE_SUFFIXES else {}
+            compressed = "Content-Encoding" in headers
             encoding = "-gzip" if compressed else ""
             etag = (f'"{stat.st_dev:x}-{stat.st_ino:x}-{stat.st_size:x}'
                     f'-{stat.st_mtime_ns:x}-{stat.st_ctime_ns:x}{encoding}"')
@@ -1207,20 +1197,20 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             size = stat.st_size
             if compressed and not unchanged:
                 with stream:
-                    wire = gzip.compress(stream.read(), compresslevel=1, mtime=0)
+                    wire = gzip_content(stream.read())
                 stream = BytesIO(wire)
                 size = len(wire)
             self.send_response(304 if unchanged else 200)
             self.send_header("ETag", etag)
             self.send_header("Last-Modified", self.date_time_string(modified))
-            if json_file:
-                self.send_header("Vary", "Accept-Encoding")
-            if not unchanged:
+            if unchanged:
+                _ = headers.pop("Content-Encoding", None)
+            else:
                 self.send_header("Content-Type", self.guess_type(str(file)))
                 self.send_header("Content-Length", str(size))
                 self.send_header("X-Content-Type-Options", "nosniff")
-                if compressed:
-                    self.send_header("Content-Encoding", "gzip")
+            for name, value in headers.items():
+                self.send_header(name, value)
             self.end_headers()
             if unchanged:
                 stream.close()
@@ -1238,40 +1228,47 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             for value in self.headers.get_all("If-None-Match", [])
         )
 
+    def gzip_headers(self) -> dict[str, str]:
+        """Select the encoding headers for a response that can use gzip."""
+        headers = {"Vary": "Accept-Encoding"}
+        accepts = ",".join(self.headers.get_all("Accept-Encoding", []))
+        if accepts_gzip(accepts):
+            headers["Content-Encoding"] = "gzip"
+        return headers
+
     def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None,
-                      builds_version: str = "") -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(content)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
+                      builds_version: str = "", content_security_policy: str = "", cache_gzip: bool = False) -> None:
+        headers: dict[str, str] = {}
         if delivery_pending is not None:
-            self.send_header("X-Item-Delivery-Pending", str(delivery_pending).lower())
+            headers["X-Item-Delivery-Pending"] = str(delivery_pending).lower()
         if builds_version:
-            self.send_header("X-Builds-Page-Version", builds_version)
-        self.end_headers()
-        if self.command != "HEAD":
-            _ = self.wfile.write(content)
+            headers["X-Builds-Page-Version"] = builds_version
+        if content_security_policy:
+            headers["Content-Security-Policy"] = content_security_policy
+        self.encoded_response(status, content, "text/html; charset=utf-8", headers, cache_gzip=cache_gzip)
 
     def review_response(self, content: bytes, content_type: str, prepared: bytes = b'', *,
                         version: str = '', status: int = 200) -> None:
-        """Compress the retained Review index and shell for transfer."""
-        accepts = self.headers.get('Accept-Encoding','')
-        compressed = accepts_gzip(accepts)
-        if compressed:
-            content = prepared or gzip.compress(content,compresslevel=1,mtime=0)
+        """Serve the Review response with any prepared gzip bytes."""
+        headers = {"X-Review-Version": version} if version else {}
+        self.encoded_response(status, content, content_type, headers, prepared)
+
+    def encoded_response(self, status: int, content: bytes, content_type: str,
+                         headers: dict[str, str], prepared: bytes = b"", *, cache_gzip: bool = False) -> None:
+        headers.update(self.gzip_headers())
+        if "Content-Encoding" in headers:
+            compress = _cached_gzip_content if cache_gzip else gzip_content
+            content = prepared or compress(content)
         self.send_response(status)
-        self.send_header('Content-Type',content_type)
-        self.send_header('Content-Length',str(len(content)))
-        self.send_header('Cache-Control','no-store')
-        self.send_header('Vary','Accept-Encoding')
-        self.send_header('X-Content-Type-Options','nosniff')
-        if version:
-            self.send_header('X-Review-Version', version)
-        if compressed:
-            self.send_header('Content-Encoding','gzip')
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.end_headers()
-        _ = self.wfile.write(content)
+        if self.command != "HEAD":
+            _ = self.wfile.write(content)
 
     def failed_answer(self, page: change_page.ReviewPage, body: str, status: int, reason: str,
                       error: Exception) -> None:
@@ -1313,7 +1310,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self._write_post(self.new_item_post)
             return
         if route.path == review_page.ATTACHMENT_PATH:
-            self.send_error(405)
+            self.html_response(405, change_page.document("<p>Use GET to open this attachment.</p>", "Review attachment"))
             return
         if route.path == console_tune.PAGE_PATH:
             self.tune_post(route.query)
@@ -1874,13 +1871,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Serve an image named by a retained Review record."""
         server = cast(ReviewLinksServer, self.server)
         if self.tailscale_refusal() or not self.same_origin():
-            self.send_error(403)
+            self.html_response(403, change_page.document("<p>Access to this attachment is forbidden.</p>", "Review attachment"))
             return None
         fields = parse_qs(query, keep_blank_values=True)
-        if set(fields) != {"key", "id"} or any(len(values) != 1 for values in fields.values()):
-            self.send_error(404)
-            return None
         try:
+            if set(fields) != {"key", "id"} or any(len(values) != 1 for values in fields.values()):
+                raise ValueError("Invalid attachment query.")
             item = server.review_cache.get().records[fields["key"][0]]
             origin = review_items.submission_origin(item)
             if not isinstance(origin, new_item_dialog.ReviewSubmission):
@@ -1898,7 +1894,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < len(content) <= new_item_dialog.MAX_IMAGE_BYTES:
                 raise FileNotFoundError()
         except (KeyError, OSError, ValueError):
-            self.send_error(404)
+            self.html_response(404, change_page.document("<p>This attachment is not available.</p>", "Review attachment"))
             return None
         return self.attachment_response(content, media)
 
@@ -2342,8 +2338,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        _ = self.wfile.write(content)
-        self.wfile.flush()
+        if self.command != "HEAD":
+            _ = self.wfile.write(content)
+            self.wfile.flush()
 
     @override
     def guess_type(self, path: str | os.PathLike[str]) -> str:
