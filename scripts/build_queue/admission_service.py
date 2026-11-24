@@ -1610,6 +1610,13 @@ def is_mac_linux_guest(destination: placement.PlacementDestination) -> bool:
     return destination.provider == "ssh" and destination.target == "mac-linux"
 
 
+def _holds_consumed_guest_slot(saved: records.SavedPlacementAssignment) -> bool:
+    # A consumed guest holds the slot until the service records closure.
+    return (isinstance(saved.state, placement.CurrentAssignment)
+            and is_mac_linux_guest(saved.assignment.destination)
+            and isinstance(saved.permission, placement.PermissionConsumed))
+
+
 @dataclass
 class WaitingAdmission:
     request: wire.AdmitRequest | wire.LaunchRequest
@@ -5141,6 +5148,17 @@ done
                     self._end_placement_rank(request)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
+        if current and _holds_consumed_guest_slot(saved):
+            # Keep the slot busy until all recovered guest attempts close.
+            for other_key, other in self.assignments.items():
+                if other.assignment.episode == assignment.episode and _holds_consumed_guest_slot(other):
+                    self.current_assignments[assignment.episode] = other_key
+                    holder = other.holder
+                    if isinstance(holder, placement.ClaimHolderIdentity) and holder.host == self.host:
+                        owner = wire.Owner(holder.pid, holder.start_time)
+                        if self._live(owner):
+                            self._watch_owner(owner)
+                    break
         destination = assignment.destination
         worker = self.host_targets.get((destination.provider, destination.target))
         if worker is not None:
@@ -6509,6 +6527,46 @@ def read_state(directory: Path) -> ServiceState:
     return parse_service_state((directory / "state.json").read_text())
 
 
+def _restore_current_assignments(state: ServiceState) -> dict[str, str]:
+    """Recover current assignments and log each guest that awaits its turn to settle."""
+    def slot_priority(saved: records.SavedPlacementAssignment) -> int:
+        if _holds_consumed_guest_slot(saved):
+            return 2
+        destination = saved.assignment.destination
+        report = saved.terminal_report
+        settled = isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
+        return int(not settled and (destination.provider == "scaler" or is_mac_linux_guest(destination)))
+
+    index = state.current_assignments
+    repaired = {episode: key for episode, key in index.items()
+                if (saved := state.assignments.get(key)) is not None and saved.assignment.episode == episode
+                and isinstance(saved.state, placement.CurrentAssignment)}
+    for key, saved in state.assignments.items():
+        if not isinstance(saved.state, placement.CurrentAssignment):
+            continue
+        episode = saved.assignment.episode
+        if episode not in index and not _holds_consumed_guest_slot(saved):
+            continue
+        previous = repaired.get(episode)
+        if previous is None or slot_priority(saved) > slot_priority(state.assignments[previous]):
+            repaired[episode] = key
+    for episode, key in index.items():
+        if episode not in repaired:
+            print(f"memory admission: removed invalid index entry for episode {episode!r} with key {key!r}",
+                  file=sys.stderr)
+        elif repaired[episode] != key:
+            print(f"memory admission: repaired index for episode {episode!r} from {key!r} to {repaired[episode]!r}",
+                  file=sys.stderr)
+    for episode in repaired.keys() - index.keys():
+        print(f"memory admission: restored missing index for episode {episode!r} with key {repaired[episode]!r}",
+              file=sys.stderr)
+    for key, saved in state.assignments.items():
+        if _holds_consumed_guest_slot(saved) and repaired[saved.assignment.episode] != key:
+            print(f"memory admission: retained unsettled Mac Linux attempt {key!r} for episode {saved.assignment.episode!r}",
+                  file=sys.stderr)
+    return repaired
+
+
 def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> ServiceState:
     def check_placement_shape(value: object) -> None:
         if isinstance(value, list):
@@ -6526,22 +6584,9 @@ def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> Ser
     raw_state = cast(dict[str, object], json.loads(text))
     check_placement_shape(raw_state)
     state = wire.parse_record(text, ServiceState)
-    saved_current_keys = {saved.assignment.episode: key for key, saved in state.assignments.items()
-                          if isinstance(saved.state, placement.CurrentAssignment)}
-    for episode, key in tuple(state.current_assignments.items()):
-        saved = state.assignments.get(key)
-        if saved is None or saved.assignment.episode != episode:
-            repaired_key = saved_current_keys.get(episode)
-            if repaired_key is None:
-                del state.current_assignments[episode]
-                print(f"memory admission: removed invalid index entry for episode {episode!r} with key {key!r}",
-                      file=sys.stderr)
-                continue
-            state.current_assignments[episode] = repaired_key
-            print(f"memory admission: repaired index for episode {episode!r} from {key!r} to {repaired_key!r}",
-                  file=sys.stderr)
-            key = repaired_key
-            saved = state.assignments[key]
+    state = replace(state, current_assignments=_restore_current_assignments(state))
+    for key in state.current_assignments.values():
+        saved = state.assignments[key]
         report = saved.terminal_report
         if (is_mac_linux_guest(saved.assignment.destination) and isinstance(saved.permission, placement.PermissionAvailable)
                 and isinstance(report, placement.TerminalAttemptReport) and report.outcome == GUEST_SETTLEMENT_REQUESTED):
