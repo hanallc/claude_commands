@@ -190,16 +190,26 @@ def availability() -> Available | Unavailable:
 
 
 def settlement(episode: str, attempt: int) -> placement.Settled | placement.Pending:
-    """Read the ledger for the exact queue claim."""
+    """Read the exact claim and request cleanup if its booking has expired."""
     claim_id = execution_identity.assigned_claim_id(episode, f'{attempt:032x}')
     try:
         book = ledger.CostLedger(target_config.ssh_target_state_directory('aws'))
         rows = book.gate_claim_reservations(claim_id)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return placement.Pending('The AWS gate ledger is unavailable')
-    if any(ledger.gate_is_open(row) for row in rows):
-        return placement.Pending('AWS launch settlement remains pending')
-    return placement.Settled()
+    if not any(ledger.gate_is_open(row) for row in rows):
+        return placement.Settled()
+    now = int(time.time())
+    if any(row.expires <= now and cleanup_due(row, now) for row in rows):
+        try:
+            command = reconcile_command(book.directory, start_only=True)
+            # Admission can run without a user session environment.
+            runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+            _ = subprocess.run(command, env={**os.environ, 'XDG_RUNTIME_DIR': runtime}, check=False, capture_output=True,
+                               timeout=settings().number('api_timeout_s'))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f'The cloud gate reconcile did not start: {error}', file=sys.stderr, flush=True)
+    return placement.Pending('AWS launch settlement remains pending')
 
 
 def cleanup_due(reservation: ledger.GateReservation, now: int) -> bool:
@@ -376,15 +386,13 @@ def instance_not_found(error: AwsUnavailable) -> bool:
     return code == 'InvalidInstanceID.NotFound'
 
 
-def cleanup_folder(folder: Path, worker: GateWorker, *,
-                   schedule_cleanup: Callable[[int], None] | None = None) -> bool:
+def cleanup_folder(folder: Path, worker: GateWorker) -> bool:
     """Clean one gate folder or all module folders in a trial."""
     paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
-    return cleanup_requests(paths, worker, schedule_cleanup=schedule_cleanup)
+    return cleanup_requests(paths, worker)
 
 
-def cleanup_requests(paths: Sequence[Path], worker: GateWorker, *,
-                     schedule_cleanup: Callable[[int], None] | None = None) -> bool:
+def cleanup_requests(paths: Sequence[Path], worker: GateWorker) -> bool:
     """Clean only the attempts in the selected request files."""
     attempts: list[GateCleanupAttempt] = []
     complete = True
@@ -398,11 +406,10 @@ def cleanup_requests(paths: Sequence[Path], worker: GateWorker, *,
         except (OSError, ValueError, KeyError, TypeError) as error:
             print('gate cleanup: ' + str(error), file=sys.stderr)
             complete = False
-    return cleanup_attempts(attempts, worker, schedule_cleanup=schedule_cleanup) and complete
+    return cleanup_attempts(attempts, worker) and complete
 
 
-def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker, *,
-                     schedule_cleanup: Callable[[int], None] | None = None) -> bool:
+def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker) -> bool:
     """Request terminations before discovery and retain unconfirmed bookings."""
     complete = True
     deadline = worker.clock() + settings().number('termination_timeout_s')
@@ -421,12 +428,8 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker,
                 boxes.append(GateTermination(reservation.attempt, instance, region))
             elif 'arguments' in launch:
                 token = ledger.text(ledger.mapping(launch['arguments']), 'ClientToken')
-                if schedule_cleanup is not None and reservation.placement_claim and worker.clock() < reservation.expires:
-                    # An empty lookup can confirm absence only after expiry.
-                    schedule_cleanup(reservation.expires)
-                else:
-                    uncertain.append(UncertainGateLaunch(reservation.attempt, (region,),
-                        'Name=client-token,Values=' + token, reservation.expires))
+                uncertain.append(UncertainGateLaunch(reservation.attempt, (region,),
+                    'Name=client-token,Values=' + token, reservation.expires))
             elif item.launch_record_checked:
                 worker.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(worker.clock())))
             else:
@@ -822,8 +825,11 @@ class GateWorker:
         index = ledger.instant(launch, 'variant') if launch else 0
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         unreachable: set[str] = set()
+        attempt = ledger.text(request, 'attempt')
         for offset in range(index, stop):
-            if launch.get('arguments') and offset == index:
+            replay = bool(launch.get('arguments')) and offset == index
+            fresh_assignment = not replay and request.get('placement_claim') is not None
+            if replay:
                 arguments = ledger.mapping(launch['arguments'])
                 self.box_region = str(launch.get('region', self.api.region))
                 size = ledger.text(arguments, 'InstanceType')
@@ -881,11 +887,12 @@ class GateWorker:
                     arguments['ImageId'] = ledger.text(regional, 'image')
                 launch = {**saved_order, 'variant': offset, 'arguments': arguments, 'region': self.box_region, 'zone': zone,
                           'gate_time_limit_s': seconds}
-                save(path, launch)
+                if not fresh_assignment:
+                    save(path, launch)
             api = self.regional_api(self.box_region)
-            self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
+            self.book.gate_region(attempt, self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-            if self.clock() >= ledger.instant(request, 'expires'):
+            if not fresh_assignment and self.clock() >= ledger.instant(request, 'expires'):
                 reply = api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
                 instances = [instance for group in ledger.rows(reply, 'Reservations')
@@ -904,6 +911,11 @@ class GateWorker:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
+                            if fresh_assignment:
+                                if reason := self._check_launch_booking(attempt):
+                                    return CloudDeclined(reason)
+                                # Save the token before AWS can accept the request.
+                                save(path, launch)
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
                         self.record_launch(request, size, zone, 'launched')
                         break
@@ -959,6 +971,14 @@ class GateWorker:
         return {ledger.text(row, 'Key'): ledger.text(row, 'ETag')
                 for row in ledger.rows({'Contents': listing.get('Contents', [])}, 'Contents')}
 
+    def _check_launch_booking(self, attempt: str) -> str:
+        """Close the booking if the current cap blocks launch."""
+        now = int(self.clock())
+        reason = self.book.recheck_gate_booking(self.settings_path, attempt, now)
+        if reason:
+            self.book.resolve_gate(attempt, ledger.GateAbsent(now))
+        return reason
+
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
         row: dict[str, object] = {}
@@ -991,9 +1011,7 @@ class GateWorker:
             if new_launch:
                 if claim is not None:
                     self.charges()
-                    now = int(self.clock())
-                    if reason := self.book.recheck_gate_booking(self.settings_path, attempt, now):
-                        self.book.resolve_gate(attempt, ledger.GateAbsent(now))
+                    if reason := self._check_launch_booking(attempt):
                         return {'status': 'fallback', 'reason': reason}
                 bucket = ledger.text(deployment, 'bucket')
                 if request['source_key']:
@@ -1439,20 +1457,17 @@ def read_saved_request(repo: Path, path: Path, tree: str,
 
 
 def gate_attempt_command(operation: Literal['--worker', '--cleanup'], folder: Path,
-                         directory: Path, sidecar: Path, *, settings_path: Path | None = None,
-                         start_at: int | None = None) -> list[str]:
-    unit = 'cloud-gate-' + folder.name
-    if start_at is not None:
-        unit += '-expiry-cleanup'
+                         directory: Path, sidecar: Path) -> list[str]:
     return service_command('scripts.aws_target.cloud_gate',
         [operation, str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
-         '--settings', str(settings_path or account_settings_path())], unit, start_at=start_at)
+         '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
 
 
-def reconcile_command(directory: Path) -> list[str]:
-    """Run only the reconcile step; one unit name lets one reconcile run at a time."""
+def reconcile_command(directory: Path, *, start_only: bool = False) -> list[str]:
+    """Use one unit name so only one reconcile service runs at a time."""
     return service_command('scripts.aws_target.cloud_gate',
-        ['--reconcile', '--directory', str(directory), '--settings', str(account_settings_path())], 'cloud-gate-reconcile')
+        ['--reconcile', '--directory', str(directory), '--settings', str(account_settings_path())],
+        'cloud-gate-reconcile', start_only=start_only)
 
 
 def end_open_gates(directory: Path, service: Callable[[Sequence[str]], int]) -> None:
@@ -1790,7 +1805,7 @@ def route_reservation(repo: Path, folder: Path, mode: gate.SuiteMode, job: StepJ
 
 
 def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False,
-                    start_at: int | None = None) -> list[str]:
+                    start_only: bool = False) -> list[str]:
     """Use the installed scaler environment for each gate controller."""
     credential = str(admin_secrets.credentials_file())
     configuration = ['--setenv=CONF_DIR=' + os.environ['CONF_DIR']] if 'CONF_DIR' in os.environ else []
@@ -1805,9 +1820,8 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
             cleanup_arguments = ['--cleanup' if value == '--worker' else value for value in arguments]
         command = shlex.join([sys.executable, '-m', module, *cleanup_arguments])
         cleanup = ['--property=ExecStopPost=' + command.replace('%', '%%').replace('$', '$$')]
-    timing = (['--wait', '--pipe'] if start_at is None else
-              [f'--on-calendar=@{start_at}', '--timer-property=RemainAfterElapse=no'])
-    return ['systemd-run', '--user', *timing, '--collect', '--unit=' + unit,
+    launch = ['--no-block'] if start_only else ['--wait', '--pipe']
+    return ['systemd-run', '--user', *launch, '--collect', '--unit=' + unit,
             '--setenv=AWS_SHARED_CREDENTIALS_FILE=' + credential,
             *configuration, *owner, *cleanup,
             '--property=KillMode=' + ('mixed' if paired else 'control-group'), '--property=UMask=0077',
@@ -1879,15 +1893,8 @@ def main() -> int:
     with control_lock(folder):
         worker = gate_worker()
         if cleanup is not None:
-            assert sidecar is not None
-
-            def schedule_cleanup(expires: int) -> None:
-                command = gate_attempt_command('--cleanup', folder, directory, sidecar,
-                                               settings_path=settings_path, start_at=expires)
-                _ = subprocess.run(command, check=True, timeout=settings().number('api_timeout_s'))
-
             with cancellation.defer_cleanup_signals():
-                return int(not cleanup_folder(folder, worker, schedule_cleanup=schedule_cleanup))
+                return int(not cleanup_folder(folder, worker))
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             return 0
         outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))

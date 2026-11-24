@@ -3150,6 +3150,8 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 else:
                     print(f"Assign the fix: gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
+    except (AwsGateTookNoRun, AwsGateLaunchPending):
+        raise
     except (Exception, KeyboardInterrupt) as error:
         if not result_sent and not (isinstance(run, GateRun) and not run.passed):
             reason = GateRefused("interrupted by SIGINT") if isinstance(error, KeyboardInterrupt) else error

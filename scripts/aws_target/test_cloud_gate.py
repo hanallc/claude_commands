@@ -429,6 +429,30 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         booking, = self.book.gate_claim_reservations(attempt)
         self.assertIsInstance(booking.state, ledger.GateAbsent)
 
+    def test_assigned_worker_rechecks_a_lower_cap_after_upload(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.request['placement_claim'] = attempt
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        booking = replace(cloud_gate.gate_booking(cloud_gate.settings(), attempt, int(self.now),
+            ledger.instant(self.request, 'expires')), placement_claim=attempt)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            reply = self.fake(arguments, **options)
+            if 'put-object' in arguments:
+                numeric_settings(self.settings, {'daily_limit_usd': '0.01'})
+            return reply
+
+        worker = cloud_gate.GateWorker(AwsCli('build-scaler', 'fixture-region', 1, execute=transport),
+            self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+        self.assertEqual(worker.execute(self.folder, self.request, self.deployment),
+                         {'status': 'fallback', 'reason': 'daily_limit'})
+        self.assertTrue(any('put-object' in command for command in self.fake.commands))
+        self.assertEqual(self.fake.launches, [])
+        self.assertNotIn('arguments', cloud_gate.read(self.folder / 'launch.json'))
+        booking, = self.book.gate_claim_reservations(attempt)
+        self.assertIsInstance(booking.state, ledger.GateAbsent)
+
     def test_confirmed_scaler_decline_closes_the_booking_without_a_terminal_report(self) -> None:
         assignment = aws_gate_assignment().assignment
         claim = placement.assigned_claim_reference(assignment)
@@ -468,7 +492,32 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         booked, = self.book.gate_claim_reservations(claim.claim_id)
         self.assertIsInstance(booked.state, ledger.GateAbsent)
 
-    def test_stop_cleanup_settles_an_uncertain_assignment_at_expiry(self) -> None:
+    def test_stop_cleanup_terminates_an_instance_found_by_client_token(self) -> None:
+        attempt = ledger.text(self.request, 'attempt')
+        self.request['placement_claim'] = attempt
+        cloud_gate.save(self.folder / 'request.json', self.request)
+        booking = replace(cloud_gate.gate_booking(cloud_gate.settings(), attempt, int(self.now),
+            ledger.instant(self.request, 'expires')), placement_claim=attempt)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, booking), ledger.GateReserved)
+        self.fake.launch_timeouts = 1
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.fake.commands.clear()
+        api = AwsCli('fixture', 'fixture-region', 1, execute=self.fake)
+        cleanup = ['--cleanup', str(self.folder), '--directory', str(self.state),
+                   '--sidecar', str(self.folder / 'reservation.cgroup'), '--settings', str(self.settings)]
+        with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+              mock.patch.object(cloud_gate, 'GateWorker', wraps=partial(cloud_gate.GateWorker, clock=lambda: self.now)),
+              mock.patch.object(sys, 'argv', ['cloud_gate', *cleanup]),
+              mock.patch.object(subprocess, 'run') as schedule):
+            self.assertEqual(cloud_gate.main(), 0)
+        schedule.assert_not_called()
+        first, *_ = self.fake.commands
+        self.assertIn('describe-instances', first)
+        self.assertIn(f'Name=client-token,Values={attempt}-0', first)
+        booking, = self.book.gate_claim_reservations(attempt)
+        self.assertIsInstance(booking.state, ledger.GateTerminated)
+
+    def test_queue_settlement_retries_expired_cleanup_from_the_saved_booking(self) -> None:
         episode = 'episode'
         claim = execution_identity.assigned_claim_id(episode, f'{10:032x}')
         expires = int(self.now) + 1200
@@ -484,27 +533,39 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         api = AwsCli('fixture', 'fixture-region', 1, execute=self.fake)
         cleanup = ['--cleanup', str(self.folder), '--directory', str(self.state),
                    '--sidecar', str(self.folder / 'reservation.cgroup'), '--settings', str(self.settings)]
-        with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+
+        def start_reconcile(command: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('--no-block', command)
+            self.assertNotIn('--wait', command)
+            self.assertFalse(any(option.startswith('--on-calendar') for option in command))
+            environment = cast(dict[str, str], _options['env'])
+            self.assertEqual(environment['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
+            with mock.patch.object(sys, 'argv', ['cloud_gate', *command[command.index('--reconcile'):]]):
+                status = cloud_gate.main()
+            return subprocess.CompletedProcess(list(command), status, '', '')
+
+        with (mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': ''}),
+              mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(cloud_gate, 'account_settings_path', return_value=self.settings),
               mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
               mock.patch.object(cloud_gate, 'GateWorker', wraps=partial(cloud_gate.GateWorker, clock=lambda: self.now)),
+              mock.patch.object(time, 'time', side_effect=lambda: self.now),
               mock.patch.object(sys, 'argv', ['cloud_gate', *cleanup]),
-              mock.patch.object(subprocess, 'run',
-                  return_value=subprocess.CompletedProcess([], 0, '', '')) as schedule):
+              mock.patch.object(subprocess, 'run', side_effect=start_reconcile) as start):
+            self.assertEqual(cloud_gate.main(), 1)
             self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
-            self.assertEqual(cloud_gate.main(), 0)
-            self.assertEqual(self.fake.commands, [])
-            schedule.assert_called_once()
-            command = cast(tuple[list[str]], schedule.call_args.args)[0]
-            self.assertIn(f'--on-calendar=@{expires}', command)
-            self.assertEqual(command[command.index('--cleanup'):], cleanup)
-            self.assertNotIn('--wait', command)
-            self.assertNotIn('--pipe', command)
-            self.advance(1200)
-            self.assertEqual(cloud_gate.main(), 0)
-            self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
-            schedule.assert_called_once()
-        self.assertEqual(len(self.fake.commands), 1)
-        self.assertIn('describe-instances', self.fake.commands[0])
+            start.assert_not_called()
+            self.advance(1201)
+            self.fake.describe_errors = [subprocess.TimeoutExpired('describe-instances', 1)]
+            with mock.patch.object(cloud_gate, 'process_start', return_value=Gone()):
+                self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+                start.assert_called_once()
+                self.assertIsInstance(self.book.gate_claim_reservations(claim)[0].state, ledger.GateLaunchPending)
+                self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+                self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
+                self.assertEqual(start.call_count, 2)
+        self.assertEqual(len(self.fake.commands), 3)
+        self.assertTrue(all('describe-instances' in row for row in self.fake.commands))
 
     def test_settlement_uses_only_the_exact_claim_and_its_retries(self) -> None:
         episode = 'episode'
@@ -514,10 +575,13 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
         booking = ledger.GateReservation(claim, now, now + 60, Decimal('.8'), Decimal(0), placement_claim=claim)
         retry = replace(booking, attempt='retry', state=ledger.GateRunning('fixture-instance'))
         with (mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state),
+              mock.patch.object(time, 'time', return_value=self.now),
+              mock.patch.object(subprocess, 'run') as start,
               mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Settlement uses local files'))):
             self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
             with self.book.transaction() as state:
-                state.gate_reservations.extend((booking, retry, replace(booking, attempt='unrelated', placement_claim='')))
+                unrelated = replace(booking, attempt='unrelated', placement_claim='', at=now - 120, expires=now - 1)
+                state.gate_reservations.extend((booking, retry, unrelated))
             before = self.book.path.read_bytes()
             with mock.patch.object(ledger.CostLedger, 'locked_snapshot') as lock:
                 self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
@@ -529,6 +593,8 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
             self.assertEqual(cloud_gate.settlement(episode, 10), placement.Settled())
             _ = self.book.path.write_text('unreadable')
             self.assertIsInstance(cloud_gate.settlement(episode, 10), placement.Pending)
+
+        start.assert_not_called()
 
     def test_availability_uses_only_local_evidence(self) -> None:
         directory = self.state
@@ -3266,17 +3332,18 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                                       mock.patch.object(gate, 'nightly_git'),
                                       mock.patch.object(gate, 'nightly_owner', return_value='fixture'),
                                       mock.patch.object(copies, 'standing', return_value=nullcontext(repo)),
-                                      mock.patch.object(gate, '_sweep_nightly_build_folders'),
-                                      mock.patch.object(gate, 'push_nightly_result')):
+                                      mock.patch.object(gate, '_sweep_nightly_build_folders')):
                             _ = isolated.enter_context(patch)
                         nightly_red = isolated.enter_context(mock.patch.object(gate, 'nightly_red_lock',
                             side_effect=AssertionError('AWS dispatch status must not create a nightly red result')))
                         local = isolated.enter_context(mock.patch.object(gate, 'run_suites'))
+                        notice = isolated.enter_context(mock.patch.object(gate, 'push_nightly_result'))
                         actual = gate.main(command)
                     self.assertEqual(actual, status, output.getvalue() + errors.getvalue())
                     self.assertTrue(fake.launches)
                     local.assert_not_called()
                     nightly_red.assert_not_called()
+                    notice.assert_not_called()
                     self.assertEqual(gate.checked_git(repo, 'rev-parse', 'HEAD'), base)
                     failure_file = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
                     if status == GATE_PRELAUNCH_REFUSED_STATUS:
