@@ -1671,7 +1671,7 @@ Those workers may build.
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
 | `record-recipient --session-id --name` | Written by `top_level.py`. |
-| `release [target] [--holder N]` / `release --resume` | Removes its holder file first, then records released_at and release_started_at; notices follow after the last file is gone. Other holder files keep the hold in force. One notice per recipient; the memory gate orders builds. `--resume` refuses while any holder file exists. Other targets return exit 2 without changes. |
+| `release [target] [--holder N]` / `release --resume` | Removes its holder file before it records `released_at` and `release_started_at`. Release sends notices after it removes the last holder file. The memory gate orders builds. `--resume` refuses while any holder file exists. Other targets return exit 2. |
 | `status` | One line per holder with since, reason and ETA, its keep list, cycle delivery rows, and the audit with `--keep <pid>` for each run that would stop; or `no build hold`. Then `release pending:` lines name unfinished releases and their unsent recipients, using the release drain's reader, and `/build:hold release` to finish them, even with no holder file. A damaged record or cycle is named with its path, error and the command that sets it aside. Status changes no file. Present files stay held despite cycle release fields. |
 | `audit` | Reads running build processes from `/proc`. Prints session-owned builds by class. Records other_session and no_session builds when a hold is in force. |
 
@@ -1742,9 +1742,20 @@ It saves the command's session marker separately from the owner staff ID.
 If the command has an owner staff ID, its session must match that staff member's current session.
 Release checks the stop confirmation and the saved evidence before it sends a restart notice.
 Release sends the restart notice only to the saved session.
+`send.py --exact-thread` sends a Codex restart notice only to its saved thread.
+Send failures keep restart notices pending.
+If release cannot verify the saved staff session, it keeps the restart pending.
+Release checks the age of each restart notice before it sends the notice.
+Release removes pending restarts when the release age exceeds `restart_notice.max_age_seconds` in `build_targets.conf`.
+The default limit is 86,400 seconds (24 hours).
+Release can send the ordinary notice while the restart notice stays pending.
+A newer restart replaces older pending restarts for the same session after it passes all checks.
+A retry before holder removal replaces the pending record for that cycle.
 An unreadable stop confirmation or run record keeps the restart notice pending.
+The enforcer checks that the detached command exits after TERM or KILL.
 A confirmed stop can receive a notice after the command exits.
 Release drops invalid restart notices and keeps waits with an independent or unknown origin.
+Enforcer registration preserves the origin of each existing wait.
 Release notices show a hold's start date if it differs from today's date in the user's time zone.
 
 `release --resume` supports a file left by an old release. It refuses while any hold is in force. With no cycle, the holder broadcasts the release. `open_cycle`, `save_cycle` and `write_hold` write a complete temporary file before `os.replace`; holder temporary files stay outside the holder directory.

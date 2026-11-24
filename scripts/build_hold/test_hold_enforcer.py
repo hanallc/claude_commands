@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Callable, Mapping
@@ -35,6 +36,7 @@ from scripts.mac_test import claim_state
 from scripts.herdr import worker_panes
 from scripts.lib import process_stop
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production import staff
 
@@ -91,12 +93,20 @@ class HoldEnforcerTests(unittest.TestCase):
 
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
         }))
+        self.addCleanup(self.finish_hold_recorders, set(threading.enumerate()))
         self.write_holder()
         # Registering a stopped session must use this temporary cycle.
         with build_hold.release_lock():
             cycle = build_hold.open_cycle(datetime.fromtimestamp(100, timezone.utc))
             cycle["holders"]["holder"] = {"since": datetime.fromtimestamp(100, timezone.utc).isoformat(), "released_at": ""}
             build_hold.save_cycle(cycle)
+
+    def finish_hold_recorders(self, existing: set[threading.Thread]) -> None:
+        """Wait for this fixture's recorder processes before cleanup."""
+        for thread in threading.enumerate():
+            if thread not in existing and thread.name == "hold-event-recorder":
+                thread.join(timeout=TEST_HANG_GUARD_SECS)
+                self.assertFalse(thread.is_alive(), "The hold event recorder did not exit")
 
     def read_claims(self, proc_root: Path) -> build_hold.LiveClaims:
         self.assertEqual(proc_root, self.proc)
@@ -379,7 +389,7 @@ class HoldEnforcerTests(unittest.TestCase):
                                           self.uid, enforcer_pid, self.claimed)
 
     def rows(self) -> list[dict[str, object]]:
-        return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
+        return [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/hold-builds-*.jsonl")
                 for line in path.read_text().splitlines()]
 
     def write_step(self, call_id: str, state: step_record.StepState, pid: int) -> None:
@@ -992,7 +1002,7 @@ class HoldEnforcerTests(unittest.TestCase):
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
         for outcome in ("shared holders", "shared releases", "shared run record",
-                        "record failure", "identity change", "no command group", "unconfirmed", "stopped"):
+                        "record failure", "identity change", "no command group", "unconfirmed", "still running", "stopped"):
             with self.subTest(outcome=outcome):
                 record = (self.root / ".local/state/build-hold-enforcer/run.json"
                           if outcome == "shared run record" else self.root / "detached-run.json")
@@ -1036,6 +1046,8 @@ class HoldEnforcerTests(unittest.TestCase):
                     cycle = build_hold.read_cycle()
                     assert not isinstance(cycle, build_hold.NoCycle)
                     self.assertIn("gate-owner", cycle["recipients"])
+                    if outcome == "stopped":
+                        (self.proc / str(pid) / "stat").unlink()
 
                 def stop() -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
                     assert isinstance(run, hold_enforcer.WaitingRun)
@@ -1047,7 +1059,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 with (mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop),
                       mock.patch.object(detached_runs, "write_text_atomic", side_effect=stage_reason),
-                      mock.patch.object(process_stop, "supported", return_value=outcome != "stopped")):
+                      mock.patch.object(process_stop, "supported", return_value=outcome not in ("still running", "stopped"))):
                     if outcome.startswith("shared"):
                         before = record.read_bytes()
                         rows = self.rows()
@@ -1075,14 +1087,20 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIsInstance(result, hold_enforcer.StoppedRun if confirmed else hold_enforcer.RunIdentityChanged)
                 row, = self.rows()[row_count:]
                 self.assertEqual(row["stop_status"], "stopped" if confirmed else "not_stopped")
-                request_id = cast(str, row["stop_request_id"])
-                self.assertEqual(detached_runs.confirms_hold_stop(record, record.stem, request_id), confirmed)
+                if outcome == "no command group":
+                    self.assertNotIn("stop_request_id", row)
+                else:
+                    request_id = cast(str, row["stop_request_id"])
+                    self.assertEqual(detached_runs.confirms_hold_stop(record, record.stem, request_id), confirmed)
                 saved = cast(dict[str, object], json.loads(record.read_text()))
                 if outcome in ("unconfirmed", "stopped"):
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
                     self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                     if not confirmed:
                         self.assertIn("without a verified scope", str(saved["scope_error"]))
+                elif outcome == "still running":
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    self.assertNotIn("stop_reason", saved)
                 else:
                     self.assertEqual(signals, [])
                     self.assertNotIn("stop_reason", saved)
@@ -1434,7 +1452,8 @@ class HoldEnforcerTests(unittest.TestCase):
         table = self.table()
         self.assertIsInstance(hold_enforcer.stop_waiting_run(
             hold_enforcer.WaitingRun(table[10], OwningSession(replacement)),
-            holder, table, self.proc, signal_group=lambda _pid, _signal: None), hold_enforcer.StoppedRun)
+            holder, table, self.proc, signal_group=lambda pid, _signal: (self.proc / str(pid) / "stat").unlink()),
+            hold_enforcer.StoppedRun)
         with mock.patch.object(build_hold, "send_release_to", return_value=build_hold.ReleaseDelivered()) as send:
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
         send.assert_called_once()
@@ -1475,6 +1494,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     if not succeed:
                         raise ProcessLookupError(pid)
                     signals.append((pid, signum))
+                    (self.proc / str(pid) / "stat").unlink()
 
                 if clear:
                     result = hold_enforcer.stop_waiting_run(
@@ -1504,7 +1524,8 @@ class HoldEnforcerTests(unittest.TestCase):
 
         live_address, ended_address, closed_address = (f"codex:{worker.current_session}" for worker in (live, ended, closed))
         self.assertEqual([to for to, _ in sent], [live_address, ended_address, ended_address])
-        self.assertEqual(attempts, [live_address, ended_address, closed_address, ended_address, closed_address])
+        self.assertEqual(attempts, [live_address, ended_address, closed_address, ended_address,
+                                    closed_address, closed_address, closed_address])
         for (_, notice), (index, worker) in zip(sent, ((0, live), (1, ended), (3, ended)), strict=True):
             self.assertIn(f"Restart the stopped run python3 unittest for {worker.name}.", notice)
             self.assertIn(f"Run ID run-{index}.", notice)
@@ -1525,8 +1546,10 @@ class HoldEnforcerTests(unittest.TestCase):
                                      "boot_id": "test-boot", "owner_session": address}
         entry: build_hold.ReleaseEntry = {**build_hold.new_entry(address, worker.name), "run": run}
         failure = build_hold.ReleaseSendFailed("delivery was not confirmed")
+        now = datetime.now(timezone.utc)
+        checks = build_hold.RestartNoticeChecks(now, timedelta(minutes=1), lambda: now, "cycle", {})
         with mock.patch.object(build_hold, "send_release_to", return_value=failure) as send:
-            result = build_hold.send_stopped_run_release(entry, run, "released", staff.initial_snapshot())
+            result = build_hold.send_stopped_run_release(entry, run, "released", staff.initial_snapshot(), checks)
         self.assertEqual(result, failure)
         send.assert_called_once_with(entry, address, "released Restart the stopped run checks for worker. Run ID checks.")
 
@@ -1567,6 +1590,94 @@ class HoldEnforcerTests(unittest.TestCase):
 
     def test_release_recovers_an_active_detached_stop_after_an_audit_save_failure(self) -> None:
         self.assert_release_recovers_stop("active detached")
+
+    def test_detached_restart_requires_the_wrapper_to_end_after_the_child_signal(self) -> None:
+        for exits in (True, False):
+            with self.subTest(exits=exits):
+                self.assert_detached_child_stop(exits)
+
+    def test_detached_restart_is_confirmed_when_kill_ends_the_wrapper(self) -> None:
+        self.assert_detached_kill_stop(release_original=False)
+
+    def test_detached_restart_is_confirmed_after_the_original_holder_releases(self) -> None:
+        self.assert_detached_kill_stop(release_original=True)
+
+    def assert_detached_kill_stop(self, *, release_original: bool) -> None:
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        record = self.root / "wrapped-tests.json"
+        self.write_detached_run(record, command_started=True, command=["bash", "run-tests.sh"])
+        _ = self.process(100, "python3", start=10_000,
+                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        wrapper = self.process(10, "bash", parent=100, argv=("bash", "run-tests.sh"), session="test-owner")
+        _ = self.process(11, "cargo", parent=10, start=11_001, argv=("cargo", "test"))
+        table = self.table()
+        child = table[11]
+        decision = hold_enforcer.WouldStopBuild(child, OwningSession("test-owner"), "timed test", holder, child)
+        signals: list[tuple[int, int]] = []
+
+        def signal_child(pid: int, signum: int) -> None:
+            signals.append((pid, signum))
+            if signum == signal.SIGKILL:
+                (wrapper / "stat").unlink()
+
+        stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=signal_child, clock=lambda: self.now)
+        stopper.stop(decision, table, (holder,), 999, self.claimed)
+        row, = self.rows()
+        confirmation = build_hold.stop_confirmation_path(cast(str, row["stop_request_id"]))
+        self.assertEqual(row["stop_status"], "not_stopped")
+        self.assertEqual(confirmation.read_text(), "not_stopped\n")
+        if release_original:
+            _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("second", "second"),
+                                      "timed test", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+            self.assertIn("still held by second", build_hold.release_cycle(self.holders, holder.key))
+        remaining, = build_hold.natedev_holds(self.holders).in_force
+        self.now = 2
+        stopper.kill_survivors(self.table(), (remaining,), 999, self.claimed)
+        self.assertEqual(signals, [(11, signal.SIGTERM), (11, signal.SIGKILL)])
+        row, = self.rows()
+        self.assertEqual(row["stop_status"], "stopped")
+        self.assertEqual(confirmation.read_text(), "stopped\n")
+        with (mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")),
+              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send):
+            self.assertEqual(build_hold.release_cycle(self.holders, remaining.key), "released, builds may resume.")
+        send.assert_called_once()
+        self.assertIn("Run ID wrapped-tests.", cast(str, send.call_args.args[2]))
+
+    def assert_detached_child_stop(self, exits: bool) -> None:
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        record = self.root / "wrapped-tests.json"
+        self.write_detached_run(record, command_started=True, command=["bash", "run-tests.sh"])
+        _ = self.process(100, "python3", start=10_000,
+                         argv=("python3", "detached_runs.py", "supervise", str(record)))
+        wrapper = self.process(10, "bash", parent=100, argv=("bash", "run-tests.sh"), session="test-owner")
+        _ = self.process(11, "cargo", parent=10, start=11_001, argv=("cargo", "test"))
+        table = self.table()
+        child = table[11]
+        decision = hold_enforcer.WouldStopBuild(child, OwningSession("test-owner"), "timed test", holder, child)
+        def signal_child(pid: int, signum: int) -> None:
+            self.assertEqual((pid, signum), (11, signal.SIGTERM))
+            if exits:
+                (wrapper / "stat").unlink()
+
+        with mock.patch.object(os, "kill", side_effect=signal_child) as send_signal:
+            stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=send_signal)
+            stopper.stop(decision, table, (holder,), 999, self.claimed)
+        send_signal.assert_called_once_with(11, signal.SIGTERM)
+        row = self.rows()[-1]
+        status = "stopped" if exits else "not_stopped"
+        self.assertEqual(row["stop_status"], status)
+        confirmation = build_hold.stop_confirmation_path(cast(str, row["stop_request_id"]))
+        self.assertEqual(confirmation.read_text(), status + "\n")
+        with (mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")) as lookup,
+              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send):
+            self.assertEqual(build_hold.release_cycle(self.holders, holder.key), "released, builds may resume.")
+        lookup.assert_called_once_with("test-owner")
+        send.assert_called_once()
+        self.assertEqual("Run ID wrapped-tests." in cast(str, send.call_args.args[2]), exits)
+        if exits:
+            self.write_holder()
+            _ = build_hold.open_cycle(datetime.fromtimestamp(100, timezone.utc))
+            hold_enforcer.hold_build_log(holder).unlink()
 
     def test_release_recovers_a_direct_stop_after_an_audit_save_failure(self) -> None:
         self.assert_release_recovers_stop("direct")
@@ -1617,6 +1728,9 @@ class HoldEnforcerTests(unittest.TestCase):
 
         def signal_fixture(pid: int, signum: int) -> None:
             signals.append((pid, signum))
+            if detached:
+                stat = self.proc / str(pid) / "stat"
+                _ = stat.write_text(stat.read_text().replace(") S ", ") Z ", 1))
 
         def stop() -> None:
             if path == "drain":
@@ -1683,11 +1797,8 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertEqual(released, complete + " Release notices still pending for gate-owner."
                                  if run_unreadable else pending)
                 self.assertFalse((self.holders / holder.key).exists())
-                if run_unreadable:
-                    send.assert_not_called()
-                else:
-                    send.assert_called_once()
-                    self.assertNotIn("Restart the stopped run", cast(str, send.call_args.args[2]))
+                send.assert_called_once()
+                self.assertNotIn("Restart the stopped run", cast(str, send.call_args.args[2]))
                 intent = build_hold.read_release_intent(build_hold.release_directory() / "pending-release.json")
                 assert not isinstance(intent, build_hold.NoReleaseIntent)
                 notices = intent["notices"]
@@ -1739,7 +1850,7 @@ class HoldEnforcerTests(unittest.TestCase):
         lookup.assert_not_called()
         send.assert_not_called()
 
-    def test_release_drops_a_restart_when_the_staff_session_was_replaced(self) -> None:
+    def test_release_keeps_a_pending_restart_when_the_staff_session_was_replaced(self) -> None:
         holder, = build_hold.natedev_holds(self.holders).in_force
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         director = fixture_member("showrunner", name="director")
@@ -1756,12 +1867,16 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(build_hold.read_restart_entry(row["restart"])["session_id"], worker.current_session)
         _ = staff.update_current_session(staff.StaffId(worker.current_session),
                                          staff.StaffId(fixture_runtime_id("replacement")))
-        with (mock.patch.object(build_hold, "socket_for") as lookup,
-              mock.patch.object(build_hold, "send_release_to") as send):
+        with (mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")) as lookup,
+              mock.patch.object(build_hold, "send_release_to") as send,
+              mock.patch.object(build_hold, "send_session_release", return_value=build_hold.ReleaseDelivered())):
             self.assertEqual(build_hold.release_cycle(self.holders, holder.key),
-                             "released, builds may resume. Dropped 1 invalid restart notices.")
-        lookup.assert_not_called()
+                             f"released, builds may resume. Release notices still pending for {worker.current_session}.")
+        lookup.assert_called_once_with(worker.current_session)
         send.assert_not_called()
+        with build_hold.release_lock() as held:
+            record, = build_hold.recorded_releases(held)
+        self.assertEqual(record.state, "pending")
 
     def test_direct_restart_uses_the_staff_members_matching_codex_session(self) -> None:
         holder, = build_hold.natedev_holds(self.holders).in_force
