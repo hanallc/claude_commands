@@ -52,6 +52,7 @@ from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never
 
 
 from scripts.herdr import pane_launch
+from scripts.herdr import message_proof as _message_proof
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, operation_deadline, script_prompts, session_folder
 from scripts.lib.agent_program import is_agent_process, is_claude_process as is_claude_process, is_codex_process as is_codex_process
@@ -3751,14 +3752,19 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
 def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     """Prove the pane owner. Check for Codex terminal holders when input is pending."""
+    return _foreground_pane_owner(info, for_input=for_input, message_owner=_message_proof.StrictOwnerProof.REQUIRED)
+
+
+def _foreground_pane_owner(info: dict[str, object], *, for_input: bool, message_owner: _message_proof.MessageOwnerProof
+                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     try:
-        return _prove_foreground_owner(info, for_input=for_input)
+        return _prove_foreground_owner(info, for_input=for_input, message_owner=message_owner)
     except _CodexForegroundProcessGone as error:
         if isinstance(info, _PaneProcessInfo):
             try:
                 fresh = info.read_again()
                 if _pane_process_ids(fresh, "fresh pane process info") == _pane_process_ids(info, "pane process info"):
-                    owner = _prove_foreground_owner(fresh, for_input=for_input)
+                    owner = _prove_foreground_owner(fresh, for_input=for_input, message_owner=message_owner)
                     if isinstance(owner, ProvedCodexForeground) and owner.pid == error.owner_pid:
                         return owner
                     if isinstance(owner, UnprovedForegroundOwner) and owner.kind == "codex":
@@ -3768,7 +3774,7 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
         return UnprovedForegroundOwner("codex", str(error))
 
 
-def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
+def _prove_foreground_owner(info: dict[str, object], *, for_input: bool, message_owner: _message_proof.MessageOwnerProof
                             ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     foreground = _foreground_processes(info)
     claude: list[tuple[dict[str, object], list[str]]] = []
@@ -3815,14 +3821,28 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
             if len(candidates) == 1:
                 return candidates[0]
             registered: list[ProvedClaudeForeground] = []
+            denied: _ProcessEnvironmentDenied | None = None
             for candidate in candidates:
                 try:
                     native = native_process(candidate.pid, "claude")
                 except NativeRegistryChanging:
                     continue
+                except _ProcessEnvironmentDenied as error:
+                    if for_input or isinstance(message_owner, _message_proof.StrictOwnerProof):
+                        raise
+                    denied = error
+                    continue
                 registered.append(replace(candidate, native=native))
             if len(registered) == 1:
-                return registered[0]
+                owner = registered[0]
+                if denied is None:
+                    return owner
+                if isinstance(owner.native, NativeAgentProcess) and message_owner == _message_proof.ProvedMessageOwner(
+                        conversation=owner.native.current_identity, pid=owner.pid, start=owner.native.started):
+                    return owner
+                raise denied
+            if denied is not None and not registered:
+                raise denied
         except (HerdrFailure, OSError, ValueError) as error:
             return UnprovedForegroundOwner("claude", str(error))
         return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
@@ -3842,7 +3862,7 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
 def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPaneAgent | ObservedEmpty | UnknownPaneOwner:
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
-        owner = foreground_pane_owner(info)
+        owner = _foreground_pane_owner(info, for_input=False, message_owner=_message_proof.message_owner.get())
         if isinstance(owner, ClaudeForegroundWithoutArgv):
             return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
         if isinstance(owner, UnprovedForegroundOwner):
@@ -5453,11 +5473,18 @@ def running_codex_threads(*, thread_host: Callable[[list[str]], bool],
     return set(codex.live)
 
 
+class _ProcessEnvironmentDenied(PermissionError):
+    """The Linux process environment cannot be read."""
+
+
 def process_environment(pid: int) -> dict[str, str]:
     """Read a process even outside herdr; a failed observation remains an error."""
     if _platform() == "darwin":
         return darwin_process_environment(pid)
-    return _process_environment(proc_root() / str(pid))
+    try:
+        return _process_environment(proc_root() / str(pid))
+    except PermissionError as error:
+        raise _ProcessEnvironmentDenied(error.errno, error.strerror, cast(object, error.filename)) from error
 
 
 def _process_arguments(process: Path) -> list[str]:

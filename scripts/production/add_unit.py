@@ -27,7 +27,7 @@ from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import pane_record, remote
 from scripts.lib import autocompact, build_folders, git_exclude, git_files, models_registry
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.message import sessions
@@ -313,8 +313,8 @@ def default_worktree(production: Production, unit: str) -> Path:
     word = build_folders.repo_word(production.checkout)
     path = build_folders.worktree_path(word, unit, worktrees.UNIT_WORKTREE_NAME)
     legacy = path.with_name("director")
-    if not os.path.lexists(path) and worktrees.checkout_record(path) is None:
-        if worktrees.checkout_record(legacy) is not None:
+    if not os.path.lexists(path) and worktree_records.checkout_record(path) is None:
+        if worktree_records.checkout_record(legacy) is not None:
             return legacy
     return path
 
@@ -408,7 +408,7 @@ def launch_request(args: argparse.Namespace, *,
     if isinstance(member, staff_sources.MemberFound) and isinstance(member.row.worktree, staff.PresentWorktree):
         recorded = unit_lookup.local_worktree(member).path
         if isinstance(session, NewSession) or recorded != worktree or os.path.lexists(recorded):
-            saved_make = worktrees.checkout_record(recorded)
+            saved_make = worktree_records.checkout_record(recorded)
             if saved_make is not None and worktrees.pending_checkout(recorded, production.checkout, saved_make.branch):
                 branch = saved_make.branch
             else:
@@ -772,7 +772,7 @@ def ensure_worktree(request: UnitLaunch) -> None:
             worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch),
             layout, owner=request.identity.unit, merge_branch=production.merge_branch,
             allow_existing=True, record_adoption=True)
-    except worktrees.Refused as error:
+    except worktree_records.Refused as error:
         raise Refusal(str(error)) from error
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path

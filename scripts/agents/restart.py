@@ -2384,14 +2384,14 @@ def _restart(pane_evidence: ExitStack, operation: shutdown_record.RestartActivit
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
     if restarted:
-        from scripts.worktree import worktrees
+        from scripts.worktree import worktree_records, worktrees
 
         try:
             scope = worktrees.RestartedWorktrees(frozenset(path.resolve() for path in restarted))
             for link in worktrees.old_worktree_links(remove_unused=True, scope=scope):
                 if link.removed:
                     print(f"restart: removed old worktree link {link.old}")
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktrees.Refused) as error:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktree_records.Refused) as error:
             print(f"restart: kept old worktree links: {_error_reason(error)}", file=sys.stderr)
     resume_checks.report()
     report_record_save_failures()
