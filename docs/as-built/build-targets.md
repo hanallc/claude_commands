@@ -624,8 +624,18 @@ No alias accepts them.
 Call records use the package name or `workspace`.
 
 After help and saved-pass query exits, verify reads the Git top level.
-A missing root `Cargo.toml` prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` and exits 2.
+If the root has no `Cargo.toml`, Verify prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` on stderr and exits 2.
+If the root has `scripts/copies/copies.py`, Verify also prints `claude_commands: run tests with copies.py --affected or --module` on stderr.
 This refusal precedes environment setup and Cargo calls.
+
+From a `claude_commands` checkout, run the affected tests through the queue with:
+
+```sh
+./scripts/lib/py scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+```
+
+Add `--module <module>` after `--affected` to select a module.
+
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
 For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
 No configuration maps repositories to unit gates.
