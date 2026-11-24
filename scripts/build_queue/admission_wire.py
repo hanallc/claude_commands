@@ -353,6 +353,14 @@ class WidthRequest(CallerCode):
 
 
 @dataclass(frozen=True)
+class ParentGateTargets:
+    """Show a nested gate's targets on the live parent reservation."""
+
+    reservation: str
+    gate_targets: placement.GateTargets
+
+
+@dataclass(frozen=True)
 class BuildHistoryRequest(CallerCode):
     """The request asks for the build history generation."""
 
@@ -787,7 +795,7 @@ class DispatchStatus:
 
 
 Request = (RepositorySlotRequest | VerifyRunSlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest
-           | ReleaseRequest | WidthRequest | ViewRequest
+           | ReleaseRequest | WidthRequest | ParentGateTargets | ViewRequest
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest
            | QueueMoveRequest | QueueUndoRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport
@@ -803,7 +811,7 @@ _REQUESTS: dict[str, type] = {
     "repository_slot": RepositorySlotRequest,
     "verify_run_slot": VerifyRunSlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
-    "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
+    "width": WidthRequest, "parent_gate_targets": ParentGateTargets, "view": ViewRequest, "explain": ExplainRequest,
     "build_history": BuildHistoryRequest, "mine": MineRequest,
     "queue_move": QueueMoveRequest, "queue_undo": QueueUndoRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,

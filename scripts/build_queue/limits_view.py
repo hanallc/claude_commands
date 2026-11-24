@@ -190,6 +190,7 @@ class RepositoryRow:
     natedev: Cell = field(default_factory=Cell)
     mac: Cell = field(default_factory=Cell)
     aws: Cell = field(default_factory=Cell)
+    mac_linux: Cell = field(default_factory=Cell)
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,7 @@ class BuildLimits:
     history_unavailable: bool
     unplaced: WaitGroups
     words: Mapping[str, str] = field(default_factory=lambda: PAGE_WORDS)
+    mac_linux: MachineLimits | None = None
 
 
 def recorded_origin(identity: str) -> str:
@@ -923,6 +925,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     rows: dict[str, RepositoryRow] = {}
     local_waits: WaitGroups = {}
     mac_waits: WaitGroups = {}
+    mac_linux_waits: WaitGroups = {}
     aws_waits: WaitGroups = {}
     unplaced: WaitGroups = {}
     metric_waits: dict[str, WaitGroups] = {}
@@ -953,8 +956,12 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             unresolved_policy = True
         return name
 
-    def remote_wait(machine: str) -> WaitGroups:
-        return aws_waits if machine in saved.aws_targets else unplaced
+    def remote_wait(machine: str, name: str, *, scaler: bool = False) -> WaitGroups:
+        if machine == "mac-linux":
+            return row(name).mac_linux.waits if name else mac_linux_waits
+        if scaler or machine in saved.aws_targets:
+            return row(name).aws.waits if name else aws_waits
+        return unplaced
 
     for key in local_limits:
         origin = recorded_origin(key)
@@ -1029,7 +1036,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             elif entry.machine == local:
                 destination = row(name).natedev.waits if name else local_waits
             else:
-                destination = row(name).aws.waits if name and entry.machine in saved.aws_targets else remote_wait(entry.machine)
+                destination = remote_wait(entry.machine, name)
             add_wait(destination, WAIT_WORDS["run_limit_full"], visible.name)
             continue
         step = entry.step
@@ -1054,9 +1061,9 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
             mac_name = mac_row_name(scope)
             destination = row(mac_name).mac.waits if mac_name else mac_waits
         elif machine != local:
-            scaler = (machine in saved.aws_targets or any(candidate.destination.provider == "scaler"
-                and candidate.destination.target == machine for candidate in step.placement_candidates))
-            destination = (row(name).aws.waits if name else aws_waits) if scaler else remote_wait(machine)
+            scaler = any(candidate.destination.provider == "scaler"
+                and candidate.destination.target == machine for candidate in step.placement_candidates)
+            destination = remote_wait(machine, name, scaler=scaler)
         elif isinstance(reason, records.GpuSlotWait):
             if name:
                 destination = row(name).natedev.waits
@@ -1166,6 +1173,8 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                 cell.other_used = 0
             if cell.used or cell.limit is not None or cell.waits or cell.runs or cell.other_used or cell.gpu:
                 item.quiet = False
+        if item.mac_linux.waits:
+            item.quiet = False
         if unattributed and item.natedev.policy is CellPolicy.NO_LIMIT:
             item.natedev.used = None
             item.natedev.runs.clear()
@@ -1202,6 +1211,7 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
     def facts_text(machine: machine_facts.Machine) -> str:
         return facts_line(facts, machine, explanation.now, zone)
 
+    show_mac_linux = bool(mac_linux_waits) or any(item.mac_linux.waits for item in rows.values())
     return BuildLimits(MachineLimits(local_state(snapshots, local, bool(inputs.reservations), zone),
                                     (*limits, *shared), local_waits, unattributed, local_note, facts_text("natedev")),
                        MachineLimits(mac_state(snapshots, zone), (), mac_waits, mac_heading.unattributed,
@@ -1209,4 +1219,5 @@ def build_limits(reading: records.QueueRead, snapshots: target_availability.Snap
                        MachineLimits(aws_state, (cloud, saved.aws_money), aws_waits, facts=facts_text("aws")),
                        tuple(sorted(rows.values(), key=lambda item: (first_rows.get(item.name, len(first_rows)),
                                                                      item.name.casefold(), item.name))),
-                       saved.history is ReadingState.UNAVAILABLE, unplaced)
+                       saved.history is ReadingState.UNAVAILABLE, unplaced,
+                       mac_linux=MachineLimits("", (), mac_linux_waits) if show_mac_linux else None)

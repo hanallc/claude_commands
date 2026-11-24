@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -2653,6 +2653,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
     verification = verify_command(command)
     with ExitStack() as scope:
         captured = ""
+        targets: placement.GateTargets | None = None
         if isinstance(verification, VerifyCommand):
             tree = scope.enter_context(requested_source(source, policy, merge))
             prepared = DirectCommandCopy(tree)
@@ -2695,7 +2696,9 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             if result.stderr:
                 _ = sys.stderr.write(result.stderr)
         else:
-            result = launch()
+            with (first_step.report_parent_gate_targets(targets)
+                  if targets is not None else nullcontext()):
+                result = launch()
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         selection = PublicationSelection.CHANGED
         if command_exit == 0 and not isinstance(verification, VerifyCommand):
@@ -2726,7 +2729,8 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
         return subprocess.run(command, cwd=source, pass_fds=args.lease_fd, check=False, text=True)
 
     if not targets.names and uses_parent_reservation(tuple(command)):
-        result = run()
+        with first_step.report_parent_gate_targets(targets):
+            result = run()
     else:
         with first_step.admitted_run(command, source, targets=targets) as admitted:
             admitted.handoff(source)

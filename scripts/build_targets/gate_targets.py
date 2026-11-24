@@ -41,14 +41,11 @@ def scaler_gate_exclusion(registry: conf.ConfigRead, target: target_config.Scale
     return ""
 
 
-def scaler_enabled(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> bool:
-    return not scaler_gate_exclusion(registry, target)
-
-
 def scaler_candidate(registry: conf.ConfigRead, target: target_config.ScalerTarget) -> placement.PlacementCandidate:
     destination = placement.PlacementDestination("scaler", target.name, target.name, WHOLE_MAC)
+    reason = scaler_gate_exclusion(registry, target)
     return placement.PlacementCandidate(destination,
-        placement.AllowedHost() if scaler_enabled(registry, target) else placement.FixedExclusion("off"),
+        placement.FixedExclusion(reason) if reason else placement.AllowedHost(),
         placement.ExplicitProviderSettings(target.settings))
 
 

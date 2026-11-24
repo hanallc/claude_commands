@@ -2541,6 +2541,32 @@ class ProcessRunEvidenceTests(unittest.TestCase):
 
 
 class ReplyPublicationTests(unittest.TestCase):
+    def test_the_parent_row_shows_nested_gate_targets_until_the_wrapper_closes(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(os.getppid(), "123")
+            write_process(fixture.proc.path, os.getpid(), parent=owner.pid)
+            request = fixture.request(need=0, owner=owner)
+            grant = only_admitted(fixture.server.handle_request(request))
+            parent_reason = "the gate uses its parent reservation"
+            targets = placement.GateTargets((), (("mac-linux", parent_reason), ("aws", parent_reason)))
+            report = status_wire.ParentGateTargets(grant.reservation, targets)
+
+            def selection() -> placement.GateTargets | None:
+                _ = fixture.server.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                row, = (row for row in reply.reading.view.running if row.pid == owner.pid)
+                self.assertEqual(row.step, request.identity.step)
+                return row.gate_targets
+
+            self.assertIsNone(selection())
+            peer = fixture.connect(report)
+            self.assertEqual(peer.replies(), [wire.Ok()])
+            self.assertEqual(selection(), targets)
+            peer.close()
+            fixture.server.run_once(0)
+            self.assertIsNone(selection())
+
     def test_view_captures_granted_local_reservations_and_verify_owners(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(need=0, step="test")

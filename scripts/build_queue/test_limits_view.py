@@ -58,9 +58,16 @@ class BuildLimitsTests(unittest.TestCase):
         shown = limits_view.build_limits(base, (), waits, {}, {}, saved, UTC)
         row = next(item for item in shown.repositories if item.name == "claude_commands")
         words = limits_view.wait_words(guest.reason).one
-        self.assertEqual(wait_names(shown.unplaced), {words: ["Guest gate"]})
+        self.assertEqual(wait_names(shown.unplaced), {})
+        self.assertEqual(wait_names(row.mac_linux.waits), {words: ["Guest gate"]})
         self.assertEqual(wait_names(row.aws.waits), {words: ["AWS gate"]})
         self.assertEqual(wait_names(row.natedev.waits), {})
+        rendered, tooltip = cast(list[str], test_memory_hover.MemoryHoverTests().page_expression("""(() => {
+            renderBuildLimits(data.build_limits);
+            return [$('build-limits-content').innerHTML, pageTooltipHtml('limit:cell:mac_linux:claude_commands', data)];
+        })()""", {"build_limits": snapshot_codec.snapshot_value(shown)}, limits=True))
+        self.assertIn('data-machine="mac-linux">mac-linux</span>', rendered)
+        self.assertIn("Guest gate", tooltip)
 
     def configure_hana(self, fixture: AdmissionFixture, *, maximum: int = 2) -> None:
         config = fixture.root / "build_admission.conf"

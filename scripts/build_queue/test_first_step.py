@@ -13,7 +13,7 @@ from unittest import mock
 from scripts.aws_target.config import AwsOff, cloud_gate_off_reason
 from scripts.build_hold import build_hold
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_records as records, execution_identity, queue_place
+from scripts.build_queue import admission_records as records, execution_identity, memory_feed, queue_place
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_wire, first_step, placement
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_targets import gate_targets, target_config
@@ -368,6 +368,22 @@ class FirstStepTests(unittest.TestCase):
                         self.assertEqual(copies.main(["run", "--repo", str(source), "--commit", "HEAD",
                                                      *targets, "--", *command]), 17)
 
+    def test_nested_gate_reports_targets_to_the_parent_reservation(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            script = source / "gate.py"
+            _ = script.write_text("raise SystemExit(17)\n")
+            command = ("python3", str(script), *MODULE_GATE_COMMAND[2:])
+            parent = client.OuterReservation("parent", os.getpid())
+            marker = f"{parent.reservation}\t{parent.pid}\t{fixture.state_dir}\t{fixture.socket_path}"
+            with (mock.patch.dict(os.environ, {client.RESERVED_STEP_ENV: marker}),
+                  mock.patch.object(gate_targets, "outer_reservation", return_value=parent),
+                  mock.patch.object(first_step, "report_parent_gate_targets", create=True,
+                                    return_value=nullcontext()) as report):
+                self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--", *command]), 17)
+            report.assert_called_once_with(placement.GateTargets((), (
+                ("mac-linux", gate_targets.PARENT_RESERVATION), ("aws", gate_targets.PARENT_RESERVATION))))
+
     def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
@@ -392,6 +408,29 @@ class FirstStepTests(unittest.TestCase):
                 disabled = first_step.gate_targets(GATE_COMMAND, source)
                 self.assertEqual(disabled.names, ("mac-linux", "natedev"))
                 self.assertEqual(disabled.exclusions, (("aws", cloud_gate_off_reason(AwsOff())),))
+
+    def test_named_gate_records_why_the_scaler_is_off(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            _ = register_scaler(fixture)
+            _ = write_config_fixture(fixture.root / "cloud_gate.conf", "enabled=off\n")
+            targets = first_step.gate_targets(GATE_COMMAND, source, requested="natedev,claude-aws")
+            owner = fixture.fixture_owner(os.getpid(), "123")
+            def check_request(request: wire.PlacementRequest, _reason: str) -> wire.Assignment:
+                scaler = next(candidate for candidate in request.constraints.candidates
+                              if candidate.destination.provider == "scaler")
+                affected = (placement.CandidateEligibility(scaler.destination, scaler.eligibility),)
+                reason = memory_feed.gate_target_reasons(request.identity.gate_targets, affected, targets.names,
+                                                          machines=("aws",))
+                self.assertEqual(reason, f"aws: {cloud_gate_off_reason(AwsOff())}")
+                raise first_step.FirstStepRefused("The fixture checked the gate request")
+
+            with (mock.patch.object(records, "process_start_time", return_value=owner.start_time),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(queue_place, "wait_for_placement", side_effect=check_request),
+                  self.assertRaisesRegex(first_step.FirstStepRefused, "The fixture checked the gate request")):
+                with first_step.admitted_run(GATE_COMMAND, source, targets=targets):
+                    self.fail("The gate received a placement")
 
     def test_first_step_submits_the_registered_scaler(self) -> None:
         with PlacementFixture() as fixture:

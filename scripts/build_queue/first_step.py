@@ -5,6 +5,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 import os
+from socket import AF_UNIX, SOCK_STREAM, socket
 from pathlib import Path
 import subprocess
 import sys
@@ -20,7 +21,9 @@ from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.build_queue.admission_wire import KnownPlacementStatus, read_assignment
+from scripts.build_queue.admission_wire import (
+    DEFAULT_ADMISSION_SOCKET, KnownPlacementStatus, ParentGateTargets, read_assignment,
+)
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_SCRIPTS, GATE_UNSETTLED_LAUNCH_STATUS,
     OtherCommand, VerifyCommand, command_job, command_program, gate_job_from_process, parse_command_program,
@@ -357,6 +360,31 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> p
     if isinstance(selected, NoEnabledTarget):
         raise FirstStepRefused(selected.reason)
     return selected
+
+
+@contextmanager
+def report_parent_gate_targets(targets: placement.GateTargets) -> Generator[None]:
+    """Publish the gate selection while the wrapper runs under its parent."""
+    from scripts.build_targets.gate_targets import PARENT_RESERVATION
+
+    marker = os.environ.get(client.RESERVED_STEP_ENV, "").split("\t")
+    with ExitStack() as scope:
+        if len(marker) >= 3 and any(reason == PARENT_RESERVATION for _, reason in targets.exclusions):
+            reservation, _, _, *resources = marker
+            path = ((resources[0] or DEFAULT_ADMISSION_SOCKET) if resources
+                    else str(wire.admission_socket_path()))
+            try:
+                connection = scope.enter_context(socket(AF_UNIX, SOCK_STREAM))
+                connection.settimeout(records.read_memory_config(report=False).query_timeout_seconds)
+                connection.connect(str(path))
+                request = ParentGateTargets(reservation, targets)
+                connection.sendall(wire.encode_request(request).encode())
+                with connection.makefile("rb") as stream:
+                    if not isinstance(wire.parse_reply(stream.readline()), wire.Ok):
+                        scope.close()
+            except (OSError, ValueError, conf.Unusable):
+                scope.close()
+        yield
 
 
 def _gate_request(command: Sequence[str], source: Path, targets: placement.GateTargets,

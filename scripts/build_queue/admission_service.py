@@ -1543,6 +1543,7 @@ class Connection:
     finished: bool = False
     version: int = 1
     placement_request_digest: bytes | None = None
+    parent_gate: status_wire.ParentGateTargets | None = None
 
 
 @dataclass(frozen=True)
@@ -3022,6 +3023,8 @@ class AdmissionServer:
             self.system_reader.update(plan)
             evidence = self.system_reader.latest
         self.system_evidence = evidence
+        parent_gates = {report.reservation: report.gate_targets for connection in self.connections.values()
+                        if (report := connection.parent_gate) is not None}
         memories: list[tuple[records.Reservation, records.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
             if isinstance(record.place, wire.CloudPlace):
@@ -3043,6 +3046,8 @@ class AdmissionServer:
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
             resolve_reservation_repository(row, record)
+            if (gate_targets := parent_gates.get(record.reservation_id)) is not None:
+                row["queue_waiter"] = {**row.get("queue_waiter", record.queue_waiter), "gate_targets": gate_targets}
             lifetime = evidence.lifetimes.get(episode, gate.LiveOwnerProcess())
             unscoped_direct = (not record.sidecar and episode not in self.placement_requests
                                and episode in evidence.lifetimes)
@@ -5309,7 +5314,8 @@ done
 
         candidate = configured_scaler_gate(conf.read(registry), destination.target)
         if not isinstance(candidate.eligibility, placement.AllowedHost):
-            raise ValueError(f"The AWS scaler is {candidate.eligibility.reason}")
+            reason = candidate.eligibility.reason
+            raise ValueError("The AWS scaler is off" if reason == "off" else reason)
         if (candidate.destination, candidate.settings) != (destination, self._placement_settings(request, destination)):
             raise ValueError("The AWS scaler differs from the assigned target")
 
@@ -6419,7 +6425,7 @@ done
         return [self._placement_status(assignment, check_lifetime=False)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
-        if isinstance(request, status_wire.PlacementStatusRequest):
+        if isinstance(request, (status_wire.PlacementStatusRequest, status_wire.ParentGateTargets)):
             return ""
         if isinstance(request, wire.VerifyRunSlotRequest):
             if uid != os.getuid() and process_uid(request.owner.pid, self.proc.path) != uid:
@@ -6529,6 +6535,21 @@ done
             print(f"admission request {type(request).__name__}: wall={wall:.3f}s cpu={cpu:.3f}s",
                   file=sys.stderr, flush=True)
 
+    def _report_parent_gate(self, request: status_wire.ParentGateTargets,
+                            connection: Connection | NoConnection) -> wire.Ok | wire.Refused:
+        record = next((row for row in self.reservations.values() if row.reservation_id == request.reservation), None)
+        if (record is None or not isinstance(record.place, wire.LocalPlace)
+                or not isinstance(record.ending, NotEnding) or not isinstance(connection, Connection)):
+            return wire.Refused("The parent reservation is unavailable")
+        credentials = connection.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        pid, uid, _ = struct.unpack("3i", credentials)
+        if ((uid != os.getuid() and self._account(record.owner) != uid)
+                or pid not in gate.process_tree({record.owner.pid: record.owner.start_time}, self.proc.processes())):
+            return wire.Refused("The gate does not use this parent reservation")
+        connection.parent_gate = request
+        self._schedule_pass()
+        return wire.Ok()
+
     def _handle_request(self, request: wire.Request, connection: Connection | NoConnection
                         ) -> list[wire.Reply]:
         uid = peer_uid(connection)
@@ -6553,6 +6574,8 @@ done
             return [wire.Ok()]
         if isinstance(request, wire.SettlementRequest):
             return [self._request_settlement(request)]
+        if isinstance(request, status_wire.ParentGateTargets):
+            return [self._report_parent_gate(request, connection)]
         provider_report = isinstance(request, wire.ExecutionReport) and (
             request.assignment.destination.provider == "scaler" or is_mac_linux_guest(request.assignment.destination))
         if (isinstance(connection, Connection) and not provider_report
@@ -7003,7 +7026,8 @@ done
         if connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
-        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
+        connection.finished = not (isinstance(reply, (wire.Wait, wire.BuildHistoryReply))
+                                   or isinstance(reply, wire.Ok) and connection.parent_gate is not None)
         if connection.finished:
             self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished
@@ -7101,6 +7125,8 @@ done
         self.epoll.unregister(descriptor)
         del self.connections[descriptor]
         connection.socket.close()
+        if connection.parent_gate is not None:
+            self._schedule_pass()
 
     def _detach_admission(self, connection: Connection, reply: wire.Refused | NoWaitReply = NO_WAIT_REPLY) -> bool:
         """End this connection's eligibility before a later pass can grant it."""
