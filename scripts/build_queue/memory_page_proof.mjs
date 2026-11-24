@@ -916,7 +916,7 @@ try {
         queueFixture = structuredClone(queueFixture);
         queueFixture.move_revision += 'joined';
         queueFixture.waiters.unshift({...template, key:'remote-start', pid:651,
-          name:'remote startup', machine:'mac', reason:'remote startup',
+          name:'remote startup', machine:'mac', targets:['mac'], reason:'remote startup',
           move:{row_id:'remote-start', movable:false}});
         await call('Input.dispatchMouseEvent',{type:'mouseReleased', ...moveTarget, button:'left', buttons:0, clickCount:1});
         await waitForLine('The queue changed.');
@@ -954,6 +954,7 @@ try {
         assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:typesafe"] .place').textContent`), '2');
 
         queueFixture.move_revision += 'mac-only';
+        // The waiting row uses its eligible targets to select the dim icons.
         queueFixture.waiters.splice(3, 0, {...template, key:'mac-only', pid:652,
           name:'Speculative Mac copy', since:fixtureTime - 75, machine:'mac', targets:['mac'], reason:'waiting for mac', why:'target',
           order_note:'Newest eligible copy starts first',
@@ -967,7 +968,8 @@ try {
         await waitForLine('typesafe · test affected moved from 2 to 1');
         assert.deepEqual(await evaluate(`['typesafe', 'natemerge', 'new-unit', 'mac-only'].map(key =>
           document.querySelector('tr[data-tip="wait:' + key + '"] .place').textContent)`), ['1', '2', '3', '4']);
-        assert.equal(await evaluate(`document.querySelector('tr[data-tip="wait:mac-only"] td.machine .machine').dataset.machine`), 'mac');
+        assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr[data-tip="wait:mac-only"] td.machine .machine')]
+          .map(icon => [icon.dataset.machine, icon.classList.contains('dim')])`), [['mac', true]]);
         assert.ok(!(await snapshot()).handles.includes('mac-only'));
         assert.ok(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"]').textContent.includes('Newest eligible copy starts first')`));
         assert.equal(await evaluate(`document.querySelector('.wrow[data-tip="wait:mac-only"] .amounts').textContent`), '');

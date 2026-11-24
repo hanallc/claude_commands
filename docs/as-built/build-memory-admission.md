@@ -83,11 +83,10 @@ The page keeps `agent_swap_demand` and `swap_covered_bytes` as its reserve field
 Each new host reading still reads `MemAvailable`.
 The pressure limits remain unchanged.
 
-The service measures each handled request's wall time and process CPU time.
-The measurements include configuration recovery for the logging threshold.
+The service measures each handled request's wall time and thread CPU time.
 `request_slow_seconds=0.25` sets the logging threshold in `config/build_admission.conf`.
 A request above that threshold logs its request kind, wall seconds, and CPU seconds to stderr.
-The service reads the threshold at use.
+The service reads the threshold when it loads the admission configuration.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
@@ -211,13 +210,14 @@ An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
 `wait_for_placement` polls after each configured waiting interval, which is one second by default.
 The timer controls polling even when the queue, view, hold, or release files change.
-The service publishes placement waits and grants after each pass.
-The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
-Each published placement reply carries its request digest and the current input event count.
-A poll uses the published reply when the request digest and input event count both match.
-Reuse needs no pass or state write if the caller version matches.
-Readings, process exits, configuration changes and queue changes advance the count.
-The pass timer also advances the count so the next pass can read the provider journal and check deadlines.
+The service caches placement waits after each pass.
+It hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+A poll can reuse a wait when the request digest and input event count match and no configuration change is pending.
+An episode with a current assignment or local grant takes the regular request path.
+An unchanged poll that reuses a wait needs no pass, state write, or configuration file read.
+A poll from another account still checks the owner's account in `/proc/<pid>/status`.
+The timer refreshes waits at the larger of `waiting_pass_seconds` and `min_pass_gap_seconds`.
+The next poll sees the new result after the pass.
 `Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
@@ -303,10 +303,10 @@ A `mac-linux` gate row has machine `mac-linux` after the gate consumes its launc
 The service sets the remote `started_at` from the consume time, so `memory_feed.unconfirmed_guest_run` reads the consume from it.
 A confirmed guest attempt gives the row `guest_run`. A consumed attempt that the queue has not confirmed gives `guest_unconfirmed: true`.
 The Builds page shows both attempts in Running with the recorded job, unit, and caller.
-The Machine cell shows one bright icon for `mac-linux` and the guest state.
-The icon uses the Mac color in light and dark modes.
-The cell shows `not confirmed` until confirmation, then `running`.
-The tooltip lists the named targets. It shows the attempt ID after confirmation.
+The Machine cell shows one bright Apple icon with a 🐧 badge.
+The Apple icon has a white fill and a black outline in light and dark modes.
+The cell adds `not confirmed` until the queue confirms the run.
+The tooltip shows `Runs on` and `Named targets`.
 The memory column shows `on mac-linux`. The vCPU column shows `—`.
 The admission service reads the module counter from the current guest's placement request sidecar.
 It publishes the counter before and after the guest confirms the attempt.
@@ -659,7 +659,7 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 Each publication of the view also replaces `admission/view.json` atomically.
-The pass stores the current input event count with its placement replies before it replaces the view file.
+The pass stores the current input event count with its placement waits before it replaces the view file.
 The file holds the publication time, `fresh_until`, and the encoded socket reply.
 `fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
 A socket `ViewRequest` returns the last published view without starting a pass.
@@ -2363,15 +2363,23 @@ On 2026-11-23, Nate asked again for the Unit column to go because the row start 
 At 10:00 he asked why the Slot column still showed; natedev has no slots, so each of its rows showed `—`.
 On 2026-11-23, Nate said: “where it is running should be what shows in the running column”.
 On 2026-11-23, Nate approved the machine icons proposal of bob (List item 260): the `Machine` column shows icons, not names.
-`MACHINE_ICONS` in `memory_live.html` gives each known machine its icon: lucide `server` for `natedev`, lucide `laptop` for `mac`, and lucide `cloud` for `aws`.
-`mac-linux` is the laptop with a 🐧 badge. `hana-aws` is the cloud with a 🌸 badge. `hana-gpu` is the cloud with a ⚡ badge.
-One hidden `<svg>` at the top of the page defines each symbol once, and each icon uses it with `<use href>`.
-The badge is CSS text from the icon's `data-badge`, so it is not page text.
-Each icon has its machine name as its accessible name (`role="img"` and `aria-label`).
-A running row's `Machine` cell shows one bright icon in a faint box: the machine that runs the step.
+`MACHINE_ICONS` in `memory_live.html` gives each known machine its icon.
+
+- `natedev` uses the 🐧 emoji by itself.
+- `mac` uses the Apple silhouette.
+- `mac-linux` uses the Apple silhouette with a 🐧 badge.
+- `aws` uses the cloud with a 🐧 badge.
+- `hana-aws` uses the cloud with a 🌸 badge.
+- `hana-gpu` uses the cloud with a ⚡ badge.
+
+A hidden `<svg>` defines the Apple and cloud symbols once.
+Each SVG icon references its symbol with `<use href>`.
+CSS draws each badge from the icon's `data-badge` value.
+Each icon records its machine in `data-machine` and uses that name in `aria-label`.
+A running row shows one bright icon in a faint box for the machine that runs the step.
 The feed's `machine` field is the one source for that machine.
 The row hover says `Runs on` with that machine, and lists the other machines that the step named under `Named targets`.
-A waiting row's `Machine` cell shows one dim icon for each machine that can take the step, in the feed's order.
+A waiting row shows one icon at half opacity for each machine that can take the step, in the feed's order.
 A waiting CI step has one target: the host machine, where the CI runners run (`memory_feed.ci_target_notes`). The running CI row shows the same machine.
 Its hover names those machines in words under `Runs on`, after the `Waits for` reason.
 A machine with no icon shows its name as text in its machine color.
@@ -2380,7 +2388,8 @@ Waiting rows size the `Step` column, so each step shows on one line; a new waiti
 In a tight pane a waiting step breaks between words. There, the column takes the width of its widest word, so no word is cut.
 Each word of a waiting step with more than one word is in its own `.word` span with `white-space: nowrap`, so a word such as `cargo-style` never breaks at its hyphen.
 A legend under the table shows `Legend:`, then each of the six icons with its name.
-Each machine on the page shows in its machine color: the `Machine` icons, the legend, the hover's `Runs on` and `Named targets`, Target availability, the Build limits headings, and the top costs.
+The machine colors apply to SVG symbols and machine names throughout the page.
+Emoji use their own colors.
 The `.machine` rules in `memory_live.html` are the one machine color map. `config/memory_feed.conf` sets the colors for `natedev`, `mac`, and `aws`.
 `mac-linux` is the Linux guest on the Mac, so it uses the `mac` color. `hana-aws` and `hana-gpu` are AWS boxes, so they use the `aws` color.
 Every match in the map ignores case, so the hover words `Mac` and `AWS` match their machines.
