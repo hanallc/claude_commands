@@ -18,14 +18,14 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import BinaryIO, ClassVar, Literal, cast, override
+from typing import BinaryIO, ClassVar, Literal, cast, final, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
@@ -48,6 +48,7 @@ from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.browser_test_support import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
+from scripts.review_links.test_serve import new_item_notice_log, read_new_item_notices
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
 
@@ -290,7 +291,7 @@ class _Chrome(_Browser):
         while load not in self.loaded:
             _ = self.read(deadline)
 
-    def dom(self, page: Path, marker: str, *, reduced_motion: bool,
+    def dom(self, page: Path | str, marker: str, *, reduced_motion: bool,
             window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
         with self.stop_on_error():
             session = self.session
@@ -302,7 +303,7 @@ class _Chrome(_Browser):
                 _ = self.command("Emulation.clearDeviceMetricsOverride", {}, session)
             features = [{"name": "prefers-reduced-motion", "value": "reduce"}] if reduced_motion else []
             _ = self.command("Emulation.setEmulatedMedia", {"features": features}, session)
-            destination = page.as_uri()
+            destination = page.as_uri() if isinstance(page, Path) else page
             # Evaluate the promise in the new document, after the navigation.
             marker_literal = json.dumps(marker)
             script = (
@@ -660,6 +661,115 @@ document.body.append(result);
         _ = the_list.unpark(MORTY.id, item.id, source="nate")
         check = list_page.saved_action_state(MORTY.id, item.id)["check_html"]
         self.assertIn('<span class="warning">Check overdue Nov 16 12:00 EST</span>', check)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_window_send_files_one_linked_row_before_the_notice(self) -> None:
+        self.check_live_window_send(lose_reply=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_exact_window_retry_returns_the_first_item_and_closes(self) -> None:
+        self.check_live_window_send(lose_reply=True)
+
+    def check_live_window_send(self, *, lose_reply: bool) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\n")
+        _ = write_config_fixture(conf.path("producer_map"))
+        words = "Keep the wait time next to the queue name."
+        saved: list[tuple[int, Mapping[str, object]]] = []
+        probe = r"""<script>
+(async()=>{
+ const result=document.createElement('p');
+ result.id='probe-results';
+ const until=(element,ready)=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(finish);
+  const timer=setTimeout(()=>{
+   observer.disconnect();
+   reject(new Error(document.querySelector('.new-item-error').textContent || 'The window did not settle.'));
+  },5000);
+  function finish(){
+   if(ready()){clearTimeout(timer);observer.disconnect();resolve();}
+  }
+  observer.observe(element,{attributes:true,subtree:true,childList:true});finish();
+ });
+ try {
+  const dialog=document.querySelector('#review-new-item');
+  const send=dialog.querySelector('[type="submit"]');
+  const words=dialog.querySelector('textarea');
+  const error=dialog.querySelector('.new-item-error');
+  document.querySelector('[data-owner-new]').click();
+  const includePage=dialog.querySelector('[name="include_page"]');
+  if(includePage.checked) includePage.click();
+  await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
+  dialog.querySelector('[name="kind"][value="investigation"]').click();
+  words.value=__WORDS__;
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  send.click();
+  if(__RETRY__){
+   await until(dialog,()=>!dialog.open || !error.hidden && !send.disabled);
+   if(!dialog.open) throw new Error('The lost reply closed the window before the retry.');
+   send.click();
+  }
+  await until(dialog,()=>!dialog.open || !error.hidden && !send.disabled);
+  if(dialog.open) throw new Error(error.textContent);
+  result.textContent=JSON.stringify([]);
+ } catch(error){
+  result.textContent=JSON.stringify([String(error)]);
+ }
+ document.body.append(result);
+})();
+</script>""".replace("__WORDS__", json.dumps(words)).replace("__RETRY__", json.dumps(lose_reply))
+
+        @final
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None,
+                              builds_version: str = "") -> None:
+                if self.path == list_page.PAGE_PATH:
+                    content = content.replace(b"</body>", probe.encode() + b"</body>", 1)
+                super().html_response(status, content, delivery_pending=delivery_pending, builds_version=builds_version)
+
+            @override
+            def json_response(self, status: int, fields: Mapping[str, object]) -> None:
+                if self.command == "POST" and self.path == review_page.NEW_ITEM_PATH and "id" in fields:
+                    saved.append((status, fields))
+                    if lose_reply and len(saved) == 1 and status == 200:
+                        self.close_connection = True
+                        return
+                super().json_response(status, fields)
+
+        with (patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "key-state"),
+                                     "REBUILD_NEEDS_DIR": str(self.root / "rebuild-needs")}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              new_item_notice_log(self.root, MORTY.id) as log,
+              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+            server.RequestHandlerClass = Probe
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}"
+                result = self.chrome().dom(url, "probe-results", reduced_motion=True, window_size=(1280, 900))
+            finally:
+                server.shutdown()
+                thread.join()
+            marker = '<p id="probe-results">'
+            self.assertIn(marker, result.stdout, result.stderr)
+            failures = cast(list[str], json.loads(html.unescape(result.stdout.split(marker, 1)[1].split("</p>", 1)[0])))
+            self.assertEqual(failures, [])
+            record, = investigation.records(MORTY.id, include_read=True)
+            row, = the_list.records(MORTY.id, include_closed=True)
+            notice, = read_new_item_notices(log)
+            self.assertIn(words, notice["words"])
+            self.assertEqual(notice["rows"], [row.id])
+            first_status, first = saved[0]
+            self.assertEqual(first_status, 200)
+            self.assertEqual((first["id"], first["list_number"], row.reviews), (record.id, row.number, (first["key"],)))
+            if lose_reply:
+                _, (status, receipt) = saved
+                self.assertEqual(status, 200)
+                self.assertEqual(receipt, {**first, "version": receipt["version"]})
+            else:
+                self.assertEqual(len(saved), 1)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_new_item_refreshes_without_opening_a_row(self) -> None:
@@ -1542,10 +1652,11 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                 class Probe(serve.ReviewLinksHandler):
                     @override
                     def html_response(self, status: int, content: bytes, *,
-                                      delivery_pending: bool | None = None) -> None:
+                                      delivery_pending: bool | None = None, builds_version: str = "") -> None:
                         if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
-                        super().html_response(status, content, delivery_pending=delivery_pending)
+                        super().html_response(status, content, delivery_pending=delivery_pending,
+                                              builds_version=builds_version)
 
                     @override
                     def review_response(self, content: bytes, content_type: str, prepared: bytes = b"", *,
@@ -1617,6 +1728,9 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                             result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         elif size == "390,900":
+                            for browser in (self._chrome, self._firefox):
+                                if browser is not None:
+                                    browser.close()
                             result = self.firefox_view(url, None, width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:

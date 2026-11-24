@@ -631,7 +631,7 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
         logs.append(ReviewLog(moment(fields['followup']['sent']), 'nate', fields['followup']['text']))
     logs.extend(saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
-    key = 'question/'+owner+'/'+path.name
+    key = question_record_key(record)
     review_id = fields.get('review_id', path.stem)
     identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
@@ -804,7 +804,7 @@ def investigation_item(record: investigation.Investigation, members: staff.Staff
     logs.extend(record.log)
     state = investigation_state(record)
     owner = owner_for(record.owner, members)
-    key = 'investigation/'+record.owner+'/'+record.id
+    key = investigation_record_key(record)
     identity_text = name(record.owner, members)+'/'+record.id
     return ReviewItem(key, identity_text, investigation_type(record), owner, record.source_owner, record.title, state,
         ReviewTimes(filed, logs[-1].time), tuple(logs),
@@ -863,7 +863,7 @@ def issue_item(issue: Issue, owner: staff.StaffId, members: staff.StaffSnapshot,
     """Project a proposal for the Review index and its body."""
     issue = Issue(proposal_path(issue.path), issue.fields)
     row = proposals_table.issue_row(issue, members, sources=sources)
-    key = 'proposal/'+str(issue.path)
+    key = proposal_record_key(issue.path)
     if not isinstance(row.progress, proposal_issue.AwaitingApproval):
         filed = moment(issue.value('date_created') or '1970-01-01')
         return proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by') or owner),
@@ -873,6 +873,28 @@ def issue_item(issue: Issue, owner: staff.StaffId, members: staff.StaffSnapshot,
     filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
     return proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by')), issue.path.stem, filed,
                          members, entry, 'proposal-'+owner)
+
+
+def question_record_key(record: update_registration.QuestionRecord) -> str:
+    return f"question/{record.owner}/{record.path.name}"
+
+
+def investigation_record_key(record: investigation.Investigation) -> str:
+    return f"investigation/{record.owner}/{record.id}"
+
+
+def proposal_record_key(path: Path) -> str:
+    return f"proposal/{path}"
+
+
+def submission_review_key(saved: review_submissions.SavedSubmission) -> str:
+    """Name the saved record in the Review index."""
+    record = saved.record
+    if isinstance(record, update_registration.QuestionRecord):
+        return question_record_key(record)
+    if isinstance(record, Issue):
+        return proposal_record_key(saved.path)
+    return investigation_record_key(record)
 
 
 def submission_item(saved: review_submissions.SavedSubmission, members: staff.StaffSnapshot) -> ReviewItem:
