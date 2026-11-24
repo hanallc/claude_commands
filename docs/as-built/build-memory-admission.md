@@ -422,10 +422,20 @@ Queue priority remains the first ordering field.
 A CI step uses the same `order_since` field for its job start; see "CI cargo admission".
 
 The service retains the run's process watch between steps.
+The first local gate preparation stores its queue row ID in `RunPlace`.
+The grant also stores the repository name.
+A later step of the run uses the same queue row ID, so queue moves apply to the run.
+Between reservations, the rank holds later local requests behind the run.
+A request that ranks earlier can start during the gap.
+The live rank counts once toward the local repository run limit.
+The next step of that run uses the same place at the limit.
+A placed gate that completes its suites does not create a preparation rank.
 The run holds memory for a 10-second gap between steps. It holds no CPU token during that gap.
+The rank itself holds no memory.
 When the run ends, waiting steps use their own arrival times for order again.
 The service persists run places with waiter places through the generic codec in `state.json`.
 After a restart, the service restores live run places and removes ended run places.
+Older run records use empty defaults for the queue row ID and repository name.
 
 ### The admission service
 

@@ -66,6 +66,7 @@ from scripts.build_queue import admission_records as records, progress_profile a
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import FixedSystemReader as FixedSystemReader
 
 
 def setUpModule() -> None:
@@ -1932,26 +1933,6 @@ class SwapInReadingsTests(unittest.TestCase):
                         assert isinstance(reading, records.ReadingUnavailable)
                         self.assertIn("swap-in reading unavailable", reading.reason)
                         self.assertIn(str(path), reading.reason)
-
-
-class FixedSystemReader:
-    """Publish private evidence without an operating-system reader."""
-    def __init__(self, latest: service.SystemEvidence) -> None:
-        self.latest: service.SystemEvidence = latest
-        self.plans: list[service.SystemReadingPlan] = []
-        self.requests: int = 0
-
-    def update(self, plan: service.SystemReadingPlan) -> None:
-        self.plans.append(plan)
-
-    def request_read(self) -> None:
-        self.requests += 1
-
-    def raise_failure(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 class ReferenceActivityReader(ScopeActivityReader):
@@ -8795,6 +8776,123 @@ class RunPlaceTests(unittest.TestCase):
             fixture.end_run(run)
             self.assertEqual(fixture.queue_pids(), [other.owner.pid, second.owner.pid])
             self.assertFalse(service.read_state(fixture.state_dir).run_places)
+
+    def test_a_run_behind_the_head_never_starts_before_the_head_runs_next_step(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+            fixture.clock.advance(1)
+            younger = fixture.request(step="gate")
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
+            fixture.clock.advance(59)
+            _ = fixture.run_pass()
+            self.assertFalse(fixture.server.reservations)
+            self.assertFalse(fixture.server.slots)
+            step = fixture.request(run=run, step="gate")
+            step = replace(step, sidecar=str(fixture.root / "gate.cgroup"))
+            _ = only_admitted(fixture.server.handle_request(step))
+            self.assertNotIn(younger.episode, fixture.server.reservations)
+
+    def test_a_younger_gate_stays_behind_the_run_after_restart_in_the_gap(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+            fixture.clock.advance(60)
+            fixture.restart()
+            younger = fixture.request(step="gate")
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Wait)
+            self.assertFalse(fixture.server.slots)
+            self.assertFalse(fixture.server.reservations)
+            fixture.end_run(run)
+            _ = only_admitted([fixture.server.ledger[younger.episode].reply])
+
+    def test_ranked_gate_takes_its_next_step_at_the_repository_run_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            _ = config.write_text(config.read_text()
+                + f"\nmax_runs.{fixture.server.host}.fixture=2\nmax_runs.exempt_unit=natemerge\n")
+            first, second = fixture.run_owner(), fixture.run_owner()
+            first_step = fixture.request(run=first, step="gate")
+            first_grant = only_admitted(fixture.server.handle_request(first_step))
+            fixture.allow_next_start()
+            second_step = fixture.request(run=second, step="gate", since=first_step.since - 1)
+            second_grant = only_admitted(fixture.server.handle_request(second_step))
+            for request, grant in ((first_step, first_grant), (second_step, second_grant)):
+                fixture.release(grant)
+                fixture.end_owner(request.owner)
+            fixture.clock.advance(60)
+            waiting = fixture.request(step="gate")
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            step = fixture.request(run=second, step="gate")
+            _ = only_admitted(fixture.server.handle_request(step))
+            self.assertNotIn(waiting.episode, fixture.server.reservations)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, records.QueueInputs)
+            result = fixture.server.last_result
+            assert isinstance(result, gate.PassResult)
+            decision, = (row.decision for row in result.rows
+                         if row.owner == records.run_owner(waiting.owner.pid, waiting.owner.start_time))
+            self.assertEqual(decision.run_limit, records.RunLimitWait(2, 2, "fixture", inputs.local_machine))
+
+    def test_priority_step_can_start_ahead_of_the_kept_gate_rank(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+            fixture.clock.advance(60)
+            fixture.server.priority = records.QueuePriority(({"unit": "urgent", "why": "fixture",
+                "set_at": fixture.clock.now(), "set_by": "fixture"},))
+            first = fixture.request(step="gate")
+            first = replace(first, identity=replace(first.identity, unit="urgent"))
+            _ = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            normal = fixture.request(step="gate")
+            self.assertIsInstance(fixture.server.handle_request(normal)[0], wire.Wait)
+
+    def test_old_run_place_loads_with_empty_move_id_and_repository(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run), end_owner=True)
+            saved = cast(dict[str, object], json.loads(fixture.state_text()))
+            places = cast(dict[str, dict[str, object]], saved["run_places"])
+            place, = places.values()
+            _ = place.pop("move_id", None)
+            _ = place.pop("repository", None)
+            _ = (fixture.state_dir / "state.json").write_text(json.dumps(saved))
+            restored, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertEqual(restored.move_id, "")
+            self.assertEqual(restored.repository, "")
+
+    def test_main_892cb2d74f_loads_run_place_with_new_fields(self) -> None:
+        repository = Path.home() / ".claude"
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            _ = fixture.finish_step(fixture.request(run=run, step="gate"), end_owner=True)
+            place, = service.read_state(fixture.state_dir).run_places.values()
+            self.assertTrue(place.move_id)
+            self.assertEqual(place.repository, "fixture")
+            baseline = fixture.root / "baseline"
+            baseline.mkdir()
+            for name in ("admission_protocol.py", "admission_wire.py", "admission_service.py", "snapshot_codec.py"):
+                source = subprocess.check_output(
+                    ("git", "-C", str(repository), "show", f"892cb2d74f:scripts/build_queue/{name}"),
+                    timeout=5)
+                _ = (baseline / name).write_bytes(source)
+            check = """
+import sys
+from pathlib import Path
+import scripts.build_queue
+scripts.build_queue.__path__ = [sys.argv[1], *scripts.build_queue.__path__]
+from scripts.build_queue import admission_service, admission_protocol
+place, = admission_service.read_state(Path(sys.argv[2])).run_places.values()
+assert type(place) is admission_protocol.RunPlace
+assert place.run.pid == int(sys.argv[3])
+assert not hasattr(place, 'move_id')
+assert not hasattr(place, 'repository')
+"""
+            result = subprocess.run((sys.executable, "-c", check, str(baseline),
+                                     str(fixture.state_dir), str(run.pid)),
+                                    capture_output=True, text=True, check=False, timeout=8)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_run_exit_between_steps_removes_the_idle_watch_and_saved_place(self) -> None:
         with AdmissionFixture() as fixture:

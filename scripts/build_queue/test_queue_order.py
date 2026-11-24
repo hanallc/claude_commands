@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records, execution_identity, head_stall, placement, queue_snapshot
-from scripts.build_queue.admission_service import QueueHeadAnchor, QueuePin, QueueRowAnchor
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB
+from scripts.build_queue.admission_service import QueueHeadAnchor, QueuePin, QueueRowAnchor, read_state
+from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
     placement_request, publish_candidate,
@@ -57,6 +57,36 @@ def ids(line: records.QueueMoveLine) -> list[str]:
 
 
 class QueueMoveTests(unittest.TestCase):
+    def test_a_moved_run_keeps_its_rank_after_restart_between_steps(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            fixture.free(0)
+            fixture.hold_starts()
+            older = fixture.request(since=fixture.clock.now() - 1, step="gate")
+            first = fixture.request(run=run, step="gate")
+            for request in (older, first):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            line = move_line(fixture)
+            _, first_id = ids(line)
+            moved, = fixture.server.handle_request(wire.QueueMoveRequest(
+                "move-run-first", first_id, line.revision, wire.QueueHeadDrop()))
+            assert isinstance(moved, wire.QueueMoved)
+            self.assertEqual(moved.new_place, 1)
+            fixture.free(60 * GIB)
+            _ = fixture.run_pass()
+            grant = only_admitted([fixture.server.ledger[first.episode].reply])
+            fixture.release(grant)
+            fixture.end_owner(first.owner)
+            fixture.clock.advance(60)
+            fixture.restart()
+            saved = read_state(fixture.state_dir)
+            self.assertEqual(saved.queue_pins, (QueuePin(first_id, QueueHeadAnchor()),))
+            self.assertFalse(any(place.owner == first.owner for place in saved.places.values()))
+            self.assertIsInstance(fixture.server.handle_request(older)[0], wire.Wait)
+            step = fixture.request(run=run, step="gate")
+            _ = only_admitted(fixture.server.handle_request(step))
+            self.assertNotIn(older.episode, fixture.server.reservations)
+
     @override
     def setUp(self) -> None:
         # The service applies natedev holds only on natedev; the guest has another host name.

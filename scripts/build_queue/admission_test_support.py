@@ -298,6 +298,27 @@ class TestProcesses:
             _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
 
+class FixedSystemReader:
+    """Publish evidence from a test fixture."""
+
+    def __init__(self, latest: service.SystemEvidence) -> None:
+        self.latest: service.SystemEvidence = latest
+        self.plans: list[service.SystemReadingPlan] = []
+        self.requests: int = 0
+
+    def update(self, plan: service.SystemReadingPlan) -> None:
+        self.plans.append(plan)
+
+    def request_read(self) -> None:
+        self.requests += 1
+
+    def raise_failure(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 class PrivateReadings:
     """Count each real gate reader, against only the fixture's fake files."""
     def __init__(self, root: Path) -> None:
