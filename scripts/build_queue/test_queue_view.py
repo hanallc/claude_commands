@@ -302,6 +302,17 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertIs(restored.gate_label, expected)
                     if expected == queue_view.MacGateLabel.PLACEMENT:
                         self.assertEqual(queue_view.gate_label_text(restored), wire)
+        build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, session="current-session")
+        for name, session_fields, session in (
+                ("legacy session only", {"launcher_session": "legacy-session"}, "legacy-session"),
+                ("empty shared session", {"session": "", "launcher_session": "legacy-session"}, "legacy-session"),
+                ("current session", {"session": "current-session", "launcher_session": "legacy-session"},
+                 "current-session")):
+            with self.subTest(name=name):
+                row = queue_view.mac_build_record(build)
+                del row["session"]
+                row.update(session_fields)
+                self.assertEqual(queue_view.mac_build_from_record(row).session, session)
 
     def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
         with QueueFixture(captured=False) as fixture:
@@ -339,31 +350,22 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
                     self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
 
-    def test_mac_reader_names_the_launcher_of_each_build(self) -> None:
-        # bob, 2026-11-23: a Mac build with no unit names who started it, from its parent process chain.
+    def test_mac_reader_preserves_the_submitting_session_and_verify_call(self) -> None:
         with QueueFixture(captured=False) as fixture:
             folder = str(fixture.root)
-            for name, launcher, marker, environment, kind, session in (
-                ("claude", ("claude --resume a", "/Users/nate/.local/share/claude/versions/2.0.76"), "",
-                 {"CLAUDE_CODE_SESSION_ID": "session-a"}, queue_view.MacLauncher.CLAUDE, "session-a"),
-                ("session marker", ("-zsh", "/bin/zsh"), "session-b", {}, queue_view.MacLauncher.CLAUDE, "session-b"),
-                ("CI", ("/actions/Runner.Worker spawn", "/actions/Runner.Worker"), "", {"RUNNER_NAME": "hana-mac-1"},
-                 queue_view.MacLauncher.CI, ""),
-                ("rust-analyzer", ("/Zed/rust-analyzer-2026-11-02", "/Zed/rust-analyzer-2026-11-02"), "", {},
-                 queue_view.MacLauncher.RUST_ANALYZER, ""),
-                ("terminal", ("-zsh", "/bin/zsh"), "", {}, queue_view.MacLauncher.TERMINAL, ""),
+            for name, marker, environment, session, call, placement in (
+                ("Claude", "", {"CLAUDE_CODE_SESSION_ID": "session-a"}, "session-a", "", ""),
+                ("copy record", "session-b", {"CLAUDE_CODE_SESSION_ID": "other"}, "session-b", "", ""),
+                ("Verify", "", {"CODEX_THREAD_ID": "session-c", "BUILDLOG_CALL_ID": "verify-id"}, "session-c", "verify-id", ""),
+                ("no record", "", {}, "", "", ""),
+                ("placed Verify", "", {"CODEX_THREAD_ID": "session-d", "BUILDLOG_CALL_ID": "placed-id",
+                    "MAC_PLACEMENT": "episode/attempt"}, "session-d", "placed-id", "episode/attempt"),
             ):
                 with self.subTest(name=name):
-                    command, executable = launcher
                     processes: dict[int, dict[str, object]] = {
                         100: {"parent": 90, "command": "cargo build -p hana", "executable": "/bin/cargo",
                               "resident_bytes": 1234, "started_at": NOW},
-                        90: {"parent": 80, "command": "/bin/zsh -c cargo build -p hana", "executable": "/bin/zsh",
-                             "resident_bytes": 0, "started_at": NOW},
-                        80: {"parent": 70, "command": command, "executable": executable,
-                             "resident_bytes": 0, "started_at": NOW},
-                        70: {"parent": 1, "command": "/Applications/Terminal.app/Contents/MacOS/Terminal",
-                             "executable": "/Applications/Terminal.app/Contents/MacOS/Terminal",
+                        90: {"parent": 1, "command": "/bin/zsh -c cargo build -p hana", "executable": "/bin/zsh",
                              "resident_bytes": 0, "started_at": NOW},
                     }
                     script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
@@ -372,16 +374,25 @@ class MacQueueViewTests(unittest.TestCase):
                         + f"output = lambda arguments: 'p100\\nn{folder}\\n'\n"
                         + "repository_name = lambda folder: 'hana'\n"
                         + f"project_record = lambda folder: dict(recorded_unit='', session={marker!r}, repository='')\n"
-                        + f"process_environment = lambda pid: {environment!r}\n"
-                        + "print(json.dumps(read_builds()))")
+                        + "environment_reads = []\n"
+                        + "def process_environment(pid):\n"
+                        + "    environment_reads.append(pid)\n"
+                        + f"    return {environment!r} if pid == 100 else {{}}\n"
+                        + "reading = read_reading()\n"
+                        + "print(json.dumps([reading['builds'], environment_reads]))")
                     result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    row, = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+                    rows, environment_reads = cast(tuple[list[dict[str, object]], list[int]],
+                        json.loads(result.stdout.removesuffix("rc=0\n")))
+                    row, = rows
                     _ = row.pop("progress_tail")
                     row["counter"] = {}
                     build = queue_view.mac_build_from_record(row)
-                    self.assertIs(build.launcher, kind)
-                    self.assertEqual(build.launcher_session, session)
+                    self.assertEqual(build.session, session)
+                    self.assertEqual(build.verify_call_id, call)
+                    self.assertEqual(build.gate_placement, placement)
+                    if placement:
+                        self.assertEqual(environment_reads.count(build.pid), 1)
                     self.assertEqual(queue_view.mac_build_from_record(queue_view.mac_build_record(build)), build)
 
     def test_mac_command_step_reads_the_verb_and_the_package(self) -> None:

@@ -13,11 +13,13 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, tzinfo
 from enum import Enum, auto
@@ -44,7 +46,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, cost_actions, mac_idle, mac_idle_alert, machine_facts, parse
+from scripts.buildlog import charts, cost_actions, index, mac_idle, mac_idle_alert, machine_facts, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -966,23 +968,17 @@ class FeedStaff:
     def __init__(self, members: staff.StaffSnapshot):
         self.members: staff.StaffSnapshot = members
         self.worktrees: dict[tuple[str, Path], staff.StaffRow | None] = {}
-        self.labels: Mapping[str, unit_labels.UnitLabels] = unit_labels.recorded_owner_labels(
-            {member.current_session for member in members.rows}, members)
+        self.labels_by_id: Mapping[staff.StaffId, unit_labels.UnitLabels] = {
+            member.id: unit_labels.recorded_member_labels(members, member) for member in members.rows}
 
     def labels_for(self, reference: str, machine: str, folder: Path) -> unit_labels.UnitLabels | None:
         member = self.members.by_member_reference(reference) if reference else None
         if member is None and folder.is_absolute():
             member = self.worktree_owner(machine, folder)
-        return self.labels.get(member.current_session) if member is not None else None
-
-    def member_name(self, reference: str) -> str:
-        """The staff name of a fixed member id or its current conversation, or "" for an unknown session."""
-        member = self.members.by_member_reference(reference) if reference else None
-        return member.name if member is not None else ""
+        return self.labels_by_id.get(member.id) if member is not None else None
 
     def fixed_owner_labels(self, staff_id: staff.StaffId) -> unit_labels.UnitLabels | None:
-        member = self.members.by_id(staff_id) if staff_id else None
-        return self.labels.get(member.current_session) if member is not None else None
+        return self.labels_by_id.get(staff_id)
 
     def ended_step_labels(self, identity: admission_records.EndedStepFacts) -> unit_labels.UnitLabels:
         """Find the current staff labels by the ended step's fixed ID."""
@@ -1034,15 +1030,10 @@ class MemoryWaitRow(WaitRow):
     job_start: NotRequired[str]
 
 
-class MacStarter(TypedDict):
-    """Who started a Mac build with no unit, and its step. The page shows them as a unit row shows its unit."""
-
-    name: str
-    step: str
-
-
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     kind: Literal["mac-build"]
+    row_owner: QueueRowName
+    row_step: str
     repository: str
     gate_label: str
     showrunner: str
@@ -1057,7 +1048,6 @@ class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     vcpus: int | queue_view.MacJobsUnavailable
     slot_folder: NotRequired[str]
     slot_machine: NotRequired[str]
-    started_by: NotRequired[MacStarter]
 
 
 class MacReadingUnavailableRow(RowQueueNotes, NamedQueueRow):
@@ -1462,15 +1452,13 @@ def step_page_owner(step: admission_records.RunningStep | admission_records.Wait
 
 def mac_build_units(builds: Sequence[queue_view.MacBuild],
                     mac_claims: Sequence[claim_state.HeldClaim]) -> Mapping[int, unit_labels.UnitLabels]:
-    """Use a Mac claim's session, from the page's one target reading, to resolve its staff unit."""
+    """Use claims that match the build's checkout or submitting session."""
     from scripts.copies import copies
-    from scripts.mac_test import claim_state
 
     if not builds:
         return {}
-    held_claims = [claim for claim in mac_claims
-                   if claim.record.get("remote_host", "mac").rsplit("@", 1)[-1] == "mac"]
-    claims = [claim.record for claim in held_claims]
+    claims = [claim.record for claim in mac_claims
+              if claim.record.get("remote_host", "mac").rsplit("@", 1)[-1] == "mac"]
     leases = [lease for lease in copies.held_remote_mirrors()
               if lease.identity.host.rsplit("@", 1)[-1] == "mac"]
     labels = unit_labels.unit_labels_for([claim["submitting_session"] for claim in claims], os.environ)
@@ -1498,15 +1486,6 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
                     claim.get("repo_name", "") == build.repository)}
         if len(matches) == 1:
             result[build.pid] = next(iter(matches))
-        elif (not matches and not sessions and build.origin is queue_view.MacBuildOrigin.NON_CI and
-              not any(contains(claim["worktree"], build.folder) for claim in claims)):
-            repository_claims = [claim for claim in held_claims
-                                 if (claim.scope.name if isinstance(claim.scope, claim_state.RepositoryScope)
-                                     else claim.record.get("repo_name")) == build.repository]
-            if len(repository_claims) == 1:
-                session = repository_claims[0].record["submitting_session"]
-                if session in labels:
-                    result[build.pid] = labels[session]
     return result
 
 
@@ -1548,27 +1527,46 @@ def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str
     return slot_place(build_slot_number(folder, machine, roots, home=home), folder, machine)
 
 
-def mac_launcher_name(build: queue_view.MacBuild, members: FeedStaff) -> str:
-    """Name who started a Mac build: hana CI, a Claude session's staff name, or the launcher; "" for an old reading."""
-    if build.origin is queue_view.MacBuildOrigin.CI:
-        return QueueKind.CI.value
-    match build.launcher:
-        case queue_view.MacLauncher.CLAUDE:
-            return members.member_name(build.launcher_session) or "Claude session"
-        case queue_view.MacLauncher.CI:
-            return QueueKind.CI.value
-        case queue_view.MacLauncher.RUST_ANALYZER | queue_view.MacLauncher.TERMINAL:
-            return build.launcher.value
-        case queue_view.MacLauncher.UNKNOWN:
-            return ""
-        case _:
-            assert_never(build.launcher)
+@dataclass(frozen=True)
+class MacBuildSource:
+    """The checkout, submitting session, and host of an offloaded build."""
+
+    folder: str
+    session: str
+    host: str
+
+
+def mac_verify_call_id(build: queue_view.MacBuild) -> str:
+    if build.verify_call_id:
+        return build.verify_call_id
+    # Older readings may only record the Verify step's placement.
+    episode = build.gate_placement.partition("/")[0]
+    call_id, _, step = episode.rpartition("-step-")
+    return call_id if step.isdecimal() else ""
+
+
+def mac_verify_sources(call_ids: set[str]) -> dict[str, MacBuildSource]:
+    """Read the indexed source calls after their placements leave the queue."""
+    if not call_ids:
+        return {}
+    try:
+        with closing(index.read_only()) as database:
+            rows = cast(list[tuple[str, str, str, str]], database.execute(
+                """SELECT id, COALESCE(NULLIF(worktree, ''), cwd, ''), COALESCE(session, ''), COALESCE(host, '')
+                FROM calls WHERE id IN (SELECT value FROM json_each(?)) AND tool = 'verify.sh'""",
+                (json.dumps(sorted(call_ids)),)).fetchall())
+    except sqlite3.Error:
+        # The report index can be absent or replaced during a refresh.
+        return {}
+    return {call_id: MacBuildSource(folder, session, host)
+            for call_id, folder, session, host in rows if folder or session}
 
 
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
                  identity: unit_labels.UnitLabels, *, names: StepNames,
                  slot_roots: Mapping[str, str], slot_machine: str,
-                 placed_step: admission_records.RunningStep | None = None, launcher: str = "") -> MacBuildRow:
+                 placed_step: admission_records.RunningStep | None = None, source_folder: str = "",
+                 verify_source_missing: bool = False) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
@@ -1583,12 +1581,18 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     unit = staff_unit(identity, missing="—")
     caller = "" if label or public_queue_text(identity.owner_text) else codec.select_queue_name(
         public_owner_name(identity.session, build.session))
-    # A placed run keeps the owner that its queue request stored.
-    stored_unit, stored_name = (placed_step.unit, placed_step.session_name) if placed_step is not None else ("", "")
-    who = QueueKind.CI.value if ci else owner_name(identity, stored_unit, stored_name, caller, launcher,
-                                                   package or build.repository)
+    if ci:
+        who = QueueKind.CI.value
+    elif verify_source_missing:
+        who = ""
+    else:
+        checkout = source_folder or (placed_step.folder if placed_step is not None else build.folder)
+        who = owner_name(identity, "", caller, Path(checkout).name, build.repository)
     name = QueueRowName.owned(who, shown_step) if isinstance(shown_step, QueueRowName) else title_step
     display_name = name.with_mac_status(shown_gate)
+    row_step = ""
+    if isinstance(shown_step, QueueRowName):
+        row_step = title_step if isinstance(unit, StaffUnitName) and not ci else shown_step
     parts = (staff_names.row_parts(who, shown_step, identity.unit) if isinstance(shown_step, QueueRowName)
              else staff_names.text_parts(name))
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
@@ -1600,7 +1604,8 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             call = build_command_call(shlex.split(build.command))
         except ValueError:
             pass
-    row: MacBuildRow = {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
+    row: MacBuildRow = {"kind": "mac-build", "row_owner": QueueRowName.owner_only(who), "row_step": row_step,
+            **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
             **call_notes(verify, placed_step.step if placed_step is not None else verb, call),
             **job_notes(NotGateStep(), names, step=verb, verify=verify, ci=ci),
             "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
@@ -1614,9 +1619,6 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
                          if isinstance(build.counter, progress.ProgressCounter) else
                          {"kind": "NoProgress", "reason": build.counter.reason})}
-    # A row with no unit starts with who started it, as a unit row starts with its unit.
-    if launcher and not isinstance(unit, StaffUnitName) and not stored_unit:
-        row["started_by"] = {"name": who, "step": shown_step if isinstance(shown_step, QueueRowName) else ""}
     if placement_notes is not None:
         row["runs_on"] = placement_notes["runs_on"]
         row["targets"] = placement_notes["targets"]
@@ -3195,17 +3197,29 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         with staff.supplied_snapshot(staff_display.members):
             mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
         mac_steps = {step.mac_placement: step for step in parsed.view.running if step.mac_placement}
+        call_ids = {build.pid: call_id for build in mac_reading.builds
+                    if build.origin is not queue_view.MacBuildOrigin.CI and build.gate_placement not in mac_steps
+                    and (call_id := mac_verify_call_id(build))}
+        verify_sources = mac_verify_sources(set(call_ids.values()))
         for build in mac_reading.builds:
             if build.gate_label is queue_view.MacGateLabel.PLACEMENT and build.gate_placement in guest_placements:
                 continue
-            current = members.labels_for(build.session, mac_machine, Path(build.folder))
-            claim = mac_units.get(build.pid)
-            identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
-                claim or current or unit_labels.UnitLabels(""))
             placed = mac_steps.get(build.gate_placement) if build.gate_label is queue_view.MacGateLabel.PLACEMENT else None
+            source = MacBuildSource(placed.folder, placed.session_id, machine) if placed is not None else (
+                verify_sources.get(call_ids.get(build.pid, "")))
+            verify_source_missing = source is None and build.pid in call_ids
+            if source is not None:
+                identity = members.labels_for(source.session, source.host or machine, Path(source.folder)) or unit_labels.UnitLabels("")
+            elif verify_source_missing:
+                identity = unit_labels.UnitLabels("")
+            else:
+                current = members.labels_for(build.session, mac_machine, Path(build.folder))
+                identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
+                    mac_units.get(build.pid) or current or unit_labels.UnitLabels(""))
             mac_row = mac_work_row(build, mac_reading, identity, names=names, slot_roots=slot_roots,
                                    slot_machine=mac_machine, placed_step=placed,
-                                   launcher=mac_launcher_name(build, members))
+                                   source_folder=source.folder if source is not None else "",
+                                   verify_source_missing=verify_source_missing)
             work_rows.append(mac_row)
     work_rows.sort(key=lambda row: row["started_at"])
     model = queue_view.QueueModel(parsed, labels, names=names)

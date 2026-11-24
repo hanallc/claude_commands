@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+from dataclasses import replace
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -11,11 +12,13 @@ import unittest
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import limits_view, memory_feed, progress_profile as progress, snapshot_codec
+from scripts.build_queue import limits_view, memory_feed, progress_profile as progress, queue_view, snapshot_codec
 from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
+from scripts.lib.build_steps import RECORDED_STEP_NAMES
+from scripts.message import unit_labels
 from scripts.review_links import page_frame
 from scripts.production import staff
 from scripts.review_links import staff_names
@@ -154,22 +157,43 @@ class MemoryHoverTests(unittest.TestCase):
         lines = self.page_expression("data.walk.map(row => queueRowLabels(row).owner)", {"walk": walk})
         self.assertEqual(lines, ["aws", "", "", "", ""])
 
-    def test_a_mac_build_with_no_unit_starts_with_who_started_it(self) -> None:
-        # bob, 2026-11-23: the launcher starts the row, the repository is the small text and the verb fills Step.
+    def test_mac_rows_without_units_show_the_checkout_or_showrunner(self) -> None:
         runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
         names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
         setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
         mac = {"kind": "mac-build", "unit": "—", "showrunner": "—", "repository": "hana", "machine": "mac",
                "started_at": 100, "read_at": 190, "used": 1.5, "stage": {"kind": "MacBuilding"}}
-        walk = [{**mac, "name": "terminal: build", "started_by": {"name": "terminal", "step": "build"}},
-                {**mac, "name": "builds: test", "started_by": {"name": "builds", "step": "test"}}]
+        build = queue_view.MacBuild(100, "/Users/nate/clippy", 100, "cargo clippy", "hana",
+                                    resident_bytes=GIB)
+        matching_step = memory_feed.mac_work_row(build, queue_view.MacBuildReading(190, (build,)),
+            unit_labels.UnitLabels(""), names=RECORDED_STEP_NAMES, slot_roots={}, slot_machine="mac")
+        ci = queue_view.mac_build_from_record({
+            "pid": 101, "folder": "/Users/nate/hana", "started_at": 100,
+            "command": "cargo nextest run", "repository": "hana", "origin": "ci", "gate_label": "hana-ci",
+            "test_pid": 0, "resident_bytes": GIB, "counter": {}, "recorded_unit": "", "session": "",
+        })
+        ci_row = memory_feed.mac_work_row(ci, queue_view.MacBuildReading(190, (ci,)),
+            unit_labels.UnitLabels(""), names=RECORDED_STEP_NAMES, slot_roots={}, slot_machine="mac")
+        labeled_rows: list[object] = []
+        for gate in ("user", "unplaced"):
+            labeled = replace(build, gate_label=queue_view.parse_gate_label(gate))
+            row = memory_feed.mac_work_row(labeled, queue_view.MacBuildReading(190, (labeled,)),
+                unit_labels.UnitLabels(""), names=RECORDED_STEP_NAMES, slot_roots={}, slot_machine="mac")
+            labeled_rows.append(snapshot_codec.snapshot_value(row))
+        walk = [{**mac, "name": "cargo-liner: build"},
+                {**mac, "name": "builds: test", "showrunner": "builds"},
+                snapshot_codec.snapshot_value(matching_step),
+                snapshot_codec.snapshot_value(ci_row), *labeled_rows]
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": walk, "waiters": []}
         rendered = cast(list[str], self.page_expression("(()=>{" + setup + "renderWalk(data);"
             + "return [$('walk').innerHTML, ...data.walk.map(row => tooltipHtml('row:'+row.key, data))];})()", data, walk=True))
         root = ElementTree.fromstring(f"<root>{rendered[0]}</root>")
-        for index, (start, color, step) in enumerate((("terminal", None, "build"), ("builds", "role.showrunner", "test"))):
-            with self.subTest(start=start):
+        for index, (start, color, step, gate) in enumerate((
+                ("cargo-liner", None, "build", ""), ("builds", "role.showrunner", "test", ""),
+                ("clippy", None, "clippy", ""), ("hana CI", None, "nextest", "hana-ci"),
+                ("clippy", None, "clippy", "user"), ("clippy", None, "clippy", "unplaced"))):
+            with self.subTest(start=start, gate=gate):
                 chart = root.find(f".//div[@data-run='fixture-run-{index}']")
                 table = root.find(f".//tr[@data-tip='row:fixture-run-{index}']")
                 assert chart is not None and table is not None
@@ -178,29 +202,32 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual("".join(name.itertext()), start)
                 colored = name.find("span[@data-color-text]")
                 self.assertEqual(colored.get("data-color-text") if colored is not None else None, color)
-                self.assertEqual(chart.findtext(".//span[@class='owner']"), "hana")
+                self.assertEqual(chart.findtext(".//span[@class='owner']"), "")
                 self.assertEqual(step_text(table, "th[@class='step']"), step)
-                self.assertIn("<dt>Started by</dt>", rendered[index + 1])
-                self.assertIn(start, rendered[index + 1].split("<dt>Started by</dt>", 1)[1].split("</dd>", 1)[0])
+                self.assertNotIn("<dt>Started by</dt>", rendered[index + 1])
+                self.assertEqual("<dt>Showrunner</dt>" in rendered[index + 1], start == "builds")
+                if gate:
+                    tip = ElementTree.fromstring(rendered[index + 1])
+                    fields = dict((field.text, value.text) for field, value in zip(
+                        tip.findall("dt"), tip.findall("dd"), strict=True))
+                    self.assertEqual(fields.get("Mac build"), gate)
 
-    def mac_starter_hover(self, extra: dict[str, object]) -> list[tuple[object, object]]:
-        """Give the hover rows of one Mac build that a staff owner named "builds" started."""
+    def mac_owner_hover(self, extra: dict[str, object]) -> list[tuple[object, object]]:
         row = {"kind": "mac-build", "machine": "mac", "name": "builds: build", "unit": "—", "repository": "hana",
-               "used": 1.5, "started_at": 100, "read_at": 190, "stage": {"kind": "MacBuilding"},
-               "started_by": {"name": "builds", "step": "build"}, **extra}
+               "used": 1.5, "started_at": 100, "read_at": 190, "stage": {"kind": "MacBuilding"}, **extra}
         rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('row:fixture-run-0', data)",
                                                                    {"read_at": 200, "walk": [row]}))
         return [(row["label"], row["value"]) for row in rows]
 
     def test_a_caller_that_started_a_mac_build_shows_once(self) -> None:
-        rows = self.mac_starter_hover({"caller": "builds", "showrunner": "—"})
-        self.assertEqual([row for row in rows if row[0] == "Started by"], [("Started by", "builds")])
-        self.assertEqual([row for row in rows if row[1] == "builds"], [("Started by", "builds")])
+        rows = self.mac_owner_hover({"caller": "builds", "showrunner": "—"})
+        self.assertEqual([row for row in rows if row[0] == "Started by"], [])
+        self.assertEqual([row for row in rows if row[1] == "builds"], [("Caller", "builds")])
 
     def test_a_showrunner_that_started_a_mac_build_shows_once(self) -> None:
-        rows = self.mac_starter_hover({"showrunner": "builds"})
-        self.assertEqual([row for row in rows if row[0] == "Started by"], [("Started by", "builds")])
-        self.assertEqual([row for row in rows if row[1] == "builds"], [("Started by", "builds")])
+        rows = self.mac_owner_hover({"showrunner": "builds"})
+        self.assertEqual([row for row in rows if row[0] == "Started by"], [])
+        self.assertEqual([row for row in rows if row[1] == "builds"], [("Showrunner", "builds")])
 
     def test_queue_rows_show_unit_showrunner_step_and_one_running_target(self) -> None:
         # nate, 2026-11-21 and 2026-11-23: the unit starts the row, the showrunner is the small text under it,

@@ -915,13 +915,11 @@ function doneText(row) {
     : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
-// A Showrunner or Caller name that already shows as Started by is left out, so no name shows twice.
 function ownerFields(row) {
-  const starter = row.started_by?.name || '';
   const showrunner = ownerText(row.showrunner);
-  const fields = [staffField('Started by', [starter]), staffField('Showrunner', [showrunner === starter ? '' : showrunner])];
+  const fields = [staffField('Showrunner', [showrunner])];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
-  if (row.caller && row.caller !== starter) fields.push(field('Caller', row.caller));
+  if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
 function olderStepTitle(row) {
@@ -1146,15 +1144,15 @@ function publicParts(parts) {
   }
   return shown;
 }
-// One function gives the row start, its small text and the Step and Verify cells, so any console page can use them.
-// A row with a unit starts with the unit; its showrunner is the small text. A Mac build with no unit starts with who
-// started it, in the same form: its repository is the small text and its step fills Step. Another row starts with the
-// owner before ": " in its name, and the text after it fills Step.
+// Use the same owner and step layout for all Running rows.
 function queueRowLabels(row) {
-  if (row.started_by) return {name: row.started_by.name, unit: "", owner: "", starter: row.started_by.name,
-    repository: row.repository || "", step: row.started_by.step, verify: row.verify?.verb || ""};
   const unit = ciRow(row) ? "" : ownerText(row.unit);
   const verify = row.verify?.verb || "";
+  const showrunner = unit ? ownerText(row.showrunner) : "";
+  const owner = showrunner === unit ? "" : showrunner;
+  if (row.kind === "mac-build" && row.row_owner !== undefined) {
+    return {name: row.row_owner, unit, owner, step: row.row_step, verify};
+  }
   if (!unit) {
     // A row with no unit starts with its owner, the text before ": " in its name. The step goes in Step.
     // The owner has no small line: it would repeat the owner.
@@ -1162,18 +1160,16 @@ function queueRowLabels(row) {
     return {name: split < 0 ? row.name : row.name.slice(0, split), unit, owner: "",
       step: split < 0 ? "" : row.name.slice(split + 2), verify};
   }
-  const showrunner = ownerText(row.showrunner);
-  return {name: row.name, unit, owner: showrunner === unit ? "" : showrunner,
-    step: row.title?.unit ? row.title.step : "", verify};
+  return {name: row.name, unit, owner, step: row.title?.unit ? row.title.step : "", verify};
 }
 // A unit always shows in the unit color, by its role, also when it has no staff entry. Python makes the span.
 function unitName(text) {
   return globalThis.staffNames?.unit(text) ?? esc(text);
 }
 // A row starts with its unit, or else with its owner in its staff color (plain ink when the owner has no staff entry).
-function rowLabel({name, unit = "", owner = "", starter = "", repository = ""}, note = "") {
-  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(starter || name)}</span></span>` +
-    `<span class="owner">${owner ? staffName(owner) : esc(repository)}</span>` +
+function rowLabel({name, unit = "", owner = ""}, note = "") {
+  return `<span class="row-label"><span class="row-heading"><span class="name">${unit ? unitName(unit) : staffName(name)}</span></span>` +
+    `<span class="owner">${owner ? staffName(owner) : ""}</span>` +
     (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, bars = "") {
