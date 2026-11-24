@@ -820,6 +820,38 @@ type MacDiskRecoveryState = MacDiskRecoveryActive | MacDiskRecoveryInactive
 type RequestMacDiskRecovery = Callable[[str, MacDiskRecoveryRequest], MacDiskRecoveryState]
 
 
+def _sweep_mac_disk(controller: offload.ProcessController,
+                    config: eligibility.OffloadConfig | eligibility.SshProbeSettings,
+                    repository: eligibility.KnownRepository, probe: offload.ProbeSnapshot, name: str
+                    ) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
+    from scripts.mac_test import offload
+
+    result = offload.ensure_mac_disk_floor(controller, config, repository, probe, name)
+    if isinstance(result, offload.SweepFailed):
+        print(f"build targets: Mac disk exclusion: {result.cause}", file=sys.stderr)
+    return result
+
+
+def mac_disk_recovery_eligibility(target: LocalTarget | SshTarget,
+                                  config: eligibility.OffloadConfig | eligibility.SshProbeSettings,
+                                  repository: eligibility.KnownRepository, probe: offload.ProbeSnapshot,
+                                  request_disk_recovery: RequestMacDiskRecovery) -> EligibleTarget | ExcludedTarget:
+    """Apply the disk floor to a Mac reading and request a sweep if necessary."""
+    from scripts.mac_test import offload
+
+    reading = offload.check_mac_disk_floor(probe, offload.mac_disk_floor(config))
+
+    def recover_disk() -> None:
+        name = target.name if isinstance(target, SshTarget) else "mac"
+        _ = _sweep_mac_disk(offload.ProcessController(), config, repository, probe, name)
+
+    request = MacDiskSweep(reading, recover_disk) if isinstance(reading, offload.MacDiskShort) else MacDiskRecoveryQuery()
+    recovery = request_disk_recovery(config.host, request)
+    if isinstance(recovery, MacDiskRecoveryActive):
+        return MacDiskRecoveryPending(target, "disk", recovery.disk)
+    return EligibleTarget(target) if isinstance(request, MacDiskRecoveryQuery) else ExcludedTarget(target, "disk")
+
+
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing, *,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
@@ -877,28 +909,13 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             offload.write_backoff(time.time() + delay, name, wait=not recover_mac_backoff)
             return ExcludedTarget(target, "unreachable")
 
-        def sweep(sweep_controller: offload.ProcessController) -> offload.MacDiskReady | offload.SweepShort | offload.SweepFailed:
-            result = offload.ensure_mac_disk_floor(sweep_controller, config, repository, probe, name)
-            if isinstance(result, offload.SweepFailed):
-                print(f"build targets: Mac disk exclusion: {result.cause}", file=sys.stderr)
-            return result
-
         if request_disk_recovery is not None:
-            reading = offload.check_mac_disk_floor(probe, offload.mac_disk_floor(config))
-
-            def recover_disk() -> None:
-                _ = sweep(offload.ProcessController())
-
-            request = MacDiskSweep(reading, recover_disk) if isinstance(reading, offload.MacDiskShort) else MacDiskRecoveryQuery()
-            recovery = request_disk_recovery(config.host, request)
-            if isinstance(recovery, MacDiskRecoveryActive):
-                return MacDiskRecoveryPending(target, "disk", recovery.disk)
-            return EligibleTarget(target) if isinstance(request, MacDiskRecoveryQuery) else ExcludedTarget(target, "disk")
+            return mac_disk_recovery_eligibility(target, config, repository, probe, request_disk_recovery)
 
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
         with handlers:
-            disk = sweep(controller)
+            disk = _sweep_mac_disk(controller, config, repository, probe, name)
         if not isinstance(disk, offload.MacDiskReady):
             return ExcludedTarget(target, "disk")
     except offload.OffloadInterrupted as interrupted:

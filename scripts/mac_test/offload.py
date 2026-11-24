@@ -811,6 +811,22 @@ class ProbeSnapshot:
 
 
 @dataclass(frozen=True)
+class MacMirrorProcess:
+    """One process observed in a saved Mac mirror."""
+
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
+class MacHostProbeSnapshot:
+    """Disk space and observed mirror processes from one SSH command."""
+
+    disk: ProbeSnapshot
+    processes: dict[str, MacMirrorProcess]
+
+
+@dataclass(frozen=True)
 class LeftoversEnded:
     """Both selectors completed and found no remaining remote work."""
 
@@ -1777,20 +1793,19 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
     return f"{remote_mirror(repository, target, slot)}/target"
 
 
+_MAC_DISK_PROBE = (
+    'free_gib=$(df -g "$HOME" | awk \'NR == 2 {print $4}\')\n'
+    'printf \'free_gib=%s\\nhost=%s\\nrc=0\\n\' "$free_gib" "$(hostname -s)"'
+)
+
+
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     from scripts.copies import copies
 
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return "\n".join(
-        (
-            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
-            "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$free_gib" "$(hostname -s)"',
-        )
-    )
+    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -2150,6 +2165,69 @@ def save_mac_watch_origin(controller: ProcessController, host: str, root: MacMir
         write_text_atomic(path, json.dumps(record, separators=(",", ":")) + "\n")
 
 
+def _record_probe_failure(target: str, reason: str) -> UnavailableProbe:
+    mark = eligibility.state_directory(target) / "failed_probe"
+    try:
+        with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+            changed = not mark.exists()
+            write_text_atomic(mark, "failed\n")
+    except BlockingIOError:
+        return UNAVAILABLE_PROBE
+    if changed:
+        label = "Mac" if target in ("", "mac") else target
+        print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
+    return UNAVAILABLE_PROBE
+
+
+def _probe_failure_reason(result: CapturedCommandResult, timeout_s: float) -> str:
+    if isinstance(result, CommandTimedOut):
+        return f"SSH probe timed out after {timeout_s:g} s"
+    if isinstance(result, CommandCouldNotStart):
+        return f"SSH probe could not start (time limit {timeout_s:g} s)"
+    if result.status != 0:
+        return next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                    f"SSH probe exited with status {result.status}")
+    return "the probe answer could not be read"
+
+
+def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSettings, target: str,
+                   mirrors: Sequence[str]) -> MacHostProbeSnapshot | UnavailableProbe:
+    """Read disk space and saved mirror processes in one SSH command."""
+    script = [_MAC_DISK_PROBE]
+    if mirrors:
+        script.append('if mac_cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn); then')
+        script.append('lsof() { printf "%s\\n" "$mac_cwd_records"; }')
+        for index, mirror in enumerate(mirrors):
+            selector = mirror_selector_script(KnownRepository(mirror), target)
+            script.extend(("(", selector, 'for pid in $(select_leftovers); do',
+                'start=$(ps -p "$pid" -o lstart=) || continue',
+                f"""printf 'mirror_process={index}\\t%s\\t%s\\n' "$pid" "$start" """,
+                "done", ")"))
+        script.append("fi")
+    started_ns = time.time_ns()
+    result = controller.capture([*ssh_prefix(config), "\n".join(script)], CommandTimeLimit(config.probe_timeout_s))
+    if isinstance(result, CommandOutput) and result.status == 0:
+        disk = parse_probe(result.stdout)
+        if isinstance(disk, ProbeSnapshot):
+            record_reachable(target, probe_started_ns=started_ns)
+            processes: dict[str, MacMirrorProcess] = {}
+            for line in result.stdout.splitlines():
+                if not line.startswith("mirror_process="):
+                    continue
+                parts = line.removeprefix("mirror_process=").split("\t", 2)
+                if len(parts) != 3:
+                    continue
+                index_text, pid_text, start_time = parts
+                if not (index_text.isascii() and index_text.isdecimal()
+                        and pid_text.isascii() and pid_text.isdecimal() and start_time.strip()):
+                    continue
+                index, pid = int(index_text), int(pid_text)
+                if index < len(mirrors) and pid > 0:
+                    _ = processes.setdefault(mirrors[index], MacMirrorProcess(pid, start_time.strip()))
+            return MacHostProbeSnapshot(disk, processes)
+    return _record_probe_failure(target, _probe_failure_reason(result, config.probe_timeout_s))
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig | eligibility.SshProbeSettings,
@@ -2158,20 +2236,6 @@ def probe_mac(
     slot: int = 1,
     *, record_version_decline: bool = True,
 ) -> ProbeResult:
-    mark = eligibility.state_directory(target) / "failed_probe"
-
-    def failed(reason: str) -> UnavailableProbe:
-        try:
-            with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
-                changed = not mark.exists()
-                write_text_atomic(mark, "failed\n")
-        except BlockingIOError:
-            return UNAVAILABLE_PROBE
-        if changed:
-            label = "Mac" if target in ("", "mac") else target
-            print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
-        return UNAVAILABLE_PROBE
-
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
         record_reachable(target, probe_started_ns=probe_started_ns)
         return probe
@@ -2185,7 +2249,7 @@ def probe_mac(
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
         if isinstance(probe_reachability(controller, config), UnreachableHost):
-            return failed("SSH reachability check failed")
+            return _record_probe_failure(target, "SSH reachability check failed")
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
         script = probe_script(repository, target, slot)
@@ -2209,14 +2273,7 @@ def probe_mac(
     if (linux and isinstance(result, CommandOutput)
             and result.stdout.strip() == "linux_startup=unresolved"):
         return UnresolvedSlotStartup()
-    if isinstance(result, CommandTimedOut):
-        reason = f"SSH probe timed out after {timeout_s:g} s"
-    elif isinstance(result, CommandCouldNotStart):
-        reason = f"SSH probe could not start (time limit {timeout_s:g} s)"
-    elif result.status != 0:
-        reason = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-                      f"SSH probe exited with status {result.status}")
-    else:
+    if isinstance(result, CommandOutput) and result.status == 0:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
             if watch_root is not None:
@@ -2238,9 +2295,8 @@ def probe_mac(
                 if record_version_decline:
                     write_version_decline(target, repository.name)
                 return UnavailableProbe(detail)
-            return failed("public tools or tracked scripts differ")
-        reason = "the probe answer could not be read"
-    return failed(reason)
+            return _record_probe_failure(target, "public tools or tracked scripts differ")
+    return _record_probe_failure(target, _probe_failure_reason(result, timeout_s))
 
 
 @dataclass(frozen=True)

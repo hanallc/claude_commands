@@ -1948,7 +1948,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 "the claim has no saved Mac mirror", fixture.clock.now())),))
 
     @contextmanager
-    def mac_backoff_fixture(self, *, backoff: bool = True) -> Generator[MacBackoffTestFixture]:
+    def mac_backoff_fixture(self, *, backoff: bool = True, probe_timeout: int = 1) -> Generator[MacBackoffTestFixture]:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
         from scripts.mac_test import claim_state, eligibility, offload
@@ -1956,7 +1956,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             settings = fixture.root / "mac_test.conf"
             _ = write_config_fixture(settings,
-                "offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s=1\nfree_floor_gib=60\n")
+                f"offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s={probe_timeout}\nfree_floor_gib=60\n")
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
@@ -1971,6 +1971,95 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
                 yield MacBackoffTestFixture(fixture, eligibility.backoff_path(target.name), key, probe)
+
+    @contextmanager
+    def mac_cycle_fixture(self, *, keys: int, probe_seconds: int = 0, blocked_key: bool = False
+                          ) -> Generator[tuple[MacBackoffTestFixture, tuple[placement.HostEvidenceKey, ...]]]:
+        from scripts.mac_test import claim_state, mac_test, offload
+
+        start = threading.Event()
+        readings: Queue[placement.HostEvidence] = Queue()
+        guard = test_hang_guard.TEST_HANG_GUARD_SECS
+
+        class ObservedWorker(service.HostEvidenceWorker):
+            @override
+            def _read(self) -> None:
+                if not start.wait(guard):
+                    raise AssertionError("the test did not start the probe cycle")
+                super()._read()
+
+            @override
+            def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                running = super()._probe(key, subscription)
+                readings.put(self.evidence(key))
+                return running
+
+        with (self.mac_backoff_fixture(backoff=False, probe_timeout=15) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ObservedWorker)):
+            server = fixture.admission.server
+            server.host_probe = server.read_provider_evidence
+
+            def capture(_arguments: Sequence[str]) -> offload.CommandOutput:
+                fixture.admission.clock.advance(probe_seconds)
+                return offload.CommandOutput(0, "free_gib=60\nhost=fixture-mac\nrc=0\n", "")
+
+            fixture.probe.answer = capture
+            request = server.host_requests[fixture.key]
+            subscribed: list[placement.HostEvidenceKey] = []
+            read = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                        getattr(server, "_host_evidence_reader"))
+            try:
+                for index in range(keys):
+                    session = (OwningSession("blocked-session") if blocked_key and index == 0
+                               else fixture.key.session)
+                    key = replace(fixture.key, package=f"package-{index}", session=session)
+                    server.host_requests[key] = replace(request, constraints=replace(
+                        request.constraints, package=key.package, session=session))
+                    _ = read(key, guard)
+                    subscribed.append(key)
+                if blocked_key:
+                    paths = mac_test.state_paths(fixture.key.destination.target)
+                    paths.block.parent.mkdir(parents=True, exist_ok=True)
+                    since = datetime.now(UTC)
+                    mac_test.write_block(paths.block, claim_state.ActiveMacBlock(
+                        "nate", "release work", since, since + timedelta(hours=1),
+                        claim_state.RecordedSession("submitting-session", "nate"), mac_test.NO_SHOWRUNNER,
+                        "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED))
+                start.set()
+                completed = {readings.get(timeout=guard).key for _ in subscribed}
+                self.assertEqual(completed, set(subscribed))
+                worker, = server.host_targets.values()
+                worker.close()
+                worker.thread.join(guard)
+                self.assertFalse(worker.thread.is_alive())
+                yield fixture, tuple(subscribed)
+            finally:
+                server.close()
+                start.set()
+                for worker in server.host_targets.values():
+                    worker.thread.join(guard)
+                    self.assertFalse(worker.thread.is_alive())
+
+    def test_mac_cycle_reads_the_host_once_for_many_policy_keys(self) -> None:
+        with self.mac_cycle_fixture(keys=5) as (fixture, _keys):
+            self.assertEqual(fixture.probe.call_count, 1)
+
+    def test_mac_cycle_keeps_sixteen_slow_readings_fresh_together(self) -> None:
+        with self.mac_cycle_fixture(keys=16, probe_seconds=12) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            for reading in evidence:
+                self.assertIsInstance(reading, placement.FreshHostEvidence)
+                assert isinstance(reading, placement.FreshHostEvidence)
+                self.assertEqual(reading.eligibility, placement.AllowedHost())
+            self.assertEqual(len({reading.observed_at for reading in evidence}), 1)
+
+    def test_mac_cycle_keeps_the_session_block_for_each_key(self) -> None:
+        with self.mac_cycle_fixture(keys=3, blocked_key=True) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            results = [reading.eligibility for reading in evidence if isinstance(reading, placement.FreshHostEvidence)]
+            self.assertEqual(results, [placement.TemporaryExclusion("blocked"), placement.AllowedHost(),
+                                       placement.AllowedHost()])
+            self.assertEqual(fixture.probe.call_count, 1)
 
     @contextmanager
     def mac_disk_sweep_fixture(self) -> Generator[MacDiskSweepFixture]:

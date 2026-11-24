@@ -876,8 +876,10 @@ Existing waits keep their place on natedev until then.
 Below the required floor, it runs one shared floor sweep and reads free space again.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
-An admission probe publishes a pending disk reading that excludes the Mac.
-One recovery thread per host runs the sweep while the evidence worker reads other keys.
+The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
+The keys that share the reading have the same observation time.
+The worker checks repository policy, session, and claim scope for each key.
+The worker reports pending disk recovery while a separate thread runs the sweep.
 The Mac stays excluded during recovery even when a probe reports enough free space.
 When the sweep ends, the worker probes all subscribed Mac keys again.
 The sweep holds no admission or claim lock during removal.
