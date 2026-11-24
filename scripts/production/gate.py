@@ -3197,7 +3197,14 @@ class MacLinuxAssignment:
     assignment: placement.PlacementAssignment
 
 
-GateTarget = str | LocalGateAssignment | MacLinuxAssignment | NoGateAssignment
+@dataclass(frozen=True)
+class AwsGateAssignment:
+    """A queue assignment that permits the AWS gate route."""
+
+    assignment: placement.PlacementAssignment
+
+
+GateTarget = str | LocalGateAssignment | MacLinuxAssignment | AwsGateAssignment | NoGateAssignment
 
 
 class GateAssignmentRefused(GateRefused):
@@ -3228,6 +3235,8 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
         assigned = gate_start_target(args, args.command)
         if isinstance(assigned, NoGateAssignment):
             raise GateAssignmentRefused("The queue returned no gate placement")
+        if isinstance(assigned, AwsGateAssignment):
+            raise GateAssignmentRefused("Direct gates require natedev or mac-linux")
         yield assigned
 
 
@@ -3239,8 +3248,6 @@ def gate_start_target(args: GateArguments, arguments: Sequence[str]) -> GateTarg
     """
     placed = current_gate_placement(SuiteMode.TARGETED if args.affected else SuiteMode.GATE, args.gate_job)
     target = placement_target(placed)
-    if target == "aws" and not args.prepared_copy:
-        raise GateAssignmentRefused("A direct gate cannot take an AWS assignment")
     flag = gate_natedev_only_flag(arguments)
     if flag is not None and not isinstance(placed, NoGateAssignment) and placed.assignment.destination.target != "natedev":
         raise GateAssignmentRefused(
@@ -3254,6 +3261,8 @@ def placement_target(
     """Return the target of a checked placement."""
     if isinstance(placed, NoGateAssignment):
         return placed
+    if placed.assignment.destination.target == "aws":
+        return AwsGateAssignment(placed.assignment)
     if placed.assignment.destination.target == "mac-linux":
         return MacLinuxAssignment(placed.assignment)
     if isinstance(placed, admission_wire.LocalPlacementGranted) and placed.assignment.destination.target == "natedev":
@@ -3404,11 +3413,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                               selected=selection, gate_job=gate_job)
         if isinstance(outcome, str):
-            if not isinstance(target, NoGateAssignment):
-                raise GateRefused(f"AWS gate failed: {outcome}")
-            print('Cloud gate uses natedev: ' + outcome, flush=True)
-            return run_local(type_dirs)
-        return finish_remote(outcome) if isinstance(target, NoGateAssignment) else outcome
+            raise GateRefused(f"AWS gate failed: {outcome}")
+        return outcome
 
     def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
@@ -3452,6 +3458,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         finally:
             ACTIVE_ROUTED_GATE_TREE.reset(token)
 
+    run_selected: Callable[[AllModules | TreeSelection], GateRun]
     match gate_target_kind(target) if isinstance(target, str) else target:
         case LocalGateAssignment() as local_assignment:
             status = 1
@@ -3477,14 +3484,14 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             if not enabled:
                 raise MacLinuxGateRefused(f"Mac Linux guest gate refused with build_targets.conf {key}=off")
             run_selected = partial(run_guest, guest_assignment)
-        case "aws":
+        case AwsGateAssignment():
             if type_dirs:
                 raise GateRefused("The AWS gate route does not support type checks")
             run_selected = run_cloud
         case NoGateAssignment():
             if named:
                 return run_named_modules(repo, named, mode)
-            run_selected = run_cloud
+            run_selected = lambda _selection: run_local(type_dirs)
         case _:
             raise GateRefused(f"The gate does not support the assigned target {target}")
 

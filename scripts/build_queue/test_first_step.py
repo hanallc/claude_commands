@@ -16,6 +16,7 @@ from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate, mac_linux_candidate,
     placement_request, publish_candidate,
 )
+from scripts.build_targets import gate_targets as target_defaults
 from scripts.lib import build_folders, conf
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import command_job
@@ -62,6 +63,32 @@ class FirstStepTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "mac-linux"}):
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source, requested="mac"), ("mac",))
                 self.assertEqual(first_step.gate_targets(GATE_COMMAND, source=source), ("mac-linux",))
+
+    def test_only_the_canonical_gate_can_request_aws(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            canonical = source / "scripts/production/gate.py"
+            canonical.parent.mkdir(parents=True)
+            canonical.touch()
+            (source / "gate.py").symlink_to(canonical)
+            (source / "gate-alias.py").symlink_to(canonical)
+            requested = "aws,mac-linux,natedev"
+            self.assertEqual(first_step.gate_targets(GATE_COMMAND, source, requested),
+                             ("aws", "mac-linux", "natedev"))
+            for invocation in (
+                ("gate.py",), ("scripts/production/merge_gate.py",), ("scripts/production/targeted_test.py",),
+                ("-m", "scripts.production.gate"), ("-m", "scripts.production.merge_gate"),
+                ("-m", "scripts.production.targeted_test"),
+            ):
+                with self.subTest(invocation=invocation):
+                    command = ("python3", *invocation, "--tests-only")
+                    self.assertEqual(first_step.gate_targets(command, source, requested), ("mac-linux", "natedev"))
+            self.assertEqual(first_step.gate_targets(("python3", "gate-alias.py"), source, requested), ())
+            with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": ""}),
+                  mock.patch.object(target_defaults, "eligible_gate_targets", return_value=("aws", "natedev"))):
+                self.assertEqual(first_step.gate_targets(GATE_COMMAND, source), ("aws", "natedev"))
+                self.assertEqual(first_step.gate_targets(("python3", "-m", "scripts.production.gate"), source),
+                                 ("natedev",))
 
     def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
         with PlacementFixture() as fixture:

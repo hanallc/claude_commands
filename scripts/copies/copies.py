@@ -48,7 +48,7 @@ from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
     GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-    OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, parse_command_program, read_step_names,
+    StepJob, VerifyCommand, build_call_arguments, command_job, read_step_names,
     verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
@@ -2610,6 +2610,7 @@ def command_tail(command: list[str]) -> list[str]:
 
 def take_prepared_gate_handoff() -> bool:
     """Consume the pipe token passed to the prepared gate."""
+    # The pipe skips placement. Only the queue can confirm an AWS assignment.
     try:
         reader = int(os.environ.pop(PREPARED_GATE_FD, "0"))
         if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
@@ -2659,9 +2660,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         def launch() -> subprocess.CompletedProcess[str]:
             child_environment = {**os.environ, **environment}
             _ = child_environment.pop(PREPARED_GATE_FD, None)
-            program = parse_command_program(arguments, keep_path=True)
-            if (isinstance(program, OtherCommand) or Path(arguments[0]).name in {"bash", "sh"}
-                    or (tree / program[0]).resolve() != tree.resolve() / "scripts/production/gate.py"):
+            if not first_step.canonical_gate_command(arguments, tree):
                 return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
             with ExitStack() as child_scope:
                 reader, writer = os.pipe()
