@@ -50,7 +50,7 @@ from scripts.review_links import image_store, review_events
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
 from scripts.lib import urgency
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production.cli_fixture import invoke_cli
@@ -3269,10 +3269,10 @@ class ActionTest(unittest.TestCase):
             _ = subprocess.run(["git", *arguments], check=True, capture_output=True)
         base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
                               text=True).stdout.strip()
-        worktrees.write_record(worktrees.WorktreeRecord(
+        worktrees.write_record(worktree_records.WorktreeRecord(
             1, str(tree), f"{team}-try-{row}", str(repo), base, "main", team, "2026-11-23T00:00:00+00:00",
-            worktrees.RecordedWorktreeOutput(team, f"try-{row}", root / f"build/repo/{team}/try-{row}")))
-        self.addCleanup(worktrees.record_file(tree).unlink, missing_ok=True)
+            worktree_records.RecordedWorktreeOutput(team, f"try-{row}", root / f"build/repo/{team}/try-{row}")))
+        self.addCleanup(worktree_records.record_file(tree).unlink, missing_ok=True)
         return tree, repo
 
     def test_a_verdict_removes_the_producers_clean_try_folder(self) -> None:
