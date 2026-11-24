@@ -1097,6 +1097,15 @@ class BusyHolderTests(unittest.TestCase):
 
 @final
 class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
+    def test_verify_refuses_the_mirror_descriptor_environment_variable(self) -> None:
+        name = "COPIES_MIRROR_LEASE_FDS"
+        result = self.verify("test", "sample", "--mac", "fixture", "--env", name, extra={name: ""})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, f"verify.sh: --env {name}: the runner sets it, "
+                         + "or it changes what Cargo builds; it is not forwarded.\n")
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_runs(), [])
+
     def test_unreadable_history_ends_verify_without_a_retry(self) -> None:
         git = self.bin_directory / "git"
         source = git.read_text().replace("#!/bin/bash\n",
@@ -1914,6 +1923,14 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
         self.assertEqual(remote_words[lint_index + 1 :], ["nextest", *words])
+
+    def test_offload_refuses_the_mirror_descriptor_environment_variable(self) -> None:
+        name = "COPIES_MIRROR_LEASE_FDS"
+        self.environment[name] = ""
+        result = self.command(runner_options=("--env", name), separate_stderr=True)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, f"offload: --env {name}: the runner sets it; it is not forwarded.\n")
+        self.assertEqual(self.events_for("ssh"), [])
 
     def test_nextest_and_copy_runs_deliver_forwarded_environment_to_the_remote_command(self) -> None:
         self.environment.update({"NO_COLOR": "1", "TERM": "xterm-256color", "TERM_PROGRAM": "verify"})

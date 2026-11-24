@@ -4106,6 +4106,9 @@ def main() -> int:
     for name in arguments.environment:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             cli.error(f"--env {name}: not a variable name")
+        if name == floor_claims.MIRROR_LEASE_FDS:
+            print(f"offload: --env {name}: the runner sets it; it is not forwarded.", file=sys.stderr)
+            return 2
         if name not in os.environ:
             cli.error(f"--env {name}: not set here")
     if arguments.fetch is not None and not plain_fetch_folder(arguments.fetch):

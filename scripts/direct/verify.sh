@@ -339,7 +339,7 @@ parse_routing_arguments() {
     fi
     for name in ${MAC_ENV_NAMES[@]+"${MAC_ENV_NAMES[@]}"}; do
         case "$name" in
-            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
+            PATH|HOME|MACOSX_DEPLOYMENT_TARGET|RUSTFLAGS|RUSTDOCFLAGS|COPIES_MIRROR_LEASE_FDS|BUILDLOG_*|LINT_*|CARGO_*|RUSTC*|NEXTEST_*|DYLD_*|MAC_TEST_*|VERIFY_*)
                 printf 'verify.sh: --env %s: the runner sets it, or it changes what Cargo builds; it is not forwarded.\n' "$name" >&2
                 exit 2 ;;
         esac
