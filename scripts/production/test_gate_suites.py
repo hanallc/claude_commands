@@ -286,12 +286,13 @@ class MergeGateSuitesTests(GateSuitesFixture):
         selection = affected_modules.AffectedSelection(
             affected_modules.CertifiedBase(self.git(self.checkout, "rev-parse", "HEAD"), "2026-01-15T00:00:00+00:00"),
             (), ())
+        aws = gate.placement_target(placed("claude-aws"))
         for reuse, types in ((True, ()), (False, ()), (False, ("scripts",))):
+            target = "natedev" if types else aws
             for changed in (False, True):
                 with (self.subTest(reuse=reuse, types=types, changed=changed),
                       mock.patch.dict(os.environ, self.environment),
                       mock.patch.object(cloud_gate, "route") as route,
-                      mock.patch.object(gate.PassedTreeLedger, "reuse", return_value=reuse),
                       contextlib.redirect_stdout(io.StringIO())):
                     _ = self.git(self.checkout, "restore", "subject.txt")
 
@@ -307,19 +308,25 @@ class MergeGateSuitesTests(GateSuitesFixture):
                                                    kind=gate.GateJobKind.TYPE_CHECK),) if types else ()
                         return gate.GateRun(jobs, 1, 0, tests_reused=reuse)
 
+                    def reuse_pass(*_args: object, **_kwargs: object) -> bool:
+                        if changed and reuse:
+                            self.write(subject, "changed during pass reuse\n")
+                        return reuse
+
                     before = self.pass_records()
                     with (mock.patch.object(gate, "select_affected", side_effect=select),
+                          mock.patch.object(gate.PassedTreeLedger, "reuse", side_effect=reuse_pass),
                           mock.patch.object(gate, "run_suites", side_effect=local) as run_local):
                         if changed:
                             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
                                 _ = gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
-                                                         target=gate.NO_GATE_ASSIGNMENT)
+                                                         target=target)
                             self.assertEqual(self.pass_records(), before)
                         else:
                             self.assertTrue(gate.run_gate_suites(self.checkout, types, mode=gate.SuiteMode.TARGETED,
-                                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
+                                                                 target=target).passed)
                     route.assert_not_called()
-                    self.assertEqual(run_local.call_count, int(reuse or bool(types)))
+                    self.assertEqual(run_local.call_count, int(bool(types)))
 
     @gate_suites("hooks")
     def test_refused_empty_selection_does_not_record_a_pass(self) -> None:
@@ -328,6 +335,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         head = self.git(self.checkout, "rev-parse", "HEAD")
         selection = affected_modules.AffectedSelection(
             affected_modules.CertifiedBase(head, "2026-01-15T00:00:00+00:00"), (), ())
+        aws = gate.placement_target(placed("claude-aws"))
 
         def change_during_selection(*_args: object, **_kwargs: object) -> affected_modules.AffectedSelection:
             self.write(self.checkout / "subject.txt", "changed during empty selection\n")
@@ -338,14 +346,14 @@ class MergeGateSuitesTests(GateSuitesFixture):
               mock.patch.object(gate, "select_affected", return_value=selection) as select,
               contextlib.redirect_stdout(io.StringIO())):
             self.assertTrue(gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED,
-                                                 target=gate.NO_GATE_ASSIGNMENT).passed)
+                                                 target=aws).passed)
             accepted, = self.gate_run_records()
             self.assertEqual((accepted["selection"], accepted["status"]), ("affected", 0))
             before = self.pass_records()
 
             select.side_effect = change_during_selection
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED, target=gate.NO_GATE_ASSIGNMENT)
+                _ = gate.run_gate_suites(self.checkout, mode=gate.SuiteMode.TARGETED, target=aws)
             route.assert_not_called()
 
         self.assertEqual(self.gate_run_records(), [accepted])
@@ -679,26 +687,29 @@ class MergeGateSuitesTests(GateSuitesFixture):
             _ = excludes.write("\n/subject.txt\n/ignored.txt\n")
         expected = subject.read_bytes()
         marker, notice = self.write_nightly_red_marker()
+        aws = gate.placement_target(placed("claude-aws"))
+        remote = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 1, ""),), 1, 0)
 
-        def fallback(*_args: object, **_kwargs: object) -> str:
+        def stage_deletion(*_args: object, **_kwargs: object) -> gate.GateRun:
             _ = self.git(self.checkout, "rm", "--cached", "subject.txt")
-            return "fixture cloud unavailable"
+            return remote
 
-        def commit_ignored_file(*_args: object, **_kwargs: object) -> str:
+        def commit_ignored_file(*_args: object, **_kwargs: object) -> gate.GateRun:
             self.write(added, "new tracked file\n")
             _ = self.git(self.checkout, "add", "-f", "ignored.txt")
             _ = self.git(self.checkout, "commit", "-qm", "Track the ignored file", "--only", "--", "ignored.txt")
-            return "fixture cloud unavailable"
+            return remote
 
         with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(cloud_gate, "route", side_effect=fallback) as route,
+              mock.patch.object(cloud_gate, "route", side_effect=stage_deletion) as route,
               contextlib.redirect_stdout(io.StringIO())):
-            self.assertTrue(gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT).passed)
+            self.assertIs(gate.run_gate_suites(self.checkout, target=aws), remote)
             self.assertEqual(cloud_gate.working_tree(self.checkout),
                              (self.git(self.checkout, "rev-parse", "HEAD^{tree}"), {"subject.txt"}))
             route.side_effect = commit_ignored_file
             with self.assertRaisesRegex(GateRefused, "^The checkout changed during the gate$"):
-                _ = gate.run_gate_suites(self.checkout, target=gate.NO_GATE_ASSIGNMENT)
+                _ = gate.run_gate_suites(self.checkout, target=aws)
+            self.assertEqual(route.call_count, 2)
         self.assertEqual(subject.read_bytes(), expected)
         self.assertEqual(self.git(self.checkout, "diff", "--cached", "--name-status"), "D\tsubject.txt")
         self.assertEqual(marker.read_text(), notice)
