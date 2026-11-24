@@ -537,7 +537,8 @@ The copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on na
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
-`targeted_test.py --checkout <copy>` and `merge_gate.py --checkout <copy>` take the shared lock before tests start.
+The affected gate takes the shared lock after it accepts the prepared copy.
+The merge gate takes the shared lock before tests start.
 Scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting.
 They create the mark when absent and retain it through deletion.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
@@ -653,19 +654,25 @@ Call records use the package name or `workspace`.
 
 After help and saved-pass query exits, verify reads the Git top level.
 If the root has no `Cargo.toml`, Verify prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` on stderr and exits 2.
-If the root has `scripts/copies/copies.py`, Verify also prints `claude_commands: run tests with copies.py --affected or --module` on stderr.
+If the root has `scripts/copies/copies.py`, Verify also prints the command below on stderr.
 This refusal precedes environment setup and Cargo calls.
 
-From a `claude_commands` checkout, run the affected tests through the queue with:
+Run affected tests from a `claude_commands` checkout through `copies.py run`.
+A direct `gate.py --affected` call prints the command with the Git worktree root and its current `HEAD` commit.
+The gate exits with status 1 before it requests placement.
+
+Run this command from the worktree root.
 
 ```sh
-./scripts/lib/py scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+  --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 Add `--module <module>` after `--affected` to select a module.
+Merge-line gates use `--tests-only`.
 
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
-For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
+For `~/.claude`, run the affected gate with the prepared checkout from `copies.py run`.
 No configuration maps repositories to unit gates.
 [Checkpoint documentation and final targets](rustdoc-once-and-final-targets.md) defines the Cargo doc and final behavior.
 
