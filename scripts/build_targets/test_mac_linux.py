@@ -711,6 +711,8 @@ class MacLinuxRouteTests(unittest.TestCase):
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
         _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            'GATE_STATE_DIR': str(self.root / 'gate-state'),
+            'GATE_PASSED_DIR': str(self.root / 'gate-passes'),
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
             'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
@@ -850,13 +852,13 @@ fi
                     'claim': claim.claim_id, 'result': 'proven', 'detail': 'The guest confirmed the run ended',
                     'written_at': 123.5}
         real_fsync = os.fsync
-        synced: list[bytes] = []
+        synced: list[tuple[int, bytes]] = []
 
         def sync(fd: int) -> None:
             with path.open('rb') as reader, self.assertRaises(BlockingIOError):
                 fcntl.flock(reader, fcntl.LOCK_EX | fcntl.LOCK_NB)
             real_fsync(fd)
-            synced.append(path.read_bytes())
+            synced.append((os.fstat(fd).st_ino, path.read_bytes()))
 
         def failed_send(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
             self.assertEqual(request.assignment, assignment)
@@ -865,7 +867,7 @@ fi
             before, line = path.read_bytes().splitlines()
             self.assertEqual(before, partial)
             self.assertEqual(json.loads(line), expected)
-            self.assertEqual(synced, [path.read_bytes()])
+            self.assertEqual(synced, [(entry.stat().st_ino, path.read_bytes()) for entry in (path, path.parent)])
             raise wire.AdmissionUnavailable('fixture socket outage')
 
         with (patch.object(mac_linux, 'time', return_value=123.5),
@@ -1223,6 +1225,7 @@ fi
                     submit.assert_called_once()
 
     def test_direct_affected_retries_after_a_consumed_guest_takes_no_run(self) -> None:
+        self.assertEqual(gate.gate_state_dir(), self.root / 'gate-state')
         key = treekey.tree_key(str(self.repo))
         assert key is not None
         guest = replace(self.placed, attempt=f'{46:032x}', source_key=execution_identity.SourceKeyKnown(key))
@@ -1677,6 +1680,7 @@ fi
         start = process_start.process_start(os.getpid())
         assert isinstance(start, process_start.Started)
         self.assertEqual(request.assignment, self.placed)
+        self.assertTrue(request.guest_proof_required)
         self.assertEqual(request.holder, placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start))
         destination = self.placed.destination
         self.assertEqual(request.claim, placement.ProviderClaimReference(destination.provider, destination.target,
@@ -1685,6 +1689,48 @@ fi
         self.assertTrue(held)
         self.assertEqual(trace, '')
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_first_guest_launch_syncs_the_journal_directory_before_consume(self) -> None:
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        self.assertFalse(path.exists())
+        consume = admission_client.consume_permission
+        fsync = os.fsync
+        synced: list[int] = []
+
+        def record_sync(fd: int) -> None:
+            fsync(fd)
+            synced.append(os.fstat(fd).st_ino)
+
+        def check_launch(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+            record = cast(dict[str, object], json.loads(path.read_bytes()))
+            self.assertEqual(record['result'], 'awaiting arm')
+            self.assertEqual(record['claim'], request.claim.claim_id)
+            self.assertIn(path.stat().st_ino, synced)
+            self.assertIn(path.parent.stat().st_ino, synced)
+            self.assertGreater(synced.index(path.parent.stat().st_ino), synced.index(path.stat().st_ino))
+            return consume(request)
+
+        with (patch.object(os, 'fsync', side_effect=record_sync),
+              patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        send.assert_called_once()
+
+    def test_a_failed_journal_directory_sync_does_not_consume_permission(self) -> None:
+        path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        fsync = os.fsync
+
+        def fail_directory_sync(fd: int) -> None:
+            if path.parent.exists() and os.fstat(fd).st_ino == path.parent.stat().st_ino:
+                raise OSError('fixture journal directory sync failed')
+            fsync(fd)
+
+        with (patch.object(os, 'fsync', side_effect=fail_directory_sync),
+              patch.object(admission_client, 'consume_permission') as consume):
+            self.assertEqual(self.route(), 'mac-linux: fixture journal directory sync failed')
+        consume.assert_not_called()
+        self.assert_guest_clean()
 
     def test_a_refused_launch_permission_starts_nothing_on_the_guest(self) -> None:
         refusal = wire.DispatchStatus(self.placed, placement.ClosedAssignment('cancelled'), placement.PermissionAvailable(),

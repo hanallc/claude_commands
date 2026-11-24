@@ -30,6 +30,7 @@ from scripts.build_queue import admission_protocol as wire, admission_records as
 from scripts.build_queue import admission_client as client, mac_run, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import limits_view, memory_feed
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.buildlog import store
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
@@ -37,14 +38,14 @@ from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint import memory_test_support
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pressure_reading
 from scripts.lint import memory_admit as gate
-from scripts.production.gate_routes import SuiteMode
+from scripts.production.gate_routes import ALL_MODULES, ModuleCoverage, SuiteMode
 from scripts.message.unit_labels import UnitLabels
-from scripts.lib import conf
+from scripts.lib import conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets import mac_linux
-from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
+from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget, mac_linux_end_proof_journal
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -235,7 +236,7 @@ def consume_guest_permission(fixture: PlacementFixture, assignment: placement.Pl
 
 
 def write_guest_no_start_proof(fixture: PlacementFixture, claim: placement.ProviderClaimReference) -> None:
-    journal = fixture.root / "target-state" / "mac-linux" / "end-proofs.jsonl"
+    journal = mac_linux_end_proof_journal()
     row = {"attempt": execution_identity.attempt_key(claim.episode, claim.attempt), "claim": claim.claim_id,
            "result": "not started", "detail": "The guest confirmed no start", "written_at": fixture.clock.now()}
     journal.parent.mkdir(parents=True, exist_ok=True)
@@ -2632,25 +2633,59 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(reply.state, placement.ClosedAssignment("cancelled"))
             self.assertNotIn(guest.episode, fixture.server.current_assignments)
 
-    def test_guest_with_proof_required_waits_after_both_holders_exit(self) -> None:
+    def test_guest_in_a_different_state_dir_waits_for_proof_after_both_holders_exit(self) -> None:
         with (PlacementFixture(private_child_starts=True) as fixture,
+              mock.patch.dict(os.environ),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker),
               mock.patch.object(mac_linux, "reconcile_unproven")):
+            _ = os.environ.pop("BUILD_TARGETS_STATE_DIR", None)
             request = mac_linux_and_natedev_request(fixture, natedev=False)
             key = publish_candidate(fixture, request).key
             guest = assignment_for(fixture, request)
             holder = guest_gate(fixture, guest)
-            claim = placement.assigned_claim_reference(guest)
-            identity = placement.ClaimHolderIdentity(guest.owner.host, holder.pid, holder.start_time)
-            consume = wire.ConsumePermission("proof-required", guest, claim, identity)
-            envelope = cast(dict[str, dict[str, object]], json.loads(wire.encode_request(consume)))
-            self.assertNotIn("guest_proof_required", envelope["data"])
-            marked = replace(consume, guest_proof_required=True)
-            decoded = wire.parse_request(wire.encode_request(marked))
-            self.assertEqual(decoded, marked)
-            with mock.patch.object(mac_run, "claim_held", return_value=True):
-                self.assertIsInstance(fixture.server.handle_request(decoded)[0], wire.FirstAuthorization)
-                self.assertIsInstance(fixture.server.handle_request(consume)[0], wire.DispatchStatus)
+            claim_id = mac_test.MAC_LINUX_CLAIM_ID_PREFIX + "fixture"
+            claim = placement.ProviderClaimReference(guest.destination.provider, guest.destination.target,
+                guest.destination.scope, claim_id, guest.episode, guest.attempt)
+            guest_claim = claim_state.ClaimIdentity(claim_id, guest.episode, guest.attempt)
+            settings = mac_linux.GuestSettings(("fixture-mac", "fixture-guest"), "guest", 1, 10, 20)
+            checkout = mac_linux.GuestCheckoutIdentity("guest-machine", "/fixture")
+            source = mac_linux.CandidateSource("head", "commit", "tree", "main", "origin", "runner",
+                                               frozenset({"module"}), ModuleCoverage.COMPLETE)
+            armed = mac_linux.ArmedGuestAttempt("guest-run", checkout.machine_id, "guest-boot", 10,
+                                                settings.guest_user, checkout.checkout)
+            service_journal = mac_linux_end_proof_journal()
+            gate_state = fixture.root / "gate-state"
+
+            def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
+                legacy = replace(message, guest_proof_required=False)
+                envelope = cast(dict[str, dict[str, object]], json.loads(wire.encode_request(legacy)))
+                self.assertNotIn("guest_proof_required", envelope["data"])
+                decoded = wire.parse_request(wire.encode_request(message))
+                self.assertEqual(decoded, message)
+                gate_journal = mac_linux_end_proof_journal()
+                self.assertNotEqual(gate_journal, service_journal)
+                self.assertTrue(gate_journal.is_file())
+                self.assertFalse(service_journal.exists())
+                reply, = fixture.server.handle_request(decoded)
+                assert isinstance(reply, wire.FirstAuthorization), reply
+                self.assertIsInstance(fixture.server.handle_request(legacy)[0], wire.DispatchStatus)
+                return reply
+
+            with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(gate_state)}),
+                  mock.patch.object(mac_linux, "new_run_settings", return_value=settings),
+                  mock.patch.object(mac_linux, "candidate_source", return_value=source),
+                  mock.patch.object(mac_linux, "read_guest_checkout", return_value=checkout),
+                  mock.patch.object(mac_linux, "mac_linux_reservation", return_value=nullcontext(guest_claim)),
+                  mock.patch.object(mac_linux, "transfer_source",
+                                    side_effect=mac_linux.GuestEndUnproven("guest still running", armed)),
+                  mock.patch.object(os, "getpid", return_value=holder.pid),
+                  mock.patch.object(process_start, "process_start", return_value=process_start.Started(holder.start_time)),
+                  mock.patch.object(store, "host_name", return_value=guest.owner.host),
+                  mock.patch.object(mac_run, "claim_held", return_value=True),
+                  mock.patch.object(client, "consume_permission", side_effect=consume),
+                  self.assertRaisesRegex(mac_linux.GuestEndUnproven, "guest still running")):
+                _ = mac_linux.route(fixture.root, mode=SuiteMode.GATE, full=True, module_time_limit_s=3,
+                                    selected=ALL_MODULES, gate_job=StepJob("test-all", unit="fixture"), assignment=guest)
             attempt = execution_identity.attempt_key(guest.episode, guest.attempt)
             fixture.restart()
             saved = fixture.server.assignments[attempt]
@@ -2668,8 +2703,8 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(worker.probe_next(), key)
             _ = fixture.run_pass()
             saved = fixture.server.assignments[attempt]
-            self.assertTrue(saved.guest_proof_required)
             self.assertIsInstance(saved.state, placement.CurrentAssignment)
+            self.assertTrue(saved.guest_proof_required)
             write_guest_no_start_proof(fixture, claim)
             self.assertEqual(worker.probe_next(), key)
             _ = fixture.run_pass()

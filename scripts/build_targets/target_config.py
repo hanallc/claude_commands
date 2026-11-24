@@ -203,6 +203,11 @@ def ssh_target_state_directory(target: str) -> Path:
     return Path(configured).expanduser()
 
 
+def mac_linux_end_proof_journal() -> Path:
+    """Return the journal for guest launch and end proof."""
+    return ssh_target_state_directory("mac-linux") / "end-proofs.jsonl"
+
+
 def uses_legacy_mac_layout(platform: Platform) -> bool:
     """Mac targets retain one mirror per source repository name."""
     return platform == "macos"

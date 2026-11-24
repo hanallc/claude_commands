@@ -41,7 +41,7 @@ from uuid import uuid4
 from scripts.aws_target import gate_box, ledger
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
-from scripts.lib import build_folders, conf, process_group, process_start
+from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
@@ -209,9 +209,9 @@ def mac_linux_reservation(repo: Path, work: SuiteMode | StepJob,
     return mac_run.held(repo, GUEST_CLAIM_TARGET, work, gate_job)
 
 
-def consume_launch_permission(claim: claim_state.ClaimIdentity,
+def consume_launch_permission(launch: GuestLaunchRecovery,
                               assignment: PlacementAssignment) -> ProviderClaimReference:
-    """Consume the launch permission of the gate assignment before the guest run starts.
+    """Consume permission after the gate syncs its launch record.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
     A lost consume reply leaves the permission unknown. The guest starts nothing.
@@ -219,16 +219,14 @@ def consume_launch_permission(claim: claim_state.ClaimIdentity,
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
     from scripts.buildlog import store
 
-    start = process_start.process_start(os.getpid())
-    if not isinstance(start, process_start.Started):
-        raise GuestTookNoRun('the gate process has no start time to hold the launch permission')
+    gate_holder, = launch.holders
     destination = assignment.destination
     reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
-                                                 claim.claim_id, assignment.episode, assignment.attempt)
-    holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+                                                 launch.claim, assignment.episode, assignment.attempt)
+    holder = placement.ClaimHolderIdentity(store.host_name(), gate_holder.pid, gate_holder.start)
     try:
         permission = admission_client.consume_permission(
-            wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder))
+            wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder, guest_proof_required=True))
     except wire.AdmissionUnavailable as error:
         raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}') from error
     if isinstance(permission, wire.DispatchStatus):
@@ -1260,10 +1258,6 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
-def _end_proofs_path() -> Path:
-    return target_config.ssh_target_state_directory(TARGET) / 'end-proofs.jsonl'
-
-
 def _append_guest_end(dispatch: GuestGateDispatch, evidence: GuestEndProven | GuestNotStartedProven | ArmedGuestAttempt,
                       detail: str) -> None:
     from scripts.build_queue.execution_identity import attempt_key
@@ -1285,7 +1279,7 @@ def _write_guest_end(key: str, claim: str,
 
 
 def _append_guest_end_row(row: dict[str, object]) -> None:
-    path = _end_proofs_path()
+    path = target_config.mac_linux_end_proof_journal()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, 'a+b') as journal:
@@ -1298,6 +1292,8 @@ def _append_guest_end_row(row: dict[str, object]) -> None:
         _ = journal.write((json.dumps(row) + '\n').encode())
         journal.flush()
         os.fsync(fd)
+        # Sync the directory even if an earlier writer left the file without a directory sync.
+        atomic_file.sync_folder(path.parent)
 
 
 @dataclass(frozen=True)
@@ -1383,7 +1379,7 @@ def _read_guest_end(episode: str, attempt: int) -> Settled | Pending | GuestEndR
     recorded = False
     proven = False
     try:
-        with _end_proofs_path().open('rb') as journal:
+        with target_config.mac_linux_end_proof_journal().open('rb') as journal:
             for line in journal:
                 if not line.endswith(b'\n'):
                     continue
@@ -1460,7 +1456,7 @@ def settlement(episode: str, attempt: int, *, legacy_holder_ended: bool = False)
 def _warn_guest_reconcile(unit: str, detail: str) -> None:
     """Record one warning per attempt across service starts."""
     try:
-        folder = _end_proofs_path().parent / 'end-proof-warnings'
+        folder = target_config.mac_linux_end_proof_journal().parent / 'end-proof-warnings'
         folder.mkdir(parents=True, exist_ok=True)
         os.close(os.open(folder / unit, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         print('Mac Linux guest reconcile failed: ' + ' '.join(detail.split()), file=sys.stderr, flush=True)
@@ -2159,7 +2155,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                     raise guest_probe_failure('checkout', error) from error
                 settings = replace(settings, checkout_identity=identity)
                 launch = _record_guest_launch(assignment, claim, settings)
-                dispatch = GuestGateDispatch(assignment, consume_launch_permission(claim, assignment))
+                dispatch = GuestGateDispatch(assignment, consume_launch_permission(launch, assignment))
                 reply = transfer_source(repo, settings, source, request, dispatch)
                 run = completed_run(reply, request, source)
         except GuestMissingPrerequisite:

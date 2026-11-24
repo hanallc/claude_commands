@@ -605,6 +605,11 @@ No package selects the whole workspace.
 | `doc [<package>]` | Workspace rustdoc against staged content. |
 | `example [<package>] [--name <name>]` | Workspace or named example selection. |
 | `final [<package>] [--saved] [--tree <tree>]` | Workspace check and selected tests, or a saved-pass query. |
+| `test,lint,doc [<package>]` | Run a comma list of `test`, `lint`, and `doc` in the given order. |
+
+A verb list accepts one optional package and no verb flags. The first failure ends the list with its status.
+On Linux, the parent initializes `BUILDLOG_RUN` once. Each verb inherits it and uses its own call record.
+Steps that require a checkout slot omit the identity from placement requests. Such a step can leave its grant without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
 `parse_command_arguments` reads the command form.
