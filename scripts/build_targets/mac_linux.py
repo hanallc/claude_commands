@@ -1236,7 +1236,8 @@ def report_guest_completion(dispatch: GuestGateDispatch, run: GateRun) -> None:
             raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest result')
 
     def warn(reason: str) -> None:
-        print(f'Mac Linux guest completion report failed: {reason}', file=sys.stderr, flush=True)
+        with suppress(OSError, ValueError):
+            print(f'Mac Linux guest completion report failed: {reason}', file=sys.stderr, flush=True)
 
     with ExitStack() as reports:
         _start_guest_queue_report(send, math.inf, reports, warn)

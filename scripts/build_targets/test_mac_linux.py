@@ -952,6 +952,28 @@ fi
         self.assertEqual(errors.getvalue().count('Mac Linux guest queue report failed: fixture refusal'), 1)
         self.assertEqual(errors.getvalue().count('Mac Linux guest completion report failed: fixture refusal'), 1)
 
+    def test_closed_stderr_keeps_the_failed_guest_verdict_after_a_report_timeout(self) -> None:
+        completions: list[wire.ExecutionReport] = []
+
+        def report(request: wire.ExecutionReport, *, deadline: float, timeout: float) -> wire.DispatchStatus:
+            self.assertGreater(deadline, time.monotonic())
+            if isinstance(request.outcome, placement.AttemptCompleted):
+                completions.append(request)
+                raise wire.AdmissionUnavailable(f'no answer in {timeout:g} s')
+            return wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
+
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(errors, 'write', side_effect=BrokenPipeError('fixture stderr pipe closed')) as write,
+              patch.object(mac_linux, 'send_guest_execution', report)):
+            result = self.route('red')
+        assert isinstance(result, GateRun), result
+        self.assertFalse(result.passed)
+        self.assertEqual([job.returncode for job in result.jobs], [1, 1])
+        completion, = completions
+        self.assertEqual(completion.outcome, placement.AttemptCompleted(1))
+        self.assertEqual(completion.path, placement.DispatchPathSettled())
+        write.assert_called_once_with('Mac Linux guest completion report failed: no answer in 1 s')
+
     def test_guest_module_progress_uses_the_placement_sidecar(self) -> None:
         sidecar = self.root / 'placement.cgroup'
         response = wire.DispatchStatus(self.placed, placement.CurrentAssignment(), placement.PermissionConsumed(1.0))
