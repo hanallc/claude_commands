@@ -536,9 +536,7 @@ VERIFY_START_DIR="$(cd -- "$VERIFY_START_DIR" && pwd -P)"
 PY="$VERIFY_START_DIR/../lib/py"
 VERIFY_METADATA_SCRIPT="$VERIFY_START_DIR/verify_metadata.py"
 
-# The compile covers the workspace, so a misspelled package would otherwise
-# pass check and lint silently and leave nextest with an empty filter. Fail it
-# as a usage error instead.
+# Read the current workspace members for the fmt scope.
 read_metadata() {
     if [[ -n "${GATE_METADATA:-}" ]]; then
         printf '%s\n' "$GATE_METADATA"
@@ -884,7 +882,10 @@ finish_verify_verb_list() {
 }
 
 run_verify_verbs() {
-    local verb length offset=0 status list_run
+    local verb length offset=0 status list_run step_list=0
+    if (( ${#VERIFY_STEP_LENGTHS[@]} )); then
+        step_list=1
+    fi
     for verb in ${VERIFY_VERBS[@]+"${VERIFY_VERBS[@]}"}; do
         VERIFY_STEP_LENGTHS+=("$(( $# + 1 ))")
         VERIFY_STEP_WORDS+=("$verb" "$@")
@@ -904,6 +905,13 @@ run_verify_verbs() {
         status=0
         wait "$!" || status=$?
         VERIFY_VERB_PREVIOUS_JOB=$!
+        if (( step_list )); then
+            {
+                printf 'verify.sh: step result:'
+                printf ' %q' "${VERIFY_STEP_WORDS[@]:offset:length}"
+                printf ' exit=%d\n' "$status"
+            } >&2
+        fi
         (( status == 0 )) || exit "$status"
         # A request probe prepares only the first step for its caller.
         [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || break
