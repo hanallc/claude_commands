@@ -827,35 +827,45 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
     return current
 
 
+def dispatch_turn_ready(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
+                        line: str, dispatch_id: str, *, run: Path,
+                        ) -> worker_panes.OpenWorker | DispatchSubmission | ExitCode:
+    """Check pane readiness. A saved delivery can wait for the pane."""
+    if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
+        return _blocked_question(client, started)
+    if line:
+        receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
+        if isinstance(receipt, DispatchEvidenceUnknown):
+            print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+            return ExitCode.UNCERTAIN
+        if not isinstance(receipt, DispatchNotSubmitted):
+            return DispatchSubmission.SUBMITTED
+    ready = _dispatch_ready(parent, started, client) if line else started
+    if not isinstance(ready, worker_panes.OpenWorker):
+        return ready
+    if line and started.status == herdr.AgentStatus.WORKING:
+        receipt = dispatch_receipt(ready.row, line, dispatch_id, run=run)
+        if isinstance(receipt, DispatchEvidenceUnknown):
+            print(f"{ready.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+            return ExitCode.UNCERTAIN
+        if not isinstance(receipt, DispatchNotSubmitted):
+            return DispatchSubmission.SUBMITTED
+    if ready.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+        print(f"{ready.row.name}: agent is {ready.status.value}", file=sys.stderr)
+        return ExitCode.BUSY
+    return ready
+
+
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
                    line: str, dispatch_id: str, *, run: Path,
                    on_submission: Callable[[], object] = lambda: None,
                    defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
                    ) -> DispatchSubmission | ExitCode:
     """Submit the saved prompt after the bounded idle checks."""
-    if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
-        return _blocked_question(client, started)
-    receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
-    if isinstance(receipt, DispatchEvidenceUnknown):
-        print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
-    if not isinstance(receipt, DispatchNotSubmitted):
-        return DispatchSubmission.SUBMITTED
-    ready = _dispatch_ready(parent, started, client)
-    if not isinstance(ready, worker_panes.OpenWorker):
-        return ready
-    current = ready
+    current = dispatch_turn_ready(parent, started, client, line, dispatch_id, run=run)
+    if not isinstance(current, worker_panes.OpenWorker):
+        return current
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)
-    if started.status == herdr.AgentStatus.WORKING:
-        receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
-        if isinstance(receipt, DispatchEvidenceUnknown):
-            print(f"{current.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-            return ExitCode.UNCERTAIN
-        if not isinstance(receipt, DispatchNotSubmitted):
-            return DispatchSubmission.SUBMITTED
-    if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-        print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
-        return ExitCode.BUSY
     try:
         if callable(defer_compaction) and isinstance(_compaction_plan(current.row), CompactionRequired):
             defer_compaction()
@@ -1074,7 +1084,7 @@ def _assignment_runs(record: staff.StaffSnapshot, parent: StaffId, role: WorkerR
 
 
 def select_worker(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot, *,
-                  runs: unit_runs.LauncherRunDirectories | None = None) -> (
+                  runs: unit_runs.LauncherRunDirectories | None = None, additional_runs: tuple[Path, ...] = ()) -> (
         WorkerName | worker_panes.StartRefused | worker_panes.ProcessUnknownWorker | worker_panes.UncertainWorker):
     """Select a proved idle worker, a resumable worker, or the lowest free name."""
     names = [WorkerName.parse(row.name) for row in record.find(kind="worker", parent=parent)
@@ -1083,7 +1093,7 @@ def select_worker(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot
     candidates.sort(key=lambda item: _role_number(item.row.name, role))
     reusable = [item for item in candidates if worker_panes.worker_state(item) == "idle"]
     if reusable:
-        runs = _assignment_runs(record, parent, role) if runs is None else runs
+        runs = _assignment_runs(record, parent, role, additional=additional_runs) if runs is None else runs
         detached = _worker_detached_work(record, runs, (item.row.id for item in reusable))
         directories = dict.fromkeys(run for paths in detached.launcher_runs.by_worker.values() for run in paths)
         with progress_history.dispatch_reads(record, directories):

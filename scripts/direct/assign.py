@@ -497,13 +497,10 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     """Send the assignment through the shared worker command."""
     directory = phase_reservation.phase_directory(run, phase)
     launcher = launcher_command()
-    slot = args.to or args.new_worker or role
+    named = args.to or args.new_worker
+    slot = named or role
     suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
-    summary = directory / f"{slot}_summary{suffix}.txt"
-    status = directory / f"{slot}_status{suffix}"
     message = directory / f"{slot}_prompt{suffix}.txt"
-    reply = directory / f"{slot}_reply{suffix}.txt"
-    log = directory / f"{slot}_agent{suffix}.log"
     content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
@@ -512,20 +509,45 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     record = staff.snapshot()
     parent = unit_runs.run_owner(state, record)
     if isinstance(parent, staff.StaffRow):
-        slots = {slot}
-        slots.update(name for name, passed in pass_recorder.open_passes(state).items()
-                     if name and passed.get("prompt_file") == str(message))
-        for observed in worker_panes.observe_selected(parent.id, record, [staff.WorkerName.parse(name) for name in sorted(slots)]):
-            if worker_panes.worker_state(observed) != "busy":
-                continue
-            if message.is_file() and message.read_text() == content:
-                work = progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0)
-                match = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=role,
-                    prompt=message, launcher_command=launcher, work=work)
-                if isinstance(match, pass_recorder.MatchedDispatch) and match.worker_name == observed.row.name:
-                    continue
-            print(f"{observed.row.name}: worker is busy", file=sys.stderr)
-            return staff_worker.ExitCode.BUSY
+        saved_slot = slot if named else progress_history.launch_slot(run, slot, launcher)
+        passed = pass_recorder.pass_slots(state).get(saved_slot, {})
+        saved_prompt = Path(text(passed.get("prompt_file")))
+        match: pass_recorder.MatchedDispatch | pass_recorder.NoMatchedDispatch = pass_recorder.NoMatchedDispatch()
+        if (saved_prompt in (message, directory / f"{saved_slot}_prompt{suffix}.txt")
+                and saved_prompt.is_file() and saved_prompt.read_text() == content):
+            work = progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0)
+            candidate = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=role,
+                prompt=saved_prompt, launcher_command=launcher, work=work)
+            if (isinstance(candidate, pass_recorder.MatchedDispatch) and candidate.worker_name
+                    and candidate.instance_id == passed.get("instance_id")
+                    and (not named or candidate.worker_name == named)):
+                match = candidate
+        if isinstance(match, pass_recorder.MatchedDispatch):
+            chosen = staff.WorkerName.parse(match.worker_name)
+            message = saved_prompt
+        elif named:
+            chosen = staff.WorkerName.parse(named)
+        else:
+            chosen = staff_worker.select_worker(parent.id, role, record, additional_runs=(run,))
+        if isinstance(chosen, worker_panes.StartRefused):
+            return staff_worker.startup_result(staff.WorkerName.parse(role), chosen)
+        if isinstance(chosen, staff.WorkerName):
+            row = worker_admission.find_worker(record, parent.id, chosen.value)
+            if row is not None:
+                observed = worker_panes.observe_worker(parent.id, row, record)
+                if isinstance(observed, worker_panes.OpenWorker) and worker_panes.worker_state(observed) == "busy":
+                    delivery = pass_recorder.dispatch_delivery(passed if isinstance(match, pass_recorder.MatchedDispatch) else {})
+                    ready = staff_worker.dispatch_turn_ready(parent.id, observed, herdr.Herdr(herdr.shared_session()),
+                        delivery.line, delivery.completion_id, run=run)
+                    if isinstance(ready, staff_worker.ExitCode):
+                        return ready
+                slot = chosen.value
+                if isinstance(match, pass_recorder.NoMatchedDispatch):
+                    message = directory / f"{slot}_prompt{suffix}.txt"
+    summary = directory / f"{slot}_summary{suffix}.txt"
+    status = directory / f"{slot}_status{suffix}"
+    reply = directory / f"{slot}_reply{suffix}.txt"
+    log = directory / f"{slot}_agent{suffix}.log"
     check = [PYTHON, PASS_RECORD, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
     if args.lens:

@@ -1267,23 +1267,69 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.turn_starts, 1)
         self.assertIn("role=impl; exit 6", (self.session_dir / "board.log").read_text())
 
-        with self.subTest(state="working"):
-            self.native.agent.finish_after = 100
-            _ = self.successful("implement", "--to", "impl")
-            phase = status.parent
-            files = {path: path.read_bytes() for path in phase.iterdir() if path.is_file()}
-            self.assertIn(b"Implement the second change.", files[phase / "impl_prompt.txt"])
-            run_files = (self.session_dir / "board.log", self.session_dir / "heartbeat.log",
-                         self.session_dir / unit_runs.STATE_FILE)
-            saved_run = {path: path.read_bytes() for path in run_files}
-            history = self.events()
-            self.write_phase_prompt("7", "Assignment core", "Test the second change.")
-            refused = self.launch("test", "--to", "impl")
-            self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
-            self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, files)
-            self.assertEqual({path: path.read_bytes() for path in run_files}, saved_run)
-            self.assertEqual(self.events(), history)
-            self.assertEqual(self.turn_starts, 2)
+        self.native.agent.finish_after = 100
+        _ = self.successful("implement", "--to", "impl")
+        phase = status.parent
+        files = {path: path.read_bytes() for path in phase.iterdir() if path.is_file()}
+        self.assertIn(b"Implement the second change.", files[phase / "impl_prompt.txt"])
+        run_files = (self.session_dir / "board.log", self.session_dir / "heartbeat.log",
+                     self.session_dir / unit_runs.STATE_FILE)
+        saved_run = {path: path.read_bytes() for path in run_files}
+        history = self.events()
+        pane, line = self.native.agent.submitted[-1]
+        row = self.native.agent.row(pane)
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        source = worker_admission.transcript_source(row, backend)
+        transcript = source.read_text()
+        question = "Which output format must I use?"
+        world = self.native.fixture.world
+        locations = world.locations
+        for case, expected in (("working", worker.ExitCode.BUSY), ("missing receipt", worker.ExitCode.BUSY),
+                               ("blocked", worker.ExitCode.BLOCKED)):
+            with self.subTest(state=case):
+                role = "implement" if case == "missing receipt" else "test"
+                if case == "missing receipt":
+                    self.write_phase_prompt("7", "Assignment core", "Implement the second change.")
+                    entry = json.dumps(line)
+                    write_text_atomic(source, "".join(item for item in transcript.splitlines(keepends=True)
+                                                       if entry not in item))
+                    world.first_turn_timeout = True
+                else:
+                    self.write_phase_prompt("7", "Assignment core", "Test the second change.")
+                if case == "blocked":
+                    locations[pane]["agent_status"] = "blocked"
+                    self.native.agent.questions[pane] = question
+                try:
+                    if case == "missing receipt":
+                        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.session_dir))
+                        self.assertIsInstance(worker.dispatch_receipt(row, delivery.line, delivery.completion_id,
+                                                                      run=self.session_dir), worker.DispatchNotSubmitted)
+                    refused = self.launch(role, "--to", "impl")
+                    self.assertEqual(refused.returncode, expected, refused.stdout + refused.stderr)
+                    if case == "blocked":
+                        self.assertIn(question, refused.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in phase.iterdir() if path.is_file()}, files)
+                    self.assertEqual({path: path.read_bytes() for path in run_files}, saved_run)
+                    self.assertEqual(self.events(), history)
+                    self.assertEqual(self.turn_starts, 2)
+                finally:
+                    if case == "missing receipt":
+                        world.first_turn_timeout = False
+                        write_text_atomic(source, transcript)
+        locations[pane]["agent_status"] = "working"
+        alternate = self.native.opened("impl2")
+        self.write_phase_prompt("7", "Assignment core", "Implement the third change.")
+        arguments = ["--role", "implement", "--cwd", str(self.project), "--phase", "7",
+                     "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
+        for case in ("idle alternate", "repeat on the alternate"):
+            with self.subTest(state=case):
+                result = invoke_assignment(arguments, os.environ.copy())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.turn_starts, 3)
+                self.assertEqual(self.native.agent.submitted[-1][0], alternate.pane)
+                self.assertEqual({path: path.read_bytes() for path in phase.glob("impl_*")},
+                                 {path: content for path, content in files.items() if path.name.startswith("impl_")})
 
     def test_a_failed_worker_records_an_error_pass_and_returns_worker_failure(self) -> None:
         status = self.session_dir / "phases/7/impl_status"
