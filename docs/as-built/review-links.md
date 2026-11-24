@@ -1731,7 +1731,7 @@ The console lists it as **Images**, with the Lucide `image` icon.
 A showrunner or unit registers each image, or a before and after pair, with one command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID) [--list-item L<n>]
 ```
 
 - The caption is the change in the fewest plain words that stay accurate. It adds a second line, `Look for: <place>`, only when the change is hard to find.
@@ -1741,6 +1741,9 @@ A showrunner or unit registers each image, or a before and after pair, with one 
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- Use `--list-item L<n>` to link the picture to a List item.
+  Registration searches the current and old List folders.
+  The picture record stores the List id and its keeper id.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.
@@ -1803,21 +1806,38 @@ The server checks the token.
 **Approved** needs no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Feedback always means that the image is not approved, so the page has no separate **Not Approved** button.
 A card loaded before that change can still post `not approved`; the server refuses it with **Not Approved was removed. Use Send Feedback.**
-Otherwise the card leaves the page at once, and the request runs in the background.
+The card stays visible until the server confirms the send.
 The page skips its refresh while a send runs.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
 The page also hides an image while the server recovers its verified delivery on startup.
 A failed or uncertain delivery returns the card with a delivery notice.
 When the owner answers the last open question, the card returns and the console shows a new update.
-The server sends one message to the owner's staff id, resolved to its current session at each try.
-It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
-The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
-A `Feedback:` line follows when the user wrote text.
-Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
-After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
-A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
-When no try reaches the owner, the server answers 503 and writes nothing.
-The card goes back in its place with one line: **Not sent: <reason>**.
+The server sends the answer to the owner's staff id.
+For a linked picture, the server saves the verdict and the user's words in the List log before it sends.
+The same List write sets Next step to `<producer name>: act on nate's answer to picture <id>`.
+It marks the item read and keeps open List questions.
+An answer changes Waiting for nate to Working.
+Feedback changes Delivered to Working. Approval leaves Delivered for the producer to close.
+The answer clears a Waiting for nate ETA unless it approves a Delivered item.
+The server sends the answer to the item's saved producer and the picture owner.
+One staff id receives one message if it serves both roles.
+The server resolves each recipient to its current session at each try.
+The send uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
+An answer message gives the verdict and any feedback.
+For a current picture it also gives the image links, caption, subject and delete command.
+For a removed picture it gives the picture id.
+The message includes the List id when the picture has one.
+
+A private answer record outside the picture folder saves the words, delivery key and confirmed recipients.
+A retry uses the saved delivery key and sends only to recipients that have no confirmation.
+The live picture gets `feedback_at` after all recipients confirm the send.
+The page then hides the card unless a new question answer needs review.
+Delete saves the picture reference in the same private store before it removes the picture folder.
+An open card can still send an answer after deletion.
+The page shows **This picture was removed; your words went to <owner name>.**
+If a save or delivery fails, the server answers 503 and names the step or recipient.
+A refresh keeps the draft words in the form while it can still send the answer.
+The linked answer stays in the List log if delivery fails or the owner deletes the image.
 An agent deletes an image with this command:
 
 ```sh

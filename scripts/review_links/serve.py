@@ -2254,13 +2254,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(400, str(error), error)
             return
         except images.AnswerNotSent as error:
-            self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
+            self.browser_failure(503, str(error), error)
             return
         except ValueError as error:
             self.browser_failure(400, "Use the form on this page.", error)
             return
         except OSError as error:
-            self.browser_failure(503, "The image could not be changed. Try again.", error)
+            self.browser_failure(503, "Could not save the picture change. Try again.", error)
+            return
+        if isinstance(delivery, images.ImageAnswerSent):
+            self.json_response(200, {"state": "done", **({"notice": delivery.notice} if delivery.notice else {})})
             return
         try:
             self.json_response(200, {"state": "done"})

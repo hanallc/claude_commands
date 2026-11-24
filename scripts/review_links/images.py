@@ -21,7 +21,7 @@ from urllib.parse import parse_qs
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production.delivery_state import QuestionSendState
-from scripts.production import staff
+from scripts.production import staff, the_list
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, review_link
@@ -55,7 +55,12 @@ class ImageReview:
 
 
 class AnswerNotSent(Exception):
-    """No try reached the owner; the image stays on the page."""
+    """The server could not save or send the answer."""
+
+
+@dataclass(frozen=True)
+class ImageAnswerSent:
+    notice: str = ""
 
 
 def images_root(root: Path) -> Path:
@@ -132,23 +137,35 @@ def waiting_images(request: console.NewsRequest, *, status: change_page.Delivery
 
 
 def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
-             *, before: Path | None = None) -> image_store.ImageRecord:
+             *, before: Path | None = None, list_item: str | None = None) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
     if not caption.strip():
         raise ValueError("the caption is empty; say the change in the fewest plain words that stay accurate")
-    if staff.snapshot().by_id(owner) is None:
+    members = staff.snapshot()
+    if members.by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
+    keeper = the_list.image_list_keeper(list_item) if list_item is not None else None
     return image_store.register_file(image, images_root(review_link.review_root().resolve()),
-                                     caption, str(owner), subject, before=before)
+                                     caption, str(owner), subject, before=before,
+                                     list_item=list_item, list_keeper=keeper)
 
 
 def delete(root: Path, identity: str) -> None:
     if not image_store.IDENTITY.fullmatch(identity):
         raise ValueError(f"{identity}: not an image id")
-    folder = images_root(root) / identity
-    if folder.is_symlink() or not folder.is_dir():
+    directory = images_root(root)
+    if not directory.is_dir():
         raise ValueError(f"no image {identity}")
-    shutil.rmtree(folder)
+    folder = directory / identity
+    with file_lock.exclusive(directory / LOCK):
+        if folder.is_symlink() or not folder.is_dir():
+            raise ValueError(f"no image {identity}")
+        record = image_store.read_record(folder)
+        saved = _image_answers(directory, record)
+        if "list_item" in saved and "list_keeper" not in saved:
+            saved["list_keeper"] = the_list.image_list_keeper(saved["list_item"])
+        image_store.write_answers(directory, saved)
+        shutil.rmtree(folder)
 
 
 def console_token(root: Path) -> str:
@@ -246,6 +263,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
     content = (STYLE + page_frame.title("Images", "images")
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
+               + '<p hidden data-image-notice role="status"></p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
                + f' {card_motion.attributes()}'
@@ -257,8 +275,8 @@ def render(status: change_page.DeliveryStatus) -> bytes:
 
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus
-           ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Save a question for deferred delivery; keep feedback and delete actions as before."""
+           ) -> change_page.MessageDelivery | change_page.NoMessageDelivery | ImageAnswerSent:
+    """Save a question, send an answer, or delete the picture."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round"} or any(
@@ -280,13 +298,11 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
-        send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
-        return change_page.NoMessageDelivery()
-    with file_lock.exclusive(images_root(root) / LOCK):
-        try:
-            delete(root, identity)
-        except ValueError as error:
-            raise question_record.AnswerRefused(str(error)) from error
+        return send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
+    try:
+        delete(root, identity)
+    except ValueError as error:
+        raise question_record.AnswerRefused(str(error)) from error
     return change_page.NoMessageDelivery()
 
 
@@ -313,6 +329,7 @@ def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) 
         *((f"Feedback: {feedback}",) if feedback else ()),
         *(f"{label or 'Image'}: {origin}{image_path(record, file)}" for label, file in shown_files(record)),
         f"Caption: {record['caption']}", f"For: {record['subject']}",
+        *((f"List item: {record['list_item']}",) if "list_item" in record else ()),
         "After you act on it, delete the image: "
         + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))
 
@@ -325,54 +342,136 @@ def feedback_round(answered: set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(answered)).encode()).hexdigest()
 
 
-def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None) -> None:
-    """Hide the image only if no question received an answer after the first submission."""
+def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_store.ImageAnswers:
+    try:
+        answers = image_store.read_answers(directory, record["id"])
+    except FileNotFoundError:
+        return image_store.new_answers(record)
+    if answers["registered_at"] != record["registered_at"] or answers["owner"] != record["owner"]:
+        raise ValueError("This picture has a different registration.")
+    return answers
+
+
+def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None
+                    ) -> tuple[str, image_store.ImageAnswers]:
+    """Save the words and the List recipient before the first send."""
+    folder = directory / identity
+    try:
+        record = image_store.read_record(folder)
+    except FileNotFoundError:
+        record = None
+    if record is None:
+        try:
+            saved = image_store.read_answers(directory, identity)
+        except FileNotFoundError as error:
+            raise question_record.AnswerRefused(f"no image {identity}") from error
+    else:
+        saved = _image_answers(directory, record)
+
+    parts = [saved["registered_at"], answer, feedback]
+    if round_id is not None:
+        parts.append(round_id)
+    key = change_page.review_delivery_key(folder / image_store.RECORD, identity, json.dumps(parts))
+    attempts = saved["attempts"]
+    if key not in attempts:
+        previous: set[str] = set()
+        if record is None:
+            message = ("From the user (via the Images page): " + ANSWERS[answer] + f"\nPicture {identity} was removed.")
+            if feedback:
+                message += "\nFeedback: " + feedback
+            if "list_item" in saved:
+                message += "\nList item: " + saved["list_item"]
+        else:
+            # Keep the original question round when a request started before the store moved.
+            legacy = folder / (".review-link-feedback-" + key.removeprefix("review:"))
+            try:
+                previous = set(legacy.read_text(encoding="utf-8").splitlines())
+            except FileNotFoundError:
+                previous = answered_question_ids(record)
+                if round_id is not None and round_id != feedback_round(previous):
+                    raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.") from None
+            message = answer_message(record, answer, feedback)
+        attempts[key] = {"message": message, "answered": sorted(previous), "recipients": [], "confirmed": []}
+        image_store.write_answers(directory, saved)
+    else:
+        atomic_file.sync_folder(directory)
+
+    attempt = attempts[key]
+    if not attempt["recipients"]:
+        recipients = [saved["owner"]]
+        if "list_item" in saved:
+            item = saved["list_item"]
+            words = f"Image {identity}: {ANSWERS[answer]}"
+            if feedback:
+                words += "\n" + feedback
+            try:
+                keeper = staff.StaffId(saved["list_keeper"]) if "list_keeper" in saved else the_list.image_list_keeper(item)
+                producer = the_list.save_image_answer(keeper, item, key, words, image_id=identity,
+                                                      approved=answer == "approved")
+            except (the_list.ListError, OSError) as error:
+                raise AnswerNotSent(f"Could not save the answer on {item}: {error}. Try again.") from error
+            saved["list_keeper"] = keeper
+            if producer not in recipients:
+                recipients.append(producer)
+        attempt["recipients"] = recipients
+        image_store.write_answers(directory, saved)
+    return key, saved
+
+
+def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
+    row = members.by_id(staff.StaffId(identity))
+    return row.name if row is not None else identity
+
+
+def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None
+                ) -> ImageAnswerSent:
+    """Send to each recipient that has yet to confirm this answer."""
+    if not image_store.IDENTITY.fullmatch(identity):
+        raise question_record.AnswerRefused("not an image id")
     if answer == "feedback" and not feedback:
         raise question_record.AnswerRefused("enter feedback")
     directory = images_root(root)
-    folder = directory / identity
     lock = directory / LOCK
+    folder = directory / identity
+    if not directory.is_dir():
+        raise question_record.AnswerRefused(f"no image {identity}")
     with file_lock.exclusive(lock):
         try:
-            record = image_store.read_record(folder)
-        except (OSError, ValueError) as error:
-            raise question_record.AnswerRefused(f"no image {identity}") from error
-        parts = [record["registered_at"], answer, feedback]
-        if round_id is not None:
-            parts.append(round_id)
-        attempt = json.dumps(parts)
-        key = change_page.review_delivery_key(folder / image_store.RECORD, identity, attempt)
-        snapshot = folder / (".review-link-feedback-" + key.removeprefix("review:"))
-        try:
-            previously_answered = set(snapshot.read_text(encoding="utf-8").splitlines())
-        except FileNotFoundError:
-            previously_answered = answered_question_ids(record)
-            if round_id is not None and round_id != feedback_round(previously_answered):
-                raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
-            atomic_file.write_text_atomic(snapshot, "".join(f"{item}\n" for item in sorted(previously_answered)),
-                                          new_file_mode=0o600)
-        else:
-            # A prior attempt can leave the file visible after a failed directory sync.
-            atomic_file.sync_folder(folder)
-    settings = conf.read("review_links")
-    owner = staff.StaffId(record["owner"])
-    failures = change_page.send_with_retries(SENDER, (owner,),
-                                             answer_message(record, answer, feedback), settings.whole("delivery_tries"),
-                                             settings.number("delivery_pause_seconds"), key=key)
-    if failures:
-        raise AnswerNotSent(failures[-1].error)
+            key, saved = _picture_answer(directory, identity, answer, feedback, round_id)
+        except OSError as error:
+            raise AnswerNotSent(f"Could not save the picture answer: {error}. Try again.") from error
+    attempt = saved["attempts"][key]
+    remaining = tuple(staff.StaffId(target) for target in attempt["recipients"] if target not in attempt["confirmed"])
+    failures: list[change_page.DeliveryFailure] = []
+    if remaining:
+        settings = conf.read("review_links")
+        failures = change_page.send_with_retries(
+            SENDER, remaining, attempt["message"], settings.whole("delivery_tries"),
+            settings.number("delivery_pause_seconds"), key=key, confirm=True)
+    failed = {failure.recipient for failure in failures}
     with file_lock.exclusive(lock):
-        try:
-            current = image_store.read_record(folder)
-        except (OSError, ValueError):
-            # The owner deleted the image while the message was on its way.
-            return
-        if current["registered_at"] != record["registered_at"] or current["owner"] != owner:
-            return
-        if answered_question_ids(current) - previously_answered:
-            return
-        current["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
-        image_store.write_record(folder, current)
+        current = image_store.read_answers(directory, identity)
+        delivery = current["attempts"][key]
+        confirmed = sorted(set(delivery["confirmed"]) | (set(remaining) - failed))
+        if delivery["confirmed"] != confirmed:
+            delivery["confirmed"] = confirmed
+            image_store.write_answers(directory, current)
+        missing = set(delivery["recipients"]) - set(confirmed)
+        if not missing:
+            try:
+                record = image_store.read_record(folder)
+            except FileNotFoundError:
+                owner = _recipient_name(staff.snapshot(), saved["owner"])
+                return ImageAnswerSent(f"This picture was removed; your words went to {owner}.")
+            if (record["registered_at"] == saved["registered_at"] and record["owner"] == saved["owner"]
+                    and "feedback_at" not in record and not answered_question_ids(record) - set(delivery["answered"])):
+                record["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+                image_store.write_record(folder, record)
+            return ImageAnswerSent()
+    members = staff.snapshot()
+    reasons = [f"{_recipient_name(members, failure.recipient)} did not get the message ({failure.error})."
+               for failure in failures if isinstance(failure.recipient, str) and failure.recipient in missing]
+    raise AnswerNotSent(" ".join((*reasons, "Try again.")))
 
 
 # The group index is as wide as its cells need above 900px, so no name or time wraps.
@@ -420,6 +519,7 @@ const empty = document.querySelector('[data-empty]');
 const groups = document.querySelector('[data-image-groups]');
 const layout = document.querySelector('[data-image-layout]');
 const waiting = document.querySelector('[data-image-waiting]');
+const notice = document.querySelector('[data-image-notice]');
 let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
 let sending = 0;
@@ -477,17 +577,19 @@ function bind(root) {
       status.textContent = 'Enter feedback first.';
       return;
     }
-    // Remove the card after the fade. Restore the card if the request fails.
-    const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
+    const card = form.closest('article');
     const body = new URLSearchParams(new FormData(form, event.submitter));
+    if (form.dataset.retryAction === body.get('action') && form.dataset.retryWords === body.get('feedback')) {
+      body.set('feedback_round', form.dataset.retryRound);
+    }
     status.textContent = '';
-    let postFailed = false;
+    let postFailed = false, retry = !question;
     setCardSubmitting(form, true);
     sending++;
     try {
-      if (!question) await motion.removeCard(card, apply);
       const response = await fetch(location.pathname, {method: 'POST', body});
       if (!response.ok) {
+        retry = retry && response.status >= 500;
         const reason = await response.json().then(body => body.reason, () => '');
         throw new Error(reason || 'HTTP ' + response.status);
       }
@@ -497,10 +599,24 @@ function bind(root) {
         list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
         apply();
         pageRefresh.restart();
+      } else {
+        const result = await response.json().catch(() => ({}));
+        if (result.notice) {
+          notice.textContent = result.notice;
+          notice.hidden = false;
+        }
+        await motion.removeCard(card, apply);
       }
     } catch (error) {
       postFailed = true;
-      if (!question) home.insertBefore(card, next?.parentNode === home ? next : null);
+      if (!question) status.dataset.answerFailed = 'true';
+      if (retry) {
+        form.dataset.retryAction = body.get('action');
+        form.dataset.retryWords = body.get('feedback');
+        form.dataset.retryRound = body.get('feedback_round');
+      } else {
+        delete form.dataset.retryAction;
+      }
       status.textContent = 'Not sent: ' + error.message;
       apply();
     } finally {
@@ -536,12 +652,30 @@ async function refresh(_supersede=false,current=()=>true) {
     const forms = new Map([...list.querySelectorAll('form[data-image-form]')]
       .map(form => [form.elements.image.value, form]));
     fresh.querySelectorAll('form[data-image-form]').forEach(form => {
-      const previous = forms.get(form.elements.image.value);
+      const image = form.elements.image.value;
+      const previous = forms.get(image);
       if (!previous) return;
+      forms.delete(image);
       form.elements.feedback.value = previous.elements.feedback.value;
       const oldStatus = previous.querySelector('[data-image-status]');
-      if (!oldStatus.dataset.refreshFailed) form.querySelector('[data-image-status]').textContent = oldStatus.textContent;
+      const newStatus = form.querySelector('[data-image-status]');
+      if (!oldStatus.dataset.refreshFailed) newStatus.textContent = oldStatus.textContent;
+      if (oldStatus.dataset.answerFailed) newStatus.dataset.answerFailed = 'true';
+      if (previous.dataset.retryAction) {
+        form.dataset.retryAction = previous.dataset.retryAction;
+        form.dataset.retryWords = previous.dataset.retryWords;
+        form.dataset.retryRound = previous.dataset.retryRound;
+      }
     });
+    // A removed picture can still accept the words from an open form.
+    for (const form of forms.values()) {
+      const status = form.querySelector('[data-image-status]');
+      if (status.dataset.answerFailed || form.elements.feedback.value.trim()) {
+        const card = form.closest('article').cloneNode(true);
+        card.querySelector('textarea').value = form.elements.feedback.value;
+        fresh.append(card);
+      }
+    }
     const top = scrollY;
     const wasWaiting = !waiting.hidden;
     const previousRate = refreshSeconds();
@@ -594,6 +728,7 @@ def main(arguments: list[str]) -> int:
     subject = add.add_mutually_exclusive_group(required=True)
     _ = subject.add_argument("--change", help="the change id, such as sdlc/C12")
     _ = subject.add_argument("--phase", help="the phase id")
+    _ = add.add_argument("--list-item", help="the item in morty's List, such as L324")
     remove = actions.add_parser("delete", help="remove an image and its folder")
     _ = remove.add_argument("--id", required=True, help="the image id")
     reply = actions.add_parser('answer', help='answer a question and return the image to the user')
@@ -613,7 +748,8 @@ def main(arguments: list[str]) -> int:
             else:
                 parser.error("give --image, or --before and --after")
             record = register(shown, cast(str, args.caption), staff.StaffId(cast(str, args.owner)),
-                              f"Change {change}" if change is not None else f"Phase {phase}", before=before)
+                              f"Change {change}" if change is not None else f"Phase {phase}", before=before,
+                              list_item=cast(str | None, args.list_item))
             origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
             print(f"registered {record['id']}: "
                   + " ".join(f"{origin}{image_path(record, file)}" for _, file in shown_files(record)))
