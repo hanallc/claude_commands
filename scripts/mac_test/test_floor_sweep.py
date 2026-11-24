@@ -88,7 +88,7 @@ class FloorSweepTests(unittest.TestCase):
         self.assertEqual(snapshot, offload.MacHostProbeSnapshot(offload.ProbeSnapshot(164, "fixture-mac"), {
             "old": offload.MacMirrorProcess(41, "fixture-start-41"),
             "new": offload.MacMirrorProcess(42, "fixture-start-42"),
-        }))
+        }, {}))
         self.assertEqual(scans.read_text().splitlines(), ["scan"])
         command.assert_called_once()
 

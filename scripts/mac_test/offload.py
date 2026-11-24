@@ -818,12 +818,21 @@ class MacMirrorProcess:
     start_time: str
 
 
+class MacMirrorSetup(Enum):
+    """The result of preparing a mirror for a step."""
+
+    READY = "ready"
+    FAILED = "failed"
+    UNREPORTED = "unreported"
+
+
 @dataclass(frozen=True)
 class MacHostProbeSnapshot:
-    """Disk space and observed mirror processes from one SSH command."""
+    """Disk space, mirror setup, and mirror processes from one SSH command."""
 
     disk: ProbeSnapshot
     processes: dict[str, MacMirrorProcess]
+    setup: dict[eligibility.LegacyMirrorName, MacMirrorSetup]
 
 
 @dataclass(frozen=True)
@@ -2191,9 +2200,19 @@ def _probe_failure_reason(result: CapturedCommandResult, timeout_s: float) -> st
 
 
 def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSettings, target: str,
-                   mirrors: Sequence[str]) -> MacHostProbeSnapshot | UnavailableProbe:
-    """Read disk space and saved mirror processes in one SSH command."""
-    script = [_MAC_DISK_PROBE]
+                   mirrors: Sequence[str], *, setup_mirrors: Sequence[eligibility.LegacyMirrorName] = (),
+                   ) -> MacHostProbeSnapshot | UnavailableProbe:
+    """Read disk space, prepare step mirrors, and scan saved mirrors in one SSH command."""
+    from scripts.copies import copies
+
+    script: list[str] = []
+    if setup_mirrors:
+        root = mac_mirror_root()
+        for index, mirror in enumerate(setup_mirrors):
+            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}")
+            script.extend((f"if ( {setup} ); then", f"printf 'mirror_setup={index}\\tready\\n'",
+                           "else", f"printf 'mirror_setup={index}\\tfailed\\n'", "fi"))
+    script.append(_MAC_DISK_PROBE)
     if mirrors:
         script.append('if mac_cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn); then')
         script.append('lsof() { printf "%s\\n" "$mac_cwd_records"; }')
@@ -2211,20 +2230,23 @@ def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSe
         if isinstance(disk, ProbeSnapshot):
             record_reachable(target, probe_started_ns=started_ns)
             processes: dict[str, MacMirrorProcess] = {}
+            setups = dict.fromkeys(setup_mirrors, MacMirrorSetup.UNREPORTED)
             for line in result.stdout.splitlines():
-                if not line.startswith("mirror_process="):
+                label, _, payload = line.partition("=")
+                if label not in ("mirror_setup", "mirror_process"):
                     continue
-                parts = line.removeprefix("mirror_process=").split("\t", 2)
-                if len(parts) != 3:
+                index_text, tab, payload = payload.partition("\t")
+                if not (tab and index_text.isascii() and index_text.isdecimal()):
                     continue
-                index_text, pid_text, start_time = parts
-                if not (index_text.isascii() and index_text.isdecimal()
-                        and pid_text.isascii() and pid_text.isdecimal() and start_time.strip()):
-                    continue
-                index, pid = int(index_text), int(pid_text)
-                if index < len(mirrors) and pid > 0:
-                    _ = processes.setdefault(mirrors[index], MacMirrorProcess(pid, start_time.strip()))
-            return MacHostProbeSnapshot(disk, processes)
+                index = int(index_text)
+                if label == "mirror_setup":
+                    if index < len(setup_mirrors) and payload in ("ready", "failed"):
+                        setups[setup_mirrors[index]] = MacMirrorSetup(payload)
+                elif index < len(mirrors):
+                    pid_text, _, start_time = payload.partition("\t")
+                    if pid_text.isascii() and pid_text.isdecimal() and int(pid_text) > 0 and start_time.strip():
+                        _ = processes.setdefault(mirrors[index], MacMirrorProcess(int(pid_text), start_time.strip()))
+            return MacHostProbeSnapshot(disk, processes, setups)
     return _record_probe_failure(target, _probe_failure_reason(result, config.probe_timeout_s))
 
 

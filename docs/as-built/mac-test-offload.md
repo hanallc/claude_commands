@@ -877,6 +877,10 @@ Below the required floor, it runs one shared floor sweep and reads free space ag
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
 The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
+The same command reports setup for each required mirror.
+Each step requires a successful setup result for its mirror.
+The worker reads local claims again after SSH.
+It attaches process evidence only to claims that match the records from before SSH.
 The keys that share the reading have the same observation time.
 The worker checks repository policy, session, and claim scope for each key.
 The worker reports pending disk recovery while a separate thread runs the sweep.

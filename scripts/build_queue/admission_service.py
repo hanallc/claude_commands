@@ -1274,11 +1274,16 @@ class _MacHostExcluded:
     reason: str
 
 
+type _MacStepPolicy = eligibility.KnownRepository | target_config.ExcludedTarget | placement.HostEvidenceUnavailable
+
+
 @dataclass(frozen=True)
 class _MacHostReading:
     observed_at: float
     settings: eligibility.SshProbeSettings
+    policies: dict[placement.HostEvidenceKey, _MacStepPolicy]
     claims: tuple[HeldClaim, ...]
+    probed_claims: dict[Path, HeldClaim]
     probe: offload.MacHostProbeSnapshot | _MacHostExcluded
 
 
@@ -1297,6 +1302,7 @@ class _MacHostNotRead:
 class _MacHostProbeCycle:
     observed_at: float
     refresh_generation: int
+    keys: tuple[placement.HostEvidenceKey, ...]
     reading: _MacHostReading | _MacHostUnreadable | _MacHostNotRead = _MacHostNotRead()
 
 
@@ -1458,7 +1464,7 @@ class HostEvidenceWorker:
                          if (key.destination.host == first.destination.host
                              and key.configuration_generation == first.configuration_generation
                              and key.settings == first.settings)})
-        token = _MAC_HOST_PROBE_CYCLE.set(_MacHostProbeCycle(self.clock.now(), generation))
+        token = _MAC_HOST_PROBE_CYCLE.set(_MacHostProbeCycle(self.clock.now(), generation, tuple(keys)))
         try:
             for key, subscription in keys.items():
                 with self.lock:
@@ -4616,69 +4622,104 @@ class AdmissionServer:
                 raise
             return MacDiskRecoveryActive(request.disk)
 
-    def _read_mac_host(self, destination: placement.PlacementDestination, configuration: conf.ConfigRead,
-                       observed_at: float) -> _MacHostReading:
-        """Read the Mac and its saved claims once for this probe cycle."""
-        from scripts.mac_test import claim_state, eligibility, offload
+    def _mac_step_policies(self, target: target_config.LocalTarget | target_config.SshTarget,
+                           configuration: conf.ConfigRead, cycle: _MacHostProbeCycle,
+                           ) -> dict[placement.HostEvidenceKey, _MacStepPolicy]:
+        """Select the mirrors required by the steps in this cycle."""
+        from scripts.build_targets import build_targets
+        from scripts.mac_test import eligibility
 
-        name = destination.target
+        policies: dict[placement.HostEvidenceKey, _MacStepPolicy] = {}
+        for key in cycle.keys:
+            sent = key.command_kind
+            kind = eligibility.recorded_step_kind(key.step) if isinstance(sent, placement.CommandKindNotSent) else sent
+            if kind in placement.STEP_COMMAND_KINDS:
+                try:
+                    policies[key] = build_targets.step_policy(target, Path(key.repository), key.package, kind,
+                        backoff=eligibility.NO_BACKOFF, configuration=configuration)
+                except (OSError, UnicodeError, ValueError) as error:
+                    policies[key] = placement.HostEvidenceUnavailable(key, cycle.observed_at, str(error))
+        return policies
+
+    def _read_mac_host(self, target: target_config.LocalTarget | target_config.SshTarget,
+                       configuration: conf.ConfigRead, cycle: _MacHostProbeCycle) -> _MacHostReading:
+        """Read the Mac once and refresh the local claims after SSH."""
+        from scripts.mac_test import claim_state, eligibility
+
+        name = target.name
+        settings = eligibility.probe_settings(configuration)
+        policies = self._mac_step_policies(target, configuration, cycle)
+        setup_mirrors = sorted({policy.legacy_mirror_name for policy in policies.values()
+                                if isinstance(policy, eligibility.KnownRepository)})
         paths = claim_state.state_paths(name)
         with claim_state.locked(paths.lock):
-            claims, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
-        settings = eligibility.probe_settings(configuration)
-        mirrors = sorted({mirror.mirror_name for claim in claims
+            probed_claims = {claim.path: claim for claim in claim_state.read_claims(paths)}
+        mirrors = sorted({mirror.mirror_name for claim in probed_claims.values()
                           if claim.record.get("remote_host") == settings.host
                           and not claim.record.get("cleanup_pending", False)
                           and isinstance(mirror := claim_state.saved_mac_repository(claim.record),
                                          claim_state.MacMirrorIdentity)})
+        probe = self._probe_mac_host(name, settings, mirrors, setup_mirrors)
+        with claim_state.locked(paths.lock):
+            claims, _ = claim_state.sweep_mac_replacements(paths, claim_state.read_claims(paths))
+        return _MacHostReading(cycle.observed_at, settings, policies, claims, probed_claims, probe)
+
+    def _probe_mac_host(self, name: str, settings: eligibility.SshProbeSettings, mirrors: list[str],
+                        setup_mirrors: list[eligibility.LegacyMirrorName],
+                        ) -> offload.MacHostProbeSnapshot | _MacHostExcluded:
+        """Run one shared command when the host permits a probe."""
+        from scripts.mac_test import eligibility, offload
+
+        configuration = settings.configuration
         if not configuration.value("offload", conf.on_off) and not mirrors:
-            return _MacHostReading(observed_at, settings, claims, _MacHostExcluded("off"))
+            return _MacHostExcluded("off")
         recover = self._begin_mac_backoff_probe(name)
         try:
             if not recover and isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
-                return _MacHostReading(observed_at, settings, claims, _MacHostExcluded("backoff"))
-            probe = offload.probe_mac_host(offload.ProcessController(), settings, name, mirrors)
+                return _MacHostExcluded("backoff")
+            probe = offload.probe_mac_host(offload.ProcessController(), settings, name, mirrors,
+                                           setup_mirrors=setup_mirrors)
             if isinstance(eligibility.read_backoff(time.time(), name), eligibility.ActiveBackoff):
-                return _MacHostReading(observed_at, settings, claims, _MacHostExcluded("backoff"))
+                return _MacHostExcluded("backoff")
             if isinstance(probe, offload.UnavailableProbe):
                 offload.write_backoff(time.time() + configuration.number("unreachable_backoff_s"), name, wait=not recover)
-                return _MacHostReading(observed_at, settings, claims, _MacHostExcluded("unreachable"))
-            return _MacHostReading(observed_at, settings, claims, probe)
+                return _MacHostExcluded("unreachable")
+            return probe
         finally:
             if recover:
                 with self.mac_recovery_lock:
                     self.mac_recovery_retry_at[name] = self.clock.monotonic() + self._waiting_pass_interval()
 
     def _mac_step_eligibility(self, target: target_config.LocalTarget | target_config.SshTarget,
-                              key: placement.HostEvidenceKey, kind: placement.StepCommandKind,
+                              key: placement.HostEvidenceKey,
+                              repository: eligibility.KnownRepository | target_config.ExcludedTarget,
                               reading: _MacHostReading
                               ) -> target_config.EligibleTarget | target_config.ExcludedTarget:
         """Apply the step and session rules to the shared Mac reading."""
         from scripts.build_targets import build_targets
-        from scripts.mac_test import claim_state, eligibility, mac_test
+        from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
-        configuration = reading.settings.configuration
-        root = Path(key.repository)
-        repository = build_targets.step_policy(target, root, key.package, kind, backoff=eligibility.NO_BACKOFF,
-                                               configuration=configuration)
         if isinstance(repository, target_config.ExcludedTarget):
             return repository
         name = key.destination.target
         paths = claim_state.state_paths(name)
         settings = target.settings if isinstance(target, target_config.SshTarget) else eligibility.DEFAULT_MAC_SETTINGS
-        capacity = mac_test.free_now(paths, settings, root, session=key.session, configuration=configuration,
+        capacity = mac_test.free_now(paths, settings, Path(key.repository), session=key.session,
+                                    configuration=reading.settings.configuration,
                                     mac_scope=key.destination.scope, recover_mac_backoff=True)
         if capacity == "blocked":
             return target_config.ExcludedTarget(target, capacity)
         if isinstance(reading.probe, _MacHostExcluded):
             return target_config.ExcludedTarget(target, reading.probe.reason)
+        if reading.probe.setup.get(repository.legacy_mirror_name) is not offload.MacMirrorSetup.READY:
+            return target_config.ExcludedTarget(target, "copy")
         answer = build_targets.mac_disk_recovery_eligibility(
             target, reading.settings, repository, reading.probe.disk, self._request_mac_disk_recovery)
         if isinstance(answer, target_config.EligibleTarget) and capacity in ("busy", "state"):
             return target_config.ExcludedTarget(target, capacity)
         return answer
 
-    def _mac_claim_execution(self, reading: _MacHostReading, record: RemoteJobClaim
+    def _mac_claim_execution(self, reading: _MacHostReading, claim: HeldClaim, record: RemoteJobClaim
                              ) -> execution_identity.ExecutionEvidence:
         """Find the saved claim's process in the shared Mac reading."""
         from scripts.mac_test import claim_state
@@ -4686,7 +4727,8 @@ class AdmissionServer:
         mirror = claim_state.saved_mac_repository(record)
         if not isinstance(mirror, claim_state.MacMirrorIdentity):
             return execution_identity.ExecutionEvidenceUnavailable("the claim has no saved Mac mirror", reading.observed_at)
-        if (not isinstance(reading.probe, _MacHostExcluded) and record["remote_host"] == reading.settings.host
+        if (not isinstance(reading.probe, _MacHostExcluded) and claim == reading.probed_claims.get(claim.path)
+                and record["remote_host"] == reading.settings.host
                 and (process := reading.probe.processes.get(mirror.mirror_name)) is not None):
             return execution_identity.ObservedExecution(execution_identity.ProcessExecution(
                 record["remote_host"], record.get("instance_generation", ""), process.pid, process.start_time))
@@ -4758,14 +4800,14 @@ class AdmissionServer:
         if destination.provider == "mac" and isinstance(cycle, _MacHostProbeCycle):
             if isinstance(cycle.reading, _MacHostNotRead):
                 try:
-                    cycle.reading = self._read_mac_host(destination, configuration, cycle.observed_at)
+                    cycle.reading = self._read_mac_host(target, configuration, cycle)
                 except (OSError, UnicodeError, ValueError) as error:
                     cycle.reading = _MacHostUnreadable(cycle.observed_at, str(error))
             if isinstance(cycle.reading, _MacHostUnreadable):
                 return placement.HostEvidenceUnavailable(key, cycle.reading.observed_at, cycle.reading.reason)
             shared = cycle.reading
-        sent = request.constraints.command_kind
-        kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
+        sent = key.command_kind
+        kind = recorded_step_kind(key.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
         observed_at = shared.observed_at if isinstance(shared, _MacHostReading) else self.clock.now()
         disk_recovery: build_targets.MacDiskRecoveryPending | build_targets.MacDiskRecoveryInactive
@@ -4777,7 +4819,10 @@ class AdmissionServer:
             return placement.FreshHostEvidence(key, observed_at, "", placement.FixedExclusion("command"))
         else:
             if isinstance(shared, _MacHostReading):
-                answer = self._mac_step_eligibility(target, key, kind, shared)
+                policy = shared.policies[key]
+                if isinstance(policy, placement.HostEvidenceUnavailable):
+                    return policy
+                answer = self._mac_step_eligibility(target, key, policy, shared)
             elif isinstance(target, target_config.SshTarget):
                 recover = target.platform == "macos" and self._begin_mac_backoff_probe(target.name)
                 try:
@@ -4863,7 +4908,7 @@ class AdmissionServer:
             adopted.append(placement.AdoptedProviderClaim(reference,
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))
-            execution = (self._mac_claim_execution(shared, record) if isinstance(shared, _MacHostReading)
+            execution = (self._mac_claim_execution(shared, claim, record) if isinstance(shared, _MacHostReading)
                          else self._observe_provider_execution(request, destination, reference, record, paths.platform, configuration))
             executions.append((reference, execution))
         observed_at = shared.observed_at if isinstance(shared, _MacHostReading) else self.clock.now()
