@@ -9558,6 +9558,56 @@ class CiJobStartPlaceTests(unittest.TestCase):
                 _ = fixture.server.handle_request(request)
             self.assertEqual(fixture.queue_pids(), [ci.owner.pid, older.owner.pid])
 
+    def test_a_waiting_request_from_an_older_front_ranks_at_its_job_start_after_a_reload(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            older = fixture.request(since=now - 600)
+            ci = self.ci_request(fixture, records.NO_JOB_START)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, ci.owner.pid])
+            fixture.server.persist()
+            # The new service code reads the job start from the runner process of the request that waits.
+            fixture.job_starts[ci.owner.pid] = records.JobStart(now - 900)
+            fixture.restart()
+            fixture.clock.advance(1)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [ci.owner.pid, older.owner.pid])
+            self.assertEqual(fixture.server.waiters[ci.episode].row.get("ci_job_start"), records.JobStart(now - 900))
+            self.assertEqual(fixture.server.waiters[ci.episode].row["since"], ci.since)
+
+    def test_a_recovered_job_start_stays_when_a_later_read_finds_none(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            now = fixture.clock.now()
+            older = fixture.request(since=now - 600)
+            ci = self.ci_request(fixture, records.NO_JOB_START)
+            fixture.job_starts[ci.owner.pid] = records.JobStart(now - 900)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            fixture.server.persist()
+            # A later read fails, and the older front sends NoJobStart again after a reload.
+            fixture.job_starts.clear()
+            fixture.restart()
+            fixture.clock.advance(1)
+            for request in (older, ci):
+                _ = fixture.server.handle_request(request)
+            self.assertEqual(fixture.queue_pids(), [ci.owner.pid, older.owner.pid])
+            self.assertEqual(fixture.server.waiters[ci.episode].row.get("ci_job_start"), records.JobStart(now - 900))
+
+    def test_the_service_reads_no_job_start_for_a_request_with_no_runner(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            local = replace(fixture.service_request(runner=""), job_start=records.NO_JOB_START)
+            fixture.job_starts[local.owner.pid] = records.JobStart(fixture.clock.now() - 900)
+            _ = fixture.server.handle_request(local)
+            self.assertNotIn("ci_job_start", fixture.server.waiters[local.episode].row)
+
 
 @dataclass(frozen=True)
 class ScopedMemoryTrace:
