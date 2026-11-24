@@ -68,6 +68,8 @@ class HoldEnforcerTests(unittest.TestCase):
         self.claimed = frozenset()
         self.claim_reader = hold_enforcer.claimed_processes
         _ = self.enterContext(mock.patch.object(hold_enforcer, "claimed_processes", side_effect=self.read_claims))
+        # A real hold event recorder is a detached process that can write here during cleanup.
+        _ = self.enterContext(mock.patch.object(build_hold, "start_recorder"))
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
         _ = boot.write_text("test-boot\n")
@@ -467,7 +469,6 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, \
              mock.patch.object(os, "kill") as kill, \
-             mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(build_hold, "print_hold_audit"), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
                 "--keep", "40", "--release-eta", "23:59", "--zone", "Etc/GMT+12",
@@ -530,8 +531,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(os, "sysconf", return_value=100), \
              mock.patch.object(build_hold, "start_hold", side_effect=publish), \
              mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
-             mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
-             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
@@ -710,8 +710,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 signal_process=lambda pid, signum: signals.append((pid, signum)))
 
         with mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop), \
-             mock.patch.object(hold_enforcer, "start") as start, \
-             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+             mock.patch.object(hold_enforcer, "start") as start, redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "30", "--proc-root", str(self.proc)]), 0)
@@ -729,7 +728,6 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(11, "cargo", parent=10, argv=("cargo", "test"))
         _ = self.process(12, "rustc", parent=11)
         with mock.patch.object(hold_enforcer, "start"), \
-             mock.patch.object(build_hold, "start_hold_recorder"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
@@ -868,8 +866,7 @@ class HoldEnforcerTests(unittest.TestCase):
              mock.patch.object(time, "clock_gettime_ns", return_value=120_000_000_000) as clock, \
              mock.patch.object(os, "sysconf", return_value=100), \
              mock.patch.object(hold_enforcer, "start"), \
-             mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
-             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), redirect_stdout(io.StringIO()):
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--keep", "45", "--proc-root", str(self.proc)]), 0)
@@ -892,8 +889,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
         with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
              mock.patch.object(hold_enforcer, "start") as start, \
-             mock.patch.object(hold_enforcer, "wait_for_kept_runs") as wait, \
-             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()) as output:
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs") as wait, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                 "--proc-root", str(self.proc)]), 0)
