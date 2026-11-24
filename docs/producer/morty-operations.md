@@ -80,7 +80,7 @@ Refresh an existing link after its source changes.
 ## Local constraints
 
 Do not edit the live `~/.claude` checkout. Use an isolated worktree for shared code changes.
-Do not run builds for status. Required phase and merge checks remain the owners' work.
+Do not run builds for status. The owners run the required phase checks and gate jobs.
 The review pool is retired. Use current owner roles.
 Use `session labels` instead of `unit-marks` in text for nate.
 Keep tunable operational values in configuration. Do not start unrelated cleanup.
