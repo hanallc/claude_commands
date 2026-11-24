@@ -1172,6 +1172,7 @@ function showHiddenActionResults(items){
  if(latestActionFailure && hidden(latestActionFailure.key)) messages.push(latestActionFailure.message);
  showActionFailure(status,messages.join(' '));
 }
+/** @param {{kind:'success' | 'failure' | 'undone', message:string, hiddenMessage?:string}} result */
 function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  const key=item.dataset.key;
  actionNotices.set(key,{message,hiddenMessage});
@@ -1180,7 +1181,8 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  if(status) showActionFailure(status,message);
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(kind==='failure' && restored && rowMotion.has(item)){
+ // A refused or undone send brings its departing row back.
+ if(kind!=='success' && restored && rowMotion.has(item)){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }

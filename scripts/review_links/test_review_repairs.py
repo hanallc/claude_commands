@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import shutil
-import subprocess
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +14,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
 from scripts.lib import conf, urgency
+from scripts.lib.process_group import run_process_group
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
@@ -388,10 +388,9 @@ class ReviewRepairsTests(unittest.TestCase):
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                    done = run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
-                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,
-                        timeout=probe_timeout+30)
+                        f'http://127.0.0.1:{server.server_port}'+place],timeout=probe_timeout+30)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
                 server.shutdown()

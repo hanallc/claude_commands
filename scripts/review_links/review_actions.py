@@ -12,6 +12,7 @@ from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from urllib.parse import urlencode
 
+from scripts.for_you.action import REVIEW_PATH
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
@@ -282,16 +283,47 @@ class SubmissionDeliveryPending(OSError):
     """Another request is sending this item."""
 
 
+_READ_STAFF_AUTHORITY = staff.ReadStaffAuthority()
+
+
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
-                                status: change_page.DeliveryStatus, *, evidence_page: str = ""
+                                status: change_page.DeliveryStatus, *, evidence_page: str = "",
+                                members: staff.StaffSnapshot | staff.ReadStaffAuthority = _READ_STAFF_AUTHORITY
                                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Claim the first message for a published native request."""
-    return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+    with staff.supplied_snapshot(members) if isinstance(members, staff.StaffSnapshot) else nullcontext():
+        return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+
+
+def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
+    """Finish a staged List row before claiming its notice."""
+    route = review_submissions.list_filing_route(saved)
+    if isinstance(route, review_submissions.NoListFiling):
+        return
+    if isinstance(route, review_submissions.ListFilingUnavailable):
+        review_submissions.skip_list_filing(saved, route.reason)
+        return
+    key = review_items.submission_review_key(saved)
+    evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
+    words = saved.words
+    try:
+        _ = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
+                                     producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
+                                     review_key=key, source=route["source"],
+                                     reservation=review_submissions.list_filing_reservation(saved))
+    except the_list.RetiredListProducer as error:
+        review_submissions.skip_list_filing(saved, str(error))
 
 
 def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,
                                words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    # Finish the List row under the recipient locks before taking the delivery lock.
+    with review_submissions.submission_for_delivery(address) as filing:
+        if isinstance(filing, review_submissions.NoNativeSubmission):
+            return change_page.NoMessageDelivery()
+        _ensure_list_filing(filing.saved())
+
     with status.locked(), review_submissions.submission_for_delivery(address) as located:
         if isinstance(located, review_submissions.NoNativeSubmission):
             return change_page.NoMessageDelivery()
@@ -324,7 +356,7 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         else:
             evidence = ""
             if evidence_page:
-                key = review_items.submission_item(saved, staff.snapshot()).key
+                key = review_items.submission_review_key(saved)
                 evidence = "\n\nEvidence in Review\n" + evidence_page + '#' + urlencode({'item': key})
             message = (f'New {saved.kind} {saved.id} from Review.\n\n{words or saved.words}{evidence}\n\n'
                        + change_page.reply_command(saved.key))
@@ -360,7 +392,7 @@ def recover_submission_deliveries(status: change_page.DeliveryStatus, review_pat
             finally:
                 if isinstance(delivery, change_page.MessageDelivery):
                     status.release_recovery_claims((delivery.attempt,))
-        except (OSError, ValueError, RuntimeError) as error:
+        except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
             print(f"Review first message {pending.address.request_id}: {error}", file=sys.stderr)
 
 

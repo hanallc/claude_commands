@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -16,8 +15,10 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, reply_tokens, review_submissions
+from scripts.review_links.browser_test_support import firefox_probe_results
 from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -78,7 +79,6 @@ const check = (ok, description) => { if (!ok) failures.push(description); };
 const dialog = document.querySelector('dialog'), body = dialog.querySelector('.new-item-body');
 const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
 const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
-const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
 const launch = document.querySelector('[data-owner-new]'), png = '__PNG__';
 const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
 const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
@@ -117,23 +117,20 @@ function untilError() {
  });
 }
 async function sendSaved() {
- const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
- const shown = new Promise((resolve, reject) => {
+ const created = new Promise((resolve, reject) => {
+  const onCreated = event => { observer.disconnect(); resolve(event); };
   const observer = new MutationObserver(() => {
-   if (confirmation.hidden && error.hidden) return;
+   if (error.hidden || send.disabled) return;
    observer.disconnect();
-   if (confirmation.hidden) reject(new Error(error.textContent));
-   else resolve(confirmation.textContent);
+   document.removeEventListener('review-item-created', onCreated);
+   reject(new Error(error.textContent));
   });
-  observer.observe(dialog, {attributes:true, subtree:true, attributeFilter:['hidden']});
+  document.addEventListener('review-item-created', onCreated, {once:true});
+  observer.observe(dialog, {attributes:true, subtree:true, attributeFilter:['hidden','disabled']});
  });
  send.click();
- const message = await shown;
- check(dialog.open && document.activeElement === done && send.disabled,
-       'Send keeps the confirmation open with focus on Done.');
- done.click();
  const event = await created;
- check(message === 'Saved ' + event.detail.id + '.', 'The dialog shows the saved ID.');
+ check(closeToLauncher(), 'Send closes the dialog and returns focus.');
  return event;
 }
 (async () => {
@@ -196,7 +193,6 @@ async function sendSaved() {
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
    check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
-   check(closeToLauncher(), 'Done closes the confirmation and returns focus.');
    check(error.hidden && !error.textContent, 'A successful Send shows no failure.');
 
    await open({kind:'question'});
@@ -556,7 +552,7 @@ async function sendSaved() {
     const retry = ownerPosts.findLast(post => post.request_id);
     check(retry.request_id === first.request_id && retry.capture_key === first.capture_key,
           'The retry uses the same draft ID and capture key.');
-    check(dialog.open && confirmation.hidden && textarea.value === wordsBeforeRetry &&
+    check(dialog.open && textarea.value === wordsBeforeRetry &&
           error.textContent === alreadyFiled, 'The notice keeps the draft open with its words.');
     await whenShown(shot);
     const renewedKey = captureKey;
@@ -728,8 +724,8 @@ OWNER_OPTIONS_PROBE = r"""
   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
   const saved = new Promise(resolve => document.addEventListener('review-item-saved', resolve, {once:true}));
   send.click();
+  check(!dialog.open && document.activeElement === buttons[0], 'Send closes the dialog and restores focus at once.');
   check((await saved).detail.id === 'I1', 'Send reports the saved Enhancement.');
-  check(!dialog.open && document.activeElement === buttons[0], 'Send closes the dialog and restores focus.');
  } catch (error) { failures.push(String(error)); }
  await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
  parent.postMessage('finished', location.origin);
@@ -810,11 +806,10 @@ const whenVisible = element => {
  });
 };
 const send = async () => {
- const confirmation = dialog.querySelector('#new-item-saved');
+ const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
  dialog.querySelector('[type="submit"]').click();
- await whenVisible(confirmation);
- check(dialog.open && confirmation.textContent === 'Saved I1.', 'The Bug dialog shows the saved ID.');
- dialog.querySelector('[data-done]').click();
+ const event = await created;
+ check(!dialog.open && event.detail.id === 'I1', 'The Bug dialog closes and reports the saved ID.');
 };
 (async () => {
  try {
@@ -877,7 +872,6 @@ const send = async () => {
    check(captured.script_errors.length === 20 && captured.script_errors[0].message === 'Error 2'
          && captured.script_errors[0].line === 9 && captured.script_errors[0].column === 3
          && captured.script_errors.at(-1).message === 'Rejected', 'The request keeps the last twenty script errors.');
-   check(dialog.open === false, 'Done closes the confirmation.');
 
    holdCapture = true;
    await open();
@@ -937,7 +931,9 @@ const send = async () => {
    check(listFirst.request_id.startsWith('r6-') && listFirst.capture_key &&
          JSON.stringify(wire[started]) === JSON.stringify(listFirst),
          'The List retries with the original capture key and draft ID.');
-   check(dialog.open && words.value === 'Keep these edits for a new Send.',
+   const editNotice = dialog.querySelector('.new-item-error');
+   check(dialog.open && words.value === 'Keep these edits for a new Send.' && !editNotice.hidden &&
+         editNotice.textContent === 'Saved I1. Your edits are still in the dialog.',
          'The dialog keeps the edits after it confirms the original Send.');
 
    words.value = '';
@@ -965,8 +961,8 @@ const send = async () => {
 """
 
 
-def bug_fixture_page(*, photo: bool = False) -> bytes:
-    probe = BUG_PROBE.replace("__PHOTO__", json.dumps(photo))
+def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
+    probe = script.replace("__PHOTO__", json.dumps(photo))
     return (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Review</title>'
             f'{page_frame.PAGE_SCRIPT_ERRORS}<style>{console_theme.CSS}{page_frame.OWNER_STYLE.removeprefix("<style>").removesuffix("</style>")}'
@@ -981,6 +977,133 @@ def bug_fixture_page(*, photo: bool = False) -> bytes:
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 
 
+UNDO_PROBE = r"""
+const failures = [];
+const check = (value, description) => { if (!value) failures.push(description); };
+const wire = [], fetchHTTP = window.fetch, host = window.top.document;
+const outcome = __OUTCOME__;
+const held = '/send-hold/' + 'a'.repeat(24), saved = {id:'I1',key:'bug/owner/I1'};
+let realSends = 0;
+window.fetch = async (path, options = {}) => {
+ path = String(path);
+ if (path === held + '/undo') return Response.json({outcome:'undone'});
+ if (path === held) {
+  realSends++;
+  return outcome === 'failure' ? Response.json({error:'The test send failed.'},{status:503}) : Response.json(saved);
+ }
+ if (!path.startsWith('/console/review/new-item')) return fetchHTTP(path, options);
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[
+  {id:'owner',name:'sdlc',proposal:true}, {id:'chosen',name:'chosen producer',proposal:true},
+ ]});
+ const payload = JSON.parse(options.body);
+ // The screenshot stays pending, so the first Send keeps its item for a retry.
+ if (payload.page_capture) return new Promise(() => {});
+ wire.push([payload, new Headers(options.headers).get('X-Undo-Hold')]);
+ if (wire.length === 1) return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ return Response.json(saved);
+};
+const dialog = document.querySelector('dialog');
+const launch = document.querySelector('[data-owner-new]');
+const words = dialog.querySelector('textarea'), error = dialog.querySelector('.new-item-error');
+const send = dialog.querySelector('[type="submit"]');
+const until = async (test, label) => {
+ const end = performance.now() + 8000;
+ while (!test()) {
+  if (performance.now() > end) throw new Error(label);
+  await new Promise(resolve => setTimeout(resolve, 20));
+ }
+};
+const type = text => {
+ words.value = text;
+ words.dispatchEvent(new Event('input', {bubbles:true}));
+};
+(async () => {
+ try {
+  launch.click();
+  await until(() => dialog.querySelector('[data-recipients] input:checked'), 'The dialog did not load its recipients.');
+  dialog.querySelector('[name="recipient_id"][value="chosen"]').click();
+  type('The first words.');
+  const input = new DataTransfer();
+  const bytes = Uint8Array.from(atob('__PNG__'), character => character.charCodeAt(0));
+  input.items.add(new File([bytes], 'pasted.png', {type:'image/png'}));
+  const paste = new ClipboardEvent('paste', {cancelable:true});
+  Object.defineProperty(paste, 'clipboardData', {value:input});
+  words.dispatchEvent(paste);
+  const image = dialog.querySelector('[data-previews] img')?.src;
+  await until(() => !send.disabled, 'Send did not become available.');
+  const events = [];
+  for (const name of ['review-item-saved', 'review-item-created']) {
+   document.addEventListener(name, event => events.push([name, event.detail.id, dialog.open]));
+  }
+  send.click();
+  check(!dialog.open && document.activeElement === launch, 'Send closes the dialog and returns focus at once.');
+  const toast = () => host.querySelector('[data-send-undo]');
+  await until(() => toast()?.querySelector('button'), 'The Undo toast did not show.');
+  check(toast().querySelector('span').textContent === 'Sent to chosen producer.',
+        'The toast names the selected recipient.');
+  check(toast().querySelector('button').textContent === 'Undo', 'The toast offers Undo.');
+  check(!dialog.open && toast().parentElement.parentElement === host.body && events.length === 0 && realSends === 0,
+        'The page stays available while the send waits.');
+  if (outcome === 'second-draft') {
+   launch.click();
+   const second = document.querySelector('dialog[open]');
+   check(second && second !== dialog && !second.querySelector('textarea').value,
+         'New item opens an empty second draft during the hold.');
+   second.querySelector('textarea').value = 'Keep a separate second draft.';
+   second.querySelector('[data-close]').click();
+  }
+  const undo = outcome.startsWith('undo') || outcome === 'second-draft';
+  if (undo) toast().querySelector('button').click();
+  else {
+   const [fade] = toast().getAnimations();
+   check(fade.effect.getTiming().duration === 30000, 'The toast uses the duration from the server.');
+   fade.finish();
+  }
+  if (undo || outcome === 'failure') {
+   await until(() => dialog.open && !error.hidden && !send.disabled, 'The dialog did not reopen for editing.');
+   check(error.textContent === (undo ? 'Undone. Edit and send again.' : 'The test send failed.'),
+         'The dialog shows the result above the draft.');
+   check(words.value === 'The first words.' && dialog.querySelector('[name="kind"]:checked')?.value === 'bug' &&
+         dialog.querySelector('[name="recipient_id"]:checked')?.value === 'chosen',
+         'The dialog restores the type, recipient and words.');
+   check(image && dialog.querySelector('[data-previews] img')?.src === image, 'The dialog restores the pasted image.');
+   check(dialog.querySelector('[name="include_page"]').checked && !dialog.querySelector('[data-capture-slot]').hidden,
+         'The dialog restores the pending page capture.');
+   check(!toast() && events.length === 0 && realSends === (undo ? 0 : 1),
+         'The page sends no success event after Undo or failure.');
+   if (outcome === 'second-draft') {
+    dialog.querySelector('[data-close]').click();
+    launch.click();
+    check(document.querySelector('dialog[open] textarea')?.value === 'Keep a separate second draft.',
+          'Undo restores the first draft and keeps the second draft separate.');
+   }
+   if (outcome !== 'undo-resend') return;
+   type('The edited words.');
+   send.click();
+  }
+  await until(() => events.length === 2, 'The successful Send did not report the saved item.');
+  check(JSON.stringify(events) === JSON.stringify([
+   ['review-item-saved', 'I1', false], ['review-item-created', 'I1', false]
+  ]), 'Send closes the dialog before it reports the saved item.');
+  check(!toast(), 'The Undo toast disappears.');
+  if (undo) {
+   check(wire.length === 2 && wire[0][0].words === 'The first words.' &&
+         wire[1][0].words === 'The edited words.' && wire[1][1] === '1',
+         'The Send after Undo posts the edited words.');
+   check(wire[0][0].capture_key && wire[1][0].capture_key === wire[0][0].capture_key &&
+         JSON.stringify(wire[1][0].defer_capture) === JSON.stringify(wire[0][0].defer_capture),
+         'The Send after Undo uses the same page capture.');
+  } else {
+   check(wire.length === 1 && wire[0][0].kind === 'bug' && wire[0][1] === '1', 'Send holds the Bug once.');
+  }
+ } catch (failure) {
+  failures.push(String(failure));
+ } finally {
+  await fetchHTTP('/results', {method:'POST', body:JSON.stringify(failures)});
+ }
+})();
+"""
+
 LIST_RETRY_PROBE = r'''
 const failures = [];
 const check = (ok, description) => { if (!ok) failures.push(description); };
@@ -991,7 +1114,7 @@ const type = dialog.querySelector('[name="kind"][value="investigation"]');
 const include = dialog.querySelector('[name="include_page"]');
 const reloadAfterSend = __RELOAD_AFTER_SEND__;
 const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
-const probeKey = 'test-list-first-send', draftKey = 'console.list.pending-send';
+const probeKey = 'test-list-first-send', draftPrefix = 'console.list.pending-send.';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
 const posts = [], fetchHTTP = window.fetch;
 let captures = 0;
@@ -1049,7 +1172,8 @@ function enterWords(value) {
          'Reload keeps the draft ID and sends the edited words.');
    check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
          'The retry shows the first saved item ID.');
-   check(!sessionStorage.getItem(draftKey), 'An already filed response clears the draft ID.');
+   check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'An already filed response clears the draft slot.');
   } else if (reloadAfterSend && !failures.length) {
    sessionStorage.setItem(probeKey, JSON.stringify(posts[0]));
    location.reload();
@@ -1071,7 +1195,8 @@ function enterWords(value) {
          'Each Send uses the same draft ID.');
    check(posts[0].capture_key === firstKey && posts[1].capture_key === firstKey && posts[2].capture_key === readyKey,
          'Send uses the new capture after the first one expires.');
-   check(!sessionStorage.getItem(draftKey), 'A successful Send clears the draft ID.');
+   check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'A successful Send clears the draft slot.');
   }
  } catch (error) {
   failures.push(String(error));
@@ -1081,6 +1206,88 @@ function enterWords(value) {
  parent.postMessage('finished', location.origin);
 })();
 '''
+
+
+TWO_LIST_DRAFTS_PROBE = r"""
+const failures = [], posts = [];
+const fetchHTTP = window.fetch;
+const prefix = 'console.list.pending-send.', probeKey = 'test-list-drafts';
+const earlier = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+const endpoint = '/console/review/new-item';
+const check = (ok, message) => { if (!ok) failures.push(message); };
+window.fetch = async (path, options) => {
+ if (path.startsWith('/send-hold/')) return Response.json({id:'I1'});
+ if (!path.startsWith(endpoint)) return fetchHTTP(path, options);
+ if (!options?.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[
+  {id:'owner',name:'sdlc',proposal:true}, {id:'other',name:'producer',proposal:true},
+ ]});
+ const item = JSON.parse(options.body);
+ if (!item.request_id) return Response.json({});
+ posts.push(item);
+ const hold = String(posts.length).repeat(24);
+ return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+};
+async function waitFor(test) {
+ const end = performance.now() + 8000;
+ while (!test()) {
+  if (performance.now() > end) throw new Error('The dialog or toast did not appear.');
+  await new Promise(resolve => setTimeout(resolve, 20));
+ }
+}
+async function send(words, select = '') {
+ document.querySelector('[data-owner-new]').click();
+ const dialog = document.querySelector('dialog[open]');
+ await waitFor(() => dialog.querySelector('input[name=recipient_id]:checked'));
+ const shown = dialog.querySelector('input[name=recipient_id]:checked').value;
+ if (select) dialog.querySelector('input[name=recipient_id][value=' + select + ']').click();
+ if (dialog.querySelector('[name=include_page]').checked) dialog.querySelector('[name=include_page]').click();
+ const field = dialog.querySelector('textarea');
+ field.value = words;
+ field.dispatchEvent(new InputEvent('input',{bubbles:true}));
+ const host = window.top.document;
+ const existing = new Set(host.querySelectorAll('[data-send-undo]'));
+ dialog.querySelector('[type=submit]').click();
+ const freshToast = () => [...host.querySelectorAll('[data-send-undo]')].find(toast => !existing.has(toast));
+ await waitFor(freshToast);
+ return {item:posts.at(-1), shown, toast:freshToast()};
+}
+(async () => {
+ try {
+  if (!earlier) {
+   const first = await send('The first draft.', 'other');
+   const second = await send('The second draft.');
+   check(first.item.request_id !== second.item.request_id, 'Concurrent sends use different draft IDs.');
+   check(first.toast.querySelector('span').textContent === 'Sent to producer.' &&
+         second.toast.querySelector('span').textContent === 'Sent to sdlc.', 'The first sends name their recipients.');
+   check(sessionStorage.getItem(prefix + first.item.request_id) === 'other' &&
+         sessionStorage.getItem(prefix + second.item.request_id) === 'owner',
+         'Each send stores its own recovery slot.');
+   if (!failures.length) {
+    sessionStorage.setItem(probeKey, JSON.stringify(posts));
+    location.reload();
+    return;
+   }
+  } else {
+   const pending = new Map(earlier.map(item => [item.request_id, item]));
+   for (const _ of earlier) {
+    const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+    const {item, shown, toast} = await send('Recover a draft.', 'other');
+    check(pending.get(item.request_id)?.recipient_id === shown, 'Reload restores the draft ID and its recipient.');
+    check(toast.querySelector('span').textContent === 'Sending.', 'A retry that can recover a filing shows Sending.');
+    toast.getAnimations()[0].finish();
+    await created;
+    pending.delete(item.request_id);
+    check(sessionStorage.getItem(prefix + item.request_id) === null, 'A save removes its own recovery slot.');
+    check([...pending.keys()].every(id => sessionStorage.getItem(prefix + id) !== null),
+          'A save keeps the other recovery slot.');
+   }
+   check(!pending.size, 'The dialog recovers both drafts.');
+  }
+ } catch (error) { failures.push(String(error)); }
+ sessionStorage.removeItem(probeKey);
+ await fetchHTTP('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+"""
 
 
 RECIPIENT_DRAFT_PROBE = r'''
@@ -1208,9 +1415,14 @@ class DialogFixture:
     retire_recipient_on_restart: bool = False
     owner_reason: str = ""
 
+    def __post_init__(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
+
     def environment(self) -> dict[str, str]:
         return {"SHOWRUNNER_STATE_DIR": str(self.root / "state"), "REVIEW_LINKS_ROOT": str(self.root / "review"),
-                "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config")}
+                "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(self.root / "config"),
+                "STAFF_FILE": str(self.root / "staff.json")}
 
 
 def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
@@ -1345,11 +1557,11 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         try:
             profile = output.parent / "profile"
             profile.mkdir()
-            run = subprocess.run(
+            run = run_process_group(
                 ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                  "--window-size", "1440,900", "--screenshot", str(output),
                  f"http://127.0.0.1:{server.server_port}/"],
-                capture_output=True, text=True, timeout=75, check=False)
+                timeout=75)
             if run.returncode:
                 raise AssertionError(run.stderr)
             if not finished.is_set():
@@ -1452,6 +1664,36 @@ class NewItemDialogTests(unittest.TestCase):
         fixture = DialogFixture(temporary)
         capture_dialogs(temporary / "bug.png", {1440: fixture}, pages={1440: bug_fixture_page()})
         self.assertEqual(fixture.results, [])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_send_after_undo_posts_the_edited_words(self) -> None:
+        self.assert_held_send("undo-resend")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_non_list_send_closes_the_dialog_at_send(self) -> None:
+        self.assert_held_send("success")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_undo_reopens_the_new_item_with_the_words(self) -> None:
+        self.assert_held_send("undo")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_new_item_opens_a_second_draft_during_the_hold(self) -> None:
+        self.assert_held_send("second-draft")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_recovers_two_unresolved_drafts_after_reload(self) -> None:
+        page = bug_fixture_page(script=TWO_LIST_DRAFTS_PROBE).replace(
+            b'data-page-owner="review"', b'data-page-owner="list"')
+        self.assertEqual(firefox_probe_results(page), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_failed_held_send_reopens_the_new_item_with_the_error(self) -> None:
+        self.assert_held_send("failure")
+
+    def assert_held_send(self, outcome: str) -> None:
+        probe = UNDO_PROBE.replace("__OUTCOME__", json.dumps(outcome)).replace("__PNG__", PNG)
+        self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_owner_button_selects_the_owner_and_sends_an_enhancement(self) -> None:
