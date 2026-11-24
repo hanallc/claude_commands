@@ -47,6 +47,7 @@ from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, is_test_module
 from scripts.production import gate
+from scripts.production.gate_routes import GateResultUnknown, GateTookNoRun
 from scripts.style.git_process import parse_tree_listing
 from scripts.test_times import gate_record
 
@@ -69,6 +70,7 @@ class CloudAttempt:
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     claim: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
     service_unconfirmed: bool = False
+    lost_box_result: bool = False
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,12 @@ def availability() -> Available | Unavailable:
         return Unavailable(reason) if reason else Available()
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return Unavailable('The local AWS gate evidence is unavailable')
+
+
+def placement_eligibility() -> placement.AllowedHost | placement.TemporaryExclusion:
+    """Read local capacity evidence for the queue."""
+    answer = availability()
+    return placement.AllowedHost() if isinstance(answer, Available) else placement.TemporaryExclusion(answer.reason)
 
 
 def cleanup_due(reservation: ledger.GateReservation, now: int) -> bool:
@@ -1523,12 +1531,14 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         outcome = CloudDeclined(str(error))
     except BaseException:
         if isinstance(authorization, wire.FirstAuthorization):
-            report_gate_execution(authorization, attempt, placement.AttemptCancelled('The gate caller ended'))
+            _ = report_gate_execution(authorization, attempt, placement.AttemptCancelled('The gate caller ended'))
         raise
     if isinstance(authorization, wire.FirstAuthorization):
         disposition = (placement.AttemptCompleted(int(not outcome.run.passed)) if isinstance(outcome, CloudCompleted)
                        else placement.AttemptDeclined(outcome.reason))
-        report_gate_execution(authorization, attempt, disposition)
+        result_missing = report_gate_execution(authorization, attempt, disposition)
+    else:
+        result_missing = False
     if isinstance(outcome, CloudDeclined):
         if attempt.interruptions:
             outcome = CloudDeclined(f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
@@ -1540,6 +1550,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         except OSError as error:
             detail = ' '.join(str(error).split())
             print('Cloud gate fallback row was not written: ' + detail, file=sys.stderr, flush=True)
+        if result_missing:
+            raise GateResultUnknown(f'AWS gate result is unknown: {outcome.reason}')
     return outcome
 
 
@@ -1700,6 +1712,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 reservation.status = 0
                 if failure is RetryableCloudFailure.NONE:
                     return outcome
+                attempt.lost_box_result = True
                 if failure is RetryableCloudFailure.SPOT:
                     if counted_interruption != folder.name:
                         attempt.interruptions += 1
@@ -1829,25 +1842,33 @@ def main() -> int:
 
 
 def report_gate_execution(authorization: wire.FirstAuthorization, attempt: CloudAttempt,
-                          outcome: placement.AttemptCompleted | placement.AttemptDeclined | placement.AttemptCancelled) -> None:
-    """Keep a consumed assignment pending while launch evidence is open."""
+                          outcome: placement.AttemptCompleted | placement.AttemptDeclined | placement.AttemptCancelled) -> bool:
+    """Report the outcome and return whether a started gate could lack a verdict."""
     book = ledger.CostLedger(attempt.directory)
     pending = attempt.service_unconfirmed
+    launched = attempt.lost_box_result
     if attempt.identifier and book.path.exists():
         try:
-            pending = pending or any(row.attempt == attempt.identifier and ledger.gate_is_open(row)
-                                     for row in book.read_snapshot().gate_reservations)
+            rows = [row for row in book.read_snapshot().gate_reservations
+                    if row.attempt == attempt.identifier]
+            pending = pending or any(ledger.gate_is_open(row) for row in rows)
+            launched = launched or any(not isinstance(row.state, ledger.GateAbsent) for row in rows)
         except ledger.LedgerUnavailable:
             pending = True
     path = (placement.DispatchPathPending('AWS launch settlement remains pending') if pending
             else placement.DispatchPathSettled())
-    evidence = execution_identity.ExecutionEvidenceUnavailable('AWS gate attempt ' + (attempt.identifier or 'did not start'),
-                                                               time.time())
+    evidence = (execution_identity.ExecutionNotStarted() if isinstance(outcome, placement.AttemptDeclined)
+                and not (pending or launched) else execution_identity.ExecutionEvidenceUnavailable(
+                    'AWS gate attempt ' + (attempt.identifier or 'did not start'), time.time()))
+    disposition = (placement.PrelaunchRefused(outcome.reason)
+                   if isinstance(evidence, execution_identity.ExecutionNotStarted) and isinstance(outcome, placement.AttemptDeclined)
+                   else outcome)
     try:
         _ = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(), authorization.assignment,
-            authorization.claim, evidence, outcome, path))
+            authorization.claim, evidence, disposition, path))
     except (OSError, wire.AdmissionUnavailable) as error:
         print(f'AWS gate queue report failed: {error}', file=sys.stderr, flush=True)
+    return pending or launched
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
@@ -1857,21 +1878,23 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
     """Run the gate only after the queue authorizes this assignment."""
     start = process_start(os.getpid())
     if not isinstance(start, Started):
-        return 'The gate process has no live start time'
+        raise GateTookNoRun('The gate process has no live start time')
     holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
     claim = placement.assigned_claim_reference(assignment)
     try:
         authorization = admission_client.consume_permission(
             wire.ConsumePermission(admission_client.request_id(), assignment, claim, holder))
     except (OSError, wire.AdmissionUnavailable) as error:
-        return f'The AWS launch permission is unavailable: {error}'
+        raise GateTookNoRun(f'The AWS launch permission is unavailable: {error}') from error
     if not isinstance(authorization, wire.FirstAuthorization):
-        return f'The queue refused AWS launch permission: {authorization.reason}'
+        raise GateTookNoRun(f'The queue refused AWS launch permission: {authorization.reason}')
     if authorization.assignment != assignment or authorization.claim != claim:
-        return 'The AWS launch permission differs from the request'
+        raise GateTookNoRun('The AWS launch permission differs from the request')
     outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                   selected=selected, gate_job=gate_job, authorization=authorization)
-    return outcome.reason if isinstance(outcome, CloudDeclined) else outcome.run
+    if isinstance(outcome, CloudDeclined):
+        raise GateTookNoRun(f'AWS gate took no run: {outcome.reason}')
+    return outcome.run
 
 
 if __name__ == '__main__':

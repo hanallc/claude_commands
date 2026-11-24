@@ -47,6 +47,7 @@ from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import gate
+from scripts.production.gate_routes import GateResultUnknown, GateTookNoRun
 from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import conf
@@ -367,8 +368,10 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
               mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('Use the fake AWS transport'))):
             route = partial(cloud_gate.route, self.root, mode=gate.SuiteMode.GATE, full=False,
                             module_time_limit_s=30, assignment=assignment)
-            self.assertEqual(route(), 'The launch reply is unavailable')
-            self.assertEqual(route(), 'The queue refused AWS launch permission: already consumed')
+            with self.assertRaisesRegex(GateResultUnknown, 'The launch reply is unavailable'):
+                _ = route()
+            with self.assertRaisesRegex(GateTookNoRun, 'already consumed'):
+                _ = route()
         start.assert_called_once()
         self.assertEqual(consume.call_count, 2)
         self.assertEqual(cast(wire.ConsumePermission, consume.call_args.args[0]).claim, claim)
@@ -3132,13 +3135,14 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                   mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
                 before = len(self.fallback_rows())
                 reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
-                with self.assertRaisesRegex(GateRefused, reason):
+                with self.assertRaisesRegex(GateTookNoRun, reason):
                     _ = gate.run_gate_suites(self.repo, full=True, mode=mode, target=target)
                 local.assert_not_called()
                 service.assert_not_called()
                 report.assert_called_once()
                 sent = cast(wire.ExecutionReport, report.call_args.args[0])
-                self.assertEqual(sent.outcome, placement.AttemptDeclined(reason))
+                self.assertEqual(sent.outcome, placement.PrelaunchRefused(reason))
+                self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
                 self.assertIsInstance(sent.path, placement.DispatchPathSettled)
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
@@ -4607,7 +4611,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
               mock.patch.object(admission_client, 'report_execution') as report,
               mock.patch.object(cloud_gate, 'run', side_effect=run_cloud),
               mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO()),
-              self.assertRaisesRegex(GateRefused, 'AWS gate failed: capacity')):
+              self.assertRaisesRegex(GateTookNoRun, 'AWS gate took no run: capacity')):
             _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED, target=target)
         local.assert_not_called()
         report.assert_called_once()

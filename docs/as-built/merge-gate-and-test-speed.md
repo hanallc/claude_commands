@@ -62,9 +62,8 @@ Without a supplied assignment, the gate asks `first_step.admitted_run` to place 
 The queue offers natedev, the Mac Linux guest and AWS according to the target configuration.
 A direct merge gate asks after it creates the merge tree. The nightly gate asks after it prepares the fetched checkout.
 The gate keeps merge writes, validation, push, promotion and nightly publication on natedev.
-The natedev handoff returns the initial memory reservation before the local runner takes its reservation.
-A standalone `--module` run asks the queue for placement. A nested `--module` run keeps its parent reservation.
-The remote runner tests the requested module list. The result supplies no pass certificate.
+The natedev handoff keeps its memory reservation until the suites end.
+A `--module` run uses natedev. A nested run keeps its parent reservation.
 `--promote-only` runs on natedev.
 If the gate cannot verify a supplied assignment, it reports the reason and starts no runner.
 An assignment to `natedev` runs the gate on natedev.
@@ -105,17 +104,11 @@ The queue's guestkeep change will retain the Mac claim until a later proof.
 If the guest starts no test run, the route returns `GuestNotStarted`.
 This covers a Mac block or busy Mac claim, a refused or unavailable launch permission, an active retry backoff, a failed guest probe and a failed arm step.
 It also covers a guest run that fails before the runner writes the `mac-linux run start` line, which comes before the gate starts its suites.
-The gate then prints `Mac Linux guest took no run: <cause>` (a merge gate adds `; merge undone, not pushed`), writes a claim failure next to the assignment file (`<assignment>.claim-failure`) and exits with status 79.
-`copies.py gate-step` owns the original placement request. On status 79 it checks the claim failure, reports it to the queue, and asks for placement again with the same request.
-The queue also accepts the claim failure after the gate consumed the launch permission, when a new process read shows that the gate process ended.
-The new assignment goes into the same file, and the gate runs again on the assigned machine.
-The 180-second wait belongs to the guest, not to the run: another free named machine takes the run at once.
-If the guest is the only free machine, the run waits 180 seconds and tries the guest again.
-A second decline from the guest in the same run ends the guest for that run, so a cause that does not clear goes to the next named machine.
-If no named machine remains, the gate step stops with "Gate placement blocked".
-A refused placement during the retry stops the gate step with "Gate placement blocked".
-A failure after the first test started is not placed again: the gate fails.
-`copies.py run` does not place a gate again after a guest decline.
+The gate prints `Mac Linux guest took no run: <cause>` and exits with status 79.
+Status 80 identifies an unknown result after a guest could have started tests.
+A direct gate or `copies.py gate-step` makes one placement request per run.
+Checkpoint and bump stop after status 79 or 80.
+A confirmed test failure gives status 1.
 Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
 A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
 See [Gate placement](build-targets.md#gate-placement).
@@ -207,7 +200,8 @@ The route confirms termination before it releases unused cost reservation.
 A launch timeout keeps the cost reservation until reconciliation confirms the outcome.
 
 The route reports cloud setup and infrastructure failures to the queue.
-The queue can reassign after settlement.
+A gate ends with status 79 if AWS confirms that no tests started.
+A gate ends with status 80 if AWS could have started tests and supplies no verdict.
 Capacity refusals first exhaust the configured sizes and zones.
 A connect failure at launch means AWS did not receive the request, so no box exists.
 The route then skips that region and tries the next region; it prints `Cloud gate skips <region>: <reason>`.
@@ -226,7 +220,7 @@ Launch, refusal, fallback, and finish rows record the queue's tagged job record 
 The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
 Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
-A final AWS refusal prints `AWS gate failed: <reason>`.
+A final AWS refusal prints its reason.
 These lines contain no account, instance, or subnet identifier.
 
 The shared cost ledger includes Rust charges and all gate reservations.

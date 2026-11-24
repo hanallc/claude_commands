@@ -891,7 +891,8 @@ It deducts live gate vCPUs from current Spot quotas and checks recent quota refu
 With `enabled=off` in `cloud_gate.conf`, the queue excludes AWS.
 The route checks this switch again before a launch.
 The AWS route consumes the assignment's launch permission once and reports the result to the queue.
-An AWS refusal ends the gate command and leaves any reassignment to the queue.
+The gate ends with status 79 when AWS takes no run.
+The gate ends with status 80 when AWS could have run tests and gives no verdict.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.

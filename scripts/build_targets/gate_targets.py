@@ -9,6 +9,7 @@ from scripts.build_targets import target_config
 from scripts.direct.step_selection import Pinned
 from scripts.lib import build_folders, conf
 from scripts.lib.build_steps import OtherCommand, gate_natedev_only_flag, gate_target_kind, parse_command_program
+from scripts.mac_test.claim_state import WHOLE_MAC
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,19 @@ class NoEnabledTarget:
     """No enabled target can run the requested Claude gate."""
 
     reason: str = "No enabled build target can run this Claude gate. Check enabled.* in build_targets.conf."
+
+
+def aws_gate_candidate() -> placement.PlacementCandidate:
+    """Use the existing cloud gate switch for AWS placements."""
+    path = conf.path("cloud_gate")
+    destination = placement.PlacementDestination("scaler", "aws", "aws", WHOLE_MAC)
+    settings = placement.ExplicitProviderSettings(path)
+    try:
+        enabled = conf.read(path).value("enabled", conf.on_off, default=False, recover_invalid=False)
+    except conf.Unusable as error:
+        return placement.PlacementCandidate(destination, placement.FixedExclusion(str(error)), settings)
+    eligibility = placement.AllowedHost() if enabled else placement.FixedExclusion("off")
+    return placement.PlacementCandidate(destination, eligibility, settings)
 
 
 def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[str, ...] | NoEnabledTarget:
@@ -45,4 +59,6 @@ def eligible_gate_targets(repo_root: Path, command: tuple[str, ...]) -> tuple[st
         if any(candidate.destination.target == target.name and isinstance(candidate.eligibility, placement.AllowedHost)
                for candidate in fixed.candidates):
             names.append(target.name)
+    if isinstance(aws_gate_candidate().eligibility, placement.AllowedHost):
+        names.append("aws")
     return tuple(names) if names else NoEnabledTarget()

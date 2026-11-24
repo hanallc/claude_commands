@@ -1,7 +1,7 @@
 """Hold first-step admission while a caller prepares its repository slot."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import os
@@ -22,7 +22,7 @@ from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_queue.admission_wire import read_assignment
 from scripts.lib.build_steps import (
-    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, OtherCommand,
+    CLAIM_FAILURE_SUFFIX, GATE_SCRIPTS, OtherCommand,
     VerifyCommand, command_job, command_program, gate_natedev_only_flag, parse_command_program, read_step_names,
     verify_command,
 )
@@ -82,28 +82,11 @@ class FirstStepAdmission:
 
     def _hand_gate(self, grant: GatePlacement) -> None:
         # A local grant keeps its reservation, so the queue reads the assignment as current when the gate checks it.
-        # The gate ends that reservation after the check, before it takes its own (gate.gate_start_target).
-        # close() cancels the placement, and the cancel returns a reservation that the gate did not end.
+        # The gate uses the reservation for its suites. The cancel returns an unused reservation.
         os.environ['BUILDLOG_PLACEMENT_FILE'] = str(self.assignment_file)
         os.environ['BUILDLOG_PLACEMENT_EPISODE'] = grant.grant.assignment.episode
         if isinstance(grant.request.local, wire.LocalAdmissionContext):
             os.environ['BUILDLOG_PLACEMENT_SIDECAR'] = grant.request.local.sidecar
-
-    def place_again(self, request: wire.PlacementRequest) -> None:
-        """Place the gate again with its original request and pass the new assignment to the next run."""
-        grant = self.grant
-        if not isinstance(grant, GatePlacement) or grant.request != request:
-            raise wire.AdmissionUnavailable('only the original gate request can be placed again')
-        self.grant = GatePlacement(_placement_grant(request), request)
-        client.write_assignment(self.assignment_file, self.grant.grant)
-        self._hand_gate(self.grant)
-
-    def run_gate(self, run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
-        """Run the gate; place it again while its Mac Linux guest takes no run."""
-        grant = self.grant
-        if not isinstance(grant, GatePlacement):
-            return run()
-        return run_gate_with_placement(run, self.assignment_file, grant.request, self.place_again)
 
     def close(self) -> None:
         """Release preparation after an error before command startup."""
@@ -199,42 +182,6 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
     return answer
 
 
-def run_gate_with_placement(
-    run: Callable[[], subprocess.CompletedProcess[str]],
-    assignment_file: Path,
-    request: wire.PlacementRequest,
-    place_again: Callable[[wire.PlacementRequest], None],
-) -> subprocess.CompletedProcess[str]:
-    """Retry a gate within the scope that owns its original placement request.
-
-    The placement callback installs the new assignment before the next run.
-    """
-    while True:
-        result = run()
-        if result.returncode != MAC_LINUX_PRELAUNCH_REFUSED_STATUS:
-            return result
-        try:
-            refusal = read_gate_claim_failure(assignment_file, request)
-            settled = client.claim_failure(refusal)
-            # The guest gate can consume the launch permission before it takes no run.
-            if (settled.assignment != refusal.assignment
-                    or settled.state != placement.ClosedAssignment(refusal.reason)
-                    or not isinstance(settled.permission, (placement.PermissionAvailable, placement.PermissionConsumed))
-                    or not isinstance(settled.retry, placement.RetryAt)):
-                raise wire.AdmissionUnavailable('the queue has not settled the Mac guest attempt')
-            destination = refusal.assignment.destination
-            print(f'placement: retry — {destination.host} ({destination.target}) did not answer. '
-                  + 'Requesting placement again.', flush=True)
-            place_again(request)
-            replacement = read_assignment(assignment_file).assignment
-            if (not assignment_matches_request(replacement, request)
-                    or replacement.attempt == refusal.assignment.attempt):
-                raise wire.AdmissionUnavailable('the queue did not provide a replacement assignment')
-        except (OSError, ValueError, wire.AdmissionUnavailable, FirstStepRefused) as error:
-            return subprocess.CompletedProcess(request.constraints.command, result.returncode, '',
-                                               f'Gate placement blocked. {error}\n')
-
-
 def assignment_matches_request(assignment: placement.PlacementAssignment, request: wire.PlacementRequest) -> bool:
     destination = assignment.destination
     return (assignment.episode == request.episode and assignment.owner == request.owner
@@ -276,6 +223,8 @@ def gate_targets(command: Sequence[str], source: Path, requested: str = "") -> t
 def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...],
                   owner: wire.Owner, position: SlotQueuePosition, run: wire.RunIdentity,
                   sidecar: Path) -> wire.PlacementRequest:
+    from scripts.build_targets.gate_targets import aws_gate_candidate
+
     arguments = tuple(command)
     flag = gate_natedev_only_flag(arguments)
     if flag is not None and "natedev" not in targets:
@@ -291,9 +240,12 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
     builder = client.placement_constraint_builder()
     candidates: list[placement.PlacementCandidate] = []
     for name in ordered_names:
-        fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
-            Pinned(name), writes_tree=False)
-        named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)
+        if name == "aws":
+            named = (aws_gate_candidate(),)
+        else:
+            fixed = builder(source, '', 'final', arguments, session, source_key, target_config.ANY_ELIGIBLE_TARGET,
+                Pinned(name), writes_tree=False)
+            named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)
         if not named:
             raise FirstStepRefused(f'gate target {name} is not configured')
         candidates.extend(replace(candidate, eligibility=placement.FixedExclusion(f"{flag} runs only on natedev"))

@@ -81,7 +81,7 @@ from scripts.copies import copies
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+from scripts.lib.build_steps import (CLAIM_FAILURE_SUFFIX,
                                      gate_job_for_command, gate_job_from_process, gate_natedev_only_flag,
                                      gate_target_kind, read_step_names)
 from scripts.lint import memory_admit, sweep
@@ -91,7 +91,7 @@ from scripts.production import (  # noqa: E402
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
-    ALL_MODULES as ALL_MODULES, AllModules as AllModules,
+    ALL_MODULES as ALL_MODULES, AllModules as AllModules, GatePlacementIncomplete, GateTookNoRun,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
     MacGateCancellation as MacGateCancellation, MacGateExcludeFileMissing as MacGateExcludeFileMissing,
     MacGateExclusions as MacGateExclusions, ModuleCoverage, SelectedModules as SelectedModules,
@@ -2489,12 +2489,21 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
-        rollback_merge(repo, baseline)
-        if isinstance(recovery, GateRecovery):
-            recovery.rollback = ""
-            recovery.save()
-        refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
-        raise refused(f"{error or type(error).__name__}; merge undone, not pushed") from error
+        try:
+            rollback_merge(repo, baseline)
+            if isinstance(recovery, GateRecovery):
+                recovery.rollback = ""
+                recovery.save()
+        except Exception as cleanup_error:
+            if not isinstance(error, GatePlacementIncomplete):
+                raise
+            if isinstance(recovery, GateRecovery):
+                recovery.rollback = baseline
+            raise type(error)(f"{error}\nMerge cleanup failed. {cleanup_error or type(cleanup_error).__name__}") from cleanup_error
+        if isinstance(error, GatePlacementIncomplete):
+            print("Merge undone. The merge was not pushed.", file=sys.stderr, flush=True)
+            raise
+        raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
@@ -3091,12 +3100,15 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
         owner = nightly_owner(args)
-        with copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
+        with gate_cleanup_scope() as cleanup:
+            clone = cleanup.enter_context(copies.standing(unit, repo, copies.CommittedSource(commit), step="test-nightly"))
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 with gate_suite_target(args, clone, target) as assigned:
                     run = run_gate_suites(clone, NIGHTLY_TYPE_DIRS, module_time_limit_s=args.module_time_limit_s,
                                           full=True, gate_job=args.gate_job, target=assigned, nightly_types=True)
+            except GatePlacementIncomplete:
+                raise
             except (GateRefused, first_step.FirstStepRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
                 run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),
@@ -3145,6 +3157,8 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 else:
                     print(f"Assign the fix: gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
+    except GatePlacementIncomplete:
+        raise
     except (Exception, KeyboardInterrupt) as error:
         if not result_sent and not (isinstance(run, GateRun) and not run.passed):
             reason = GateRefused("interrupted by SIGINT") if isinstance(error, KeyboardInterrupt) else error
@@ -3207,7 +3221,8 @@ def gate_suite_target(args: GateArguments, source: Path, target: GateTarget) -> 
     if not targets:
         yield "natedev"
         return
-    with first_step.admitted_run(args.command, source, targets=targets) as admitted:
+    with gate_cleanup_scope() as cleanup:
+        admitted = cleanup.enter_context(first_step.admitted_run(args.command, source, targets=targets))
         if not isinstance(admitted.grant, first_step.GatePlacement):
             raise GateAssignmentRefused("The queue returned no gate placement")
         admitted.handoff(source)
@@ -3296,8 +3311,25 @@ class MacLinuxGateRefused(GateRefused):
     """The assigned Mac Linux guest could not complete the gate."""
 
 
-class MacLinuxTookNoRun(GateRefused):
-    """The assigned Mac Linux guest took no run. The caller can place the gate again."""
+class MacLinuxTookNoRun(GateTookNoRun):
+    """The assigned Mac Linux guest did not start the tests."""
+
+
+@contextmanager
+def gate_cleanup_scope() -> Generator[ExitStack]:
+    """Keep the placement error if cleanup also fails."""
+    incomplete: GatePlacementIncomplete | None = None
+    try:
+        with ExitStack() as cleanup:
+            try:
+                yield cleanup
+            except GatePlacementIncomplete as error:
+                incomplete = error
+                raise
+    except Exception as error:
+        if incomplete is not None and error is not incomplete:
+            raise type(incomplete)(f"{incomplete}\nGate cleanup failed. {error or type(error).__name__}") from error
+        raise
 
 
 class GuestNotStartedOutcome(Protocol):
@@ -3418,16 +3450,16 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             ACTIVE_ROUTED_GATE_TREE.reset(token)
 
     match gate_target_kind(target) if isinstance(target, str) else target:
-        case LocalGateAssignment():
+        case LocalGateAssignment() as local_assignment:
             status = 1
             try:
-                run = (run_named_modules(repo, named, mode, local_grant=target) if named else
+                run = (run_named_modules(repo, named, mode, local_grant=local_assignment) if named else
                        run_routed(lambda _routed, _dirty: run_suites(
-                           repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode, local_grant=target)))
+                           repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode, local_grant=local_assignment)))
                 status = int(not run.passed)
                 return run
             finally:
-                release_local_gate(target, status)
+                release_local_gate(local_assignment, status)
         case "natedev" | NoGateAssignment():
             if named:
                 return run_named_modules(repo, named, mode)
@@ -3549,21 +3581,22 @@ def unwind_tests_only_on_sigterm() -> Generator[None]:
 
 def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
     try:
-        with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
-            repo = Path(args.repo).expanduser().resolve()
+        repo = Path(args.repo).expanduser().resolve()
+        with gate_cleanup_scope() as cleanup:
+            _ = cleanup.enter_context(scratch.copy_lock(repo))
             # The copy record names the owner only when the caller and its process family name none,
             # so a bad copy record never refuses a run whose caller gave an owner.
             unowned = isinstance(admission_records.request_owner(""), admission_records.OwnerNotGiven)
             owner = copies.source_owner(repo) if unowned else ""
-            with gate_recovery(repo), admission_records.default_owner(owner):
-                run = run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
-                                      mode=mode, gate_job=args.gate_job, target=target, named=args.modules)
+            _ = cleanup.enter_context(gate_recovery(repo))
+            _ = cleanup.enter_context(admission_records.default_owner(owner))
+            run = run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
+                                  mode=mode, gate_job=args.gate_job, target=target, named=args.modules)
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
-    except MacLinuxTookNoRun as error:
-        print(error, file=sys.stderr, flush=True)
-        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+    except GatePlacementIncomplete:
+        raise
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3662,6 +3695,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
         return run_gate_command(args, target)
+    except GatePlacementIncomplete as error:
+        print(error, file=sys.stderr, flush=True)
+        return error.status
     except (GateRefused, first_step.FirstStepRefused) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -3669,7 +3705,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected:
-        with test_run_folder(), gate_suite_target(args, Path(args.repo).expanduser().resolve(), target) as assigned:
+        with gate_cleanup_scope() as cleanup:
+            _ = cleanup.enter_context(test_run_folder())
+            assigned = cleanup.enter_context(gate_suite_target(args, Path(args.repo).expanduser().resolve(), target))
             return run_tests_only(args, SuiteMode.TARGETED, assigned)
     if args.tests_only:
         with (unwind_tests_only_on_sigterm(),
@@ -3679,24 +3717,22 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
         if args.nightly:
             args.unit = _nightly_unit(args)
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
-        with scratch.copy_lock(checkout):
+        with gate_cleanup_scope() as cleanup:
+            _ = cleanup.enter_context(scratch.copy_lock(checkout))
             if args.nightly:
-                with admission_records.default_owner(args.unit):
-                    try:
-                        return nightly(args, target)
-                    finally:
-                        _sweep_nightly_build_folders()
+                _ = cleanup.enter_context(admission_records.default_owner(args.unit))
+                _ = cleanup.callback(_sweep_nightly_build_folders)
+                return nightly(args, target)
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)
                 if review_list is not None:
                     record_changes(checkout, review_list, production, args.merge_branch)
                 return 0
-            with gate_recovery(checkout):
-                return merge_checkpoint(args, target)
-    except MacLinuxTookNoRun as error:
-        print(error, file=sys.stderr, flush=True)
-        return MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+            _ = cleanup.enter_context(gate_recovery(checkout))
+            return merge_checkpoint(args, target)
+    except GatePlacementIncomplete:
+        raise
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

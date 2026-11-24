@@ -43,7 +43,9 @@ from scripts.build_targets import target_config
 from scripts.lib import build_folders, conf, process_group
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production.gate_routes import AllModules, GateJobKind, GateRun, ModuleCoverage, SuiteMode, TreeSelection
+from scripts.production.gate_routes import (
+    AllModules, GateJobKind, GateResultUnknown, GateRun, ModuleCoverage, SuiteMode, TreeSelection,
+)
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
@@ -1383,9 +1385,13 @@ def stream_diagnostic(stderr: bytes) -> str:
     return ' '.join(stderr.decode(errors='replace').split())[-1200:] or 'no diagnostic'
 
 
+class GuestResultUnavailable(GuestUnavailable):
+    """The guest started tests and supplied no usable result."""
+
+
 def guest_failure(tests_started: bool, reason: str) -> GuestUnavailable:
     """A failure before the first test lets natedev take the gate; a failure after it refuses the gate."""
-    return (GuestUnavailable if tests_started else GuestTookNoRun)(reason)
+    return (GuestResultUnavailable if tests_started else GuestTookNoRun)(reason)
 
 
 def guest_bundle(repo: Path, settings: GuestSettings) -> FullBundle | DeltaBundle:
@@ -1668,6 +1674,9 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(' '.join((str(error), *notes)))
+    except (GuestEndUnproven, GuestResultUnavailable) as error:
+        notes = cast(list[str], getattr(error, '__notes__', []))
+        raise GateResultUnknown(f'{TARGET}: ' + ' '.join((str(error), *notes))) from error
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))
