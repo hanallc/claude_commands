@@ -245,17 +245,18 @@ class ObservedAdmissionServer(service.AdmissionServer):
 
 class TestProcesses:
     """Real pidfds with private resident-memory files."""
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, private_child_starts: bool = False) -> None:
         self.path: Path = path
         path.mkdir(parents=True, exist_ok=True)
-        self.children: list[subprocess.Popen[bytes]] = []
+        self.private_child_starts: bool = private_child_starts
+        self.children: dict[int, subprocess.Popen[bytes]] = {}
         self.starts: dict[int, str] = {}
         self.fixture_owners: dict[int, str] = {}
 
     def spawn(self, used: int = GIB) -> wire.Owner:
         child = subprocess.Popen(["sleep", "300"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.children.append(child)
-        start = records.process_start_time(child.pid)
+        self.children[child.pid] = child
+        start = str(child.pid) if self.private_child_starts else records.process_start_time(child.pid)
         if start is None:
             raise RuntimeError("child has no process start time")
         self.starts[child.pid] = start
@@ -272,10 +273,17 @@ class TestProcesses:
         return gate.process_table(self.path)
 
     def owner_start(self, pid: int) -> service.LiveOwnerIdentity | service.OwnerProcessGone:
-        start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
+        if self.private_child_starts and (child := self.children.get(pid)) is not None:
+            start = self.starts[pid] if child.poll() is None else None
+        else:
+            start = self.fixture_owners[pid] if pid in self.fixture_owners else records.process_start_time(pid)
         return service.OwnerProcessGone() if start is None else service.LiveOwnerIdentity(start)
 
     def owner_process(self, pid: int) -> service.OwnerProcessReading:
+        if self.private_child_starts and pid in self.children:
+            if isinstance(self.owner_start(pid), service.OwnerProcessGone):
+                return service.OwnerProcessGone()
+            return service.linux_owner_process(pid, self.path)
         return service.linux_owner_process(pid, Path("/proc"))
 
     def pidfd(self, pid: int) -> int:
@@ -285,12 +293,12 @@ class TestProcesses:
         return gate.reservation_lifetime(row, owner_live)
 
     def kill(self, owner: wire.Owner) -> None:
-        child = next(child for child in self.children if child.pid == owner.pid)
+        child = self.children[owner.pid]
         child.kill()
         _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def close(self) -> None:
-        for child in self.children:
+        for child in self.children.values():
             if child.poll() is None:
                 child.kill()
             _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
@@ -388,7 +396,8 @@ class GaplessRefill:
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
-                 state_dir: Path | None = None, skip_idle_spacing: bool = False) -> None:
+                 state_dir: Path | None = None, skip_idle_spacing: bool = False,
+                 private_child_starts: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
@@ -409,7 +418,7 @@ class AdmissionFixture(ExitStack):
             self.skip_idle_spacing: bool = skip_idle_spacing
             self.clock: FakeClock = FakeClock()
             self.fault: Faults = Faults()
-            self.proc: TestProcesses = TestProcesses(self.root / "proc")
+            self.proc: TestProcesses = TestProcesses(self.root / "proc", private_child_starts=private_child_starts)
             _ = self.callback(self.proc.close)
             pressure = self.root / "pressure"
             if not pressure.exists():
