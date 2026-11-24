@@ -1431,8 +1431,10 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
         except BaseException as error:
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
-                detail = stream_diagnostic(error.stderr if isinstance(error.stderr, bytes) else b'')
-                raise GuestUnavailable(f'SSH or guest run exceeded {timeout} seconds: {detail}') from error
+                stderr = error.stderr if isinstance(error.stderr, bytes) else b''
+                started = run_start_line(armed.attempt).encode() in stderr.split(b'\n')
+                failure = GuestResultUnavailable if started else GuestUnavailable
+                raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 

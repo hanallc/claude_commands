@@ -1066,7 +1066,7 @@ fi
               patch.object(mac_linux, 'stop_ssh_process', stop_ssh),
               redirect_stderr(io.StringIO()) as errors):
             try:
-                with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'exceeded 1 seconds'):
+                with self.assertRaisesRegex(mac_linux.GuestResultUnavailable, 'exceeded 1 seconds'):
                     _ = self.run_guest_stream(program, self.root / 'placement.cgroup', timeout=1)
             finally:
                 release.set()
@@ -1079,6 +1079,7 @@ fi
         program = f'import signal, sys; sys.stderr.buffer.write({diagnostic!r}); sys.stderr.flush(); signal.pause()'
         with self.assertRaisesRegex(mac_linux.GuestUnavailable, 'diagnostic:') as caught:
             _ = self.run_guest_stream(program, self.root / 'placement.cgroup', timeout=2)
+        self.assertNotIsInstance(caught.exception, mac_linux.GuestResultUnavailable)
         reason = caught.exception.__cause__
         assert isinstance(reason, subprocess.TimeoutExpired)
         self.assertEqual(reason.stderr, diagnostic)
@@ -1316,12 +1317,11 @@ fi
         _ = self.registry.write_text(self.registry.read_text().replace(f'{key}=20', f'{key}=4'))
         with (patch.dict(os.environ, {'FIXTURE_RUN_SECONDS': '30', 'FIXTURE_HELD_LINK': '1'}),
               patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 1),
-              patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6)):
-            result = self.route('hang')
-        self.assertIsInstance(result, str)
+              patch.object(mac_linux.GuestSettings, 'transfer_timeout_seconds', 6),
+              self.assertRaisesRegex(GateResultUnknown, 'SSH or guest run exceeded 6 seconds') as result):
+            _ = self.route('hang')
         group = (self.root / 'run.group').read_text()
-        self.assertIn('SSH or guest run exceeded 6 seconds', str(result))
-        self.assertIn('Guest cleanup: ended', str(result))
+        self.assertIn('Guest cleanup: ended', str(result.exception))
         self.assertEqual(self.run_lock().read_text().split()[0], group)
         self.assertEqual(subprocess.call(['flock', '-x', '-n', self.run_lock(), 'true']), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['probe', 'arm', 'run', 'cleanup'])
@@ -2082,11 +2082,11 @@ fi
         self.assertFalse((self.guest_home / 'build').exists())
 
     def test_inner_reset_after_the_guest_started_does_not_retry(self) -> None:
-        with patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset-after-start'}):
-            result = self.route()
-        self.assertIsInstance(result, str)
-        self.assertIn(mac_linux.RUN_START, str(result))
-        self.assertIn('Connection reset by peer', str(result))
+        with (patch.dict(os.environ, {'FIXTURE_SSH_RUN': 'reset,reset-after-start'}),
+              self.assertRaises(GateResultUnknown) as result):
+            _ = self.route()
+        self.assertIn(mac_linux.RUN_START, str(result.exception))
+        self.assertIn('Connection reset by peer', str(result.exception))
         self.assert_guest_clean('probe', 'arm', 'run', 'run', 'cleanup')
 
     def test_a_different_ssh_error_does_not_retry(self) -> None:
