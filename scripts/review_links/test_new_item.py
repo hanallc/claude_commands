@@ -11,10 +11,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, NoReturn, cast, override
 from unittest import mock
+from urllib.parse import urlencode
 
-from scripts.production import staff
-from scripts.lib import main_publish
-from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions
+from scripts.agents.remote import local_machine
+from scripts.lib import conf, main_publish
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production import staff, the_list
+from scripts.production.staff_test_support import fixture_member
+from scripts.review_links import for_you, new_item, new_item_dialog, review_page, review_submissions, test_serve
 
 def member(identity: str, kind: staff.Kind, name: str, parent: staff.StaffRow | None = None) -> staff.StaffRow:
     reports: staff.ReportsTo | staff.StaffRoot = staff.ReportsTo(parent.id) if parent is not None else staff.StaffRoot()
@@ -323,17 +327,6 @@ class NewItemTests(ServerFixture):
         self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
         self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
 
-    def test_each_review_item_reports_its_own_list_number(self) -> None:
-        self.server.list_number = 1
-        self.assertEqual(self.run_main("bug", "bob", "A waiting row has no drag grip."),
-                         (new_item.Outcome.FILED, "Bug → bob. List item 1.\n", ""))
-        self.server.review_key = "another-key"
-        self.server.list_number = 2
-        self.assertEqual(self.run_main("bug", "bob", "A waiting row has no drag grip."),
-                         (new_item.Outcome.FILED, "Bug → bob. List item 2.\n", ""))
-        first, second = self.server.posts
-        self.assertNotEqual(first["request_id"], second["request_id"])
-
     def test_a_list_write_failure_after_filing_keeps_the_draft(self) -> None:
         def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
                      body: bytes = b"") -> new_item.ServerReply:
@@ -351,6 +344,47 @@ class NewItemTests(ServerFixture):
                              (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
         self.assertEqual(len(self.server.posts), 3)
         self.assertEqual(self.server.posts, [self.server.posts[0]] * 3)
+
+
+class NewItemServerTests(unittest.TestCase):
+    def test_identical_words_create_separate_list_rows_and_review_links(self) -> None:
+        server = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server.doCleanups)
+        server.setUp()
+        case = server.review_fixture()
+        document = server.root.parent / "bob"
+        document.mkdir()
+        bob = fixture_member("producer", name="bob", doc=staff.LiveDoc(local_machine(), document))
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        _ = conf.path("producer_map").write_text("# Producers use their own rows.\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        address = for_you.ConsoleAddress("127.0.0.1", server.port)
+        output, errors = io.StringIO(), io.StringIO()
+        words = "A waiting row has no drag grip."
+        arguments = ["bug", bob.name, words, "--session", "another-session"]
+        with (mock.patch.object(server.server, "review_cache", cache),
+              mock.patch.object(server.server, "delivery_status", case.status),
+              mock.patch.object(server.server.RequestHandlerClass, "log_request"),
+              mock.patch.object(for_you, "console_address", return_value=address),
+              mock.patch("platform.system", return_value="Linux"),
+              redirect_stdout(output), redirect_stderr(errors)):
+            for _ in range(2):
+                self.assertEqual(new_item.main(arguments), new_item.Outcome.FILED, errors.getvalue())
+                self.assertTrue(server.new_item_posts.wait_until_none_run())
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(output.getvalue().splitlines(), ["Bug → bob. List item 1.", "Bug → bob. List item 2."])
+        first, second = the_list.records(morty.id, include_closed=True)
+        self.assertEqual((first.number, second.number), (1, 2))
+        first_key, = first.reviews
+        second_key, = second.reviews
+        self.assertNotEqual(first_key, second_key)
+        reviews = cache.get().records
+        for item, key in ((first, first_key), (second, second_key)):
+            self.assertEqual((item.owner, item.producer, item.unit, item.title), (bob.id, bob.id, "", words))
+            self.assertIn(urlencode({"jump": key}), item.evidence)
+            self.assertEqual((reviews[key].owner, reviews[key].title), (bob.id, words))
 
 
 if __name__ == "__main__":

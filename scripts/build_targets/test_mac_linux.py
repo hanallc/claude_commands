@@ -1163,6 +1163,43 @@ fi
     def test_a_folder_publisher_start_failure_preserves_the_command_output(self) -> None:
         self.check_folder_report_thread_failure('report')
 
+    def test_a_stalled_folder_config_read_warns_after_the_guest_result(self) -> None:
+        program = """
+from pathlib import Path
+import sys
+from threading import Event
+from unittest.mock import patch
+
+from scripts.build_targets import mac_linux
+from scripts.build_targets.test_mac_linux import MacLinuxRouteTests
+from scripts.lib import conf
+
+entered = Event()
+read = conf.read
+
+def read_config(file):
+    if file == 'build_admission':
+        entered.set()
+        Event().wait()
+    return read(file)
+
+case = MacLinuxRouteTests('runTest')
+case.repo, case.guest_home = map(Path, sys.argv[1:])
+with (patch.object(conf, 'read', read_config),
+      patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0.75)):
+    case.check_folder_report_stream()
+    assert entered.wait(1), 'The configuration read did not start.'
+    print('Guest result returned.', flush=True)
+"""
+        process = subprocess.run([sys.executable, '-c', program, str(self.repo), str(self.guest_home)],
+                                 cwd=Path(__file__).resolve().parents[2], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+        self.assertEqual(process.returncode, 0, process.stdout)
+        self.assertEqual(process.stdout.splitlines(), [
+            'Guest result returned.',
+            'Mac Linux guest queue report failed: the queue report configuration read timed out',
+        ])
+
     def test_a_report_preparation_start_failure_preserves_the_command_output(self) -> None:
         self.check_folder_report_thread_failure('prepare')
 

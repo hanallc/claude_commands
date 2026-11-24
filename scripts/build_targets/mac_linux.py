@@ -1126,7 +1126,7 @@ def warn_guest_report(reason: str) -> None:
 
 def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, transfer_deadline: float,
                        reports: ExitStack, *, folder_payload: bytes) -> None:
-    """Start the report worker. Collect only reports from bare start lines."""
+    """Start the report worker and collect Folder reports in a separate thread."""
     started = monotonic()
     preparation_deadline = min(transfer_deadline, started + SSH_CONNECT_TIMEOUT_SECONDS)
     ready: Future[Callable[[], None]] = Future()
@@ -1149,23 +1149,14 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
                     if monotonic() >= deadline:
                         raise TimeoutError(f'no answer in {timeout:g} s')
                 except Exception as error:
-                    if folder_payload:
-                        warn_guest_report(str(error) or type(error).__name__)
-                    else:
-                        result.set_exception(error)
+                    result.set_exception(error)
                 else:
                     result.set_result(None)
 
             worker = Thread(target=report, daemon=True)
             worker.start()
         except Exception as error:
-            if folder_payload:
-                warn_guest_report(str(error) or type(error).__name__)
-            else:
-                ready.set_exception(error)
-            return
-
-        if folder_payload:
+            ready.set_exception(error)
             return
 
         def collect_report() -> None:
@@ -1193,7 +1184,13 @@ def start_guest_report(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, tr
         except Exception as error:
             warn_guest_report(str(error) or type(error).__name__)
 
-    if not folder_payload:
+    if folder_payload:
+        # Keep the process alive until collection finishes or reaches its deadline.
+        try:
+            Thread(target=collect, daemon=False).start()
+        except RuntimeError as error:
+            warn_guest_report(str(error))
+    else:
         _ = reports.callback(collect)
 
 
