@@ -126,6 +126,9 @@ Until setup succeeds, the service refuses guest placement and launch permission.
 The gate refuses the launch before it consumes permission if the state root is missing or is a file.
 Run `./scripts/lib/py scripts/build_targets/build_targets.py setup-mac-linux` on natedev to perform the same setup manually.
 The route records the guest address, machine ID, checkout path, and gate process identity before it requests permission.
+The checkout probe accepts one identity line with an LF or CRLF ending.
+A malformed reply with exit code zero gets one immediate retry.
+For rejected replies, the probe reports the natedev checkout, each exit code, and bounded representations of stdout and stderr.
 The arm checks the saved guest identity before it writes any guest records.
 It appends records to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
 It records `proven` when cleanup confirms the end of a run.
