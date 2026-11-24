@@ -15,10 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
-from scripts.build_queue.first_step import gate_targets
+from scripts.build_queue.first_step import FirstStepRefused, gate_targets
 from scripts.copies import copies
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
+from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, command_program
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
@@ -116,10 +116,19 @@ def test_steps(production: ProductionDocument, paths: tuple[str, ...],
     return steps
 
 
+def checkpoint_gate_targets(command: Sequence[str], folder: Path) -> tuple[str, ...]:
+    """Report unavailable placement as a blocked checkpoint."""
+    try:
+        return gate_targets(command, folder)
+    except FirstStepRefused as error:
+        reason = str(error)
+        raise Stop("test", "blocked", reason, reason) from error
+
+
 def run_test_command(command: list[str], folder: Path, *, raise_start_errors: bool = False) -> subprocess.CompletedProcess[str]:
     locks = copies.COMMAND_LOCKS.get()
     submitted = command
-    targets = gate_targets(command)
+    targets = checkpoint_gate_targets(command, folder)
     if targets:
         scripts = Path(__file__).resolve().parents[1]
         submitted = [str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "gate-step",
@@ -142,9 +151,9 @@ def failed_tests(output: str) -> frozenset[str]:
     return frozenset(NEXTEST_FAIL.findall(output))
 
 
-# A red module in the merge gate output: `--- accounts/test_accounts.py exit=1 ---`.
+# A failed module in the gate output: `--- accounts/test_accounts.py exit=1 ---`.
 GATE_RED = re.compile(r"^--- (\S+) (?:rerun alone )?exit=(-?\d+) ---$", re.MULTILINE)
-# A module that the merge gate passed when it ran the module again alone.
+# A module that passed when the gate ran it again alone.
 GATE_GREEN_ALONE = re.compile(r"^--- (\S+) passed on rerun alone; first run exit=", re.MULTILINE)
 
 
@@ -153,7 +162,7 @@ def runs_merge_gate(command: Sequence[str]) -> bool:
 
 
 def red_names(command: Sequence[str], output: str) -> frozenset[str]:
-    """Return the red gate modules of a merge gate command, or the red nextest tests of another command."""
+    """Return the failed modules for a gate command or the failed nextest tests for another command."""
     if not runs_merge_gate(command):
         return failed_tests(output)
     green = frozenset(GATE_GREEN_ALONE.findall(output))
@@ -229,8 +238,9 @@ def stop_test_without_result(step: CheckpointTestStep, result: subprocess.Comple
     if result.returncode == TREE_CHANGED_STATUS:
         raise Stop("test", "cancelled", f"{step.label} cancelled because the tree changed; log {log}",
                    f"resubmit this checkpoint after your edits are done; test log: {log}")
-    if result.returncode == MAC_LINUX_PRELAUNCH_REFUSED_STATUS and command_program(step.command) in GATE_SCRIPTS:
-        raise Stop("test", "blocked", f"{step.label} could not complete placement. Log {log}",
+    if (result.returncode in (MAC_LINUX_PRELAUNCH_REFUSED_STATUS, GATE_RESULT_UNKNOWN_STATUS)
+            and command_program(step.command) in GATE_SCRIPTS):
+        raise Stop("test", "blocked", f"{step.label} ended with gate status {result.returncode}. Log {log}",
                    f"Check the gate placement in {log}.")
 
 
@@ -322,7 +332,7 @@ class BumpGateRecord(TypedDict):
     started: str
     pid: int
     proc_start: str
-    result: Literal["pending", "green", "red"]
+    result: Literal["pending", "green", "red", "blocked"]
     detail: str
     log: str
 
@@ -367,11 +377,11 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
         if not same_gate_runner(current, record) or current["result"] == "pending":
             print("bump gate delivery superseded; no notice sent", flush=True)
             return
-        red = current["result"] == "red"
-        text = (f"Bump gate {'red' if red else 'green'}: {current['unit']}; tip {current['tip']}; "
+        text = (f"Bump gate {current['result']}: {current['unit']}; tip {current['tip']}; "
                 + f"{current['detail']}; log {current['log']}")
         script = tool("send.py", session_send.SEND_SCRIPT, "MERGE_CHECKPOINT_SEND")
-        recipients: tuple[Literal["unit", "showrunner"], ...] = ("unit", "showrunner") if red else ("showrunner",)
+        recipients: tuple[Literal["unit", "showrunner"], ...] = (
+            ("showrunner",) if current["result"] == "green" else ("unit", "showrunner"))
         delivered = current.get("delivered_to", [])
         current["delivered_to"] = delivered
         for recipient in recipients:
@@ -396,7 +406,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                     print(f"bump gate send {recipient} attempt {attempt} failed: {error}", flush=True)
 
 
-def complete_gate(path: Path, record: BumpGateRecord, result: Literal["green", "red"], detail: str) -> None:
+def complete_gate(path: Path, record: BumpGateRecord, result: Literal["green", "red", "blocked"], detail: str) -> None:
     with record_lock(path):
         current = read_record(path)
         if not same_gate_runner(current, record):

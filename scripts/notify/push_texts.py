@@ -5,12 +5,15 @@ import hashlib
 import importlib
 import json
 import string
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.display_text import display_field
 from scripts.message import session_send
 from scripts.message.send_result import SEND_RETRY_EXIT as SEND_RETRY_EXIT
 
@@ -246,6 +249,24 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
     if timeout:
         command.extend(["--timeout", str(timeout)])
     return command
+
+
+def send_user_push(rendered: RenderedPush, *, sender: str, key: str, clears_when: str, send_timeout_s: float,
+                   options: tuple[str, ...] = ()) -> bool:
+    """Send one outage phone push to the user, with its clear check. Print the reason when send.py refuses it."""
+    from scripts.lib.process_failure import failure_detail
+
+    command = user_send_argv(rendered, sender=sender, key=key)
+    command.extend(["--clears-when", clears_when, *options, "--recipient-key", "user"])
+    try:
+        sent = subprocess.run(command, capture_output=True, text=True, timeout=send_timeout_s, check=False)
+        if sent.returncode == 0:
+            return True
+        reason = failure_detail(sent)
+    except (OSError, subprocess.SubprocessError) as error:
+        reason = str(error)
+    print(f"{sender}: phone push {key} failed: {display_field(reason)}", file=sys.stderr)
+    return False
 
 
 def user_retire_argv(sender: str, key: str) -> list[str]:

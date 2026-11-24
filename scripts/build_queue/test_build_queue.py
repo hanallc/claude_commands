@@ -1,250 +1,264 @@
-"""Build priority controls use one admission reading and the caller identity."""
+"""Check the durable build priority command with private admission state."""
 from __future__ import annotations
 
-from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, TimedChunk
-from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, build_queue
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
-import json
 import os
-from pathlib import Path
 import unittest
 from unittest import mock
-from typing import Protocol, cast, override
-from scripts.build_queue.queue_fixture import NOW, QueueFixture, write_memory_config
-from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase
+from typing import cast, override
+
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records
+from scripts.build_queue import admission_service, build_queue, person_actions, queue_snapshot
+from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash
 from scripts.lint import memory_admit
 from scripts.message import unit_labels
-from scripts.message.unit_labels import UnitLabels
 
-GIB = records.GIB
 
-class LabelReadMock(Protocol):
-    return_value: dict[str, UnitLabels]
-
-class QueueTests(NotificationGuardedTestCase):
-    fixture: QueueFixture = cast(QueueFixture, cast(object, None))
-    root: Path = Path()
-    labels_read: LabelReadMock = cast(LabelReadMock, cast(object, None))
+class QueueTests(unittest.TestCase):
+    fixture: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
 
     @override
     def setUp(self) -> None:
-        super().setUp()
-        self.fixture = self.enterContext(QueueFixture(captured=False))
-        self.root = self.fixture.root
-        _ = self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=self.fixture.read))
-        self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
-        config = self.root / "build_admission.conf"
-        write_memory_config(config)
-        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
-        self.enterContext(mock.patch.dict(os.environ, {"MAC_IDLE_STATE_DIR": str(self.root / "mac-idle")}))
-        _ = self.enterContext(mock.patch.object(os, "cpu_count", return_value=17))
+        self.fixture = self.enterContext(AdmissionFixture())
+        self.fixture.free(0)
+        self.fixture.hold_starts()
+
+    def waiter(self, pid: int, unit: str) -> wire.AdmitRequest:
+        owner = self.fixture.fixture_owner(pid, str(pid))
+        request = self.fixture.request(owner=owner)
+        request = replace(request, identity=replace(request.identity, name="recorded-" + unit,
+            unit=unit, folder=f"/fixture/tree-{pid}"))
+        _ = self.fixture.server.handle_request(request)
+        return request
+
+    def save_for(self, request: wire.AdmitRequest, name: str) -> person_actions.Bump:
+        key = self.fixture.server.waiters[request.episode].row.get("move_id", "")
+        assert key
+        bump = person_actions.Bump(name, person_actions.SetBump(key), request.identity.unit,
+            "actor", self.fixture.clock.now(), "urgent")
+        person_actions.save_bump(self.fixture.state_dir, bump)
+        return bump
+
+    def bumps(self) -> list[person_actions.Bump]:
+        return [bump for _, bump in person_actions.pending_bumps(self.fixture.state_dir, 0)]
+
+    def priority_events(self) -> list[str]:
+        return [line for path in self.fixture.state_dir.parent.glob("*/*.jsonl")
+                for line in path.read_text().splitlines() if '"queue_priority"' in line]
+
+    def priority_units(self) -> list[str]:
+        priority = self.fixture.server.priority
+        return [entry["unit"] for entry in priority.entries] if isinstance(priority, records.QueuePriority) else []
+
+    def bump_output(self, *words: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with (mock.patch("sys.argv", ["build_queue.py", *words]),
+              redirect_stdout(output), redirect_stderr(errors)):
+            status = build_queue.main()
+        return status, output.getvalue(), errors.getvalue()
 
     def test_bare_bump_prints_usage_and_the_builds_page_link(self) -> None:
         from scripts.build_queue import memory_feed
 
         for arguments in ((), ("--help",)):
-            with self.subTest(arguments=arguments), mock.patch("sys.argv", ["build_queue.py", *arguments]), \
-                 mock.patch.object(memory_feed, "page_url", return_value="https://fixture/builds"), \
-                 mock.patch.object(memory_admit, "queue_read") as read, redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(build_queue.main(), 0)
-            self.assertEqual(output.getvalue(),
-                "Usage: /build:bump <position|session|folder> | clear [unit]\nhttps://fixture/builds\n")
-            read.assert_not_called()
+            with (self.subTest(arguments=arguments),
+                  mock.patch.object(memory_feed, "page_url", return_value="https://fixture/builds"),
+                  mock.patch.object(queue_snapshot, "read_queue_snapshot") as read):
+                self.assertEqual(self.bump_output(*arguments),
+                    (0, "Usage: /build:bump <position|session|folder> | clear [unit]\nhttps://fixture/builds\n", ""))
+                read.assert_not_called()
 
-    def test_bump_from_any_session_records_the_actor(self) -> None:
-        _ = self.fixture.waiter(100, "head-id", "head")
-        _ = self.fixture.waiter(200, "worker-id", "worker")
-        admission = self.private_mutation_service()
-        labels = {"worker-id": UnitLabels("worker", unit="berth")}
-        self.labels_read.return_value = labels
-        for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
-                                      ("", "codex-session", "codex-session"), ("", "", "user")):
-            with self.subTest(actor=actor), \
-                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}), \
-                 mock.patch.object(memory_admit, "priority_labels", return_value=labels):
-                self.assertEqual(self.bump_output("2")[0], 0)
-                priority = admission.server.priority
-                self.assertNotIsInstance(priority, records.NoQueuePriority)
-                if not isinstance(priority, records.NoQueuePriority):
-                    self.assertEqual(priority.entries[0]["set_by"], actor)
-                events = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
-                          for line in path.read_text().splitlines() if '"queue_priority"' in line]
-                self.assertEqual(events[-1]["set_by"], actor)
-                self.assertEqual(admission_client.priority_clear(actor), wire.Ok())
+    def test_bump_records_with_a_silent_socket(self) -> None:
+        request = self.waiter(200, "berth")
+        selected = self.fixture.server.waiters[request.episode].row.get("move_id", "")
+        with (mock.patch.object(admission_client, "view", side_effect=wire.AdmissionUnavailable("no answer")) as view,
+              mock.patch.object(admission_client, "priority_set",
+                                side_effect=wire.AdmissionUnavailable("no answer")) as set_priority,
+              mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "actor-id"}),
+              mock.patch("time.time", return_value=123.0)):
+            status, output, errors = self.bump_output("1")
+        self.assertEqual((status, errors), (0, ""))
+        bump, = self.bumps()
+        self.assertEqual(output, f"build queue: recorded {bump.id}\n")
+        self.assertEqual(bump, person_actions.Bump(bump.id, person_actions.SetBump(selected, 1),
+            "berth", "actor-id", 123.0, "the user's bump"))
+        view.assert_not_called()
+        set_priority.assert_not_called()
 
-    def test_clear_one_unit_passes_the_unit_to_the_client(self) -> None:
-        with mock.patch.object(records, "queue_command_actor", return_value="actor"), mock.patch.object(
-                admission_client, "priority_clear", return_value=wire.Ok()) as clear, mock.patch(
-                "sys.argv", ["build_queue.py", "clear", "demo"]), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(build_queue.main(), 0)
-        clear.assert_called_once_with("actor", "demo")
-        self.assertEqual(output.getvalue(), "queue priority cleared\n")
+    def test_clear_one_unit_records_a_known_priority(self) -> None:
+        _ = self.waiter(200, "demo")
+        self.assertEqual(self.bump_output("1")[0], 0)
+        _ = self.fixture.server.run_pass()
+        with (mock.patch.object(records, "queue_command_actor", return_value="actor"),
+              mock.patch.object(admission_client, "priority_clear") as socket_clear):
+            status, output, errors = self.bump_output("clear", "demo")
+            socket_clear.assert_not_called()
+        self.assertEqual((status, errors), (0, ""))
+        bump = self.bumps()[-1]
+        self.assertEqual(output, f"build queue: recorded {bump.id}\n")
+        self.assertEqual((bump.action, bump.unit, bump.actor, bump.reason),
+            (person_actions.ClearBump(), "demo", "actor", "the user's clear"))
 
-    def test_clear_unknown_unit_distinguishes_refusal_from_unavailable_service(self) -> None:
-        cases = (
-            (wire.Refused("unknown unit missing"), 3, "build queue: unknown unit missing\n", ""),
-            (wire.AdmissionUnavailable("no socket"), 2, "",
-             "build queue: admission service unavailable: no socket\n"),
-        )
-        for result, expected_status, expected_output, expected_errors in cases:
-            output, errors = io.StringIO(), io.StringIO()
-            with self.subTest(result=result), mock.patch.object(
-                    records, "queue_command_actor", return_value="actor"), mock.patch.object(
-                    admission_client, "priority_clear", side_effect=(
-                        result if isinstance(result, wire.AdmissionUnavailable) else None),
-                    return_value=result) as clear, mock.patch(
-                    "sys.argv", ["build_queue.py", "clear", "missing"]), \
-                    redirect_stdout(output), redirect_stderr(errors):
-                self.assertEqual(build_queue.main(), expected_status)
-            clear.assert_called_once_with("actor", "missing")
-            self.assertEqual(output.getvalue(), expected_output)
-            self.assertEqual(errors.getvalue(), expected_errors)
+    def test_clear_unknown_unit_refuses_without_a_record(self) -> None:
+        with mock.patch.object(admission_client, "priority_clear", return_value=wire.Refused("unknown unit missing")):
+            self.assertEqual(self.bump_output("clear", "missing"),
+                (3, "build queue: unknown unit missing; the queue priority did not change\n", ""))
+        self.assertEqual(self.bumps(), [])
 
-    def test_repeat_bump_prints_the_same_priority_place(self) -> None:
-        _ = self.fixture.waiter(100, "head-id", "head")
-        _ = self.fixture.waiter(200, "worker-id", "worker")
-        admission = self.private_mutation_service()
-        labels = {"head-id": UnitLabels("head", unit="demo"),
-                  "worker-id": UnitLabels("worker", unit="cables")}
-        self.labels_read.return_value = labels
-        with mock.patch.object(memory_admit, "priority_labels", return_value=labels):
-            self.assertIn("priority #1", self.bump_output("1")[1])
-            self.assertIn("priority #2", self.bump_output("2")[1])
-            self.assertIn("priority #1", self.bump_output("1")[1])
-        priority = admission.server.priority
-        assert isinstance(priority, records.QueuePriority)
-        self.assertEqual([entry["unit"] for entry in priority.entries], ["demo", "cables"])
+    def test_bump_pass_applies_records_in_file_order_and_restart_applies_none_twice(self) -> None:
+        _ = self.waiter(100, "head")
+        tail = self.waiter(200, "tail")
+        other = self.waiter(300, "other")
+        for name, request in (("first", other), ("second", tail), ("repeat", other)):
+            _ = self.save_for(request, name)
+        self.assertEqual(self.priority_units(), [])
+        _ = self.fixture.server.run_pass()
+        self.assertEqual(self.priority_units(), ["other", "tail"])
+        self.assertEqual(self.fixture.queue_pids(), [300, 200, 100])
+        state = admission_service.read_state(self.fixture.state_dir)
+        journal = self.fixture.state_dir / person_actions.JOURNAL_NAME
+        self.assertEqual(state.bumps.offset, journal.stat().st_size)
+        self.assertEqual({episode: move.from_place for episode, move in state.bumps.moves.items()},
+                         {other.episode: 3, tail.episode: 3})
+        self.fixture.restart()
+        self.assertEqual(self.priority_units(), ["other", "tail"])
+        self.assertEqual(admission_service.read_state(self.fixture.state_dir).bumps, state.bumps)
+        self.assertEqual(len(self.priority_events()), 2)
 
-    def test_bump_passes_a_dash_unit_as_one_argparse_value(self) -> None:
-        with mock.patch.object(records, "queue_command_actor", return_value="showrunner"), \
-             mock.patch.object(build_queue, "bump", return_value=0) as run:
+    def test_bump_restart_applies_the_tail_after_the_state_write(self) -> None:
+        first = self.waiter(200, "first")
+        second = self.waiter(300, "second")
+        _ = self.save_for(first, "first")
+        _ = self.save_for(second, "second")
+        self.fixture.fault.stage = "after_state_write"
+        with self.assertRaises(InjectedCrash):
+            _ = self.fixture.server.run_pass()
+        self.assertEqual(self.priority_units(), ["first"])
+        self.fixture.restart()
+        self.assertEqual(self.priority_units(), ["first", "second"])
+        self.assertEqual(person_actions.bump_status(self.fixture.state_dir), ())
+        self.assertEqual(len(self.priority_events()), 2)
+
+    def test_bump_set_then_clear_leaves_the_previous_priority(self) -> None:
+        _ = self.waiter(100, "head")
+        _ = self.waiter(200, "tail")
+        self.assertEqual(self.bump_output("1")[0], 0)
+        _ = self.fixture.server.run_pass()
+        for arguments in (("2",), ("clear", "tail")):
+            self.assertEqual(self.bump_output(*arguments)[0], 0)
+        self.assertEqual(self.priority_units(), ["head"])
+        _ = self.fixture.server.run_pass()
+        self.assertEqual(self.priority_units(), ["head"])
+        self.assertEqual(person_actions.bump_status(self.fixture.state_dir), ())
+
+    def test_bump_for_a_departed_step_keeps_the_refusal_after_restart(self) -> None:
+        request = self.waiter(200, "demo")
+        _ = self.save_for(request, "gone")
+        self.fixture.end_fixture_owner(200)
+        _ = self.fixture.server.run_pass()
+        self.assertEqual(self.priority_units(), [])
+        expected = (person_actions.BumpNotApplied("demo", "the step left the queue"),)
+        self.assertEqual(person_actions.bump_status(self.fixture.state_dir), expected)
+        self.fixture.restart()
+        self.assertEqual(person_actions.bump_status(self.fixture.state_dir), expected)
+
+    def test_bump_passes_a_dash_selector_as_one_value(self) -> None:
+        with (mock.patch.object(records, "queue_command_actor", return_value="showrunner"),
+              mock.patch.object(build_queue, "bump", return_value=0) as run):
             self.assertEqual(self.bump_output("-x"), (0, "", ""))
         run.assert_called_once_with("-x", "showrunner")
 
-    def test_bump_sets_the_units_priority_and_reports_its_resolved_place(self) -> None:
-        first = self.fixture.waiter(100, "head-id", "head")
-        second = self.fixture.waiter(200, "worker-id", "worker")
-        before = (first.read_bytes(), second.read_bytes())
-        admission = self.private_mutation_service()
-        with mock.patch.object(memory_admit, "priority_labels", return_value={"worker-id": UnitLabels("worker", unit="berth")}):
-            self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="berth")}
-            status, output, errors = self.bump_output("2")
-            self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 100])
-        self.assertEqual((status, output, errors), (0, "queue priority set for berth (step #2): first step now #1; priority #1\n", ""))
-        self.assertEqual((first.read_bytes(), second.read_bytes()), before)
-        priority = admission.server.priority
-        self.assertNotIsInstance(priority, records.NoQueuePriority)
-        if not isinstance(priority, records.NoQueuePriority):
-            self.assertEqual((priority.entries[0]["unit"], priority.entries[0]["why"]), ("berth", "the user's bump"))
-
     def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
-        admission = self.private_mutation_service()
-        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unmatched priority write")):
-            status, output, errors = self.bump_output("berth")
-        self.assertEqual((status, output, errors), (3, "build queue: no waiting step matches berth\n", ""))
-        self.assertIsInstance(admission.server.priority, records.NoQueuePriority)
+        with mock.patch.object(unit_labels, "unit_labels_for", return_value={}):
+            self.assertEqual(self.bump_output("missing"), (3, "build queue: no waiting step matches missing\n", ""))
+        self.assertEqual(self.bumps(), [])
+
+    def test_bump_uses_the_place_numbers_that_include_a_kept_place(self) -> None:
+        _ = self.waiter(100, "head")
+        worker = self.waiter(200, "worker")
+        published = queue_snapshot.read_view_snapshot(self.fixture.state_dir)
+        now = self.fixture.clock.now()
+        kept = records.HeldPlace("queue", "fixture", "lint", now, now, now + 60, "4242-99",
+                                 ("natedev",), 1, "failed", position=2)
+        reading = replace(published.reading, held_places=(kept,))
+        queue_snapshot.write_view_snapshot(self.fixture.state_dir, published.written_at, published.fresh_until,
+                                          wire.encode_reply(wire.ViewReply(reading)).encode())
+        with mock.patch.object(admission_client, "priority_set") as priority:
+            self.assertEqual(self.bump_output("2"), (3, "build queue: place #2 is kept for queue\n", ""))
+            self.assertEqual(self.bumps(), [])
+            status, output, errors = self.bump_output("3")
+            priority.assert_not_called()
+        self.assertEqual((status, errors), (0, ""))
+        bump, = self.bumps()
+        self.assertEqual(output, f"build queue: recorded {bump.id}\n")
+        step_key = self.fixture.server.waiters[worker.episode].row.get("move_id", "")
+        self.assertTrue(step_key)
+        self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(step_key, 3), "worker"))
 
     def test_bump_requires_exactly_one_selector_without_running_priority(self) -> None:
         for selectors in (("berth", "other"), ("two words",)):
-            with self.subTest(selectors=selectors), \
-                 mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("usage ran priority")):
+            with self.subTest(selectors=selectors):
                 self.assertEqual(self.bump_output(*selectors),
                     (3, "build bump: use /build:bump <position|session|folder>\n", ""))
+        self.assertEqual(self.bumps(), [])
 
-    def test_bump_selectors_send_the_selected_rows_real_unit_and_actor(self) -> None:
-        _ = self.fixture.waiter(100, "head-id", "head")
-        _ = self.fixture.waiter(200, "worker-id", "worker")
-        self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="actual-unit")}
-        for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200"):
-            with self.subTest(selector=selector), \
-                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "actor-id"}), \
-                 mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as mutation:
-                self.assertEqual(self.bump_output(selector),
-                    (0, "queue priority set for actual-unit (step #2): first step now #2\n", ""))
-                mutation.assert_called_once_with("actual-unit", "the user's bump", "actor-id")
+    def test_bump_selectors_record_the_selected_step_and_unit(self) -> None:
+        _ = self.waiter(100, "head")
+        tail = self.waiter(200, "tail")
+        labels = {tail.identity.session_id: unit_labels.UnitLabels("worker", unit="roster-tail")}
+        selected = self.fixture.server.waiters[tail.episode].row.get("move_id", "")
+        with mock.patch.object(unit_labels, "unit_labels_for", return_value=labels) as read_roster:
+            self.assertEqual(self.bump_output("2")[0], 0)
+            read_roster.assert_not_called()
+            for selector in (tail.identity.session_id, "worker", "/fixture/tree-200", "tree-200"):
+                with self.subTest(selector=selector):
+                    self.assertEqual(self.bump_output(selector)[0], 0)
+        self.assertEqual([(bump.action, bump.unit) for bump in self.bumps()],
+                         [(person_actions.SetBump(selected, 2), "tail")] * 5)
 
-    def test_bump_row_without_a_unit_refuses_without_writing_priority(self) -> None:
-        _ = self.fixture.waiter(100, "head-id", "head")
-        self.labels_read.return_value = {}
-        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unitless priority write")):
-            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
+    def test_unitless_bump_refuses_without_writing_priority(self) -> None:
+        _ = self.waiter(100, "")
+        with mock.patch.object(memory_admit, "priority_labels", return_value={}):
+            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step 1 has no unit\n", ""))
+        self.assertEqual(self.bumps(), [])
 
-    def test_unowned_row_refuses_a_bump_without_writing_priority(self) -> None:
-        _ = self.fixture.waiter(100, "", "")
-        self.labels_read.return_value = {}
-        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unowned priority write")):
-            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
+    def test_clear_from_any_session_records_the_actor(self) -> None:
+        for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
+                                    ("", "codex-session", "codex-session"), ("", "", "user")):
+            with (self.subTest(actor=actor),
+                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}),
+                  mock.patch.object(admission_client, "priority_clear", return_value=wire.Ok())):
+                self.assertEqual(self.bump_output("clear")[0], 0)
+                self.assertTrue(self.bumps(), "clear must save a record")
+                bump = self.bumps()[-1]
+                self.assertEqual((bump.action, bump.unit, bump.actor), (person_actions.ClearBump(), "", actor))
 
-    def test_clear_from_any_session_sends_the_actor(self) -> None:
-        for arguments in (("clear",),):
-            for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
-                                          ("", "codex-session", "codex-session"), ("", "", "user")):
-                with self.subTest(arguments=arguments, actor=actor), \
-                     mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude, "CODEX_THREAD_ID": codex}), \
-                     mock.patch.object(admission_client, "priority_clear", return_value=wire.Ok()) as clear, \
-                     mock.patch("sys.argv", ["build_queue.py", *arguments]), \
-                     redirect_stdout(io.StringIO()):
-                    self.assertEqual(build_queue.main(), 0)
-                    clear.assert_called_once_with(actor)
+    def test_bump_without_a_published_order_reports_unavailable(self) -> None:
+        (self.fixture.state_dir / "queue.json").unlink()
+        (self.fixture.state_dir / queue_snapshot.VIEW_NAME).unlink()
+        self.assertEqual(self.bump_output("1"),
+                         (2, "", "build queue: a numeric selector requires the published queue view\n"))
+        self.assertEqual(self.bumps(), [])
 
-    def private_mutation_service(self) -> AdmissionFixture:
-        files = {path: path.read_bytes() for path in self.fixture.directory.glob("*.waiting")}
-        admission = self.enterContext(AdmissionFixture(root=self.root, log_dir=self.root / "buildlog"))
-        for path, contents in files.items():
-            _ = path.write_bytes(contents)
-        admission.clock.epoch = NOW
-        admission.free(0)
-        admission.hold_starts()
-        for path in self.fixture.directory.glob("*.waiting"):
-            row = memory_admit.read_waiter(path)
-            owner = admission.fixture_owner(row["pid"], row["start_time"])
-            request = admission.request(owner=owner, need=row["need"], since=row["since"])
-            request = replace(request, identity=wire.Identity(row.get("session_id", ""),
-                row.get("session_name", ""), row.get("step", ""), row.get("folder", "")))
-            _ = admission.server.handle_request(request)
-        _ = self.enterContext(admission.serving())
-        _ = self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=admission_client.view))
-        return admission
+    def test_numeric_bump_requires_the_published_view(self) -> None:
+        _ = self.waiter(100, "head")
+        worker = self.waiter(200, "worker")
+        (self.fixture.state_dir / queue_snapshot.VIEW_NAME).unlink()
 
-    def bump_output(self, *units: str) -> tuple[int, str, str]:
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch("sys.argv", ["build_queue.py", *units]), \
-             redirect_stdout(output), redirect_stderr(errors):
-            status = build_queue.main()
-        return status, output.getvalue(), errors.getvalue()
+        self.assertEqual(self.bump_output("2"),
+                         (2, "", "build queue: a numeric selector requires the published queue view\n"))
+        self.assertEqual(self.bumps(), [])
+
+        with mock.patch.object(unit_labels, "unit_labels_for", return_value={}):
+            self.assertEqual(self.bump_output(worker.identity.folder)[0], 0)
+        bump, = self.bumps()
+        step_key = self.fixture.server.waiters[worker.episode].row.get("move_id", "")
+        self.assertEqual((bump.action, bump.unit), (person_actions.SetBump(step_key, 2), "worker"))
 
 
-if __name__ == "__main__":
-    _ = unittest.main()
-
-class ServiceQueryFailureTests(unittest.TestCase):
-    def test_views_use_one_query_deadline_for_missing_and_silent_services(self) -> None:
-        for silent in (False, True):
-            with self.subTest(silent=silent), AdmissionFixture() as fixture:
-                timeout = records.read_memory_config().query_timeout_seconds
-                for arguments in (["4"], ["1"]):
-                    exchange = (Exchange(TimedChunk(timeout / 4, b"{"), TimeoutError()) if silent
-                                else Exchange(connect_error=FileNotFoundError()))
-                    transport = ScriptedTransport(fixture.clock, exchange)
-                    output, errors = io.StringIO(), io.StringIO()
-                    started = fixture.clock.monotonic()
-                    with mock.patch.object(admission_client, "CLOCK", fixture.clock), \
-                         mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket), \
-                         mock.patch("time.sleep", side_effect=AssertionError("a query must not retry")), \
-                         mock.patch("sys.argv", ["queue", *arguments]), \
-                         redirect_stdout(output), redirect_stderr(errors):
-                        status = build_queue.main()
-                    self.assertEqual(fixture.clock.monotonic() - started, timeout if silent else 0)
-                    self.assertEqual(len(transport.attempts), 1)
-                    self.assertEqual(len(transport.requests), 1 if silent else 0)
-                    self.assertEqual(status, 2)
-                    self.assertEqual(output.getvalue(), "")
-                    reason = "no answer in 0.5 s" if silent else "no socket"
-                    self.assertEqual(errors.getvalue(),
-                        f"build queue: admission service unavailable: {reason}\n")
-
+class ServiceQueryTests(unittest.TestCase):
     def test_queue_read_returns_the_private_services_exact_reading(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -254,3 +268,7 @@ class ServiceQueryFailureTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             with fixture.serving():
                 self.assertEqual(memory_admit.queue_read(), reply.reading)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

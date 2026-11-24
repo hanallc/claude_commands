@@ -268,6 +268,90 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     self.assertNotIn("docs/plans/alpha.md", tree)
                     self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha phase \S+ as-built \(")
 
+    def duplicate_shrink_on_unit_branch(self) -> str:
+        plan = "docs/plans/alpha.md"
+        subject = "shrink(alpha): phase 43"
+        initial = "Phase 43 is open.\n\n# Schedule\n\nReview the plan.\n\n# Phase 44\n"
+        base = self.checkpoint(plan, initial, subject="Add the plan", push=False)
+        _ = self.git("merge", "--ff-only", base)
+        _ = self.git("merge", "--ff-only", base, cwd=self.promote)
+        shortened = initial.replace("Phase 43 is open.", "Phase 43 is complete.")
+        original = self.checkpoint(plan, shortened, subject=subject, push=False)
+        _ = self.git("merge", "--no-ff", "-m", "Merge the first shrink", original, cwd=self.promote)
+        _ = self.git("push", "origin", "main", "production")
+        _ = self.push_main_change("src/alpha.txt", "main changes this file\n")
+        _ = self.git("reset", "--hard", base, cwd=self.unit)
+        duplicate = self.checkpoint(plan, shortened, subject=subject + " again", push=False)
+        self.assertEqual(self.git("merge-base", original, duplicate), base)
+        self.assertEqual(self.git("diff", original, duplicate), "")
+        return duplicate
+
+    def test_shrink_scope_accepts_an_empty_diff_already_on_main(self) -> None:
+        shrink = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("fetch", "origin", "main")
+        _ = self.git("merge", "--no-ff", "-m", "Bring main into production", "origin/main")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        before = self.git("rev-parse", "HEAD^{tree}")
+        main = self.git("rev-parse", "main", cwd=self.origin)
+        _ = self.git("update-ref", "refs/heads/main", f"{shrink}^1", cwd=self.origin)
+        held = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+        self.assertEqual(held.process.returncode, 1, held.process.stdout + held.process.stderr)
+        self.assertIn("scope: held — shrink paths must be", held.process.stdout)
+        _ = self.git("update-ref", "refs/heads/main", main, cwd=self.origin)
+
+        result = self.run_checkpoint(shrink, "--shrink", phase="43", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("scope: ok — 0 changed paths", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "origin/production^{tree}"), before)
+        self.assertEqual(self.git("rev-parse", "origin/production^2"), shrink)
+
+    def test_shrink_ancestry_accepts_a_duplicate_shrink_on_another_branch(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-parse", f"{closing}^"), duplicate)
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
+    def test_shrink_ancestry_accepts_a_duplicate_with_a_production_only_parent(self) -> None:
+        duplicate = self.duplicate_shrink_on_unit_branch()
+        _ = self.git("reset", "--hard", f"{duplicate}^", cwd=self.unit)
+        parent = self.checkpoint("src/beta.txt", "production work\n", subject="Update production", push=False)
+        _ = self.git("merge", "--ff-only", parent)
+        _ = self.git("push", "origin", "production")
+        _ = self.git("cherry-pick", duplicate, cwd=self.unit)
+        plan = "docs/plans/alpha.md"
+        content = (self.unit / plan).read_text() + "\nPhase 44 is complete.\n"
+        closing = self.checkpoint(plan, content, subject="shrink(alpha): phase 44")
+        self.assertEqual(self.git("rev-list", "main..production", cwd=self.origin), parent)
+
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("ancestry: ok", result.process.stdout)
+
+    def test_shrink_ancestry_holds_on_content_after_a_duplicate_shrink(self) -> None:
+        _ = self.duplicate_shrink_on_unit_branch()
+        subject = "Add pending work"
+        pending = self.checkpoint("src/beta.txt", "pending work\n", subject=subject, push=False)
+        closing = self.checkpoint("docs/plans/alpha.md", "phase 44 complete\n", subject="shrink(alpha): phase 44")
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assert_stopped_before_merge(result, "held", f"ancestry: held — unmerged commit {pending[:12]}: {subject}")
+        self.assertIn(f"wait for {pending[:12]} to merge, then resend the shrink", result.process.stdout)
+
+    def test_shrink_ancestry_holds_on_conflict_after_a_duplicate_shrink(self) -> None:
+        _ = self.duplicate_shrink_on_unit_branch()
+        subject = "Change a line that main changed"
+        pending = self.checkpoint("src/alpha.txt", "branch changes this file\n", subject=subject, push=False)
+        closing = self.checkpoint("docs/plans/alpha.md", "phase 44 complete\n", subject="shrink(alpha): phase 44")
+        result = self.run_checkpoint(closing, "--shrink", phase="44", review=False)
+        self.assert_stopped_before_merge(result, "held", f"ancestry: held — unmerged commit {pending[:12]}: {subject}")
+        self.assertIn(f"wait for {pending[:12]} to merge, then resend the shrink", result.process.stdout)
+
     def test_checkpoint_merges_into_its_staff_parent_and_ignores_unavailable_worktrees(self) -> None:
         checkpoint = self.checkpoint()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):

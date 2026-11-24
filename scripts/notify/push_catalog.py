@@ -147,6 +147,12 @@ ENTRIES = (
          PushExample("three_tests", {"minutes": "12", "tests": waiting_tests(3)})),
         purpose="The Mac does not answer while natedev tests wait for it.",
         expand_values=mac_idle_unreachable_values),
+    PushText("machine_watch.unreachable", "Machine watch", "blocked", "Builds cannot reach {machine}",
+        ActionTemplate("Turn on the {machine} build machine and check its network connection."),
+        "For {minutes} min, the build queue could not connect to the {machine} build machine. "
+        + "Until {machine} answers again, its build steps wait or run more slowly on natedev instead.",
+        (PushExample("guest", {"machine": "mac-linux", "minutes": "60"}),),
+        purpose="Builds cannot connect to a machine in use."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "
@@ -347,11 +353,6 @@ ENTRIES = (
             "free": "140.0 GiB", "floor": "150.0 GiB",
             "recommendation": "Review ~/old-output first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall."})),
         purpose="A low-disk alert recommends one folder for natedev review."),
-    PushText("sweep.disk_floor_recovered", "disk_floor", "note", "{machine} disk space is back", NoActionNeeded(),
-        "{machine} has {free} free, above the {rearm} line. The next fall below {floor} sends one alert.",
-        (PushExample("natedev", {"machine": "natedev", "free": "156.0 GiB", "rearm": "155.0 GiB", "floor": "150.0 GiB"}),
-         PushExample("Mac", {"machine": "Mac", "free": "156.0 GiB", "rearm": "155.0 GiB", "floor": "150.0 GiB"})),
-        purpose="The disk stayed above the rearm line after a delivered low-space alert."),
     # Current disk-floor.nix: alertGib=150, build floor=300 GiB.
     PushText("nixos.disk_low", "disk_floor", "note", "Builds need more disk space",
         ActionTemplate("In a terminal on natedev, delete {shortfall} GiB of personal files you no longer need."),

@@ -268,7 +268,7 @@ def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_M
 def queue_path() -> Path:
     state = os.environ.get("ZONE_STATE") or str(
         Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "zone")
-    return Path(state) / "mac.json"
+    return Path(state).absolute() / "mac.json"
 
 
 def read_queue() -> PendingMacPull | NoPendingMacPull:
