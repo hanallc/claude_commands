@@ -190,17 +190,15 @@ A session id gets at most one restart in that interval, including failed attempt
 before relaunch it becomes a durable `launching` reservation; the saved login,
 cwd, config directory and original process identity remain in the journal.
 The relaunch budget equals twice `command_timeout_seconds`, plus `relaunch_launch_seconds` and `relaunch_confirmation_seconds`.
-The initial budget is 1320 seconds: two 600-second commands, 90 seconds for launch, and 30 seconds for confirmation. A timeout, nonzero result or
-failure to start retains the reservation and sends the blocked push. The timer
-never repeats an unconfirmed launch, including after an interrupted sweep.
-Even exit 0 keeps the reservation until a live replacement has the same session,
-cwd and account directory, a different process identity, and a healthy nix shell.
-A replacement that is still broken, or no healthy confirmation within the launch
-budget, sends the blocked push. A late healthy replacement clears the pending
-record without starting another copy.
-A replacement still missing its nix shell, or an unchanged
-broken session after the guard interval, requires user repair. Observing a
-healthy session permits future independent recovery after the hour guard.
+The initial budget is 1320 seconds. It includes two 600-second commands, 90 seconds for launch, and 30 seconds for confirmation.
+A timeout, an error exit, or a failure to start keeps the reservation and sends an alert.
+The timer never repeats an unconfirmed launch, even after an interrupted sweep.
+Exit 0 also keeps the reservation until the healer confirms a live replacement.
+The replacement must have the same session ID, cwd and account directory, a different process identity, and a healthy nix shell.
+The healer sends an alert if the replacement is still broken or the launch budget expires without confirmation.
+A late healthy replacement clears the pending record without starting another copy.
+An unchanged session that is still broken after the guard interval also requires repair.
+After the healer observes a healthy session, it can recover the session again after the hour guard.
 An unreadable journal prevents automatic restarts.
 
 Every restart, refusal, and change in a skip reason appends one object to
@@ -208,11 +206,23 @@ Every restart, refusal, and change in a skip reason appends one object to
 `name`, `cwd`, `action`, and `reason`. Times are UTC ISO timestamps. Repeated
 unchanged skip reasons do not add lines.
 
-A refused environment or failed recovery sends the registered STE push
-`nix_heal.failed` once, with key `nix-heal-<id>`. Its `--clears-when` command is
-`heal.py sweep --only <id> --check`: exit 0 requires a live healthy session;
-a missing, broken or unreadable process keeps it active. No restart occurs in
-check mode. The push catalog owns its title, action and text.
+A refused environment or failed recovery alerts the nearest showrunner above the session's staff row.
+The message gives the cause, the raw reason, and the retry and escalation commands.
+The journal records `showrunner_alerted` with the name of the showrunner after a confirmed send.
+If the staff record is unreadable, no showrunner owns the session, or the send lacks confirmation, the healer sends Nate the push.
+The healer writes the fallback reason to stderr. The timer saves it in its run log.
+
+1. Repair the nix setup on the affected machine. Get Nate's approval before you change `/etc/nixos`.
+2. Run `heal.py retry --only <id>` after the repair. It clears the restart guard and notification flag for the next sweep.
+3. Run `heal.py escalate --only <id>` if you cannot repair the setup. It uses the saved failure reason to send Nate the push.
+
+Both commands take the same state lock as the sweep.
+Retry refuses while a restart is pending. Escalation requires a live session and a saved reason.
+A failed retry can send a new showrunner alert.
+
+The push catalog owns the title, action and text of `nix_heal.failed`.
+The push keeps the key `nix-heal-<id>` and the clear command `heal.py sweep --only <id> --check`.
+Check mode exits 0 only when the session is live and healthy. It performs no restart.
 
 ## Timer registration
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Restart idle Claude sessions that missed their worktree's nix environment.
 
-Registry decoding and process identity belong to message/sessions.py. Build
-holds belong to the build-target state readers. A locked journal reserves each
-restart before invoking shutdown, including failed attempts, for one hour.
-A five-minute notifier timer runs the sweep.
+The sweep reserves each restart in the journal before shutdown.
+It reports failed recovery to the owning showrunner.
+If the showrunner cannot receive the alert, the sweep sends Nate a push.
+Use retry after a repair, or escalate if the repair fails.
 """
 from __future__ import annotations
 try:
@@ -23,8 +23,8 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
-from contextlib import ExitStack
+from collections.abc import Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +34,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.lib import atomic_file, conf, nix_env
 from scripts.herdr import herdr, pane_launch
 from scripts.production import staff
-from scripts.message import send_result, session_records, sessions
+from scripts.message import send_result, session_records, session_send, sessions
 from scripts.message import send_budget
 if TYPE_CHECKING:
     from scripts.notify import push_texts, review
@@ -131,6 +131,7 @@ class HealHistory(TypedDict):
     notified: bool
     action: str
     reason: str
+    alert_reason: str
     pending: NoPendingRestart | PendingRestart
 
 
@@ -291,7 +292,7 @@ def hold_reason() -> str:
 
 def new_history() -> HealHistory:
     return HealHistory(restart_at=0.0, restart_pid=0, restart_proc_start="", healthy_since_restart=False,
-                       notified=False, action="", reason="", pending=NoPendingRestart(kind="none"))
+                       notified=False, action="", reason="", alert_reason="", pending=NoPendingRestart(kind="none"))
 
 
 def read_pending(value: object) -> NoPendingRestart | PendingRestart:
@@ -334,19 +335,32 @@ def read_history(directory: Path) -> dict[str, HealHistory]:
         start, notified = fields.get("restart_proc_start"), fields.get("notified")
         healthy = fields.get("healthy_since_restart")
         action, reason = fields.get("action"), fields.get("reason")
+        alert_reason = fields.get("alert_reason", reason)
         if (not isinstance(restarted, (int, float)) or isinstance(restarted, bool) or not math.isfinite(restarted)
                 or not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(start, str)
                 or not isinstance(healthy, bool) or not isinstance(notified, bool)
-                or not isinstance(action, str) or not isinstance(reason, str)):
+                or not isinstance(action, str) or not isinstance(reason, str) or not isinstance(alert_reason, str)):
             raise ValueError("invalid nix-heal session state; refusing to lose the restart guard")
         histories[key] = HealHistory(restart_at=float(restarted), restart_pid=pid,
             restart_proc_start=start, healthy_since_restart=healthy, notified=notified, action=action, reason=reason,
-            pending=read_pending(fields.get("pending", {"kind": "none"})))
+            alert_reason=alert_reason, pending=read_pending(fields.get("pending", {"kind": "none"})))
     return histories
 
 
 def save_history(directory: Path, histories: dict[str, HealHistory]) -> None:
     atomic_file.write_text_atomic(directory / "state.json", json.dumps(histories))
+
+
+@contextmanager
+def state_lock(directory: Path) -> Generator[bool]:
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "state.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 def log(directory: Path, session: HealSession, history: HealHistory, action: str, reason: str) -> None:
@@ -360,28 +374,91 @@ def log(directory: Path, session: HealSession, history: HealHistory, action: str
     history["action"], history["reason"] = action, reason
 
 
+def alert_cause(reason: str) -> str:
+    if reason.endswith(".envrc loaded but no nix shell (IN_NIX_SHELL unset)"):
+        return "The automatic restart could not fix it. The .envrc file loaded, but no nix shell started."
+    if reason == "session still has no nix shell after its heal restart":
+        return "An automatic restart did not fix it."
+    return "The automatic restart could not fix it. The nix shell setup refused to load."
+
+
+def heal_command(command: str, session_id: str, *options: str) -> str:
+    return shlex.join([str(SCRIPTS / "lib/py"), str(Path(__file__).resolve()), command, "--only", session_id, *options])
+
+
+def send_alert(command: list[str], limits: HealLimits) -> tuple[send_result.Outcome | None, str]:
+    try:
+        timeout = max(limits.alert_seconds, send_budget.user_seconds(review.user_send_seconds()))
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return None, str(error)
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+    return (outcome.header.outcome if isinstance(outcome, send_result.ConfirmedSendOutcome) else None), detail
+
+
+def send_push(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory,
+              reason: str) -> tuple[bool, str]:
+    push = push_texts.render("nix_heal.failed", session=session.name,
+                             machine=socket.gethostname(), cwd=str(session.cwd), cause=alert_cause(reason))
+    command = push_texts.user_send_argv(push, key=f"nix-heal-{session.session_id}")
+    command.extend(["--clears-when", heal_command("sweep", session.session_id, "--check")])
+    outcome, detail = send_alert(command, limits)
+    if outcome in {"sent", "skipped", "replaced", "queued", "kept"}:
+        history["notified"] = True
+        return True, outcome.upper()
+    log(directory, session, history, "push_failed", detail)
+    return False, " ".join(detail.split())
+
+
+def showrunner_owner(session_id: str) -> staff.StaffRow | None:
+    record = staff.snapshot()
+    member = record.by_member_reference(session_id)
+    if member is None:
+        return None
+    visited = {member.id}
+    parent = record.parent_of(member)
+    while parent is not None and parent.id not in visited:
+        if parent.kind == "showrunner":
+            return parent
+        visited.add(parent.id)
+        parent = record.parent_of(parent)
+    return None
+
+
 def alert(directory: Path, limits: HealLimits, session: HealSession, history: HealHistory, reason: str) -> None:
     if history["notified"]:
         return
-    if reason.endswith(".envrc loaded but no nix shell (IN_NIX_SHELL unset)"):
-        cause = "The automatic restart could not fix it. The .envrc file loaded, but no nix shell started."
-    elif reason == "session still has no nix shell after its heal restart":
-        cause = "An automatic restart did not fix it."
+    history["alert_reason"] = reason
+    try:
+        owner = showrunner_owner(session.session_id)
+    except (OSError, ValueError, staff.StaffRefused, staff.StaffNotFound) as error:
+        fallback = f"Could not read the staff record. {error}"
     else:
-        cause = "The automatic restart could not fix it. The nix shell setup refused to load."
-    check = shlex.join([str(SCRIPTS / "lib/py"), str(Path(__file__).resolve()), "sweep",
-                        "--only", session.session_id, "--check"])
-    push = push_texts.render("nix_heal.failed", session=session.name,
-                             machine=socket.gethostname(), cwd=str(session.cwd), cause=cause)
-    command = push_texts.user_send_argv(push, key=f"nix-heal-{session.session_id}")
-    command.extend(["--clears-when", check])
-    timeout = max(limits.alert_seconds, send_budget.user_seconds(review.user_send_seconds()))
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    outcome = send_result.send_outcome(result.returncode, result.stdout)
-    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in {"sent", "skipped", "replaced", "queued", "kept"}:
-        history["notified"] = True
-    else:
-        log(directory, session, history, "push_failed", (result.stderr or result.stdout).strip() or f"exit {result.returncode}")
+        fallback = "The session has no owning showrunner."
+        if owner is not None:
+            machine = socket.gethostname()
+            text = (
+                f"The nix shell for {session.name} did not load on {machine}.\n"
+                f"The worktree is {session.cwd}.\n"
+                f"{alert_cause(reason)}\n"
+                f"The healer recorded this reason.\n{reason}\n\n"
+                "1. Repair the nix setup for this worktree. Get Nate's approval before you change /etc/nixos.\n"
+                f"2. Run this command on {machine} after the repair.\n"
+                f"   {heal_command('retry', session.session_id)}\n"
+                f"3. Run this command on {machine} to send Nate a push if you cannot repair the setup.\n"
+                f"   {heal_command('escalate', session.session_id)}"
+            )
+            command = session_send.send_argv("--to", str(owner.id), "--from", "nix-heal",
+                                             "--key", f"nix-heal-{session.session_id}", "--text", text)
+            outcome, detail = send_alert(command, limits)
+            if outcome in {"sent", "queued", "kept"}:
+                history["notified"] = True
+                log(directory, session, history, "showrunner_alerted", owner.name)
+                return
+            fallback = f"Could not confirm the alert to {owner.name}. {detail}"
+    print(f"nix-heal: {session.session_id}: {fallback}", file=sys.stderr)
+    _ = send_push(directory, limits, session, history, reason)
 
 
 def stop_completion(session: HealSession, login: str) -> StopComplete | StopPending | StopRefused:
@@ -596,11 +673,8 @@ def sweep(only: str = "", check: bool = False) -> int:
         needs_attention = [item for item in selected if not isinstance(inspect(item), (Healthy, Gone))]
         if not needs_attention and not (directory / "state.json").exists():
             return 0
-        directory.mkdir(parents=True, exist_ok=True)
-        with (directory / "state.lock").open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with state_lock(directory) as locked:
+            if not locked:
                 return 0
             histories = read_history(directory)
             pending_ids: set[str] = set()
@@ -644,7 +718,45 @@ def sweep(only: str = "", check: bool = False) -> int:
         return 1 if check else 0
 
 
-class SweepArguments(argparse.Namespace):
+def update_recovery(command: str, session_id: str) -> int:
+    try:
+        directory = state_directory()
+        with state_lock(directory) as locked:
+            if not locked:
+                print("The nix-heal state is busy.")
+                return 1
+            histories = read_history(directory)
+            history = histories.get(session_id)
+            if command == "retry":
+                if history is not None:
+                    if history["pending"]["kind"] != "none":
+                        print(f"A restart is pending for {session_id}.")
+                        return 1
+                    history.update(restart_at=0.0, restart_pid=0, restart_proc_start="",
+                                   healthy_since_restart=False, notified=False)
+                    save_history(directory, histories)
+                print(f"The next sweep can retry {session_id}.")
+                return 0
+            session = find_session(session_id)
+            if isinstance(session, Unavailable):
+                print(f"Could not read the live session. {' '.join(session.reason.split())}")
+                return 1
+            if isinstance(session, Gone):
+                print(f"No live session matches {session_id}.")
+                return 1
+            if history is None or not history["alert_reason"]:
+                print(f"No failure reason is saved for {session_id}.")
+                return 1
+            confirmed, outcome = send_push(directory, HealLimits.read(), session, history, history["alert_reason"])
+            save_history(directory, histories)
+            print(f"{outcome} push for {session_id}." if confirmed else f"Push failed. {outcome}")
+            return 0 if confirmed else 1
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"{command} failed. {' '.join(str(error).split())}")
+        return 1
+
+
+class HealArguments(argparse.Namespace):
     def __init__(self) -> None:
         super().__init__()
         self.command: str = ""
@@ -654,11 +766,15 @@ class SweepArguments(argparse.Namespace):
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("sweep",))
+    _ = parser.add_argument("command", choices=("sweep", "retry", "escalate"))
     _ = parser.add_argument("--only", default="")
     _ = parser.add_argument("--check", action="store_true")
-    parsed = parser.parse_args(arguments, namespace=SweepArguments())
-    return sweep(parsed.only, parsed.check)
+    parsed = parser.parse_args(arguments, namespace=HealArguments())
+    if parsed.command == "sweep":
+        return sweep(parsed.only, parsed.check)
+    if not parsed.only or parsed.check:
+        parser.error(f"{parsed.command} requires --only and does not accept --check")
+    return update_recovery(parsed.command, parsed.only)
 
 
 if __name__ == "__main__":
