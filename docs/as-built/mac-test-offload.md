@@ -820,8 +820,10 @@ The Mac retains its single slot per repository.
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
 The copy stays kept if `stop-checkout` cannot confirm it is clear.
-The queue reads the smoke exit status from SSH.
-Cleanup keeps old scratch recovery records that contain `argv.json.state`.
+The queue reads the smoke exit status from the final output line and checks the run token.
+It keeps the run record if the final status is missing or invalid.
+For an old scratch run, the callback confirms checkout clearance before it ends the task and removes both registry rows.
+The queue removes the old run record and receipt after successful cleanup.
 
 [Gate checkouts](gate-checkouts.md#remote-mirrors) defines the mirror metadata, lock order, recovery, process scans, registry commands, and probe behavior.
 Candidate leases precede the shared scan, so a process that starts before lease acquisition protects its mirror.
