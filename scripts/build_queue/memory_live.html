@@ -2772,6 +2772,7 @@ function canvasFont(element) {
 
 const MIN_TRACK_WIDTH = 160;
 const TABLE_CAP_GAP = 12;
+const MIN_TABLE_CAP_GAP = 4;
 const PREFERRED_STEP_REM = 10;
 function fitWalkDetails() {
   const walk = $("walk");
@@ -2784,9 +2785,10 @@ function fitWalkDetails() {
   walk.style.minWidth = "";
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
+  let tableCapGap = TABLE_CAP_GAP;
   function measure(labelWidth) {
-    // The table starts half the cap line and the gap past the cap, as the placement below sets it.
-    const neededWidth = table.getBoundingClientRect().width + 0.5 + TABLE_CAP_GAP;
+    // The table starts half the cap line plus the gap after the cap.
+    const neededWidth = table.getBoundingClientRect().width + 0.5 + tableCapGap;
     root.style.setProperty("--amt", labelWidth);
     const fullTrackWidth = walk.getBoundingClientRect().right - track.getBoundingClientRect().left;
     const reservedWidth = capFraction > 0
@@ -2860,6 +2862,11 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("step", chosen.width);
   let fit = measure(chosen.label);
+  // Use the available space for the cap gap before widening the walk.
+  if (capFraction > 0 && fit.tableSpare < 0) {
+    tableCapGap = Math.max(MIN_TABLE_CAP_GAP, Math.floor(TABLE_CAP_GAP + fit.tableSpare));
+    fit = measure(chosen.label);
+  }
   const shortBy = minimumTrackWidth - fit.remainingWidth;
   if (shortBy > 0) {
     // Beyond the cap the track runs under the table, so a wider walk gives the chart only the cap share.
@@ -2885,7 +2892,7 @@ function fitWalkDetails() {
     headingRight = heading.getBoundingClientRect().left + Math.ceil(context.measureText(heading.textContent).width)
       + parseFloat(getComputedStyle(walk).getPropertyValue("--queue-heading-gap"));
   }
-  const capLeft = range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
+  const capLeft = range.left + range.width * capFraction + 0.5 + tableCapGap;
   const tableLeft = !hasCap(latest) ? tableRight : Math.max(capLeft, Math.min(tableRight, headingRight));
   walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
@@ -2893,7 +2900,7 @@ function fitWalkDetails() {
     if (!metadata) continue;
     const detail = row.querySelector(".amounts");
     if (row.classList.contains("cloud-work"))
-      detail.style.maxWidth = `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px`;
+      detail.style.maxWidth = `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - tableCapGap)}px`;
     row.style.minHeight = "44px";
     metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));

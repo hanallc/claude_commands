@@ -5406,6 +5406,10 @@ def write_browser_fixture(folder: Path) -> None:
         verified_waiter["detail"] = builder.name
         verify_page["walk"].extend(row for row in fixture.mac_verify_call_page()["walk"]
                                    if row.get("kind") == "mac-build" and "verify" in row)
+        # Give Chrome fixed seven-digit PIDs after the admission checks use the real processes.
+        for pid, row in enumerate((*verify_page["walk"], *verify_page["waiters"]), start=4_000_100):
+            if isinstance(row["pid"], int):
+                row["pid"] = pid
         pages["verify_calls"] = json.loads(memory_feed.page_json(verify_page))
         pages["three_target_gate_wait"] = json.loads(memory_feed.page_json(
             fixture.gate_wait_page(placement.AllowedHost())))

@@ -879,6 +879,25 @@ try {
                 assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut at 1440 px.');
               }
               if (width === 900) {
+                const pidLayouts = await evaluate(`(() => {
+                  const walk = document.querySelector('#walk');
+                  const scroll = walk.closest('.walk-scroll');
+                  const layouts = [[999999,999999], [999999,4194304], [4194304,4194304]].map(([runningPid,waitingPid]) => {
+                    renderWalk({...latest, walk:latest.walk.map(row => ({...row,pid:runningPid})),
+                      waiters:latest.waiters.map(row => ({...row,pid:waitingPid}))});
+                    fitLabels();
+                    return {
+                      runningPid, waitingPid, pidWidth:walk.querySelector('thead .pid').getBoundingClientRect().width,
+                      overflow:scroll.scrollWidth - scroll.clientWidth,
+                      trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
+                    };
+                  });
+                  renderWalk(latest);
+                  fitLabels();
+                  return layouts;
+                })()`);
+                assert.ok(pidLayouts.every(({overflow, trackWidth}) => overflow <= 1 && trackWidth >= 159),
+                  'The 900 px walk does not fit both PID widths. ' + JSON.stringify(pidLayouts));
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
                 assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);

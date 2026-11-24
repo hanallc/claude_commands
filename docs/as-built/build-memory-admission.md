@@ -2468,7 +2468,8 @@ The table is always beside the chart, and each step uses one row at every pane w
 In a narrow pane the table narrows its column gaps.
 A pane still too narrow for the chart and the table scrolls the Running and Queued card sideways; the page itself does not scroll.
 The card never scrolls down, and its axis labels fit their 16 px row.
-The table starts half the cap line and one gap past the cap, and the fit measures the table at that same place.
+The fit measures and places the table half the cap line plus a gap after the cap.
+The gap starts at 12 px and can decrease to 4 px before the card needs to scroll.
 The label column is as wide as the widest row title or small line, running or waiting, with the reorder handle space of its row. The Free row also counts.
 When the queue shows reorder handles, every waiting row keeps the handle space, so the title of a fixed row lines up with the others.
 A row title never wraps. In a pane too narrow for it, the title ends in an ellipsis, and the row hover gives the full text.
