@@ -172,8 +172,6 @@ PLACEMENT_REASON_TEXT = {
     "offload_exclude": "the target excludes this step",
 }
 
-MAC_FIT_EXCLUSIONS = frozenset({"memory", "fit"})
-
 
 def confirmed_guest_run(assignment: placement.PlacementAssignment,
                         evidence: execution_identity.ExecutionEvidence) -> records.ConfirmedGuestRun | None:
@@ -1350,9 +1348,18 @@ def same_remote_resource(first: placement.PlacementDestination, second: placemen
 
 
 def mac_only_request(request: wire.PlacementRequest) -> bool:
-    """Identify both forms of a request that requires the Mac."""
-    return (isinstance(request.constraints.selection, placement.MacOnlyHost)
-            or isinstance(request.route, target_config.MacOnly))
+    """Identify requests that require the Mac."""
+    selection, route = request.constraints.selection, request.route
+    return (isinstance(selection, placement.MacOnlyHost)
+            or isinstance(route, target_config.MacOnly)
+            or isinstance(selection, placement.PinnedHost) and selection.target == "mac"
+            or isinstance(route, target_config.PinnedTarget) and route.target == "mac")
+
+
+def _probe_hold_exclusion(eligibility: placement.HostEligibility, *, mac_only: bool) -> bool:
+    """Check if a temporary exclusion permits a hold for one probe."""
+    return isinstance(eligibility, placement.TemporaryExclusion) and (
+        eligibility.reason == "busy" or mac_only and eligibility.reason not in ("disk", "off", "state"))
 
 
 @dataclass(frozen=True)
@@ -1363,14 +1370,6 @@ class PlacementHold:
     destination: placement.PlacementDestination
     key: placement.HostEvidenceKey
     observed_at: float
-
-
-@dataclass(frozen=True)
-class MacFitHold:
-    """Keep the Mac for a Mac-only request that waits for capacity."""
-
-    episode: str
-    destination: placement.PlacementDestination
 
 
 @dataclass(frozen=True)
@@ -1860,7 +1859,6 @@ class AdmissionServer:
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
         # Start time of each hold that keeps a remote destination for an older waiting request.
         self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
-        self.mac_fit_holds: set[MacFitHold] = set()
         # The reading that answered each ended hold. That reading never starts another hold.
         self.placement_hold_answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
@@ -3318,12 +3316,7 @@ class AdmissionServer:
             self.next_pass = self.clock.monotonic()
         remaining = {owner for owner, episode in by_owner.items() if episode in self.waiters}
         snapshot_owners = (inputs.waiter_orders.keys() | held_owners) & remaining
-        mac_waits = {records.run_owner(request.owner.pid, request.owner.start_time)
-                     for request in self.placement_requests.values()
-                     if mac_only_request(request) and isinstance(request.purpose, placement.NormalStep)
-                     and self._placement_waiting(request)}
-        ordered = [(path, row) for path, row in visible_order
-                   if records.waiter_owner(row) in snapshot_owners or records.waiter_owner(row) in mac_waits]
+        ordered = [(path, row) for path, row in visible_order if records.waiter_owner(row) in snapshot_owners]
         try:
             queue_snapshot.write_queue_snapshot(self.state_dir,
                 replace(inputs, ordered=ordered, spacing=self.spacing,
@@ -4689,7 +4682,8 @@ done
         row = self._row(admission, place)
         if isinstance(request.run, wire.RunIdentity):
             row["build_run"] = _live_run(request.run)
-        row["route"] = target_config.MAC_ONLY if mac_only_request(request) else request.route
+        row["route"] = (target_config.MAC_ONLY if isinstance(request.constraints.selection, placement.MacOnlyHost)
+                        else request.route)
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
         if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)
@@ -5002,13 +4996,14 @@ done
             return self._placement_status(terminal[-1].assignment)
         candidates = self.placement_eligibility.get(request.episode, ())
         selection = request.constraints.selection
-        if isinstance(selection, placement.MacOnlyHost):
+        if mac_only_request(request):
             refusal = next((candidate.eligibility.reason for candidate in candidates
                 if candidate.destination.target == "mac"
-                and (isinstance(candidate.eligibility, placement.FixedExclusion)
-                     or isinstance(candidate.eligibility, placement.TemporaryExclusion)
-                     and candidate.eligibility.reason != "busy"
-                     and candidate.eligibility.reason not in MAC_FIT_EXCLUSIONS)), "")
+                and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
+                and (candidate.eligibility.reason == "disk"
+                     or isinstance(selection, placement.MacOnlyHost)
+                     and (isinstance(candidate.eligibility, placement.FixedExclusion)
+                          or candidate.eligibility.reason not in ("busy", "blocked")))), "")
             if refusal:
                 return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
                     placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
@@ -5093,7 +5088,6 @@ done
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
             self.placement_hold_answers = {}
-            self.mac_fit_holds = set()
             return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
@@ -5122,8 +5116,7 @@ done
         removed: set[str] = set()
         pending_remote_starts = set(inputs.pending_remote_starts)
         cargo_folders = dict(inputs.cargo_folders)
-        held: list[PlacementHold | MacFitHold] = []
-        fit_holds: set[MacFitHold] = set()
+        held: list[PlacementHold] = []
         taken: list[placement.PlacementDestination] = []
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         answers: dict[tuple[str, placement.PlacementDestination], float] = {}
@@ -5135,7 +5128,7 @@ done
             prerequisite = self.prerequisites.get(request.episode)
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
-            waiting_for: list[PlacementHold | MacFitHold] = []
+            waiting_for: list[PlacementHold] = []
             for candidate in self.placement_eligibility.get(request.episode, ()):
                 destination = candidate.destination
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
@@ -5144,10 +5137,10 @@ done
                         and isinstance(inputs.build_space, records.NoBuildSpaceHold)
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
-                hold = self._placement_hold(request, candidate, answers)
-                if hold is not None:
-                    waiting_for.append(hold)
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
+                    hold = self._placement_hold(request, candidate, answers)
+                    if hold is not None:
+                        waiting_for.append(hold)
                     continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
@@ -5188,16 +5181,12 @@ done
             else:
                 for hold in waiting_for:
                     held.append(hold)
-                    if isinstance(hold, MacFitHold):
-                        fit_holds.add(hold)
-                        continue
                     start = self.placement_holds.get((hold.episode, hold.destination))
                     # A hold lasts until the next probe of the older request; it never starts again on the same reading.
                     if start is not None and hold.observed_at < start:
                         holds[(hold.episode, hold.destination)] = start
         self.placement_holds = holds
         self.placement_hold_answers = answers
-        self.mac_fit_holds = fit_holds
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
         named = {owner: candidates for owner, request in owners.items()
                  if self._placement_waiting(request) and (candidates := self._placement_candidate_reading(request))}
@@ -5206,33 +5195,25 @@ done
             pending_remote_starts=frozenset(pending_remote_starts), placement_candidates=named)
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
-                        answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | MacFitHold | None:
-        """Keep a remote destination for a waiting request.
+                        answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
+        """Keep a remote destination for one probe of an older request.
 
-        A Mac-only capacity hold ends when the request starts, leaves, or gets a fixed or disk exclusion.
-        Other holds give the request one probe to get a free reading.
+        A reading that ended a hold does not start another hold.
         """
         destination = candidate.destination
         eligibility = candidate.eligibility
-        if not isinstance(request.purpose, placement.NormalStep) or destination.provider in ("local", "scaler"):
-            return None
-        if (destination.target == "mac" and mac_only_request(request)
-                and not isinstance(eligibility, placement.FixedExclusion)
-                and eligibility != placement.TemporaryExclusion("disk")):
-            fit_hold = MacFitHold(request.episode, destination)
-            if (fit_hold in self.mac_fit_holds or isinstance(eligibility, placement.TemporaryExclusion)
-                    and eligibility.reason in MAC_FIT_EXCLUSIONS):
-                return fit_hold
         key = self.placement_host_keys.get((request.episode, destination))
-        if (key is None or not (isinstance(eligibility, placement.EvidenceNeeded)
-                        or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
+        if key is None or not isinstance(request.purpose, placement.NormalStep) or destination.provider in ("local", "scaler"):
+            return None
+        mac_only = destination.target == "mac" and mac_only_request(request)
+        if not isinstance(eligibility, placement.EvidenceNeeded) and not _probe_hold_exclusion(eligibility, mac_only=mac_only):
             return None
         reader = self.host_readers.get(key)
         if reader is None:
             return None
         latest = reader.latest
         if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
-                and not (isinstance(latest.eligibility, placement.TemporaryExclusion) and latest.eligibility.reason == "busy")):
+                and not _probe_hold_exclusion(latest.eligibility, mac_only=mac_only)):
             return None
         pair = (request.episode, destination)
         observed_at = self.host_evidence(key).observed_at
@@ -5245,21 +5226,16 @@ done
         return PlacementHold(request.episode, destination, key, observed_at)
 
     def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
-                        held: list[PlacementHold | MacFitHold],
-                        holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
-        """Check for an older request that holds this remote destination.
+                        held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
+        """Keep a destination for an older request whose last reading predates this request's reading.
 
-        For a probe hold, read the older key next. End that hold after the reply or the probe time limit.
+        The worker probes the older key next. The reply or the probe time limit ends the hold.
         """
         key = self.placement_host_keys.get((request.episode, destination))
         observed_at = self.host_evidence(key).observed_at if key is not None else self.clock.now()
         now = self.clock.now()
         for hold in held:
-            if not same_remote_resource(hold.destination, destination):
-                continue
-            if isinstance(hold, MacFitHold):
-                return True
-            if hold.observed_at >= observed_at:
+            if not same_remote_resource(hold.destination, destination) or hold.observed_at >= observed_at:
                 continue
             reader = self.host_readers.get(hold.key)
             if reader is None:

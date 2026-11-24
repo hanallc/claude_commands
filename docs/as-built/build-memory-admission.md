@@ -2799,8 +2799,7 @@ A move gives the moved row a new anchor and keeps its former successor in place.
 Absent and unnamed waits stay in the full order.
 The page omits waits with no name source.
 Placement, memory admission, and continuation claims use the eligible rows in this order.
-`queue.json` includes local and Mac-only waits in queue order.
-The live memory admission walk uses the local waits.
+`queue.json` records the local queue order for memory admission.
 The head-stall check uses only rows that can run on natedev.
 The grant pass shows a newly granted row in Waiting without a move handle.
 The first pass that counts its reservation shows the row in Running and includes the memory charge.
@@ -2813,10 +2812,14 @@ A local reservation keeps its saved place until the service sees processes in it
 The first reading clears the saved place for a direct reservation without a scope file.
 A placement retry before launch keeps its place.
 Both hosts use the visible order for normal steps.
-A Mac-only request with a temporary memory or fit exclusion holds its Mac destination against later requests with overlapping scopes.
-The hold ends when the request starts, leaves the queue, or gets a fixed exclusion.
-A disk exclusion ends the hold and returns an immediate refusal for `--mac-only`.
-A request that allows natedev uses the existing one-probe hold for missing evidence or busy readings.
+A Mac-only request includes a request pinned to the Mac.
+An older Mac-only request with a temporary exclusion can hold its destination.
+The hold applies when a later request has a newer free reading for an overlapping scope.
+Disk, off, and state exclusions prevent this hold.
+The next probe or its time limit ends the hold.
+A blocked Mac returns a wait for `--mac-only`.
+A disk exclusion immediately refuses all Mac-only requests.
+Other requests can hold a remote destination for one probe when a reading is missing or the destination is busy.
 When placement preparation sees a remote start, it ends the startup hold and removes the local waiter.
 The table includes remote-only waits in queue order.
 The Machine cell uses the existing Mac icon for a Mac-only wait.
