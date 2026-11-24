@@ -17,16 +17,16 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import ExitStack, suppress
-from dataclasses import dataclass, field
+from collections.abc import Callable, Sequence
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
 from scripts.direct import recorder_state
-from scripts.lib import atomic_file, conf_reads, transcripts, unit_runs
+from scripts.lib import conf_reads, transcripts, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_records
 from scripts.production import staff
@@ -424,19 +424,6 @@ def append_event(state: dict[str, object], event: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def pass_history(state: dict[str, object]) -> Iterator[dict[str, object]]:
-    history = string(state.get("history_file"))
-    if history:
-        with Path(history).open(encoding="utf-8") as events:
-            fcntl.flock(events.fileno(), fcntl.LOCK_SH)
-            for line in events:
-                event = json_object(line)
-                if event is None:
-                    raise ValueError(f"Invalid pass history: {history}")
-                if event.get("event_type") in ("pass_started", "pass_finished"):
-                    yield event
-
-
 def _main_identity_from_codex(session_id: str) -> KnownMainIdentity | MainIdentityUnavailable:
     session_root = Path.home() / ".codex" / "sessions"
     matches = list(session_root.rglob(f"*{session_id}.jsonl"))
@@ -799,39 +786,23 @@ class LaunchCheck(TypedDict):
     fix_cause: str | LedgerRepairCause
 
 
-@dataclass(frozen=True)
-class PassLaunchRequest:
-    session_dir: Path
-    phase_id: str
-    pass_kind: staff.WorkerRole
-    prompt_file: str
-    fix_cause: str
-    lens: str
-
-
-def _pass_launch_request(args: argparse.Namespace) -> PassLaunchRequest:
-    return PassLaunchRequest(argument_session_dir(args), optional_arg(args, "phase_id"),
-                             cast(staff.WorkerRole, arg_string(args, "pass_kind")),
-                             optional_arg(args, "prompt_file"), optional_arg(args, "fix_cause"), optional_arg(args, "lens"))
-
-
 def _launch_refused(
-    state: dict[str, object], args: PassLaunchRequest, reason: str,
+    state: dict[str, object], args: argparse.Namespace, reason: str,
 ) -> NoReturn:
     event = record_event(state, "launch_refused", now_epoch(), phase_record={})
-    event.update(reason=reason, pass_kind=args.pass_kind,
-                 phase_id=args.phase_id, prompt_file=args.prompt_file,
-                 lens=args.lens)
+    event.update(reason=reason, pass_kind=arg_string(args, "pass_kind"),
+                 phase_id=optional_arg(args, "phase_id"), prompt_file=optional_arg(args, "prompt_file"),
+                 lens=optional_arg(args, "lens"))
     append_event(state, event)
     raise SystemExit(reason)
 
 
 def _launch_check(
-    args: PassLaunchRequest, state: dict[str, object], phase: dict[str, object],
+    args: argparse.Namespace, state: dict[str, object], phase: dict[str, object], session_dir: Path,
 ) -> LaunchCheck:
     """Check prompt identity and a fix's cause before changing any open pass."""
     prompt_phase_line: Literal["matched", "absent"] = "absent"
-    prompt_file = args.prompt_file
+    prompt_file = optional_arg(args, "prompt_file")
     if prompt_file:
         try:
             text = Path(prompt_file).expanduser().read_text(encoding="utf-8")
@@ -845,10 +816,10 @@ def _launch_check(
                 _launch_refused(state, args, f"Stale prompt phase: {line}; open phase is Phase {phase.get('id')} — {phase.get('title')}")
             prompt_phase_line = "matched"
             break
-    fix_cause: str | LedgerRepairCause = args.fix_cause.strip()
-    if args.pass_kind == "fix":
+    fix_cause: str | LedgerRepairCause = optional_arg(args, "fix_cause").strip()
+    if arg_string(args, "pass_kind") == "fix":
         instance = string(phase.get("instance_id"))
-        for path in (args.session_dir / "findings_state.json", args.session_dir / f"findings_state-{instance}.json"):
+        for path in (session_dir / "findings_state.json", session_dir / f"findings_state-{instance}.json"):
             try:
                 ledger = json_object(path.read_text(encoding="utf-8"))
             except FileNotFoundError:
@@ -880,10 +851,10 @@ def _launch_check(
 
 
 def _checked_launch(
-    args: PassLaunchRequest, state: dict[str, object],
+    args: argparse.Namespace, state: dict[str, object], session_dir: Path,
 ) -> tuple[dict[str, object], LaunchCheck]:
     """Validate a named open phase and its launch without changing any pass."""
-    phase_id = args.phase_id
+    phase_id = optional_arg(args, "phase_id")
     if not phase_id:
         _ = recorder_state.only_open_phase(state)
         _launch_refused(state, args, "Missing phase: --phase-id is required for a recorded run")
@@ -891,21 +862,21 @@ def _checked_launch(
     if phase is None:
         open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
         _launch_refused(state, args, f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
-    return phase, _launch_check(args, state, phase)
+    return phase, _launch_check(args, state, phase, session_dir)
 
 
 def _check_launch(args: argparse.Namespace) -> None:
-    request = _pass_launch_request(args)
+    session_dir = argument_session_dir(args)
     try:
-        state = read_state(request.session_dir)
+        state = read_state(session_dir)
     except staff.StaffUnreadable as error:
-        print(f"staff: {request.pass_kind}: not opened: {error}", file=sys.stderr)
+        print(f"staff: {arg_string(args, 'pass_kind')}: not opened: {error}", file=sys.stderr)
         raise SystemExit(3) from error
-    phase, launch_check = _checked_launch(request, state)
-    if request.lens == "ux":
+    phase, launch_check = _checked_launch(args, state, session_dir)
+    if optional_arg(args, "lens") == "ux":
         event = record_event(state, "launch_checked", now_epoch(), phase_record=phase)
-        event.update(launch_check=launch_check, pass_kind=request.pass_kind, lens=request.lens,
-                     prompt_file=request.prompt_file)
+        event.update(launch_check=launch_check, pass_kind=arg_string(args, "pass_kind"),
+                     lens="ux", prompt_file=optional_arg(args, "prompt_file"))
         append_event(state, event)
 
 
@@ -915,47 +886,6 @@ class MatchedDispatch:
 
     worker_name: str
     instance_id: str
-
-
-@dataclass(frozen=True)
-class AssignmentPromptRetry(MatchedDispatch):
-    path: Path
-
-
-@dataclass(frozen=True)
-class AssignmentManifest:
-    paths: list[str]
-
-
-@dataclass(frozen=True)
-class GeneratedAssignment(AssignmentManifest):
-    work_order_size: int
-
-
-class NoAssignmentManifest(Enum):
-    NONE = "this dispatch has no assignment manifest"
-
-
-@dataclass(frozen=True)
-class WorkerDispatchRequest:
-    launch: PassLaunchRequest
-    team_slot: str
-    launcher_pid: int
-    worker_name: str
-    worker_id: staff.StaffId
-    launcher_command: list[str]
-    activity: str
-    called_task: str
-    called_family: str
-    called_model: str
-    called_effort: str
-    fix_pass: int
-    dispatch_kind: str
-    new_pass_instance_id: uuid.UUID | None
-    assignment: AssignmentManifest | NoAssignmentManifest
-    assign_status_file: str
-    early_review_pass_id: str = ""
-    print_pass_id: bool = False
 
 
 @dataclass(frozen=True)
@@ -974,7 +904,6 @@ class ActiveDispatchPromptConflict:
 
     worker_name: str
     instance_id: str
-    slot: str = field(default="", compare=False)
 
 
 class DispatchPromptRefused(RuntimeError):
@@ -985,23 +914,9 @@ class DispatchPromptRefused(RuntimeError):
         super().__init__(f"Active pass {conflict.instance_id} has different prompt content")
 
 
-def _recorded_ticket_widen(passed: dict[str, object], directory: Path, paths: list[str]) -> bool:
-    slot = string(passed.get("team_slot"))
-    original = string_list(passed.get("assignment_paths"))
-    if not slot.startswith("style-ticket-") or not original or paths[:len(original)] != original or paths == original:
-        return False
-    with suppress(FileNotFoundError):
-        if (directory / "ticket-paths.txt").read_text(encoding="utf-8").splitlines() == paths:
-            for path in directory.glob("dispatch_*_paths.json"):
-                saved = json_object(path.read_text(encoding="utf-8")) or {}
-                if saved.get("worker") == slot and saved.get("pass_instance_id") == passed.get("instance_id"):
-                    return saved.get("paths") == paths
-    return False
-
-
 def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool, assignment: AssignmentManifest | NoAssignmentManifest = NoAssignmentManifest.NONE,
+                    dispatch_owned: bool,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
         return NoMatchedDispatch()
@@ -1013,50 +928,36 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                        else cast(object, saved_command))
     same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
         active.get("status") in ("active", "refused") and launcher_command == current_command))
-    instance = string(active.get("instance_id"))
-    saved_path = Path(string(active.get("prompt_file")))
-    request = Path(string(fields.get("prompt_file")))
-    generated = (isinstance(assignment, GeneratedAssignment) and instance and saved_path.parent == request.parent
-                 and saved_path.stem.removesuffix(f".{instance}") == request.stem.rpartition(".")[0])
     stage_two = False
-    if dispatch_owned and not generated and fields.get("prompt_file") != active.get("prompt_file"):
+    if dispatch_owned and fields.get("prompt_file") != active.get("prompt_file"):
         delivery = dispatch_delivery(active)
         prompt = json.dumps(fields.get("prompt_file"))
+        instance = string(active.get("instance_id"))
         stage_two = (same_launcher and active.get("status") in ("active", "refused") and active.get("kind") == "review"
                      and bool(instance and delivery.early_ready) and delivery.completion_id == f"{instance}-2"
                      and delivery.line.startswith("Stage 2: ")
                      and f"Read the unchanged prompt file {prompt}. " in delivery.line)
         if not stage_two:
             return NoMatchedDispatch()
-    same_fields = all(active.get(key, "") == value for key, value in fields.items()
-                      if key != "prompt_file" or not (stage_two or generated))
     if dispatch_owned and not stage_two:
         try:
-            content = request.read_bytes()
+            digest = hashlib.sha256(Path(string(fields.get("prompt_file"))).read_bytes()).hexdigest()
         except OSError:
             return NoMatchedDispatch()
-        delivery_digest = active.get("delivery_prompt_digest", active.get("prompt_digest"))
-        same_prompt = delivery_digest == hashlib.sha256(content).hexdigest()
-        if (not same_prompt and same_launcher and same_fields and generated
-                and isinstance(assignment, GeneratedAssignment) and "delivery_prompt_digest" in active
-                and active.get("prompt_digest") == hashlib.sha256(content[:assignment.work_order_size]).hexdigest()):
-            same_prompt = _recorded_ticket_widen(active, saved_path.parent, assignment.paths)
-            if (not same_prompt and active.get("status") == "completed"
-                    and string(active.get("team_slot")).startswith("style-ticket-")):
-                raise DispatchSelectionChanged(f"Pass {instance} has no recorded widen for these paths")
-        if not same_prompt:
+        if active.get("prompt_digest") != digest:
             if active.get("status") == "active":
                 return ActiveDispatchPromptConflict(string(active.get("worker_name")), string(active.get("instance_id")))
             return NoMatchedDispatch()
-    if not same_fields or (launcher_command and saved_command and not same_launcher):
+    if launcher_command and saved_command and not same_launcher:
+        return NoMatchedDispatch()
+    if not all(active.get(key, "") == value for key, value in fields.items()
+               if key != "prompt_file" or not stage_two):
         return NoMatchedDispatch()
     if active.get("status") not in ("active", "refused") and not (
             dispatch_owned and active.get("status") == "completed" and same_launcher):
         return NoMatchedDispatch()
-    worker = string(active.get("worker_name"))
-    if generated:
-        return AssignmentPromptRetry(worker, instance, saved_path)
-    return (ContinueDispatchStage if stage_two else MatchedDispatch)(worker, instance)
+    matched = ContinueDispatchStage if stage_two else MatchedDispatch
+    return matched(string(active.get("worker_name")), string(active.get("instance_id")))
 
 
 class VacantDispatchSlot(Enum):
@@ -1109,80 +1010,55 @@ def validate_dispatch_selection(state: dict[str, object], selection: DispatchSel
         raise DispatchSelectionChanged(f"Slot {slot} or phase {phase} changed during dispatch")
 
 
-def _restore_assignment_prompt(passed: dict[str, object], retry: AssignmentPromptRetry, request: Path) -> None:
-    """Restore the verified prompt while the caller holds the recorder lock."""
-    digest = passed.get("delivery_prompt_digest", passed.get("prompt_digest"))
-    with suppress(FileNotFoundError):
-        if hashlib.sha256(retry.path.read_bytes()).hexdigest() == digest:
-            return
-    content = request.read_bytes()
-    if hashlib.sha256(content).hexdigest() != digest and "delivery_prompt_digest" in passed:
-        content = retry.path.with_suffix(".admitted").read_bytes()
-    if hashlib.sha256(content).hexdigest() != digest:
-        raise DispatchSelectionChanged(f"Original prompt for pass {retry.instance_id} is unavailable")
-    atomic_file.write_bytes_atomic(retry.path, content)
-
-
-def record_worker_dispatch(args: WorkerDispatchRequest, selection: DispatchSelection | SelectDispatchAtRecorder,
-                           link_state: Callable[[], None]) -> str:
-    """Validate and record the dispatch under one recorder lock."""
-    run = args.launch.session_dir
-    run.mkdir(parents=True, exist_ok=True)
-    with recorder_lock_path(run).open("a+", encoding="utf-8") as lock, ExitStack() as locks:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        membership = staff.initial_snapshot()
-        state = read_state(run, record=membership)
-        retry = isinstance(selection, DispatchSelection) and isinstance(selection.action, AssignmentPromptRetry)
-        completed = retry and pass_slots(state).get(args.team_slot, {}).get("status") == "completed"
-        if retry and not completed and args.launch.pass_kind == "fix":
-            ledger = locks.enter_context((run / ".findings.lock").open("a+", encoding="utf-8"))
-            fcntl.flock(ledger.fileno(), fcntl.LOCK_SH)
-        instance = start_pass(args, selection, state, membership, completed_retry=completed)
-        if not completed:
-            link_state()
-        return instance
-
-
-def start_pass(args: WorkerDispatchRequest, selection: DispatchSelection | SelectDispatchAtRecorder,
-               state: dict[str, object], membership: staff.StaffSnapshot, *,
-               dispatch_owned: bool = True, completed_retry: bool = False) -> str:
-    launch, team_slot = args.launch, args.team_slot
-    session_dir, pass_kind = launch.session_dir, launch.pass_kind
-    worker_id, worker_name = args.worker_id, args.worker_name
-    worker = membership.by_id(worker_id)
+def start_pass(args: argparse.Namespace,
+               selection: DispatchSelection | SelectDispatchAtRecorder = SelectDispatchAtRecorder.SELECT) -> str:
+    if not _launcher_owned() and not getattr(args, "dispatch_owned", False):
+        raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
+    session_dir = argument_session_dir(args)
+    pass_kind = arg_string(args, "pass_kind")
+    fix_pass = arg_integer(args, "fix_pass")
+    called_agent = AgentIdentity(
+        family=arg_string(args, "called_family", "unknown"),
+        model=arg_string(args, "called_model", "unknown"),
+        effort=arg_string(args, "called_effort", "unset") or "unset",
+        session_id="",
+    )
+    team_slot = optional_arg(args, "team_slot") if hasattr(args, "team_slot") else _team_slot()
+    membership = staff.initial_snapshot()
+    state = read_state(session_dir, record=membership)
+    worker = membership.by_id(staff.StaffId(optional_arg(args, "worker_id")))
     inferred_owner = False
-    if not worker_id and worker_name:
+    if not optional_arg(args, "worker_id") and (name := optional_arg(args, "worker_name")):
         owner = unit_runs.run_owner(state, membership)
         if isinstance(owner, staff.StaffRow):
             worker = next((row for row in membership.find(kind="worker", parent=owner.id)
-                           if worker_name in (row.name, row.id)), None)
+                           if name in (row.name, row.id)), None)
     if worker is not None and worker.kind == "worker" and isinstance(worker.parent, staff.ReportsTo):
-        worker_id, worker_name = worker.id, worker.name
+        args.worker_id = worker.id
+        args.worker_name = worker.name
         if not state.get(unit_runs.OWNER_FIELD):
             state[unit_runs.OWNER_FIELD] = worker.parent.id
             inferred_owner = True
+    launcher_command = _launcher_arguments(optional_arg(args, "launcher_command"))
     if isinstance(selection, DispatchSelection):
-        validate_dispatch_selection(state, selection, team_slot, launch.phase_id)
-    launcher_command, launcher_pid = args.launcher_command, args.launcher_pid
-    early_id, assignment = args.early_review_pass_id, args.assignment
+        validate_dispatch_selection(state, selection, team_slot, optional_arg(args, "phase_id"))
+    # Name the phase when more than one phase is open.
+    phase, launch_check = _checked_launch(args, state, session_dir)
+    launcher_pid = arg_integer(args, "launcher_pid", os.getppid())
+    early_id = optional_arg(args, "early_review_pass_id")
     dispatch_fields: dict[str, object] = {
         "early_review_pass_id": early_id,
         "kind": pass_kind,
-        "fix_pass": args.fix_pass,
-        "called_task": args.called_task,
-        "worker_id": worker_id,
-        "prompt_file": launch.prompt_file,
-        "dispatch_kind": args.dispatch_kind,
-        "lens": launch.lens,
+        "fix_pass": fix_pass,
+        "called_task": arg_string(args, "called_task"),
+        "worker_id": optional_arg(args, "worker_id"),
+        "prompt_file": optional_arg(args, "prompt_file"),
+        "dispatch_kind": optional_arg(args, "dispatch_kind"),
+        "lens": optional_arg(args, "lens"),
     }
     active = pass_slots(state).get(team_slot)
-    launch_check: LaunchCheck | dict[str, object]
-    if completed_retry and active is not None:
-        phase, launch_check = object_dict(active.get("phase")) or {}, {}
-    else:
-        phase, launch_check = _checked_launch(launch, state)
     match = dispatch_match(active, phase, dispatch_fields, launcher_command,
-                           dispatch_owned=dispatch_owned, assignment=assignment)
+                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)))
     if isinstance(match, ActiveDispatchPromptConflict):
         raise DispatchPromptRefused(match)
     if isinstance(selection, DispatchSelection):
@@ -1191,15 +1067,11 @@ def start_pass(args: WorkerDispatchRequest, selection: DispatchSelection | Selec
                 or active.get("worker_id") != dispatch_fields["worker_id"]):
             raise DispatchSelectionChanged(f"Pass {action.instance_id} changed during dispatch")
         match = action
-    if isinstance(match, AssignmentPromptRetry) and active is not None:
-        _restore_assignment_prompt(active, match, Path(launch.prompt_file))
-        if completed_retry:
-            return match.instance_id
-    status_file = args.assign_status_file
+    status_file = optional_arg(args, "assign_status_file")
     if status_file:
         status_file = str(worker_artifact(Path(status_file), os.environ.get(TEAM_SLOT_ENV, team_slot), team_slot))
     if (active is not None and isinstance(match, MatchedDispatch)
-            and (not args.print_pass_id or active.get("launcher_pid") == launcher_pid)):
+            and (not getattr(args, "print_pass_id", False) or active.get("launcher_pid") == launcher_pid)):
         changed = inferred_owner or active.get("launcher_pid") != launcher_pid
         active["launcher_pid"] = launcher_pid
         if launcher_command and not active.get("launcher_command"):
@@ -1216,15 +1088,6 @@ def start_pass(args: WorkerDispatchRequest, selection: DispatchSelection | Selec
         armed = object_dict(phase.get(ARMED_REVIEW_KEY))
         if pass_kind != "review" or armed is None or armed.get("pass_instance_id") != early_id:
             raise SystemExit("The open phase has no early review reserved for this pass")
-    if dispatch_owned:
-        prompt = Path(launch.prompt_file)
-        content = prompt.read_bytes()
-        digest = hashlib.sha256(content).hexdigest()
-        dispatch_fields["prompt_digest"] = digest
-        if isinstance(assignment, GeneratedAssignment) and team_slot.startswith("style-ticket-"):
-            dispatch_fields.update(delivery_prompt_digest=digest, assignment_paths=assignment.paths,
-                                   prompt_digest=hashlib.sha256(content[:assignment.work_order_size]).hexdigest())
-            atomic_file.write_bytes_atomic(prompt.with_suffix(".admitted"), content)
     now = now_epoch()
     owner_id = state.get(unit_runs.OWNER_FIELD)
     # A different dispatch replaces only this slot's pass.
@@ -1233,30 +1096,31 @@ def start_pass(args: WorkerDispatchRequest, selection: DispatchSelection | Selec
     if owner_id:
         state[unit_runs.OWNER_FIELD] = owner_id
     refresh_main_identity(session_dir, state)
-    number = integer(state.get("dispatch_number"))
-    if number or isinstance(assignment, AssignmentManifest):
-        number = (number or sum(event.get("event_type") == "pass_started" for event in pass_history(state))) + 1
-        state["dispatch_number"] = dispatch_fields["dispatch_number"] = number
-    instance_id = early_id or str(args.new_pass_instance_id or uuid.uuid4())
+    proposed: object = getattr(args, "new_pass_instance_id", None)
+    instance_id = early_id or str(proposed if isinstance(proposed, uuid.UUID) else uuid.uuid4())
     current_pass: dict[str, object] = {
         **dispatch_fields,
         "instance_id": instance_id,
-        "activity": args.activity,
+        "activity": arg_string(args, "activity"),
         "started_at": now,
-        "worker_name": worker_name,
+        "called_task": arg_string(args, "called_task"),
+        "worker_name": optional_arg(args, "worker_name"),
+        "worker_id": optional_arg(args, "worker_id"),
         "launcher_command": launcher_command,
         "launcher_pid": launcher_pid,
-        "called_agent": AgentIdentity(family=args.called_family, model=args.called_model,
-                                      effort=args.called_effort or "unset", session_id=""),
+        "called_agent": called_agent,
         "team_slot": team_slot,
         "phase": phase_stamp(phase),
         "status": "active",
     }
+    if getattr(args, "dispatch_owned", False):
+        current_pass["prompt_digest"] = hashlib.sha256(Path(optional_arg(args, "prompt_file")).read_bytes()).hexdigest()
     if status_file:
         current_pass["assign_status_file"] = status_file
     slots = pass_slots(state)
     slots[team_slot] = current_pass
     write_state(session_dir, state)
+    worker_id = staff.StaffId(optional_arg(args, "worker_id"))
     if worker_id and pass_kind in staff.WORKER_ROLES:
         role = staff.KnownWorkerRole(pass_kind)
         try:
@@ -1282,22 +1146,8 @@ def start_pass(args: WorkerDispatchRequest, selection: DispatchSelection | Selec
 
 
 def _start_pass_command(args: argparse.Namespace) -> None:
-    if not _launcher_owned():
-        raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
-    request = WorkerDispatchRequest(
-        launch=_pass_launch_request(args), team_slot=_team_slot(), launcher_pid=arg_integer(args, "launcher_pid", os.getppid()),
-        worker_name=optional_arg(args, "worker_name"), worker_id=staff.StaffId(optional_arg(args, "worker_id")),
-        launcher_command=_launcher_arguments(optional_arg(args, "launcher_command")),
-        activity=arg_string(args, "activity"), called_task=arg_string(args, "called_task"),
-        called_family=arg_string(args, "called_family", "unknown"), called_model=arg_string(args, "called_model", "unknown"),
-        called_effort=arg_string(args, "called_effort", "unset"), fix_pass=arg_integer(args, "fix_pass"),
-        dispatch_kind="", new_pass_instance_id=None, assignment=NoAssignmentManifest.NONE, assign_status_file="",
-        early_review_pass_id=optional_arg(args, "early_review_pass_id"), print_pass_id=getattr(args, "print_pass_id", False) is True,
-    )
-    membership = staff.initial_snapshot()
-    state = read_state(request.launch.session_dir, record=membership)
-    instance_id = start_pass(request, SelectDispatchAtRecorder.SELECT, state, membership, dispatch_owned=False)
-    if request.print_pass_id:
+    instance_id = start_pass(args)
+    if getattr(args, "print_pass_id", False):
         print(instance_id)
 
 

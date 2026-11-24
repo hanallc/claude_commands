@@ -2675,15 +2675,6 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
         self.assertEqual(self.agent.submitted, [])
 
-        _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
-            worker_name=opened.row.name, worker_id=opened.row.id, prompt=self.prompt, kind="impl", lens="",
-            launcher_command=["assign.sh", "--phase", "8", "--prompt", str(self.prompt)])
-        state = self.run_dir / unit_runs.STATE_FILE
-        previous = state.read_bytes()
-        self.assertEqual(self.dispatch(), worker.ExitCode.BUSY)
-        self.assertEqual(state.read_bytes(), previous)
-        self.assertEqual(self.agent.submitted, [])
-
         with self.subTest(cause="busy assignment preserves the submitted pass"):
             self.fixture.world.first_turn_timeout = False
             self.agent.finish_after = 100
