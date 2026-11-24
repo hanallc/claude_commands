@@ -580,6 +580,34 @@ if sys.argv[1] == "prepare":
             self.assertIn("caller watch did not start", result.stderr)
             self.assertFalse((root / "events").exists())
 
+    def test_caller_watch_ends_a_watcher_without_a_complete_ready_line(self) -> None:
+        for output in (b"", b"rea"):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = queue_fixture(root)
+                _ = write_config_fixture(root / "config/mac_gate.conf", "placement_check_timeout_seconds=1\n")
+                watcher = root / "watcher.py"
+                _ = watcher.write_text(f"import os, sys\nos.write(1, {output!r})\nos.read(int(sys.argv[2]), 1)\n")
+                queue_program = """\
+import sys
+from scripts.mac_test import mac_queue_run
+mac_queue_run.__file__ = sys.argv[1]
+raise SystemExit(mac_queue_run.main(sys.argv[2:]))
+"""
+                reader, writer = os.pipe()
+                try:
+                    command = [sys.executable, "-c", queue_program, str(watcher), "--caller-fd", str(reader),
+                               *self.command(root)[3:]]
+                    # The watcher holds stderr open until it ends. Keep its caller pipe open.
+                    result = subprocess.run(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                finally:
+                    os.close(reader)
+                    os.close(writer)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "mac queue: the Mac queue caller watch did not start\n")
+                self.assertFalse((root / "events").exists())
+
     def test_a_caller_watch_failure_after_ready_stops_the_queue_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -20,6 +20,7 @@ import json
 from dataclasses import dataclass
 import os
 import select
+import selectors
 import signal
 from pathlib import Path
 import shlex
@@ -482,6 +483,23 @@ def watch_caller(caller: int, queue: int) -> int:
     return 2
 
 
+def watcher_ready(output: int, timeout: float) -> bool:
+    expected = b"ready\n"
+    received = b""
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as readiness:
+        _ = readiness.register(output, selectors.EVENT_READ)
+        while received != expected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not readiness.select(remaining):
+                return False
+            chunk = os.read(output, len(expected) - len(received))
+            received += chunk
+            if not chunk or not expected.startswith(received):
+                return False
+    return True
+
+
 @contextlib.contextmanager
 def caller_watch(caller: int) -> Generator[None]:
     pid = os.getpid()
@@ -503,9 +521,10 @@ def caller_watch(caller: int) -> Generator[None]:
         with watcher:
             try:
                 assert watcher.stdout is not None
-                grace = conf.read("mac_gate").number("terminate_grace_seconds")
-                ready = b"ready\n"
-                if watcher.stdout.readline(len(ready)) != ready:
+                config = conf.read("mac_gate")
+                startup_timeout = config.whole("placement_check_timeout_seconds")
+                grace = config.number("terminate_grace_seconds")
+                if not watcher_ready(watcher.stdout.fileno(), startup_timeout):
                     raise ValueError("the Mac queue caller watch did not start")
 
                 def monitor() -> None:
