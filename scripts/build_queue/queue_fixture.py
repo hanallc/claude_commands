@@ -89,12 +89,13 @@ HEAD_NOW = datetime(2026, 10, 30, 11, 0, tzinfo=UTC).timestamp()
 
 
 def write_process(proc: Path, pid: int, used: int = 0, *, parent: int = 1,
-                  start: str | None = None, anonymous: int | None = None, swap: int = 0) -> None:
+                  start: str | None = None, anonymous: int | None = None, swap: int = 0,
+                  name: str = "verify") -> None:
     """Write private process identity, resident use, anonymous use, and swap."""
     directory = proc / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
     fields = ["S", str(parent), *(["0"] * 17), str(pid) if start is None else start]
-    if (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n") <= 0:
+    if (directory / "stat").write_text(f"{pid} ({name}) {' '.join(fields)}\n") <= 0:
         raise OSError("empty fixture process")
     anon = used if anonymous is None else anonymous
     if (directory / "status").write_text(

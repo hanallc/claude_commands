@@ -11,6 +11,7 @@ import os
 import argparse
 import json
 import select
+import socket
 import shlex
 import signal
 import sys
@@ -21,12 +22,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Collection, Generator, Mapping
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from contextvars import ContextVar, copy_context
 from io import StringIO, TextIOWrapper
 from importlib import import_module
 from hashlib import sha256
-from functools import cached_property, partial
+from functools import cache, cached_property, partial
 from threading import Event, Lock
 from time import monotonic
 from types import MappingProxyType
@@ -722,17 +723,9 @@ _resume_names: ContextVar[LaunchNames | LaunchNamesNotRead] = ContextVar("resume
 _NO_SOURCE_ACCOUNTS: Mapping[str, str] = MappingProxyType({})
 _detached_moves: ContextVar[bool] = ContextVar("detached_moves", default=False)
 _move_resume: ContextVar[bool] = ContextVar("move_resume", default=False)
-_batch_process: ContextVar[bool] = ContextVar("batch_process", default=False)
-
-
-@dataclass(frozen=True)
-class BuildQueueUnreadable:
-    reason: str
-
-
-@dataclass(frozen=True)
-class BuildMoveDeferred(StopFailed):
-    """The director remains running until build ownership permits its automatic move."""
+# A user command checks a held row again after this time. A poll is necessary: flock has no timeout, and the
+# wait also watches the restart activity lock.
+_ROW_POLL_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -824,6 +817,8 @@ _move_stop_target: ContextVar[MoveStopAttempt | StopTargetAtUse] = ContextVar(
 class DetachedMoveRequest:
     request_id: str
     staff_members: frozenset[str]
+    # The time that the parent user command waited before the handoff.
+    waited_seconds: float = 0.0
 
 
 class NewMoveRequest:
@@ -843,6 +838,9 @@ class MoveBatch:
     request_id: str = field(default_factory=lambda: uuid4().hex)
     results: dict[str, MoveResult] = field(default_factory=dict)
     native_sessions: dict[str, str] = field(default_factory=dict)
+    user_command: bool = False
+    claimed: set[str] = field(default_factory=set)
+    started: float = 0.0
 
 
 _NEW_MOVE_REQUEST = NewMoveRequest()
@@ -2078,11 +2076,18 @@ _STOP_RESUME_PROGRAM = Path(__file__).resolve()
 _DETACHED_START_SECONDS = 15
 
 
+def _with_options(command: list[str], *options: str) -> list[str]:
+    """Put options before the `--` that starts the session list, so the parser does not read them as sessions."""
+    boundary = command.index("--") if "--" in command else len(command)
+    return [*command[:boundary], *options, *command[boundary:]]
+
+
 def _launch_mac_with_log(command: list[str], environment: dict[str, str], log_fd: int) -> None:
     read_fd, ready_fd = os.pipe()
     try:
         try:
-            _ = subprocess.Popen([*command, "--ready-fd", str(ready_fd)], env=environment, start_new_session=True,
+            _ = subprocess.Popen(_with_options(command, "--ready-fd", str(ready_fd)), env=environment,
+                                 start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=log_fd, pass_fds=(ready_fd,))
         finally:
             os.close(ready_fd)
@@ -2094,6 +2099,23 @@ def _launch_mac_with_log(command: list[str], environment: dict[str, str], log_fd
         os.close(read_fd)
 
 
+def notify_ready(ready_fd: int | None, *, systemd: bool) -> None:
+    """Confirm the start of a detached process to the parent that waits in `_detach`."""
+    if ready_fd is not None:
+        try:
+            with suppress(BrokenPipeError):
+                _ = os.write(ready_fd, b"1")
+        finally:
+            os.close(ready_fd)
+    if systemd:
+        address = os.environ.pop("NOTIFY_SOCKET", "")
+        if not address:
+            raise OSError("The systemd readiness socket is unavailable because NOTIFY_SOCKET is missing")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+            notifier.connect("\0" + address[1:] if address.startswith("@") else address)
+            _ = notifier.send(b"READY=1")
+
+
 def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PROGRAM, log: Path | None = None,
             log_fd: int | None = None) -> Path:
     """Run lifecycle work outside the caller's stop boundary."""
@@ -2103,8 +2125,7 @@ def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PRO
     if "--requester" not in arguments:
         requester = showrunners.own_name()
         options = ["--requester", requester]
-        boundary = arguments.index("--") if "--" in arguments else len(arguments)
-        arguments = [*arguments[:boundary], *options, *arguments[boundary:]]
+        arguments = _with_options(arguments, *options)
     if log is None:
         logs = shutdown_state_root() / "logs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -2124,7 +2145,7 @@ def _detach(arguments: list[str], task: str, *, program: Path = _STOP_RESUME_PRO
             _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--service-type=notify",
                                 "--expand-environment=no", f"--property=StandardOutput=append:{source}",
                                 "--property=StandardError=journal", "--property=UnsetEnvironment=CLAUDE_CODE_SESSION_ID",
-                                *command, "--notify-systemd"], env=environment, stdin=subprocess.DEVNULL,
+                                *_with_options(command, "--notify-systemd")], env=environment, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, check=True, timeout=_DETACHED_START_SECONDS)
     elif sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
@@ -2146,18 +2167,25 @@ def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int
     identities = {session: batch.native_sessions[session] for session in selected}
     group = ("--group", batch.intent.group) if isinstance(batch.intent, moves.FollowGroupAccount) else ()
     group_scope = ("--explicit-group-scope",) if batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT else ()
-    _ = _detach(["batch", "--target", target, *group, *group_scope, "--why", why, "--cause", cause, "--warn-seconds", str(warn_seconds),
-                 "--request-id", batch.request_id,
-                 *(arg for session, identity in identities.items() if (label := source_accounts.get(session))
-                   for arg in ("--source-account", f"{identity}={label}")),
-                 "--", *identities.values()], "move")
+    user = ("--user-command", "--waited-seconds", f"{monotonic() - batch.started:.3f}") if batch.user_command else ()
+    logs = shutdown_state_root() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"move-{uuid4().hex}.log"
+    # The parent waits until the child confirms its start; the child takes the claims before it confirms.
+    with log.open("ab") as stream:
+        _ = _detach(["batch", "--target", target, *group, *group_scope, *user, "--why", why, "--cause", cause,
+                     "--warn-seconds", str(warn_seconds), "--request-id", batch.request_id,
+                     *(arg for session, identity in identities.items() if (label := source_accounts.get(session))
+                       for arg in ("--source-account", f"{identity}={label}")),
+                     "--", *identities.values()], "move", log=log, log_fd=stream.fileno())
 
 
 def _handoff_locked_moves(selected: Mapping[str, str], locks: Mapping[str, LockedMoveRow], target: str,
                           why: str, warn_seconds: int, cause: moves.MoveCause,
                           sources: Mapping[str, str]) -> dict[str, MoveResult]:
     for session in selected:
-        locks[session].lock.close()
+        if session in locks:
+            locks[session].lock.close()
     try:
         _handoff_batch(list(selected), target, why, warn_seconds, cause, sources)
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
@@ -2342,100 +2370,149 @@ def _resume_move(identity: str, target: str, requester: str, why: str, began: fl
         _move_resume.reset(token)
 
 
-def _verify_build_holders(selected: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
-    """Keep live verify calls, including calls that have not entered the admission queue."""
-    from scripts.build_hold.owning_session import OwningSession, RunNotInStaff, RunOwner, owning_session, run_resolution
-    from scripts.direct import step_record
-    from scripts.lib import process_start
-
-    directory = step_record.record_directory()
-    try:
-        paths = sorted(path for path in directory.iterdir() if path.suffix == ".json")
-    except FileNotFoundError:
-        return {}
-    except OSError as error:
-        return BuildQueueUnreadable(f"verify records are unreadable: {error}")
-    owned: dict[str, list[str]] = {}
-    for path in paths:
-        record = step_record.read(path.stem)
-        if isinstance(record, (step_record.MissingRecord, step_record.StaleRecord)):
-            continue
-        if isinstance(record, step_record.UnreadableRecord):
-            return BuildQueueUnreadable(f"verify call {record.call_id} is unreadable: {record.reason}")
-        try:
-            if sys.platform == "darwin":
-                result = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(record.pid)],
-                    capture_output=True, text=True, timeout=5, check=False)
-                if result.returncode or "HOME=" not in result.stdout:
-                    raise OSError("process environment is unreadable")
-                entries = result.stdout.split()
-            else:
-                proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
-                entries = (proc / str(record.pid) / "environ").read_bytes().decode(errors="replace").split("\0")
-            environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
-            resolution = run_resolution(environment)
-            if isinstance(resolution, RunNotInStaff):
-                owner, reason = "", f"named run owner cannot be resolved: {resolution.run}"
-            else:
-                resolved = (OwningSession(resolution.session_id) if isinstance(resolution, RunOwner)
-                            else owning_session(environment))
-                owner = resolved.session_id if isinstance(resolved, OwningSession) else ""
-                reason = "verify call has no readable session identity" if not owner else ""
-        except (OSError, subprocess.SubprocessError) as error:
-            owner, reason = "", str(error)
-        # The environment belongs to this call only while its saved process identity still matches.
-        current = process_start.process_start(record.pid)
-        if isinstance(current, (process_start.Gone, process_start.Zombie)):
-            continue
-        if isinstance(current, process_start.Started) and current.start != record.proc_start:
-            continue
-        if isinstance(current, process_start.Unreadable):
-            return BuildQueueUnreadable(f"verify call {record.call_id} identity is unreadable: {current.reason}")
-        if reason:
-            return BuildQueueUnreadable(f"verify call {record.call_id}: {reason}")
-        if owner in selected:
-            owned.setdefault(owner, []).append(f"verify.sh {record.kind} in {record.repo}")
-    return {owner: tuple(steps) for owner, steps in owned.items()}
-
-
-def _build_holders(sessions: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
-    """Name the running, waiting and cloud build steps that each session owns in the admission queue."""
-    from scripts.build_queue import admission_client, admission_protocol as wire
-
-    try:
-        reading = admission_client.view()
-    except wire.AdmissionUnavailable as error:
-        return BuildQueueUnreadable(str(error) or "no answer")
-    owned: dict[str, list[str]] = {}
-    steps = [*((step.session_id, step.step, step.folder) for step in reading.view.running),
-             *((step.session_id, step.step, step.folder) for step in reading.view.waiting),
-             *((row.identity.session_id, row.identity.step, row.identity.folder)
-               for row in (reading.cloud if isinstance(reading, wire.CloudQueueRead) else ()))]
-    for session, step, folder in steps:
-        if session in sessions:
-            owned.setdefault(session, []).append(f"{step} in {folder}" if folder else step)
-    verify = _verify_build_holders(sessions)
-    if isinstance(verify, BuildQueueUnreadable):
-        return verify
-    for session, names in verify.items():
-        owned.setdefault(session, []).extend(names)
-    return {session: tuple(names) for session, names in owned.items()}
-
-
 def _owns_detached_request(identity: str, request_id: str) -> bool:
-    current = moves.read_latest_request(identity)
+    return _is_request(moves.read_latest_request(identity), request_id)
+
+
+def _is_request(current: moves.LatestMoveRequest | moves.NoLatestMoveRequest, request_id: str) -> bool:
     return isinstance(current, moves.LatestMoveRequest) and current.request_id == request_id
 
 
 def _move_lock_command(batch: MoveBatch, identity: str, target: str) -> str:
-    if isinstance(batch.origin, NewMoveRequest):
+    # The child of a user command removes its claim at the limit, so a retry finds nothing; it gives the batch command.
+    if isinstance(batch.origin, NewMoveRequest) or (batch.user_command and isinstance(batch.origin, DetachedMoveRequest)):
         destination = batch.intent if isinstance(batch.intent, moves.FollowGroupAccount) else target
-        return moves.batch_move_command(identity, destination)
+        return moves.batch_move_command(identity, destination, user_command=batch.user_command)
     return moves.RETRY_COMMAND
 
 
-def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapping[str, LockedMoveRow],
-                   ) -> LockedMoveRow | moves.MoveInProgress | StopFailed | SessionNotFound:
+def _move_claim(batch: MoveBatch, target: str) -> moves.LatestMoveRequest:
+    destination = f"group:{batch.intent.group}" if isinstance(batch.intent, moves.FollowGroupAccount) else target
+    return moves.LatestMoveRequest(batch.request_id, destination,
+                                   explicit_group_scope=batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT,
+                                   owner=_own_claim_owner() if batch.user_command else None)
+
+
+@cache
+def _own_claim_owner() -> moves.ClaimOwner:
+    return moves.own_claim_owner()
+
+
+@dataclass(frozen=True)
+class RowHeld:
+    """Another operation holds a row that a user command needs; the command takes the row when it is free."""
+
+    session: str
+    member: ResolvedMoveMember
+    identity: str
+    reason: str
+    holder: str
+
+
+def _hold_row(session: str, member: ResolvedMoveMember, identity: str, target: str, reason: str, holder: str
+              ) -> RowHeld | moves.MoveSuperseded:
+    """Claim a held row for a user command at its first try; a later try ends when the claim is missing or replaced.
+
+    A move that holds the row reads the latest request before its stop and drops the row as superseded.
+    Only a newer move removes or replaces the claim, so the command then stops its wait for the row.
+    """
+    batch = _move_batch.get()
+    batch.native_sessions[session] = identity
+    held = RowHeld(session, member, identity, reason, holder)
+    retry = batch.origin
+    claim = _move_claim(batch, target)
+    try:
+        if identity in batch.claimed:
+            return held if _owns_detached_request(identity, batch.request_id) else moves.MoveSuperseded(identity)
+        if isinstance(retry, DetachedMoveRequest):
+            # The child takes the claim of its parent, so the claim lives while the child waits.
+            if not moves.set_claim_owner(identity, batch.request_id, _own_claim_owner()):
+                return moves.MoveSuperseded(identity)
+        else:
+            with moves.claim_lock():
+                if isinstance(retry, moves.PendingMoveRequest) and moves.read_latest_request(identity) != retry.request:
+                    return moves.MoveSuperseded(identity)
+                name = retry.member.name if isinstance(retry, moves.PendingMoveRequest) else member.name
+                moves.write_latest_request(identity, claim, name=name)
+        batch.claimed.add(identity)
+    except (OSError, ValueError) as error:
+        print(f"{identity}: cannot write or read the move request before the row is free: {error}", file=sys.stderr)
+    return held
+
+
+def _restart_holds(row_id: str) -> bool:
+    """A restart holds each row in its record from the stop to the start, also in the gap where it holds no row lock."""
+    return shutdown_record.active() and row_id in shutdown_record.read()
+
+
+def _restart_held_row(session: str, member: ResolvedMoveMember, identity: str, target: str, *, user_command: bool
+                      ) -> RowHeld | moves.MoveSuperseded | moves.MoveInProgress | moves.MoveWaitingForRow:
+    reason = "a restart holds this row"
+    if user_command:
+        return _hold_row(session, member, identity, target, reason, "")
+    return _held_row_result(session, member, identity, target, reason, "")
+
+
+def _end_user_claims(held: Mapping[str, RowHeld]) -> None:
+    """End each claim of a user command when the command ends, also when its process lives on.
+
+    The command removes the claim of a row that it never took, so that no other path replays it.
+    A retry keeps that request, because it replaced the pending move.
+    Any other request that the command leaves stays for a retry as a plain request.
+    """
+    batch = _move_batch.get()
+    untaken = {row.identity for row in held.values()}
+    for identity in sorted(batch.claimed):
+        try:
+            if identity in untaken and not isinstance(batch.origin, moves.PendingMoveRequest):
+                moves.remove_latest_request(identity, batch.request_id)
+            else:
+                _ = moves.set_claim_owner(identity, batch.request_id, None)
+        except (OSError, ValueError) as error:
+            print(f"{identity}: cannot end the move request: {error}", file=sys.stderr)
+
+
+def _hung_holder_seconds(settings: conf.ConfigRead) -> float:
+    """Limit the wait for a holder that is hung: one stop and one start of a restart, a resume or a move."""
+    stop = (settings.whole("STOP_GRACE_SECONDS") + settings.whole("KILL_GRACE_SECONDS")
+            + settings.whole("MOVE_STOP_MARGIN_SECONDS"))
+    upkeep = settings.number("UPKEEP_ROW_WAIT_SECONDS") + settings.number("RESTART_RECORD_LOCK_SECONDS")
+    start = (settings.number("HOLDER_EXIT_SECONDS") + settings.number("OWN_PANE_SHELL_SECONDS")
+             + settings.number("START_SECONDS") + settings.number("OPENING_PROMPT_SECONDS") + settings.number("STAY_SECONDS"))
+    return stop + upkeep + start
+
+
+def _await_row_operation(deadline: float) -> bool:
+    """A user command meets rows where another operation, such as a stop, a start or a restart, is in flight.
+
+    A user command waits for the operation to end (ruling): wait one poll,
+    then the caller tries the held rows again. A row in the record of an active restart stays held, also in the gap
+    where the restart holds no row lock. True when the caller can wait again after this try; False when the limit
+    for a hung holder has passed, so this try is the last one.
+    """
+    time.sleep(_ROW_POLL_SECONDS)
+    return monotonic() < deadline
+
+
+def _held_row_result(session: str, member: ResolvedMoveMember, identity: str, target: str, reason: str, holder: str
+                     ) -> moves.MoveInProgress | moves.MoveWaitingForRow:
+    batch = _move_batch.get()
+    command = _move_lock_command(batch, identity, target)
+    active = staff.row_activity(member.row_key)
+    if isinstance(active, staff.RowMoving):
+        try:
+            account = (accounts.current_move_account(batch.intent.group)
+                       if isinstance(batch.intent, moves.FollowGroupAccount) else target)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return moves.MoveWaitingForRow(session, reason, command)
+        if active.target == account:
+            return moves.MoveInProgress(session, account, command)
+    busy = f"another operation holds this row ({holder})" if holder else reason
+    return moves.MoveWaitingForRow(session, reason if isinstance(active, staff.RowAvailable) else busy, command)
+
+
+def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapping[str, LockedMoveRow], *,
+                   user_command: bool) -> LockedMoveRow | RowHeld | moves.MoveInProgress | StopFailed | SessionNotFound:
     batch = _move_batch.get()
     member = batch.members[session]
     if member.row_key in admitted:
@@ -2454,6 +2531,8 @@ def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapp
             identity = str(owner.current_session)
         if isinstance(detached, DetachedMoveRequest) and not _owns_detached_request(identity, detached.request_id):
             return moves.MoveSuperseded(identity)
+        if owner is not None and _restart_holds(str(owner.id)):
+            return _restart_held_row(session, member, identity, target, user_command=user_command)
         record = lock.enter_context(staff.session_operation(identity, native_key=moves.native_row_key(identity)))
         current = record.by_current_session(identity)
         if owner is not None and (current is None or current.id != owner.id):
@@ -2462,6 +2541,9 @@ def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapp
                                            _move_lock_command(batch, identity, target))
         if current is not None:
             member = _staff_move_member(current.id, record)
+            if _restart_holds(str(current.id)):
+                lock.close()
+                return _restart_held_row(session, member, identity, target, user_command=user_command)
         batch.members[session] = member
         batch.native_sessions[session] = identity
         return LockedMoveRow(session, member, identity, lock)
@@ -2473,18 +2555,10 @@ def _lock_move_row(session: str, target: str, cleanup: ExitStack, admitted: Mapp
                     return moves.MoveSuperseded(identity)
             except (OSError, ValueError) as read_error:
                 return StopFailed(identity, str(read_error))
-        command = _move_lock_command(batch, identity, target)
-        active = staff.row_activity(member.row_key)
-        if isinstance(active, staff.RowMoving):
-            try:
-                account = (accounts.current_move_account(batch.intent.group)
-                           if isinstance(batch.intent, moves.FollowGroupAccount) else target)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                return moves.MoveWaitingForRow(session, str(error), command)
-            if active.target == account:
-                return moves.MoveInProgress(session, account, command)
-        reason = str(error) if isinstance(active, staff.RowAvailable) else "another operation holds this row"
-        return moves.MoveWaitingForRow(session, reason, command)
+        if user_command:
+            # A user command claims the row at once and waits for the operation that holds it.
+            return _hold_row(session, member, identity, target, str(error), error.holder)
+        return _held_row_result(session, member, identity, target, str(error), error.holder)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         lock.close()
         return StopFailed(session, str(error))
@@ -2522,7 +2596,7 @@ def _alert_pending_moves(batch: MoveBatch, entries: Mapping[str, pane_record.Pan
     probes = {pane_launch.reference_id(entry) for entry in entries.values() if entry["environment"].get(PROBE_ENV) == "1"}
     names: list[str] = []
     for session, result in batch.results.items():
-        if isinstance(result, (ClaudeUp, MoveHandedOff, BuildMoveDeferred, moves.MoveSuperseded, moves.MoveWaitingForRow)):
+        if isinstance(result, (ClaudeUp, MoveHandedOff, moves.MoveSuperseded, moves.MoveWaitingForRow)):
             continue
         member = batch.members[session]
         identity = batch.native_sessions.get(session)
@@ -2555,13 +2629,17 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                   request: DetachedMoveRequest | NewMoveRequest | moves.PendingMoveRequest = _NEW_MOVE_REQUEST,
                   intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
                   moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
-                  staff_members: Collection[staff.StaffId] = ()) -> list[MoveResult]:
-    """Move available sessions and report busy rows for a manual retry."""
+                  staff_members: Collection[staff.StaffId] = (), user_command: bool = False) -> list[MoveResult]:
+    """Move the selected sessions now.
+
+    A user command waits for a busy row and wins over an automatic move. An automatic move reports a busy row at once.
+    By the placeholder (x) default, a newer user command also wins over an older one.
+    """
     selected = list(dict.fromkeys(sessions))
     if not selected:
         return []
     members: dict[str, ResolvedMoveMember] = {}
-    batch = MoveBatch(members, intent, request, target)
+    batch = MoveBatch(members, intent, request, target, user_command=user_command)
     if isinstance(request, DetachedMoveRequest):
         batch.request_id = request.request_id
     try:
@@ -2586,14 +2664,6 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 _ = sources.setdefault(primary, label)
         selected = list(members)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-        if isinstance(error, staff.StaffUnreadable) and cause != "by hand":
-            reason = f"move deferred: build ownership is unreadable ({error})"
-            if not isinstance(request, DetachedMoveRequest):
-                print(f"build wait: {reason}")
-            failure = BuildMoveDeferred
-        else:
-            reason = str(error)
-            failure = StopFailed
         results: list[MoveResult] = []
         for session in sessions:
             if isinstance(request, DetachedMoveRequest) and session not in request.staff_members:
@@ -2604,7 +2674,7 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 except (OSError, ValueError) as read_error:
                     results.append(StopFailed(session, str(read_error)))
                     continue
-            results.append(failure(session, reason))
+            results.append(StopFailed(session, str(error)))
         return results
     token = _move_batch.set(batch)
     try:
@@ -2699,21 +2769,31 @@ def _remove_latest_move(identity: str, request_id: str) -> None:
 
 
 def _claim_move_request(row: LockedMoveRow, batch: MoveBatch, target: str, *, new: bool) -> bool:
-    destination = f"group:{batch.intent.group}" if isinstance(batch.intent, moves.FollowGroupAccount) else target
-    claim = moves.LatestMoveRequest(batch.request_id, destination,
-                                   explicit_group_scope=batch.intent is moves.ExplicitMoveTarget.GROUP_ACCOUNT)
+    claim = _move_claim(batch, target)
     try:
-        current = moves.read_latest_request(row.identity)
-        retry = batch.origin
-        if ((not new and current != claim)
-                or (new and isinstance(retry, moves.PendingMoveRequest)
-                    and (retry.member.reference != row.identity or current != retry.request))):
+        with moves.claim_lock():
+            current = moves.read_latest_request(row.identity)
+            retry = batch.origin
+            if not new:
+                superseded = current != claim
+            elif row.identity in batch.claimed:
+                # Only a newer move removes or replaces the claim of a waiting user command (placeholder (x) default).
+                superseded = not _is_request(current, batch.request_id)
+            elif not batch.user_command:
+                # An automatic move never takes a row from a live user command.
+                superseded = isinstance(current, moves.LatestMoveRequest) and moves.claim_is_live(current)
+            else:
+                superseded = (isinstance(retry, moves.PendingMoveRequest)
+                              and (retry.member.reference != row.identity or current != retry.request))
+            if new and not superseded:
+                name = retry.member.name if isinstance(retry, moves.PendingMoveRequest) else row.member.name
+                moves.write_latest_request(row.identity, claim, name=name)
+        if superseded:
             batch.results[row.session] = moves.MoveSuperseded(row.identity)
             row.lock.close()
             return False
-        if new:
-            name = retry.member.name if isinstance(retry, moves.PendingMoveRequest) else row.member.name
-            moves.write_latest_request(row.identity, claim, name=name)
+        if batch.user_command:
+            batch.claimed.add(row.identity)
     except (OSError, ValueError) as error:
         batch.results[row.session] = StopFailed(row.identity, f"cannot record or read the latest move request: {error}")
         row.lock.close()
@@ -2723,18 +2803,46 @@ def _claim_move_request(row: LockedMoveRow, batch: MoveBatch, target: str, *, ne
 
 def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int, requester: str,
                cause: moves.MoveCause, source_accounts: Mapping[str, str], settings: conf.ConfigRead) -> list[MoveResult]:
+    """Move the free rows at once, then wait for the held rows and move them in later passes."""
+    batch = _move_batch.get()
+    aliases: dict[str, str] = {}
+    held: dict[str, RowHeld] = {}
+    move_pass = partial(_run_move_pass, held=held, aliases=aliases, target=target, why=why, warn_seconds=warn_seconds,
+                        requester=requester, cause=cause, source_accounts=source_accounts)
+    # The limit starts before the first pass. The child counts it from the start of its parent.
+    batch.started = monotonic() - (batch.origin.waited_seconds if isinstance(batch.origin, DetachedMoveRequest) else 0.0)
+    try:
+        move_pass(selected)
+        deadline = batch.started + _hung_holder_seconds(settings) if held else 0.0
+        while held:
+            again = _await_row_operation(deadline)
+            move_pass(list(held))
+            if not again:
+                break
+    finally:
+        # On each end, also an interrupt in the first pass.
+        _end_user_claims(held)
+    for session, row in held.items():
+        batch.results[session] = _held_row_result(session, row.member, row.identity, target, row.reason, row.holder)
+    return [batch.results[aliases.get(session, session)] for session in selected]
+
+
+def _run_move_pass(sessions: list[str], *, held: dict[str, RowHeld], aliases: dict[str, str], target: str, why: str,
+                   warn_seconds: int, requester: str, cause: moves.MoveCause, source_accounts: Mapping[str, str]) -> None:
+    """Move each free row and keep the rows that another operation holds in `held`; keep no row lock after the pass."""
     batch = _move_batch.get()
     results = batch.results
     locks: dict[str, LockedMoveRow] = {}
     admitted: dict[str, LockedMoveRow] = {}
-    aliases: dict[str, str] = {}
-    held: dict[str, tuple[str, ...]] = {}
     warned: set[str] = set()
-    build_deadline = math.inf
     check_presence = isinstance(batch.origin, moves.PendingMoveRequest)
     with ExitStack() as cleanup:
-        for session in selected:
-            row = _lock_move_row(session, target, cleanup, admitted)
+        for session in sessions:
+            row = _lock_move_row(session, target, cleanup, admitted, user_command=batch.user_command)
+            if isinstance(row, RowHeld):
+                held[session] = row
+                continue
+            _ = held.pop(session, None)
             if not isinstance(row, LockedMoveRow):
                 results[session] = row
                 continue
@@ -2763,45 +2871,26 @@ def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int,
                         row.lock.close()
                 if _detached_moves.get():
                     if ready:
-                        results.update(_handoff_locked_moves({session: session for session in ready}, locks, account,
-                                                            why, warn_seconds, cause, source_accounts))
+                        # The detached child also waits for the held rows.
+                        _hand_over(_handoff_locked_moves({session: session for session in (*ready, *held)}, locks,
+                                                         account, why, warn_seconds, cause, source_accounts), held)
                     break
-                reading = (_build_holders([plan.identity for plan in ready.values()])
-                           if ready and cause != "by hand" else {})
-                next_held: dict[str, tuple[str, ...]] = {}
-                for session, plan in tuple(ready.items()):
-                    if isinstance(reading, BuildQueueUnreadable):
-                        steps = held.get(session, ())
-                        if not steps:
-                            reason = f"move deferred: build ownership is unreadable ({reading.reason})"
-                            print(f"build wait: {reason}")
-                            results[session] = BuildMoveDeferred(session, reason)
-                            locks[session].lock.close()
-                            del ready[session]
-                            continue
-                    else:
-                        steps = reading.get(plan.identity, ())
-                    if steps:
-                        if session not in held:
-                            print(f"build wait: {session} owns {'; '.join(steps)}; the move waits for its steps to end")
-                        next_held[session] = steps
-                        del ready[session]
-                held = next_held
                 if ready:
                     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
                     if any(plan.identity == caller for plan in ready.values()):
                         _record_launches([plan.member.reference for plan in ready.values()])
-                        chosen = {session: plan.identity for session, plan in ready.items()}
-                        chosen.update((session, session) for session in held)
                         sources = dict(source_accounts) | {session: plan.source.session.account for session, plan in ready.items()
                                                           if isinstance(plan.source, LiveMoveSource)}
-                        results.update(_handoff_locked_moves(chosen, locks, account, why, warn_seconds, cause, sources))
+                        # The child stops this caller, so the child also waits for the held rows.
+                        chosen = {session: plan.identity for session, plan in ready.items()}
+                        chosen.update((session, session) for session in held)
+                        _hand_over(_handoff_locked_moves(chosen, locks, account, why, warn_seconds, cause, sources), held)
                         break
                     unwarned = {session: plan for session, plan in ready.items() if session not in warned}
                     if warn_seconds and unwarned:
                         _warn_moves(unwarned, account, why, warn_seconds)
                         warned.update(unwarned)
-                        locks = {session: locks[session] for session in (*held, *ready)}
+                        locks = {session: locks[session] for session in ready}
                         continue
                     ready = {session: plan for session, plan in ready.items()
                              if _claim_move_request(locks[session], batch, target, new=False)}
@@ -2810,24 +2899,16 @@ def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int,
                                           cause=cause, source_accounts=source_accounts, plans=ready, locks=locks,
                                           admitted_record=record)
                         results.update(zip(ready, moved))
-            if not held:
-                break
-            if not _batch_process.get():
-                results.update(_handoff_locked_moves({session: session for session in held}, locks, target,
-                                                     why, warn_seconds, cause, source_accounts))
-                break
-            now = monotonic()
-            if build_deadline == math.inf:
-                build_deadline = now + settings.whole("MOVE_BUILD_WAIT_MINUTES") * 60
-            if now >= build_deadline:
-                for session, steps in held.items():
-                    reason = f"move deferred: build ownership remains: {'; '.join(steps)}"
-                    print(f"build wait limit: {session}: {reason}")
-                    results[session] = BuildMoveDeferred(session, reason)
-                break
-            locks = {session: locks[session] for session in held}
-            time.sleep(min(settings.whole("MOVE_BUILD_POLL_SECONDS"), build_deadline - now))
-    return [results[aliases.get(session, session)] for session in selected]
+            break
+
+
+def _hand_over(handed: Mapping[str, MoveResult], held: dict[str, RowHeld]) -> None:
+    """Record the handoff results; the child owns the claims and the held rows that it took."""
+    batch = _move_batch.get()
+    batch.results.update(handed)
+    batch.claimed.difference_update(batch.native_sessions.get(session, session) for session, result in handed.items()
+                                    if isinstance(result, MoveHandedOff))
+    held.clear()
 
 
 def _stop_move(attempt: MoveStopAttempt) -> StopResult:
@@ -2996,12 +3077,6 @@ def _load_batch_modules() -> None:
         # Launches can need these modules to check the target environment.
         "scripts.lib.copy_record",
         "scripts.lib.slot_root",
-        # Automatic moves use the admission queue and verify process records.
-        "scripts.build_queue.admission_client",
-        "scripts.build_queue.admission_protocol",
-        "scripts.build_hold.owning_session",
-        "scripts.build_hold.override_guard",
-        "scripts.direct.step_record",
     ):
         _ = import_module(name)
 
@@ -3037,28 +3112,33 @@ class MoveStillPending:
     intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
 
 
+def _pending_destination(destination: str, request: moves.LatestMoveRequest | LegacyMoveReport) -> MoveStillPending:
+    target, intent = _pending_target(destination)
+    if isinstance(intent, moves.FollowGroupAccount):
+        target = accounts.current_move_account(intent.group)
+    elif isinstance(request, moves.LatestMoveRequest) and request.explicit_group_scope:
+        intent = moves.ExplicitMoveTarget.GROUP_ACCOUNT
+    return MoveStillPending(target, intent)
+
+
 def _reconcile_move(identity: str, name: str, destination: str, request: moves.LatestMoveRequest | LegacyMoveReport
                      ) -> MoveStillPending | ClaudeUp | SessionNotFound | StopFailed:
     try:
         with staff.session_operation(identity, native_key=moves.native_row_key(identity)) as record:
             if isinstance(request, moves.LatestMoveRequest) and moves.read_latest_request(identity) != request:
                 return moves.MoveSuperseded(identity)
-            target, intent = _pending_target(destination)
-            if isinstance(intent, moves.FollowGroupAccount):
-                target = accounts.current_move_account(intent.group)
-            elif isinstance(request, moves.LatestMoveRequest) and request.explicit_group_scope:
-                intent = moves.ExplicitMoveTarget.GROUP_ACCOUNT
+            pending = _pending_destination(destination, request)
             owner = record.by_current_session(identity)
             member = (_staff_move_member(owner.id, record) if owner is not None
                       else ResolvedMoveMember(pane_launch.NativeLaunchReference(identity), name))
             source = _read_move_source(member, identity, record, check_presence=True)
             if isinstance(source, StopFailed):
                 return source
-            if isinstance(source, SessionNotFound) or isinstance(source, LiveMoveSource) and source.session.account == target:
+            if isinstance(source, SessionNotFound) or isinstance(source, LiveMoveSource) and source.session.account == pending.account:
                 if isinstance(request, moves.LatestMoveRequest):
                     moves.remove_latest_request(identity, request.request_id)
                 return source if isinstance(source, SessionNotFound) else source.session
-            return MoveStillPending(target, intent)
+            return pending
     except staff.StaffRefused as error:
         command = moves.RETRY_COMMAND if isinstance(request, moves.LatestMoveRequest) else ""
         return moves.MoveWaitingForRow(identity, str(error), command)
@@ -3081,6 +3161,12 @@ def _pending_move_command(command: str, request_id: str) -> int:
         seen.add(identity)
         current = request.request if isinstance(request, moves.PendingMoveRequest) else request
         state = _reconcile_move(identity, member.name, destination, current)
+        if isinstance(state, moves.MoveWaitingForRow) and command != "result" and isinstance(current, moves.LatestMoveRequest):
+            # The retry is a user command, so it waits for the busy row in move_sessions.
+            try:
+                state = _pending_destination(destination, current)
+            except (OSError, ValueError) as error:
+                state = StopFailed(identity, str(error))
         if isinstance(state, (ClaudeUp, moves.MoveSuperseded)):
             return
         found = True
@@ -3101,7 +3187,8 @@ def _pending_move_command(command: str, request_id: str) -> int:
             if not announced:
                 print("The retry starts a new move request.")
                 announced = True
-            result, = move_sessions([identity], state.account, why="retry account move", request=request, intent=state.intent)
+            result, = move_sessions([identity], state.account, why="retry account move", request=request, intent=state.intent,
+                                    user_command=True)
             code |= _print_retry_result(result)
 
     try:
@@ -3149,6 +3236,12 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--request-id", default="", help=argparse.SUPPRESS)
     _ = batch.add_argument("--group", choices=accounts.CLAUDE_GROUPS, help=argparse.SUPPRESS)
     _ = batch.add_argument("--explicit-group-scope", action="store_true", help=argparse.SUPPRESS)
+    _ = batch.add_argument("--user-command", action="store_true", help=argparse.SUPPRESS)
+    _ = batch.add_argument("--waited-seconds", type=float, default=0.0, help=argparse.SUPPRESS)
+    # The log path is the same file as the log descriptor, so the batch writes through the path.
+    _ = batch.add_argument("--log-fd", type=int, help=argparse.SUPPRESS)
+    _ = batch.add_argument("--ready-fd", type=int, help=argparse.SUPPRESS)
+    _ = batch.add_argument("--notify-systemd", action="store_true", help=argparse.SUPPRESS)
     _ = batch.add_argument("--staff-member", action="append", default=[], help=argparse.SUPPRESS)
     _ = batch.add_argument("--log", type=Path)
     _ = batch.add_argument("--preload-restarted", action="store_true", help=argparse.SUPPRESS)
@@ -3176,12 +3269,11 @@ def main(argv: list[str] | None = None) -> int:
                                 cast(int, args.pid), cast(str, args.generation), cast(str, args.requester), cast(str, args.why))
             _ = output.write(cause + "\n")
         return int(bool(cause))
-    # The batch is the one process that may wait for build steps; its output goes to the move log.
+    # The batch writes its output to the move log.
     group = cast(accounts.ClaudeGroup | None, args.group)
     target = cast(str, args.target)
     if not (target or group):
         batch.error("provide --target for an explicit move or --group for a group move")
-    token = _batch_process.set(True)
     intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget
     if group is not None:
         intent = moves.FollowGroupAccount(group)
@@ -3190,39 +3282,46 @@ def main(argv: list[str] | None = None) -> int:
     else:
         intent = moves.ExplicitMoveTarget.REQUESTED_ACCOUNT
     request_id = cast(str, args.request_id)
-    request = (DetachedMoveRequest(request_id, frozenset(cast(list[str], args.staff_member)))
+    request = (DetachedMoveRequest(request_id, frozenset(cast(list[str], args.staff_member)),
+                                   cast(float, args.waited_seconds))
                if request_id else _NEW_MOVE_REQUEST)
-    try:
-        log = cast(Path | None, args.log)
-        if log is None:
-            log = shutdown_state_root() / "move.log"
-            log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
-            try:
-                _load_batch_modules()
-            except (ImportError, AttributeError) as error:
-                if cast(bool, args.preload_restarted):
-                    raise
-                print(f"batch startup: module preload failed ({type(error).__name__}); restarting in a new interpreter",
-                      flush=True)
-                os.execv(sys.executable, [sys.executable, __file__, "batch", "--preload-restarted", *argv[1:]])
-            results = move_sessions(cast(list[str], args.sessions), target,
-                                    why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
-                                    requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
-                                    request=request, intent=intent,
-                                    source_accounts={identity: label for item in cast(list[str], args.source_account)
-                                                     for identity, _, label in (item.partition("="),)})
-            for result in results:
-                fields = asdict(result)
-                if isinstance(result, moves.MoveSuperseded):
-                    fields["reason"] = f"not moved: {result.reason}"
-                elif isinstance(result, moves.MoveWaitingForRow) and result.command:
-                    fields["reason"] = f"Move pending: {result.reason}. Run again: {result.command}"
-                elif isinstance(result, moves.MoveInProgress) and result.command:
-                    fields["reason"] = f"Move pending. Run again: {result.command}"
-                _ = output.write(json.dumps({"result": type(result).__name__, **fields}) + "\n")
-    finally:
-        _batch_process.reset(token)
+    if not cast(bool, args.preload_restarted):
+        if request_id and cast(bool, args.user_command):
+            # The child takes the claims of its parent before it confirms its start, so each claim stays live.
+            for identity in cast(list[str], args.sessions):
+                try:
+                    _ = moves.set_claim_owner(identity, request_id, _own_claim_owner())
+                except (OSError, ValueError) as error:
+                    print(f"{identity}: cannot take the move request: {error}", file=sys.stderr)
+        notify_ready(cast(int | None, args.ready_fd), systemd=cast(bool, args.notify_systemd))
+    log = cast(Path | None, args.log)
+    if log is None:
+        log = shutdown_state_root() / "move.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
+        try:
+            _load_batch_modules()
+        except (ImportError, AttributeError) as error:
+            if cast(bool, args.preload_restarted):
+                raise
+            print(f"batch startup: module preload failed ({type(error).__name__}); restarting in a new interpreter",
+                  flush=True)
+            os.execv(sys.executable, [sys.executable, __file__, "batch", "--preload-restarted", *argv[1:]])
+        results = move_sessions(cast(list[str], args.sessions), target,
+                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
+                                requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
+                                request=request, intent=intent, user_command=cast(bool, args.user_command),
+                                source_accounts={identity: label for item in cast(list[str], args.source_account)
+                                                 for identity, _, label in (item.partition("="),)})
+        for result in results:
+            fields = asdict(result)
+            if isinstance(result, moves.MoveSuperseded):
+                fields["reason"] = f"not moved: {result.reason}"
+            elif isinstance(result, moves.MoveWaitingForRow) and result.command:
+                fields["reason"] = f"Move pending: {result.reason}. Run again: {result.command}"
+            elif isinstance(result, moves.MoveInProgress) and result.command:
+                fields["reason"] = f"Move pending. Run again: {result.command}"
+            _ = output.write(json.dumps({"result": type(result).__name__, **fields}) + "\n")
     return int(any(not isinstance(result, (ClaudeUp, MoveHandedOff)) for result in results))
 
 

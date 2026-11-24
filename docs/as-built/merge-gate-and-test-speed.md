@@ -86,7 +86,8 @@ The route takes the Mac repository claim before the first SSH request.
 Then the gate consumes the launch permission of its assignment (`ConsumePermission`) before the first SSH request.
 The gate process is the claim holder, and the Mac claim id is the claim reference.
 The queue keeps a consumed guest assignment current while the gate process lives.
-So the queue places no other run on the busy guest, and the Builds page shows a running guest row.
+So the queue places no other run on the busy guest, and the Builds page shows a guest row with machine `mac-linux`.
+Until the queue confirms the guest attempt, the row shows `mac-linux (not confirmed)`.
 A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
 If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
@@ -106,7 +107,10 @@ A second decline from the guest in the same run ends the guest for that run, so 
 If no named machine remains, the gate step stops with "Gate placement blocked".
 A refused placement during the retry stops the gate step with "Gate placement blocked".
 A failure after the first test started is not placed again: the gate fails.
-`copies.py run` with named gate targets does not place the gate again yet.
+`copies.py run` does not place a gate again after a guest decline.
+Checkpoint and bump gates use `copies.py gate-step` when they have placement targets.
+A claude gate requests every enabled target that the fixed placement rules permit when the caller gives no targets.
+See [Gate placement](build-targets.md#gate-placement).
 If the guest cannot return a result after a test started, the gate fails and reports the guest and the reason.
 Each failure with a stream status names that status and the last 1200 characters of the stream standard error (`stream_report`).
 If the guest returns a failure, the gate reports the guest and the failed jobs.
