@@ -1494,13 +1494,15 @@ print('signals')
             descriptors.append(directory)
             return open_lock(path, directory, create=create)
 
-        with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember_parent):
+        with (mock.patch.object(build_folder_lock, "folder_parent", wraps=build_folder_lock.folder_parent) as opens,
+              mock.patch.object(build_folder_lock, "open_lock", side_effect=remember_parent)):
             with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-", folders.ExplicitBuildParent(parent))) as path:
                 _ = parent.rename(moved)
                 parent.mkdir()
                 _ = (parent / "keep").write_text("replacement")
                 self.assertTrue((moved / path.name).is_dir())
                 self.assertFalse(path.exists())
+        opens.assert_called_once_with(path, parent, create=False)
         allocated, removed, stage = descriptors
         self.assertEqual({removed, stage}, {allocated})
         self.assertEqual(list(moved.iterdir()), [])
@@ -1607,7 +1609,11 @@ locks.probe_retry_seconds=0.005
         path = self.root / "tree"
         path.mkdir()
         self.assertTrue(folders.remove_build_folder(path))
+        with self.assertRaises(FileNotFoundError):
+            _ = path.lstat()
         self.assertTrue(folders.remove_build_folder(path))
+        with self.assertRaises(FileNotFoundError):
+            _ = path.lstat()
         self.assertFalse(path.with_suffix(".lock").exists())
 
     def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
@@ -2028,6 +2034,16 @@ assert not loaded, loaded
                         record = cast(dict[str, object], json.loads(lease.read_text()))
                         self.assertEqual(record["pid"], os.getpid())
                         self.assertEqual(record["purpose"], "gate-proof-")
+                    for staged in path.parent.glob(".removing-*"):
+                        if staged.suffix:
+                            continue
+                        inode = staged.lstat()
+                        self.assertTrue(stat.S_ISDIR(inode.st_mode), staged)
+                        record = cast(dict[str, object], json.loads(folders.lease_path(staged).read_text()))
+                        self.assertEqual(record, {"device": inode.st_dev, "inode": inode.st_ino})
+                        lock = staged.with_name(staged.name + ".lock")
+                        with build_folder_lock.folder_parent(staged, staged.parent, create=False) as parent:
+                            self.assertTrue(build_folder_lock.is_marked_lock(lock.name, parent, lock.lstat()), staged)
                     self.assertEqual(folders.build_folder_state(path), "free")
                 finally:
                     release.set()
