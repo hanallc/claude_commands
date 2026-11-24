@@ -1749,6 +1749,54 @@ fi
         self.assert_guest_clean('probe', 'arm', 'arm', 'arm')
         self.assertFalse(self.run_lock().exists())
 
+    def test_arm_connect_retries_exhausted_replaces_guest_at_original_rank(self) -> None:
+        fixture = GatePlacementFixture(self)
+        guest = self.placed = replace(fixture.guest, attempt=f'{42:032x}')
+        admission_wire.write_assignment(fixture.assignment_file, wire.Assignment(guest))
+        args = ('--tests-only', '--full', '--module-time-limit-s', '3', '--repo', str(self.repo))
+        attempts: list[tuple[str, int]] = []
+
+        def run() -> subprocess.CompletedProcess[str]:
+            target = admission_wire.read_assignment(fixture.assignment_file).assignment.destination.target
+            with redirect_stderr(io.StringIO()) as errors:
+                status = gate.main(args)
+            attempts.append((target, status))
+            return subprocess.CompletedProcess(args, status, '', errors.getvalue())
+
+        def replace_assignment(request: wire.PlacementRequest) -> None:
+            self.assertEqual(request, fixture.request)
+            with patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+                self.assertEqual(mac_linux.settlement(guest.episode, 42), placement.Settled())
+            admission_wire.write_assignment(fixture.assignment_file, fixture.local)
+
+        fixture.report_failure.return_value = wire.DispatchStatus(guest, placement.CurrentAssignment(),
+            placement.PermissionConsumed(1.0), retry=placement.RetryAt(1.0))
+        local_run = GateRun((gate.GateJobResult('fixture', 'test_first.py', 0, 1, ''),), 1, 0)
+        sidecar = fixture.assignment_file.with_name('progress')
+        with (patch.dict(os.environ, {'FIXTURE_SSH_ARM': 'reset,refused,reset',
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main'),
+                                     'BUILDLOG_PLACEMENT_FILE': str(fixture.assignment_file),
+                                     'BUILDLOG_PLACEMENT_SIDECAR': str(sidecar)}),
+              patch.object(gate, 'gate_recovery', return_value=nullcontext()),
+              patch.object(gate, 'current_gate_placement', side_effect=[wire.Assignment(guest), fixture.local]),
+              patch.object(mac_linux, 'sleep'),
+              patch.object(mac_linux, 'send_guest_execution') as execution,
+              patch.object(admission_client, 'request_settlement') as settle,
+              patch.object(gate, 'run_suites', return_value=local_run) as local,
+              patch.object(gate, 'release_local_gate') as release):
+            result = first_step.run_gate_with_placement(run, fixture.assignment_file, fixture.request, replace_assignment)
+        self.assertEqual(attempts, [('mac-linux', 79), ('natedev', 0)], result.stderr)
+        self.assertEqual(result.returncode, 0)
+        report = wire.parse_request(fixture.report_file.read_bytes())
+        assert isinstance(report, wire.ClaimFailure), report
+        self.assertEqual((report.assignment, report.reason), (guest, 'mac_linux_start_unconfirmed'))
+        fixture.report_failure.assert_called_once_with(report)
+        execution.assert_not_called()
+        settle.assert_not_called()
+        local.assert_called_once()
+        release.assert_called_once_with(gate.LocalGateAssignment(fixture.local.grant, guest.owner, sidecar), 0)
+        self.assert_guest_clean('probe', 'arm', 'arm', 'arm')
+
     def test_recovery_uses_a_saved_guest_when_the_holder_exits_without_releasing(self) -> None:
         request = self.lose_guest_permission_reply(43)
         episode = request.assignment.episode

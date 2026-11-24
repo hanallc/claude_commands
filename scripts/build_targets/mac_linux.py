@@ -803,10 +803,7 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
                 raise
         return subprocess.CompletedProcess(command, process.returncode, output, errors)
 
-    try:
-        response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
-    except GuestConnectAttemptsFailed as error:
-        raise GuestArmNotSent(str(error)) from error
+    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
     if response.returncode:
         diagnostic = response.stderr.decode(errors='replace').strip() or 'no diagnostic'
         raise GuestUnavailable(f'guest arm exited {response.returncode}: {diagnostic}')
@@ -1741,12 +1738,14 @@ def send_guest_end_report(request: ExecutionReport) -> None:
         raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
 
 
-def settle_guest_no_run(dispatch: GuestGateDispatch) -> None:
-    """Record that the gate consumed permission and the guest received no arm command."""
+def settle_guest_no_run(dispatch: GuestGateDispatch, *, retry_before_settlement: bool) -> None:
+    """Save no-start proof and report settlement for the old no-answer path."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 
     try:
         _append_guest_end(dispatch, GuestNotStartedProven(), 'The guest received no arm command')
+        if retry_before_settlement:
+            return
         request = wire.ExecutionReport(admission_client.request_id(), dispatch.assignment, dispatch.claim,
             execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER),
             placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
@@ -2022,8 +2021,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             dispatch.arm_requested = True
                             dispatch.settled = False
                             armed = arm_guest(settings, request['attempt'])
-                        except GuestArmNotSent as error:
+                        except (GuestArmNotSent, GuestConnectAttemptsFailed) as error:
                             dispatch.arm_requested, dispatch.settled = prior_arm, prior_settlement
+                            if isinstance(error, GuestConnectAttemptsFailed):
+                                raise GuestConnectAttemptsFailed(f'the gate could not send the arm request: {error}') from error
                             raise GuestTookNoRun(f'the gate could not send the arm request: {error}') from error
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
                             raise GuestTookNoRun(f'the guest did not arm the run: {error}') from error
@@ -2365,11 +2366,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         saved, launch = launch, None
         _release_guest_launch(saved)
 
-    def refused(reason: str, *, permission_unknown: bool = False,
-                lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
+    def refused(reason: str, *, permission_unknown: bool = False, lock_refused: bool = False,
+                retry_before_settlement: bool = False) -> GuestNotStarted | GuestGateBlocked:
         if dispatch is None and not permission_unknown:
             return GuestNotStarted(reason)
-        retry_before_settlement = False
         if dispatch is not None:
             if dispatch.arm_requested:
                 if dispatch.started is not None:
@@ -2379,7 +2379,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                     reason += '. The guest did not confirm whether the run started.'
                     return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
             else:
-                settle_guest_no_run(dispatch)
+                settle_guest_no_run(dispatch, retry_before_settlement=retry_before_settlement)
         try:
             release_launch()
         except OSError as error:
@@ -2453,7 +2453,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except (GuestTookNoRun, GuestNotLocked) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown),
-                       lock_refused=isinstance(error, GuestNotLocked))
+                       lock_refused=isinstance(error, GuestNotLocked),
+                       retry_before_settlement=isinstance(error, GuestConnectAttemptsFailed))
     except GuestEndUnproven as error:
         if dispatch is not None:
             try:
