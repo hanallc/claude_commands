@@ -600,7 +600,9 @@ class GateWorker:
                   result_seen_at: int | ledger.GateResultNotReceived = ledger.GATE_RESULT_NOT_RECEIVED) -> None:
         targets = ledger.GateCleanupTargets(self.box_region, (instance,))
         with self.book.transaction() as state:
-            ledger.mark_gate_cleanup(state, attempt, owner, targets, result_seen_at=result_seen_at)
+            cleanup = ledger.mark_gate_cleanup(state, attempt, owner, targets, result_seen_at=result_seen_at)
+        if isinstance(cleanup, ledger.GateTerminated):
+            return
         api = self.regional_api(self.box_region)
         deadline = self.clock() + settings().number('termination_timeout_s')
         requested = False
@@ -681,11 +683,12 @@ class GateWorker:
                         if box.targets.region != region:
                             continue
                         try:
-                            ledger.mark_gate_cleanup(state, box.attempt, box.owner, box.targets)
+                            cleanup = ledger.mark_gate_cleanup(state, box.attempt, box.owner, box.targets)
                         except ledger.GateCleanupSuperseded as error:
                             superseded.append(str(error))
                         else:
-                            current.append(box)
+                            if isinstance(cleanup, ledger.GateCleanupPending):
+                                current.append(box)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 print('gate cleanup: ' + str(error), file=sys.stderr)
                 skipped = True

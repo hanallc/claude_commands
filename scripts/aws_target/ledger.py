@@ -111,6 +111,10 @@ class GateAbsent:
 class GateTerminated:
     at: int
     instance_id: str
+    additional_instances: tuple[str, ...] = ()
+
+    def confirms(self, instances: tuple[str, ...]) -> bool:
+        return {self.instance_id, *self.additional_instances} == set(instances)
 
 
 @dataclass(frozen=True)
@@ -848,10 +852,9 @@ class GateCleanupInProgress(LedgerUnavailable):
     """The booking is reserved for cleanup."""
 
 
-def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
+def require_gate_cleanup_owner(booking: GateReservation | None, attempt: str,
                                owner: GateWorkerOwner | GateOwnerUnknown) -> GateReservation:
     """Check the cleanup selection while the ledger lock is held."""
-    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
     if booking is None or not gate_is_open(booking):
         raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking is no longer open')
     if booking.owner != owner:
@@ -859,18 +862,25 @@ def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
     return booking
 
 
-def mark_gate_cleanup(state: LedgerEvidence, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
-                      targets: GateCleanupTargets, *,
-                      result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED) -> None:
-    """Save the cleanup targets and the first valid result time before the AWS call."""
-    booking = require_gate_cleanup_owner(state, attempt, owner)
+def mark_gate_cleanup(
+    state: LedgerEvidence, attempt: str, owner: GateWorkerOwner | GateOwnerUnknown,
+    targets: GateCleanupTargets, *, result_seen_at: int | GateResultNotReceived = GATE_RESULT_NOT_RECEIVED,
+) -> GateCleanupPending | GateTerminated:
+    """Return a matching confirmed end or save cleanup before the AWS call."""
+    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+    if (booking is not None and isinstance(booking.state, GateTerminated)
+            and booking.region == targets.region and booking.state.confirms(targets.instances)):
+        return booking.state
+    booking = require_gate_cleanup_owner(booking, attempt, owner)
     if isinstance(booking.cleanup, GateCleanupPending):
         if booking.cleanup.targets != targets:
             raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
         if isinstance(booking.cleanup.result_seen_at, int) or isinstance(result_seen_at, GateResultNotReceived):
-            return
+            return booking.cleanup
+    pending = GateCleanupPending(targets, result_seen_at)
     state.gate_reservations[state.gate_reservations.index(booking)] = replace(
-        booking, region=targets.region, cleanup=GateCleanupPending(targets, result_seen_at))
+        booking, region=targets.region, cleanup=pending)
+    return pending
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -986,7 +996,9 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         elif kind == 'absent':
             gate_state = GateAbsent(instant(status, 'at'))
         elif kind == 'terminated':
-            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'))
+            additional = (tuple(text(row, 'id') for row in rows(status, 'additional_instances'))
+                          if 'additional_instances' in status else ())
+            gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'), additional)
         else:
             raise LedgerUnavailable('unknown gate reservation state')
         cleanup = GATE_CLEANUP_NOT_STARTED
@@ -1116,7 +1128,9 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
              {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
              {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
-             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id}}
+             {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id,
+              **({'additional_instances': [{'id': value} for value in r.state.additional_instances]}
+                 if r.state.additional_instances else {})}}
             for r in state.gate_reservations],
         "compute_requests": [
             {'at': r.at, 'stack': r.stack, 'region': r.region, 'spot_max_usd_per_hour': str(r.spot_max_usd_per_hour),
@@ -2632,10 +2646,13 @@ class CostLedger:
                      cleanup: GateCleanupTargets | GateCleanupNotStarted = GATE_CLEANUP_NOT_STARTED) -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
-            if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
-                _ = require_gate_cleanup_owner(state, attempt, expected_owner)
             booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
+                _ = require_gate_cleanup_owner(booking, attempt, expected_owner)
             if booking is not None and isinstance(booking.state, GateTerminated):
+                if isinstance(cleanup, GateCleanupTargets) and (booking.region != cleanup.region
+                        or not booking.state.confirms(cleanup.instances)):
+                    raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
                 return
             if isinstance(cleanup, GateCleanupTargets):
                 if (booking is None or not isinstance(booking.cleanup, GateCleanupPending)
@@ -2644,6 +2661,8 @@ class CostLedger:
                     raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
                 if isinstance(booking.cleanup.result_seen_at, int):
                     outcome = replace(outcome, at=booking.cleanup.result_seen_at)
+                outcome = replace(outcome, additional_instances=tuple(
+                    sorted(set(cleanup.instances) - {outcome.instance_id})))
             elif booking is not None and isinstance(booking.cleanup, GateCleanupPending):
                 raise GateCleanupInProgress('The gate booking is in cleanup')
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at

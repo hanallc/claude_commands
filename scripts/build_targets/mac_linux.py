@@ -1280,9 +1280,10 @@ def _write_guest_end(key: str, claim: str,
 
 def _append_guest_end_row(row: dict[str, object]) -> None:
     path = target_config.mac_linux_end_proof_journal()
-    directory = path.parent.resolve()
+    directory = path.parent
+    state_root = directory.parent
     directory.mkdir(parents=True, exist_ok=True)
-    fd = os.open(directory / path.name, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, 'a+b') as journal:
         fcntl.flock(journal, fcntl.LOCK_EX)
         if os.fstat(fd).st_size:
@@ -1293,11 +1294,9 @@ def _append_guest_end_row(row: dict[str, object]) -> None:
         _ = journal.write((json.dumps(row) + '\n').encode())
         journal.flush()
         os.fsync(fd)
-        # A previous writer can leave directories visible before they reach disk.
-        for folder in (directory, *directory.parents):
-            atomic_file.sync_folder(folder)
-            if folder.is_mount():
-                break
+        # A previous writer can leave the journal directory visible before it reaches disk.
+        atomic_file.sync_folder(directory)
+        atomic_file.sync_folder(state_root)
 
 
 @dataclass(frozen=True)
