@@ -83,11 +83,10 @@ The page keeps `agent_swap_demand` and `swap_covered_bytes` as its reserve field
 Each new host reading still reads `MemAvailable`.
 The pressure limits remain unchanged.
 
-The service measures each handled request's wall time and process CPU time.
-The measurements include configuration recovery for the logging threshold.
+The service measures each handled request's wall time and thread CPU time.
 `request_slow_seconds=0.25` sets the logging threshold in `config/build_admission.conf`.
 A request above that threshold logs its request kind, wall seconds, and CPU seconds to stderr.
-The service reads the threshold at use.
+The service reads the threshold when it loads the admission configuration.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
@@ -211,18 +210,14 @@ An unavailable key permits placement and sends no source key with the copy.
 `PlacementWait` carries the original queue time, position and candidate eligibility.
 `wait_for_placement` polls after each configured waiting interval, which is one second by default.
 The timer controls polling even when the queue, view, hold, or release files change.
-The service publishes placement waits and grants after each pass.
-The service hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
-Each published reply carries the request digest, the input event count, the provider evidence version, and the earliest applicable deadline.
-A poll can reuse a reply when the digest, count, and version match and the deadline is in the future.
-The deadline covers provider evidence expiry, attempt retries, guest backoff, and the hold for a remote start.
-The configuration watch checks admission configuration and the provider settings read by the pass.
-The service compares file stamps for settings outside the watched folder and for settings that use symbolic links.
-A pending configuration change or an ended claim holder prevents reuse.
-The owner can then ask the service to close the attempt under the usual provider rules.
-The reuse check needs no pass or state write.
-Readings, process exits, configuration changes, queue changes, and the pass timer advance the input event count.
-Provider workers change the evidence version when they store new evidence.
+The service caches placement waits after each pass.
+It hashes poll bytes with SHA-256 before it fills in the caller identity or resolves the Cargo folder.
+A poll can reuse a wait when the request digest and input event count match and no configuration change is pending.
+An episode with a current assignment or local grant takes the regular request path.
+An unchanged poll that reuses a wait needs no pass, state write, or configuration file read.
+A poll from another account still checks the owner's account in `/proc/<pid>/status`.
+The timer refreshes waits at the larger of `waiting_pass_seconds` and `min_pass_gap_seconds`.
+The next poll sees the new result after the pass.
 `Assignment` carries a saved destination and attempt. Launch permission requires a separate request.
 `ClaimFailure` closes the exact assignment before another placement decision.
 `ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
@@ -664,7 +659,7 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 Each publication of the view also replaces `admission/view.json` atomically.
-The pass stores the current input event count with its placement replies before it replaces the view file.
+The pass stores the current input event count with its placement waits before it replaces the view file.
 The file holds the publication time, `fresh_until`, and the encoded socket reply.
 `fresh_until` adds the longest configured pass interval or minimum pass gap to the publication time.
 A socket `ViewRequest` returns the last published view without starting a pass.
