@@ -1290,20 +1290,26 @@ def end(parent: StaffId, name: WorkerName, *,
         return ExitCode.OK
 
 
-def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
+def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, *, run: Path
                    ) -> DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown | DispatchAwaitingReply:
     """Read acceptance and closure once before choosing the worker's resume step."""
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    return transcript_receipt(worker_admission.conversation_entries(row, backend, set()),
+    receipt = transcript_receipt(worker_admission.conversation_entries(row, backend, set()),
         DispatchPrompt(dispatch.instance_id, include_stage_two=True), DoneReply(dispatch.instance_id)).receipt
+    if isinstance(receipt, DispatchAwaitingReply) and isinstance(receipt.matching_done, DispatchComplete):
+        _, other_passes = detached_runs.worker_results(run / worker_lifecycle.DETACHED_RUNS_DIR, row,
+                                                       since=0, pane_dispatch_id=dispatch.instance_id)
+        if other_passes.issuperset(receipt.runs):
+            return receipt.matching_done
+    return receipt
 
 
-def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
+def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch, *, run: Path
                 ) -> BusyPass | UnsubmittedAssignment | NoOwnPass | DispatchEvidenceUnknown:
     """Use the transcript receipt to select one step for every resume path."""
-    receipt = resume_receipt(row, dispatch)
+    receipt = resume_receipt(row, dispatch, run=run)
     if isinstance(receipt, DispatchNotSubmitted):
         return UnsubmittedAssignment(dispatch.instance_id, dispatch.launcher_command)
     if isinstance(receipt, (DispatchSubmitted, DispatchAwaitingReply)):
@@ -1325,29 +1331,33 @@ class WorkerResume:
     detached: str = ""
 
 
-def _resume_launcher(row: staff.StaffRow, resume: WorkerResume, *,
+def _resume_launcher(opened: worker_panes.OpenWorker, resume: WorkerResume, *,
                      on_submission: Callable[[], object] | NoLaunchCleanup = NO_LAUNCH_CLEANUP
                      ) -> Literal[ExitCode.OK] | DispatchEvidenceUnknown:
     """Deliver the resume step while restore holds the dispatch lock."""
-    record = staff.snapshot()
-    parent = record.parent_of(row)
+    row = opened.row
     step, detached = resume.step, resume.detached
-    recipient = row if isinstance(step, (BusyPass, NoOwnPass)) else parent
     client = _client()
-    pane = next((item for item in client.tab_sessions()
-                 if recipient is not None and item.session_id == recipient.current_session), None)
-    if pane is None or parent is None or recipient is None:
-        return DispatchEvidenceUnknown(f"{'worker' if recipient == row else 'director'} session is unavailable")
-    if isinstance(step, (BusyPass, NoOwnPass)):
-        status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane.pane_id),
+    if isinstance(step, UnsubmittedAssignment):
+        parent = staff.snapshot().parent_of(row)
+        if parent is None:
+            return DispatchEvidenceUnknown("director session is unavailable")
+        target = parent.current_session
+        director = next((item for item in client.tab_sessions() if item.session_id == target), None)
+        if director is None:
+            return DispatchEvidenceUnknown("director session is unavailable")
+        pane = director.pane_id
+        text = launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
+    else:
+        pane, target = opened.pane, row.current_session
+        status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane),
                       herdr.AgentStatus.UNKNOWN)
-        if status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+        if not status.idle:
             return DispatchEvidenceUnknown("The worker must be idle to receive its resume message")
-    text = (launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
-            if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step, detached=detached))
+        text = resume_message("", own_pass=step, detached=detached)
     submit = (client.prompt if isinstance(on_submission, NoLaunchCleanup) else
               partial(client.prompt, on_submission=on_submission))
-    submit(pane.pane_id, text, target=str(recipient.current_session))
+    submit(pane, text, target=str(target))
     return ExitCode.OK
 
 
@@ -1369,7 +1379,7 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
     """Decide from the recorded dispatches, transcript, pane and live runs."""
     directories = tuple(dict.fromkeys(directories))
     detached = _detached_resume_context(state.row, directories)
-    active: dict[str, progress_history.ActiveDispatch] = {}
+    active: dict[str, tuple[Path, progress_history.ActiveDispatch]] = {}
     # Read the current staff binding under the worker lock and share it across the runs.
     with staff.supplied_snapshot(staff.snapshot()):
         for directory in directories:
@@ -1377,10 +1387,14 @@ def _resume_needed(state: worker_panes.OpenWorker | worker_panes.StoppedWorker |
             if isinstance(dispatch, progress_history.ActiveDispatchUnavailable):
                 return DispatchEvidenceUnknown(dispatch.reason)
             if isinstance(dispatch, progress_history.ActiveDispatch):
-                _ = active.setdefault(dispatch.instance_id, dispatch)
+                _ = active.setdefault(dispatch.instance_id, (directory, dispatch))
     if len(active) > 1:
         return DispatchEvidenceUnknown("The worker has multiple active dispatches")
-    step = resume_step(state.row, next(iter(active.values()))) if active else NO_OWN_PASS
+    if active:
+        run, dispatch = next(iter(active.values()))
+        step = resume_step(state.row, dispatch, run=run)
+    else:
+        step = NO_OWN_PASS
     if isinstance(step, DispatchEvidenceUnknown):
         return step
     if detached or isinstance(step, UnsubmittedAssignment):
@@ -1403,7 +1417,7 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
         elif isinstance(active, progress_history.ActiveDispatch):
-            step = resume_step(row, active)
+            step = resume_step(row, active, run=directory)
             if not isinstance(step, DispatchEvidenceUnknown):
                 return step
             print(f"anomaly: {row.name}: {step.reason}", file=sys.stderr)
@@ -1439,7 +1453,7 @@ def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorker
                 continue
             if isinstance(active, progress_history.ActiveDispatch):
                 _ = results.pop(row.id, None)
-                step = resume_step(row, active)
+                step = resume_step(row, active, run=run)
                 if isinstance(step, (BusyPass, UnsubmittedAssignment)):
                     panes.append(PaneWorkerResume(row.id, step))
                 elif isinstance(step, DispatchEvidenceUnknown):
@@ -1616,10 +1630,11 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         if isinstance(result.created_pane, worker_panes.CreatedWorkerPane):
                             resume = partial(resume, on_submission=cleanup.pop_all)
                         changed = True
-                        row = result.row
+                        opened = result
                     else:
-                        row = state.row
-                    resumed = resume(row, plan)
+                        opened = state
+                    row = opened.row
+                    resumed = resume(opened, plan)
                     if isinstance(resumed, DispatchEvidenceUnknown):
                         failed(row, resumed.reason, notice=f"anomaly: {name}: {resumed.reason}")
                         continue

@@ -492,7 +492,7 @@ class WorkerCommandTests(unittest.TestCase):
         folder = path.parent
         delivery = send.PaneTextDelivered("sent", f"worker {opened.row.name} at fixture pane")
 
-        def resume(_row: staff.StaffRow, _plan: worker.WorkerResume) -> worker.ExitCode:
+        def resume(_opened: worker_panes.OpenWorker, _plan: worker.WorkerResume) -> worker.ExitCode:
             saved = cast(dict[str, object], json.loads(path.read_text()))
             self.assertEqual(saved["status"], "finished")
             return worker.ExitCode.OK
@@ -675,6 +675,52 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
 
+    def test_restore_resumes_a_stopped_worker_with_a_result_after_done(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        dispatch = progress_history.active_dispatch(row.id, self.run_dir)
+        assert isinstance(dispatch, progress_history.ActiveDispatch)
+        path, result = self.detached_record(row, "private-check")
+        result.update(pane_dispatch_id=dispatch.instance_id, delivery=f"sent: worker {row.name} at {pane}")
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        self.agent.append(pane, "user", "Detached run: private-check\nRun finished: private verification")
+        _ = self.fixture.world.stop(row, self.fixture.world)
+        state = worker_panes.observe_worker(self.fixture.parent.id, row, staff.snapshot())
+        self.assertIsInstance(state, worker_panes.StoppedWorker)
+        notices = len(self.fixture.prompts())
+
+        with patch.object(self.fixture.world, "tab_sessions", return_value=[]) as tabs:
+            code, _, errors = self.command("restore")
+        self.assertEqual(code, worker.ExitCode.OK, errors)
+        tabs.assert_not_called()
+        prompt, = self.fixture.prompts()[notices:]
+        self.assertEqual(prompt[2], pane)
+        self.assertIn(f"Continue pass {dispatch.instance_id} in this conversation.", prompt[3])
+        self.assertEqual(staff.by_id(row.id), row)
+
+        self.agent.complete(pane)
+        self.assertIs(self.finish(), turn_end.TurnOutcome.DONE)
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+
+    def test_restore_recovers_a_complete_pass_after_another_pass_result(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        path, result = self.detached_record(row, "other-check")
+        result.update(pane_dispatch_id="other-pass", delivery=f"sent: worker {row.name} at {pane}")
+        atomic_file.write_text_atomic(path, json.dumps(result))
+        self.agent.append(pane, "user", "Detached run: other-check\nRun finished: private verification")
+        _ = self.fixture.world.stop(row, self.fixture.world)
+        launches, prompts = len(self.fixture.world.launches), len(self.fixture.prompts())
+
+        code, _, errors = self.command("restore")
+        self.assertEqual((code, errors), (worker.ExitCode.OK, ""))
+        self.assertEqual(len(self.fixture.world.launches), launches)
+        self.assertEqual(len(self.fixture.prompts()), prompts)
+        self.assertEqual(self.reply.read_text().strip(), self.agent.replies[-1])
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts
 
@@ -725,14 +771,14 @@ class WorkerCommandTests(unittest.TestCase):
         before = self.fixture.staff_state(), len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers restored\n", ""))
-        resume.assert_called_once_with(replace(busy.row, role=staff.KnownWorkerRole("impl")),
-            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", "impl"))))
         self.assertEqual(self.fixture.staff_state(), before[0])
         self.assertEqual(len(self.fixture.world.launches), before[1] + 1)
         states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
         self.assertIsInstance(states[busy.row.id], worker_panes.OpenWorker)
         resumed = states[busy.row.id]
         assert isinstance(resumed, worker_panes.OpenWorker)
+        resume.assert_called_once_with(resumed,
+            worker.WorkerResume(worker.UnsubmittedAssignment(dispatch_id, ("assign.sh", "--to", "impl"))))
         self.assertEqual(resumed.pane, busy.pane)
         self.assertEqual(resumed.terminal, busy.terminal)
         self.assertIsInstance(states[idle.row.id], worker_panes.ClosedWorker)
@@ -806,7 +852,9 @@ class WorkerCommandTests(unittest.TestCase):
         launches = len(self.fixture.world.launches)
         with patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume:
             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
-        resume.assert_called_once_with(replace(opened.row, role=staff.KnownWorkerRole("impl")),
+        resumed = worker_panes.observe_worker(self.fixture.parent.id, opened.row, staff.snapshot())
+        self.assertIsInstance(resumed, worker_panes.OpenWorker)
+        resume.assert_called_once_with(resumed,
             worker.WorkerResume(worker.UnsubmittedAssignment(active.instance_id, active.launcher_command)))
         self.assertEqual(len(self.fixture.world.launches), launches)
         self.assertEqual(self.agent.submitted, [])
@@ -4487,7 +4535,7 @@ class WorkerCommandTests(unittest.TestCase):
         with (patch.object(self.fixture.world, "tab_sessions", return_value=[]),
               patch.object(self.fixture.world, "prompt") as prompt):
             plan = worker.WorkerResume(worker.UnsubmittedAssignment("saved-pass", ("assign.sh",)))
-            self.assertEqual(worker._resume_launcher(opened.row, plan),  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(worker._resume_launcher(opened, plan),  # pyright: ignore[reportPrivateUsage]
                              worker.DispatchEvidenceUnknown("director session is unavailable"))
         prompt.assert_not_called()
 

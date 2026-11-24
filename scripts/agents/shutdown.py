@@ -487,7 +487,15 @@ def _lifecycle(options: CommandLine) -> int:
                 print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
                 code = 2
                 continue
-            with staff.row_operation(str(row.id)):
+            with ExitStack() as operation:
+                try:
+                    _ = operation.enter_context(staff.row_operation(str(row.id)))
+                except staff.StaffRefused as error:
+                    if not options.production:
+                        raise
+                    print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
+                    code = 2
+                    continue
                 started = False
                 if _paused_resume_needs_message(row):
                     _ = staff.resume(str(row.id))
@@ -500,7 +508,7 @@ def _lifecycle(options: CommandLine) -> int:
                         print(f"{row.name}: active")
                     else:
                         _ = staff.set_hold(str(row.id), row.paused)
-                        code = 1
+                        code = max(code, 1)
                 else:
                     try:
                         if isinstance(row.paused, staff.Paused):

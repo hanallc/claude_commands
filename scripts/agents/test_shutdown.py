@@ -2,28 +2,61 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import math
 import os
 import signal
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 from unittest.mock import call, patch
 
-from scripts.agents import pane_record, shutdown, stop_resume, test_stop_resume
+from scripts.agents import pane_record, shutdown, shutdown_record, stop_resume, test_stop_resume
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.lib import atomic_file
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.whoami import quota_state
 
 
 NATIVE_PROCESS = herdr.native_process
+
+
+class ProductionResumeTests(StaffTestCase):
+    def test_production_resume_continues_after_a_held_row(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        units = [fixture_member("unit", name=name, parent=owner.id) for name in ("alpha", "beta", "gamma")]
+        pause = staff.Paused("2026-11-24T08:31:00-08:00", "director", "review")
+        first, held, last = [staff.set_hold(str(row.id), pause) for row in sorted(units, key=lambda row: row.id)]
+        lock = self.staff_file.parent / "rows" / f"{held.id}.lock"
+        lock.parent.mkdir(exist_ok=True)
+        holder = f"agents move {held.name} claude2"
+
+        with (lock.open("w") as stream, redirect_stdout(io.StringIO()) as output,
+              redirect_stderr(io.StringIO()) as errors, patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+              patch.object(shutdown, "_paused_resume_needs_message", return_value=True),
+              patch.object(quota_state, "no_worker_mode", return_value=False),
+              patch.object(shutdown, "_message", return_value={"kind": "sent"}) as send,
+              patch.object(shutdown_record, "remove_started")):
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            json.dump({"pid": os.getpid(), "command": holder}, stream)
+            stream.flush()
+            self.assertEqual(shutdown.main(["resume", "--production", owner.name]), 2)
+
+        self.assertEqual(output.getvalue().splitlines(), [f"{first.name}: active", f"{last.name}: active"])
+        self.assertEqual(errors.getvalue().splitlines(),
+                         [f"shutdown: StaffRefused: {held.name}: another operation holds this row (pid {os.getpid()}: {holder})"])
+        message = "Continue where you stopped. Resume your existing workers. Do not open new workers."
+        self.assertEqual(send.call_args_list, [call(first, message), call(last, message)])
+        self.assertEqual(staff.by_id(first.id), replace(first, paused=staff.Active()))
+        self.assertEqual(staff.by_id(held.id), held)
+        self.assertEqual(staff.by_id(last.id), replace(last, paused=staff.Active()))
 
 
 class ProducerCommandsTests(unittest.TestCase):

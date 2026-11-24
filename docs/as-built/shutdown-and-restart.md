@@ -31,6 +31,8 @@ The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
 `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
+It reports each held row and its holder when known.
+It resumes the available rows and returns exit 2 if a row lock blocks a resume.
 Resume removes a pause record and sends a running director one continuation message.
 A paused director on the other machine gets the continuation message without a local liveness read.
 The machine comes from its worktree or its showrunner document.
@@ -633,7 +635,11 @@ Restore holds the dispatch lock across the record read, receipt read, and prompt
 Restore, named resume, and director notes use one receipt rule.
 An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
 Director notes reuse shared dispatch history reads.
-A DONE line or a finished record closes the dispatch and suppresses its resume note and step.
+A matching DONE or a finished record suppresses the resume step for that pass.
+A later detached result from that pass still requires another matching DONE.
+Restore preserves DONE when the record links the later result to another pass.
+Restore uses the worker pane with the proved native identity for its continuation.
+It checks that the worker is idle. The prompt checks the native identity again before it sends input.
 The decision reads the record and transcript once per worker and uses the restart's shared run index.
 
 ## Launch names
