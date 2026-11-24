@@ -139,7 +139,7 @@ Both paths compute the evidence key from the submitted request and current confi
 Settlement schedules the probe before it reads the shared evidence result.
 Local placements release their reader subscriptions when their reservations end.
 
-`RepositorySlotReady()` advises a retry because `/proc/locks` can omit a held slot, and only the caller's successful `flock` proves it acquired the slot.
+The service has no repository slot request.
 
 ### Cloud gates
 

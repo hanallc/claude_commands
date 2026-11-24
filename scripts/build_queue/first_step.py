@@ -1,4 +1,4 @@
-"""Hold first-step admission while a caller prepares its repository slot."""
+"""Hold first-step admission while a caller prepares its numbered copy."""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence

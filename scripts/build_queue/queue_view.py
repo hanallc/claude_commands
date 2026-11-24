@@ -866,17 +866,15 @@ class WaitingBuild:
     step: admission_records.WaitingStep
 
 
-def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
+def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow]:
     """Insert cloud waits in admission order. Keep the local queue order."""
-    rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
+    rows: list[WaitingBuild | wire.CloudRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
-    slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
 
-    def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
-        return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+    def order(row: wire.CloudRow) -> tuple[float, int, str]:
+        return cloud_queue_order(row.place, row.since)
 
-    for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
-                        key=order):
+    for cloud in sorted((row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), key=order):
         order_time = order(cloud)[0]
         position = next((index for index, row in enumerate(rows)
                          if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))

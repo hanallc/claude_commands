@@ -155,7 +155,7 @@ The Hana AWS guest fetches verified bundles into its main checkout at `~/rust/ha
 The command uses its assigned copy number under `~/build/hana/aws-hana`.
 Each copy keeps its Cargo output under `target`.
 The guest keeps the shell cache under `~/build/hana/main/shells` and holds the main output lock during use.
-The AWS gate uses its separate slot path.
+No code makes or uses the old repository slot folders under `/build/slot` or `~/build/slot`.
 
 `lint/sweep.py --unused-folders` uses each folder's `.lint-sweep-used` stamp. The cutoff is two days. The sweep checks the stamp again under the folder lock. It keeps unstamped folders, folders in use, and CI folders. It lists eligible folders and keeps unit and repository parents. The nightly gate invokes the sweep.
 
