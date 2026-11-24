@@ -6149,7 +6149,7 @@ class ServiceTests(unittest.TestCase):
     def test_start_provisions_the_mac_linux_state_root_before_ready(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.server.close()
-            root = fixture.root / "guest-state"
+            root = fixture.root / "target-state" / "guest-state"
             server = fixture.new_server(start=False)
             try:
                 with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
@@ -6159,7 +6159,7 @@ class ServiceTests(unittest.TestCase):
                     def ready(message: str) -> None:
                         self.assertEqual(message, "READY=1")
                         self.assertTrue(root.is_dir())
-                        sync.assert_called_once_with(root.parent)
+                        self.assertEqual(sync.call_args_list, [mock.call(root.parent), mock.call(fixture.root)])
 
                     notify.side_effect = ready
                     self.assertFalse(root.exists())
@@ -6175,15 +6175,17 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.server.close()
             root = fixture.root / "guest-state"
+            root.mkdir()
             failure = OSError(errno.EIO, "fixture parent sync failed")
             with (mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(root)}),
                   mock.patch.object(atomic_file, "sync_folder", side_effect=failure) as sync,
                   redirect_stderr(io.StringIO()) as journal):
                 fixture.server = fixture.new_server()
-            self.assertFalse(root.exists())
+            self.assertTrue(root.is_dir())
             sync.assert_called_once_with(root.parent)
             self.assertEqual(journal.getvalue().splitlines()[0],
-                             f"memory admission: Cannot prepare the Mac Linux state root. {failure}")
+                             f"memory admission: Cannot prepare the Mac Linux state root {root}: {failure}. "
+                             + "Run build_targets.py setup-mac-linux on natedev.")
             self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
 
     def test_serve_binds_the_environment_socket_without_listen_fds(self) -> None:

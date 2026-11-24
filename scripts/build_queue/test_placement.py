@@ -40,7 +40,7 @@ from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_pre
 from scripts.lint import memory_admit as gate
 from scripts.production.gate_routes import ALL_MODULES, ModuleCoverage, SuiteMode
 from scripts.message.unit_labels import UnitLabels
-from scripts.lib import conf, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
@@ -2130,6 +2130,61 @@ class PlacementTests(unittest.TestCase):
         local = placement.PlacementDestination("local", "natedev", "natedev", FIXTURE_MAC_SCOPE)
         self.assertEqual(placement.retry_decision(guest, MAC_LINUX_NO_ANSWER, 10.0), placement.RetryAt(10.0))
         self.assertEqual(placement.retry_decision(local, "busy", 10.0), placement.RetryAt(10.0))
+
+    def test_guest_placement_retries_failed_state_root_setup(self) -> None:
+        with PlacementFixture() as fixture:
+            root = fixture.root / ".local/state/build-targets"
+            self.assertTrue(root.is_dir())
+            sync_folder = atomic_file.sync_folder
+
+            def fail_parent_sync(folder: Path) -> None:
+                if folder == root.parent.parent:
+                    raise OSError("fixture parent sync failed")
+                sync_folder(folder)
+
+            with mock.patch.object(atomic_file, "sync_folder", side_effect=fail_parent_sync) as sync:
+                fixture.restart()
+                request = mac_linux_and_natedev_request(fixture, natedev=False)
+                _ = publish_candidate(fixture, request)
+                refused, = fixture.server.handle_request(request)
+                assert isinstance(refused, wire.DispatchStatus), refused
+                reason = (f"Cannot prepare the Mac Linux state root {root}: fixture parent sync failed. "
+                          + "Run build_targets.py setup-mac-linux on natedev.")
+                self.assertEqual(refused.permission, placement.NoLaunchPermission(reason))
+                self.assertEqual(refused.reason, reason)
+                self.assertEqual(fixture.server.assignments, {})
+                self.assertEqual(sync.call_args_list.count(mock.call(root.parent.parent)), 2)
+                mixed = mac_linux_and_natedev_request(fixture)
+                _ = publish_candidate(fixture, mixed)
+                local, = fixture.server.handle_request(mixed)
+                assert isinstance(local, wire.LocalPlacementGranted), local
+                self.assertEqual(local.assignment.destination.target, "natedev")
+                sync.side_effect = sync_folder
+                guest = assignment_for(fixture, request)
+                self.assertEqual(guest.destination.target, "mac-linux")
+                self.assertEqual(sync.call_args_list.count(mock.call(root.parent.parent)), 4)
+
+    def test_guest_state_root_failure_blocks_a_restored_launch_permission(self) -> None:
+        with PlacementFixture() as fixture:
+            root = fixture.root / ".local/state/build-targets"
+            request = mac_linux_and_natedev_request(fixture, natedev=False)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            sync_folder = atomic_file.sync_folder
+
+            def fail_parent_sync(folder: Path) -> None:
+                if folder == root.parent:
+                    raise OSError("fixture parent sync failed")
+                sync_folder(folder)
+
+            with mock.patch.object(atomic_file, "sync_folder", side_effect=fail_parent_sync):
+                fixture.restart()
+                refused, = fixture.server.handle_request(request)
+                assert isinstance(refused, wire.Refused), refused
+                blocked, = consume_guest_permission(fixture, assignment, guest_gate(fixture, assignment))
+                assert isinstance(blocked, wire.DispatchStatus), blocked
+                self.assertEqual(blocked.permission, placement.NoLaunchPermission(refused.reason))
+            self.assertEqual(assignment_for(fixture, request), assignment)
 
     def test_a_guest_that_took_no_run_frees_the_run_for_natedev_at_once(self) -> None:
         # Two named machines with the real queue choice: the Mac Linux guest declines, natedev takes the run at once.
