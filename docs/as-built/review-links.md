@@ -301,7 +301,12 @@ These routes clear the snapshot when the action ends.
 Accounts preferences, News polls, and Disks polls keep the snapshot.
 Builds revalidates `memory.json` at its feed interval.
 The server uses only `If-None-Match` to decide whether to return HTTP 304 for a static file.
-The server sends static JSON with gzip when the client accepts gzip.
+The server sends HTML responses, Review versions and Review indexes with gzip when the client accepts gzip.
+Static HTML, CSS, JavaScript, JSON, SVG and TXT files also support gzip.
+An explicit gzip quality takes precedence over the wildcard quality.
+Responses that support gzip include `Vary: Accept-Encoding`.
+Static files have different ETags for gzip and identity.
+HEAD returns the headers for the selected encoding with no body.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
@@ -795,7 +800,7 @@ Other types include the same page data when Send requests a pending screenshot o
 The Review card shows this evidence under **Page data**.
 A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
-Review reuses gzip bytes for an unchanged page shell with its current owner control.
+Review and Accounts reuse gzip bytes for an unchanged page with its current owner control.
 A Bug with a screenshot also includes the viewport.
 The dialog shows the saved item ID after Send on Review and the other pages outside The List.
 Select **Done** to close the confirmation.
