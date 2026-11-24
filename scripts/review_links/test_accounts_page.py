@@ -19,8 +19,7 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.review_links.probe_test_support import firefox_probe_results
-from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.accounts import accounts, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents.test_support import write_machine_config

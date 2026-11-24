@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from scripts.review_links import record_table, review_page
-from scripts.review_links.probe_test_support import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> list[list[str]]:

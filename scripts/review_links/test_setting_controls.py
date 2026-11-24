@@ -5,7 +5,7 @@ import shutil
 import unittest
 
 from scripts.review_links import console_theme, page_frame, setting_controls
-from scripts.review_links.probe_test_support import firefox_probe_results
+from scripts.review_links.browser_test_support import firefox_probe_results
 
 
 def cost_limit(value: str, live: str) -> str:
