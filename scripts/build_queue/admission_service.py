@@ -6,7 +6,7 @@ except FileNotFoundError:
     pass
 
 from collections import deque
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -716,9 +716,14 @@ class PendingLeft:
 
 @dataclass(frozen=True)
 class PendingCloudGroup:
-    """Keep the group's place until admission or coordinator exit."""
+    """Keep the group's place and first caller until admission or coordinator exit."""
     target: str
     group: status_wire.CloudGroup
+    unit: str = ""
+    session_id: str = ""
+
+
+CloudQueueOrder = tuple[int, float, int, str]
 
 
 @dataclass(frozen=True)
@@ -1850,6 +1855,7 @@ class AdmissionServer:
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
         self.last_result: gate.PassResult | NoPass = NoPass()
         self.last_policy: records.AdmissionPolicy | NoPass = NoPass()
+        self.last_cloud_waiters: tuple[WaitingAdmission, ...] = ()
         # The natedev hold of each held local waiter at the last pass.
         self.local_holds: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
@@ -2253,7 +2259,7 @@ class AdmissionServer:
                 key = records.waiter_owner(row) if grant is not None else place.move_id
                 rows.append((self.state_dir / key, ranked))
         if isinstance(self.priority, records.QueuePriority):
-            return self._rank_priority_waiters(rows, self.priority)
+            return self._rank_priority_waiters(rows)
         return gate.sort_waiters(rows)
 
     def _full_queue_order(self, ranked: list[tuple[Path, records.RankedWaiter]]
@@ -2282,25 +2288,19 @@ class AdmissionServer:
                 visible.add(place.move_id)
         return [(path, row) for path, row in ordered if row.get("move_id") in visible]
 
-    def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]], priority: records.QueuePriority
-                               ) -> list[tuple[Path, records.RankedWaiter]]:
-        # Match CI priority by runner. Keep the runner out of the published unit field.
-        ci_waiters: dict[Path, records.RankedWaiter] = {}
-        sessions: list[str] = []
-        ranking_rows: list[tuple[Path, records.Waiter]] = []
-        for path, row in rows:
-            name = self._priority_name(row)
-            if name != row.get("unit", ""):
-                ci_waiters[path] = row
-                row = row.copy()
-                row["unit"] = name
-            elif not name:
-                sessions.append(row.get("session_id", ""))
-            ranking_rows.append((path, row))
+    def _priority_context(self, callers: Iterable[tuple[str, str]]) -> gate.QueueOrderContext:
+        if not isinstance(self.priority, records.QueuePriority) or not self.priority.entries:
+            return gate.QueueOrderContext(self.priority, {})
+        sessions = list(dict.fromkeys(session for unit, session in callers if not unit and session))
         labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
-        ranked, _ = gate.apply_queue_priority(ranking_rows, gate.QueueOrderContext(priority, labels))
-        return [(path, gate.rank_waiter(ci_waiters[path], records.waiter_priority(row))
-                 if path in ci_waiters else row) for path, row in ranked]
+        return gate.QueueOrderContext(self.priority, labels)
+
+    def _rank_priority_waiters(self, rows: list[tuple[Path, records.RankedWaiter]]
+                               ) -> list[tuple[Path, records.RankedWaiter]]:
+        context = self._priority_context((self._priority_name(row), row.get("session_id", "")) for _, row in rows)
+        # Use the CI runner for ranking. Keep the recorded unit in the row.
+        return gate.sort_waiters((path, gate.rank_waiter(
+            row, gate.unit_order(self._priority_name(row), row.get("session_id", ""), context))) for path, row in rows)
 
     def _current_move_line(self, rows: list[tuple[Path, records.RankedWaiter]],
                            movable: set[str]) -> records.QueueMoveLine:
@@ -3234,7 +3234,10 @@ class AdmissionServer:
             del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
-        cloud_started = self._cloud_pass(inputs, self.configuration)
+        cloud_waiters, cloud_groups = self._cloud_waiters()
+        cloud_started = self._cloud_pass(inputs, self.configuration, cloud_waiters, cloud_groups)
+        self.last_cloud_waiters = tuple(waiting for _, waiting in cloud_waiters
+                                        if self.waiters.get(waiting.request.episode) is waiting)
         by_owner = {records.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
         head = result.policy.queued_head
         head_label = (wait_line_name(self.waiters[by_owner[records.waiter_owner(head.waiter)]])
@@ -3316,35 +3319,61 @@ class AdmissionServer:
             self.system_reader.update(self._reading_plan(config))
         return result
 
-    def _register_cloud_group(self, place: wire.CloudPlace, group: status_wire.CloudGroup
+    def _register_cloud_group(self, place: wire.CloudPlace, group: status_wire.CloudGroup, identity: wire.Identity
                               ) -> wire.Refused | None:
-        pending = PendingCloudGroup(place.target, group)
         previous = self.pending_cloud_groups.get(group.key)
         if previous is not None:
-            if previous != pending:
+            if previous.target != place.target or previous.group != group:
                 return wire.Refused("cloud group members disagree on the group")
-            return None
-        if any(isinstance(record.place, wire.CloudPlace) and isinstance(record.place.group, status_wire.CloudGroup)
-               and record.place.group.key == group.key for record in self.reservations.values()):
+            if previous.unit:
+                return None
+        elif any(isinstance(record.place, wire.CloudPlace) and isinstance(record.place.group, status_wire.CloudGroup)
+                 and record.place.group.key == group.key for record in self.reservations.values()):
             return wire.Refused("cloud group already has reservations")
+
+        session = previous.session_id if previous is not None and previous.session_id else identity.session_id
+        unit = identity.unit if session == identity.session_id else ""
+        if not unit and session:
+            unit = gate.queue_unit(unit, session, gate.priority_labels([session]))
+        pending = PendingCloudGroup(place.target, group, unit, session)
+        if pending == previous:
+            return None
         self.pending_cloud_groups[group.key] = pending
-        if self.proc.owner_start(group.coordinator.pid) == LiveOwnerIdentity(group.coordinator.start_time):
+        if previous is None and self.proc.owner_start(group.coordinator.pid) == LiveOwnerIdentity(group.coordinator.start_time):
             self._watch_owner(group.coordinator)
         self.persist()
         return None
 
-    @staticmethod
-    def _cloud_order(waiting: WaitingAdmission) -> tuple[float, int, str]:
-        request = waiting.request
-        assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
-        return status_wire.cloud_queue_order(request.place, waiting.row["since"])
+    def _cloud_waiters(self) -> tuple[list[tuple[CloudQueueOrder, WaitingAdmission]], dict[str, CloudQueueOrder]]:
+        """Rank the connected waits and the saved groups with the same priority."""
+        waiting_cloud = [waiting for waiting in self.waiters.values()
+            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace)]
+        context = self._priority_context([
+            *((self._priority_name(waiting.row), waiting.row.get("session_id", "")) for waiting in waiting_cloud),
+            *((pending.unit, pending.session_id) for pending in self.pending_cloud_groups.values()),
+        ])
+        group_orders: dict[str, CloudQueueOrder] = {}
+        for key, pending in self.pending_cloud_groups.items():
+            unit = gate.queue_unit(pending.unit, pending.session_id, context.labels)
+            if unit != pending.unit:
+                self.pending_cloud_groups[key] = replace(pending, unit=unit)
+            rank = gate.priority_rank(gate.unit_order(unit, "", context))
+            group_orders[key] = (rank,
+                *status_wire.cloud_queue_time(wire.CloudPlace(pending.target, pending.group), pending.group.started_at))
+        ordered: list[tuple[CloudQueueOrder, WaitingAdmission]] = []
+        for waiting in waiting_cloud:
+            request = waiting.request
+            assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
+            group = request.place.group
+            if isinstance(group, status_wire.CloudGroup):
+                order = group_orders[group.key]
+            else:
+                unit = gate.unit_order(self._priority_name(waiting.row), waiting.row.get("session_id", ""), context)
+                order = (gate.priority_rank(unit), *status_wire.cloud_queue_time(request.place, waiting.row["since"]))
+            ordered.append((order, waiting))
+        return sorted(ordered, key=lambda entry: entry[0]), group_orders
 
-    def _cloud_waiters(self) -> list[WaitingAdmission]:
-        return sorted((waiting for waiting in self.waiters.values()
-            if isinstance(waiting.request, wire.AdmitRequest) and isinstance(waiting.request.place, wire.CloudPlace)),
-            key=self._cloud_order)
-
-    def _cloud_groups(self, waiting_cloud: list[WaitingAdmission], slots: int
+    def _cloud_groups(self, waiting_cloud: Iterable[WaitingAdmission], slots: int
                       ) -> dict[str, list[WaitingAdmission]]:
         groups: dict[str, list[WaitingAdmission]] = {}
         for waiting in waiting_cloud:
@@ -3383,21 +3412,20 @@ class AdmissionServer:
             self._prune_watches()
         return groups
 
-    def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
-        waiting_cloud = self._cloud_waiters()
+    def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration,
+                    waiting_cloud: list[tuple[CloudQueueOrder, WaitingAdmission]],
+                    group_orders: Mapping[str, CloudQueueOrder]) -> bool:
         if not waiting_cloud and not self.pending_cloud_groups:
             return False
         config = configuration.config
         slots = configuration.cloud_gate_slots
-        groups = self._cloud_groups(waiting_cloud, slots)
-        disconnected = min(((pending.group.started_at, 0, key)
-            for key, pending in self.pending_cloud_groups.items() if key not in groups),
-            default=(float("inf"), 0, ""))
+        groups = self._cloud_groups((waiting for _, waiting in waiting_cloud), slots)
+        disconnected = min((group_orders[key] for key in self.pending_cloud_groups if key not in groups), default=None)
         used = sum(isinstance(record.place, wire.CloudPlace) for record in self.reservations.values())
         started = False
         blocked = False
         position = 0
-        for waiting in waiting_cloud:
+        for order, waiting in waiting_cloud:
             request = waiting.request
             if self.waiters.get(request.episode) is not waiting:
                 continue
@@ -3406,7 +3434,7 @@ class AdmissionServer:
             members = groups[group.key] if isinstance(group, status_wire.CloudGroup) else [waiting]
             size = group.size if isinstance(group, status_wire.CloudGroup) else 1
             if not blocked:
-                if self._cloud_order(waiting) < disconnected and len(members) == size and used + size <= slots:
+                if (disconnected is None or order < disconnected) and len(members) == size and used + size <= slots:
                     self._admit(members, config, configuration.peak_history_share_percent,
                                 cargo_folder=placement.NoCargoFolder(), verify_slots={})
                     used += size
@@ -3424,7 +3452,8 @@ class AdmissionServer:
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
         return started
 
-    def _cloud_reading(self, reading: records.QueueRead, configuration: gate.UsableAdmissionConfiguration
+    def _cloud_reading(self, reading: records.QueueRead, configuration: gate.UsableAdmissionConfiguration,
+                       waiting_cloud: Iterable[WaitingAdmission]
                        ) -> records.QueueRead | wire.CloudQueueRead:
         rows: list[wire.CloudRow] = []
         reservations = [record for record in self.reservations.values() if isinstance(record.place, wire.CloudPlace)]
@@ -3456,9 +3485,6 @@ class AdmissionServer:
                 current, counter, wait_state))
         if recorded_launch:
             self.persist()
-        waiting_cloud = self._cloud_waiters()
-        if not rows and not waiting_cloud:
-            return reading
         for waiting in waiting_cloud:
             request = waiting.request
             assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
@@ -3466,6 +3492,8 @@ class AdmissionServer:
             rows.append(wire.CloudRow(request.owner, request.identity, request.place, waiting.row["since"], 0.0,
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
                 progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
+        if not rows:
+            return reading
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
             tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
@@ -3642,7 +3670,9 @@ class AdmissionServer:
         reading = self._placement_reading(reading)
         move_line = self._current_move_line(reading.ordered, self._movable_wait_ids() - hidden)
         reading = replace(reading, view=replace(reading.view, move_line=move_line))
-        reading = replace(self._cloud_reading(reading, self.configuration),
+        remaining_cloud = (waiting for waiting in self.last_cloud_waiters
+                           if self.waiters.get(waiting.request.episode) is waiting)
+        reading = replace(self._cloud_reading(reading, self.configuration, remaining_cloud),
                           held_places=reading.number_held_places(self.held_places, gate.waiter_order, self.priority))
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         occupancy = self._local_occupancy(self.last_inputs)
@@ -5881,13 +5911,13 @@ done
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
             if isinstance(request, wire.AdmitRequest) and self._replaced(request.run):
                 return self._mutation_reply(key, wire.Refused(status_wire.REPLACED_REASON))
-            if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
-                    and isinstance(group := request.place.group, status_wire.CloudGroup)):
-                if (refused := self._register_cloud_group(request.place, group)) is not None:
-                    return self._mutation_reply(key, refused)
             if not isinstance(request, ServiceEstimatedAdmission):
                 members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
                 request = replace(request, identity=self._named_identity(request.identity, members=members))
+            if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
+                    and isinstance(group := request.place.group, status_wire.CloudGroup)):
+                if (refused := self._register_cloud_group(request.place, group, request.identity)) is not None:
+                    return self._mutation_reply(key, refused)
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
