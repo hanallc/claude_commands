@@ -2629,7 +2629,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
         else:
-            targets = first_step.gate_targets(command, args.targets)
+            targets = first_step.gate_targets(command, source, args.targets)
             prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
                                                          gate_targets=targets))
             tree = prepared.tree
@@ -2658,11 +2658,11 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
 
 
 def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
-    """Place and run a named gate in the caller's prepared checkout."""
+    """Place and run a gate in the caller's prepared checkout."""
     source = Path(args.repo or "").resolve()
-    targets = first_step.gate_targets(command, args.targets)
+    targets = first_step.gate_targets(command, source, args.targets)
     if not targets:
-        raise CopyError("gate-step requires a gate command and named targets")
+        raise CopyError("gate-step requires a gate command and placement targets")
     with first_step.admitted_run(command, source, targets=targets) as admitted:
         admitted.handoff(source)
         result = admitted.run_gate(lambda: subprocess.run(command, cwd=source, pass_fds=args.lease_fd,
@@ -2993,7 +2993,7 @@ def parse_copy_arguments(argv: list[str] | None) -> CopyArguments:
     run = commands.add_parser("run", help="run a command in a private source copy")
     gate = commands.add_parser("gate-step", help="place a gate in a prepared checkout")
     _ = gate.add_argument("--repo", required=True)
-    _ = gate.add_argument("--targets", required=True)
+    _ = gate.add_argument("--targets", default="")
     _ = gate.add_argument("--lease-fd", action="append", type=int, default=[])
     _ = gate.add_argument("command", nargs=argparse.REMAINDER)
     hold = commands.add_parser("hold", help="run a step in a slot or hold a remote source copy")
