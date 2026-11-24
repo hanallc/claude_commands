@@ -182,7 +182,7 @@ def scaler_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], bo
 
 
 class GuestSettlementProvider(Protocol):
-    def settlement(self, episode: str, attempt: int, *, legacy_holder_ended: bool) -> placement.Settled | placement.Pending: ...
+    def settlement(self, episode: str, attempt: int) -> placement.Settled | placement.Pending: ...
 
 
 def mac_linux_provider() -> GuestSettlementProvider:
@@ -190,11 +190,10 @@ def mac_linux_provider() -> GuestSettlementProvider:
     return cast(GuestSettlementProvider, cast(object, import_module("scripts.build_targets.mac_linux")))
 
 
-def guest_settlement(episode: str, attempt: int, *, legacy_holder_ended: bool,
-                     holds_slot: Callable[[], bool]) -> placement.DispatchPathState:
+def guest_settlement(episode: str, attempt: int, *, holds_slot: Callable[[], bool]) -> placement.DispatchPathState:
     try:
         provider = mac_linux_provider()
-        result = provider.settlement(episode, attempt, legacy_holder_ended=legacy_holder_ended)
+        result = provider.settlement(episode, attempt)
     except AttributeError:
         return placement.DispatchPathPending("Mac Linux settlement is unavailable")
     if isinstance(result, placement.Pending):
@@ -1233,7 +1232,6 @@ class DispatchEvidenceProbe:
     key: placement.HostEvidenceKey
     saved: records.SavedPlacementAssignment
     read: Callable[[], placement.DispatchPathState | wire.ExecutionReport] = field(compare=False)
-    allow_legacy_guest_settlement: bool = False
 
 
 @dataclass(frozen=True)
@@ -5324,28 +5322,22 @@ done
         episode = assignment.episode
         attempt_key = execution_identity.attempt_key(episode, assignment.attempt)
         report = saved.terminal_report
-        allow_legacy = not saved.guest_execution_observed and (
-            isinstance(report, placement.TerminalAttemptReport)
-            or (not self._placement_owner_live(assignment.owner) and not self._start_pending(saved)))
 
         def holds_slot() -> bool:
             active = self.assignments.get(attempt_key)
             return not self.closed and active is not None and _holds_consumed_guest_slot(active)
 
         def read_dispatch() -> placement.DispatchPathState:
-            return guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt),
-                legacy_holder_ended=allow_legacy and self._confirmed_local_holder_ended(saved.holder),
-                holds_slot=holds_slot)
+            return guest_settlement(episode, placement.scaler_attempt_number(assignment.attempt), holds_slot=holds_slot)
 
-        if self._dispatch_settlement_pending(saved, read_dispatch, allow_legacy_guest_settlement=allow_legacy):
+        if self._dispatch_settlement_pending(saved, read_dispatch) or self._start_pending(saved):
             return
         terminal = (replace(report, path=placement.DispatchPathSettled())
                     if isinstance(report, placement.TerminalAttemptReport) else self._lost_report())
         self._close_for_report(replace(saved, terminal_report=terminal), terminal, persist_change=False)
 
     def _dispatch_settlement_pending(self, saved: records.SavedPlacementAssignment,
-                                     read: Callable[[], placement.DispatchPathState], *,
-                                     allow_legacy_guest_settlement: bool = False) -> bool:
+                                     read: Callable[[], placement.DispatchPathState]) -> bool:
         assignment = saved.assignment
         submitted = self.placement_requests.get(assignment.episode)
         if not isinstance(self.last_usable_configuration, records.MemoryConfig):
@@ -5360,8 +5352,7 @@ done
             self.host_requests[key] = submitted
         self.placement_host_keys[(assignment.episode, assignment.destination)] = key
         reader = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-        return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read,
-            allow_legacy_guest_settlement=allow_legacy_guest_settlement))
+        return reader.worker.dispatch_pending(DispatchEvidenceProbe(key, saved, read))
 
     def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport, *,
                           persist_change: bool = True) -> None:
