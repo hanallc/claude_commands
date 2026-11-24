@@ -167,8 +167,7 @@ def _status(selected: Account, here: bool) -> tuple[list[MachineStatusReport], d
             peer_report = parse_inventory(output)
         except InvalidInventory as error:
             return [local, _unavailable(machine, status, str(error))], kept_workers
-        kept_workers.update(_peer_kept_workers(output))
-        return [local, peer_report], kept_workers
+        return [local, peer_report], _peer_kept_workers(output) | kept_workers
 
 
 def _report_json(report: MachineStatusReport, kept_workers: Mapping[str, list[str]]) -> Mapping[str, object]:

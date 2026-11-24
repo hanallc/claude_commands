@@ -391,6 +391,19 @@ else:
         self.assertEqual((result, errors), (0, ""))
         self.assertEqual(json.loads(peer_output), [empty_inventory(), peer])
 
+    def test_peer_status_keeps_the_local_workers_for_a_shared_session_id(self) -> None:
+        session = complete_session(host={"kind": "unknown"})
+        local = inventory.parse_inventory(json.dumps({**empty_inventory(), "sessions": [session]}))
+        peer: dict[str, object] = {**empty_inventory("Mac"), "sessions": [{**session, "kept_workers": []}]}
+        identity = str(session["session_id"])
+        with (patch.object(status_entry, "_local_inventory", return_value=(local, {identity: ["impl"]})),
+              patch.object(remote, "run_remote", return_value=(0, json.dumps(peer))),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        sessions = cast(list[dict[str, object]], reports[0]["sessions"])
+        self.assertEqual(sessions[0]["kept_workers"], ["impl"])
+
     def test_status_starts_the_peer_before_finishing_the_local_report(self) -> None:
         authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))
         self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)

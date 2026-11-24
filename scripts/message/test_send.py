@@ -2205,6 +2205,59 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.held_text().count("Same update."), 1)
         self.assertEqual(self.relayed, [])
 
+    def test_two_resumes_keep_one_continuation_during_a_review(self) -> None:
+        from contextlib import ExitStack
+
+        from scripts.agents import restart_support, shutdown, stop_resume
+        from scripts.herdr import herdr
+        from scripts.whoami import quota_state
+
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
+
+        def store_hold(reference: str, hold: staff.Paused | staff.Active) -> staff.StaffRow:
+            row = replace(self.staff_rows[reference], paused=hold)
+            self.staff_rows[reference] = row
+            return row
+
+        def clear_hold(reference: str) -> staff.StaffRow:
+            return store_hold(reference, staff.Active())
+
+        def deliver(command: list[str], _recipient: str, text: str) -> restart_support.MessageSendOutcome:
+            result = send.send(local_options([*command[1:], "--text", text]))
+            outcomes.append(result.outcome)
+            if result.outcome == "kept":
+                return {"kind": "kept", "reason": result.detail}
+            self.assertEqual(result.outcome, "skipped", result.detail)
+            return {"kind": "window skipped", "reason": result.detail}
+
+        for keep_workers in (False, True):
+            with self.subTest(keep_workers=keep_workers):
+                identity = f"director-{keep_workers}"
+                self.session(identity, identity)
+                pause = staff.Paused("2026-11-24T08:31:00-08:00", "operator", "review", keep_workers=keep_workers)
+                paused = store_hold(identity, pause)
+                at = send.now().timestamp()
+                review_hold.set_count(identity, 2, at, self.fail, record_keys=send.record_released_acceptances)
+                outcomes: list[str] = []
+                with (mock.patch.object(staff, "row_operation", return_value=ExitStack()),
+                      mock.patch.object(staff, "resume", side_effect=clear_hold),
+                      mock.patch.object(staff, "set_hold", side_effect=store_hold),
+                      mock.patch.object(herdr, "reboot_lock", side_effect=ExitStack),
+                      mock.patch.object(stop_resume, "running_on_account",
+                                        return_value=stop_resume.ClaudeUp(identity, "w1:p1", "claude2")),
+                      mock.patch.object(quota_state, "no_worker_mode", return_value=False),
+                      mock.patch.object(restart_support, "_send_command", return_value=["send.py"]),
+                      mock.patch.object(restart_support, "_deliver_message", side_effect=deliver)):
+                    for _ in range(2):
+                        self.assertEqual(shutdown.main(["resume", identity]), 1)
+                        self.assertEqual(self.staff_rows[identity], paused)
+                self.assertEqual(outcomes, ["kept", "skipped"])
+                released: list[str] = []
+                review_hold.set_count(identity, 0, at, released.append, record_keys=send.record_released_acceptances)
+                self.assertEqual(released, [held_notice(1, identity)])
+                self.assertEqual(self.held_text(identity).count("Continue where you stopped."), 1)
+        self.assertEqual(self.relayed, [])
+
     def test_urgent_send_goes_through_an_open_review(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")

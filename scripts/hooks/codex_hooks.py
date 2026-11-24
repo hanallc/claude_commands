@@ -29,7 +29,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Generator
 from enum import Enum
+from pathlib import Path
 from typing import NamedTuple, cast
 
 
@@ -84,6 +86,10 @@ class CodexHook:
         return self.event[:1].lower() + self.event[1:]
 
 
+DIRECTOR_HOLD = CodexHook("director-hold", PythonHookScript("conversation_pause.py", ("codex-director-hold",)),
+                          "UserPromptSubmit", matcher="*")
+
+
 HOOKS: tuple[CodexHook, ...] = (
     CodexHook("fn-length", PythonHookScript("post-tool-use-fn-length.py")),
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
@@ -99,8 +105,7 @@ HOOKS: tuple[CodexHook, ...] = (
               "PreCompact", matcher="*"),
     CodexHook("compaction-clear-turn", ShellHookFront("compaction-marker-clear.sh"),
               "UserPromptSubmit", matcher="*"),
-    CodexHook("director-hold", PythonHookScript("conversation_pause.py", ("codex-director-hold",)),
-              "UserPromptSubmit", matcher="*"),
+    DIRECTOR_HOLD,
     CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
               "PostCompact", matcher="*"),
     CodexHook("turn-end", PythonHookScript("../herdr/turn_end.py"), "Stop", matcher="*"),
@@ -379,7 +384,7 @@ def _initialize(server: AppServer) -> None:
     )
 
 
-def _listed_hook_entries(server: AppServer, path: str) -> list[dict[str, object]]:
+def _listed_hook_entries(server: AppServer, path: str, *, report_diagnostics: bool = True) -> list[dict[str, object]]:
     result = server.call("hooks/list", {"cwds": [_home()]})
     data = result.get("data")
     if not isinstance(data, list):
@@ -387,7 +392,7 @@ def _listed_hook_entries(server: AppServer, path: str) -> list[dict[str, object]
     entries: list[dict[str, object]] = []
     for workspace in cast(list[object], data):
         fields = _object(workspace, "hooks/list workspace")
-        for kind in ("warnings", "errors"):
+        for kind in ("warnings", "errors") if report_diagnostics else ():
             messages = fields.get(kind)
             if isinstance(messages, list):
                 for message in cast(list[object], messages):
@@ -455,9 +460,10 @@ def _listed_fields(hook: CodexHook) -> dict[str, object]:
             "handlerType": "command", "timeoutSec": hook.timeout}
 
 
-def _select_hooks(entries: list[dict[str, object]]) -> dict[CodexHook, LocatedHook | MissingHook]:
-    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
-    definitions = {hook: _listed_fields(hook) for hook in HOOKS}
+def _select_hooks(entries: list[dict[str, object]], hooks: tuple[CodexHook, ...] = HOOKS
+                  ) -> dict[CodexHook, LocatedHook | MissingHook]:
+    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in hooks}
+    definitions = {hook: _listed_fields(hook) for hook in hooks}
     for entry in entries:
         hook = next((hook for hook, fields in definitions.items()
                      if all(entry.get(field) == value for field, value in fields.items())), None)
@@ -498,15 +504,34 @@ def _failure(entry: LocatedHook | MissingHook, listed: list[dict[str, object]]) 
     return f"{entry.hook.name}: hooks/list " + "; ".join(differences)
 
 
+def _ready(entry: LocatedHook | MissingHook) -> bool:
+    return isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
+
+
+@contextlib.contextmanager
+def _read_hooks(binary: str, codex_home: str, *, report_diagnostics: bool = True
+                ) -> Generator[tuple[AppServer, list[dict[str, object]]]]:
+    server = AppServer(binary, codex_home)
+    try:
+        _initialize(server)
+        yield server, _listed_hook_entries(server, os.path.join(codex_home, "hooks.json"),
+                                           report_diagnostics=report_diagnostics)
+    finally:
+        server.close()
+
+
+def director_hold_ready(home: Path) -> bool:
+    """Check the director hold in the selected Codex home."""
+    with _read_hooks(_command_binary(), str(home.absolute()), report_diagnostics=False) as (_, listed):
+        return _ready(_select_hooks(listed, (DIRECTOR_HOLD,))[DIRECTOR_HOLD])
+
+
 def _run(action: str) -> int:
     codex_home = _codex_home()
     binary = _command_binary()
     path = os.path.join(codex_home, "hooks.json")
     previously_trusted = _install_file(path, binary, codex_home) if action == "install" else []
-    server = AppServer(binary, codex_home)
-    try:
-        _initialize(server)
-        listed = _listed_hook_entries(server, path)
+    with _read_hooks(binary, codex_home) as (server, listed):
         if previously_trusted and _restore_moved_trust(server, listed, previously_trusted):
             listed = _listed_hook_entries(server, path)
         entries = _select_hooks(listed)
@@ -517,17 +542,14 @@ def _run(action: str) -> int:
                     _trust_handlers(server, {entry.key: {"trusted_hash": entry.current_hash}})
                     listed = _listed_hook_entries(server, path)
                     entries = _select_hooks(listed)
-    finally:
-        server.close()
-    success = all(isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
-                  for entry in entries.values())
+    success = all(_ready(entry) for entry in entries.values())
     for hook in HOOKS:
         entry = entries[hook]
         if action == "install" and success and isinstance(entry, LocatedHook):
             print(f"{hook.name} codex hook: trusted {entry.key}")
         else:
             print(f"{hook.name} codex hook: {_status(entry)}")
-        if not isinstance(entry, LocatedHook) or entry.trust_status != "trusted" or not entry.enabled:
+        if not _ready(entry):
             print(f"codex hooks: {action}: {_failure(entry, listed)}", file=sys.stderr)
     return 0 if success else 1
 

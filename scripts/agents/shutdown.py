@@ -44,6 +44,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -446,16 +447,15 @@ def remove_stray_producer(name: str, session: str) -> int:
         return finish_producer_cleanup(cleanup_path, cleanup, admission)
 
 
-def _message(row: staff.StaffRow, text: str, *, require_live: bool = False) -> restart_support.MessageSendOutcome:
+def _message(row: staff.StaffRow, text: str, *, require_live: bool = False,
+             key: str = "") -> restart_support.MessageSendOutcome:
     address = str(row.id)
     if not require_live:
         prefix = "codex:" if isinstance(staff.backend(row), staff.CodexBackend) else "session:"
         address = prefix + row.current_session
     try:
-        if require_live:
-            result = restart_support.send_message(address, "agents lifecycle", text, recipient_kind=row.kind)
-        else:
-            result = restart_support.send_message(address, "agents lifecycle", text)
+        result = restart_support.send_message(address, "agents lifecycle", text, key=key,
+                                              recipient_kind=row.kind if require_live else None)
     except (OSError, ValueError, RuntimeError) as error:
         result = restart_support.MessageUnconfirmed(kind="unconfirmed", reason=str(error))
     if not restart_support.message_was_delivered(result):
@@ -484,6 +484,87 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
         stop_resume.running_on_account(str(row.current_session), "",
             kind="codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"),
         stop_resume.ClaudeUp))
+
+
+def _director_codex_home(row: staff.StaffRow) -> Path | None:
+    """Use the live account or the saved home of a stopped Codex director."""
+    from scripts.message import codex_daemon
+    from scripts.whoami import account
+
+    observed = herdr.read_conversation(str(row.current_session))
+    if isinstance(observed, herdr.LiveConversation):
+        if observed.kind == "claude":
+            return None
+        homes: set[Path] = set()
+        for pid in observed.pids:
+            setting = account.process_codex_home(pid)
+            if isinstance(setting, account.ProcessEnvironmentUnread):
+                raise ValueError(setting.reason)
+            homes.add(setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex")
+        if not observed.pids:
+            homes = {read.owner.home for read in codex_daemon.read_daemons(os.environ)
+                     if not isinstance(read.sessions, codex_daemon.DaemonUnreadable)
+                     and any(thread.thread_id == row.current_session for thread in read.sessions)}
+        if len(homes) == 1:
+            home = next(iter(homes)).expanduser()
+            if home.is_absolute():
+                return home
+        raise ValueError("cannot prove the live Codex home")
+    try:
+        kind = pane_launch.current_kind(row)
+    except ValueError:
+        if isinstance(observed, herdr.StoppedConversation):
+            return None
+        raise
+    if kind == "claude":
+        return None
+    if not isinstance(row.home, staff.SessionHome):
+        raise ValueError("cannot prove the saved Codex home")
+    return row.home.path
+
+
+def _local_keep_workers_refusal(row: staff.StaffRow) -> str:
+    """Return the reason when the director cannot use the shared prompt hold."""
+    from scripts.hooks import codex_hooks
+
+    try:
+        home = _director_codex_home(row)
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+        return f"cannot check director-hold ({' '.join(str(error).splitlines())})"
+    if home is None:
+        return ""
+    try:
+        if codex_hooks.director_hold_ready(home):
+            return ""
+    except (codex_hooks.HookError, OSError):
+        pass
+    return ("director-hold is unavailable. Run "
+            f"CODEX_HOME={shlex.quote(str(home))} ~/.claude/scripts/lib/py ~/.claude/scripts/hooks/codex_hooks.py install")
+
+
+def _keep_workers_refusal(row: staff.StaffRow) -> str:
+    machine = stop_resume.member_machine(row)
+    if machine and not unit_machine_is_local(machine):
+        status, output = run_remote(["_keep-workers-check", str(row.id), str(row.current_session)])
+        return (" ".join(output.splitlines()) or f"cannot check director-hold on {machine}") if status else ""
+    return _local_keep_workers_refusal(row)
+
+
+def _remote_keep_workers_check(identity: str, session: str) -> int:
+    try:
+        row = staff.initial_snapshot().by_id(staff.StaffId(identity))
+        if row is None or row.current_session != session:
+            raise ValueError("the director changed before the hook check")
+        machine = stop_resume.member_machine(row)
+        if machine and not unit_machine_is_local(machine):
+            raise ValueError(f"the director belongs to {machine}")
+        reason = _local_keep_workers_refusal(row)
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        reason = " ".join(str(error).splitlines())
+    if reason:
+        print(reason)
+        return 2
+    return 0
 
 
 def _lifecycle(options: CommandLine) -> int:
@@ -532,15 +613,16 @@ def _lifecycle(options: CommandLine) -> int:
                     continue
                 started = False
                 keep_workers = isinstance(row.paused, staff.Paused) and row.paused.keep_workers
+                key = f"agents-resume:{row.id}:{row.paused.since}" if isinstance(row.paused, staff.Paused) else ""
                 if _paused_resume_needs_message(row):
                     _ = staff.resume(str(row.id))
                     text = stop_resume.PAUSED_CONTINUATION
                     if keep_workers:
-                        delivery = _message(row, text, require_live=True)
+                        delivery = _message(row, text, require_live=True, key=key)
                     else:
                         workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
                                    else "Resume your existing workers. Do not open new workers.")
-                        delivery = _message(row, f"{text} {workers}")
+                        delivery = _message(row, f"{text} {workers}", key=key)
                     if restart_support.message_was_delivered(delivery):
                         started = True
                         shutdown_record.remove_started([str(row.id)])
@@ -558,7 +640,7 @@ def _lifecycle(options: CommandLine) -> int:
                             result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
                         if started and keep_workers:
-                            delivery = _message(row, stop_resume.PAUSED_CONTINUATION, require_live=True)
+                            delivery = _message(row, stop_resume.PAUSED_CONTINUATION, require_live=True, key=key)
                             started = restart_support.message_was_delivered(delivery)
                             if not started:
                                 code = max(code, 1)
@@ -581,6 +663,10 @@ def _lifecycle(options: CommandLine) -> int:
             if not stopped:
                 print(f"{row.name}: exited")
             code = max(code, stopped)
+            continue
+        if options.keep_workers and row.kind in ("unit", "showrunner") and (reason := _keep_workers_refusal(row)):
+            print(f"{row.name}: --keep-workers refused. {reason}", file=sys.stderr)
+            code = 2
             continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
         held = row if already_exited else staff.pause(str(row.id), why, keep_workers=options.keep_workers)
@@ -638,6 +724,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
+    if len(arguments) == 3 and arguments[0] == "_keep-workers-check":
+        return _remote_keep_workers_check(arguments[1], arguments[2])
     parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
     commands = parser.add_subparsers(prog=parser.prog, dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")

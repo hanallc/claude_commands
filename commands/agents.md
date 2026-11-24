@@ -14,6 +14,8 @@ Use the `agents` program.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT` to select a production.
 - Add `--keep-workers` to let the workers continue during the pause.
   When nate asks in his own words for a pause where the workers continue, use `--keep-workers` without a question to him.
+  A Codex director needs the trusted `director-hold` hook in its Codex home.
+  A production pause reports each refusal and pauses the other selected directors.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
 - Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
