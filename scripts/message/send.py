@@ -202,11 +202,9 @@ MODEL = "sonnet"
 AUTO_MODE_TEXT = "auto_mode.refused"
 AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id auto_mode.refused'
                   + ' --value session=<session> --value machine=<machine>'
-                  + ' --value "command=<a refused command, short: the program and its key arguments>"'
-                  + ' [one --value command=... for each] --value "waits=<a sentence: what waits; no instruction>"'
+                  + ' --value "command=<a refused command>" [one --value command=... for each]'
+                  + ' [--value "waits=<a short clause such as its build waits or its merge waits>"]'
                   + ' [--value "rule=<the allow rule>"]')
-# The push shows a longer refused command cut to its first 89 characters and "…".
-REFUSED_COMMAND_LENGTH = 90
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -4733,32 +4731,25 @@ def default_sender() -> str:
 
 
 def auto_mode_values(values: dict[str, str], commands: list[str], sender: str) -> dict[str, str]:
-    """The auto_mode.refused values: the session gives the facts and each refused command, in order.
-    This fills the sender, the kind of action (rca.action_of), the waits sentence and the grammar,
-    and shows each command on its own line."""
+    """Prepare the sender, command count, and waits clause for the catalog."""
     if not sender:
         raise ValueError(AUTO_MODE_TEXT + " is sent by a Claude session: its sender is that session's name,"
                          + " and this run has no session record")
     given = set(values)
-    required = {"session", "machine", "waits"}
-    if not required <= given or not given <= required | {"rule"}:
-        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, command, waits and an optional rule;"
-                         + f" missing {sorted(required - given)}; extra {sorted(given - required - {'rule'})}")
-    shown = [command.strip() for command in commands]
-    if not shown or not all(shown):
+    required = {"session", "machine"}
+    allowed = required | {"waits", "rule"}
+    if not required <= given or not given <= allowed:
+        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, command, and optional waits and rule;"
+                         + f" missing {sorted(required - given)}; extra {sorted(given - allowed)}")
+    if not commands or not all(command.strip() for command in commands):
         raise ValueError(AUTO_MODE_TEXT + ": give each refused command as its own --value command=..., none empty")
-    shown = [command if len(command) <= REFUSED_COMMAND_LENGTH else command[:REFUSED_COMMAND_LENGTH - 1] + "…"
-             for command in shown]
-    waits = values["waits"].strip().rstrip(".")
+    waits = values.get("waits", "").strip().rstrip(".")
     if typed_texts(waits) or named_places(waits):
         raise ValueError(AUTO_MODE_TEXT + ": waits says only what waits; it tells the user to type nothing"
                          + " and names no pane or session. The Action line says what the user does")
-    one = len(shown) == 1
-    rule = values.get("rule", "").strip()
-    return {"sender": sender, "session": values["session"], "machine": values["machine"],
-            "action": rca.action_of(commands), "refused": "\n".join(shown),
-            "noun": "command" if one else "commands", "this": "this" if one else "these",
-            "waits_line": rca.waits_line(waits), "rule_line": " The rule: " + rule if rule else ""}
+    count = len(commands)
+    return values | {"sender": sender, "count": str(count), "noun": "command" if count == 1 else "commands",
+                     "waits": rca.one_line(waits)}
 
 
 def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
@@ -4787,25 +4778,27 @@ def mac_locked_check(asking: AskingSession | NoAskingSession, clears_when: str) 
 
 
 def reviewed_waits(options: Options) -> Options:
-    """Review the waits sentence within the configured budget.
-
-    Keep the sentence only when the reviewer approves it. Send the alert without the sentence if the review fails.
-    """
+    """Review the waits clause within the budget."""
     values = template_values(options)
-    if not values.get("waits_line") or review.switched_off():
+    waits = values.get("waits", "")
+    if not waits or review.switched_off():
         return options
+    values["waits"] = ""
     rendered = push_texts.render(AUTO_MODE_TEXT, **values)
+    # Put the clause in the review body so its text is separate from the fixed title.
     draft = review.Draft(rendered.sender, decision_priority.priority(options.need, options.due), rendered.title, rendered.action,
-                         rendered.body, False, rendered.session)
-    outcome = review.review(draft, False, limit=waits_review_seconds())
+                         rca.waits_line(waits).strip(), False, rendered.session)
+    outcome = review.review(draft, False, limit=waits_review_seconds(), text_id=AUTO_MODE_TEXT)
     if isinstance(outcome, review.Approved):
         return options
+    header = first_line(draft.action, draft.session)
+    if outcome.failures and all(failure.quote and (failure.quote in draft.title or failure.quote in header)
+                                for failure in outcome.failures):
+        return options
     why = outcome.why if isinstance(outcome, review.Unreviewed | review.Withheld) else ", ".join(outcome.failed_rules)
-    print(f"send.py: {AUTO_MODE_TEXT} goes without its waits sentence: the review gave {why}", file=sys.stderr)
-    values["waits_line"] = ""
-    rendered = push_texts.render(AUTO_MODE_TEXT, **values)
+    print(f"send.py: {AUTO_MODE_TEXT} goes without its waits clause: {why}", file=sys.stderr)
     return options._replace(values=tuple(f"{key}={item}" for key, item in values.items()),
-                            text=session_prefix(rendered.session) + rendered.body)
+                            summary=rendered.title, text=session_prefix(rendered.session) + rendered.body)
 
 
 def paid_credits_values(text_id: str, values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
@@ -4834,10 +4827,11 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 
 def refusal_report(options: Options) -> rca.Report:
-    """Open a case for the session with refused commands, the waits sentence, and the alert's sender and key."""
+    """Give the RCA case the original commands and the reviewed waits clause."""
     values = template_values(options)
+    waits = values["waits"]
     return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
-                      waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
+                      waits=waits[:1].upper() + waits[1:], source=options.sender or "",
                       key=options.key or "")
 
 
