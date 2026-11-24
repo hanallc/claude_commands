@@ -606,26 +606,24 @@ def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
 
 
 def report_owner_end(request: wire.OwnerEnd) -> None:
-    """Report the guest gate result within one queue query timeout."""
+    """Retry transport failures within the queue outage limit."""
     from scripts.build_queue import admission_protocol as wire, admission_records as records
 
-    started = CLOCK.monotonic()
     config = records.read_memory_config(report=False)
-    timeout = config.query_timeout_seconds
-    deadline = started + timeout
-    pause = min(config.reconnect_seconds, timeout / 4)
+    deadline = CLOCK.monotonic() + config.unreachable_limit_seconds
     outgoing = wire.encode_owner_end(request).encode()
     while True:
+        query_deadline = min(deadline, CLOCK.monotonic() + config.query_timeout_seconds)
         try:
-            with _connect(_remaining_seconds(deadline)) as connection:
-                connection.settimeout(_remaining_seconds(deadline))
+            with _connect(_remaining_seconds(query_deadline)) as connection:
+                connection.settimeout(_remaining_seconds(query_deadline))
                 connection.sendall(outgoing)
-                line = _line(connection, bytearray(), deadline)
+                line = _line(connection, bytearray(), query_deadline)
         except OSError as error:
             remaining = deadline - CLOCK.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"no answer in {timeout:g} s") from error
-            CLOCK.sleep(min(pause, remaining))
+                raise TimeoutError(f"no answer in {config.unreachable_limit_seconds:g} s") from error
+            CLOCK.sleep(min(config.reconnect_seconds, remaining))
         else:
             break
 

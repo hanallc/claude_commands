@@ -114,25 +114,25 @@ class FirstStepTests(unittest.TestCase):
             assignment = client.read_assignment(admitted.assignment_file).assignment
             clock = FakeClock()
             timeouts: list[float] = []
+            config = records.read_memory_config()
 
             def connect_after_refusal(timeout: float) -> socket.socket:
                 timeouts.append(timeout)
                 if len(timeouts) == 1:
-                    raise ConnectionRefusedError("fixture queue is down")
+                    clock.advance(timeout)
+                    raise TimeoutError("fixture queue is down")
                 connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 connection.settimeout(timeout)
                 connection.connect(str(fixture.socket_path))
                 return connection
 
             result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 5)
-            timeout = records.read_memory_config().query_timeout_seconds
             with (fixture.serving(), mock.patch.object(client, "CLOCK", clock),
                   mock.patch.object(client, "_connect", side_effect=connect_after_refusal)):
                 self.assertIs(admitted.run_gate(lambda: result), result)
-                self.assertEqual(len(timeouts), 2)
-                self.assertEqual(timeouts[0], timeout)
-                self.assertGreater(timeouts[1], 0)
-                self.assertLess(timeouts[1], timeout)
+                self.assertEqual(timeouts, [config.query_timeout_seconds] * 2)
+                self.assertEqual(clock.sleeps, [config.reconnect_seconds])
+                self.assertEqual(clock.monotonic(), config.query_timeout_seconds + config.reconnect_seconds)
             key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             saved = fixture.server.assignments[key]
             self.assertEqual(saved.state, placement.ClosedAssignment("completed"))
@@ -144,7 +144,7 @@ class FirstStepTests(unittest.TestCase):
             admitted = self.consumed_guest_gate(fixture)
             assignment = client.read_assignment(admitted.assignment_file).assignment
             clock = FakeClock()
-            timeout = records.read_memory_config().query_timeout_seconds
+            timeout = records.read_memory_config().unreachable_limit_seconds
             result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(GATE_COMMAND, 7)
             with (mock.patch.object(client, "CLOCK", clock),
                   mock.patch.object(client, "_connect", side_effect=FileNotFoundError("fixture queue is down")) as connect,
