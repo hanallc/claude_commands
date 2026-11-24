@@ -1203,14 +1203,17 @@ fi
 
     def test_failed_launch_release_exits_with_a_settlement_error(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
+        unreadable = path.with_name('journal-directory')
+        unreadable.mkdir(parents=True)
         armed = mac_linux.ArmedGuestAttempt('fixture-attempt', 'f' * 32, 'boot-id', 10, 'guest', '/fixture')
         for attempt, reason in ((52, 'the guest end is unproven'), (50, 'the guest main probe failed')):
-            with self.subTest(reason=reason):
+            with (self.subTest(reason=reason),
+                  patch.object(process_start, 'process_start', return_value=process_start.Started('123'))):
                 self.placed = replace(self.placed, attempt=f'{attempt:032x}')
                 transfer = (patch.object(mac_linux, 'transfer_source', side_effect=mac_linux.GuestEndUnproven(reason, armed))
                             if attempt == 52 else nullcontext())
                 with (transfer, patch.object(target_config, 'mac_linux_end_proof_journal',
-                                             side_effect=[path, path.parent, path.parent]),
+                                             side_effect=[path, unreadable, unreadable]),
                       patch.object(mac_linux, 'send_guest_execution') as report, redirect_stderr(io.StringIO())):
                     outcome = self.route('main-probe-failure')
                 blocked = self.blocked(outcome)
@@ -1693,10 +1696,17 @@ fi
 
     def test_first_guest_launch_syncs_the_journal_directory_before_consume(self) -> None:
         path = self.root / 'target-state/mac-linux/end-proofs.jsonl'
-        self.assertFalse(path.exists())
+        self.assertFalse(path.parent.parent.exists())
         consume = admission_client.consume_permission
         fsync = os.fsync
+        sync_folder = atomic_file.sync_folder
         synced: list[int] = []
+        folders: list[Path] = []
+
+        def sync_journal_folder(folder: Path) -> None:
+            self.assertIn(folder, (self.root, path.parent.parent, path.parent))
+            sync_folder(folder)
+            folders.append(folder)
 
         def record_sync(fd: int) -> None:
             fsync(fd)
@@ -1709,11 +1719,43 @@ fi
             self.assertIn(path.stat().st_ino, synced)
             self.assertIn(path.parent.stat().st_ino, synced)
             self.assertGreater(synced.index(path.parent.stat().st_ino), synced.index(path.stat().st_ino))
+            self.assertCountEqual(folders, [self.root, path.parent.parent, path.parent])
             return consume(request)
 
         with (patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
+              patch.object(atomic_file, 'sync_folder', side_effect=sync_journal_folder),
               patch.object(os, 'fsync', side_effect=record_sync),
               patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        send.assert_called_once()
+
+    def test_a_failed_state_root_parent_sync_does_not_consume_permission(self) -> None:
+        state_root = self.root / 'target-state'
+        sync_folder = atomic_file.sync_folder
+        consume = admission_client.consume_permission
+        parent_syncs: list[Path] = []
+        self.assertFalse(state_root.exists())
+
+        def sync_journal_folder(folder: Path) -> None:
+            self.assertIn(folder, (self.root, state_root, state_root / 'mac-linux'))
+            if folder == self.root:
+                self.assertTrue(state_root.is_dir())
+                parent_syncs.append(folder)
+                if len(parent_syncs) == 1:
+                    raise OSError('fixture state root parent sync failed')
+            sync_folder(folder)
+
+        def check_launch(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+            self.assertEqual(parent_syncs, [self.root, self.root])
+            return consume(request)
+
+        with (patch.object(process_start, 'process_start', return_value=process_start.Started('123')),
+              patch.object(atomic_file, 'sync_folder', side_effect=sync_journal_folder),
+              patch.object(admission_client, 'consume_permission', side_effect=check_launch) as send):
+            self.assertEqual(self.route(), 'mac-linux: fixture state root parent sync failed')
+            send.assert_not_called()
             result = self.route()
         assert isinstance(result, GateRun), result
         self.assertTrue(result.passed)

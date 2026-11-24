@@ -1282,7 +1282,15 @@ def _append_guest_end_row(row: dict[str, object]) -> None:
     path = target_config.mac_linux_end_proof_journal()
     directory = path.parent
     state_root = directory.parent
-    directory.mkdir(parents=True, exist_ok=True)
+    pending_root_sync = state_root.parent / f'.{state_root.name}.mac-linux-root-sync-pending'
+    if not state_root.is_dir() or pending_root_sync.is_dir():
+        # Create the marker first so another writer can finish an interrupted sync.
+        pending_root_sync.mkdir(parents=True, exist_ok=True)
+        state_root.mkdir(exist_ok=True)
+        atomic_file.sync_folder(state_root.parent)
+        with suppress(FileNotFoundError):
+            pending_root_sync.rmdir()
+    directory.mkdir(exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, 'a+b') as journal:
         fcntl.flock(journal, fcntl.LOCK_EX)

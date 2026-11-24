@@ -852,9 +852,10 @@ class GateCleanupInProgress(LedgerUnavailable):
     """The booking is reserved for cleanup."""
 
 
-def require_gate_cleanup_owner(booking: GateReservation | None, attempt: str,
+def require_gate_cleanup_owner(state: LedgerEvidence, attempt: str,
                                owner: GateWorkerOwner | GateOwnerUnknown) -> GateReservation:
     """Check the cleanup selection while the ledger lock is held."""
+    booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
     if booking is None or not gate_is_open(booking):
         raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the booking is no longer open')
     if booking.owner != owner:
@@ -871,7 +872,7 @@ def mark_gate_cleanup(
     if (booking is not None and isinstance(booking.state, GateTerminated)
             and booking.region == targets.region and booking.state.confirms(targets.instances)):
         return booking.state
-    booking = require_gate_cleanup_owner(booking, attempt, owner)
+    booking = require_gate_cleanup_owner(state, attempt, owner)
     if isinstance(booking.cleanup, GateCleanupPending):
         if booking.cleanup.targets != targets:
             raise GateCleanupSuperseded(f'Skipped gate cleanup for {attempt}: the selected instances changed')
@@ -2555,6 +2556,15 @@ class CostLedger:
             yield state
             self._save(state)
 
+    @contextmanager
+    def gate_cleanup_transaction(self) -> Generator[LedgerEvidence]:
+        """Save a cleanup update only if it changes the gate reservations."""
+        with self._locked() as state:
+            previous = state.gate_reservations.copy()
+            yield state
+            if state.gate_reservations != previous:
+                self._save(state)
+
     def spending_decision(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
         """Validate account evidence and apply the shared bill cap to a proposed reservation."""
         decision = self._decide(state, settings_path, 'start', now)
@@ -2646,9 +2656,10 @@ class CostLedger:
                      cleanup: GateCleanupTargets | GateCleanupNotStarted = GATE_CLEANUP_NOT_STARTED) -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
-            booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
-            if not isinstance(expected_owner, NoGateCleanupOwnerCheck):
-                _ = require_gate_cleanup_owner(booking, attempt, expected_owner)
+            if isinstance(expected_owner, NoGateCleanupOwnerCheck):
+                booking = next((row for row in state.gate_reservations if row.attempt == attempt), None)
+            else:
+                booking = require_gate_cleanup_owner(state, attempt, expected_owner)
             if booking is not None and isinstance(booking.state, GateTerminated):
                 if isinstance(cleanup, GateCleanupTargets) and (booking.region != cleanup.region
                         or not booking.state.confirms(cleanup.instances)):
