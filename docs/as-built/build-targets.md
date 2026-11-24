@@ -150,8 +150,8 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   The release intent keeps each cycle holder's name, purpose, and start time for broadcasts and cycle recovery.
   An old release intent without cycle holders still names its one holder.
   Release does not wait for an answer or an allocation.
-  The result names failed or unconfirmed deliveries:
-  `Not reached, tell them yourself: <name> (session gone | send failed | queued, delivery unconfirmed)`.
+  The result names each gone session once: `Not reached, tell them yourself: <name> (session gone)`.
+  It names each session with unsent notices once: `Release notices still pending for <name>, ...`.
 - Hold records and release delivery are described in [build-memory-admission.md](build-memory-admission.md) ("Release").
 
 ### Where a job runs: `scripts/direct/verify.sh`
