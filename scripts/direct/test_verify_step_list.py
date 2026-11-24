@@ -129,7 +129,6 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
             (("doc", "--features", "--bad"), "Usage:"),
             (("lint", "--keep-going"), "Usage:"),
             (("doc", "--mac", "--features", "extra"), "--mac needs a reason"),
-            (("doc", "missing"), "package missing not found"),
             (("doc", "--target", "missing"), "missing"),
         )
         for later, message in cases:
@@ -140,8 +139,18 @@ class VerifyStepListTests(VerifyStepRoutesFixture):
                 self.assertEqual(self.fixture.call_records(), [])
                 self.assertEqual(self.mac_rows(), [])
                 self.assertFalse(self.events.exists())
-                self.assertTrue(all(event["args"][:1] == ["metadata"] for event in self.fixture.cargo_events()))
+                self.assertEqual(self.fixture.cargo_events(), [])
                 self.assert_removed()
+
+    def test_each_step_checks_its_package_when_it_runs(self) -> None:
+        (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()
+        result = self.run_verify("check", "sample", "--local", "requires Linux", "+", "doc", "missing")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("package missing not found", result.stderr)
+        calls = [event["args"][0] for event in self.fixture.cargo_events()]
+        self.assertEqual([verb for verb in calls if verb != "metadata"], ["check"])
+        self.assertEqual(self.mac_rows(), [])
+        self.assert_removed()
 
     def test_step_list_refuses_unsupported_verbs_and_empty_steps(self) -> None:
         for arguments in (("check", "+", "build"), ("help", "+", "check"),

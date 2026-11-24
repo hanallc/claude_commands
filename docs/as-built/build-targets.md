@@ -603,11 +603,12 @@ No package selects the whole workspace.
 | `test,lint,doc [<package>]` | Run a comma list of `test`, `lint`, and `doc` in the given order. |
 | `check + lint + test hana + test hana_diegetic + doc --mac "Mac-only docs"` | Run a step list in the given order. |
 
-A comma list accepts one optional package and no verb flags.
+A comma list accepts one optional package and no verb flags. A lone `+` cannot be the package.
 A step list uses a lone `+` between `check`, `test`, `lint`, and `doc` steps.
 The splitter keeps `+` when a flag expects a value.
 Each step uses its own package and flags. A routing flag applies only to its step.
-Verify checks every step's arguments before it starts the list. A usage error exits 2.
+Verify checks the argument form of every step before it starts the list. A usage error exits 2.
+Each step checks its package when it runs.
 The first failure ends either list with its status.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
 Steps in a plus list keep their queue place even when they need a checkout slot.

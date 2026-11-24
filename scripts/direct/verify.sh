@@ -502,6 +502,26 @@ case "${1:-}" in
         ;;
 esac
 
+VERIFY_VERBS=()
+if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
+    verify_list_verbs='test|lint|doc'
+    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^($verify_list_verbs)(,($verify_list_verbs))+$ ||
+            ${#VERIFY_QUERY_ARGS[@]} -gt 2 || "${VERIFY_QUERY_ARGS[1]:-}" == -* ||
+            "${VERIFY_QUERY_ARGS[1]:-}" == + ]]; then
+        echo 'verify.sh: a verb list accepts only test, lint, doc and one optional package. Use commas between verbs.' >&2
+        exit 2
+    fi
+    IFS=, read -r -a VERIFY_VERBS <<< "${VERIFY_QUERY_ARGS[0]}"
+    seen_verbs=,
+    for verb in "${VERIFY_VERBS[@]}"; do
+        if [[ "$seen_verbs" == *",$verb,"* ]]; then
+            printf 'verify.sh: repeated verb: %s\n' "$verb" >&2
+            exit 2
+        fi
+        seen_verbs+="$verb,"
+    done
+fi
+
 # Save exported values before script variables replace caller names.
 # The --env rule refuses the VERIFY_ prefix. env -0 works in every bash build;
 # a bash built without programmable completion has no compgen.
@@ -651,8 +671,7 @@ compose_nextest_args() {
 }
 
 validate_verify_step_list() (
-    local length offset=0 metadata GATE_METADATA=""
-    local members=() targets=()
+    local length offset=0 targets=()
     # Resolve the interpreter without caching its path. Keep imports read-only.
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}" CLAUDE_DISABLE_DATACLASS_CODE_CACHE=1
     export PYTHONDONTWRITEBYTECODE=1 GIT_OPTIONAL_LOCKS=0
@@ -668,7 +687,6 @@ validate_verify_step_list() (
             lint) parse_lint_arguments ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
             doc) take_features validate ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} ;;
         esac
-        [[ -z "$VERIFY_PACKAGE" ]] || members+=("member:$VERIFY_PACKAGE")
         if [[ -n "$PINNED_TARGET" && "$PINNED_TARGET" != natedev ]]; then
             targets+=("$PINNED_TARGET")
         fi
@@ -688,10 +706,6 @@ except target_config.ConfigError as error:
     print(f"verify.sh: {error}", file=sys.stderr)
     sys.exit(2)
 ' "$VERIFY_START_DIR/../lib/package_root.py" "${targets[@]}" || exit 2
-    fi
-    if (( ${#members[@]} )); then
-        metadata="$(CARGO_NET_OFFLINE=true read_metadata)" || exit 2
-        printf '%s\n' "$metadata" | "$PY" "$VERIFY_METADATA_SCRIPT" "${members[@]}" >/dev/null || exit 2
     fi
 )
 
@@ -758,24 +772,6 @@ VERIFY_TRACE_RUNNER
     chmod +x "$PY"
 fi
 # Read-only queries run before environment setup and build admission.
-VERIFY_VERBS=()
-if [[ "${VERIFY_QUERY_ARGS[0]:-}" == *,* ]]; then
-    verify_list_verbs='test|lint|doc'
-    if [[ ! "${VERIFY_QUERY_ARGS[0]}" =~ ^($verify_list_verbs)(,($verify_list_verbs))+$ ||
-            ${#VERIFY_QUERY_ARGS[@]} -gt 2 || "${VERIFY_QUERY_ARGS[1]:-}" == -* ]]; then
-        echo 'verify.sh: a verb list accepts only test, lint, doc and one optional package. Use commas between verbs.' >&2
-        exit 2
-    fi
-    IFS=, read -r -a VERIFY_VERBS <<< "${VERIFY_QUERY_ARGS[0]}"
-    seen_verbs=,
-    for verb in "${VERIFY_VERBS[@]}"; do
-        if [[ "$seen_verbs" == *",$verb,"* ]]; then
-            printf 'verify.sh: repeated verb: %s\n' "$verb" >&2
-            exit 2
-        fi
-        seen_verbs+="$verb,"
-    done
-fi
 if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final-pass ]]; then
     command_help final >&2
     exit 2
