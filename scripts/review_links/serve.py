@@ -1310,10 +1310,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.undo_post(route)
             return
         if self.headers.get(send_hold.HOLD_HEADER) == "1" and self.held_send_path(route.path):
-            # Zero seconds turns Undo off, so the send goes to its handler at once.
+            request_ids = self.headers.get_all(send_hold.REQUEST_HEADER, [])
+            if request_ids and (len(request_ids) != 1 or not send_hold.valid_hold_id(request_ids[0])):
+                self.json_response(400, {"reason": "The send has no valid request ID."})
+                return
+            request_id = request_ids[0] if request_ids else ""
             seconds = conf.read("review_links").whole("undo_seconds")
-            if seconds:
-                self.hold_post(route, seconds)
+            server = cast(ReviewLinksServer, self.server)
+            if seconds or (request_id and server.send_holds.has_hold(request_id)):
+                self.hold_post(route, seconds, request_id)
                 return
         if route.path == review_page.NEW_ITEM_PATH:
             self._write_post(self.new_item_post)
@@ -2520,7 +2525,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(404, {"reason": "No such send."})
             return
         if action == "send":
-            self.json_response(200 if server.send_holds.send_now(hold_id) else 409, {})
+            try:
+                sent = server.send_holds.send_now(hold_id, expect_post=self.headers.get(send_hold.REQUEST_HEADER) == hold_id)
+            except OSError as error:
+                print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
+                self.json_response(503, {"reason": "The send could not release early."})
+                return
+            self.json_response(200 if sent else 409, {})
             return
         try:
             outcome = server.send_holds.undo(hold_id)
@@ -2531,7 +2542,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         status = {send_hold.UndoResult.UNDONE: 200, send_hold.UndoResult.ALREADY_SENT: 409}.get(outcome, 404)
         self.json_response(status, {"outcome": outcome.value})
 
-    def hold_post(self, route: SplitResult, seconds: int) -> None:
+    def hold_post(self, route: SplitResult, seconds: int, request_id: str) -> None:
         """Hold a marked send for Undo."""
         server = cast(ReviewLinksServer, self.server)
         if not self.same_origin(required=True) or route.query:
@@ -2552,8 +2563,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             # A restart waits until the browser has the hold id, so it can read the result from the next server.
             with server.send_holds.answering():
-                hold_id = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds)
-                self.json_response(202, send_hold.held_fields(hold_id, seconds), hold=send_hold.HoldHeader.HELD)
+                held = server.send_holds.hold(route.path, dict(self.headers.items()), body, seconds, request_id=request_id)
+                self.json_response(202, held, hold=send_hold.HoldHeader.HELD)
         except send_hold.HoldsStopped:
             self.json_response(503, {"reason": "The console is restarting. Send again."})
 

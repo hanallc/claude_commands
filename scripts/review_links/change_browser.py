@@ -1040,6 +1040,8 @@ async function save(row,form,outcome){
  clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
+ const skip=kind==='questions' && outcome==='skip';
+ if(skip) data.set('feedback','');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  showActionFailure(state);
  const moveOn=()=>{
@@ -1048,29 +1050,42 @@ async function save(row,form,outcome){
   else show();
   motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
- // Works and Does not work show the next change at once; a failed save puts the change back.
- const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
+ const early=skip || kind!=='questions' && (outcome==='works' || outcome==='not works');
  if(early) moveOn();
  try{
-  // A Skip only moves the item, so it needs no Undo.
   const options={method:'POST',body:data,headers:{Accept:'application/json'}};
-  const response=await (outcome==='skip' ? fetch(form.action,options)
-                                      : heldFetch(form.action,options,sendActionReceiver(form,data)));
+  const response=await heldFetch(form.action,options,skip ? null : sendActionReceiver(form,data));
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
   saved=true;
-  if(!early) moveOn();
+  if(skip){
+   const stillNext=navigation===position+1;
+   rows=rows.filter(card=>card!==row);rows.push(row);
+   row.dataset.pending='true';form.hidden=false;
+   if(!current && stillNext) go(row.dataset.key);
+   else show();
+   if(stillNext) showActionFailure(saveNotice,'Skipped.');
+  }else if(!early) moveOn();
  }catch(error){
   const undone=error instanceof SendUndone;
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
   showActionFailure(state,undone ? reason : 'Not saved: '+reason);
   if(early){
-   row.dataset.pending='true';form.hidden=false;show();
+   row.dataset.pending='true';form.hidden=false;
+   if(skip && undone){
+    form.querySelectorAll('button[name=outcome]').forEach(button=>button.removeAttribute('aria-pressed'));
+    if(navigation===position+1){
+     go(row.dataset.key);
+     showActionFailure(saveNotice,'Undone.');
+     return;
+    }
+   }
+   show();
   }
   if(current!==row){
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   const label=row.dataset.shown || row.dataset.key;
+   const label=row.dataset.shown || row.querySelector('h1')?.textContent || row.dataset.key;
    const message=undone ? 'Undone: '+label+'. It is back in the list.' : 'Not saved: '+label+'. '+reason;
    showActionFailure(saveNotice,message);
    saveNotice.append(' ',open);

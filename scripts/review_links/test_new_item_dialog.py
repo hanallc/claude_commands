@@ -255,7 +255,7 @@ async function sendSaved() {
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
 
    const ownerPosts = [], ownerEndpoint = '/console/review/new-item?page=builds';
-   let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true;
+   let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true, lostHold;
    let captureKey = 'd34db33fd34db33fd34db33fd34db33f';
    let ownerToken = 'owner-token';
    let releasePreview, expireNextSend = false, failNextSend = false;
@@ -271,6 +271,11 @@ async function sendSaved() {
      return previewGate.then(() => originalFetch('data:image/png;base64,' + png));
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
+    const hold = new Headers(options.headers).get('X-Undo-Request');
+    if (lostHold && hold === lostHold && !options.keepalive) {
+     lostHold = null;
+     return Promise.reject(new Error('The Send response was lost.'));
+    }
     const payload = JSON.parse(options.body);
     ownerPosts.push(payload);
     if (payload.page_capture) {
@@ -304,6 +309,7 @@ async function sendSaved() {
      return payload.page && dropPageReply ? response.then(saved => {
       if (!saved.ok) return saved;
       dropPageReply = false;
+      if (options.keepalive) lostHold = hold;
       throw new Error('The Send response was lost.');
      }) : response;
     }
@@ -751,7 +757,7 @@ const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch;
 let holdCapture = __PHOTO__;
-let releaseCapture, loseSend = false, previewPending = false, previewRequests = 0;
+let releaseCapture, loseSend = false, lostHold, previewPending = false, previewRequests = 0;
 const saved = {id:'I1',key:'bug/owner/I1'};
 window.fetch = async (path, options) => {
  if (!String(path).startsWith('/console/review/new-item')) return fetchHTTP(path, options);
@@ -764,6 +770,11 @@ window.fetch = async (path, options) => {
   return new Response(new Blob(['PNG'], {type:'image/png'}));
  }
  if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ const hold = new Headers(options.headers).get('X-Undo-Request');
+ if (lostHold && hold === lostHold && !options.keepalive) {
+  lostHold = null;
+  throw new TypeError('The Send response was lost.');
+ }
  const payload = JSON.parse(options.body);
  wire.push(payload);
  if (payload.page_capture) {
@@ -774,6 +785,7 @@ window.fetch = async (path, options) => {
  }
  if (loseSend) {
   loseSend = false;
+  if (options.keepalive) lostHold = hold;
   throw new TypeError('The Send response was lost.');
  }
  return Response.json(saved);
@@ -1117,12 +1129,17 @@ const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
 const probeKey = 'test-list-first-send', draftPrefix = 'console.list.pending-send.';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
 const posts = [], fetchHTTP = window.fetch;
-let captures = 0;
+let captures = 0, lostHold;
 window.fetch = async (path, options) => {
  if (!reloadAfterSend && path.endsWith('?capture_key=' + firstKey)) {
   return fetchHTTP(path.replace(firstKey, readyKey), options);
  }
  if (path === '/console/review/new-item' && options?.method === 'POST') {
+  const hold = new Headers(options.headers).get('X-Undo-Request');
+  if (lostHold && hold === lostHold && !options.keepalive) {
+   lostHold = null;
+   throw new TypeError('The Send response was lost.');
+  }
   const item = JSON.parse(options.body);
   if (!reloadAfterSend && item.page_capture && ++captures === 1) {
    return Response.json({capture_key:firstKey}, {status:202});
@@ -1135,6 +1152,7 @@ window.fetch = async (path, options) => {
      const response = await fetchHTTP(path, options);
      if (response.status !== 503) return response;
     }
+    if (options.keepalive) lostHold = hold;
     throw new TypeError('The Send response was lost.');
    }
   }
