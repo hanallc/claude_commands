@@ -29,7 +29,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, execution_identity, first_step, mac_run, placement, progress_profile, queue_place
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, admission_wire, execution_identity, first_step, mac_run, placement, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
@@ -1300,7 +1300,10 @@ fi
         self.assertEqual(gate.gate_state_dir(), self.root / 'gate-state')
         key = treekey.tree_key(str(self.repo))
         assert key is not None
-        guest = replace(self.placed, attempt=f'{46:032x}', source_key=execution_identity.SourceKeyKnown(key))
+        started = process_start.process_start(os.getpid())
+        assert isinstance(started, process_start.Started)
+        owner = replace(self.placed.owner, pid=os.getpid(), start_time=started.start)
+        guest = replace(self.placed, owner=owner, attempt=f'{46:032x}', source_key=execution_identity.SourceKeyKnown(key))
         local = replace(guest, attempt=f'{47:032x}', destination=replace(
             guest.destination, provider='local', target='natedev', host='natedev'))
         args = ('--affected', '--full', '--repo', str(self.repo))
@@ -1334,16 +1337,28 @@ fi
             self.assertEqual(mac_linux.settlement(guest.episode, 46), placement.Settled())
             events.append('settle')
 
+        def status(_episode: str, attempt: str) -> admission_wire.PlacementStatusReply:
+            assignment = guest if attempt == guest.attempt else local
+            return admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+                assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+
+        def run_gate() -> subprocess.CompletedProcess[str]:
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                code = gate.main(args)
+            return subprocess.CompletedProcess(command, code, "", errors.getvalue())
+
         with (patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'main-probe-failure'}),
-              patch.object(first_step, 'admitted_run', return_value=nullcontext(admitted)),
+              patch.object(admission_client, 'placement_status', side_effect=status),
               patch.object(gate, 'test_run_folder', return_value=nullcontext()),
               patch.object(mac_linux, 'send_guest_execution', side_effect=report),
               patch.object(admission_client, 'claim_failure', return_value=pending) as decline,
               patch.object(admission_client, 'request_settlement', side_effect=settle),
               patch.object(queue_place, 'wait_for_placement', return_value=wire.Assignment(local)) as again,
-              patch.object(gate, 'run_suites', return_value=GateRun((), 0, 0, selection_certified=True)) as run,
-              redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(gate.main(args), 0, errors.getvalue())
+              patch.object(gate, 'run_suites', return_value=GateRun((), 0, 0, selection_certified=True)) as run):
+            admitted.handoff(self.repo)
+            result = admitted.run_gate(run_gate)
+            self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(events, ['report', 'settle'])
         again.assert_called_once()
         self.assertEqual(again.call_args.args[0], submitted)
@@ -2059,7 +2074,7 @@ fi
     def test_missing_bwrap_refuses_before_upload(self) -> None:
         binaries = self.root / 'without-bwrap'
         binaries.mkdir()
-        for name in ('bash', 'id'):
+        for name in ('bash', 'cat', 'id'):
             executable = shutil.which(name)
             assert executable is not None
             (binaries / name).symlink_to(executable)
@@ -2514,6 +2529,7 @@ fi
     def test_reachable_guest_with_a_held_lock_retries(self) -> None:
         proofs: list[mac_linux.GuestEndProven | mac_linux.GuestEndPending] = []
         prove_guest_end = mac_linux.prove_guest_end
+        arm_guest = mac_linux.arm_guest
 
         @contextmanager
         def reservation(*_args: object) -> Generator[claim_state.ClaimIdentity]:
@@ -2526,7 +2542,10 @@ fi
         lock = self.run_lock()
         lock.parent.mkdir(parents=True)
         with lock.open('w') as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
+            def arm(settings: mac_linux.GuestSettings, attempt: str) -> mac_linux.ArmedGuestAttempt:
+                armed = arm_guest(settings, attempt)
+                fcntl.flock(held, fcntl.LOCK_EX)
+                return armed
 
             def prove(settings: mac_linux.GuestSettings,
                       armed: mac_linux.ArmedGuestAttempt, *,
@@ -2538,6 +2557,7 @@ fi
                 return proof
 
             with (patch.object(mac_linux, 'mac_linux_reservation', reservation),
+                  patch.object(mac_linux, 'arm_guest', arm),
                   patch.object(mac_linux, 'prove_guest_end', prove),
                   patch.object(mac_linux, 'sleep'),
                   patch.object(mac_linux, 'GUEST_KILL_GRACE_SECONDS', 0)):

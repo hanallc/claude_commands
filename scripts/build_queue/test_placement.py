@@ -44,7 +44,7 @@ from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
-from scripts.build_targets import mac_linux
+from scripts.build_targets import mac_linux, target_config
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget, mac_linux_end_proof_journal
 
 
@@ -146,7 +146,7 @@ def mac_linux_fixture(fixture: AdmissionFixture, *, enabled: str = "on", registe
     _ = (fixture.root / "mac_linux.conf").write_text(
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=8\n"
         + "run.time_limit_seconds=7200\n")
-    backoff = fixture.root / "target-state" / "mac-linux" / "unreachable_until"
+    backoff = fixture.root / ".local/state/build-targets/mac-linux/unreachable_until"
     backoff.parent.mkdir(parents=True, exist_ok=True)
     return backoff
 
@@ -792,7 +792,7 @@ class PlacementTests(unittest.TestCase):
                 self.assertIn(attempt, startup)
                 python = Path(service.__file__).resolve().parents[1] / "lib/py"
                 command = shlex.join((str(python), "-m", "scripts.aws_target.cloud_gate", "--reconcile",
-                                      "--directory", str(fixture.root / "target-state" / "aws")))
+                                      "--directory", str(fixture.root / ".local/state/build-targets/aws")))
                 self.assertIn(f"{attempt!r} (ledger-wide cleanup, queue unit: run {command})", startup)
                 LauncherHangGuard("Send startup alert").event(sent)
                 alert.assert_called_once_with("builds", startup)
@@ -1371,7 +1371,7 @@ class PlacementTests(unittest.TestCase):
                                                   str(inherited))
             with mock.patch.dict(os.environ, inherited_environment), PlacementFixture() as fixture:
                 self.assertEqual(conf.directory(), fixture.root)
-                self.assertEqual(Path(os.environ["BUILD_TARGETS_STATE_DIR"]), fixture.root / "target-state")
+                self.assertEqual(target_config.build_targets_state_root(), fixture.root / ".local/state/build-targets")
                 self.assertEqual(Path(os.environ["GATE_STATE_DIR"]), fixture.root / "gate-state")
             self.assertEqual(list(Path(outside).iterdir()), [inherited])
 

@@ -51,6 +51,7 @@ from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import change_review, gate
 from scripts.production.gate_modules import GateRefused
+from scripts.production.gate_routes import GatePlacementIncomplete
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import atomic_file, conf
 from scripts.lib.git_test_support import commit_repository
@@ -3765,7 +3766,10 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                         cloud_gate.save(folder / 'outcome.json', outcome)
                         return 0
 
-                    with (fixture.serving(), mock.patch.dict(os.environ, {
+                    environment = {'BUILDLOG_PREPARED_COPY': str(repo)}
+                    with (fixture.serving(), copies.prepared_gate_handoff(environment, ()) as descriptors,
+                          mock.patch.dict(os.environ, {**environment,
+                              copies.PREPARED_GATE_FD: str(os.dup(descriptors[-1])),
                               'BUILDLOG_PLACEMENT_FILE': str(assignment_file), 'BUILDLOG_PLACEMENT_EPISODE': assignment.episode}),
                           mock.patch.object(cloud_gate, 'settings', return_value=values),
                           mock.patch.object(store, 'host_name', return_value=fixture.server.host),
@@ -3793,7 +3797,14 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     self.assertTrue(fake.launches)
                     local.assert_not_called()
                     nightly_red.assert_not_called()
-                    notice.assert_not_called()
+                    if command is nightly:
+                        notice.assert_called_once()
+                        outcome = cast(object, notice.call_args.args[1])
+                        self.assertIsInstance(outcome, GatePlacementIncomplete)
+                        assert isinstance(outcome, GatePlacementIncomplete)
+                        self.assertEqual(outcome.status, status)
+                    else:
+                        notice.assert_not_called()
                     self.assertEqual(gate.checked_git(repo, 'rev-parse', 'HEAD'), base)
                     failure_file = assignment_file.with_name(assignment_file.name + CLAIM_FAILURE_SUFFIX)
                     if status == GATE_PRELAUNCH_REFUSED_STATUS:

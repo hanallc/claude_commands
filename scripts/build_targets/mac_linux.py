@@ -2009,7 +2009,11 @@ def stream_reply(stream: subprocess.CompletedProcess[bytes], attempt: str, boots
                  cleanup_detail: str) -> GuestReply:
     """The reply line and the bundle size from the output of a guest stream that ended, or the guest failure."""
     diagnostics = stream.stderr.decode(errors='replace')
-    tests_started = run_start_line(attempt) in diagnostics.splitlines()
+    lines = diagnostics.splitlines()
+    tests_started = run_start_line(attempt) in lines
+    if (stream.returncode == GUEST_NOT_LOCKED_STATUS and not tests_started
+            and f'{GUEST_ACCEPTED} {attempt}' in lines and run_locked_line(attempt) not in lines):
+        raise GuestNotLocked(f'{stream_report(stream)}. {cleanup_detail}')
     if stream.returncode:
         if stream.returncode == MISSING_PREREQUISITE_STATUS and MISSING_PREREQUISITE_MESSAGE in diagnostics:
             raise GuestMissingPrerequisite(diagnostics.strip())
@@ -2285,11 +2289,12 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         saved, launch = launch, None
         _release_guest_launch(saved)
 
-    def refused(reason: str, *, permission_unknown: bool = False) -> GuestNotStarted | GuestGateBlocked:
+    def refused(reason: str, *, permission_unknown: bool = False,
+                lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
         if dispatch is None and not permission_unknown:
             return GuestNotStarted(reason)
         if dispatch is not None:
-            if dispatch.settled and dispatch.arm_requested:
+            if dispatch.settled and dispatch.arm_requested and not lock_refused:
                 if dispatch.started is None:
                     reason += '. The guest did not confirm whether the run started.'
                 return GuestGateBlocked(reason)
@@ -2359,9 +2364,10 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return run
     except mac_run.MacRunRefused as error:
         return refused(str(error))
-    except GuestTookNoRun as error:
+    except (GuestTookNoRun, GuestNotLocked) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown))
+        return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown),
+                       lock_refused=isinstance(error, GuestNotLocked))
     except GuestEndUnproven as error:
         if dispatch is not None:
             try:

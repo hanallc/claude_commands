@@ -141,6 +141,27 @@ class FirstStepTests(unittest.TestCase):
     def test_gate_without_scaler_registration_requests_slice_one_targets(self) -> None:
         self.check_gate_mode_candidates(register_aws=False)
 
+    def test_named_gate_explicit_targets_submit_only_natedev(self) -> None:
+        with PlacementFixture() as fixture:
+            source = gate_source(fixture, "claude_commands")
+            cloud = register_scaler(fixture)
+            local = local_candidate(fixture)
+            command = (*GATE_COMMAND[:2], "--tests-only", "--module=lib/test_gate.py")
+
+            def grant(request: wire.PlacementRequest) -> wire.LocalPlacementGranted:
+                assignment = placement.PlacementAssignment(request.episode, "named-gate", local.destination,
+                    request.constraints.source_key, request.owner, request.constraints.session, request.since)
+                return wire.LocalPlacementGranted(assignment, PROGRAM_GRANT)
+
+            with (mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(fixture.root)),
+                  mock.patch.object(first_step, "_placement_grant", side_effect=grant),
+                  mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
+                  first_step.admitted_run(command, source, targets=(cloud.destination.target, "mac-linux", "natedev"))
+                  as admitted):
+                owned = admitted.grant
+                assert isinstance(owned, first_step.OwnedGatePlacement)
+                self.assertEqual(owned.request.constraints.candidates, (local,))
+
     def test_standalone_module_and_nightly_gates_only_place_on_natedev(self) -> None:
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
@@ -157,29 +178,27 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(first_step, "_placement_grant", side_effect=grant) as submit,
                   mock.patch.object(client, "cancel_placement", return_value=wire.Ok()),
                   forbid_admission_calls()):
-                for arguments in (("--tests-only", "--module=lib/test_gate.py"),
-                                  ("--nightly", "--merge-branch", "main", "--unit", "fixture")):
-                    with self.subTest(arguments=arguments):
-                        command = (*GATE_COMMAND[:2], *arguments)
+                named = (*GATE_COMMAND, "--module=lib/test_gate.py")
+                nightly = (*GATE_COMMAND[:2], "--nightly", "--merge-branch", "main", "--unit", "fixture")
+                candidates = (cloud, mac_linux_candidate(), local)
+                names = tuple(candidate.destination.target for candidate in candidates)
+                for command, expected in ((named, (local,)), (nightly, candidates)):
+                    with self.subTest(command=command):
                         submit.reset_mock()
                         with first_step.admitted_run(command, source) as admitted:
                             grant_for_gate = admitted.grant
                             assert isinstance(grant_for_gate, first_step.OwnedGatePlacement)
                             self.assertEqual(grant_for_gate.grant.assignment.destination, local.destination)
-                            self.assertEqual(grant_for_gate.request.constraints.candidates, (local,))
+                            self.assertEqual(grant_for_gate.request.constraints.candidates, expected)
                         submit.assert_called_once()
-                        names = (cloud.destination.target, "mac-linux", "natedev")
                         with first_step.admitted_run(command, source, targets=names) as admitted:
                             mixed_grant = admitted.grant
                             assert isinstance(mixed_grant, first_step.OwnedGatePlacement)
-                            candidates = mixed_grant.request.constraints.candidates
-                            self.assertEqual(tuple(c.destination.target for c in candidates), names)
-                            self.assertEqual(tuple(c for c in candidates
-                                if isinstance(c.eligibility, placement.AllowedHost)), (local,))
-                        with self.assertRaisesRegex(first_step.FirstStepRefused, "runs only on natedev"):
-                            with first_step.admitted_run(command, source, targets=names[:-1]):
-                                self.fail("a remote-only gate request was accepted")
+                            self.assertEqual(mixed_grant.request.constraints.candidates, expected)
                         self.assertEqual(submit.call_count, 2)
+                with self.assertRaisesRegex(first_step.FirstStepRefused, "runs only on natedev"):
+                    with first_step.admitted_run(named, source, targets=names[:-1]):
+                        self.fail("a remote-only named gate request was accepted")
 
     def check_gate_mode_candidates(self, *, register_aws: bool) -> None:
         with PlacementFixture() as fixture:

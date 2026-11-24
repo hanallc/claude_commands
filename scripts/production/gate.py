@@ -3392,6 +3392,11 @@ def gate_cleanup_scope(*scopes: AbstractContextManager[object]) -> Generator[Exi
                 raise
     except Exception as cleanup_error:
         if placement_error is not None and cleanup_error is not placement_error:
+            if isinstance(cleanup_error, GatePlacementIncomplete) and cleanup_error.status == placement_error.status:
+                raise
+            previous = cleanup_error.__context__
+            if isinstance(previous, GatePlacementIncomplete) and previous.status == placement_error.status:
+                placement_error = previous
             raise_gate_cleanup_failure(placement_error, cleanup_error, "Gate cleanup")
         raise
 
@@ -3789,7 +3794,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
-        with (nullcontext() if args.promote_only else unwind_gate_on_sigterm()):
+        with (unwind_gate_on_sigterm() if args.tests_only else nullcontext()):
             return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)

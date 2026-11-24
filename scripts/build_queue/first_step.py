@@ -340,8 +340,10 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
 
     arguments = tuple(command)
     flag = natedev_only_flag(arguments)
-    if flag is not None and "natedev" not in targets:
-        raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
+    if flag is not None:
+        if "natedev" not in targets:
+            raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
+        targets = ("natedev",)
     local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar))
     tree_key = treekey.tree_key(str(source))
     source_key = (execution_identity.SourceKeyKnown(tree_key) if tree_key
@@ -364,8 +366,7 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
             named = tuple(candidate for candidate in fixed.candidates if candidate.destination.target == name)
         if not named:
             raise FirstStepRefused(f'gate target {name} is not configured')
-        candidates.extend(replace(candidate, eligibility=placement.FixedExclusion(f"{flag} runs only on natedev"))
-            if flag is not None and candidate.destination.target != "natedev" else candidate for candidate in named)
+        candidates.extend(named)
     constraints = placement.PlacementConstraints(source_key, arguments, str(source), '', session,
         tuple(candidates), command_kind='final')
     route = target_config.PinnedTarget(targets[0]) if len(targets) == 1 else target_config.ANY_ELIGIBLE_TARGET
