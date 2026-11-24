@@ -636,6 +636,11 @@ From a `claude_commands` checkout, run the affected tests through the queue with
 
 Add `--module <module>` after `--affected` to select a module.
 
+`copies.py run` passes a one-use pipe to the copy's own `scripts/production/gate.py`.
+The pipe contains the launched process ID.
+The gate accepts the handoff only when the process ID and checkout both match.
+A gate started by hand in a copy shell uses direct placement, which allows natedev or Mac Linux.
+
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
 For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
 No configuration maps repositories to unit gates.

@@ -47,8 +47,9 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.build_queue import first_step
 from scripts.lib.build_steps import (
-    GATE_RESULT_UNKNOWN_STATUS, GATE_SCRIPTS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
-    StepJob, VerifyCommand, build_call_arguments, command_job, command_program, read_step_names, verify_command,
+    GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS,
+    OtherCommand, StepJob, VerifyCommand, build_call_arguments, command_job, parse_command_program, read_step_names,
+    verify_command,
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -2614,8 +2615,7 @@ def take_prepared_gate_handoff() -> bool:
         if reader < 3 or not stat.S_ISFIFO(os.fstat(reader).st_mode):
             return False
         with os.fdopen(reader, "rb", buffering=0) as pipe:
-            os.set_blocking(reader, False)
-            return pipe.read(1) == b"1"
+            return pipe.read(32) == f"{os.getpid()}\n".encode("ascii")
     except (OSError, ValueError, OverflowError):
         return False
 
@@ -2659,16 +2659,21 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         def launch() -> subprocess.CompletedProcess[str]:
             child_environment = {**os.environ, **environment}
             _ = child_environment.pop(PREPARED_GATE_FD, None)
-            pass_fds = locks
-            with ExitStack() as handoff:
-                if command_program(arguments) in GATE_SCRIPTS:
-                    reader, writer = os.pipe()
-                    _ = handoff.callback(os.close, reader)
+            program = parse_command_program(arguments, keep_path=True)
+            if (isinstance(program, OtherCommand) or Path(arguments[0]).name in {"bash", "sh"}
+                    or (tree / program[0]).resolve() != tree.resolve() / "scripts/production/gate.py"):
+                return subprocess.run(arguments, cwd=tree, pass_fds=locks, env=child_environment, text=True)
+            with ExitStack() as child_scope:
+                reader, writer = os.pipe()
+                try:
                     with os.fdopen(writer, "wb") as pipe:
-                        _ = pipe.write(b"1")
-                    child_environment[PREPARED_GATE_FD] = str(reader)
-                    pass_fds = (*locks, reader)
-                return subprocess.run(arguments, cwd=tree, pass_fds=pass_fds, env=child_environment, text=True)
+                        child_environment[PREPARED_GATE_FD] = str(reader)
+                        child = child_scope.enter_context(subprocess.Popen(
+                            arguments, cwd=tree, pass_fds=(*locks, reader), env=child_environment, text=True))
+                        _ = pipe.write(f"{child.pid}\n".encode("ascii"))
+                finally:
+                    os.close(reader)
+                return subprocess.CompletedProcess(arguments, child.wait())
 
         if isinstance(prepared, AdmittedCommandCopy):
             result = prepared.admission.run_gate(launch)
