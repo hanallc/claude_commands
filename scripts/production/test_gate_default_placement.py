@@ -17,8 +17,10 @@ from scripts.build_queue import admission_client, admission_wire as wire, execut
 from scripts.build_queue.admission_client import OuterReservation
 from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.build_targets import mac_linux
+from scripts.buildlog import treekey
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, scratch
+from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS
 from scripts.mac_test.claim_state import WHOLE_MAC
 from scripts.production import gate
@@ -33,6 +35,12 @@ def placed(target: str) -> wire.Assignment:
         NoOwningSession(), 1.0))
 
 
+def inherited_admission(grant: wire.Assignment) -> first_step.FirstStepAdmission:
+    assignment = grant.assignment
+    return first_step.FirstStepAdmission(SlotQueuePosition(assignment.episode, assignment.since),
+        first_step.InheritedGatePlacement(grant), Path('/fixture/assignment.json'))
+
+
 class GateDefaultPlacementTests(unittest.TestCase):
     def test_sigterm_releases_each_direct_placement_before_termination(self) -> None:
         merge = ['--merge-branch', 'main', '--unit-branch', 'fixture', '--checkpoint', 'tip',
@@ -43,11 +51,10 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 events: list[str] = []
 
                 @contextmanager
-                def admit(*_args: object, **_options: object) -> Generator[object]:
+                def admit(*_args: object, **_options: object) -> Generator[first_step.FirstStepAdmission]:
                     events.append('admit')
                     try:
-                        yield mock.Mock(spec=first_step.FirstStepAdmission,
-                                        grant=first_step.GatePlacement(placed('aws'), None))
+                        yield inherited_admission(placed('aws'))
                     finally:
                         events.append('release')
 
@@ -69,6 +76,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
 
                 with (mock.patch.dict(os.environ, clear=True),
                       mock.patch.object(first_step, 'admitted_run', side_effect=admit),
+                      mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('aws')]),
                       mock.patch.object(gate, 'run_tests_only', side_effect=interrupt),
@@ -93,13 +101,12 @@ class GateDefaultPlacementTests(unittest.TestCase):
                 calls: list[str] = []
 
                 @contextmanager
-                def admit(command: Sequence[str], source: Path) -> Generator[object]:
+                def admit(command: Sequence[str], source: Path) -> Generator[first_step.FirstStepAdmission]:
                     self.assertEqual(list(command), ['gate.py', *arguments])
                     self.assertEqual(source, Path.cwd())
                     calls.append('admit')
                     try:
-                        yield mock.Mock(spec=first_step.FirstStepAdmission,
-                                        grant=first_step.GatePlacement(placed('natedev'), None))
+                        yield inherited_admission(placed('natedev'))
                     finally:
                         calls.append('release')
 
@@ -113,6 +120,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
 
                 with (mock.patch.dict(os.environ, clear=True),
                       mock.patch.object(first_step, 'admitted_run', side_effect=admit),
+                      mock.patch.object(treekey, 'tree_key', return_value='fixture-source'),
                       mock.patch.object(gate, 'current_gate_placement',
                                         side_effect=[gate.NO_GATE_ASSIGNMENT, placed('natedev')]),
                       mock.patch.object(gate, 'run_tests_only', side_effect=run),
@@ -230,7 +238,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
                   mock.patch.object(gate, 'outer_reservation', return_value=parent if nested else None),
                   mock.patch.object(gate, 'current_gate_placement', side_effect=[gate.NO_GATE_ASSIGNMENT, placed('aws')]),
                   mock.patch.object(first_step, 'admitted_run', return_value=nullcontext(
-                      mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.GatePlacement(placed('aws'), None)))) as admit,
+                      inherited_admission(placed('aws')))) as admit,
                   mock.patch.object(gate, 'run_tests_only', return_value=0) as run):
                 self.assertEqual(gate.main(arguments), 0)
             self.assertEqual(admit.call_count, int(not nested))
@@ -289,7 +297,7 @@ class GateDefaultPlacementTests(unittest.TestCase):
             command = ('gate.py', '--nightly', '--merge-branch', 'main', '--unit', 'fixture')
             args = gate.GateArguments(repo=str(repo), merge_branch='main', unit='fixture', command=command)
             assignment = placed('mac-linux')
-            admitted = mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.GatePlacement(assignment, None))
+            admitted = inherited_admission(assignment)
             with (mock.patch.object(gate, 'nightly_git'), mock.patch.object(gate, 'checked_git', return_value='tree'),
                   mock.patch.object(gate, 'nightly_owner', return_value='fixture'),
                   mock.patch.object(copies, 'standing', return_value=nullcontext(clone)),

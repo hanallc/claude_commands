@@ -2493,7 +2493,7 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
             recovery.save()
-        if isinstance(error, (AwsGateTookNoRun, AwsGateLaunchPending)):
+        if isinstance(error, (AwsGateTookNoRun, GateSettlementPending)):
             print("Merge undone. The merge was not pushed.", file=sys.stderr, flush=True)
             raise
         refused = MacLinuxTookNoRun if isinstance(error, MacLinuxTookNoRun) else GateRefused
@@ -3100,7 +3100,7 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 with gate_suite_target(args, clone, target) as assigned:
                     run = run_gate_suites(clone, NIGHTLY_TYPE_DIRS, module_time_limit_s=args.module_time_limit_s,
                                           full=True, gate_job=args.gate_job, target=assigned, nightly_types=True)
-            except (AwsGateTookNoRun, AwsGateLaunchPending):
+            except (AwsGateTookNoRun, GateSettlementPending):
                 raise
             except (GateRefused, first_step.FirstStepRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
@@ -3150,7 +3150,7 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
                 else:
                     print(f"Assign the fix: gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
-    except (AwsGateTookNoRun, AwsGateLaunchPending):
+    except (AwsGateTookNoRun, GateSettlementPending):
         raise
     except (Exception, KeyboardInterrupt) as error:
         if not result_sent and not (isinstance(run, GateRun) and not run.passed):
@@ -3314,7 +3314,11 @@ class AwsGateTookNoRun(GateRefused):
     """The AWS gate declined before launch."""
 
 
-class AwsGateLaunchPending(GateRefused):
+class GateSettlementPending(GateRefused):
+    """The gate attempt still needs settlement proof."""
+
+
+class AwsGateLaunchPending(GateSettlementPending):
     """The AWS gate launch has no settlement proof."""
 
 
@@ -3344,6 +3348,8 @@ class AssignedCloudGateRoute(Protocol):
 
 class MacLinuxGateRoute(Protocol):
     """Run the tests and type checks in the Mac Linux guest."""
+
+    GuestEndUnproven: type[RuntimeError]
 
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
               module_time_limit_s: float, selected: AllModules | TreeSelection,
@@ -3409,10 +3415,14 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     def run_guest(assignment: placement.PlacementAssignment, selection: AllModules | TreeSelection) -> GateRun:
         guest = cast(MacLinuxGateRoute, cast(object, import_module("scripts.build_targets.mac_linux")))
         local_types = nightly_types and bool(type_dirs) and not guest_has_type_tools(guest)
-        outcome = guest.route(repo, mode=mode, full=full,
-                              module_time_limit_s=sys.float_info.max if named else module_time_limit_s,
-                              selected=selection, gate_job=gate_job, type_dirs=() if local_types else type_dirs,
-                              assignment=assignment)
+        try:
+            outcome = guest.route(repo, mode=mode, full=full,
+                                  module_time_limit_s=sys.float_info.max if named else module_time_limit_s,
+                                  selected=selection, gate_job=gate_job, type_dirs=() if local_types else type_dirs,
+                                  assignment=assignment)
+        except guest.GuestEndUnproven as error:
+            detail = ' '.join((str(error), *getattr(error, '__notes__', ())))
+            raise GateSettlementPending(f'Mac Linux guest gate failed: {detail}') from error
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
@@ -3590,7 +3600,7 @@ def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> 
     except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
         print(error, file=sys.stderr, flush=True)
         return GATE_PRELAUNCH_REFUSED_STATUS
-    except AwsGateLaunchPending as error:
+    except GateSettlementPending as error:
         print(error, file=sys.stderr, flush=True)
         return GATE_UNSETTLED_LAUNCH_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
@@ -3753,7 +3763,7 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     except (AwsGateTookNoRun, MacLinuxTookNoRun) as error:
         print(error, file=sys.stderr, flush=True)
         return GATE_PRELAUNCH_REFUSED_STATUS
-    except AwsGateLaunchPending as error:
+    except GateSettlementPending as error:
         print(error, file=sys.stderr, flush=True)
         return GATE_UNSETTLED_LAUNCH_STATUS
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:

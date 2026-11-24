@@ -14,6 +14,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, suppre
 from dataclasses import dataclass, field
 from enum import StrEnum
 import errno
+import fcntl
 import hashlib
 from io import BytesIO
 import json
@@ -48,7 +49,7 @@ from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_protocol import DispatchStatus, ExecutionReport
-    from scripts.build_queue.placement import PlacementAssignment, ProviderClaimReference
+    from scripts.build_queue.placement import Pending, PlacementAssignment, ProviderClaimReference, Settled
 
 
 TARGET = eligibility.MAC_LINUX_TARGET
@@ -1077,6 +1078,59 @@ def report_guest_start(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, *,
         raise wire.AdmissionUnavailable(response.reason or 'the queue did not confirm the guest attempt')
 
 
+def _end_proofs_path() -> Path:
+    return target_config.ssh_target_state_directory(TARGET) / 'end-proofs.jsonl'
+
+
+def _append_guest_end(dispatch: GuestGateDispatch, result: Literal['proven', 'unproven'], detail: str) -> None:
+    from scripts.build_queue.execution_identity import attempt_key
+
+    assignment = dispatch.assignment
+    row = {'attempt': attempt_key(assignment.episode, assignment.attempt), 'claim': dispatch.claim.claim_id,
+           'result': result, 'detail': detail, 'written_at': time()}
+    path = _end_proofs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, 'a+b') as journal:
+        fcntl.flock(journal, fcntl.LOCK_EX)
+        if os.fstat(fd).st_size:
+            _ = journal.seek(-1, os.SEEK_END)
+            if journal.read(1) != b'\n':
+                # Keep the old bytes and end the damaged line before the new row.
+                _ = journal.write(b'\n')
+        _ = journal.write((json.dumps(row) + '\n').encode())
+        journal.flush()
+        os.fsync(fd)
+
+
+def settlement(episode: str, attempt: int) -> Settled | Pending:
+    """Read the proof for the exact queue attempt."""
+    from scripts.build_queue.execution_identity import attempt_key
+    from scripts.build_queue.placement import Pending, Settled
+
+    key = attempt_key(episode, f'{attempt:032x}')
+    try:
+        with _end_proofs_path().open('rb') as journal:
+            for line in journal:
+                if not line.endswith(b'\n'):
+                    continue
+                try:
+                    row = ledger.mapping(cast(object, json.loads(line)))
+                    when = row.get('written_at')
+                    claim = row.get('claim')
+                    if (row.get('attempt') == key and row.get('result') == 'proven'
+                            and isinstance(claim, str) and claim and isinstance(row.get('detail'), str)
+                            and isinstance(when, (int, float)) and not isinstance(when, bool) and math.isfinite(when)):
+                        return Settled()
+                except (ValueError, OverflowError, RecursionError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return Pending(f'The Mac Linux end proof journal is unavailable: {error}')
+    return Pending('The Mac Linux guest end remains unproven')
+
+
 def report_guest_end(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, status: int) -> None:
     """Report the exact guest attempt after the guest proves that it ended."""
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
@@ -1087,6 +1141,7 @@ def report_guest_end(armed: ArmedGuestAttempt, dispatch: GuestGateDispatch, stat
         execution_identity.ObservedExecution(execution), placement.AttemptCompleted(status),
         placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
     try:
+        _append_guest_end(dispatch, 'proven', 'The guest confirmed the run ended')
         with conf.diagnostics(report=False):
             timeout = conf.read('build_admission').number('query_timeout_seconds')
         reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
@@ -1661,6 +1716,13 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
     except GuestTookNoRun as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return GuestNotStarted(' '.join((str(error), *notes)))
+    except GuestEndUnproven as error:
+        if dispatch is not None:
+            try:
+                _append_guest_end(dispatch, 'unproven', str(error))
+            except OSError as journal_error:
+                error.add_note(f'Cannot save the Mac Linux guest end: {journal_error}')
+        raise
     except route_errors() as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
         return f'{TARGET}: ' + ' '.join((str(error), *notes))

@@ -25,10 +25,11 @@ from collections.abc import Generator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.build_targets import mac_linux
 from scripts.buildlog import treekey
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
-from scripts.lib import scratch
+from scripts.lib import conf, scratch
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.lib.build_steps import GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.process_start import Gone
@@ -70,9 +71,10 @@ class GateModuleOwnerTests(unittest.TestCase):
 
 
 class DirectGatePlacementTests(unittest.TestCase):
-    def admission(self, source: Path, command: tuple[str, ...]) -> first_step.FirstStepAdmission:
-        aws = placed("aws")
-        assignment = aws.assignment
+    def admission(self, source: Path, command: tuple[str, ...], *, target: str = "aws"
+                  ) -> first_step.FirstStepAdmission:
+        grant = placed(target)
+        assignment = grant.assignment
         position = SlotQueuePosition(assignment.episode, assignment.since)
         profile = admission_records.ProgramProfile("gate", str(source), str(source),
             admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
@@ -80,8 +82,8 @@ class DirectGatePlacementTests(unittest.TestCase):
             (placement.PlacementCandidate(assignment.destination), placement.PlacementCandidate(placed("natedev").assignment.destination)))
         request = admission_wire.PlacementRequest(position.episode, assignment.owner, position.since, profile, constraints)
         path = source / "assignment.json"
-        admission_client.write_assignment(path, aws)
-        return first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(aws, request), path)
+        admission_client.write_assignment(path, grant)
+        return first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request), path)
 
     def test_direct_gate_uses_the_replacement_grant_after_settlement(self) -> None:
         for flag, mode in (("--tests-only", gate.SuiteMode.GATE), ("--affected", gate.SuiteMode.TARGETED)):
@@ -133,6 +135,31 @@ class DirectGatePlacementTests(unittest.TestCase):
                     self.assertEqual(events, ["admit", "aws", "settle", *([] if blocked else ["natedev"]), "close"])
                     if blocked:
                         self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
+
+    def test_unproven_guest_end_requests_settlement_through_run_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder).resolve()
+            arguments = ("--tests-only", "--repo", str(source))
+            admitted = self.admission(source, ("gate.py", *arguments), target="mac-linux")
+            assignment = admission_wire.read_assignment(admitted.assignment_file).assignment
+            armed = mac_linux.ArmedGuestAttempt("fixture-arm", "f" * 32, "boot-id", 10, "user", "/fixture")
+            failure = mac_linux.GuestEndUnproven("fixture guest end remains unproven", armed)
+            with (mock.patch.dict(os.environ, clear=True),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
+                  mock.patch.object(treekey, "tree_key", return_value="fixture-source"),
+                  mock.patch.object(conf, "read", return_value=mock.Mock(value=mock.Mock(return_value=True))),
+                  mock.patch.object(gate, "read_gate_checkout", return_value=("fixture-tree", set())),
+                  mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
+                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                  mock.patch.object(copies, "source_owner", return_value=""),
+                  mock.patch.object(mac_linux, "route", side_effect=failure),
+                  mock.patch.object(admission_client, "request_settlement",
+                                    side_effect=admission_wire.AdmissionUnavailable("fixture settlement failure")) as settle,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(arguments), 1)
+            settle.assert_called_once_with(admission_wire.SettlementRequest(assignment))
+            self.assertIn(str(failure), errors.getvalue())
+            self.assertIn("Gate placement blocked during launch settlement", errors.getvalue())
 
     def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

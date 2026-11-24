@@ -96,6 +96,16 @@ The route returns `GuestNotStarted` with the refusal reason before any upload or
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
 The guest run lock still refuses another guest run until the first run ends.
+When the proof wait expires, the gate returns status 80 to its placement retry loop.
+The route appends one record to `mac-linux/end-proofs.jsonl` under the build-targets state directory.
+It records `proven` before sending the end report or `unproven` when the proof wait expires.
+Each record contains the queue attempt key, the Mac claim ID, the result, the detail, and the wall time.
+The writer locks the file during the append and syncs the record to disk.
+A failed report send leaves the proof available on disk.
+`mac_linux.settlement()` reads the file without a lock and skips damaged rows.
+The reader uses `execution_identity.attempt_key()` with the episode and the attempt as 32 lowercase hexadecimal digits.
+Only a proven row for that key settles the attempt.
+
 natedev holds the SSH input open for the whole run.
 When the natedev process ends by any signal, the guest sees its input end and kills the run group, which frees the run lock.
 Item 191 B3 will keep the Mac claim until proof and bind the claim identity to the guest attempt.

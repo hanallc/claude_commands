@@ -99,7 +99,9 @@ So the queue places no other run on the busy guest, and the Builds page shows a 
 Until the queue confirms the guest attempt, the row shows `mac-linux (not confirmed)`.
 A refused consume, or a queue that does not answer, starts nothing on the guest.
 The guest run holds a separate lock. Before it can prove the run ended, the guest checks its machine ID and the checkout path from the arm step. The route also refuses the proof when the guest account in the settings differs from the armed account.
-If the wait expires, the gate fails with `guest unreachable` and the guest alias from `ssh.hops`.
+If the wait expires, the route prints `guest unreachable` with the guest alias from `ssh.hops`.
+The gate returns status 80 to the placement retry loop for that episode.
+The route saves the end result in the Mac Linux proof journal before any settlement report.
 The route sends no more cleanup requests.
 The queue currently releases the Mac claim at this deadline. The guest run keeps its lock until it ends.
 The queue's guestkeep change will retain the Mac claim until a later proof.
