@@ -510,19 +510,27 @@ def acquire_placement(request: wire.PlacementRequest
         return LeftQueue()
 
 
-def report_prerequisite(request: wire.PrerequisiteReport, *, report_refusal: bool = True) -> wire.Ok:
+def report_prerequisite(request: wire.PrerequisiteReport, *, unit: str = "", report_refusal: bool = True) -> wire.Ok:
     reply = _call(request, lambda _wait: None, report_refusal=report_refusal)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Ok):
         return reply
-    if not report_refusal and isinstance(reply, wire.Refused):
-        raise wire.AdmissionUnavailable(reply.reason)
+    if isinstance(reply, wire.Refused):
+        if (line := replaced_line(reply.reason, unit)) is not None:
+            raise RunReplaced(line)
+        if not report_refusal:
+            raise wire.AdmissionUnavailable(reply.reason)
     raise wire.AdmissionUnavailable("invalid prerequisite answer")
 
 
-def cancel_placement(request: wire.CancelPlacement) -> wire.Ok:
-    reply = _query(request)
+def cancel_placement(request: wire.CancelPlacement, *, unit: str = "") -> wire.Ok:
+    try:
+        reply = _query(request)
+    except wire.AdmissionUnavailable as error:
+        if (line := replaced_line(error.reason, unit)) is not None:
+            raise RunReplaced(line) from error
+        raise
     if isinstance(reply, wire.Ok):
         return reply
     raise wire.AdmissionUnavailable("invalid cancellation answer")
@@ -798,7 +806,7 @@ def _leave_queue() -> bool:
 
 
 class RunReplaced(wire.AdmissionUnavailable):
-    """A newer run of the unit took the place of this run. The reason is the replaced line."""
+    """A newer run of the unit took the place of this run."""
 
 
 def replaced_line(reason: str, unit: str) -> str | None:
@@ -2250,20 +2258,20 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         report_refusal = not args.pinned_refusals
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
-                                    report_refusal=report_refusal)
+                                    unit=identity.unit, report_refusal=report_refusal)
         while True:
             answer = request_placement(request, report_refusal=report_refusal)
             output.placement_notices(answer, placement_events=args.wait_events)
             if isinstance(answer, wire.PlacementWait) and isinstance(answer.wait, wire.Wait):
                 _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
-                                        report_refusal=report_refusal)
+                                        unit=identity.unit, report_refusal=report_refusal)
                 answer = request_placement(request, report_refusal=report_refusal)
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
             if _leave_queue():
                 _ = cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, episode, owner,
-                    "the caller left before placement"))
+                    "the caller left before placement"), unit=identity.unit)
                 raise _QueueLeft()
             # The first pass only lets a free remote target take the step; it is no memory wait.
             token_check = (isinstance(prerequisite, placement.TokenRequired)
