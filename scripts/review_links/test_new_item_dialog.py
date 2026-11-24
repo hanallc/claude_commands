@@ -385,7 +385,11 @@ async function sendSaved() {
    const beforeSkipped = ownerPosts.length;
    await openOwner();
    checkbox.click();
-   const skippedCapture = new Promise(resolve => { discarded = resolve; });
+   const skippedCapture = new Promise(resolve => {
+    discarded = () => {
+     if (ownerPosts.slice(beforeSkipped).filter(post => post.discard_capture).length >= 2) resolve();
+    };
+   });
    await sendOwner();
    await skippedCapture;
    const skipped = ownerPosts.findLast(post => post.request_id);
@@ -1244,7 +1248,7 @@ const send = dialog.querySelector('[type="submit"]'), shot = dialog.querySelecto
 const type = dialog.querySelector('[name="kind"][value="investigation"]');
 const include = dialog.querySelector('[name="include_page"]');
 const reloadAfterSend = __RELOAD_AFTER_SEND__, shippedPointer = __SHIPPED_POINTER__;
-const shippedUnsent = __SHIPPED_UNSENT__, later = dialog.querySelector('[data-later-draft]');
+const scheduledResult = __SCHEDULED_RESULT__, later = dialog.querySelector('[data-later-draft]');
 const launch = document.querySelector('[data-owner-new]');
 const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
 const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
@@ -1262,12 +1266,13 @@ window.fetch = async (path, options) => {
   if (!reloadAfterSend && item.page_capture && ++captures === 1) {
    return Response.json({capture_key:firstKey}, {status:202});
   }
-  if (shippedUnsent && item.page_capture) return Response.json({error:'No Firefox.'}, {status:503});
+  if (scheduledResult && item.page_capture) return Response.json({error:'No Firefox.'}, {status:503});
   if (item.discard_capture) return Response.json({});
   if (item.request_id) {
    posts.push(item);
-   if (shippedUnsent && item.kind === 'scheduled') {
-    if (!restored.scheduled) throw new TypeError('The Scheduled reply was lost.');
+   if (scheduledResult && item.kind === 'scheduled') {
+    if (scheduledResult === 'refused') return Response.json({error:'Invalid schedule.'}, {status:400});
+    if (scheduledResult.startsWith('retry') && !restored.scheduled) throw new TypeError('The Scheduled reply was lost.');
     return Response.json({id:'L1'});
    }
    if (!restored && posts.length === 1) {
@@ -1308,6 +1313,7 @@ function pasteListImage() {
 async function checkSeparateScheduledDraft() {
  const pending = () => JSON.parse(sessionStorage.getItem(draftKey) || 'null');
  const recipientsReady = () => !!dialog.querySelector('[name="recipient_id"]:checked');
+ const confirmation = dialog.querySelector('#new-item-saved');
  const waitForStep = (test, step) => Promise.race([
   waitFor(test), new Promise((resolve, reject) => setTimeout(() => reject(new Error(step)), 2500))
  ]);
@@ -1319,13 +1325,14 @@ async function checkSeparateScheduledDraft() {
   check(/^r6-/.test(id) && !posts.length, 'Recipient selection stores a native draft before Send.');
   sessionStorage.setItem(draftKey, JSON.stringify({id, recipient}));
   sessionStorage.setItem(probeKey, JSON.stringify({id, recipient}));
- } else if (!restored.scheduled) {
+ } else if (!restored.scheduled && !restored.reopenNative) {
   await waitForStep(recipientsReady, 'The shipped draft did not restore its recipient.');
   type.click();
   enterWords('Keep the first List Send.');
   pasteListImage();
   check(!later.hidden && scheduled.disabled, 'The shipped pointer offers a separate draft.');
   later.click();
+  await waitForStep(() => scheduled.checked, 'The separate Scheduled draft did not open.');
   check(scheduled.checked && !words.value, 'The separate Scheduled draft has its own fields.');
   enterWords(scheduleWords);
   dialog.querySelector('[data-cancel]').click();
@@ -1334,31 +1341,51 @@ async function checkSeparateScheduledDraft() {
   check(type.checked && words.value === 'Keep the first List Send.' &&
         dialog.querySelectorAll('[data-previews] img').length === 1, 'Reopen shows the native words and image.');
   later.click();
+  await waitForStep(() => scheduled.checked, 'The separate Scheduled draft did not reopen.');
   check(scheduled.checked && words.value === scheduleWords && !send.disabled, 'The separate draft keeps its words.');
   send.click();
-  await waitForStep(sendFinished, 'The Scheduled Send did not return the lost reply.');
+  if (scheduledResult === 'saved') {
+   await waitForStep(() => !confirmation.hidden, 'The Scheduled Send did not show confirmation.');
+   check(confirmation.textContent.startsWith('Saved List item 1.'), 'The first Scheduled Send confirms the saved item.');
+  } else {
+   await waitForStep(sendFinished, 'The Scheduled Send did not report the failure.');
+   if (scheduledResult === 'refused') {
+    check(error.textContent === 'Invalid schedule.' && words.value === scheduleWords,
+          'The refusal keeps the Scheduled words available to edit.');
+   }
+  }
   check(posts.length === 1 && /^s1-/.test(posts[0].request_id) && posts[0].words === scheduleWords,
         'The first Scheduled Send uses a fresh ID.');
   check(pending().id === restored.id, 'The Scheduled Send keeps the shipped pointer.');
-  sessionStorage.setItem(probeKey, JSON.stringify({...restored, scheduled:posts[0]}));
+  const next = scheduledResult.startsWith('retry') ? {scheduled:posts[0]} : {reopenNative:true};
+  sessionStorage.setItem(probeKey, JSON.stringify({...restored, ...next}));
  } else {
-  await waitForStep(() => send.textContent === 'Retry' && !send.disabled, 'The Scheduled Retry did not recover on reload.');
-  send.click();
-  await waitForStep(() => !dialog.querySelector('#new-item-saved').hidden, 'The Scheduled Retry did not show confirmation.');
-  check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored.scheduled) &&
-        dialog.querySelector('#new-item-saved').textContent.startsWith('Saved List item 1.'),
-        'Scheduled Retry uses the same Send and confirms the saved item.');
-  check(pending().id === restored.id, 'Scheduled confirmation keeps the shipped pointer.');
-  dialog.querySelector('[data-done]').click();
-  launch.click();
-  await waitForStep(recipientsReady, 'The native draft did not open after Scheduled confirmation.');
+  if (!restored.reopenNative) {
+   await waitForStep(() => send.textContent === 'Retry' && !send.disabled, 'The Scheduled Retry did not recover on reload.');
+   send.click();
+   await waitForStep(() => !confirmation.hidden, 'The Scheduled Retry did not show confirmation.');
+   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored.scheduled) &&
+         confirmation.textContent.startsWith('Saved List item 1.'),
+         'Scheduled Retry uses the same Send and confirms the saved item.');
+   check(pending().id === restored.id, 'Scheduled confirmation keeps the shipped pointer.');
+   if (scheduledResult === 'retry and reload' && !failures.length) {
+    sessionStorage.setItem(probeKey, JSON.stringify({...restored, reopenNative:true}));
+    location.reload();
+    return false;
+   }
+   dialog.querySelector('[data-done]').click();
+   launch.click();
+  }
+  await waitForStep(recipientsReady, 'The native draft did not open after the Scheduled result.');
   check(type.checked && words.value === 'Keep the first List Send.' &&
-        dialog.querySelectorAll('[data-previews] img').length === 1, 'Scheduled Retry preserves the native words and image.');
+        dialog.querySelectorAll('[data-previews] img').length === 1, 'The Scheduled result preserves the native words and image.');
   if (send.disabled) throw new Error('The native Send is disabled.');
   const saved = new Promise(resolve => dialog.addEventListener('review-item-created', resolve, {once:true}));
   send.click();
   await Promise.race([saved, waitForStep(sendFinished, 'The native Send did not finish.').then(() => { throw new Error(error.textContent); })]);
-  check(posts.length === 2 && posts[1].request_id === restored.id && posts[1].recipient_id === restored.recipient,
+  const native = posts.at(-1);
+  check(posts.length === (restored.reopenNative ? 1 : 2) &&
+        native.request_id === restored.id && native.recipient_id === restored.recipient,
         'The native Send still uses the shipped ID and recipient.');
   check(!pending(), 'The native confirmation clears the shipped pointer.');
   return true;
@@ -1443,7 +1470,7 @@ async function checkListRetry() {
 (async () => {
  try {
   launch.click();
-  if (!await (shippedUnsent ? checkSeparateScheduledDraft() : checkListRetry())) return;
+  if (!await (scheduledResult ? checkSeparateScheduledDraft() : checkListRetry())) return;
  } catch (error) {
   failures.push(String(error));
  }
@@ -1806,14 +1833,17 @@ class NewItemDialogTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_send_after_reload_returns_the_item_from_the_lost_reply(self) -> None:
-        for shipped_pointer, shipped_unsent in (("", False), ("id", False), ("id and recipient", False),
-                                                ("id and recipient", True)):
-            with self.subTest(shipped_pointer=shipped_pointer, shipped_unsent=shipped_unsent):
+        for shipped_pointer, scheduled_result in (
+            ("", ""), ("id", ""), ("id and recipient", ""),
+            ("id and recipient", "retry"), ("id and recipient", "saved"),
+            ("id and recipient", "retry and reload"), ("id and recipient", "refused"),
+        ):
+            with self.subTest(shipped_pointer=shipped_pointer, scheduled_result=scheduled_result):
                 self.check_list_retry(reload_after_send=True, shipped_pointer=shipped_pointer,
-                                      shipped_unsent=shipped_unsent)
+                                      scheduled_result=scheduled_result)
 
     def check_list_retry(self, *, reload_after_send: bool, shipped_pointer: str = "",
-                         shipped_unsent: bool = False) -> None:
+                         scheduled_result: str = "") -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
         configuration = temporary / "config"
@@ -1821,16 +1851,16 @@ class NewItemDialogTests(unittest.TestCase):
         _ = (configuration / "console.conf").write_text(f"page.list.owner={OWNER}\n")
         image = (new_item_dialog.NO_PAGE_SCREENSHOT if reload_after_send else new_item_dialog.PageScreenshot(
             base64.b64decode(PNG), new_item_dialog.PageViewport(1440, 900, True)))
-        fixture = DialogFixture(temporary, screenshot=image, reject_first_send=reload_after_send and not shipped_unsent)
+        fixture = DialogFixture(temporary, screenshot=image, reject_first_send=reload_after_send and not scheduled_result)
         probe = (LIST_RETRY_PROBE.replace("__RELOAD_AFTER_SEND__", json.dumps(reload_after_send))
                  .replace("__SHIPPED_POINTER__", json.dumps(shipped_pointer))
-                 .replace("__SHIPPED_UNSENT__", json.dumps(shipped_unsent)))
+                 .replace("__SCHEDULED_RESULT__", json.dumps(scheduled_result)))
         page = fixture_page(1440, photo=False, script=probe).replace(
             b'data-page-owner="builds"', b'data-page-owner="list"')
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
             capture_dialogs(temporary / "list-retry.png", {1440: fixture}, pages={1440: page})
         self.assertEqual(fixture.results, [])
-        if shipped_unsent:
+        if scheduled_result:
             self.assertEqual(len(fixture.posts), 1)
         else:
             self.assertEqual(len(fixture.posts), 2)
