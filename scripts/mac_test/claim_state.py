@@ -12,6 +12,7 @@ import fcntl
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 from subprocess import SubprocessError
 import sys
 from typing import TYPE_CHECKING, Literal, NotRequired, Self, TypedDict, cast, override
@@ -24,7 +25,9 @@ from scripts.direct.runner_result import (
     MAC_HISTORY_KEY_UNAVAILABLE_STATUS as MAC_HISTORY_KEY_UNAVAILABLE_STATUS,
 )
 from scripts.lib import process_start as process_identity
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.mac_test.mirror_root import MacMirrorRoot
 
 if TYPE_CHECKING:
     from scripts.buildlog.repository import MacSourceRepository
@@ -288,10 +291,36 @@ def _reservation_fingerprint(claim_id: str, episode: str, attempt: str, pid: int
     return sha256(json.dumps((claim_id, episode, attempt, pid, start, since)).encode()).hexdigest()
 
 
+class MacWatchOrigin(TypedDict):
+    mirror_root: str
+    machine_id: str
+
+
+def mac_machine_id(value: object) -> str | None:
+    if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}", value):
+        return value.lower()
+    return None
+
+
+def read_mac_watch_origin(value: object) -> MacWatchOrigin | None:
+    if not isinstance(value, dict):
+        return None
+    fields = cast(dict[str, object], value)
+    machine_id = mac_machine_id(fields.get("machine_id"))
+    root = fields.get("mirror_root")
+    if machine_id is None or not isinstance(root, str):
+        return None
+    try:
+        return {"mirror_root": MacMirrorRoot(root).relative, "machine_id": machine_id}
+    except conf.Unusable:
+        return None
+
+
 class RemoteJobClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity until the named host confirms that its job ends."""
 
     remote_host: str
+    mac_watch_origin: NotRequired[MacWatchOrigin]
     cleanup_pending: NotRequired[bool]
     cleanup_request_id: NotRequired[str]
     instance_generation: NotRequired[str]
@@ -866,6 +895,9 @@ def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool 
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
+    watch_origin = read_mac_watch_origin(values.get("mac_watch_origin"))
+    if watch_origin is not None:
+        remote["mac_watch_origin"] = watch_origin
     if "replaced_reservation" in values:
         remote["replaced_reservation"] = read_replaced_reservation(values["replaced_reservation"], path)
     if 'instance_generation' in values:
