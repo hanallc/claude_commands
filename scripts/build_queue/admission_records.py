@@ -677,6 +677,21 @@ Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 NO_PRESSURE_HOLD = NoPressureHold()
 
 
+@dataclass(frozen=True)
+class JobStart:
+    """The queue clock time when the GitHub job of a CI step started. GitHub counts its 6-hour job limit from it."""
+    started_at: float
+
+
+@dataclass(frozen=True)
+class NoJobStart:
+    """The step has no GitHub job, or the client could not read the job start."""
+
+
+NO_JOB_START = NoJobStart()
+CiJobStart = JobStart | NoJobStart
+
+
 class Waiter(TypedDict):
     pid: int
     start_time: str
@@ -690,6 +705,7 @@ class Waiter(TypedDict):
     session_name: NotRequired[str]
     unit: NotRequired[str]
     ci_runner: NotRequired[str]
+    ci_job_start: NotRequired[JobStart]
     step: NotRequired[str]
     folder: NotRequired[str]
     token_left_at: NotRequired[float]
@@ -1081,6 +1097,15 @@ WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMe
               | NatedevHeld | BuildSpaceHold | placement.CargoFolderWait)
 
 
+@dataclass(frozen=True)
+class MachineChoiceWait:
+    """The step waits for placement to choose a machine for it, such as a Mac Linux guest."""
+
+
+# Only a queue row waits for a machine choice. An admission reply never carries it.
+WaitingStepReason = WaitReason | MachineChoiceWait
+
+
 def held_text(wait: NatedevHeld) -> str:
     if wait.holder and wait.purpose:
         return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
@@ -1160,7 +1185,7 @@ class WaitingStep:
     folder: str
     since: float
     need: int
-    reason: WaitReason
+    reason: WaitingStepReason
     unit: str = ""
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
@@ -1169,6 +1194,7 @@ class WaitingStep:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
+    ci_job_start: CiJobStart = field(default=NO_JOB_START, kw_only=True)
     placement_candidates: tuple[placement.CandidateEligibility, ...] = field(default=(), kw_only=True)
     placement_targets: tuple[str, ...] = field(default=(), kw_only=True)
     speculative_copy: bool = field(default=False, kw_only=True)
@@ -1721,6 +1747,16 @@ def waiter_route(row: Waiter) -> StepRoute:
     return row.get("route", DIRECT_CARGO)
 
 
+def waiter_job_start(row: Waiter) -> CiJobStart:
+    """Return the CI job start of a queue row. A row without one has NO_JOB_START."""
+    return row.get("ci_job_start", NO_JOB_START)
+
+
+def job_order_since(since: float, job_start: CiJobStart) -> float:
+    """Rank a CI step at its job start when the job started before the step arrived."""
+    return min(since, job_start.started_at) if isinstance(job_start, JobStart) else since
+
+
 def direct_cargo_route() -> LocalRequired:
     """Keep the caller's reason when a direct command must run locally."""
     reason = os.environ.get("BUILD_QUEUE_LOCAL_REASON", "")
@@ -2086,8 +2122,10 @@ def behind_place(reason: BehindHead, waiting: Sequence[WaitingStep]) -> int:
                  if step.session_id == reason.head_session_id and step.since == reason.joined_at), 0)
 
 
-def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
+def reason_phrase(reason: WaitingStepReason, waiting: Sequence[WaitingStep]) -> str:
     match reason:
+        case MachineChoiceWait():
+            return "waits for a machine choice"
         case TokenWaitingWaiter():
             return "waiting for the cargo token"
         case EstimateExpired():

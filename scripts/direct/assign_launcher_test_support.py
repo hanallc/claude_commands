@@ -95,7 +95,6 @@ locks.probe_wait_seconds=0.25
 locks.probe_retry_seconds=0.005
 """,
     "scratch": """\
-visible_root=~/repro
 holds_file=~/.local/state/scratch/holds.json
 # whole: 1..
 default_life_seconds=86400

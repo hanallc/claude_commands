@@ -145,7 +145,6 @@ record_lock_attempts=3
 repo_depth=3
 repo_skip=target node_modules .git
 suffix_length=6
-visible_root={home / 'rust/repro'}
 """)
         _ = write_config_fixture(configuration / "nix_env.conf", """\
 command_timeout_seconds=600

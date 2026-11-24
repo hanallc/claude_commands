@@ -2420,7 +2420,7 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
               patch.object(os, "link", side_effect=publish_claim),
               patch.object(Path, "read_bytes", read_file),
               patch.object(io, "FileIO", side_effect=open_log),
-              patch.object(restart, "_notify_log_claim", side_effect=ready),
+              patch.object(stop_resume, "notify_ready", side_effect=ready),
               patch.object(staff, "initial_snapshot", side_effect=snapshot),
               patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows(list(rows))),
               patch.object(restart, "stop_row", side_effect=stop_row) as stop,
